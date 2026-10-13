@@ -1,0 +1,11 @@
+[package]
+name = "sng-state"
+description = "Cluster state: openraft + redb, sharded Raft groups for desired state and placement"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+tracing.workspace = true

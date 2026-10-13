@@ -1,0 +1,11 @@
+[package]
+name = "sng-api"
+description = "Docker Engine API subset (REST) and native gRPC API"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+tracing.workspace = true

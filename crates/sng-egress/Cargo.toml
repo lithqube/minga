@@ -1,0 +1,11 @@
+[package]
+name = "sng-egress"
+description = "LLM egress proxy: token and cost budgets, caching, secret redaction"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+tracing.workspace = true

@@ -1,0 +1,11 @@
+[package]
+name = "sng-compose"
+description = "Compose Specification parser and validator (full spec, x- extensions)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+tracing.workspace = true
