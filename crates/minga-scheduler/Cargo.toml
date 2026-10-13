@@ -1,6 +1,6 @@
 [package]
-name = "sng-net"
-description = "Network control and data plane: WireGuard overlay, nftables/eBPF, ingress"
+name = "minga-scheduler"
+description = "Site-level placement; turns Compose services into tasks"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

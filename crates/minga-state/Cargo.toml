@@ -1,6 +1,6 @@
 [package]
-name = "sng-egress"
-description = "LLM egress proxy: token and cost budgets, caching, secret redaction"
+name = "minga-state"
+description = "Cluster state: openraft + redb, sharded Raft groups for desired state and placement"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

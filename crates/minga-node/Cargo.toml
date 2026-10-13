@@ -1,5 +1,5 @@
 [package]
-name = "sng-node"
+name = "minga-node"
 description = "Node supervisor: local bin-packing, task lifecycle via containerd, offline operation"
 version.workspace = true
 edition.workspace = true

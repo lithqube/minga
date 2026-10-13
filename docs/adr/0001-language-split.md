@@ -5,7 +5,7 @@
 
 ## Context
 
-Swarm-NG targets small ARM edge devices as well as on-prem clusters up to about 5,000 nodes. It needs one small binary, steady tail latency in the data plane, and memory-safe parsing of untrusted input. The control plane is mostly reconcile loops where garbage-collection pauses do not matter.
+Minga targets small ARM edge devices as well as on-prem clusters up to about 5,000 nodes. It needs one small binary, steady tail latency in the data plane, and memory-safe parsing of untrusted input. The control plane is mostly reconcile loops where garbage-collection pauses do not matter.
 
 ## Decision
 

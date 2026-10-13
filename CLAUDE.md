@@ -1,4 +1,4 @@
-# Swarm-NG
+# Minga
 
 Rust single-binary orchestrator replacing Docker Swarm for edge/on-prem/air-gapped sites. Design doc: https://claude.ai/code/artifact/084e961f-88e4-45e2-aa1a-c8a76928b575
 

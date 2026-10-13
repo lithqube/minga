@@ -1,0 +1,114 @@
+# An edge site running an inference service on a GPU, an agent API in front
+# of it, a sensor reader that needs a serial device, and an optional debug UI.
+# Uses the keys Docker Swarm ignores today.
+name: plant-7
+
+x-defaults: &defaults
+  restart: unless-stopped
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+  networks: [backplane]
+
+services:
+  inference:
+    <<: *defaults
+    image: registry.local/vllm:${VLLM_TAG:-0.6.3}
+    command: ["--model", "/models/llama", "--gpu-memory-utilization", "0.9"]
+    volumes:
+      - type: volume
+        source: models
+        target: /models
+        read_only: true
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 2m
+    deploy:
+      replicas: ${INFERENCE_REPLICAS:-1}
+      placement:
+        constraints: ["node.labels.gpu == true"]
+      resources:
+        limits:
+          memory: 24G
+        reservations:
+          cpus: "4"
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    ulimits:
+      memlock: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+    x-minga-budget:
+      tokens_per_day: 2000000
+
+  agent-api:
+    <<: *defaults
+    image: registry.local/agent-api:1.4.0
+    depends_on:
+      inference:
+        condition: service_healthy
+        restart: true
+    ports:
+      - target: 8080
+        published: 443
+        protocol: tcp
+        mode: ingress
+    secrets:
+      - source: api_token
+        target: /run/secrets/token
+        mode: "0400"
+    configs:
+      - agent_config
+    environment:
+      INFERENCE_URL: http://inference:8000
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    deploy:
+      replicas: 2
+      update_config:
+        parallelism: 1
+        order: start-first
+        failure_action: rollback
+
+  sensors:
+    <<: *defaults
+    image: registry.local/sensor-reader:2.1
+    privileged: false
+    devices:
+      - /dev/ttyUSB0:/dev/ttyUSB0:rw
+    cap_add: [SYS_RAWIO]
+    sysctls:
+      net.core.somaxconn: 1024
+    deploy:
+      mode: global
+
+  debug-ui:
+    image: registry.local/debug-ui:latest
+    profiles: [debug]
+    ports: ["9000:9000"]
+    networks: [backplane]
+
+networks:
+  backplane:
+    driver: overlay
+    attachable: true
+
+volumes:
+  models:
+    external: true
+
+secrets:
+  api_token:
+    file: ./secrets/api_token.txt
+
+configs:
+  agent_config:
+    content: |
+      max_steps: 20
+      sandbox: wasm

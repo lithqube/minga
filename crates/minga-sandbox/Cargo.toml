@@ -1,5 +1,5 @@
 [package]
-name = "sng-sandbox"
+name = "minga-sandbox"
 description = "Agent sandboxes: wasmtime and Firecracker warm pools"
 version.workspace = true
 edition.workspace = true

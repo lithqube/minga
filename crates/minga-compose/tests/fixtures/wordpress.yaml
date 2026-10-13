@@ -1,0 +1,30 @@
+# Classic WordPress + MySQL stack, written the way most tutorials show it.
+version: "3.9"
+
+services:
+  db:
+    image: mysql:8.4
+    volumes:
+      - db_data:/var/lib/mysql
+    restart: always
+    environment:
+      MYSQL_ROOT_PASSWORD: ${DB_ROOT_PASSWORD:?set DB_ROOT_PASSWORD}
+      MYSQL_DATABASE: wordpress
+      MYSQL_USER: wordpress
+      MYSQL_PASSWORD: ${DB_PASSWORD:?set DB_PASSWORD}
+
+  wordpress:
+    depends_on:
+      - db
+    image: wordpress:${WP_TAG:-6.6}
+    ports:
+      - "8000:80"
+    restart: always
+    environment:
+      - WORDPRESS_DB_HOST=db:3306
+      - WORDPRESS_DB_USER=wordpress
+      - WORDPRESS_DB_PASSWORD=${DB_PASSWORD}
+      - WORDPRESS_DB_NAME=wordpress
+
+volumes:
+  db_data: {}

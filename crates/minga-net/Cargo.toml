@@ -1,6 +1,6 @@
 [package]
-name = "sng-state"
-description = "Cluster state: openraft + redb, sharded Raft groups for desired state and placement"
+name = "minga-net"
+description = "Network control and data plane: WireGuard overlay, nftables/eBPF, ingress"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
