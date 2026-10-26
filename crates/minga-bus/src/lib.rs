@@ -19,10 +19,10 @@
 //! minga.node.{id}.event      JetStream   node lifecycle events
 //! minga.task.{id}.status     JetStream   task status reports
 //! minga.task.{id}.event      JetStream   task lifecycle events
-//! minga.task.{id}.log        JetStream   container log chunks
+//! minga.log.{id}             JetStream   container log chunks
 //! minga.ctl.node.{id}.assign JetStream   task assignment command  [work queue]
 //! minga.ctl.node.{id}.stop   JetStream   stop/remove command       [work queue]
-//! minga.ctl.node.{id}.ping   core NATS   synchronous health probe  [req/reply]
+//! minga.ctl.node.{id}.ping   core NATS   synchronous health probe [req/reply]
 //! minga.ctl.node.{id}.drain  core NATS   synchronous drain         [req/reply]
 //! ```
 //!
@@ -151,6 +151,73 @@ pub type KvStream = Pin<Box<dyn Stream<Item = KvEvent> + Send>>;
 /// Stream of incoming requests.
 pub type RequestStream = Pin<Box<dyn Stream<Item = BusRequest> + Send>>;
 
+/// Stream of log entries.
+pub type LogEventStream = Pin<Box<dyn Stream<Item = LogEntry> + Send>>;
+
+/// A single log entry from a task (container stdout/stderr or agent output).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LogEntry {
+    pub task_id: String,
+    pub stream: LogStream,
+    pub data: Vec<u8>,
+    /// Unix timestamp in milliseconds.
+    pub timestamp: u64,
+}
+
+impl LogEntry {
+    pub fn stdout(task_id: &str, data: impl Into<Vec<u8>>) -> Self {
+        Self {
+            task_id: task_id.to_string(),
+            stream: LogStream::Stdout,
+            data: data.into(),
+            timestamp: now_millis(),
+        }
+    }
+
+    pub fn stderr(task_id: &str, data: impl Into<Vec<u8>>) -> Self {
+        Self {
+            task_id: task_id.to_string(),
+            stream: LogStream::Stderr,
+            data: data.into(),
+            timestamp: now_millis(),
+        }
+    }
+
+    pub fn to_bytes(&self) -> Result<Vec<u8>> {
+        bincode::serde::encode_to_vec(self, bincode::config::standard())
+            .map_err(|e| BusError::Serialization(e.to_string()))
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        let (entry, _) = bincode::serde::decode_from_slice(bytes, bincode::config::standard())
+            .map_err(|e| BusError::Serialization(e.to_string()))?;
+        Ok(entry)
+    }
+}
+
+/// Which output stream a log entry came from.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum LogStream {
+    Stdout,
+    Stderr,
+}
+
+impl std::fmt::Display for LogStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LogStream::Stdout => write!(f, "stdout"),
+            LogStream::Stderr => write!(f, "stderr"),
+        }
+    }
+}
+
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
 // ---------------------------------------------------------------------------
 // Status reports (actual state, carried over the bus)
 // ---------------------------------------------------------------------------
@@ -250,6 +317,11 @@ pub trait EventBus: Send + Sync {
     /// Get the latest status value for a key, or `None` if not set.
     async fn get_status(&self, key: &str) -> Result<Option<Vec<u8>>>;
 
+    /// List all current status entries as (key, value) pairs.
+    ///
+    /// This is a snapshot of the latest value per key, not a stream.
+    async fn list_status(&self) -> Result<Vec<(String, Vec<u8>)>>;
+
     /// Watch for changes to any status key.
     async fn watch_status(&self) -> Result<KvStream>;
 
@@ -271,6 +343,24 @@ pub trait EventBus: Send + Sync {
 
     /// Send a reply to a request.
     async fn reply(&self, reply_subject: &str, payload: &[u8]) -> Result<()>;
+
+    // -- Logs (append-only, per-task) ----------------------------------------
+
+    /// Publish a log entry for a task. Goes to the `MINGA_LOGS` stream.
+    async fn publish_log(&self, task_id: &str, entry: &LogEntry) -> Result<()>;
+
+    /// Subscribe to log entries published **after** this call.
+    ///
+    /// This is a live tail: it does not replay previously published entries.
+    /// Use [`EventBus::log_history`] to read the retained backlog.
+    async fn subscribe_logs(&self, task_id: &str) -> Result<LogEventStream>;
+
+    /// Returns up to `tail` of the most recently published log entries for a
+    /// task (or for `*`, across all tasks), oldest first.
+    ///
+    /// `tail == 0` means "all retained entries", bounded by the transport's
+    /// retention limits.
+    async fn log_history(&self, task_id: &str, tail: usize) -> Result<Vec<LogEntry>>;
 }
 
 // ---------------------------------------------------------------------------

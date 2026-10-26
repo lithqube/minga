@@ -35,9 +35,14 @@ pub fn task_event(task_id: &str) -> String {
     format!("{PREFIX}.task.{task_id}.event")
 }
 
-/// `minga.task.{id}.log` — container log chunks (JetStream).
+/// `minga.log.{id}` — container log chunks (JetStream).
+///
+/// Log subjects live under their own top-level namespace rather than under
+/// `minga.task.`. JetStream rejects two streams whose subject filters
+/// overlap, and `minga.task.>` (the MINGA_EVENTS filter) would otherwise
+/// swallow every log subject.
 pub fn task_log(task_id: &str) -> String {
-    format!("{PREFIX}.task.{task_id}.log")
+    format!("{PREFIX}.log.{task_id}")
 }
 
 // -- Control subjects (commands + request/reply) ----------------------------
@@ -77,6 +82,11 @@ pub fn task_events_wildcard() -> String {
 /// All node events: `minga.node.>`
 pub fn node_events_wildcard() -> String {
     format!("{PREFIX}.node.>")
+}
+
+/// All log subjects: `minga.log.>`
+pub fn log_events_wildcard() -> String {
+    format!("{PREFIX}.log.>")
 }
 
 /// All events (nodes + tasks): patterns for the MINGA_EVENTS stream.
@@ -126,7 +136,7 @@ mod tests {
             task_event("plant-7.worker.0"),
             "minga.task.plant-7.worker.0.event"
         );
-        assert_eq!(task_log("abc"), "minga.task.abc.log");
+        assert_eq!(task_log("abc"), "minga.log.abc");
         assert_eq!(ctl_assign(1), "minga.ctl.node.1.assign");
         assert_eq!(ctl_stop(1), "minga.ctl.node.1.stop");
         assert_eq!(ctl_ping(1), "minga.ctl.node.1.ping");
@@ -138,6 +148,7 @@ mod tests {
         assert_eq!(ctl_node_wildcard(1), "minga.ctl.node.1.>");
         assert_eq!(task_events_wildcard(), "minga.task.>");
         assert_eq!(node_events_wildcard(), "minga.node.>");
+        assert_eq!(log_events_wildcard(), "minga.log.>");
     }
 
     #[test]

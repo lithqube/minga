@@ -144,6 +144,9 @@ fn translate_service(
     // Build the agent spec from the extension, if present.
     let agent = agent_ext.map(agent_extension_to_spec);
 
+    // Translate restart policy from Compose deploy.restart_policy.
+    let restart_policy = translate_restart_policy(&deploy.restart_policy, &svc.restart);
+
     Ok(Service {
         id: format!("{stack}.{name}"),
         name: name.to_string(),
@@ -156,7 +159,73 @@ fn translate_service(
         networks,
         resources,
         agent,
+        restart_policy,
     })
+}
+
+/// Translates Compose restart policy into Minga's `RestartPolicy`.
+///
+/// Compose `deploy.restart_policy` takes precedence over the legacy
+/// `restart` string field.
+fn translate_restart_policy(
+    deploy_rp: &Option<minga_compose::RestartPolicy>,
+    legacy_restart: &Option<String>,
+) -> minga_state::types::RestartPolicy {
+    use minga_state::types::{RestartCondition, RestartPolicy};
+
+    // Start with defaults (no restart).
+    let mut policy = RestartPolicy::default();
+
+    if let Some(rp) = deploy_rp {
+        policy.condition = match rp.condition.as_deref() {
+            Some("on-failure") => RestartCondition::OnFailure,
+            Some("any") | Some("always") => RestartCondition::Any,
+            _ => RestartCondition::None,
+        };
+        if let Some(delay) = &rp.delay {
+            policy.delay_secs = parse_duration_secs(delay).unwrap_or(1);
+        }
+        policy.max_attempts = rp.max_attempts;
+    } else if let Some(restart) = legacy_restart {
+        // Legacy `restart:` field: "no", "always", "on-failure", "unless-stopped".
+        policy.condition = match restart.as_str() {
+            "always" | "unless-stopped" => RestartCondition::Any,
+            "on-failure" => RestartCondition::OnFailure,
+            _ => RestartCondition::None,
+        };
+    }
+
+    policy
+}
+
+/// Parses a Go-style duration string (e.g. "5s", "1m30s") into seconds.
+fn parse_duration_secs(s: &str) -> Option<u64> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let mut total = 0u64;
+    let mut num = String::new();
+    for ch in s.chars() {
+        if ch.is_ascii_digit() {
+            num.push(ch);
+        } else {
+            let n: u64 = num.parse().ok()?;
+            num.clear();
+            total += match ch {
+                's' => n,
+                'm' => n * 60,
+                'h' => n * 3600,
+                _ => return None,
+            };
+        }
+    }
+    if !num.is_empty() {
+        // Bare number — treat as seconds.
+        let n: u64 = num.parse().ok()?;
+        total += n;
+    }
+    Some(total)
 }
 
 /// Converts a Compose `x-minga-agent` extension into a state `AgentSpec`.
@@ -578,5 +647,94 @@ mod tests {
         );
         let result = translate_service("agent", &svc, "test", &empty_project());
         assert!(result.is_err(), "invalid agent extension should fail");
+    }
+
+    // -- Restart policy tests --------------------------------------------------
+
+    #[test]
+    fn parse_duration_secs_simple() {
+        assert_eq!(parse_duration_secs("5s"), Some(5));
+        assert_eq!(parse_duration_secs("1m"), Some(60));
+        assert_eq!(parse_duration_secs("1h"), Some(3600));
+        assert_eq!(parse_duration_secs("90"), Some(90));
+    }
+
+    #[test]
+    fn parse_duration_secs_compound() {
+        assert_eq!(parse_duration_secs("1m30s"), Some(90));
+        assert_eq!(parse_duration_secs("2h15m"), Some(8100));
+    }
+
+    #[test]
+    fn parse_duration_secs_invalid() {
+        assert_eq!(parse_duration_secs(""), None);
+        assert_eq!(parse_duration_secs("abc"), None);
+        assert_eq!(parse_duration_secs("5x"), None);
+    }
+
+    #[test]
+    fn restart_policy_default_is_none() {
+        let svc = make_compose_service("image: nginx:latest");
+        let result = translate_service("web", &svc, "test", &empty_project()).unwrap();
+        assert_eq!(
+            result.restart_policy.condition,
+            minga_state::types::RestartCondition::None
+        );
+    }
+
+    #[test]
+    fn restart_policy_from_deploy() {
+        let svc = make_compose_service(
+            r#"
+            image: nginx:latest
+            deploy:
+              restart_policy:
+                condition: on-failure
+                delay: 5s
+                max_attempts: 3
+            "#,
+        );
+        let result = translate_service("web", &svc, "test", &empty_project()).unwrap();
+        assert_eq!(
+            result.restart_policy.condition,
+            minga_state::types::RestartCondition::OnFailure
+        );
+        assert_eq!(result.restart_policy.delay_secs, 5);
+        assert_eq!(result.restart_policy.max_attempts, Some(3));
+    }
+
+    #[test]
+    fn restart_policy_from_legacy_restart_field() {
+        let svc = make_compose_service(
+            r#"
+            image: nginx:latest
+            restart: always
+            "#,
+        );
+        let result = translate_service("web", &svc, "test", &empty_project()).unwrap();
+        assert_eq!(
+            result.restart_policy.condition,
+            minga_state::types::RestartCondition::Any
+        );
+    }
+
+    #[test]
+    fn restart_policy_deploy_overrides_legacy() {
+        let svc = make_compose_service(
+            r#"
+            image: nginx:latest
+            restart: "no"
+            deploy:
+              restart_policy:
+                condition: any
+                delay: 10s
+            "#,
+        );
+        let result = translate_service("web", &svc, "test", &empty_project()).unwrap();
+        assert_eq!(
+            result.restart_policy.condition,
+            minga_state::types::RestartCondition::Any
+        );
+        assert_eq!(result.restart_policy.delay_secs, 10);
     }
 }

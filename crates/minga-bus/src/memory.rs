@@ -4,7 +4,7 @@
 //! process memory — nothing survives a restart. The semantics mirror the
 //! NATS/JetStream implementation so tests exercise the same code paths.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -17,7 +17,7 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 
 use crate::{
     subjects, BusError, BusEvent, BusRequest, Command, EventBus, EventStream, KvEvent, KvOp,
-    KvStream, RequestStream, Result,
+    KvStream, LogEntry, LogEventStream, RequestStream, Result,
 };
 
 /// Default lease TTL: 15 seconds (3 × 5s heartbeat interval).
@@ -25,6 +25,9 @@ const DEFAULT_LEASE_TTL: Duration = Duration::from_secs(15);
 
 /// Channel capacity for events, commands, and KV notifications.
 const CHANNEL_CAPACITY: usize = 1024;
+
+/// How many log entries the in-memory bus retains per task.
+const LOG_HISTORY_CAPACITY: usize = 1000;
 
 // ---------------------------------------------------------------------------
 // MemoryBus
@@ -50,6 +53,10 @@ pub struct MemoryBus {
     pending_replies: Mutex<HashMap<String, oneshot::Sender<Vec<u8>>>>,
     /// Counter for generating unique reply subjects.
     reply_counter: AtomicU64,
+    /// Broadcast channel for log entries.
+    logs_tx: broadcast::Sender<LogEntry>,
+    /// Retained log entries per task, oldest first.
+    log_history: Mutex<HashMap<String, VecDeque<LogEntry>>>,
 }
 
 struct CommandChannel {
@@ -67,6 +74,7 @@ impl MemoryBus {
     pub fn with_lease_ttl(lease_ttl: Duration) -> Arc<Self> {
         let (events_tx, _) = broadcast::channel(CHANNEL_CAPACITY);
         let (kv_tx, _) = broadcast::channel(CHANNEL_CAPACITY);
+        let (logs_tx, _) = broadcast::channel(CHANNEL_CAPACITY);
         Arc::new(Self {
             events_tx,
             commands: Mutex::new(HashMap::new()),
@@ -77,6 +85,8 @@ impl MemoryBus {
             request_handlers: Mutex::new(HashMap::new()),
             pending_replies: Mutex::new(HashMap::new()),
             reply_counter: AtomicU64::new(0),
+            logs_tx,
+            log_history: Mutex::new(HashMap::new()),
         })
     }
 
@@ -170,6 +180,11 @@ impl EventBus for MemoryBus {
 
     async fn get_status(&self, key: &str) -> Result<Option<Vec<u8>>> {
         Ok(self.kv.lock().unwrap().get(key).cloned())
+    }
+
+    async fn list_status(&self) -> Result<Vec<(String, Vec<u8>)>> {
+        let kv = self.kv.lock().unwrap();
+        Ok(kv.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
     }
 
     async fn watch_status(&self) -> Result<KvStream> {
@@ -279,6 +294,70 @@ impl EventBus for MemoryBus {
                 "no pending reply for `{reply_subject}`"
             ))),
         }
+    }
+
+    async fn publish_log(&self, task_id: &str, entry: &LogEntry) -> Result<()> {
+        // Retain a bounded history per task so `log_history` can serve the
+        // backlog the way the JetStream-backed bus does.
+        {
+            let mut history = self.log_history.lock().unwrap();
+            let entries = history.entry(entry.task_id.clone()).or_default();
+            entries.push_back(entry.clone());
+            while entries.len() > LOG_HISTORY_CAPACITY {
+                entries.pop_front();
+            }
+        }
+        let _ = task_id;
+        let _ = self.logs_tx.send(entry.clone());
+        Ok(())
+    }
+
+    async fn subscribe_logs(&self, task_id: &str) -> Result<LogEventStream> {
+        let mut rx = self.logs_tx.subscribe();
+        let task_id = task_id.to_string();
+        let (tx, mpsc_rx) = mpsc::channel(CHANNEL_CAPACITY);
+
+        tokio::spawn(async move {
+            loop {
+                match rx.recv().await {
+                    Ok(entry) => {
+                        if (task_id == "*" || entry.task_id == task_id)
+                            && tx.send(entry).await.is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!(skipped = n, "log subscriber lagged");
+                        continue;
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
+
+        Ok(Box::pin(ReceiverStream { rx: mpsc_rx }))
+    }
+
+    async fn log_history(&self, task_id: &str, tail: usize) -> Result<Vec<LogEntry>> {
+        let history = self.log_history.lock().unwrap();
+
+        // Collect matching entries across tasks when task_id is "*".
+        let mut entries: Vec<LogEntry> = Vec::new();
+        if task_id == "*" {
+            for task_entries in history.values() {
+                entries.extend(task_entries.iter().cloned());
+            }
+        } else if let Some(task_entries) = history.get(task_id) {
+            entries.extend(task_entries.iter().cloned());
+        }
+
+        // Keep only the most recent `tail` entries (tail == 0 means all).
+        if tail > 0 && entries.len() > tail {
+            entries.drain(..entries.len() - tail);
+        }
+
+        Ok(entries)
     }
 }
 
@@ -681,5 +760,140 @@ mod tests {
             )
             .await;
         assert!(matches!(result, Err(BusError::Timeout(_))));
+    }
+
+    // -- Logs ----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_publish_and_subscribe_logs() {
+        let bus = MemoryBus::new();
+        let mut stream = bus.subscribe_logs("task-1").await.unwrap();
+
+        let entry = LogEntry::stdout("task-1", b"hello world\n");
+        bus.publish_log("task-1", &entry).await.unwrap();
+
+        let received = tokio::time::timeout(Duration::from_secs(1), stream.next())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(received.task_id, "task-1");
+        assert_eq!(received.data, b"hello world\n");
+        assert_eq!(received.stream, crate::LogStream::Stdout);
+    }
+
+    #[tokio::test]
+    async fn test_subscribe_logs_filters_by_task() {
+        let bus = MemoryBus::new();
+        let mut stream = bus.subscribe_logs("task-1").await.unwrap();
+
+        bus.publish_log("task-1", &LogEntry::stdout("task-1", b"for task-1"))
+            .await
+            .unwrap();
+        bus.publish_log("task-2", &LogEntry::stdout("task-2", b"for task-2"))
+            .await
+            .unwrap();
+
+        let received = tokio::time::timeout(Duration::from_secs(1), stream.next())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(received.task_id, "task-1");
+    }
+
+    #[tokio::test]
+    async fn test_subscribe_logs_wildcard() {
+        let bus = MemoryBus::new();
+        let mut stream = bus.subscribe_logs("*").await.unwrap();
+
+        bus.publish_log("task-1", &LogEntry::stdout("task-1", b"a"))
+            .await
+            .unwrap();
+        bus.publish_log("task-2", &LogEntry::stderr("task-2", b"b"))
+            .await
+            .unwrap();
+
+        let e1 = tokio::time::timeout(Duration::from_secs(1), stream.next())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(e1.task_id, "task-1");
+
+        let e2 = tokio::time::timeout(Duration::from_secs(1), stream.next())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(e2.task_id, "task-2");
+        assert_eq!(e2.stream, crate::LogStream::Stderr);
+    }
+
+    #[tokio::test]
+    async fn test_log_entry_roundtrip() {
+        let entry = LogEntry::stderr("task-abc", b"error: something broke\n");
+        let bytes = entry.to_bytes().unwrap();
+        let decoded = LogEntry::from_bytes(&bytes).unwrap();
+        assert_eq!(entry, decoded);
+    }
+
+    #[tokio::test]
+    async fn test_log_history_returns_retained_entries() {
+        let bus = MemoryBus::new();
+
+        bus.publish_log("task-1", &LogEntry::stdout("task-1", b"one\n"))
+            .await
+            .unwrap();
+        bus.publish_log("task-2", &LogEntry::stdout("task-2", b"other\n"))
+            .await
+            .unwrap();
+
+        let history = bus.log_history("task-1", 0).await.unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].data, b"one\n");
+    }
+
+    #[tokio::test]
+    async fn test_log_history_tail_keeps_the_last_entries() {
+        let bus = MemoryBus::new();
+
+        for i in 0..5 {
+            bus.publish_log(
+                "task-1",
+                &LogEntry::stdout("task-1", format!("line {i}\n").as_bytes()),
+            )
+            .await
+            .unwrap();
+        }
+
+        let history = bus.log_history("task-1", 2).await.unwrap();
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].data, b"line 3\n");
+        assert_eq!(history[1].data, b"line 4\n");
+    }
+
+    #[tokio::test]
+    async fn test_log_history_wildcard_covers_all_tasks() {
+        let bus = MemoryBus::new();
+
+        bus.publish_log("task-1", &LogEntry::stdout("task-1", b"a\n"))
+            .await
+            .unwrap();
+        bus.publish_log("task-2", &LogEntry::stdout("task-2", b"b\n"))
+            .await
+            .unwrap();
+
+        let history = bus.log_history("*", 0).await.unwrap();
+        assert_eq!(history.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_list_status_returns_all_entries() {
+        let bus = MemoryBus::new();
+
+        bus.put_status("task.a", b"one").await.unwrap();
+        bus.put_status("task.b", b"two").await.unwrap();
+
+        let entries = bus.list_status().await.unwrap();
+        assert_eq!(entries.len(), 2);
+        assert!(entries.iter().any(|(k, v)| k == "task.a" && v == b"one"));
+        assert!(entries.iter().any(|(k, v)| k == "task.b" && v == b"two"));
     }
 }

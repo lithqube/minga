@@ -34,7 +34,9 @@ use tokio::sync::Mutex;
 use super::client::{ClientError, ContainerdClient};
 use super::oci;
 use super::proto::{Container, ProcessStatus, Runtime as ProtoRuntime};
-use crate::runtime::{ContainerInfo, ContainerStatus, Runtime, RuntimeError};
+use crate::runtime::{
+    ContainerInfo, ContainerLog, ContainerState, ContainerStatus, Runtime, RuntimeError,
+};
 
 /// Grace period after SIGTERM before sending SIGKILL.
 const GRACE_PERIOD: Duration = Duration::from_secs(10);
@@ -150,7 +152,7 @@ impl Runtime for ContainerdRuntime {
         // 4. Create the task.
         let mut client = self.client.lock().await;
         let pid = client
-            .create_task(&container_id)
+            .create_task(&container_id, "", "")
             .await
             .map_err(|e| RuntimeError::Start(format!("create task: {e}")))?;
 
@@ -299,29 +301,54 @@ impl Runtime for ContainerdRuntime {
     }
 
     async fn status(&self, container_id: &str) -> Option<ContainerStatus> {
-        // Check if we're tracking it.
-        {
-            let tracked = self.containers.lock().await;
-            if !tracked.contains(container_id) {
-                // Might still exist in containerd (e.g. after restart).
-                // Fall through to query containerd directly.
-            }
-        }
+        self.state(container_id).await.map(|s| s.status)
+    }
 
+    async fn state(&self, container_id: &str) -> Option<ContainerState> {
         let mut client = self.client.lock().await;
         match client.get_task(container_id).await {
             Ok(process) => {
                 let ps = ProcessStatus::try_from(process.status).unwrap_or(ProcessStatus::Unknown);
-                Some(match ps {
-                    ProcessStatus::Running | ProcessStatus::Created => ContainerStatus::Running,
-                    ProcessStatus::Stopped | ProcessStatus::Unknown => ContainerStatus::Stopped,
-                    ProcessStatus::Paused | ProcessStatus::Pausing | ProcessStatus::Resuming => {
-                        ContainerStatus::Running
+                match ps {
+                    ProcessStatus::Running | ProcessStatus::Created => Some(ContainerState {
+                        status: ContainerStatus::Running,
+                        exit_code: None,
+                    }),
+                    ProcessStatus::Paused | ProcessStatus::Pausing => Some(ContainerState {
+                        status: ContainerStatus::Running,
+                        exit_code: None,
+                    }),
+                    // The task has exited. `exit_status` carries the process
+                    // exit code — a non-zero code means failure.
+                    ProcessStatus::Stopped => {
+                        let exit_code = process.exit_status as i32;
+                        let status = if exit_code != 0 {
+                            ContainerStatus::Failed
+                        } else {
+                            ContainerStatus::Stopped
+                        };
+                        Some(ContainerState {
+                            status,
+                            exit_code: Some(exit_code),
+                        })
                     }
-                })
+                    // Unknown is not a valid state for a live task — treat it
+                    // as terminated so the supervisor can act on it.
+                    ProcessStatus::Unknown => Some(ContainerState {
+                        status: ContainerStatus::Stopped,
+                        exit_code: Some(0),
+                    }),
+                }
             }
             Err(_) => None,
         }
+    }
+
+    async fn logs(&self, _container_id: &str, _tail: usize) -> Vec<ContainerLog> {
+        // TODO: read container logs via containerd's log API (binary log path
+        // from OCI spec `logPath` or via `TaskService` log streams).
+        // For now, return empty — log streaming from real containers is a follow-up.
+        Vec::new()
     }
 }
 

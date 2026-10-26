@@ -42,13 +42,15 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use minga_bus::{subjects, Command, EventBus, TaskActualState, TaskStatusReport};
-use minga_state::types::{NodeId, Task, TaskId, TaskSpec, WorkloadKind};
+use minga_bus::{
+    subjects, Command, EventBus, LogEntry, LogStream, TaskActualState, TaskStatusReport,
+};
+use minga_state::types::{NodeId, RestartCondition, Task, TaskId, TaskSpec, WorkloadKind};
 use minga_state::{StateError, StateStore};
 use thiserror::Error;
 use tokio::sync::Mutex;
 
-use crate::agent::{AgentError, AgentExecutor};
+use crate::agent::{AgentError, AgentExecutor, AgentStatus};
 use crate::runtime::{Runtime, RuntimeError};
 
 #[derive(Debug, Error)]
@@ -74,6 +76,24 @@ type BusAssignedTasks = Arc<Mutex<HashSet<TaskId>>>;
 /// Tracks agent task IDs currently running on this node.
 type RunningAgents = Arc<Mutex<HashSet<TaskId>>>;
 
+/// Tracks how many log entries have been published per task (container or agent).
+/// Used to avoid re-publishing the same log lines on each reconcile pass.
+type LogOffsets = Arc<Mutex<HashMap<TaskId, usize>>>;
+
+/// Tracks restart state for a failed task.
+#[derive(Debug, Clone)]
+struct RestartState {
+    /// Number of restart attempts so far.
+    attempts: u32,
+    /// When the next restart should happen.
+    next_retry: std::time::Instant,
+    /// The task spec (needed to restart).
+    spec: TaskSpec,
+}
+
+/// Tracks restart state per task ID.
+type RestartStates = Arc<Mutex<HashMap<TaskId, RestartState>>>;
+
 /// The node supervisor. Runs a reconcile loop that converges the local
 /// container/agent state with the tasks assigned to this node.
 ///
@@ -91,6 +111,8 @@ pub struct Supervisor {
     running: RunningTasks,
     running_agents: RunningAgents,
     bus_assigned: BusAssignedTasks,
+    log_offsets: LogOffsets,
+    restart_states: RestartStates,
 }
 
 impl Supervisor {
@@ -104,6 +126,8 @@ impl Supervisor {
             running: Arc::new(Mutex::new(HashMap::new())),
             running_agents: Arc::new(Mutex::new(HashSet::new())),
             bus_assigned: Arc::new(Mutex::new(HashSet::new())),
+            log_offsets: Arc::new(Mutex::new(HashMap::new())),
+            restart_states: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -124,6 +148,8 @@ impl Supervisor {
             running: Arc::new(Mutex::new(HashMap::new())),
             running_agents: Arc::new(Mutex::new(HashSet::new())),
             bus_assigned: Arc::new(Mutex::new(HashSet::new())),
+            log_offsets: Arc::new(Mutex::new(HashMap::new())),
+            restart_states: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -144,6 +170,8 @@ impl Supervisor {
             running: Arc::new(Mutex::new(HashMap::new())),
             running_agents: Arc::new(Mutex::new(HashSet::new())),
             bus_assigned: Arc::new(Mutex::new(HashSet::new())),
+            log_offsets: Arc::new(Mutex::new(HashMap::new())),
+            restart_states: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -177,7 +205,297 @@ impl Supervisor {
         // --- Raft fallback: reconcile with desired state ----------------------
         actions += self.raft_reconcile().await?;
 
+        // --- Restart policy: check failed containers, restart if needed -------
+        actions += self.check_restarts().await;
+
         Ok(actions)
+    }
+
+    /// Check running containers for failures and restart them according
+    /// to their restart policy. Uses exponential backoff: delay * 2^attempts.
+    async fn check_restarts(&self) -> usize {
+        let mut actions = 0;
+
+        // --- Agents -----------------------------------------------------------
+        // Agents live in their own tracking map (they have no container), so
+        // they need a separate termination check.
+        if let Some(exec) = &self.agent_executor {
+            let agents = self.running_agents.lock().await;
+            let mut failed_agents: Vec<TaskId> = Vec::new();
+            for task_id in agents.iter() {
+                match exec.status(task_id).await {
+                    Some(AgentStatus::Failed) => failed_agents.push(task_id.clone()),
+                    Some(AgentStatus::Completed) => {
+                        // A completed agent exited successfully — only
+                        // `always` restarts it.
+                        failed_agents.push(task_id.clone());
+                    }
+                    _ => {}
+                }
+            }
+            drop(agents);
+
+            for task_id in failed_agents {
+                let completed = exec
+                    .status(&task_id)
+                    .await
+                    .map(|s| matches!(s, AgentStatus::Completed))
+                    .unwrap_or(false);
+
+                let spec = match self.state.get_task(&task_id).await {
+                    Ok(Some(t)) => t.spec,
+                    _ => {
+                        let states = self.restart_states.lock().await;
+                        match states.get(&task_id) {
+                            Some(rs) => rs.spec.clone(),
+                            None => {
+                                tracing::warn!(
+                                    task = %task_id,
+                                    "failed agent not found in state, cannot restart"
+                                );
+                                continue;
+                            }
+                        }
+                    }
+                };
+
+                let policy = &spec.restart_policy;
+                let should_restart = match policy.condition {
+                    RestartCondition::None => false,
+                    // A completed agent exited 0 — `on-failure` does not apply.
+                    RestartCondition::OnFailure => !completed,
+                    RestartCondition::Any => true,
+                };
+
+                if !should_restart {
+                    tracing::info!(
+                        task = %task_id,
+                        "agent exited cleanly, restart policy does not apply"
+                    );
+                    self.running_agents.lock().await.remove(&task_id);
+                    continue;
+                }
+
+                let attempt = {
+                    let mut states = self.restart_states.lock().await;
+                    let state = states
+                        .entry(task_id.clone())
+                        .or_insert_with(|| RestartState {
+                            attempts: 0,
+                            next_retry: std::time::Instant::now(),
+                            spec: spec.clone(),
+                        });
+
+                    if let Some(max) = policy.max_attempts {
+                        if state.attempts >= max {
+                            tracing::warn!(
+                                task = %task_id,
+                                attempts = state.attempts,
+                                max,
+                                "agent failed, max restart attempts reached"
+                            );
+                            states.remove(&task_id);
+                            self.running_agents.lock().await.remove(&task_id);
+                            continue;
+                        }
+                    }
+
+                    if std::time::Instant::now() < state.next_retry {
+                        continue;
+                    }
+
+                    state.attempts += 1;
+                    let backoff_secs = policy.delay_secs * (1u64 << (state.attempts - 1).min(10));
+                    state.next_retry =
+                        std::time::Instant::now() + Duration::from_secs(backoff_secs);
+                    state.attempts
+                };
+
+                let WorkloadKind::Agent(agent_spec) = &spec.kind else {
+                    continue;
+                };
+
+                match exec.start(&task_id, agent_spec).await {
+                    Ok(agent_id) => {
+                        tracing::info!(
+                            task = %task_id,
+                            agent = %agent_id,
+                            attempt,
+                            "restarted failed agent"
+                        );
+                        self.running_agents.lock().await.insert(task_id.clone());
+                        actions += 1;
+                    }
+                    Err(e) => {
+                        tracing::error!(task = %task_id, error = %e, "failed to restart agent");
+                    }
+                }
+            }
+        }
+
+        // --- Containers -------------------------------------------------------
+        // Check status of all running containers.
+        let running = self.running.lock().await;
+        let mut terminated: Vec<(TaskId, String)> = Vec::new();
+        for (task_id, container_id) in running.iter() {
+            match self.runtime.state(container_id).await {
+                Some(state) if state.status.is_terminated() => {
+                    terminated.push((task_id.clone(), container_id.clone()));
+                }
+                _ => {}
+            }
+        }
+        drop(running);
+
+        for (task_id, container_id) in terminated {
+            // Remove the terminated container from tracking and clean it up.
+            self.running.lock().await.remove(&task_id);
+            self.log_offsets.lock().await.remove(&task_id);
+
+            // Capture the exit code BEFORE stopping: `stop()` deletes the
+            // task, which would discard the exit status we need to decide
+            // whether the restart policy applies.
+            let exit_code = self
+                .runtime
+                .state(&container_id)
+                .await
+                .and_then(|s| s.exit_code);
+
+            // Best-effort stop to clean up the container. If it already
+            // exited, this only removes the task and container records.
+            let _ = self.runtime.stop(&container_id).await;
+
+            // Look up the task spec from Raft to get the restart policy.
+            let spec = match self.state.get_task(&task_id).await {
+                Ok(Some(t)) => t.spec,
+                _ => {
+                    let states = self.restart_states.lock().await;
+                    if let Some(rs) = states.get(&task_id) {
+                        rs.spec.clone()
+                    } else {
+                        tracing::warn!(
+                            task = %task_id,
+                            "terminated task not found in state, cannot restart"
+                        );
+                        continue;
+                    }
+                }
+            };
+
+            let policy = &spec.restart_policy;
+            if policy.condition == RestartCondition::None {
+                tracing::info!(task = %task_id, "task terminated, restart policy is `none`");
+                continue;
+            }
+
+            // `on-failure` only restarts a non-zero exit; `any` restarts
+            // regardless of how the task exited.
+            let should_restart = match policy.condition {
+                RestartCondition::None => false,
+                RestartCondition::OnFailure => exit_code.map(|c| c != 0).unwrap_or(true),
+                RestartCondition::Any => true,
+            };
+
+            if !should_restart {
+                tracing::info!(
+                    task = %task_id,
+                    exit_code = ?exit_code,
+                    "task exited cleanly, restart policy does not apply"
+                );
+                continue;
+            }
+
+            // Determine if we should restart, and compute backoff.
+            let (attempt, new_spec) = {
+                let mut states = self.restart_states.lock().await;
+                let state = states
+                    .entry(task_id.clone())
+                    .or_insert_with(|| RestartState {
+                        attempts: 0,
+                        next_retry: std::time::Instant::now(),
+                        spec: spec.clone(),
+                    });
+
+                if let Some(max) = policy.max_attempts {
+                    if state.attempts >= max {
+                        tracing::warn!(
+                            task = %task_id,
+                            attempts = state.attempts,
+                            max,
+                            "task failed, max restart attempts reached"
+                        );
+                        states.remove(&task_id);
+                        continue;
+                    }
+                }
+
+                if std::time::Instant::now() < state.next_retry {
+                    continue; // Not yet time to retry.
+                }
+
+                state.attempts += 1;
+                let attempt = state.attempts;
+                let backoff_secs = policy.delay_secs * (1u64 << (attempt - 1).min(10));
+                state.next_retry = std::time::Instant::now() + Duration::from_secs(backoff_secs);
+                (attempt, state.spec.clone())
+            };
+
+            // Restart the task.
+            match &new_spec.kind {
+                WorkloadKind::Container => match self.runtime.start(&task_id, &new_spec).await {
+                    Ok(new_container_id) => {
+                        tracing::info!(
+                            task = %task_id,
+                            container = %new_container_id,
+                            attempt,
+                            "restarted failed container"
+                        );
+                        self.running
+                            .lock()
+                            .await
+                            .insert(task_id.clone(), new_container_id);
+                        actions += 1;
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            task = %task_id,
+                            error = %e,
+                            "failed to restart container"
+                        );
+                    }
+                },
+                WorkloadKind::Agent(agent_spec) => {
+                    let Some(exec) = &self.agent_executor else {
+                        tracing::error!(
+                            task = %task_id,
+                            "agent task failed but no agent executor configured"
+                        );
+                        continue;
+                    };
+                    match exec.start(&task_id, agent_spec).await {
+                        Ok(agent_id) => {
+                            tracing::info!(
+                                task = %task_id,
+                                agent = %agent_id,
+                                attempt,
+                                "restarted failed agent"
+                            );
+                            self.running_agents.lock().await.insert(task_id.clone());
+                            actions += 1;
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                task = %task_id,
+                                error = %e,
+                                "failed to restart agent"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        actions
     }
 
     /// Bus reconcile: refresh lease, pull commands, publish status.
@@ -208,7 +526,90 @@ impl Supervisor {
         // Publish status reports for running tasks.
         self.publish_status(bus).await;
 
+        // Stream container/agent logs to the bus.
+        self.stream_logs(bus).await;
+
         actions
+    }
+
+    /// Stream log output from running containers and agents to the bus.
+    /// Tracks per-task offsets to avoid re-publishing the same lines.
+    async fn stream_logs(&self, bus: &Arc<dyn EventBus>) {
+        // --- Container logs ---
+        let running = self.running.lock().await;
+        for (task_id, container_id) in running.iter() {
+            let chunks = self.runtime.logs(container_id, 0).await;
+            let mut offsets = self.log_offsets.lock().await;
+            let offset = offsets.entry(task_id.clone()).or_insert(0);
+            for chunk in chunks.iter().skip(*offset) {
+                let entry = LogEntry {
+                    task_id: task_id.clone(),
+                    stream: match chunk.stream {
+                        crate::runtime::LogStream::Stdout => LogStream::Stdout,
+                        crate::runtime::LogStream::Stderr => LogStream::Stderr,
+                    },
+                    data: chunk.data.clone(),
+                    timestamp: now_millis(),
+                };
+                if let Err(e) = bus.publish_log(task_id, &entry).await {
+                    tracing::warn!(task = %task_id, error = %e, "failed to publish log entry");
+                }
+            }
+            *offset = chunks.len();
+        }
+        drop(running);
+
+        // --- Agent logs (publish result when agent completes) ---
+        let agents = self.running_agents.lock().await;
+        for task_id in agents.iter() {
+            if let Some(exec) = &self.agent_executor {
+                let status = exec.status(task_id).await;
+                if matches!(
+                    status,
+                    Some(AgentStatus::Completed) | Some(AgentStatus::Failed)
+                ) {
+                    let mut offsets = self.log_offsets.lock().await;
+                    let offset = offsets.entry(task_id.clone()).or_insert(0);
+                    if *offset == 0 {
+                        // First time seeing this agent complete — publish the result.
+                        if let Some(result) = exec.result(task_id).await {
+                            let stream = if matches!(status, Some(AgentStatus::Failed)) {
+                                LogStream::Stderr
+                            } else {
+                                LogStream::Stdout
+                            };
+                            let data = if !result.stdout.is_empty() {
+                                result.stdout.into_bytes()
+                            } else if !result.stderr.is_empty() {
+                                result.stderr.into_bytes()
+                            } else {
+                                format!(
+                                    "agent completed: fuel={}, duration={}ms, exit_code={}\n",
+                                    result.fuel_used,
+                                    result.duration.as_millis(),
+                                    result.exit_code
+                                )
+                                .into_bytes()
+                            };
+                            let entry = LogEntry {
+                                task_id: task_id.clone(),
+                                stream,
+                                data,
+                                timestamp: now_millis(),
+                            };
+                            if let Err(e) = bus.publish_log(task_id, &entry).await {
+                                tracing::warn!(
+                                    task = %task_id,
+                                    error = %e,
+                                    "failed to publish agent log"
+                                );
+                            }
+                        }
+                        *offset = 1; // Mark as published
+                    }
+                }
+            }
+        }
     }
 
     /// Execute a single command received from the bus.
@@ -300,6 +701,7 @@ impl Supervisor {
             }
             Command::Stop { task_id } => {
                 self.bus_assigned.lock().await.remove(&task_id);
+                self.log_offsets.lock().await.remove(&task_id);
 
                 // Check if it's a container or an agent.
                 let container_id = self.running.lock().await.remove(&task_id);
@@ -377,8 +779,8 @@ impl Supervisor {
             // Check if the agent has completed.
             let state = if let Some(exec) = &self.agent_executor {
                 match exec.status(task_id).await {
-                    Some(crate::agent::AgentStatus::Completed) => TaskActualState::Stopped,
-                    Some(crate::agent::AgentStatus::Failed) => TaskActualState::Failed,
+                    Some(AgentStatus::Completed) => TaskActualState::Stopped,
+                    Some(AgentStatus::Failed) => TaskActualState::Failed,
                     _ => TaskActualState::Running,
                 }
             } else {
@@ -516,6 +918,7 @@ impl Supervisor {
         drop(bus_assigned);
 
         for (task_id, container_id) in to_stop_containers {
+            self.log_offsets.lock().await.remove(&task_id);
             match self.runtime.stop(&container_id).await {
                 Ok(()) => {
                     tracing::info!(
@@ -539,6 +942,7 @@ impl Supervisor {
         }
 
         for task_id in to_stop_agents {
+            self.log_offsets.lock().await.remove(&task_id);
             if let Some(exec) = &self.agent_executor {
                 match exec.stop(&task_id).await {
                     Ok(()) => {
@@ -602,6 +1006,7 @@ fn now_millis() -> u64 {
 mod tests {
     use super::*;
     use crate::runtime::MockRuntime;
+    use futures::StreamExt;
     use minga_bus::MemoryBus;
     use minga_state::types::{PortMapping, ResourceSpec, TaskSpec, TaskState};
     use std::collections::BTreeMap;
@@ -923,6 +1328,7 @@ mod tests {
                     module_ref: "./agent.wasm".to_string(),
                     ..Default::default()
                 }),
+                ..Default::default()
             },
             ips: HashMap::new(),
         }
@@ -938,6 +1344,7 @@ mod tests {
                 module_ref: "./agent.wasm".to_string(),
                 ..Default::default()
             }),
+            ..Default::default()
         }
     }
 
@@ -1149,5 +1556,251 @@ mod tests {
         let actions = supervisor.reconcile_once().await.unwrap();
         assert_eq!(actions, 0);
         assert_eq!(agent_exec.agent_count(), 1);
+    }
+
+    // --- Log streaming tests ---------------------------------------------------
+
+    #[tokio::test]
+    async fn container_logs_streamed_to_bus() {
+        let (supervisor, _runtime, _store, bus) = setup_with_bus(1).await;
+
+        // Subscribe to logs before starting.
+        let mut log_stream = bus.subscribe_logs("t1").await.unwrap();
+
+        // Start a container via bus command.
+        let cmd = Command::Assign {
+            task_id: "t1".to_string(),
+            payload: spec_to_payload(&make_spec()),
+        };
+        bus.send_command(1, &cmd).await.unwrap();
+        supervisor.reconcile_once().await.unwrap();
+
+        // Logs should be published to the bus.
+        let entry = tokio::time::timeout(std::time::Duration::from_secs(1), log_stream.next())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(entry.task_id, "t1");
+        assert!(String::from_utf8_lossy(&entry.data).contains("starting"));
+    }
+
+    #[tokio::test]
+    async fn container_logs_not_duplicated() {
+        let (supervisor, _runtime, _store, bus) = setup_with_bus(1).await;
+
+        let mut log_stream = bus.subscribe_logs("t1").await.unwrap();
+
+        let cmd = Command::Assign {
+            task_id: "t1".to_string(),
+            payload: spec_to_payload(&make_spec()),
+        };
+        bus.send_command(1, &cmd).await.unwrap();
+
+        // First pass: logs are published (mock returns 3 lines).
+        supervisor.reconcile_once().await.unwrap();
+
+        // Drain all log entries from the first pass.
+        for _ in 0..3 {
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(1), log_stream.next())
+                .await
+                .unwrap()
+                .unwrap();
+        }
+
+        // Second pass: no duplicate logs (offset tracking).
+        // The mock runtime always returns the same 3 lines, but the offset
+        // should prevent re-publishing.
+        supervisor.reconcile_once().await.unwrap();
+
+        // Should timeout — no new logs.
+        let result =
+            tokio::time::timeout(std::time::Duration::from_millis(200), log_stream.next()).await;
+        assert!(result.is_err(), "no duplicate logs should be published");
+    }
+
+    #[tokio::test]
+    async fn agent_result_published_as_log() {
+        let (supervisor, _runtime, agent_exec, _store, bus) = setup_with_agent(1).await;
+        *agent_exec.auto_complete.lock().unwrap() = true;
+
+        let mut log_stream = bus.subscribe_logs("agent-1").await.unwrap();
+
+        let cmd = Command::Assign {
+            task_id: "agent-1".to_string(),
+            payload: spec_to_payload(&make_agent_spec()),
+        };
+        bus.send_command(1, &cmd).await.unwrap();
+        supervisor.reconcile_once().await.unwrap();
+
+        // Agent result should be published as a log entry.
+        let entry = tokio::time::timeout(std::time::Duration::from_secs(1), log_stream.next())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(entry.task_id, "agent-1");
+    }
+
+    #[tokio::test]
+    async fn log_offsets_cleaned_up_on_stop() {
+        let (supervisor, _runtime, _store, bus) = setup_with_bus(1).await;
+
+        let cmd = Command::Assign {
+            task_id: "t1".to_string(),
+            payload: spec_to_payload(&make_spec()),
+        };
+        bus.send_command(1, &cmd).await.unwrap();
+        supervisor.reconcile_once().await.unwrap();
+
+        // Log offset should exist.
+        assert!(supervisor.log_offsets.lock().await.contains_key("t1"));
+
+        // Stop the task.
+        let stop = Command::Stop {
+            task_id: "t1".to_string(),
+        };
+        bus.send_command(1, &stop).await.unwrap();
+        supervisor.reconcile_once().await.unwrap();
+
+        // Log offset should be cleaned up.
+        assert!(!supervisor.log_offsets.lock().await.contains_key("t1"));
+    }
+
+    // --- Restart policy tests --------------------------------------------------
+
+    fn make_spec_with_restart(
+        condition: minga_state::types::RestartCondition,
+        delay_secs: u64,
+        max_attempts: Option<u32>,
+    ) -> TaskSpec {
+        TaskSpec {
+            image: "nginx:latest".to_string(),
+            env: HashMap::new(),
+            ports: vec![],
+            resources: ResourceSpec::default(),
+            restart_policy: minga_state::types::RestartPolicy {
+                condition,
+                delay_secs,
+                max_attempts,
+            },
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_container_restarted_with_policy_any() {
+        let (supervisor, runtime, store, _bus) = setup_with_bus(1).await;
+
+        // Create a task with restart policy "any".
+        let spec = make_spec_with_restart(minga_state::types::RestartCondition::Any, 0, None);
+        let task = Task {
+            id: "t1".to_string(),
+            service_id: "svc".to_string(),
+            node_id: 1,
+            state: TaskState::Pending,
+            spec,
+            ips: HashMap::new(),
+        };
+        store.upsert_task(task).await.unwrap();
+
+        // Start the container.
+        supervisor.reconcile_once().await.unwrap();
+        assert_eq!(runtime.container_count(), 1);
+
+        // Mark the container as failed.
+        let running = supervisor.running.lock().await;
+        let container_id = running.get("t1").unwrap().clone();
+        drop(running);
+        runtime.mark_failed(&container_id);
+
+        // Next reconcile should detect the failure and restart.
+        let actions = supervisor.reconcile_once().await.unwrap();
+        assert!(actions >= 1, "failed container should be restarted");
+        assert_eq!(
+            runtime.container_count(),
+            1,
+            "container should be running again"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_container_not_restarted_with_policy_none() {
+        let (supervisor, runtime, store, _bus) = setup_with_bus(1).await;
+
+        let spec = make_spec_with_restart(minga_state::types::RestartCondition::None, 0, None);
+        let task = Task {
+            id: "t1".to_string(),
+            service_id: "svc".to_string(),
+            node_id: 1,
+            state: TaskState::Pending,
+            spec,
+            ips: HashMap::new(),
+        };
+        store.upsert_task(task).await.unwrap();
+
+        supervisor.reconcile_once().await.unwrap();
+        assert_eq!(runtime.container_count(), 1);
+
+        let running = supervisor.running.lock().await;
+        let container_id = running.get("t1").unwrap().clone();
+        drop(running);
+        runtime.mark_failed(&container_id);
+
+        let actions = supervisor.reconcile_once().await.unwrap();
+        assert_eq!(
+            actions, 0,
+            "container with policy=none should not be restarted"
+        );
+        assert_eq!(
+            runtime.container_count(),
+            0,
+            "failed container should be removed"
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_respects_max_attempts() {
+        let (supervisor, runtime, store, _bus) = setup_with_bus(1).await;
+
+        let spec = make_spec_with_restart(
+            minga_state::types::RestartCondition::Any,
+            0,
+            Some(1), // max 1 attempt
+        );
+        let task = Task {
+            id: "t1".to_string(),
+            service_id: "svc".to_string(),
+            node_id: 1,
+            state: TaskState::Pending,
+            spec,
+            ips: HashMap::new(),
+        };
+        store.upsert_task(task).await.unwrap();
+
+        // Start.
+        supervisor.reconcile_once().await.unwrap();
+        assert_eq!(runtime.container_count(), 1);
+
+        // Fail and restart (attempt 1).
+        {
+            let running = supervisor.running.lock().await;
+            let cid = running.get("t1").unwrap().clone();
+            runtime.mark_failed(&cid);
+        }
+        supervisor.reconcile_once().await.unwrap();
+        assert_eq!(runtime.container_count(), 1, "should restart (attempt 1)");
+
+        // Fail again — should NOT restart (max attempts reached).
+        {
+            let running = supervisor.running.lock().await;
+            if let Some(cid) = running.get("t1") {
+                runtime.mark_failed(cid);
+            }
+        }
+        supervisor.reconcile_once().await.unwrap();
+        assert_eq!(
+            runtime.container_count(),
+            0,
+            "should not restart beyond max_attempts"
+        );
     }
 }

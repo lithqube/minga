@@ -8,7 +8,7 @@
 //! Phase 0 ships [`MockRuntime`], which simulates container lifecycle
 //! in memory. A containerd-backed implementation comes in a later phase.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -35,6 +35,23 @@ pub enum ContainerStatus {
     Failed,
 }
 
+impl ContainerStatus {
+    /// Whether the container is no longer running.
+    pub fn is_terminated(&self) -> bool {
+        matches!(self, ContainerStatus::Stopped | ContainerStatus::Failed)
+    }
+}
+
+/// A container's current state together with the exit code of its last run.
+///
+/// The exit code is `None` while the container is still running, and is
+/// `Some(0)` for a container that exited successfully.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContainerState {
+    pub status: ContainerStatus,
+    pub exit_code: Option<i32>,
+}
+
 /// Information about a container known to the runtime.
 #[derive(Debug, Clone)]
 pub struct ContainerInfo {
@@ -42,6 +59,20 @@ pub struct ContainerInfo {
     pub task_id: TaskId,
     pub image: String,
     pub status: ContainerStatus,
+}
+
+/// A chunk of log output from a container.
+#[derive(Debug, Clone)]
+pub struct ContainerLog {
+    pub stream: LogStream,
+    pub data: Vec<u8>,
+}
+
+/// Which output stream a log chunk came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogStream {
+    Stdout,
+    Stderr,
 }
 
 /// A container runtime. Implementations must be thread-safe.
@@ -58,6 +89,17 @@ pub trait Runtime: Send + Sync {
 
     /// Returns the status of a container, or `None` if not found.
     async fn status(&self, container_id: &str) -> Option<ContainerStatus>;
+
+    /// Returns the status of a container together with its exit code.
+    ///
+    /// The exit code is `Some(code)` once the container has exited. This is
+    /// what lets restart policies distinguish `on-failure` from `always`.
+    async fn state(&self, container_id: &str) -> Option<ContainerState>;
+
+    /// Returns recent log output for a container. `tail` limits the number
+    /// of lines returned (0 = all available). Returns an empty vec if the
+    /// container is not found or has no logs.
+    async fn logs(&self, container_id: &str, tail: usize) -> Vec<ContainerLog>;
 }
 
 // --- MockRuntime ---------------------------------------------------------------
@@ -73,6 +115,10 @@ pub struct MockRuntime {
     counter: Mutex<u64>,
     /// If true, `start()` returns an error (to test failure handling).
     pub fail_starts: Mutex<bool>,
+    /// Container IDs that should report as `Failed` status.
+    pub failed_containers: Mutex<HashSet<String>>,
+    /// Exit codes for containers marked as failed. Defaults to 1.
+    pub exit_codes: Mutex<HashMap<String, i32>>,
 }
 
 #[derive(Debug, Clone)]
@@ -91,6 +137,36 @@ impl MockRuntime {
     /// Returns the number of currently tracked containers.
     pub fn container_count(&self) -> usize {
         self.containers.lock().unwrap().len()
+    }
+
+    /// Mark a container as failed (for testing restart policies).
+    pub fn mark_failed(&self, container_id: &str) {
+        self.failed_containers
+            .lock()
+            .unwrap()
+            .insert(container_id.to_string());
+    }
+
+    /// Mark a container as failed with a specific exit code.
+    pub fn mark_failed_with_code(&self, container_id: &str, exit_code: i32) {
+        self.failed_containers
+            .lock()
+            .unwrap()
+            .insert(container_id.to_string());
+        self.exit_codes
+            .lock()
+            .unwrap()
+            .insert(container_id.to_string(), exit_code);
+    }
+
+    /// The exit code recorded for a failed container (default 1).
+    fn failure_exit_code(&self, container_id: &str) -> i32 {
+        self.exit_codes
+            .lock()
+            .unwrap()
+            .get(container_id)
+            .copied()
+            .unwrap_or(1)
     }
 }
 
@@ -150,11 +226,58 @@ impl Runtime for MockRuntime {
     }
 
     async fn status(&self, container_id: &str) -> Option<ContainerStatus> {
+        // Check if this container has been marked as failed.
+        if self
+            .failed_containers
+            .lock()
+            .unwrap()
+            .contains(container_id)
+        {
+            return Some(ContainerStatus::Failed);
+        }
         self.containers
             .lock()
             .unwrap()
             .get(container_id)
             .map(|c| c.status)
+    }
+
+    async fn state(&self, container_id: &str) -> Option<ContainerState> {
+        let status = self.status(container_id).await?;
+        // A failed container exited non-zero; a stopped one exited zero.
+        let exit_code = match status {
+            ContainerStatus::Running => None,
+            ContainerStatus::Failed => Some(self.failure_exit_code(container_id)),
+            ContainerStatus::Stopped => Some(0),
+        };
+        Some(ContainerState { status, exit_code })
+    }
+
+    async fn logs(&self, container_id: &str, tail: usize) -> Vec<ContainerLog> {
+        let containers = self.containers.lock().unwrap();
+        let Some(c) = containers.get(container_id) else {
+            return Vec::new();
+        };
+        // Generate synthetic log lines for the mock container.
+        let lines = vec![
+            ContainerLog {
+                stream: LogStream::Stdout,
+                data: format!("[{}] starting {} (mock)\n", c.task_id, c.image).into_bytes(),
+            },
+            ContainerLog {
+                stream: LogStream::Stdout,
+                data: format!("[{}] listening on 0.0.0.0:8080\n", c.task_id).into_bytes(),
+            },
+            ContainerLog {
+                stream: LogStream::Stdout,
+                data: format!("[{}] ready (mock)\n", c.task_id).into_bytes(),
+            },
+        ];
+        if tail > 0 && tail < lines.len() {
+            lines[lines.len() - tail..].to_vec()
+        } else {
+            lines
+        }
     }
 }
 
@@ -223,5 +346,37 @@ mod tests {
         assert!(containers
             .iter()
             .all(|c| c.status == ContainerStatus::Running));
+    }
+
+    #[tokio::test]
+    async fn mock_logs_returns_synthetic_output() {
+        let rt = MockRuntime::new();
+        let id = rt
+            .start(&"t1".to_string(), &spec("nginx:latest"))
+            .await
+            .unwrap();
+
+        let logs = rt.logs(&id, 0).await;
+        assert_eq!(logs.len(), 3);
+        assert!(logs.iter().all(|l| l.stream == LogStream::Stdout));
+        assert!(String::from_utf8_lossy(&logs[0].data).contains("starting"));
+        assert!(String::from_utf8_lossy(&logs[2].data).contains("ready"));
+    }
+
+    #[tokio::test]
+    async fn mock_logs_tail_limits_output() {
+        let rt = MockRuntime::new();
+        let id = rt.start(&"t1".to_string(), &spec("a")).await.unwrap();
+
+        let logs = rt.logs(&id, 1).await;
+        assert_eq!(logs.len(), 1);
+        assert!(String::from_utf8_lossy(&logs[0].data).contains("ready"));
+    }
+
+    #[tokio::test]
+    async fn mock_logs_missing_container() {
+        let rt = MockRuntime::new();
+        let logs = rt.logs("nonexistent", 0).await;
+        assert!(logs.is_empty());
     }
 }

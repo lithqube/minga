@@ -130,6 +130,7 @@ pub fn service_spec_to_state(spec: &models::ServiceSpec) -> Result<Service, Stri
         networks,
         resources,
         agent: None,
+        restart_policy: Default::default(),
     })
 }
 
@@ -788,6 +789,7 @@ mod tests {
             networks: vec![],
             resources: ResourceSpec::default(),
             agent: None,
+            restart_policy: Default::default(),
         };
         let docker = service_to_docker(&svc);
         let env = &docker.Spec.TaskTemplate.ContainerSpec.as_ref().unwrap().Env;

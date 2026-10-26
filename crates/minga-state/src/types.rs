@@ -84,6 +84,9 @@ pub struct Service {
     /// Agent workload spec. `None` for container services.
     #[serde(default)]
     pub agent: Option<AgentSpec>,
+    /// Restart policy for tasks of this service.
+    #[serde(default)]
+    pub restart_policy: RestartPolicy,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -132,6 +135,49 @@ pub struct TaskSpec {
     /// Workload kind: container (default) or agent (WASM sandbox).
     #[serde(default)]
     pub kind: WorkloadKind,
+    /// Restart policy for failed tasks.
+    #[serde(default)]
+    pub restart_policy: RestartPolicy,
+}
+
+/// Restart policy for a task.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RestartPolicy {
+    /// When to restart: `none`, `on-failure`, or `any` (always).
+    #[serde(default)]
+    pub condition: RestartCondition,
+    /// Base delay between restarts in seconds. Exponential backoff: delay * 2^attempt.
+    #[serde(default = "default_restart_delay")]
+    pub delay_secs: u64,
+    /// Maximum number of restart attempts. `None` = unlimited.
+    #[serde(default)]
+    pub max_attempts: Option<u32>,
+}
+
+fn default_restart_delay() -> u64 {
+    1
+}
+
+impl Default for RestartPolicy {
+    fn default() -> Self {
+        Self {
+            condition: RestartCondition::None,
+            delay_secs: default_restart_delay(),
+            max_attempts: None,
+        }
+    }
+}
+
+/// When a failed task should be restarted.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub enum RestartCondition {
+    /// Never restart (default).
+    #[default]
+    None,
+    /// Restart only if the task exited with a non-zero code.
+    OnFailure,
+    /// Always restart, regardless of exit code.
+    Any,
 }
 
 /// The kind of workload a task runs.
@@ -257,6 +303,7 @@ mod tests {
                 module_ref: "./agent.wasm".to_string(),
                 ..Default::default()
             }),
+            ..Default::default()
         };
         let bytes = bincode::serde::encode_to_vec(&spec, bincode::config::standard()).unwrap();
         let (back, _): (TaskSpec, _) =
@@ -281,6 +328,7 @@ mod tests {
                 module_ref: "./agent.wasm".to_string(),
                 ..Default::default()
             }),
+            restart_policy: Default::default(),
         };
         let bytes = bincode::serde::encode_to_vec(&svc, bincode::config::standard()).unwrap();
         let (back, _): (Service, _) =
@@ -302,6 +350,47 @@ mod tests {
         };
         let json = serde_json::to_string(&spec).unwrap();
         let back: AgentSpec = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, spec);
+    }
+
+    #[test]
+    fn restart_policy_bincode_roundtrip() {
+        let policy = RestartPolicy {
+            condition: RestartCondition::OnFailure,
+            delay_secs: 5,
+            max_attempts: Some(3),
+        };
+        let bytes = bincode::serde::encode_to_vec(&policy, bincode::config::standard()).unwrap();
+        let (back, _): (RestartPolicy, _) =
+            bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
+        assert_eq!(back, policy);
+    }
+
+    #[test]
+    fn restart_policy_default_is_none() {
+        let policy = RestartPolicy::default();
+        assert_eq!(policy.condition, RestartCondition::None);
+        assert_eq!(policy.delay_secs, 1);
+        assert_eq!(policy.max_attempts, None);
+    }
+
+    #[test]
+    fn taskspec_with_restart_policy_roundtrip() {
+        let spec = TaskSpec {
+            image: "nginx:latest".to_string(),
+            env: HashMap::new(),
+            ports: vec![],
+            resources: ResourceSpec::default(),
+            restart_policy: RestartPolicy {
+                condition: RestartCondition::Any,
+                delay_secs: 10,
+                max_attempts: Some(5),
+            },
+            ..Default::default()
+        };
+        let bytes = bincode::serde::encode_to_vec(&spec, bincode::config::standard()).unwrap();
+        let (back, _): (TaskSpec, _) =
+            bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
         assert_eq!(back, spec);
     }
 }

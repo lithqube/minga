@@ -11,7 +11,7 @@
 //! |---|---|---|---|
 //! | `MINGA_EVENTS` | `minga.node.>`, `minga.task.>`, `minga.egress.>` | Limits (72h) | Status reports, lifecycle events |
 //! | `MINGA_COMMANDS` | `minga.ctl.node.>` | WorkQueue (24h) | Task assign/stop commands |
-//! | `MINGA_LOGS` | `minga.task.*.log` | Limits (512 MiB, 24h) | Container log chunks |
+//! | `MINGA_LOGS` | `minga.log.>` | Limits (512 MiB, 24h) | Container log chunks |
 //!
 //! # KV buckets
 //!
@@ -20,13 +20,12 @@
 //! | `MINGA_STATUS` | `task.{id}`, `node.{id}` | Latest actual state |
 //! | `MINGA_LEASES` | `lease.node.{id}` | Liveness (timestamp-based) |
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_nats::jetstream::consumer::pull::Config as PullConsumerConfig;
-use async_nats::jetstream::consumer::push::Config as PushConsumerConfig;
-use async_nats::jetstream::consumer::AckPolicy;
+use async_nats::jetstream::consumer::{AckPolicy, DeliverPolicy};
 use async_nats::jetstream::kv::{Config as KvConfig, Operation as KvOperation};
 use async_nats::jetstream::stream::{Config as StreamConfig, RetentionPolicy};
 use async_nats::jetstream::{self, Context as JetStream};
@@ -37,7 +36,7 @@ use futures::StreamExt;
 
 use crate::{
     subjects, BusError, BusEvent, BusRequest, Command, EventBus, EventStream, KvEvent, KvOp,
-    KvStream, RequestStream, Result,
+    KvStream, LogEntry, LogEventStream, RequestStream, Result,
 };
 
 /// Default lease TTL: 15 seconds.
@@ -59,6 +58,14 @@ pub struct NatsBus {
 }
 
 impl NatsBus {
+    /// The underlying JetStream context.
+    ///
+    /// Exposed for integration tests and for callers that need direct
+    /// JetStream access (stream inspection, admin operations).
+    pub fn jetstream(&self) -> &JetStream {
+        &self.js
+    }
+
     /// Connect to a NATS server and set up streams/KV buckets.
     pub async fn connect(url: &str) -> Result<Arc<Self>> {
         Self::connect_with_ttl(url, DEFAULT_LEASE_TTL).await
@@ -115,9 +122,12 @@ impl NatsBus {
             .map_err(|e| BusError::Other(format!("MINGA_COMMANDS: {e}")))?;
 
         // MINGA_LOGS — container log chunks.
+        // Note: log subjects live under `minga.log.>`, not `minga.task.>`.
+        // JetStream rejects streams with overlapping subject filters, and
+        // MINGA_EVENTS already claims `minga.task.>`.
         let logs = StreamConfig {
             name: "MINGA_LOGS".to_string(),
-            subjects: vec!["minga.task.*.log".to_string()],
+            subjects: vec![subjects::log_events_wildcard()],
             retention: RetentionPolicy::Limits,
             max_bytes: 512 * 1024 * 1024,
             max_age: Duration::from_secs(24 * 3600),
@@ -203,7 +213,8 @@ impl EventBus for NatsBus {
             .map_err(|e| BusError::Subscribe(format!("get stream: {e}")))?;
 
         let filter_subjects: Vec<String> = patterns.iter().map(|s| s.to_string()).collect();
-        let config = PushConsumerConfig {
+        // Pull consumers need no delivery subject, unlike push consumers.
+        let config = PullConsumerConfig {
             filter_subjects,
             ack_policy: AckPolicy::Explicit,
             ..Default::default()
@@ -298,10 +309,40 @@ impl EventBus for NatsBus {
         }
     }
 
+    async fn list_status(&self) -> Result<Vec<(String, Vec<u8>)>> {
+        use futures::StreamExt;
+
+        let mut keys = self
+            .status_kv
+            .keys()
+            .await
+            .map_err(|e| BusError::Kv(format!("keys: {e}")))?;
+
+        let mut entries = Vec::new();
+        while let Some(key) = keys.next().await {
+            let key = key.map_err(|e| BusError::Kv(format!("keys: {e}")))?;
+            if let Some(bytes) = self
+                .status_kv
+                .get(key.clone())
+                .await
+                .map_err(|e| BusError::Kv(format!("get {key}: {e}")))?
+            {
+                entries.push((key, bytes.to_vec()));
+            }
+        }
+
+        Ok(entries)
+    }
+
     async fn watch_status(&self) -> Result<KvStream> {
+        // `watch_all()` uses DeliverPolicy::New — it only yields *future*
+        // writes and never replays the current bucket contents. A status
+        // watcher must see existing task statuses too, so start from the
+        // beginning of the bucket history (history=1, so this is one entry
+        // per key) and continue streaming updates.
         let watcher = self
             .status_kv
-            .watch_all()
+            .watch_all_from_revision(1)
             .await
             .map_err(|e| BusError::Kv(format!("watch: {e}")))?;
 
@@ -395,6 +436,147 @@ impl EventBus for NatsBus {
             .await
             .map_err(|e| BusError::Publish(format!("reply: {e}")))?;
         Ok(())
+    }
+
+    async fn publish_log(&self, task_id: &str, entry: &LogEntry) -> Result<()> {
+        let subject = subjects::task_log(task_id);
+        let payload = entry.to_bytes()?;
+        self.js
+            .publish(subject, Bytes::from(payload))
+            .await
+            .map_err(|e| BusError::Publish(format!("log: {e}")))?;
+        Ok(())
+    }
+
+    async fn subscribe_logs(&self, task_id: &str) -> Result<LogEventStream> {
+        let stream = self
+            .js
+            .get_stream("MINGA_LOGS")
+            .await
+            .map_err(|e| BusError::Subscribe(format!("get MINGA_LOGS: {e}")))?;
+
+        let filter = if task_id == "*" {
+            subjects::log_events_wildcard()
+        } else {
+            subjects::task_log(task_id)
+        };
+
+        // Pull consumers need no delivery subject, unlike push consumers.
+        // DeliverPolicy::New means this subscription only sees entries
+        // published from now on — the retained backlog is read separately
+        // via `log_history`.
+        let config = PullConsumerConfig {
+            filter_subjects: vec![filter],
+            ack_policy: AckPolicy::Explicit,
+            deliver_policy: DeliverPolicy::New,
+            ..Default::default()
+        };
+
+        let consumer = stream
+            .create_consumer(config)
+            .await
+            .map_err(|e| BusError::Subscribe(format!("create log consumer: {e}")))?;
+
+        let messages = consumer
+            .messages()
+            .await
+            .map_err(|e| BusError::Subscribe(format!("log messages: {e}")))?;
+
+        let log_stream = messages.filter_map(|msg| async move {
+            match msg {
+                Ok(m) => {
+                    let _ = m.ack().await;
+                    match LogEntry::from_bytes(&m.payload) {
+                        Ok(entry) => Some(entry),
+                        Err(e) => {
+                            tracing::warn!(error = %e, "failed to deserialize log entry");
+                            None
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "log stream error");
+                    None
+                }
+            }
+        });
+
+        Ok(Box::pin(log_stream))
+    }
+
+    async fn log_history(&self, task_id: &str, tail: usize) -> Result<Vec<LogEntry>> {
+        let stream = self
+            .js
+            .get_stream("MINGA_LOGS")
+            .await
+            .map_err(|e| BusError::Subscribe(format!("get MINGA_LOGS: {e}")))?;
+
+        let filter = if task_id == "*" {
+            subjects::log_events_wildcard()
+        } else {
+            subjects::task_log(task_id)
+        };
+
+        // Read the retained backlog with a short-lived pull consumer that
+        // starts at the beginning of the stream, then keep only the last
+        // `tail` entries. `tail == 0` keeps everything retained.
+        let config = PullConsumerConfig {
+            filter_subjects: vec![filter],
+            ack_policy: AckPolicy::None,
+            deliver_policy: DeliverPolicy::All,
+            ..Default::default()
+        };
+
+        let mut consumer = stream
+            .create_consumer(config)
+            .await
+            .map_err(|e| BusError::Subscribe(format!("create log consumer: {e}")))?;
+
+        // The consumer's pending count tells us how many entries are
+        // retained for this filter — that is how far back we need to read.
+        let retained = consumer
+            .info()
+            .await
+            .map_err(|e| BusError::Subscribe(format!("log consumer info: {e}")))?
+            .num_pending as usize;
+        let wanted = if tail == 0 {
+            retained
+        } else {
+            tail.min(retained)
+        };
+        let mut entries: VecDeque<LogEntry> = VecDeque::with_capacity(wanted);
+
+        // Fetch every retained entry in bounded batches. A single fetch is
+        // capped at 200 and would otherwise return the *first* 200 entries.
+        let mut remaining = retained;
+        while remaining > 0 {
+            let mut batch = consumer
+                .fetch()
+                .max_messages(remaining.min(200))
+                .expires(Duration::from_secs(5))
+                .messages()
+                .await
+                .map_err(|e| BusError::Subscribe(format!("fetch log history: {e}")))?;
+            let mut received = 0;
+            while let Some(msg) = batch.next().await {
+                let msg = msg.map_err(|e| BusError::Subscribe(format!("log history: {e}")))?;
+                received += 1;
+                if let Ok(entry) = LogEntry::from_bytes(&msg.payload) {
+                    if wanted > 0 && entries.len() == wanted {
+                        entries.pop_front();
+                    }
+                    entries.push_back(entry);
+                }
+            }
+            if received == 0 {
+                return Err(BusError::Subscribe(format!(
+                    "log history incomplete: {remaining} retained entries not received"
+                )));
+            }
+            remaining -= received;
+        }
+
+        Ok(entries.into_iter().collect())
     }
 }
 

@@ -94,6 +94,7 @@ pub fn place_service(
         ports: service.ports.clone(),
         resources: service.resources.clone(),
         kind,
+        restart_policy: service.restart_policy.clone(),
     };
 
     let mut tasks = Vec::new();
@@ -214,6 +215,7 @@ mod tests {
             networks: vec!["test_default".to_string()],
             resources: ResourceSpec::default(),
             agent: None,
+            restart_policy: Default::default(),
         }
     }
 

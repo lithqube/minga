@@ -131,6 +131,7 @@ mod tests {
             networks: vec!["default".to_string()],
             resources: ResourceSpec::default(),
             agent: None,
+            restart_policy: Default::default(),
         }
     }
 

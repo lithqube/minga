@@ -57,6 +57,20 @@ enum Command {
         #[command(subcommand)]
         cmd: AgentCommand,
     },
+    /// Show logs for a task.
+    Logs {
+        /// Task ID (e.g. plant-7.web.1).
+        task_id: String,
+        /// Follow log output (like `tail -f`).
+        #[arg(short = 'f', long)]
+        follow: bool,
+        /// Number of lines to show from the end (0 = all).
+        #[arg(long, default_value = "100")]
+        tail: usize,
+        /// NATS server URL (e.g. nats://localhost:4222).
+        #[arg(long, env = "MINGA_NATS_URL")]
+        nats_url: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -284,6 +298,14 @@ async fn main() -> ExitCode {
         Command::Sandbox { cmd } => return run_sandbox(cmd).await,
         Command::Egress(args) => return run_egress(args).await,
         Command::Agent { cmd } => return run_agent(cmd).await,
+        Command::Logs {
+            task_id,
+            follow,
+            tail,
+            nats_url,
+        } => {
+            return run_logs(&task_id, follow, tail, nats_url.as_deref()).await;
+        }
     }
     ExitCode::SUCCESS
 }
@@ -984,26 +1006,146 @@ async fn run_egress(args: EgressArgs) -> ExitCode {
 async fn run_agent(cmd: AgentCommand) -> ExitCode {
     match cmd {
         AgentCommand::Ls { nats_url } => {
-            // Without NATS, there's nothing to query — print a message.
             let Some(url) = nats_url else {
                 eprintln!("error: --nats-url (or MINGA_NATS_URL) is required to list agent tasks");
                 return ExitCode::FAILURE;
             };
-            match minga_bus::NatsBus::connect(&url).await {
-                Ok(bus) => {
-                    // Watch the task status KV for agent tasks.
-                    // For now, just indicate the feature is wired.
-                    println!("connected to NATS at {url}");
-                    println!("agent task listing: query the MINGA_STATUS KV bucket");
-                    println!("  keys: task.{{task_id}}");
-                    drop(bus);
+
+            let bus = match minga_bus::NatsBus::connect(&url).await {
+                Ok(b) => {
+                    let bus: Arc<dyn minga_bus::EventBus> = b;
+                    bus
                 }
                 Err(e) => {
                     eprintln!("error: cannot connect to NATS at {url}: {e}");
                     return ExitCode::FAILURE;
                 }
+            };
+
+            // Take a snapshot of the status bucket. A watch would only report
+            // tasks that change *after* the command starts, so an `ls` that
+            // shows nothing would be the common case.
+            let statuses = match bus.list_status().await {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("error: cannot read status: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+
+            let mut reports: Vec<minga_bus::TaskStatusReport> = statuses
+                .iter()
+                .filter(|(key, _)| key.starts_with("task."))
+                .filter_map(|(_, bytes)| minga_bus::TaskStatusReport::from_bytes(bytes).ok())
+                // Agent tasks run in a sandbox and report no container_id.
+                .filter(|report| report.container_id.is_none())
+                .collect();
+
+            if reports.is_empty() {
+                println!("no agent tasks found");
+                return ExitCode::SUCCESS;
+            }
+
+            reports.sort_by(|a, b| a.task_id.cmp(&b.task_id));
+
+            println!("{:<40} {:<12} {:<8} AGE", "TASK ID", "STATE", "NODE");
+            println!("{}", "-".repeat(70));
+
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+
+            for report in reports {
+                // Guard against clock skew: observed_at may be in the future.
+                let age_secs = now_ms.saturating_sub(report.observed_at) / 1000;
+                println!(
+                    "{:<40} {:<12} {:<8} {}s",
+                    report.task_id,
+                    format!("{:?}", report.state),
+                    report.node_id,
+                    age_secs,
+                );
             }
         }
     }
     ExitCode::SUCCESS
+}
+
+// ---------------------------------------------------------------------------
+// Logs command
+// ---------------------------------------------------------------------------
+
+async fn run_logs(task_id: &str, follow: bool, tail: usize, nats_url: Option<&str>) -> ExitCode {
+    let Some(url) = nats_url else {
+        eprintln!("error: --nats-url (or MINGA_NATS_URL) is required to stream logs");
+        return ExitCode::FAILURE;
+    };
+
+    let bus = match minga_bus::NatsBus::connect(url).await {
+        Ok(b) => {
+            let bus: Arc<dyn minga_bus::EventBus> = b;
+            bus
+        }
+        Err(e) => {
+            eprintln!("error: cannot connect to NATS at {url}: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    use futures::StreamExt;
+
+    // Print the retained backlog first (the last `tail` entries), then — when
+    // following — stream new entries as they arrive.
+    match bus.log_history(task_id, tail).await {
+        Ok(history) => {
+            for entry in history {
+                print_log_entry(&entry);
+            }
+        }
+        Err(e) => {
+            eprintln!("error: cannot read log history for {task_id}: {e}");
+            return ExitCode::FAILURE;
+        }
+    }
+
+    if !follow {
+        return ExitCode::SUCCESS;
+    }
+
+    let mut log_stream = match bus.subscribe_logs(task_id).await {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("error: cannot subscribe to logs for {task_id}: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    loop {
+        tokio::select! {
+            entry = log_stream.next() => {
+                match entry {
+                    Some(entry) => print_log_entry(&entry),
+                    None => break,
+                }
+            }
+            _ = tokio::signal::ctrl_c() => break,
+        }
+    }
+
+    ExitCode::SUCCESS
+}
+
+/// Writes one log entry to stdout or stderr, preserving the original stream.
+fn print_log_entry(entry: &minga_bus::LogEntry) {
+    use std::io::Write;
+
+    let data = String::from_utf8_lossy(&entry.data);
+    if entry.stream == minga_bus::LogStream::Stderr {
+        eprint!("{data}");
+        let _ = std::io::stderr().flush();
+    } else {
+        print!("{data}");
+        let _ = std::io::stdout().flush();
+    }
 }

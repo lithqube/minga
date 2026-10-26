@@ -124,14 +124,28 @@ impl ContainerdClient {
         Ok(())
     }
 
-    // --- TaskService --------------------------------------------------------
+    // --- Tasks service ------------------------------------------------------
 
     /// Create a task from a container. Returns the PID.
-    pub async fn create_task(&mut self, container_id: &str) -> Result<u32, ClientError> {
+    ///
+    /// `stdout`/`stderr` are FIFO paths the shim writes container output to.
+    /// Pass empty strings to discard the output.
+    pub async fn create_task(
+        &mut self,
+        container_id: &str,
+        stdout: &str,
+        stderr: &str,
+    ) -> Result<u32, ClientError> {
         let request = CreateTaskRequest {
             container_id: container_id.to_string(),
-            exec_id: String::new(),
             rootfs: vec![],
+            stdin: String::new(),
+            stdout: stdout.to_string(),
+            stderr: stderr.to_string(),
+            terminal: false,
+            checkpoint: None,
+            options: None,
+            runtime_path: String::new(),
         };
         let response: CreateTaskResponse = self.unary(request, paths::TASK_CREATE).await?;
         Ok(response.pid)
@@ -166,7 +180,6 @@ impl ContainerdClient {
     ) -> Result<DeleteTaskResponse, ClientError> {
         let request = DeleteTaskRequest {
             container_id: container_id.to_string(),
-            exec_id: String::new(),
         };
         let response: DeleteTaskResponse = self.unary(request, paths::TASK_DELETE).await?;
         Ok(response)
@@ -182,6 +195,28 @@ impl ContainerdClient {
         response
             .process
             .ok_or_else(|| ClientError::TaskNotFound(container_id.to_string()))
+    }
+
+    /// List all tasks known to containerd.
+    pub async fn list_tasks(&mut self) -> Result<Vec<Process>, ClientError> {
+        let request = ListTasksRequest {
+            filter: String::new(),
+        };
+        let response: ListTasksResponse = self.unary(request, paths::TASK_LIST).await?;
+        Ok(response.tasks)
+    }
+
+    /// Wait for a task to exit and return its exit status.
+    ///
+    /// This blocks until the task's process exits, so callers should only
+    /// use it for tasks they expect to terminate.
+    pub async fn wait_task(&mut self, container_id: &str) -> Result<u32, ClientError> {
+        let request = WaitRequest {
+            container_id: container_id.to_string(),
+            exec_id: String::new(),
+        };
+        let response: WaitResponse = self.unary(request, paths::TASK_WAIT).await?;
+        Ok(response.exit_status)
     }
 
     // --- ImageService -------------------------------------------------------
@@ -243,11 +278,19 @@ impl ContainerdClient {
         Req: prost::Message + Default + Send + 'static,
         Resp: prost::Message + Default + Send + 'static,
     {
-        let request = Request::new(request);
+        let mut request = Request::new(request);
+        request.metadata_mut().insert(
+            "containerd-namespace",
+            "minga".parse().expect("static namespace"),
+        );
         let codec = ProstCodec::<Req, Resp>::default();
         let path = PathAndQuery::from_static(path);
 
         let mut grpc = Grpc::new(self.channel.clone());
+        grpc.ready().await.map_err(|e| ClientError::Rpc {
+            method: path.to_string(),
+            message: e.to_string(),
+        })?;
         let response = grpc
             .unary(request, path, codec)
             .await

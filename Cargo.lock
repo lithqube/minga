@@ -1975,6 +1975,7 @@ dependencies = [
  "bytes",
  "futures",
  "serde",
+ "testcontainers",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
@@ -1985,6 +1986,7 @@ name = "minga-cli"
 version = "0.0.1"
 dependencies = [
  "clap",
+ "futures",
  "minga-api",
  "minga-bus",
  "minga-compose",
@@ -2049,6 +2051,7 @@ version = "0.0.1"
 dependencies = [
  "async-trait",
  "bincode",
+ "futures",
  "hyper-util",
  "minga-bus",
  "minga-sandbox",
