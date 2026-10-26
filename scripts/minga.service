@@ -1,0 +1,34 @@
+[Unit]
+Description=Minga Node Supervisor
+Documentation=https://github.com/lithqube/minga
+After=network-online.target containerd.service
+Wants=network-online.target containerd.service
+
+[Service]
+Type=notify
+# Environment variables can be overridden via /etc/minga/minga.env
+EnvironmentFile=-/etc/minga/minga.env
+ExecStart=/opt/minga/minga node \
+  --containerd-socket ${CONTAINERD_SOCKET:-unix:///run/containerd/containerd.sock} \
+  --nats-url ${NATS_URL:-nats://localhost:4222} \
+  --node-id ${NODE_ID:-$(hostname)} \
+  --data-dir ${DATA_DIR:-/var/lib/minga} \
+  --log-level ${LOG_LEVEL:-info}
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=1048576
+LimitNPROC=1048576
+TasksMax=infinity
+TimeoutStartSec=120
+TimeoutStopSec=30
+
+# Security hardening
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/minga /run/containerd
+CapabilityBoundingSet=CAP_DAC_OVERRIDE CAP_SYS_RESOURCE CAP_SYS_ADMIN
+
+[Install]
+WantedBy=multi-user.target
