@@ -1,10 +1,14 @@
+mod sidecar;
+
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand};
 use minga_compose::{DeployMode, LoadOptions, Loaded};
+use sidecar::{NatsSidecar, SidecarOptions};
 
 /// Minga: single-binary orchestrator for edge, on-prem and air-gapped sites.
 #[derive(Parser)]
@@ -143,18 +147,55 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
         }
     };
 
-    // Create the event bus: NATS if --nats-url is set, in-memory otherwise.
+    // Create the event bus.
+    // - If --nats-url is set: connect to external NATS.
+    // - If manager and no --nats-url: spawn nats-server sidecar.
+    // - If worker and no --nats-url: error (workers need the manager's NATS URL).
+    let _sidecar: Option<NatsSidecar>;
     let bus: Arc<dyn minga_bus::EventBus> = match &args.nats_url {
-        Some(url) => match minga_bus::NatsBus::connect(url).await {
-            Ok(b) => b,
-            Err(e) => {
-                eprintln!("error: cannot connect to NATS at {url}: {e}");
+        Some(url) => {
+            _sidecar = None;
+            match minga_bus::NatsBus::connect(url).await {
+                Ok(b) => b,
+                Err(e) => {
+                    eprintln!("error: cannot connect to NATS at {url}: {e}");
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+        None => {
+            if !is_manager {
+                eprintln!(
+                    "error: workers must specify --nats-url (or MINGA_NATS_URL) \
+                     to connect to the manager's NATS server"
+                );
                 return ExitCode::FAILURE;
             }
-        },
-        None => {
-            tracing::warn!("no --nats-url set; using in-memory bus (single-node development only)");
-            minga_bus::MemoryBus::new()
+            // Manager: spawn the NATS sidecar.
+            let opts = SidecarOptions {
+                data_dir: PathBuf::from(&args.data_dir),
+                node_id: args.node_id,
+                ..SidecarOptions::default()
+            };
+            let sidecar = match NatsSidecar::start(&opts).await {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("error: cannot start NATS sidecar: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let url = sidecar.client_url().to_string();
+            tracing::info!(url = %url, "NATS sidecar ready");
+            match minga_bus::NatsBus::connect(&url).await {
+                Ok(b) => {
+                    _sidecar = Some(sidecar);
+                    b
+                }
+                Err(e) => {
+                    eprintln!("error: cannot connect to sidecar NATS at {url}: {e}");
+                    return ExitCode::FAILURE;
+                }
+            }
         }
     };
 

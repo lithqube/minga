@@ -136,7 +136,7 @@ Requirements: Rust 1.80+ (stable), with `rustfmt` and `clippy` components.
 - [x] **Phase 0 gate** — a 10-service Compose stack runs on 3 nodes (E2E integration test)
 - [x] **Event bus (NATS/JetStream)** — `minga-bus` crate: `EventBus` trait, `MemoryBus`, `NatsBus` — [ADR 0002](docs/adr/0002-event-bus-nats.md), [evaluation](docs/research/nats-evaluation.md)
 - [x] **Bus integration** — scheduler publishes assign/stop commands, supervisor pulls commands + reports status + refreshes leases, CLI wired with `--nats-url`
-- [ ] **NATS sidecar lifecycle** — manager spawns `nats-server` as a child process with generated config
+- [x] **NATS sidecar lifecycle** — manager spawns `nats-server` as a child process with generated config (JetStream enabled, pinned storage limits, readiness probe, `kill_on_drop` cleanup). Workers require `--nats-url` to connect to the manager's NATS server.
 - [ ] **Containerd runtime** — real `Runtime` implementation replacing `MockRuntime`
 - [ ] **Overlay networking** — WireGuard mesh, ingress, service discovery
 - [ ] **Docker Engine API** — REST subset for `docker stack` / `docker service` compatibility

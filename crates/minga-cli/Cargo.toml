@@ -17,6 +17,7 @@ minga-compose = { path = "../minga-compose" }
 minga-node = { path = "../minga-node" }
 minga-scheduler = { path = "../minga-scheduler" }
 minga-state = { path = "../minga-state" }
+thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
