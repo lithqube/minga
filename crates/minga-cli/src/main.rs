@@ -58,8 +58,14 @@ async fn main() -> ExitCode {
             let Some(loaded) = load(&compose) else {
                 return ExitCode::FAILURE;
             };
-            print_plan(&loaded);
-            tracing::info!(%stack, "deploy to a cluster: not implemented yet");
+            match minga_scheduler::translate_project(&loaded.project, &stack) {
+                Ok(translated) => print_translated(&translated),
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    return ExitCode::FAILURE;
+                }
+            }
+            tracing::info!(%stack, "cluster deployment: not implemented yet (translation only)");
         }
     }
     ExitCode::SUCCESS
@@ -124,5 +130,77 @@ fn print_plan(loaded: &Loaded) {
     }
     if !p.disabled_services.is_empty() {
         println!("disabled by profiles: {}", p.disabled_services.join(", "));
+    }
+}
+
+/// Prints the state entities that a deploy would create.
+fn print_translated(t: &minga_scheduler::TranslatedStack) {
+    println!("services:");
+    for svc in &t.services {
+        let mode = match svc.mode {
+            minga_state::types::ServiceMode::Replicated => {
+                format!("{} replica(s)", svc.replicas)
+            }
+            minga_state::types::ServiceMode::Global => "global".to_string(),
+        };
+        let constraints = if svc.constraints.is_empty() {
+            String::new()
+        } else {
+            format!("  constraints {}", svc.constraints.join(", "))
+        };
+        let resources = if svc.resources.cpus > 0.0 || svc.resources.memory_bytes > 0 {
+            format!(
+                "  resources cpu={} mem={}B",
+                svc.resources.cpus, svc.resources.memory_bytes
+            )
+        } else {
+            String::new()
+        };
+        println!(
+            "  {:<24} {:<40} {}{}{}",
+            svc.id, svc.image, mode, constraints, resources
+        );
+        if !svc.env.is_empty() {
+            let env: Vec<String> = svc.env.iter().map(|(k, v)| format!("{k}={v}")).collect();
+            println!("    env {}", env.join(" "));
+        }
+        if !svc.ports.is_empty() {
+            let ports: Vec<String> = svc
+                .ports
+                .iter()
+                .map(|p| match p.published {
+                    Some(pub_) => format!("{pub_}->{}/{}", p.target, p.protocol),
+                    None => format!("{}/{}", p.target, p.protocol),
+                })
+                .collect();
+            println!("    ports {}", ports.join(", "));
+        }
+        if !svc.networks.is_empty() {
+            println!("    networks {}", svc.networks.join(", "));
+        }
+    }
+    if !t.networks.is_empty() {
+        println!("networks:");
+        for net in &t.networks {
+            println!("  {:<24} driver={}", net.id, net.driver);
+        }
+    }
+    if !t.volumes.is_empty() {
+        println!("volumes:");
+        for vol in &t.volumes {
+            println!("  {:<24} driver={}", vol.id, vol.driver);
+        }
+    }
+    if !t.secrets.is_empty() {
+        println!("secrets:");
+        for sec in &t.secrets {
+            println!("  {}", sec.id);
+        }
+    }
+    if !t.configs.is_empty() {
+        println!("configs:");
+        for cfg in &t.configs {
+            println!("  {}", cfg.id);
+        }
     }
 }

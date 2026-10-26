@@ -13,6 +13,8 @@ path = "src/main.rs"
 [dependencies]
 clap.workspace = true
 minga-compose = { path = "../minga-compose" }
+minga-scheduler = { path = "../minga-scheduler" }
+minga-state = { path = "../minga-state" }
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

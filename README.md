@@ -91,10 +91,10 @@ Decisions are recorded as [ADRs](docs/adr/) in the repo.
 
 | Crate | Status | Purpose |
 | --- | --- | --- |
-| `minga-cli` | Partial | The `minga` binary: manager, worker and CLI. `validate` works; `deploy`/`manager`/`worker` are stubs. |
+| `minga-cli` | Partial | The `minga` binary: manager, worker and CLI. `validate` and `deploy` (translation) work; `manager`/`worker` are stubs. |
 | `minga-compose` | **Done** | Compose Specification parser and validator. Full interpolation, profiles, merge keys, `x-` extensions, dependency cycle detection, port conflict detection. 28 tests. |
 | `minga-state` | **Done** | Cluster state: openraft + redb. Single-node Raft with persistent log and state machine. 9 integration tests. |
-| `minga-scheduler` | Scaffold | Site-level placement; turns Compose services into tasks. |
+| `minga-scheduler` | **Done** | Placement engine: Compose → state entities, spread placement with constraints and resource awareness, reconcile loop. 49 tests. |
 | `minga-api` | Scaffold | Docker Engine API subset (REST) and native gRPC API. |
 | `minga-node` | Scaffold | Node supervisor: containerd integration, task lifecycle, offline operation. |
 | `minga-net` | Scaffold | WireGuard overlay, nftables/eBPF, ingress. |
@@ -130,8 +130,8 @@ Requirements: Rust 1.80+ (stable), with `rustfmt` and `clippy` components.
 
 - [x] **Compose parser & validator** — full spec parsing, interpolation, profiles, validation
 - [x] **Raft state store** — openraft + redb, single-node consensus, persistent state
+- [x] **Scheduler** — Compose → state translation, spread placement with constraints, resource-aware reconcile loop
 - [ ] **Phase 0 gate** — a 10-service Compose stack runs on 3 nodes
-- [ ] **Scheduler** — placement engine: Compose services → tasks on nodes
 - [ ] **Node supervisor** — containerd integration, task lifecycle
 - [ ] **Overlay networking** — WireGuard mesh, ingress, service discovery
 - [ ] **Docker Engine API** — REST subset for `docker stack` / `docker service` compatibility

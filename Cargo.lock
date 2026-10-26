@@ -563,6 +563,8 @@ version = "0.0.1"
 dependencies = [
  "clap",
  "minga-compose",
+ "minga-scheduler",
+ "minga-state",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -615,7 +617,12 @@ dependencies = [
 name = "minga-scheduler"
 version = "0.0.1"
 dependencies = [
- "anyhow",
+ "minga-compose",
+ "minga-state",
+ "serde",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
  "tracing",
 ]
 

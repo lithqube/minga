@@ -7,5 +7,12 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-anyhow.workspace = true
+minga-compose = { path = "../minga-compose" }
+minga-state = { path = "../minga-state" }
+serde.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
