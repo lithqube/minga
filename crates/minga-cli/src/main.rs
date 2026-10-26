@@ -45,6 +45,13 @@ enum Command {
     },
     /// Run the Docker Engine API server (Swarm-compatible REST API).
     Api(ApiArgs),
+    /// Agent sandbox management.
+    Sandbox {
+        #[command(subcommand)]
+        cmd: SandboxCommand,
+    },
+    /// Run the LLM egress proxy server.
+    Egress(EgressArgs),
 }
 
 #[derive(Subcommand)]
@@ -158,6 +165,46 @@ struct ApiArgs {
     api_bind: String,
 }
 
+#[derive(Subcommand)]
+enum SandboxCommand {
+    /// Run a WASM module in a sandbox (one-shot).
+    Run {
+        /// Path to the .wasm or .wat file.
+        #[arg(long)]
+        module: String,
+        /// Input data (string). Use @file to read from a file.
+        #[arg(long, default_value = "")]
+        input: String,
+        /// Fuel limit (instruction budget).
+        #[arg(long, default_value = "1000000000")]
+        fuel: u64,
+        /// Timeout in seconds.
+        #[arg(long, default_value = "30")]
+        timeout: u64,
+    },
+    /// Show available sandbox runtimes.
+    Info,
+}
+
+#[derive(Args)]
+struct EgressArgs {
+    /// Address to bind the egress proxy (e.g. 0.0.0.0:8080).
+    #[arg(long, default_value = "0.0.0.0:8080")]
+    bind: String,
+    /// Upstream LLM API base URL.
+    #[arg(long, default_value = "https://api.openai.com")]
+    upstream: String,
+    /// Default token budget per workload.
+    #[arg(long, default_value = "1000000")]
+    default_budget: u64,
+    /// Budget window in seconds.
+    #[arg(long, default_value = "3600")]
+    budget_window: u64,
+    /// Disable response caching.
+    #[arg(long)]
+    no_cache: bool,
+}
+
 /// Parses `--peer id=address` into a BTreeMap.
 fn parse_peers(raw: &[String]) -> Result<BTreeMap<u64, String>, String> {
     let mut peers = BTreeMap::new();
@@ -205,6 +252,8 @@ async fn main() -> ExitCode {
         Command::Net { cmd } => return run_net(cmd),
         Command::Wg { cmd } => return run_wg(cmd),
         Command::Api(args) => return run_api(args).await,
+        Command::Sandbox { cmd } => return run_sandbox(cmd).await,
+        Command::Egress(args) => return run_egress(args).await,
     }
     ExitCode::SUCCESS
 }
@@ -657,5 +706,158 @@ fn run_wg(cmd: WgCommand) -> ExitCode {
             print!("{}", config.to_config_string());
         }
     }
+    ExitCode::SUCCESS
+}
+
+// ---------------------------------------------------------------------------
+// Sandbox commands
+// ---------------------------------------------------------------------------
+
+async fn run_sandbox(cmd: SandboxCommand) -> ExitCode {
+    use minga_sandbox::SandboxRuntime;
+
+    match cmd {
+        SandboxCommand::Info => {
+            println!("Available sandbox runtimes:");
+            println!("  wasmtime    — WASM execution (cross-platform)");
+            #[cfg(target_os = "linux")]
+            println!("  firecracker — microVM execution (Linux/KVM)");
+            println!("  mock        — in-memory mock (testing)");
+        }
+        SandboxCommand::Run {
+            module,
+            input,
+            fuel,
+            timeout,
+        } => {
+            // Read the module file.
+            let module_bytes = match std::fs::read(&module) {
+                Ok(b) => b,
+                Err(e) => {
+                    eprintln!("error: cannot read module {module}: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+
+            // Read input.
+            let input_bytes = if let Some(path) = input.strip_prefix('@') {
+                match std::fs::read(path) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        eprintln!("error: cannot read input file {path}: {e}");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            } else {
+                input.into_bytes()
+            };
+
+            let spec = minga_sandbox::SandboxSpec {
+                module: module_bytes,
+                fuel_limit: Some(fuel),
+                timeout: Some(std::time::Duration::from_secs(timeout)),
+                ..Default::default()
+            };
+
+            let runtime = match minga_sandbox::WasmtimeRuntime::new() {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("error: cannot create wasmtime runtime: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+
+            let id = match runtime.create(&spec).await {
+                Ok(id) => id,
+                Err(e) => {
+                    eprintln!("error: cannot create sandbox: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+
+            println!("sandbox created: {id}");
+
+            match runtime.run(&id, &input_bytes).await {
+                Ok(result) => {
+                    println!("exit code:   {}", result.exit_code);
+                    println!("fuel used:   {}", result.fuel_consumed);
+                    println!("duration:    {:?}", result.duration);
+                    if !result.stdout.is_empty() {
+                        println!("stdout:      {}", result.stdout);
+                    }
+                    if !result.stderr.is_empty() {
+                        println!("stderr:      {}", result.stderr);
+                    }
+                    let _ = runtime.destroy(&id).await;
+                    if result.exit_code != 0 {
+                        return ExitCode::FAILURE;
+                    }
+                }
+                Err(e) => {
+                    eprintln!("error: sandbox run failed: {e}");
+                    let _ = runtime.destroy(&id).await;
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+// ---------------------------------------------------------------------------
+// Egress proxy command
+// ---------------------------------------------------------------------------
+
+async fn run_egress(args: EgressArgs) -> ExitCode {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    tracing::info!(
+        bind = %args.bind,
+        upstream = %args.upstream,
+        "starting LLM egress proxy"
+    );
+
+    let budgets = Arc::new(minga_egress::BudgetTracker::new());
+
+    // Register a default workload budget.
+    budgets.register(
+        "default",
+        minga_egress::Budget::new(args.default_budget, Duration::from_secs(args.budget_window)),
+    );
+
+    let config = minga_egress::EgressProxyConfig {
+        upstream_url: args.upstream.clone(),
+        timeout: Duration::from_secs(60),
+        cache_config: if args.no_cache {
+            None
+        } else {
+            Some(minga_egress::CacheConfig::default())
+        },
+        redact_errors: true,
+    };
+
+    let mut proxy = minga_egress::EgressProxy::new(config, budgets);
+
+    let addr = match proxy.start(&args.bind).await {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("error: cannot start egress proxy: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    println!("LLM egress proxy listening on http://{addr}");
+    println!("  upstream:  {}", args.upstream);
+    println!("  health:    http://{addr}/health");
+    println!("  budgets:   http://{addr}/budgets");
+    println!("  proxy:     http://{addr}/v1/chat/completions");
+    println!("  workload:  set X-Minga-Workload header to identify the workload");
+
+    // Wait forever (until SIGTERM/SIGINT).
+    tokio::signal::ctrl_c().await.ok();
+    tracing::info!("shutting down egress proxy");
+    proxy.shutdown();
+
     ExitCode::SUCCESS
 }

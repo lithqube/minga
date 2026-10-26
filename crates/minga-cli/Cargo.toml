@@ -15,8 +15,10 @@ clap.workspace = true
 minga-api = { path = "../minga-api" }
 minga-bus = { path = "../minga-bus" }
 minga-compose = { path = "../minga-compose" }
+minga-egress = { path = "../minga-egress" }
 minga-net = { path = "../minga-net" }
 minga-node = { path = "../minga-node" }
+minga-sandbox = { path = "../minga-sandbox" }
 minga-scheduler = { path = "../minga-scheduler" }
 minga-state = { path = "../minga-state" }
 thiserror.workspace = true
