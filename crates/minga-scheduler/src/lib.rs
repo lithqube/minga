@@ -110,7 +110,7 @@ impl Scheduler {
                         node = task.node_id,
                         "creating task"
                     );
-                    self.state.upsert_task(task.clone()).await?;
+                    self.state.upsert_task(task.as_ref().clone()).await?;
 
                     // Publish assign command to the bus.
                     if let Some(bus) = &self.bus {

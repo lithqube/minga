@@ -12,9 +12,9 @@
 
 use std::collections::HashMap;
 
-use minga_compose::{DeployMode, DeviceCount, Project, DEFAULT_NETWORK};
+use minga_compose::{AgentExtension, DeployMode, DeviceCount, Project, DEFAULT_NETWORK};
 use minga_state::types::{
-    Config as StateConfig, Network, ResourceSpec, Secret, Service, ServiceMode, Volume,
+    AgentSpec, Config as StateConfig, Network, ResourceSpec, Secret, Service, ServiceMode, Volume,
 };
 use thiserror::Error;
 
@@ -65,10 +65,17 @@ fn translate_service(
     stack: &str,
     project: &Project,
 ) -> Result<Service, TranslateError> {
-    let image =
-        svc.image.clone().filter(|i| !i.is_empty()).ok_or_else(|| {
+    // Check for x-minga-agent extension — agent services don't need an image.
+    let agent_ext = svc
+        .agent_extension()
+        .map_err(|e| TranslateError::Service(name.to_string(), e))?;
+
+    let image = match &agent_ext {
+        Some(_) => String::new(), // agent services have no container image
+        None => svc.image.clone().filter(|i| !i.is_empty()).ok_or_else(|| {
             TranslateError::Service(name.to_string(), "`image` is required".into())
-        })?;
+        })?,
+    };
 
     let deploy = svc.deploy.clone().unwrap_or_default();
 
@@ -134,6 +141,9 @@ fn translate_service(
         }
     }
 
+    // Build the agent spec from the extension, if present.
+    let agent = agent_ext.map(agent_extension_to_spec);
+
     Ok(Service {
         id: format!("{stack}.{name}"),
         name: name.to_string(),
@@ -145,7 +155,22 @@ fn translate_service(
         ports,
         networks,
         resources,
+        agent,
     })
+}
+
+/// Converts a Compose `x-minga-agent` extension into a state `AgentSpec`.
+fn agent_extension_to_spec(ext: AgentExtension) -> AgentSpec {
+    AgentSpec {
+        module_ref: ext.module,
+        fuel_limit: ext.fuel_limit,
+        memory_limit: ext.memory_limit,
+        timeout_secs: ext.timeout,
+        token_budget: ext.token_budget,
+        egress_url: ext.egress_url,
+        prompt: ext.prompt,
+        sandbox_env: ext.env,
+    }
 }
 
 fn translate_resources(
@@ -359,5 +384,199 @@ mod tests {
         assert!(parse_memory("abc").is_err());
         assert!(parse_memory("1X").is_err());
         assert!(parse_memory("-1G").is_err());
+    }
+
+    // --- agent service translation tests ---------------------------------------
+
+    fn make_compose_service(service_yaml: &str) -> minga_compose::Service {
+        // Use the real loader to parse a single-service compose file.
+        let yaml = format!("services:\n  test:\n{}", indent(service_yaml));
+        let loaded = minga_compose::load(&yaml, &minga_compose::LoadOptions::default())
+            .expect("compose should load");
+        loaded.project.services.get("test").cloned().unwrap()
+    }
+
+    fn indent(s: &str) -> String {
+        s.lines()
+            .map(|line| format!("    {line}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn empty_project() -> Project {
+        minga_compose::load("services: {}", &minga_compose::LoadOptions::default())
+            .expect("empty compose should load")
+            .project
+    }
+
+    #[test]
+    fn translate_agent_service() {
+        let svc = make_compose_service(
+            r#"
+            x-minga-agent:
+              module: ./agent.wasm
+              fuel_limit: 1000000000
+              memory_limit: 134217728
+              timeout: 60
+              token_budget: 100000
+              egress_url: https://api.openai.com
+              prompt: "You are helpful"
+              env:
+                MODEL: gpt-4o
+            deploy:
+              replicas: 2
+            "#,
+        );
+        let result = translate_service("my-agent", &svc, "test", &empty_project()).unwrap();
+        assert_eq!(result.id, "test.my-agent");
+        assert!(
+            result.image.is_empty(),
+            "agent service should have no image"
+        );
+        assert_eq!(result.replicas, 2);
+        let agent = result.agent.expect("should have agent spec");
+        assert_eq!(agent.module_ref, "./agent.wasm");
+        assert_eq!(agent.fuel_limit, Some(1_000_000_000));
+        assert_eq!(agent.memory_limit, Some(134_217_728));
+        assert_eq!(agent.timeout_secs, Some(60));
+        assert_eq!(agent.token_budget, Some(100_000));
+        assert_eq!(agent.egress_url.as_deref(), Some("https://api.openai.com"));
+        assert_eq!(agent.prompt.as_deref(), Some("You are helpful"));
+        assert_eq!(
+            agent.sandbox_env.get("MODEL").map(String::as_str),
+            Some("gpt-4o")
+        );
+    }
+
+    #[test]
+    fn translate_agent_service_minimal() {
+        let svc = make_compose_service(
+            r#"
+            x-minga-agent:
+              module: ./agent.wasm
+            "#,
+        );
+        let result = translate_service("agent", &svc, "test", &empty_project()).unwrap();
+        assert!(result.image.is_empty());
+        let agent = result.agent.expect("should have agent spec");
+        assert_eq!(agent.module_ref, "./agent.wasm");
+        assert!(agent.fuel_limit.is_none());
+        assert!(agent.token_budget.is_none());
+    }
+
+    #[test]
+    fn translate_container_service_has_no_agent() {
+        let svc = make_compose_service(
+            r#"
+            image: nginx:latest
+            deploy:
+              replicas: 1
+            "#,
+        );
+        let result = translate_service("web", &svc, "test", &empty_project()).unwrap();
+        assert_eq!(result.image, "nginx:latest");
+        assert!(
+            result.agent.is_none(),
+            "container service should have no agent spec"
+        );
+    }
+
+    #[test]
+    fn translate_container_service_requires_image() {
+        // Bypass the loader (which validates image at project level) to test
+        // translate_service's own validation.
+        let svc = minga_compose::Service {
+            image: None,
+            ..Default::default()
+        };
+        let result = translate_service("web", &svc, "test", &empty_project());
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("image"), "error should mention image: {err}");
+    }
+
+    #[test]
+    fn translate_agent_service_no_image_needed() {
+        // Agent service without image should NOT fail
+        let svc = make_compose_service(
+            r#"
+            x-minga-agent:
+              module: ./agent.wasm
+            "#,
+        );
+        let result = translate_service("agent", &svc, "test", &empty_project());
+        assert!(result.is_ok(), "agent service without image should succeed");
+    }
+
+    #[test]
+    fn translate_mixed_stack() {
+        // A project with both container and agent services
+        let container_svc = make_compose_service("image: nginx:latest\n");
+        let agent_svc = make_compose_service(
+            r#"
+            x-minga-agent:
+              module: ./agent.wasm
+            "#,
+        );
+        let project = empty_project();
+
+        let container = translate_service("web", &container_svc, "stack", &project).unwrap();
+        let agent = translate_service("bot", &agent_svc, "stack", &project).unwrap();
+
+        assert_eq!(container.image, "nginx:latest");
+        assert!(container.agent.is_none());
+        assert!(agent.image.is_empty());
+        assert!(agent.agent.is_some());
+    }
+
+    #[test]
+    fn translate_agent_service_with_resources() {
+        let svc = make_compose_service(
+            r#"
+            x-minga-agent:
+              module: ./agent.wasm
+            deploy:
+              replicas: 1
+              resources:
+                limits:
+                  cpus: "2.0"
+                  memory: 512M
+            "#,
+        );
+        let result = translate_service("agent", &svc, "test", &empty_project()).unwrap();
+        assert_eq!(result.resources.cpus, 2.0);
+        assert_eq!(result.resources.memory_bytes, 512 * 1024 * 1024);
+        assert!(result.agent.is_some());
+    }
+
+    #[test]
+    fn translate_agent_service_with_constraints() {
+        let svc = make_compose_service(
+            r#"
+            x-minga-agent:
+              module: ./agent.wasm
+            deploy:
+              placement:
+                constraints:
+                  - node.labels.gpu == true
+            "#,
+        );
+        let result = translate_service("agent", &svc, "test", &empty_project()).unwrap();
+        assert_eq!(
+            result.constraints,
+            vec!["node.labels.gpu == true".to_string()]
+        );
+    }
+
+    #[test]
+    fn translate_invalid_agent_extension_fails() {
+        let svc = make_compose_service(
+            r#"
+            x-minga-agent:
+              fuel_limit: "not-a-number"
+            "#,
+        );
+        let result = translate_service("agent", &svc, "test", &empty_project());
+        assert!(result.is_err(), "invalid agent extension should fail");
     }
 }

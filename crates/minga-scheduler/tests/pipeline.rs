@@ -121,7 +121,7 @@ services:
     let tasks: Vec<_> = actions
         .iter()
         .filter_map(|a| match a {
-            ReconcileAction::CreateTask(t) => Some(t.clone()),
+            ReconcileAction::CreateTask(t) => Some(t.as_ref().clone()),
             _ => None,
         })
         .collect();
@@ -261,7 +261,7 @@ services:
     let tasks: Vec<_> = actions
         .iter()
         .filter_map(|a| match a {
-            ReconcileAction::CreateTask(t) => Some(t.clone()),
+            ReconcileAction::CreateTask(t) => Some(t.as_ref().clone()),
             _ => None,
         })
         .collect();
@@ -370,4 +370,167 @@ services:
         Some("map_value")
     );
     assert_eq!(map_svc.env.get("NUM").map(String::as_str), Some("42"));
+}
+
+// --- Agent workload pipeline tests -------------------------------------------
+
+#[test]
+fn agent_service_full_pipeline() {
+    // Compose with an agent service → translate → place → verify agent kind.
+    let project = load(
+        r#"
+        services:
+          research-bot:
+            x-minga-agent:
+              module: ./agents/research.wasm
+              fuel_limit: 5000000000
+              memory_limit: 268435456
+              timeout: 120
+              token_budget: 500000
+              egress_url: https://api.openai.com
+              prompt: "You are a research assistant"
+              env:
+                MODEL: gpt-4o
+            deploy:
+              replicas: 2
+              resources:
+                limits:
+                  cpus: "2.0"
+                  memory: 1G
+        "#,
+    );
+
+    let translated = translate_project(&project, "test").unwrap();
+    assert_eq!(translated.services.len(), 1);
+
+    let svc = &translated.services[0];
+    assert_eq!(svc.id, "test.research-bot");
+    assert!(svc.image.is_empty(), "agent service should have no image");
+    assert_eq!(svc.replicas, 2);
+    assert_eq!(svc.resources.cpus, 2.0);
+    assert_eq!(svc.resources.memory_bytes, 1024 * 1024 * 1024);
+
+    let agent = svc.agent.as_ref().expect("should have agent spec");
+    assert_eq!(agent.module_ref, "./agents/research.wasm");
+    assert_eq!(agent.fuel_limit, Some(5_000_000_000));
+    assert_eq!(agent.memory_limit, Some(268_435_456));
+    assert_eq!(agent.timeout_secs, Some(120));
+    assert_eq!(agent.token_budget, Some(500_000));
+    assert_eq!(agent.egress_url.as_deref(), Some("https://api.openai.com"));
+    assert_eq!(
+        agent.prompt.as_deref(),
+        Some("You are a research assistant")
+    );
+    assert_eq!(
+        agent.sandbox_env.get("MODEL").map(String::as_str),
+        Some("gpt-4o")
+    );
+
+    // Place tasks on nodes.
+    let nodes = vec![node(1, 8.0, 1 << 34, 0, &[]), node(2, 8.0, 1 << 34, 0, &[])];
+    let tasks = place_service(svc, &nodes, &[]);
+    assert_eq!(tasks.len(), 2, "should place 2 replicas");
+
+    // Verify tasks have agent workload kind.
+    for task in &tasks {
+        match &task.spec.kind {
+            minga_state::types::WorkloadKind::Agent(a) => {
+                assert_eq!(a.module_ref, "./agents/research.wasm");
+                assert_eq!(a.token_budget, Some(500_000));
+            }
+            minga_state::types::WorkloadKind::Container => {
+                panic!("task should have agent workload kind");
+            }
+        }
+    }
+}
+
+#[test]
+fn mixed_container_and_agent_pipeline() {
+    // A stack with both container and agent services.
+    let project = load(
+        r#"
+        services:
+          web:
+            image: nginx:latest
+            deploy:
+              replicas: 1
+          bot:
+            x-minga-agent:
+              module: ./bot.wasm
+            deploy:
+              replicas: 1
+        "#,
+    );
+
+    let translated = translate_project(&project, "stack").unwrap();
+    assert_eq!(translated.services.len(), 2);
+
+    let web = translated
+        .services
+        .iter()
+        .find(|s| s.name == "web")
+        .unwrap();
+    assert_eq!(web.image, "nginx:latest");
+    assert!(web.agent.is_none());
+
+    let bot = translated
+        .services
+        .iter()
+        .find(|s| s.name == "bot")
+        .unwrap();
+    assert!(bot.image.is_empty());
+    assert!(bot.agent.is_some());
+    assert_eq!(bot.agent.as_ref().unwrap().module_ref, "./bot.wasm");
+
+    // Place all tasks.
+    let nodes = vec![node(1, 8.0, 1 << 34, 0, &[])];
+    let all_tasks: Vec<_> = translated
+        .services
+        .iter()
+        .flat_map(|svc| place_service(svc, &nodes, &[]))
+        .collect();
+    assert_eq!(all_tasks.len(), 2);
+
+    // One container task, one agent task.
+    let container_tasks = all_tasks
+        .iter()
+        .filter(|t| matches!(t.spec.kind, minga_state::types::WorkloadKind::Container))
+        .count();
+    let agent_tasks = all_tasks
+        .iter()
+        .filter(|t| matches!(t.spec.kind, minga_state::types::WorkloadKind::Agent(_)))
+        .count();
+    assert_eq!(container_tasks, 1);
+    assert_eq!(agent_tasks, 1);
+}
+
+#[test]
+fn agent_service_reconcile_creates_agent_tasks() {
+    // Full reconcile: agent service → plan → tasks have agent kind.
+    let project = load(
+        r#"
+        services:
+          bot:
+            x-minga-agent:
+              module: ./bot.wasm
+            deploy:
+              replicas: 1
+        "#,
+    );
+    let translated = translate_project(&project, "test").unwrap();
+    let nodes = vec![node(1, 4.0, 1 << 30, 0, &[])];
+
+    let actions = plan(&translated.services, &[], &nodes);
+    assert_eq!(actions.len(), 1);
+
+    match &actions[0] {
+        ReconcileAction::CreateTask(task) => {
+            assert!(matches!(
+                task.spec.kind,
+                minga_state::types::WorkloadKind::Agent(_)
+            ));
+        }
+        _ => panic!("expected CreateTask action"),
+    }
 }

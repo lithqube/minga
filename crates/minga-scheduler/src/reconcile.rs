@@ -20,7 +20,7 @@ use crate::placement::place_service;
 #[derive(Debug, Clone, PartialEq)]
 pub enum ReconcileAction {
     /// Create (or overwrite) a task in the state store.
-    CreateTask(Task),
+    CreateTask(Box<Task>),
     /// Remove a task from the state store. Carries the node_id so the
     /// scheduler can publish a stop command to the right node via the bus.
     RemoveTask { task_id: TaskId, node_id: NodeId },
@@ -60,7 +60,7 @@ pub fn plan(services: &[Service], tasks: &[Task], nodes: &[ClusterNode]) -> Vec<
         // Create tasks that are desired but don't exist yet.
         for task in &desired {
             if !existing_ids.contains(task.id.as_str()) {
-                actions.push(ReconcileAction::CreateTask(task.clone()));
+                actions.push(ReconcileAction::CreateTask(Box::new(task.clone())));
             }
         }
 
@@ -130,6 +130,7 @@ mod tests {
             }],
             networks: vec!["default".to_string()],
             resources: ResourceSpec::default(),
+            agent: None,
         }
     }
 
@@ -144,6 +145,7 @@ mod tests {
                 env: HashMap::new(),
                 ports: vec![],
                 resources: ResourceSpec::default(),
+                ..Default::default()
             },
             ips: HashMap::new(),
         }

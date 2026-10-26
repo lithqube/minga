@@ -47,6 +47,7 @@ fn sample_service(id: &str) -> Service {
         ports: Vec::new(),
         networks: vec!["default".to_string()],
         resources: ResourceSpec::default(),
+        agent: None,
     }
 }
 

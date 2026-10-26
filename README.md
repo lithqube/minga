@@ -2,13 +2,13 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.80%2B-orange.svg)](https://www.rust-lang.org)
-[![Status](https://img.shields.io/badge/status-wave%206%20(agent%20workloads)-green.svg)]()
+[![Status](https://img.shields.io/badge/status-wave%207%20(agent%20E2E)-green.svg)]()
 
 A single-binary container and agent orchestrator for **edge, on-prem and air-gapped sites**, written in Rust. It runs Compose files natively, speaks enough of the Docker Swarm API to replace it, and treats AI-agent workloads — sandboxes, durable runs, budgets, GPUs — as first-class objects.
 
 Named after the [minga](https://en.wikipedia.org/wiki/Minga) of Chiloé, where a community moves a whole house together.
 
-> **Status: Wave 6 complete — agent workloads.** A 10-service Compose stack runs on a 3-node Raft cluster end-to-end with NATS/JetStream event bus, real containerd containers, WireGuard overlay networking (IPAM, DNS, config generation), and a Swarm-compatible Docker Engine API (v1.41) so `docker stack deploy`, `docker service ls`, `docker node ls` work against Minga. Agent sandboxes (wasmtime + warm pools, Firecracker stub) and an LLM egress proxy (budgets, caching, secret redaction) are in. 407 tests across 10 crates. See the [roadmap](#roadmap).
+> **Status: Wave 7 complete — agent workloads end-to-end.** A 10-service Compose stack runs on a 3-node Raft cluster end-to-end with NATS/JetStream event bus, real containerd containers, WireGuard overlay networking (IPAM, DNS, config generation), and a Swarm-compatible Docker Engine API (v1.41) so `docker stack deploy`, `docker service ls`, `docker node ls` work against Minga. Agent workloads are first-class: declare `x-minga-agent` in Compose, and the scheduler, supervisor, WASM sandbox, and LLM egress proxy handle the rest. 457 tests across 10 crates. See the [roadmap](#roadmap).
 
 ## Why Minga
 
@@ -92,15 +92,15 @@ Decisions are recorded as [ADRs](docs/adr/) in the repo.
 | Crate | Status | Purpose |
 | --- | --- | --- |
 | `minga-cli` | **Done** | The `minga` binary: `validate`, `deploy` (translation), `manager`, and `worker` subcommands wired to the scheduler and supervisor. |
-| `minga-compose` | **Done** | Compose Specification parser and validator. Full interpolation, profiles, merge keys, `x-` extensions, dependency cycle detection, port conflict detection. 28 tests. |
-| `minga-state` | **Done** | Cluster state: openraft + redb. Multi-node Raft with TCP networking, leader election, failover, persistent log and state machine. 15 tests. |
-| `minga-scheduler` | **Done** | Placement engine: Compose → state entities, spread placement with constraints and resource awareness, reconcile loop. 49 tests. |
-| `minga-node` | **Done** | Node supervisor: `Runtime` trait with `MockRuntime` (testing) and `ContainerdRuntime` (real containers via containerd gRPC). OCI spec generation, graceful shutdown (SIGTERM→SIGKILL), image pull. Reconcile loop starts/stops containers from Raft + bus. 43 tests. |
+| `minga-compose` | **Done** | Compose Specification parser and validator. Full interpolation, profiles, merge keys, `x-` extensions (including `x-minga-agent` for agent workloads), dependency cycle detection, port conflict detection. 39 tests. |
+| `minga-state` | **Done** | Cluster state: openraft + redb. Multi-node Raft with TCP networking, leader election, failover, persistent log and state machine. `WorkloadKind` discriminant on `TaskSpec` (Container / Agent). 21 tests. |
+| `minga-scheduler` | **Done** | Placement engine: Compose → state entities (containers + agents via `x-minga-agent`), spread placement with constraints and resource awareness, reconcile loop. 58 tests. |
+| `minga-node` | **Done** | Node supervisor: `Runtime` trait with `MockRuntime` (testing) and `ContainerdRuntime` (real containers via containerd gRPC), plus `AgentExecutor` trait with `MockAgentExecutor` and `WasmtimeAgentExecutor` (WASM sandboxes). OCI spec generation, graceful shutdown (SIGTERM→SIGKILL), image pull. Reconcile loop starts/stops containers and agents from Raft + bus, dispatching by `WorkloadKind`. 67 tests. |
 | `minga-bus` | **Done** | Event bus abstraction: `EventBus` trait with `MemoryBus` (in-process) and `NatsBus` (NATS/JetStream). Commands, events, KV status, liveness leases, request/reply. 24 tests. |
 | `minga-api` | **Done** | Docker Engine API v1.41 REST subset: services, tasks, nodes, networks, secrets, configs CRUD with label filters. Bidirectional translation between Docker API types and Minga state. `minga api` CLI subcommand. Real `docker` CLI verified via testcontainers. 76 tests. |
 | `minga-net` | **Done** | Overlay networking: CIDR utilities, deterministic IPAM (hash-based allocation, linear probing), WireGuard keypair generation (X25519) + `wg-quick` config generation, DNS service discovery (`minga.local`), `OverlayManager` coordinator. 70 tests. |
-| `minga-sandbox` | **Done** | Agent sandboxes: `SandboxRuntime` trait with `MockSandboxRuntime` (testing), `WasmtimeRuntime` (real WASM execution with fuel metering, memory limits, timeouts), `WarmPool` (pre-warmed sandbox pool with acquire/release, background replenish/evict), `FirecrackerRuntime` stub (Linux + KVM). CLI: `minga sandbox run`, `minga sandbox info`. 36 tests. |
-| `minga-egress` | **Done** | LLM egress proxy (axum): per-workload token budgets with sliding windows, LRU response caching with TTL, secret redaction (10 built-in rules: API keys, AWS keys, JWTs, credit cards, etc.), reverse proxy with token metering from `usage.total_tokens`. CLI: `minga egress --bind --upstream --default-budget`. 53 tests. |
+| `minga-sandbox` | **Done** | Agent sandboxes: `SandboxRuntime` trait with `MockSandboxRuntime` (testing), `WasmtimeRuntime` (real WASM execution with fuel metering, memory limits, timeouts), `WarmPool` (pre-warmed sandbox pool with acquire/release, background replenish/evict), `FirecrackerRuntime` stub (Linux + KVM). Wired into the supervisor via `WasmtimeAgentExecutor`. CLI: `minga sandbox run`, `minga sandbox info`. 36 tests. |
+| `minga-egress` | **Done** | LLM egress proxy (axum): per-workload token budgets with sliding windows, LRU response caching with TTL, secret redaction (10 built-in rules: API keys, AWS keys, JWTs, credit cards, etc.), reverse proxy with token metering from `usage.total_tokens`. Wired into the node via `--egress-bind` / `--egress-upstream` flags. CLI: `minga egress --bind --upstream --default-budget`. 53 tests. |
 
 ## Development
 
@@ -142,12 +142,14 @@ Requirements: Rust 1.80+ (stable), with `rustfmt` and `clippy` components.
 - [x] **Docker Engine API** — `minga-api` crate: Docker Engine API v1.41 REST subset (axum). Services, tasks, nodes, networks, secrets, configs — full CRUD with label filters. Bidirectional translation between Docker API types and Minga Raft state. `minga api` CLI subcommand (`--bind`, `--node-id`, `--data-dir`, `--peers`). Real `docker` CLI verified end-to-end via testcontainers (`docker service ls`, `docker node ls`, `docker info`, `docker version`). 76 tests (64 unit + 11 integration + 1 doc).
 - [x] **Agent sandboxes** — `minga-sandbox` crate: `SandboxRuntime` trait with `MockSandboxRuntime`, `WasmtimeRuntime` (real WASM execution via wasmtime 24 with fuel metering, memory limits, timeouts, output capture), `WarmPool` (pre-warmed pool with acquire/release/run, background replenish + idle eviction, pool stats), `FirecrackerRuntime` stub (Linux + KVM detection). WASM module contract: exports `memory` + `run(input_len: i32) -> i32`, input at offset 1024, output at offset 0 with 4-byte LE length prefix. CLI: `minga sandbox run --module foo.wasm --input '{"q":"hi"}'`, `minga sandbox info`. 36 tests (38 on Linux).
 - [x] **LLM egress proxy** — `minga-egress` crate: axum reverse proxy with per-workload token budgets (`BudgetTracker`, sliding window, register/unregister/check/record), LRU response caching (`ResponseCache`, FNV-1a key, TTL, only caches 2xx), secret redaction (`SecretRedactor`, 10 built-in regex rules: OpenAI/Anthropic keys, AWS keys, JWTs, credit cards, emails, hex secrets, private keys, bearer tokens), token metering from `usage.total_tokens` with char/4 fallback. Workload identified via `X-Minga-Workload` header. CLI: `minga egress --bind 0.0.0.0:8080 --upstream https://api.openai.com --default-budget 100000`. 53 tests.
+- [x] **Agent workloads end-to-end** — `x-minga-agent` Compose extension declares agent services (WASM module, fuel/memory/timeout limits, token budget, egress URL, prompt). Flows through the full pipeline: compose parsing → scheduler translation (`WorkloadKind::Agent` on `TaskSpec`) → Raft placement → bus dispatch → supervisor (`AgentExecutor` trait: `MockAgentExecutor`, `WasmtimeAgentExecutor`) → WASM sandbox execution. Egress proxy co-located on the node. CLI: `minga node --sandbox-runtime wasmtime --module-dir ./modules --egress-bind 127.0.0.1:8080 --egress-upstream https://api.openai.com`, `minga agent ls`. [ADR 0003](docs/adr/0003-agent-workloads.md). 3 new pipeline integration tests (full agent pipeline, mixed container+agent, reconcile creates agent tasks).
 
 ## Documentation
 
 - [Design document](docs/design.md) — scope, feature gap vs Swarm, tech stack, roadmap
 - [ADR 0001: Language split](docs/adr/0001-language-split.md) — why Rust, when Go is acceptable
 - [ADR 0002: Event bus](docs/adr/0002-event-bus-nats.md) — NATS/JetStream behind `minga-bus`
+- [ADR 0003: Agent workloads](docs/adr/0003-agent-workloads.md) — WASM sandboxes + LLM egress in the orchestration pipeline
 - [NATS/JetStream evaluation](docs/research/nats-evaluation.md) — should Minga adopt NATS as its event bus, and how
 - [CLAUDE.md](CLAUDE.md) — project conventions for AI-assisted development
 

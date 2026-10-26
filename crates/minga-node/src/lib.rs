@@ -37,10 +37,15 @@
 //! # }
 //! ```
 
+pub mod agent;
 pub mod containerd;
 pub mod runtime;
 pub mod supervisor;
 
+pub use agent::{
+    shared_executor, AgentError, AgentExecutor, AgentInfo, AgentRunResult, AgentStatus,
+    MockAgentExecutor, WasmtimeAgentExecutor,
+};
 pub use containerd::ContainerdRuntime;
 pub use runtime::{
     shared_runtime, ContainerInfo, ContainerStatus, MockRuntime, Runtime, RuntimeError,

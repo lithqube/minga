@@ -29,6 +29,7 @@ fn test_spec(image: &str) -> TaskSpec {
         env: HashMap::from([("TEST_VAR".to_string(), "hello".to_string())]),
         ports: vec![],
         resources: ResourceSpec::default(),
+        ..Default::default()
     }
 }
 

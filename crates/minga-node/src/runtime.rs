@@ -173,6 +173,7 @@ mod tests {
             env: HashMap::new(),
             ports: Vec::new(),
             resources: Default::default(),
+            ..Default::default()
         }
     }
 

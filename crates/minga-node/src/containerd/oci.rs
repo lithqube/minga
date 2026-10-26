@@ -374,6 +374,7 @@ mod tests {
             env: HashMap::new(),
             ports: vec![],
             resources: ResourceSpec::default(),
+            ..Default::default()
         }
     }
 

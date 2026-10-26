@@ -5,6 +5,7 @@
 //! extensions), typed parsing, profile filtering and project validation. It
 //! reports every problem it finds at once.
 
+mod agent;
 mod error;
 mod interpolate;
 mod keys;
@@ -17,6 +18,7 @@ use std::path::Path;
 use indexmap::IndexMap;
 use serde_yaml::{Mapping, Value};
 
+pub use agent::{AgentExtension, AGENT_EXTENSION_KEY};
 pub use error::{ComposeError, Errors};
 pub use interpolate::interpolate_str;
 pub use model::*;

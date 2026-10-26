@@ -107,7 +107,7 @@ impl Project {
     fn check_services(&self, errors: &mut Vec<ComposeError>) {
         for (name, svc) in &self.services {
             let at = format!("services.{name}");
-            if svc.image.as_deref().map_or(true, str::is_empty) {
+            if svc.image.as_deref().map_or(true, str::is_empty) && !svc.is_agent() {
                 errors.push(ComposeError::invalid(&at, "`image` is required"));
             }
             if let Some(deploy) = &svc.deploy {

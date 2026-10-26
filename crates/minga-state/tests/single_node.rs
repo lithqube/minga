@@ -63,6 +63,7 @@ fn sample_service(id: &str) -> Service {
             memory_bytes: 4 * 1024 * 1024 * 1024,
             gpus: 0,
         },
+        agent: None,
     }
 }
 
@@ -77,6 +78,7 @@ fn sample_task(id: &str, service_id: &str, node_id: u64) -> Task {
             env: HashMap::new(),
             ports: vec![],
             resources: ResourceSpec::default(),
+            ..Default::default()
         },
         ips: HashMap::new(),
     }

@@ -71,6 +71,7 @@ pub struct ResourceSpec {
 pub struct Service {
     pub id: ServiceId,
     pub name: String,
+    /// Container image. Empty string for agent (WASM sandbox) services.
     pub image: String,
     pub replicas: u32,
     pub mode: ServiceMode,
@@ -80,6 +81,9 @@ pub struct Service {
     pub ports: Vec<PortMapping>,
     pub networks: Vec<NetworkId>,
     pub resources: ResourceSpec,
+    /// Agent workload spec. `None` for container services.
+    #[serde(default)]
+    pub agent: Option<AgentSpec>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -119,12 +123,48 @@ pub enum TaskState {
     Failed,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct TaskSpec {
     pub image: String,
     pub env: HashMap<String, String>,
     pub ports: Vec<PortMapping>,
     pub resources: ResourceSpec,
+    /// Workload kind: container (default) or agent (WASM sandbox).
+    #[serde(default)]
+    pub kind: WorkloadKind,
+}
+
+/// The kind of workload a task runs.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub enum WorkloadKind {
+    /// A container workload (default, backward-compatible).
+    #[default]
+    Container,
+    /// An AI-agent workload running in a WASM sandbox.
+    Agent(AgentSpec),
+}
+
+/// Specification for an agent (WASM sandbox) workload.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct AgentSpec {
+    /// Path or reference to the WASM module on the node's filesystem.
+    /// Resolved by the agent executor at start time.
+    pub module_ref: String,
+    /// Maximum fuel (instruction budget). `None` = unlimited.
+    pub fuel_limit: Option<u64>,
+    /// Maximum memory in bytes. `None` = runtime default.
+    pub memory_limit: Option<u64>,
+    /// Maximum execution time in seconds. `None` = runtime default (30s).
+    pub timeout_secs: Option<u64>,
+    /// Token budget for LLM egress. `None` = no budget enforcement.
+    pub token_budget: Option<u64>,
+    /// LLM API upstream URL (goes through the egress proxy).
+    pub egress_url: Option<String>,
+    /// Initial prompt / input for the agent.
+    pub prompt: Option<String>,
+    /// Additional environment variables for the sandbox.
+    #[serde(default)]
+    pub sandbox_env: HashMap<String, String>,
 }
 
 /// An overlay network.
@@ -162,4 +202,106 @@ pub struct Secret {
 pub struct Config {
     pub id: ConfigId,
     pub name: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn workload_kind_default_is_container() {
+        assert_eq!(WorkloadKind::default(), WorkloadKind::Container);
+    }
+
+    #[test]
+    fn taskspec_default_kind_is_container() {
+        let spec = TaskSpec::default();
+        assert_eq!(spec.kind, WorkloadKind::Container);
+    }
+
+    #[test]
+    fn workload_kind_bincode_roundtrip_container() {
+        let kind = WorkloadKind::Container;
+        let bytes = bincode::serde::encode_to_vec(&kind, bincode::config::standard()).unwrap();
+        let (back, _): (WorkloadKind, _) =
+            bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
+        assert_eq!(back, kind);
+    }
+
+    #[test]
+    fn workload_kind_bincode_roundtrip_agent() {
+        let kind = WorkloadKind::Agent(AgentSpec {
+            module_ref: "./agent.wasm".to_string(),
+            fuel_limit: Some(1_000_000),
+            memory_limit: Some(128 * 1024 * 1024),
+            timeout_secs: Some(60),
+            token_budget: Some(100_000),
+            egress_url: Some("https://api.openai.com".to_string()),
+            prompt: Some("hello".to_string()),
+            sandbox_env: HashMap::from([("MODEL".to_string(), "gpt-4o".to_string())]),
+        });
+        let bytes = bincode::serde::encode_to_vec(&kind, bincode::config::standard()).unwrap();
+        let (back, _): (WorkloadKind, _) =
+            bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
+        assert_eq!(back, kind);
+    }
+
+    #[test]
+    fn taskspec_bincode_roundtrip_with_agent_kind() {
+        let spec = TaskSpec {
+            image: String::new(),
+            env: HashMap::new(),
+            ports: vec![],
+            resources: ResourceSpec::default(),
+            kind: WorkloadKind::Agent(AgentSpec {
+                module_ref: "./agent.wasm".to_string(),
+                ..Default::default()
+            }),
+        };
+        let bytes = bincode::serde::encode_to_vec(&spec, bincode::config::standard()).unwrap();
+        let (back, _): (TaskSpec, _) =
+            bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
+        assert_eq!(back, spec);
+    }
+
+    #[test]
+    fn service_bincode_roundtrip_with_agent() {
+        let svc = Service {
+            id: "stack.agent".to_string(),
+            name: "agent".to_string(),
+            image: String::new(),
+            replicas: 1,
+            mode: ServiceMode::Replicated,
+            constraints: vec![],
+            env: HashMap::new(),
+            ports: vec![],
+            networks: vec![],
+            resources: ResourceSpec::default(),
+            agent: Some(AgentSpec {
+                module_ref: "./agent.wasm".to_string(),
+                ..Default::default()
+            }),
+        };
+        let bytes = bincode::serde::encode_to_vec(&svc, bincode::config::standard()).unwrap();
+        let (back, _): (Service, _) =
+            bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
+        assert_eq!(back, svc);
+    }
+
+    #[test]
+    fn agent_spec_json_roundtrip() {
+        let spec = AgentSpec {
+            module_ref: "./agent.wasm".to_string(),
+            fuel_limit: Some(1_000_000),
+            memory_limit: None,
+            timeout_secs: Some(30),
+            token_budget: Some(50_000),
+            egress_url: Some("https://api.anthropic.com".to_string()),
+            prompt: Some("Summarize this".to_string()),
+            sandbox_env: HashMap::new(),
+        };
+        let json = serde_json::to_string(&spec).unwrap();
+        let back: AgentSpec = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, spec);
+    }
 }

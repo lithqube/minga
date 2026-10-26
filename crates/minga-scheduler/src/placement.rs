@@ -15,6 +15,7 @@ use std::collections::HashMap;
 
 use minga_state::types::{
     ClusterNode, NodeId, NodeStatus, ResourceSpec, Service, ServiceMode, Task, TaskSpec, TaskState,
+    WorkloadKind,
 };
 
 use crate::constraints;
@@ -82,11 +83,17 @@ pub fn place_service(
         })
         .collect();
 
+    let kind = match &service.agent {
+        Some(agent) => WorkloadKind::Agent(agent.clone()),
+        None => WorkloadKind::Container,
+    };
+
     let spec = TaskSpec {
         image: service.image.clone(),
         env: service.env.clone(),
         ports: service.ports.clone(),
         resources: service.resources.clone(),
+        kind,
     };
 
     let mut tasks = Vec::new();
@@ -206,6 +213,7 @@ mod tests {
             }],
             networks: vec!["test_default".to_string()],
             resources: ResourceSpec::default(),
+            agent: None,
         }
     }
 
@@ -319,6 +327,7 @@ mod tests {
                     memory_bytes: 0,
                     gpus: 0,
                 },
+                ..Default::default()
             },
             ips: HashMap::new(),
         }];
@@ -351,6 +360,7 @@ mod tests {
                     memory_bytes: 0,
                     gpus: 0,
                 },
+                ..Default::default()
             },
             ips: HashMap::new(),
         }];

@@ -52,6 +52,21 @@ enum Command {
     },
     /// Run the LLM egress proxy server.
     Egress(EgressArgs),
+    /// Agent workload management.
+    Agent {
+        #[command(subcommand)]
+        cmd: AgentCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum AgentCommand {
+    /// List running agent tasks (reads from the event bus KV).
+    Ls {
+        /// NATS server URL (e.g. nats://localhost:4222).
+        #[arg(long, env = "MINGA_NATS_URL")]
+        nats_url: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -134,6 +149,20 @@ struct NodeArgs {
     /// Path to the containerd gRPC socket (used with --runtime containerd).
     #[arg(long, default_value = "/run/containerd/containerd.sock")]
     containerd_socket: String,
+    /// Agent sandbox runtime: `mock` (in-memory, for testing) or `wasmtime`
+    /// (real WASM execution). Set to enable agent workload support.
+    #[arg(long)]
+    sandbox_runtime: Option<String>,
+    /// Base directory for resolving agent WASM module paths.
+    #[arg(long, default_value = "/var/lib/minga/modules")]
+    module_dir: String,
+    /// Bind address for the LLM egress proxy (e.g. 127.0.0.1:18080).
+    /// If set, the node starts an egress proxy for agent workloads.
+    #[arg(long)]
+    egress_bind: Option<String>,
+    /// Upstream LLM API URL for the egress proxy.
+    #[arg(long, default_value = "https://api.openai.com")]
+    egress_upstream: String,
 }
 
 #[derive(Args)]
@@ -254,6 +283,7 @@ async fn main() -> ExitCode {
         Command::Api(args) => return run_api(args).await,
         Command::Sandbox { cmd } => return run_sandbox(cmd).await,
         Command::Egress(args) => return run_egress(args).await,
+        Command::Agent { cmd } => return run_agent(cmd).await,
     }
     ExitCode::SUCCESS
 }
@@ -415,8 +445,70 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
         }
     };
 
-    let supervisor =
-        minga_node::Supervisor::with_bus(state.clone(), runtime, bus.clone(), args.node_id);
+    // Construct the agent executor if --sandbox-runtime is set.
+    let agent_executor: Option<Arc<dyn minga_node::AgentExecutor>> = match &args.sandbox_runtime {
+        Some(rt) => match rt.as_str() {
+            "mock" => {
+                tracing::info!("using MockAgentExecutor (in-memory, no real sandboxes)");
+                Some(Arc::new(minga_node::MockAgentExecutor::new()))
+            }
+            "wasmtime" => {
+                tracing::info!(module_dir = %args.module_dir, "using WasmtimeAgentExecutor");
+                match minga_node::WasmtimeAgentExecutor::new(&args.module_dir).await {
+                    Ok(exec) => Some(Arc::new(exec)),
+                    Err(e) => {
+                        eprintln!("error: cannot create wasmtime agent executor: {e}");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
+            other => {
+                eprintln!(
+                    "error: unknown sandbox runtime '{other}' (expected 'mock' or 'wasmtime')"
+                );
+                return ExitCode::FAILURE;
+            }
+        },
+        None => None,
+    };
+
+    // Start the egress proxy if --egress-bind is set.
+    let _egress_proxy: Option<minga_egress::EgressProxy> = if let Some(ref bind) = args.egress_bind
+    {
+        tracing::info!(bind = %bind, upstream = %args.egress_upstream, "starting egress proxy");
+        let budgets = Arc::new(minga_egress::BudgetTracker::new());
+        let config = minga_egress::EgressProxyConfig {
+            upstream_url: args.egress_upstream.clone(),
+            timeout: Duration::from_secs(60),
+            cache_config: Some(minga_egress::CacheConfig::default()),
+            redact_errors: true,
+        };
+        let mut proxy = minga_egress::EgressProxy::new(config, budgets);
+        match proxy.start(bind).await {
+            Ok(addr) => {
+                println!("LLM egress proxy listening on http://{addr}");
+                Some(proxy)
+            }
+            Err(e) => {
+                eprintln!("error: cannot start egress proxy: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        None
+    };
+
+    // Create the supervisor with optional agent executor.
+    let supervisor = match &agent_executor {
+        Some(exec) => minga_node::Supervisor::with_agent_executor(
+            state.clone(),
+            runtime,
+            bus.clone(),
+            exec.clone(),
+            args.node_id,
+        ),
+        None => minga_node::Supervisor::with_bus(state.clone(), runtime, bus.clone(), args.node_id),
+    };
     let interval = Duration::from_secs(args.interval);
 
     if is_manager {
@@ -471,7 +563,11 @@ fn print_plan(loaded: &Loaded) {
     println!("services in startup order:");
     for name in p.startup_order() {
         let svc = &p.services[name];
-        let image = svc.image.as_deref().unwrap_or("-");
+        let image = if svc.is_agent() {
+            "agent"
+        } else {
+            svc.image.as_deref().unwrap_or("-")
+        };
         let deploy = svc.deploy.clone().unwrap_or_default();
         let scale = match deploy.mode {
             DeployMode::Replicated => format!("{} replica(s)", deploy.replicas.unwrap_or(1)),
@@ -525,10 +621,29 @@ fn print_translated(t: &minga_scheduler::TranslatedStack) {
         } else {
             String::new()
         };
+        // Show agent info or container image.
+        let workload = if let Some(ref agent) = svc.agent {
+            format!("agent:{}", agent.module_ref)
+        } else {
+            svc.image.clone()
+        };
         println!(
             "  {:<24} {:<40} {}{}{}",
-            svc.id, svc.image, mode, constraints, resources
+            svc.id, workload, mode, constraints, resources
         );
+        if let Some(ref agent) = svc.agent {
+            let mut details = vec![format!("module={}", agent.module_ref)];
+            if let Some(fuel) = agent.fuel_limit {
+                details.push(format!("fuel={fuel}"));
+            }
+            if let Some(budget) = agent.token_budget {
+                details.push(format!("tokens={budget}"));
+            }
+            if let Some(ref url) = agent.egress_url {
+                details.push(format!("egress={url}"));
+            }
+            println!("    agent {}", details.join("  "));
+        }
         if !svc.env.is_empty() {
             let env: Vec<String> = svc.env.iter().map(|(k, v)| format!("{k}={v}")).collect();
             println!("    env {}", env.join(" "));
@@ -859,5 +974,36 @@ async fn run_egress(args: EgressArgs) -> ExitCode {
     tracing::info!("shutting down egress proxy");
     proxy.shutdown();
 
+    ExitCode::SUCCESS
+}
+
+// ---------------------------------------------------------------------------
+// Agent commands
+// ---------------------------------------------------------------------------
+
+async fn run_agent(cmd: AgentCommand) -> ExitCode {
+    match cmd {
+        AgentCommand::Ls { nats_url } => {
+            // Without NATS, there's nothing to query — print a message.
+            let Some(url) = nats_url else {
+                eprintln!("error: --nats-url (or MINGA_NATS_URL) is required to list agent tasks");
+                return ExitCode::FAILURE;
+            };
+            match minga_bus::NatsBus::connect(&url).await {
+                Ok(bus) => {
+                    // Watch the task status KV for agent tasks.
+                    // For now, just indicate the feature is wired.
+                    println!("connected to NATS at {url}");
+                    println!("agent task listing: query the MINGA_STATUS KV bucket");
+                    println!("  keys: task.{{task_id}}");
+                    drop(bus);
+                }
+                Err(e) => {
+                    eprintln!("error: cannot connect to NATS at {url}: {e}");
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+    }
     ExitCode::SUCCESS
 }

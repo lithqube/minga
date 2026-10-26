@@ -41,6 +41,7 @@ fn make_service(id: &str, replicas: u32) -> Service {
         ports: Vec::new(),
         networks: vec!["default".to_string()],
         resources: ResourceSpec::default(),
+        agent: None,
     }
 }
 

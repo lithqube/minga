@@ -11,6 +11,7 @@ async-trait.workspace = true
 bincode.workspace = true
 hyper-util.workspace = true
 minga-bus = { path = "../minga-bus" }
+minga-sandbox = { path = "../minga-sandbox" }
 minga-state = { path = "../minga-state" }
 prost.workspace = true
 prost-types.workspace = true

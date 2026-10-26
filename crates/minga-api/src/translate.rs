@@ -129,6 +129,7 @@ pub fn service_spec_to_state(spec: &models::ServiceSpec) -> Result<Service, Stri
         ports,
         networks,
         resources,
+        agent: None,
     })
 }
 
@@ -786,6 +787,7 @@ mod tests {
             ports: vec![],
             networks: vec![],
             resources: ResourceSpec::default(),
+            agent: None,
         };
         let docker = service_to_docker(&svc);
         let env = &docker.Spec.TaskTemplate.ContainerSpec.as_ref().unwrap().Env;
@@ -862,6 +864,7 @@ mod tests {
                 env: HashMap::new(),
                 ports: vec![],
                 resources: ResourceSpec::default(),
+                ..Default::default()
             },
             ips: HashMap::new(),
         };
@@ -886,6 +889,7 @@ mod tests {
                 env: HashMap::new(),
                 ports: vec![],
                 resources: ResourceSpec::default(),
+                ..Default::default()
             },
             ips: HashMap::new(),
         };
@@ -906,6 +910,7 @@ mod tests {
                 env: HashMap::new(),
                 ports: vec![],
                 resources: ResourceSpec::default(),
+                ..Default::default()
             },
             ips: HashMap::new(),
         };
