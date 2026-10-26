@@ -8,7 +8,7 @@ A single-binary container and agent orchestrator for **edge, on-prem and air-gap
 
 Named after the [minga](https://en.wikipedia.org/wiki/Minga) of Chiloé, where a community moves a whole house together.
 
-> **Status: Phase 0 gate + event bus + NATS sidecar + containerd runtime + overlay networking.** A 10-service Compose stack runs on a 3-node Raft cluster end-to-end with NATS/JetStream event bus, real containerd containers, and WireGuard overlay networking (IPAM, DNS, config generation). 241 tests across 7 crates. Docker Engine API and agent sandboxes are next. See the [roadmap](#roadmap).
+> **Status: Phase 0 gate + event bus + NATS sidecar + containerd runtime + overlay networking + Docker Engine API.** A 10-service Compose stack runs on a 3-node Raft cluster end-to-end with NATS/JetStream event bus, real containerd containers, WireGuard overlay networking (IPAM, DNS, config generation), and a Swarm-compatible Docker Engine API (v1.41) so `docker stack deploy`, `docker service ls`, `docker node ls` work against Minga. 317 tests across 8 crates. Agent sandboxes are next. See the [roadmap](#roadmap).
 
 ## Why Minga
 
@@ -97,7 +97,7 @@ Decisions are recorded as [ADRs](docs/adr/) in the repo.
 | `minga-scheduler` | **Done** | Placement engine: Compose → state entities, spread placement with constraints and resource awareness, reconcile loop. 49 tests. |
 | `minga-node` | **Done** | Node supervisor: `Runtime` trait with `MockRuntime` (testing) and `ContainerdRuntime` (real containers via containerd gRPC). OCI spec generation, graceful shutdown (SIGTERM→SIGKILL), image pull. Reconcile loop starts/stops containers from Raft + bus. 43 tests. |
 | `minga-bus` | **Done** | Event bus abstraction: `EventBus` trait with `MemoryBus` (in-process) and `NatsBus` (NATS/JetStream). Commands, events, KV status, liveness leases, request/reply. 24 tests. |
-| `minga-api` | Scaffold | Docker Engine API subset (REST) and native gRPC API. |
+| `minga-api` | **Done** | Docker Engine API v1.41 REST subset: services, tasks, nodes, networks, secrets, configs CRUD with label filters. Bidirectional translation between Docker API types and Minga state. `minga api` CLI subcommand. Real `docker` CLI verified via testcontainers. 76 tests. |
 | `minga-net` | **Done** | Overlay networking: CIDR utilities, deterministic IPAM (hash-based allocation, linear probing), WireGuard keypair generation (X25519) + `wg-quick` config generation, DNS service discovery (`minga.local`), `OverlayManager` coordinator. 70 tests. |
 | `minga-sandbox` | Scaffold | Agent sandboxes: wasmtime and Firecracker warm pools. |
 | `minga-egress` | Scaffold | LLM egress proxy: token and cost budgets, caching, secret redaction. |
@@ -139,7 +139,7 @@ Requirements: Rust 1.80+ (stable), with `rustfmt` and `clippy` components.
 - [x] **NATS sidecar lifecycle** — manager spawns `nats-server` as a child process with generated config (JetStream enabled, pinned storage limits, readiness probe, `kill_on_drop` cleanup). Workers require `--nats-url` to connect to the manager's NATS server.
 - [x] **Containerd runtime** — `ContainerdRuntime` implementing the `Runtime` trait via containerd's gRPC API (Unix socket). OCI spec generation from `TaskSpec`, image pull, container/task lifecycle, graceful shutdown (SIGTERM → 10s grace → SIGKILL). CLI: `--runtime containerd --containerd-socket /run/containerd/containerd.sock`. Integration tests skip gracefully without containerd.
 - [x] **Overlay networking** — `minga-net` crate: CIDR/IPAM (deterministic allocation from 10.100.0.0/16), WireGuard keypairs + config generation, DNS service discovery (`minga.local`), `OverlayManager` coordinator. State types extended: `Network.subnet`, `ClusterNode.wg_*`, `Task.ips`. CLI: `minga net create/inspect/alloc-subnet`, `minga wg keygen/pubkey/config`. Kernel-level data plane (netlink, `wg` apply) is a follow-up.
-- [ ] **Docker Engine API** — REST subset for `docker stack` / `docker service` compatibility
+- [x] **Docker Engine API** — `minga-api` crate: Docker Engine API v1.41 REST subset (axum). Services, tasks, nodes, networks, secrets, configs — full CRUD with label filters. Bidirectional translation between Docker API types and Minga Raft state. `minga api` CLI subcommand (`--bind`, `--node-id`, `--data-dir`, `--peers`). Real `docker` CLI verified end-to-end via testcontainers (`docker service ls`, `docker node ls`, `docker info`, `docker version`). 76 tests (64 unit + 11 integration + 1 doc).
 - [ ] **Agent sandboxes** — wasmtime + Firecracker warm pools
 - [ ] **LLM egress proxy** — budgets, caching, secret redaction
 

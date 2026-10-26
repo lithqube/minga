@@ -43,6 +43,8 @@ enum Command {
         #[command(subcommand)]
         cmd: WgCommand,
     },
+    /// Run the Docker Engine API server (Swarm-compatible REST API).
+    Api(ApiArgs),
 }
 
 #[derive(Subcommand)]
@@ -137,6 +139,25 @@ struct ComposeArgs {
     profiles: Vec<String>,
 }
 
+#[derive(Args)]
+struct ApiArgs {
+    /// This node's Raft ID.
+    #[arg(long)]
+    node_id: u64,
+    /// Address to bind the Raft RPC server (e.g. 0.0.0.0:50051).
+    #[arg(long)]
+    bind: String,
+    /// Data directory for Raft state (raft_log.redb, state.redb).
+    #[arg(long, default_value = "/var/lib/minga")]
+    data_dir: String,
+    /// Peer node as id=address (repeatable). Include all other nodes.
+    #[arg(long = "peer")]
+    peers: Vec<String>,
+    /// Address to bind the Docker Engine API server (e.g. 0.0.0.0:2375).
+    #[arg(long, default_value = "0.0.0.0:2375")]
+    api_bind: String,
+}
+
 /// Parses `--peer id=address` into a BTreeMap.
 fn parse_peers(raw: &[String]) -> Result<BTreeMap<u64, String>, String> {
     let mut peers = BTreeMap::new();
@@ -183,7 +204,58 @@ async fn main() -> ExitCode {
         }
         Command::Net { cmd } => return run_net(cmd),
         Command::Wg { cmd } => return run_wg(cmd),
+        Command::Api(args) => return run_api(args).await,
     }
+    ExitCode::SUCCESS
+}
+
+/// Runs the Docker Engine API server: opens the state store and starts
+/// the HTTP API server. The API server can run on any node — reads are
+/// served locally, writes are proposed to Raft (forwarded to the leader).
+async fn run_api(args: ApiArgs) -> ExitCode {
+    let peers = match parse_peers(&args.peers) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    tracing::info!(
+        node_id = args.node_id,
+        bind = %args.bind,
+        api_bind = %args.api_bind,
+        data_dir = %args.data_dir,
+        "starting Docker Engine API server"
+    );
+
+    let state = match minga_state::StateStore::open(args.node_id, &args.bind, &args.data_dir, peers)
+        .await
+    {
+        Ok(s) => Arc::new(s),
+        Err(e) => {
+            eprintln!("error: cannot open state store: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let server = match minga_api::ApiServer::start(state, &args.api_bind).await {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("error: cannot start API server: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    println!("Docker Engine API listening on http://{}", server.addr());
+    println!("Try: curl http://{}/_ping", server.addr());
+    println!("     DOCKER_HOST=tcp://{} docker service ls", server.addr());
+
+    // Wait forever (until SIGTERM/SIGINT).
+    tokio::signal::ctrl_c().await.ok();
+    tracing::info!("shutting down API server");
+    server.shutdown();
+
     ExitCode::SUCCESS
 }
 

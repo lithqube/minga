@@ -10,12 +10,14 @@ license = "MIT"
 repository = "https://github.com/lithqube/minga"
 
 [workspace.dependencies]
+axum = "0.7"
 anyhow = "1"
 async-nats = "0.50"
 async-trait = "0.1"
 base64 = "0.22"
 bincode = { version = "2", features = ["serde"] }
 bytes = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 futures = "0.3"
 hyper-util = { version = "0.1", features = ["tokio"] }
 indexmap = { version = "2", features = ["serde"] }
@@ -25,6 +27,7 @@ prost = "0.13"
 prost-types = "0.13"
 rand = "0.8"
 redb = "2"
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_path_to_error = "0.1"
@@ -33,6 +36,7 @@ thiserror = "2"
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
 tempfile = "3"
+testcontainers = "0.23"
 tonic = { version = "0.12", features = ["transport"] }
 tower = { version = "0.5", features = ["util"] }
 tracing = "0.1"

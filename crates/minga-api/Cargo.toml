@@ -7,5 +7,20 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-anyhow.workspace = true
+axum.workspace = true
+chrono.workspace = true
+minga-state = { path = "../minga-state" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tower.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+minga-bus = { path = "../minga-bus" }
+reqwest.workspace = true
+tempfile.workspace = true
+testcontainers.workspace = true
+tokio.workspace = true
+tower = { version = "0.5", features = ["util"] }
