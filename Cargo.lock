@@ -961,6 +961,7 @@ name = "minga-cli"
 version = "0.0.1"
 dependencies = [
  "clap",
+ "minga-bus",
  "minga-compose",
  "minga-node",
  "minga-scheduler",
@@ -1003,6 +1004,8 @@ name = "minga-node"
 version = "0.0.1"
 dependencies = [
  "async-trait",
+ "bincode",
+ "minga-bus",
  "minga-state",
  "serde",
  "tempfile",
@@ -1023,6 +1026,8 @@ dependencies = [
 name = "minga-scheduler"
 version = "0.0.1"
 dependencies = [
+ "bincode",
+ "minga-bus",
  "minga-compose",
  "minga-state",
  "serde",

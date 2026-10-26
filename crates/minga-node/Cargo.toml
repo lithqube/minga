@@ -8,6 +8,8 @@ license.workspace = true
 
 [dependencies]
 async-trait.workspace = true
+bincode.workspace = true
+minga-bus = { path = "../minga-bus" }
 minga-state = { path = "../minga-state" }
 serde.workspace = true
 thiserror.workspace = true

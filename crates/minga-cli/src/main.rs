@@ -48,6 +48,11 @@ struct NodeArgs {
     /// Reconcile interval in seconds.
     #[arg(long, default_value = "2")]
     interval: u64,
+    /// NATS server URL (e.g. nats://localhost:4222). If not set, uses
+    /// an in-memory bus (single-node development only). Can also be set
+    /// via the MINGA_NATS_URL environment variable.
+    #[arg(long, env = "MINGA_NATS_URL")]
+    nats_url: Option<String>,
 }
 
 #[derive(Args)]
@@ -138,12 +143,28 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
         }
     };
 
+    // Create the event bus: NATS if --nats-url is set, in-memory otherwise.
+    let bus: Arc<dyn minga_bus::EventBus> = match &args.nats_url {
+        Some(url) => match minga_bus::NatsBus::connect(url).await {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("error: cannot connect to NATS at {url}: {e}");
+                return ExitCode::FAILURE;
+            }
+        },
+        None => {
+            tracing::warn!("no --nats-url set; using in-memory bus (single-node development only)");
+            minga_bus::MemoryBus::new()
+        }
+    };
+
     let runtime = Arc::new(minga_node::MockRuntime::new());
-    let supervisor = minga_node::Supervisor::new(state.clone(), runtime, args.node_id);
+    let supervisor =
+        minga_node::Supervisor::with_bus(state.clone(), runtime, bus.clone(), args.node_id);
     let interval = Duration::from_secs(args.interval);
 
     if is_manager {
-        let scheduler = minga_scheduler::Scheduler::new(state);
+        let scheduler = minga_scheduler::Scheduler::with_bus(state, bus);
         tracing::info!(
             node_id = args.node_id,
             "starting manager loops (scheduler + supervisor)"

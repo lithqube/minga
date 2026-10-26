@@ -8,16 +8,18 @@
 //! 3. A 10-service Compose file is loaded and translated to state entities.
 //! 4. Services are written to the Raft state (via the leader).
 //! 5. The scheduler places tasks across all three nodes.
-//! 6. Each node's supervisor picks up its assigned tasks and starts
-//!    containers (via MockRuntime).
-//! 7. We verify: tasks are distributed across all 3 nodes, and each
-//!    node's supervisor has running containers for its assigned tasks.
+//! 6. Each node's supervisor picks up its assigned tasks via the event
+//!    bus and starts containers (via MockRuntime).
+//! 7. We verify: tasks are distributed across all 3 nodes, each node's
+//!    supervisor has running containers for its assigned tasks, status
+//!    reports are published to the bus KV, and all nodes have live leases.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use minga_bus::{subjects, EventBus, MemoryBus, TaskActualState, TaskStatusReport};
 use minga_node::{MockRuntime, Supervisor};
 use minga_scheduler::Scheduler;
 use minga_state::types::{ClusterNode, NodeStatus, ResourceSpec};
@@ -190,8 +192,9 @@ async fn phase0_gate_10_services_3_nodes() {
         assert_eq!(services.len(), 10, "all nodes should see 10 services");
     }
 
-    // --- 6. Run the scheduler (places tasks across 3 nodes) -------------------
-    let scheduler = Scheduler::new(leader.clone());
+    // --- 6. Run the scheduler (places tasks across 3 nodes, publishes commands) --
+    let bus = MemoryBus::new();
+    let scheduler = Scheduler::with_bus(leader.clone(), bus.clone());
     let actions = scheduler.reconcile_once().await.unwrap();
     assert!(!actions.is_empty(), "scheduler should create tasks");
     tracing::info!(actions = actions.len(), "scheduler created tasks");
@@ -247,14 +250,14 @@ async fn phase0_gate_10_services_3_nodes() {
         .collect();
     assert_eq!(logger_tasks.len(), 3, "logger (global) should have 3 tasks");
 
-    // --- 8. Run supervisors on each node --------------------------------------
+    // --- 8. Run supervisors on each node (via bus) -----------------------------
     let runtime1 = Arc::new(MockRuntime::new());
     let runtime2 = Arc::new(MockRuntime::new());
     let runtime3 = Arc::new(MockRuntime::new());
 
-    let sup1 = Supervisor::new(store1.clone(), runtime1.clone(), 1);
-    let sup2 = Supervisor::new(store2.clone(), runtime2.clone(), 2);
-    let sup3 = Supervisor::new(store3.clone(), runtime3.clone(), 3);
+    let sup1 = Supervisor::with_bus(store1.clone(), runtime1.clone(), bus.clone(), 1);
+    let sup2 = Supervisor::with_bus(store2.clone(), runtime2.clone(), bus.clone(), 2);
+    let sup3 = Supervisor::with_bus(store3.clone(), runtime3.clone(), bus.clone(), 3);
 
     let (a1, a2, a3) = tokio::join!(
         sup1.reconcile_once(),
@@ -312,10 +315,38 @@ async fn phase0_gate_10_services_3_nodes() {
         "supervisors should be idempotent"
     );
 
+    // --- 11. Verify bus: status reports and liveness --------------------------
+    // All 3 nodes should have live leases.
+    for node_id in 1..=3u64 {
+        assert!(
+            bus.is_alive(node_id).await.unwrap(),
+            "node {node_id} should have a live lease"
+        );
+    }
+
+    // Every task should have a status report in the bus KV.
+    for task in &all_tasks {
+        let key = subjects::kv_task_status(&task.id);
+        let status_bytes = bus
+            .get_status(&key)
+            .await
+            .unwrap_or_else(|e| panic!("failed to get status for {}: {e}", task.id));
+        assert!(
+            status_bytes.is_some(),
+            "task {} should have a status report in KV",
+            task.id
+        );
+        let report = TaskStatusReport::from_bytes(&status_bytes.unwrap())
+            .expect("status should deserialize");
+        assert_eq!(report.task_id, task.id);
+        assert_eq!(report.node_id, task.node_id);
+        assert_eq!(report.state, TaskActualState::Running);
+    }
+
     tracing::info!(
         tasks = all_tasks.len(),
         nodes = 3,
         containers = total_containers,
-        "Phase 0 gate PASSED: 10-service stack running on 3 nodes"
+        "Phase 0 gate PASSED: 10-service stack running on 3 nodes via event bus"
     );
 }

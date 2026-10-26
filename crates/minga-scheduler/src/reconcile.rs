@@ -12,7 +12,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use minga_state::types::{ClusterNode, Service, Task, TaskId};
+use minga_state::types::{ClusterNode, NodeId, Service, Task, TaskId};
 
 use crate::placement::place_service;
 
@@ -21,8 +21,9 @@ use crate::placement::place_service;
 pub enum ReconcileAction {
     /// Create (or overwrite) a task in the state store.
     CreateTask(Task),
-    /// Remove a task from the state store.
-    RemoveTask(TaskId),
+    /// Remove a task from the state store. Carries the node_id so the
+    /// scheduler can publish a stop command to the right node via the bus.
+    RemoveTask { task_id: TaskId, node_id: NodeId },
 }
 
 /// Computes the actions needed to make the cluster's tasks match the
@@ -67,7 +68,10 @@ pub fn plan(services: &[Service], tasks: &[Task], nodes: &[ClusterNode]) -> Vec<
         // a scale-down, or when a node became ineligible).
         for task in existing {
             if !desired_ids.contains(task.id.as_str()) {
-                actions.push(ReconcileAction::RemoveTask(task.id.clone()));
+                actions.push(ReconcileAction::RemoveTask {
+                    task_id: task.id.clone(),
+                    node_id: task.node_id,
+                });
             }
         }
     }
@@ -75,7 +79,10 @@ pub fn plan(services: &[Service], tasks: &[Task], nodes: &[ClusterNode]) -> Vec<
     // --- orphaned tasks: service was deleted ----------------------------------
     for task in tasks {
         if !service_ids.contains(task.service_id.as_str()) {
-            actions.push(ReconcileAction::RemoveTask(task.id.clone()));
+            actions.push(ReconcileAction::RemoveTask {
+                task_id: task.id.clone(),
+                node_id: task.node_id,
+            });
         }
     }
 
@@ -143,7 +150,7 @@ mod tests {
             .iter()
             .map(|a| match a {
                 ReconcileAction::CreateTask(t) => format!("+{}", t.id),
-                ReconcileAction::RemoveTask(id) => format!("-{id}"),
+                ReconcileAction::RemoveTask { task_id, .. } => format!("-{task_id}"),
             })
             .collect()
     }

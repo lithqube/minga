@@ -7,6 +7,8 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+bincode.workspace = true
+minga-bus = { path = "../minga-bus" }
 minga-compose = { path = "../minga-compose" }
 minga-state = { path = "../minga-state" }
 serde.workspace = true

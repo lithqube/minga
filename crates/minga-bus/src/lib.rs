@@ -152,6 +152,70 @@ pub type KvStream = Pin<Box<dyn Stream<Item = KvEvent> + Send>>;
 pub type RequestStream = Pin<Box<dyn Stream<Item = BusRequest> + Send>>;
 
 // ---------------------------------------------------------------------------
+// Status reports (actual state, carried over the bus)
+// ---------------------------------------------------------------------------
+
+/// Actual state of a task, reported by the node supervisor over the bus.
+///
+/// This is the **actual** state — distinct from `TaskState` in `minga-state`,
+/// which represents **desired** state in Raft. The supervisor publishes this
+/// to the `MINGA_STATUS` KV bucket; the scheduler reads it for placement
+/// decisions.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TaskStatusReport {
+    pub task_id: String,
+    pub node_id: u64,
+    pub state: TaskActualState,
+    pub container_id: Option<String>,
+    /// Unix timestamp in milliseconds.
+    pub observed_at: u64,
+}
+
+impl TaskStatusReport {
+    pub fn to_bytes(&self) -> Result<Vec<u8>> {
+        bincode::serde::encode_to_vec(self, bincode::config::standard())
+            .map_err(|e| BusError::Serialization(e.to_string()))
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        let (report, _) = bincode::serde::decode_from_slice(bytes, bincode::config::standard())
+            .map_err(|e| BusError::Serialization(e.to_string()))?;
+        Ok(report)
+    }
+}
+
+/// Actual state of a task (reported by the node, not stored in Raft).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum TaskActualState {
+    Starting,
+    Running,
+    Stopped,
+    Failed,
+}
+
+/// Actual state of a node, reported by the node supervisor over the bus.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct NodeStatusReport {
+    pub node_id: u64,
+    pub running_tasks: usize,
+    /// Unix timestamp in milliseconds.
+    pub observed_at: u64,
+}
+
+impl NodeStatusReport {
+    pub fn to_bytes(&self) -> Result<Vec<u8>> {
+        bincode::serde::encode_to_vec(self, bincode::config::standard())
+            .map_err(|e| BusError::Serialization(e.to_string()))
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        let (report, _) = bincode::serde::decode_from_slice(bytes, bincode::config::standard())
+            .map_err(|e| BusError::Serialization(e.to_string()))?;
+        Ok(report)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Trait
 // ---------------------------------------------------------------------------
 

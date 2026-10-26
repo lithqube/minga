@@ -270,7 +270,7 @@ services:
     let removes: Vec<&str> = actions
         .iter()
         .filter_map(|a| match a {
-            ReconcileAction::RemoveTask(id) => Some(id.as_str()),
+            ReconcileAction::RemoveTask { task_id, .. } => Some(task_id.as_str()),
             _ => None,
         })
         .collect();

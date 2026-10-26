@@ -41,6 +41,7 @@ pub mod translate;
 use std::sync::Arc;
 use std::time::Duration;
 
+use minga_bus::{Command, EventBus};
 use minga_state::{StateError, StateStore};
 use thiserror::Error;
 
@@ -53,19 +54,36 @@ pub use translate::{parse_memory, translate_project, TranslateError, TranslatedS
 pub enum SchedulerError {
     #[error("state error: {0}")]
     State(#[from] StateError),
+    #[error("bus error: {0}")]
+    Bus(String),
+    #[error("serialization error: {0}")]
+    Serialization(String),
 }
 
 /// The scheduler: runs the reconcile loop on the Raft leader.
 ///
 /// Only the leader reconciles. Followers stay idle — if leadership
 /// changes, the new leader picks up the loop.
+///
+/// When constructed with [`Scheduler::with_bus`], the scheduler also
+/// publishes task assign/stop commands to the event bus, which the
+/// node supervisors consume.
 pub struct Scheduler {
     state: Arc<StateStore>,
+    bus: Option<Arc<dyn EventBus>>,
 }
 
 impl Scheduler {
     pub fn new(state: Arc<StateStore>) -> Self {
-        Self { state }
+        Self { state, bus: None }
+    }
+
+    /// Create a scheduler that publishes commands to the event bus.
+    pub fn with_bus(state: Arc<StateStore>, bus: Arc<dyn EventBus>) -> Self {
+        Self {
+            state,
+            bus: Some(bus),
+        }
     }
 
     /// Runs one reconciliation pass. Returns the actions taken.
@@ -93,10 +111,44 @@ impl Scheduler {
                         "creating task"
                     );
                     self.state.upsert_task(task.clone()).await?;
+
+                    // Publish assign command to the bus.
+                    if let Some(bus) = &self.bus {
+                        let payload =
+                            bincode::serde::encode_to_vec(&task.spec, bincode::config::standard())
+                                .map_err(|e| SchedulerError::Serialization(e.to_string()))?;
+                        let cmd = Command::Assign {
+                            task_id: task.id.clone(),
+                            payload,
+                        };
+                        if let Err(e) = bus.send_command(task.node_id, &cmd).await {
+                            tracing::error!(
+                                task = %task.id,
+                                node = task.node_id,
+                                error = %e,
+                                "failed to publish assign command"
+                            );
+                        }
+                    }
                 }
-                ReconcileAction::RemoveTask(id) => {
-                    tracing::info!(task = %id, "removing task");
-                    self.state.remove_task(id.clone()).await?;
+                ReconcileAction::RemoveTask { task_id, node_id } => {
+                    tracing::info!(task = %task_id, "removing task");
+                    self.state.remove_task(task_id.clone()).await?;
+
+                    // Publish stop command to the bus.
+                    if let Some(bus) = &self.bus {
+                        let cmd = Command::Stop {
+                            task_id: task_id.clone(),
+                        };
+                        if let Err(e) = bus.send_command(*node_id, &cmd).await {
+                            tracing::error!(
+                                task = %task_id,
+                                node = node_id,
+                                error = %e,
+                                "failed to publish stop command"
+                            );
+                        }
+                    }
                 }
             }
         }

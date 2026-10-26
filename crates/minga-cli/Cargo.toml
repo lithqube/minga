@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 clap.workspace = true
+minga-bus = { path = "../minga-bus" }
 minga-compose = { path = "../minga-compose" }
 minga-node = { path = "../minga-node" }
 minga-scheduler = { path = "../minga-scheduler" }
