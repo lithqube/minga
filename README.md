@@ -96,6 +96,7 @@ Decisions are recorded as [ADRs](docs/adr/) in the repo.
 | `minga-state` | **Done** | Cluster state: openraft + redb. Multi-node Raft with TCP networking, leader election, failover, persistent log and state machine. 15 tests. |
 | `minga-scheduler` | **Done** | Placement engine: Compose → state entities, spread placement with constraints and resource awareness, reconcile loop. 49 tests. |
 | `minga-node` | **Done** | Node supervisor: `Runtime` trait with `MockRuntime`, reconcile loop that starts/stops containers based on Raft-assigned tasks. 12 tests. |
+| `minga-bus` | **Done** | Event bus abstraction: `EventBus` trait with `MemoryBus` (in-process) and `NatsBus` (NATS/JetStream). Commands, events, KV status, liveness leases, request/reply. 24 tests. |
 | `minga-api` | Scaffold | Docker Engine API subset (REST) and native gRPC API. |
 | `minga-net` | Scaffold | WireGuard overlay, nftables/eBPF, ingress. |
 | `minga-sandbox` | Scaffold | Agent sandboxes: wasmtime and Firecracker warm pools. |
@@ -133,7 +134,8 @@ Requirements: Rust 1.80+ (stable), with `rustfmt` and `clippy` components.
 - [x] **Scheduler** — Compose → state translation, spread placement with constraints, resource-aware reconcile loop
 - [x] **Node supervisor** — `Runtime` trait + `MockRuntime`, reconcile loop that starts/stops containers from Raft-assigned tasks
 - [x] **Phase 0 gate** — a 10-service Compose stack runs on 3 nodes (E2E integration test)
-- [ ] **Event bus (NATS/JetStream)** — `minga-bus` crate, task dispatch, status reporting, liveness leases — [evaluation complete](docs/research/nats-evaluation.md)
+- [x] **Event bus (NATS/JetStream)** — `minga-bus` crate: `EventBus` trait, `MemoryBus`, `NatsBus` — [ADR 0002](docs/adr/0002-event-bus-nats.md), [evaluation](docs/research/nats-evaluation.md)
+- [ ] **Bus integration** — wire scheduler/supervisor to `EventBus` for task dispatch, status reporting, liveness
 - [ ] **Containerd runtime** — real `Runtime` implementation replacing `MockRuntime`
 - [ ] **Overlay networking** — WireGuard mesh, ingress, service discovery
 - [ ] **Docker Engine API** — REST subset for `docker stack` / `docker service` compatibility
@@ -144,6 +146,7 @@ Requirements: Rust 1.80+ (stable), with `rustfmt` and `clippy` components.
 
 - [Design document](docs/design.md) — scope, feature gap vs Swarm, tech stack, roadmap
 - [ADR 0001: Language split](docs/adr/0001-language-split.md) — why Rust, when Go is acceptable
+- [ADR 0002: Event bus](docs/adr/0002-event-bus-nats.md) — NATS/JetStream behind `minga-bus`
 - [NATS/JetStream evaluation](docs/research/nats-evaluation.md) — should Minga adopt NATS as its event bus, and how
 - [CLAUDE.md](CLAUDE.md) — project conventions for AI-assisted development
 

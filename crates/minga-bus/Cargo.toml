@@ -1,0 +1,21 @@
+[package]
+name = "minga-bus"
+description = "Event bus abstraction: NATS/JetStream in production, in-memory for tests"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+async-nats.workspace = true
+async-trait.workspace = true
+bincode.workspace = true
+bytes.workspace = true
+futures.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
