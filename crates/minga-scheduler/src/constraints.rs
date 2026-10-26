@@ -119,6 +119,9 @@ mod tests {
                 .collect::<HashMap<_, _>>(),
             status: NodeStatus::Active,
             capacity: ResourceSpec::default(),
+            wg_public_key: None,
+            wg_endpoint: None,
+            overlay_ip: None,
         }
     }
 

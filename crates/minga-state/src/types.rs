@@ -39,6 +39,15 @@ pub struct ClusterNode {
     pub labels: HashMap<String, String>,
     pub status: NodeStatus,
     pub capacity: ResourceSpec,
+    /// WireGuard public key (base64), set when the node joins the overlay.
+    #[serde(default)]
+    pub wg_public_key: Option<String>,
+    /// WireGuard endpoint (host:port), set when the node is reachable.
+    #[serde(default)]
+    pub wg_endpoint: Option<String>,
+    /// This node's IP in the WireGuard overlay mesh.
+    #[serde(default)]
+    pub overlay_ip: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -94,6 +103,9 @@ pub struct Task {
     pub node_id: NodeId,
     pub state: TaskState,
     pub spec: TaskSpec,
+    /// IP addresses assigned to this task, keyed by network ID.
+    #[serde(default)]
+    pub ips: HashMap<NetworkId, String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -122,6 +134,12 @@ pub struct Network {
     pub name: String,
     pub driver: String,
     pub attachable: bool,
+    /// Subnet CIDR for the overlay (e.g. "10.100.0.0/24").
+    #[serde(default)]
+    pub subnet: Option<String>,
+    /// WireGuard listen port for this network (default 51820).
+    #[serde(default)]
+    pub wg_port: Option<u16>,
 }
 
 /// A named volume.

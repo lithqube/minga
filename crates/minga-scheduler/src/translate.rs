@@ -185,6 +185,15 @@ fn translate_resources(
     })
 }
 
+/// Extract a subnet CIDR from a Compose IPAM config (raw YAML value).
+/// Looks for `ipam.config[0].subnet`.
+fn parse_ipam_subnet(ipam: &Option<serde_yaml::Value>) -> Option<String> {
+    let ipam = ipam.as_ref()?;
+    let config = ipam.get("config")?.as_sequence()?;
+    let first = config.first()?;
+    first.get("subnet")?.as_str().map(String::from)
+}
+
 fn translate_networks(project: &Project, stack: &str) -> Vec<Network> {
     let mut networks: Vec<Network> = project
         .networks
@@ -194,6 +203,8 @@ fn translate_networks(project: &Project, stack: &str) -> Vec<Network> {
             name: net.name.clone().unwrap_or_else(|| network_id(stack, name)),
             driver: net.driver.clone().unwrap_or_else(|| "overlay".to_string()),
             attachable: net.attachable.unwrap_or(false),
+            subnet: parse_ipam_subnet(&net.ipam),
+            wg_port: None,
         })
         .collect();
 
@@ -206,6 +217,8 @@ fn translate_networks(project: &Project, stack: &str) -> Vec<Network> {
             name: default_id,
             driver: "overlay".to_string(),
             attachable: false,
+            subnet: None,
+            wg_port: None,
         });
     }
 

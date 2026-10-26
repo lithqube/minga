@@ -13,14 +13,17 @@ repository = "https://github.com/lithqube/minga"
 anyhow = "1"
 async-nats = "0.50"
 async-trait = "0.1"
+base64 = "0.22"
 bincode = { version = "2", features = ["serde"] }
 bytes = "1"
 futures = "0.3"
 hyper-util = { version = "0.1", features = ["tokio"] }
 indexmap = { version = "2", features = ["serde"] }
+ipnet = "2"
 openraft = { version = "0.9", features = ["serde", "storage-v2"] }
 prost = "0.13"
 prost-types = "0.13"
+rand = "0.8"
 redb = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -34,3 +37,4 @@ tonic = { version = "0.12", features = ["transport"] }
 tower = { version = "0.5", features = ["util"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+x25519-dalek = { version = "2", features = ["static_secrets"] }

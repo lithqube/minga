@@ -23,6 +23,9 @@ fn make_node(id: u64, cpus: f64, mem: u64) -> ClusterNode {
             memory_bytes: mem,
             gpus: 0,
         },
+        wg_public_key: None,
+        wg_endpoint: None,
+        overlay_ip: None,
     }
 }
 

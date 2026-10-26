@@ -418,6 +418,7 @@ mod tests {
                 }],
                 resources: ResourceSpec::default(),
             },
+            ips: HashMap::new(),
         }
     }
 

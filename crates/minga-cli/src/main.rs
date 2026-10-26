@@ -33,6 +33,67 @@ enum Command {
         /// Stack name.
         stack: String,
     },
+    /// Overlay network management.
+    Net {
+        #[command(subcommand)]
+        cmd: NetCommand,
+    },
+    /// WireGuard key and config utilities.
+    Wg {
+        #[command(subcommand)]
+        cmd: WgCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum NetCommand {
+    /// Create a new overlay network.
+    Create {
+        /// Network name.
+        name: String,
+        /// Subnet CIDR (e.g. 10.100.0.0/24). If omitted, auto-allocated from 10.100.0.0/16.
+        #[arg(long)]
+        subnet: Option<String>,
+        /// WireGuard listen port (default 51820).
+        #[arg(long)]
+        wg_port: Option<u16>,
+    },
+    /// Allocate the next available subnet from the default supernet.
+    AllocSubnet {
+        /// Network name (used for deterministic allocation).
+        name: String,
+    },
+    /// Show CIDR information for a subnet.
+    Inspect {
+        /// CIDR string (e.g. 10.100.0.0/24).
+        cidr: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum WgCommand {
+    /// Generate a new WireGuard keypair.
+    Keygen,
+    /// Show the public key derived from a private key.
+    Pubkey {
+        /// Base64-encoded private key.
+        private_key: String,
+    },
+    /// Generate a sample WireGuard interface config.
+    Config {
+        /// Private key (base64). If omitted, a new keypair is generated.
+        #[arg(long)]
+        private_key: Option<String>,
+        /// Listen port (default 51820).
+        #[arg(long, default_value = "51820")]
+        listen_port: u16,
+        /// Overlay IP with CIDR (e.g. 10.100.0.1/24).
+        #[arg(long)]
+        address: String,
+        /// Peer as public_key=endpoint=allowed_ips (repeatable).
+        #[arg(long = "peer")]
+        peers: Vec<String>,
+    },
 }
 
 #[derive(Args)]
@@ -120,6 +181,8 @@ async fn main() -> ExitCode {
             }
             tracing::info!(%stack, "cluster deployment: not implemented yet (translation only)");
         }
+        Command::Net { cmd } => return run_net(cmd),
+        Command::Wg { cmd } => return run_wg(cmd),
     }
     ExitCode::SUCCESS
 }
@@ -388,4 +451,139 @@ fn print_translated(t: &minga_scheduler::TranslatedStack) {
             println!("  {}", cfg.id);
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Network commands
+// ---------------------------------------------------------------------------
+
+fn run_net(cmd: NetCommand) -> ExitCode {
+    match cmd {
+        NetCommand::Create {
+            name,
+            subnet,
+            wg_port,
+        } => {
+            let mut mgr = minga_net::OverlayManager::new(1);
+            let result = match &subnet {
+                Some(s) => mgr.create_network(&name, &name, s, wg_port),
+                None => mgr.create_network_auto(&name, &name, wg_port),
+            };
+            match result {
+                Ok(()) => {
+                    let net = mgr.get_network(&name).unwrap();
+                    println!("network created:");
+                    println!("  id:       {}", net.id);
+                    println!("  name:     {}", net.name);
+                    println!("  subnet:   {}", net.subnet);
+                    println!("  wg_port:  {}", net.wg_port);
+                    println!("  wg_iface: {}", mgr.wg_interface_name(&name));
+                    println!("  usable:   {} hosts", net.subnet.usable_hosts());
+                }
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+        NetCommand::AllocSubnet { name } => match minga_net::ipam::allocate_subnet(&name) {
+            Ok(cidr) => {
+                println!("allocated subnet for '{name}': {cidr}");
+                println!("  usable hosts: {}", cidr.usable_hosts());
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                return ExitCode::FAILURE;
+            }
+        },
+        NetCommand::Inspect { cidr } => match minga_net::Cidr::parse(&cidr) {
+            Ok(c) => {
+                println!("CIDR: {c}");
+                println!("  network:    {}", c.network());
+                println!("  broadcast:  {}", c.broadcast());
+                println!("  prefix:     /{}", c.prefix_len());
+                println!("  total:      {} addresses", c.size());
+                println!("  usable:     {} hosts", c.usable_hosts());
+                if let Some(first) = c.nth_host(0) {
+                    println!("  first host: {first}");
+                }
+                if let Some(last) = c.nth_host(c.usable_hosts().saturating_sub(1)) {
+                    println!("  last host:  {last}");
+                }
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                return ExitCode::FAILURE;
+            }
+        },
+    }
+    ExitCode::SUCCESS
+}
+
+// ---------------------------------------------------------------------------
+// WireGuard commands
+// ---------------------------------------------------------------------------
+
+fn run_wg(cmd: WgCommand) -> ExitCode {
+    match cmd {
+        WgCommand::Keygen => {
+            let kp = minga_net::KeyPair::generate();
+            println!("private_key: {}", kp.private_key);
+            println!("public_key:  {}", kp.public_key);
+        }
+        WgCommand::Pubkey { private_key } => {
+            match minga_net::KeyPair::public_from_private(&private_key) {
+                Ok(pub_key) => println!("{pub_key}"),
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+        WgCommand::Config {
+            private_key,
+            listen_port,
+            address,
+            peers,
+        } => {
+            let private_key = match private_key {
+                Some(k) => k,
+                None => minga_net::KeyPair::generate().private_key,
+            };
+            let mut wg_peers = Vec::new();
+            for p in &peers {
+                // Format: public_key=endpoint=allowed_ips
+                let parts: Vec<&str> = p.split('=').collect();
+                if parts.len() < 2 {
+                    eprintln!("error: invalid peer format '{p}', expected public_key=endpoint=allowed_ips");
+                    return ExitCode::FAILURE;
+                }
+                let public_key = parts[0].to_string();
+                let endpoint = if parts.len() > 1 && !parts[1].is_empty() {
+                    Some(parts[1].to_string())
+                } else {
+                    None
+                };
+                let allowed_ips: Vec<String> = if parts.len() > 2 {
+                    parts[2].split(',').map(String::from).collect()
+                } else {
+                    vec![format!("{}/32", "0.0.0.0")] // placeholder
+                };
+                wg_peers.push(minga_net::Peer {
+                    public_key,
+                    allowed_ips,
+                    endpoint,
+                    keepalive: 25,
+                });
+            }
+            let config = minga_net::InterfaceConfig {
+                private_key,
+                listen_port,
+                address,
+                peers: wg_peers,
+            };
+            print!("{}", config.to_config_string());
+        }
+    }
+    ExitCode::SUCCESS
 }

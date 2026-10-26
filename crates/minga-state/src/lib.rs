@@ -28,6 +28,9 @@
 //!     labels: Default::default(),
 //!     status: NodeStatus::Active,
 //!     capacity: ResourceSpec { cpus: 8.0, memory_bytes: 32 * 1024 * 1024 * 1024, gpus: 1 },
+//!     wg_public_key: None,
+//!     wg_endpoint: None,
+//!     overlay_ip: None,
 //! }).await?;
 //!
 //! let nodes = store.list_nodes().await?;

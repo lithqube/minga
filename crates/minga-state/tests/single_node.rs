@@ -37,6 +37,9 @@ fn sample_node(id: u64) -> ClusterNode {
             memory_bytes: 32 * 1024 * 1024 * 1024,
             gpus: 1,
         },
+        wg_public_key: None,
+        wg_endpoint: None,
+        overlay_ip: None,
     }
 }
 
@@ -75,6 +78,7 @@ fn sample_task(id: &str, service_id: &str, node_id: u64) -> Task {
             ports: vec![],
             resources: ResourceSpec::default(),
         },
+        ips: HashMap::new(),
     }
 }
 
@@ -158,6 +162,8 @@ async fn write_and_read_network_volume_secret_config() {
         name: "backplane".to_string(),
         driver: "overlay".to_string(),
         attachable: true,
+        subnet: None,
+        wg_port: None,
     };
     store.upsert_network(net.clone()).await.unwrap();
     assert_eq!(store.get_network("backplane").await.unwrap(), Some(net));

@@ -8,4 +8,13 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+base64.workspace = true
+ipnet.workspace = true
+rand.workspace = true
+serde = { workspace = true, features = ["derive"] }
+thiserror.workspace = true
 tracing.workspace = true
+x25519-dalek.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

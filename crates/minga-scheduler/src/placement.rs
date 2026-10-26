@@ -108,6 +108,7 @@ pub fn place_service(
                     node_id: node.id,
                     state: TaskState::Pending,
                     spec: spec.clone(),
+                    ips: HashMap::new(),
                 });
                 consume(avail, &service.resources);
             }
@@ -128,6 +129,7 @@ pub fn place_service(
                             node_id: node.id,
                             state: TaskState::Pending,
                             spec: spec.clone(),
+                            ips: HashMap::new(),
                         });
                         consume(avail, &service.resources);
                         placed = true;
@@ -182,6 +184,9 @@ mod tests {
                 memory_bytes: mem,
                 gpus,
             },
+            wg_public_key: None,
+            wg_endpoint: None,
+            overlay_ip: None,
         }
     }
 
@@ -315,6 +320,7 @@ mod tests {
                     gpus: 0,
                 },
             },
+            ips: HashMap::new(),
         }];
         let tasks = place_service(&service, &nodes, &existing);
         assert_eq!(tasks.len(), 2);
@@ -346,6 +352,7 @@ mod tests {
                     gpus: 0,
                 },
             },
+            ips: HashMap::new(),
         }];
         let tasks = place_service(&service, &nodes, &existing);
         assert_eq!(tasks.len(), 1);

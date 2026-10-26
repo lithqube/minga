@@ -12,6 +12,7 @@ minga-bus = { path = "../minga-bus" }
 minga-compose = { path = "../minga-compose" }
 minga-state = { path = "../minga-state" }
 serde.workspace = true
+serde_yaml.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true

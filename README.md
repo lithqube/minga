@@ -8,7 +8,7 @@ A single-binary container and agent orchestrator for **edge, on-prem and air-gap
 
 Named after the [minga](https://en.wikipedia.org/wiki/Minga) of Chiloé, where a community moves a whole house together.
 
-> **Status: Phase 0 gate + event bus + NATS sidecar + containerd runtime.** A 10-service Compose stack runs on a 3-node Raft cluster end-to-end with NATS/JetStream event bus and real containerd containers. 170 tests across 6 crates. Networking, API, and agent sandboxes are next. See the [roadmap](#roadmap).
+> **Status: Phase 0 gate + event bus + NATS sidecar + containerd runtime + overlay networking.** A 10-service Compose stack runs on a 3-node Raft cluster end-to-end with NATS/JetStream event bus, real containerd containers, and WireGuard overlay networking (IPAM, DNS, config generation). 241 tests across 7 crates. Docker Engine API and agent sandboxes are next. See the [roadmap](#roadmap).
 
 ## Why Minga
 
@@ -98,7 +98,7 @@ Decisions are recorded as [ADRs](docs/adr/) in the repo.
 | `minga-node` | **Done** | Node supervisor: `Runtime` trait with `MockRuntime` (testing) and `ContainerdRuntime` (real containers via containerd gRPC). OCI spec generation, graceful shutdown (SIGTERM→SIGKILL), image pull. Reconcile loop starts/stops containers from Raft + bus. 43 tests. |
 | `minga-bus` | **Done** | Event bus abstraction: `EventBus` trait with `MemoryBus` (in-process) and `NatsBus` (NATS/JetStream). Commands, events, KV status, liveness leases, request/reply. 24 tests. |
 | `minga-api` | Scaffold | Docker Engine API subset (REST) and native gRPC API. |
-| `minga-net` | Scaffold | WireGuard overlay, nftables/eBPF, ingress. |
+| `minga-net` | **Done** | Overlay networking: CIDR utilities, deterministic IPAM (hash-based allocation, linear probing), WireGuard keypair generation (X25519) + `wg-quick` config generation, DNS service discovery (`minga.local`), `OverlayManager` coordinator. 70 tests. |
 | `minga-sandbox` | Scaffold | Agent sandboxes: wasmtime and Firecracker warm pools. |
 | `minga-egress` | Scaffold | LLM egress proxy: token and cost budgets, caching, secret redaction. |
 
@@ -138,7 +138,7 @@ Requirements: Rust 1.80+ (stable), with `rustfmt` and `clippy` components.
 - [x] **Bus integration** — scheduler publishes assign/stop commands, supervisor pulls commands + reports status + refreshes leases, CLI wired with `--nats-url`
 - [x] **NATS sidecar lifecycle** — manager spawns `nats-server` as a child process with generated config (JetStream enabled, pinned storage limits, readiness probe, `kill_on_drop` cleanup). Workers require `--nats-url` to connect to the manager's NATS server.
 - [x] **Containerd runtime** — `ContainerdRuntime` implementing the `Runtime` trait via containerd's gRPC API (Unix socket). OCI spec generation from `TaskSpec`, image pull, container/task lifecycle, graceful shutdown (SIGTERM → 10s grace → SIGKILL). CLI: `--runtime containerd --containerd-socket /run/containerd/containerd.sock`. Integration tests skip gracefully without containerd.
-- [ ] **Overlay networking** — WireGuard mesh, ingress, service discovery
+- [x] **Overlay networking** — `minga-net` crate: CIDR/IPAM (deterministic allocation from 10.100.0.0/16), WireGuard keypairs + config generation, DNS service discovery (`minga.local`), `OverlayManager` coordinator. State types extended: `Network.subnet`, `ClusterNode.wg_*`, `Task.ips`. CLI: `minga net create/inspect/alloc-subnet`, `minga wg keygen/pubkey/config`. Kernel-level data plane (netlink, `wg` apply) is a follow-up.
 - [ ] **Docker Engine API** — REST subset for `docker stack` / `docker service` compatibility
 - [ ] **Agent sandboxes** — wasmtime + Firecracker warm pools
 - [ ] **LLM egress proxy** — budgets, caching, secret redaction

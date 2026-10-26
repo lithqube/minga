@@ -14,6 +14,7 @@ path = "src/main.rs"
 clap.workspace = true
 minga-bus = { path = "../minga-bus" }
 minga-compose = { path = "../minga-compose" }
+minga-net = { path = "../minga-net" }
 minga-node = { path = "../minga-node" }
 minga-scheduler = { path = "../minga-scheduler" }
 minga-state = { path = "../minga-state" }

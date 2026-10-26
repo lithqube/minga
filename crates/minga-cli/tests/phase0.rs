@@ -43,6 +43,9 @@ fn cluster_node(id: u64, addr: &str) -> ClusterNode {
             memory_bytes: 32 * 1024 * 1024 * 1024,
             gpus: 0,
         },
+        wg_public_key: None,
+        wg_endpoint: None,
+        overlay_ip: None,
     }
 }
 

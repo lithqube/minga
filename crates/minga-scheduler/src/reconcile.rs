@@ -108,6 +108,9 @@ mod tests {
                 memory_bytes: 1 << 34,
                 gpus: 0,
             },
+            wg_public_key: None,
+            wg_endpoint: None,
+            overlay_ip: None,
         }
     }
 
@@ -142,6 +145,7 @@ mod tests {
                 ports: vec![],
                 resources: ResourceSpec::default(),
             },
+            ips: HashMap::new(),
         }
     }
 

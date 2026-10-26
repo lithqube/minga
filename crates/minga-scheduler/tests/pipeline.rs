@@ -29,6 +29,9 @@ fn node(id: u64, cpus: f64, mem: u64, gpus: u32, labels: &[(&str, &str)]) -> Clu
             memory_bytes: mem,
             gpus,
         },
+        wg_public_key: None,
+        wg_endpoint: None,
+        overlay_ip: None,
     }
 }
 
