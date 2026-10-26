@@ -8,7 +8,7 @@ A single-binary container and agent orchestrator for **edge, on-prem and air-gap
 
 Named after the [minga](https://en.wikipedia.org/wiki/Minga) of Chiloé, where a community moves a whole house together.
 
-> **Status: Phase 0 gate passed.** A 10-service Compose stack runs on a 3-node Raft cluster end-to-end: Compose parsing, state store (multi-node Raft), scheduler placement, and node supervisors with mock runtimes. 106 tests across 5 crates. Networking, API, and agent sandboxes are next. See the [roadmap](#roadmap).
+> **Status: Phase 0 gate + event bus + NATS sidecar + containerd runtime.** A 10-service Compose stack runs on a 3-node Raft cluster end-to-end with NATS/JetStream event bus and real containerd containers. 170 tests across 6 crates. Networking, API, and agent sandboxes are next. See the [roadmap](#roadmap).
 
 ## Why Minga
 
@@ -95,7 +95,7 @@ Decisions are recorded as [ADRs](docs/adr/) in the repo.
 | `minga-compose` | **Done** | Compose Specification parser and validator. Full interpolation, profiles, merge keys, `x-` extensions, dependency cycle detection, port conflict detection. 28 tests. |
 | `minga-state` | **Done** | Cluster state: openraft + redb. Multi-node Raft with TCP networking, leader election, failover, persistent log and state machine. 15 tests. |
 | `minga-scheduler` | **Done** | Placement engine: Compose → state entities, spread placement with constraints and resource awareness, reconcile loop. 49 tests. |
-| `minga-node` | **Done** | Node supervisor: `Runtime` trait with `MockRuntime`, reconcile loop that starts/stops containers based on Raft-assigned tasks. 12 tests. |
+| `minga-node` | **Done** | Node supervisor: `Runtime` trait with `MockRuntime` (testing) and `ContainerdRuntime` (real containers via containerd gRPC). OCI spec generation, graceful shutdown (SIGTERM→SIGKILL), image pull. Reconcile loop starts/stops containers from Raft + bus. 43 tests. |
 | `minga-bus` | **Done** | Event bus abstraction: `EventBus` trait with `MemoryBus` (in-process) and `NatsBus` (NATS/JetStream). Commands, events, KV status, liveness leases, request/reply. 24 tests. |
 | `minga-api` | Scaffold | Docker Engine API subset (REST) and native gRPC API. |
 | `minga-net` | Scaffold | WireGuard overlay, nftables/eBPF, ingress. |
@@ -137,7 +137,7 @@ Requirements: Rust 1.80+ (stable), with `rustfmt` and `clippy` components.
 - [x] **Event bus (NATS/JetStream)** — `minga-bus` crate: `EventBus` trait, `MemoryBus`, `NatsBus` — [ADR 0002](docs/adr/0002-event-bus-nats.md), [evaluation](docs/research/nats-evaluation.md)
 - [x] **Bus integration** — scheduler publishes assign/stop commands, supervisor pulls commands + reports status + refreshes leases, CLI wired with `--nats-url`
 - [x] **NATS sidecar lifecycle** — manager spawns `nats-server` as a child process with generated config (JetStream enabled, pinned storage limits, readiness probe, `kill_on_drop` cleanup). Workers require `--nats-url` to connect to the manager's NATS server.
-- [ ] **Containerd runtime** — real `Runtime` implementation replacing `MockRuntime`
+- [x] **Containerd runtime** — `ContainerdRuntime` implementing the `Runtime` trait via containerd's gRPC API (Unix socket). OCI spec generation from `TaskSpec`, image pull, container/task lifecycle, graceful shutdown (SIGTERM → 10s grace → SIGKILL). CLI: `--runtime containerd --containerd-socket /run/containerd/containerd.sock`. Integration tests skip gracefully without containerd.
 - [ ] **Overlay networking** — WireGuard mesh, ingress, service discovery
 - [ ] **Docker Engine API** — REST subset for `docker stack` / `docker service` compatibility
 - [ ] **Agent sandboxes** — wasmtime + Firecracker warm pools

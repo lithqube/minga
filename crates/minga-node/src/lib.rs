@@ -16,8 +16,9 @@
 //! # Runtime abstraction
 //!
 //! The supervisor talks to the container runtime through the [`Runtime`]
-//! trait. Phase 0 ships [`MockRuntime`] (in-memory simulation). A
-//! containerd-backed implementation comes in a later phase.
+//! trait. Two implementations are available:
+//! - [`MockRuntime`] — in-memory simulation for testing
+//! - [`ContainerdRuntime`] — real containers via containerd's gRPC API
 //!
 //! # Example
 //!
@@ -36,9 +37,11 @@
 //! # }
 //! ```
 
+pub mod containerd;
 pub mod runtime;
 pub mod supervisor;
 
+pub use containerd::ContainerdRuntime;
 pub use runtime::{
     shared_runtime, ContainerInfo, ContainerStatus, MockRuntime, Runtime, RuntimeError,
 };

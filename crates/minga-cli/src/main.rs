@@ -57,6 +57,13 @@ struct NodeArgs {
     /// via the MINGA_NATS_URL environment variable.
     #[arg(long, env = "MINGA_NATS_URL")]
     nats_url: Option<String>,
+    /// Container runtime: `mock` (in-memory, for testing) or `containerd`
+    /// (real containers via containerd's gRPC API).
+    #[arg(long, default_value = "mock")]
+    runtime: String,
+    /// Path to the containerd gRPC socket (used with --runtime containerd).
+    #[arg(long, default_value = "/run/containerd/containerd.sock")]
+    containerd_socket: String,
 }
 
 #[derive(Args)]
@@ -199,7 +206,31 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
         }
     };
 
-    let runtime = Arc::new(minga_node::MockRuntime::new());
+    // Construct the container runtime based on --runtime flag.
+    let runtime: Arc<dyn minga_node::Runtime> = match args.runtime.as_str() {
+        "mock" => {
+            tracing::info!("using MockRuntime (in-memory, no real containers)");
+            Arc::new(minga_node::MockRuntime::new())
+        }
+        "containerd" => {
+            tracing::info!(socket = %args.containerd_socket, "connecting to containerd");
+            match minga_node::ContainerdRuntime::connect(&args.containerd_socket).await {
+                Ok(rt) => Arc::new(rt),
+                Err(e) => {
+                    eprintln!(
+                        "error: cannot connect to containerd at {}: {e}",
+                        args.containerd_socket
+                    );
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+        other => {
+            eprintln!("error: unknown runtime '{other}' (expected 'mock' or 'containerd')");
+            return ExitCode::FAILURE;
+        }
+    };
+
     let supervisor =
         minga_node::Supervisor::with_bus(state.clone(), runtime, bus.clone(), args.node_id);
     let interval = Duration::from_secs(args.interval);
