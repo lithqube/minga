@@ -12,7 +12,7 @@ use tokio::time::timeout;
 use crate::command::{StateCommand, StateResponse};
 use crate::error::StateError;
 use crate::log_store::RedbLogStore;
-use crate::network::StubNetworkFactory;
+use crate::network::{serve_raft_rpc, TcpNetworkFactory};
 use crate::state_machine::RedbStateMachine;
 use crate::types::{
     ClusterNode, Config as StateConfig, ConfigId, Network, NetworkId, NodeId, Secret, SecretId,
@@ -29,6 +29,7 @@ pub struct StateStore {
     raft: Raft<TypeConfig>,
     reader: RedbStateMachine,
     node_id: NodeId,
+    rpc_server: tokio::task::JoinHandle<()>,
 }
 
 impl StateStore {
@@ -72,15 +73,16 @@ impl StateStore {
             .map_err(|e| StateError::storage(format!("invalid raft config: {e}")))?,
         );
 
-        let raft = Raft::new(
-            node_id,
-            config,
-            StubNetworkFactory,
-            log_store,
-            state_machine,
-        )
-        .await
-        .map_err(|e| StateError::Fatal(e.to_string()))?;
+        let bind_addr = bind_addr.into();
+
+        let raft = Raft::new(node_id, config, TcpNetworkFactory, log_store, state_machine)
+            .await
+            .map_err(|e| StateError::Fatal(e.to_string()))?;
+
+        // Start the RPC server so peers can reach this node.
+        let rpc_server = serve_raft_rpc(raft.clone(), &bind_addr)
+            .await
+            .map_err(|e| StateError::storage(format!("rpc server bind {bind_addr}: {e}")))?;
 
         // Initialize the cluster if it's pristine.
         let initialized = raft
@@ -90,13 +92,21 @@ impl StateStore {
 
         if !initialized {
             let mut members: BTreeMap<NodeId, BasicNode> = BTreeMap::new();
-            members.insert(node_id, BasicNode::new(bind_addr.into()));
+            members.insert(node_id, BasicNode::new(bind_addr.clone()));
             for (id, addr) in &peers {
                 members.insert(*id, BasicNode::new(addr.clone()));
             }
-            raft.initialize(members)
-                .await
-                .map_err(|e| StateError::Raft(format!("initialize: {e}")))?;
+            if let Err(e) = raft.initialize(members).await {
+                // Another node may have initialized concurrently.
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                let now = raft
+                    .is_initialized()
+                    .await
+                    .map_err(|e| StateError::Fatal(e.to_string()))?;
+                if !now {
+                    return Err(StateError::Raft(format!("initialize: {e}")));
+                }
+            }
         }
 
         // Wait for a leader to be elected (any node, not just us).
@@ -112,6 +122,7 @@ impl StateStore {
             raft,
             reader,
             node_id,
+            rpc_server,
         })
     }
 
@@ -130,8 +141,9 @@ impl StateStore {
         self.raft.current_leader().await
     }
 
-    /// Shuts down the Raft instance.
+    /// Shuts down the Raft instance and the RPC server.
     pub async fn shutdown(self) -> Result<(), StateError> {
+        self.rpc_server.abort();
         self.raft
             .shutdown()
             .await

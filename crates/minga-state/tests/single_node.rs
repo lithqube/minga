@@ -11,11 +11,16 @@ use minga_state::types::{
 };
 use minga_state::StateStore;
 
-/// Creates a StateStore in a unique temp directory.
+/// Unique port counter for parallel test isolation.
+static PORT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(51000);
+
+/// Creates a StateStore in a unique temp directory with a unique RPC port.
 async fn test_store(test_name: &str) -> (StateStore, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join(test_name);
-    let store = StateStore::open(1, "127.0.0.1:50051", &path, BTreeMap::new())
+    let port = PORT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let addr = format!("127.0.0.1:{port}");
+    let store = StateStore::open(1, &addr, &path, BTreeMap::new())
         .await
         .unwrap();
     (store, dir)
@@ -217,10 +222,12 @@ async fn multiple_writes_in_sequence() {
 async fn state_persists_across_restart() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("persistence");
+    let port = PORT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let addr = format!("127.0.0.1:{port}");
 
     // First run: write some data.
     {
-        let store = StateStore::open(1, "127.0.0.1:50051", &path, BTreeMap::new())
+        let store = StateStore::open(1, &addr, &path, BTreeMap::new())
             .await
             .unwrap();
         store.upsert_node(sample_node(1)).await.unwrap();
@@ -233,7 +240,7 @@ async fn state_persists_across_restart() {
 
     // Second run: data should still be there.
     {
-        let store = StateStore::open(1, "127.0.0.1:50051", &path, BTreeMap::new())
+        let store = StateStore::open(1, &addr, &path, BTreeMap::new())
             .await
             .unwrap();
         let node = store.get_node(1).await.unwrap().unwrap();

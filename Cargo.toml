@@ -11,6 +11,7 @@ repository = "https://github.com/lithqube/minga"
 
 [workspace.dependencies]
 anyhow = "1"
+async-trait = "0.1"
 bincode = { version = "2", features = ["serde"] }
 indexmap = { version = "2", features = ["serde"] }
 openraft = { version = "0.9", features = ["serde", "storage-v2"] }
@@ -21,5 +22,6 @@ serde_yaml = "0.9"
 thiserror = "2"
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
+tempfile = "3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

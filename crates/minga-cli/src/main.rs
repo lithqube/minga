@@ -1,4 +1,7 @@
+use std::collections::BTreeMap;
 use std::process::ExitCode;
+use std::sync::Arc;
+use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand};
 use minga_compose::{DeployMode, LoadOptions, Loaded};
@@ -13,10 +16,10 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Run this node in the manager role.
-    Manager,
-    /// Run this node in the worker role.
-    Worker,
+    /// Run this node in the manager role (scheduler + supervisor).
+    Manager(NodeArgs),
+    /// Run this node in the worker role (supervisor only).
+    Worker(NodeArgs),
     /// Check a Compose file and print what would be deployed.
     Validate(ComposeArgs),
     /// Deploy a Compose file as a stack.
@@ -29,6 +32,25 @@ enum Command {
 }
 
 #[derive(Args)]
+struct NodeArgs {
+    /// This node's Raft ID.
+    #[arg(long)]
+    node_id: u64,
+    /// Address to bind the Raft RPC server (e.g. 0.0.0.0:50051).
+    #[arg(long)]
+    bind: String,
+    /// Data directory for Raft state (raft_log.redb, state.redb).
+    #[arg(long, default_value = "/var/lib/minga")]
+    data_dir: String,
+    /// Peer node as id=address (repeatable). Include all other nodes.
+    #[arg(long = "peer")]
+    peers: Vec<String>,
+    /// Reconcile interval in seconds.
+    #[arg(long, default_value = "2")]
+    interval: u64,
+}
+
+#[derive(Args)]
 struct ComposeArgs {
     /// Path to the Compose file.
     #[arg(short = 'c', long, default_value = "compose.yaml")]
@@ -36,6 +58,21 @@ struct ComposeArgs {
     /// Profile to enable; repeat for several, or use `*` for all.
     #[arg(short, long = "profile")]
     profiles: Vec<String>,
+}
+
+/// Parses `--peer id=address` into a BTreeMap.
+fn parse_peers(raw: &[String]) -> Result<BTreeMap<u64, String>, String> {
+    let mut peers = BTreeMap::new();
+    for p in raw {
+        let (id, addr) = p
+            .split_once('=')
+            .ok_or_else(|| format!("invalid peer {p:?}, expected id=address"))?;
+        let id: u64 = id
+            .parse()
+            .map_err(|_| format!("invalid peer id {id:?}, expected a number"))?;
+        peers.insert(id, addr.to_string());
+    }
+    Ok(peers)
 }
 
 #[tokio::main]
@@ -46,8 +83,8 @@ async fn main() -> ExitCode {
         .init();
 
     match Cli::parse().command {
-        Command::Manager => tracing::info!("manager role: not implemented yet"),
-        Command::Worker => tracing::info!("worker role: not implemented yet"),
+        Command::Manager(args) => return run_node(args, true).await,
+        Command::Worker(args) => return run_node(args, false).await,
         Command::Validate(args) => {
             let Some(loaded) = load(&args) else {
                 return ExitCode::FAILURE;
@@ -68,6 +105,61 @@ async fn main() -> ExitCode {
             tracing::info!(%stack, "cluster deployment: not implemented yet (translation only)");
         }
     }
+    ExitCode::SUCCESS
+}
+
+/// Runs a node (manager or worker): opens the state store, starts the
+/// supervisor, and (for managers) the scheduler.
+async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
+    let peers = match parse_peers(&args.peers) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    tracing::info!(
+        node_id = args.node_id,
+        bind = %args.bind,
+        data_dir = %args.data_dir,
+        peers = ?peers,
+        role = if is_manager { "manager" } else { "worker" },
+        "starting minga node"
+    );
+
+    let state = match minga_state::StateStore::open(args.node_id, &args.bind, &args.data_dir, peers)
+        .await
+    {
+        Ok(s) => Arc::new(s),
+        Err(e) => {
+            eprintln!("error: cannot open state store: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let runtime = Arc::new(minga_node::MockRuntime::new());
+    let supervisor = minga_node::Supervisor::new(state.clone(), runtime, args.node_id);
+    let interval = Duration::from_secs(args.interval);
+
+    if is_manager {
+        let scheduler = minga_scheduler::Scheduler::new(state);
+        tracing::info!(
+            node_id = args.node_id,
+            "starting manager loops (scheduler + supervisor)"
+        );
+        tokio::select! {
+            _ = scheduler.run(interval) => {},
+            _ = supervisor.run(interval) => {},
+        }
+    } else {
+        tracing::info!(
+            node_id = args.node_id,
+            "starting worker loop (supervisor only)"
+        );
+        supervisor.run(interval).await;
+    }
+
     ExitCode::SUCCESS
 }
 

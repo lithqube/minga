@@ -2,13 +2,13 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.80%2B-orange.svg)](https://www.rust-lang.org)
-[![Status](https://img.shields.io/badge/status-phase%200%20(scaffolding)-yellow.svg)]()
+[![Status](https://img.shields.io/badge/status-phase%200%20(gate%20passed)-green.svg)]()
 
 A single-binary container and agent orchestrator for **edge, on-prem and air-gapped sites**, written in Rust. It runs Compose files natively, speaks enough of the Docker Swarm API to replace it, and treats AI-agent workloads — sandboxes, durable runs, budgets, GPUs — as first-class objects.
 
 Named after the [minga](https://en.wikipedia.org/wiki/Minga) of Chiloé, where a community moves a whole house together.
 
-> **Status: Phase 0 — design and scaffolding.** The Compose parser and `minga validate` command are working. The Raft-backed cluster state store (`minga-state`) is implemented and tested. The scheduler, node supervisor, networking, and agent sandboxes are scaffolded but not yet built. See the [roadmap](#roadmap).
+> **Status: Phase 0 gate passed.** A 10-service Compose stack runs on a 3-node Raft cluster end-to-end: Compose parsing, state store (multi-node Raft), scheduler placement, and node supervisors with mock runtimes. 106 tests across 5 crates. Networking, API, and agent sandboxes are next. See the [roadmap](#roadmap).
 
 ## Why Minga
 
@@ -91,12 +91,12 @@ Decisions are recorded as [ADRs](docs/adr/) in the repo.
 
 | Crate | Status | Purpose |
 | --- | --- | --- |
-| `minga-cli` | Partial | The `minga` binary: manager, worker and CLI. `validate` and `deploy` (translation) work; `manager`/`worker` are stubs. |
+| `minga-cli` | **Done** | The `minga` binary: `validate`, `deploy` (translation), `manager`, and `worker` subcommands wired to the scheduler and supervisor. |
 | `minga-compose` | **Done** | Compose Specification parser and validator. Full interpolation, profiles, merge keys, `x-` extensions, dependency cycle detection, port conflict detection. 28 tests. |
-| `minga-state` | **Done** | Cluster state: openraft + redb. Single-node Raft with persistent log and state machine. 9 integration tests. |
+| `minga-state` | **Done** | Cluster state: openraft + redb. Multi-node Raft with TCP networking, leader election, failover, persistent log and state machine. 15 tests. |
 | `minga-scheduler` | **Done** | Placement engine: Compose → state entities, spread placement with constraints and resource awareness, reconcile loop. 49 tests. |
+| `minga-node` | **Done** | Node supervisor: `Runtime` trait with `MockRuntime`, reconcile loop that starts/stops containers based on Raft-assigned tasks. 12 tests. |
 | `minga-api` | Scaffold | Docker Engine API subset (REST) and native gRPC API. |
-| `minga-node` | Scaffold | Node supervisor: containerd integration, task lifecycle, offline operation. |
 | `minga-net` | Scaffold | WireGuard overlay, nftables/eBPF, ingress. |
 | `minga-sandbox` | Scaffold | Agent sandboxes: wasmtime and Firecracker warm pools. |
 | `minga-egress` | Scaffold | LLM egress proxy: token and cost budgets, caching, secret redaction. |
@@ -129,20 +129,22 @@ Requirements: Rust 1.80+ (stable), with `rustfmt` and `clippy` components.
 ## Roadmap
 
 - [x] **Compose parser & validator** — full spec parsing, interpolation, profiles, validation
-- [x] **Raft state store** — openraft + redb, single-node consensus, persistent state
+- [x] **Raft state store** — openraft + redb, multi-node consensus over TCP, leader election, failover, persistent state
 - [x] **Scheduler** — Compose → state translation, spread placement with constraints, resource-aware reconcile loop
-- [ ] **Phase 0 gate** — a 10-service Compose stack runs on 3 nodes
-- [ ] **Node supervisor** — containerd integration, task lifecycle
+- [x] **Node supervisor** — `Runtime` trait + `MockRuntime`, reconcile loop that starts/stops containers from Raft-assigned tasks
+- [x] **Phase 0 gate** — a 10-service Compose stack runs on 3 nodes (E2E integration test)
+- [ ] **Event bus (NATS/JetStream)** — `minga-bus` crate, task dispatch, status reporting, liveness leases — [evaluation complete](docs/research/nats-evaluation.md)
+- [ ] **Containerd runtime** — real `Runtime` implementation replacing `MockRuntime`
 - [ ] **Overlay networking** — WireGuard mesh, ingress, service discovery
 - [ ] **Docker Engine API** — REST subset for `docker stack` / `docker service` compatibility
 - [ ] **Agent sandboxes** — wasmtime + Firecracker warm pools
 - [ ] **LLM egress proxy** — budgets, caching, secret redaction
-- [ ] **Multi-node Raft** — gRPC inter-node communication, sharded Raft groups
 
 ## Documentation
 
 - [Design document](docs/design.md) — scope, feature gap vs Swarm, tech stack, roadmap
 - [ADR 0001: Language split](docs/adr/0001-language-split.md) — why Rust, when Go is acceptable
+- [NATS/JetStream evaluation](docs/research/nats-evaluation.md) — should Minga adopt NATS as its event bus, and how
 - [CLAUDE.md](CLAUDE.md) — project conventions for AI-assisted development
 
 ## Contributing
