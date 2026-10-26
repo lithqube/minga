@@ -10,6 +10,7 @@ license.workspace = true
 axum.workspace = true
 chrono.workspace = true
 minga-state = { path = "../minga-state" }
+minga-telemetry = { path = "../minga-telemetry" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

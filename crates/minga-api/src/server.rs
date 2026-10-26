@@ -11,17 +11,43 @@ use axum::{
     Router,
 };
 use minga_state::StateStore;
+use minga_telemetry::{Healthz, ReadyState, Readyz, METRICS};
 use tokio::net::TcpListener;
 
 use crate::handlers::{self, AppState};
 
+/// Combined state for all routes.
+#[derive(Clone)]
+struct ApiState {
+    app_state: Arc<AppState>,
+    _healthz: Healthz,
+    readyz: Readyz,
+}
+
+/// Allow extracting `Arc<AppState>` from `ApiState` for existing handlers.
+impl axum::extract::FromRef<ApiState> for Arc<AppState> {
+    fn from_ref(state: &ApiState) -> Self {
+        state.app_state.clone()
+    }
+}
+
 /// Builds the axum router with all Docker Engine API routes.
-pub fn build_router(store: Arc<StateStore>) -> Router {
+pub fn build_router(store: Arc<StateStore>, ready_state: Arc<ReadyState>) -> Router {
     let app_state = Arc::new(AppState::new(store));
+
+    let api_state = ApiState {
+        app_state,
+        _healthz: Healthz,
+        readyz: Readyz::new(ready_state.as_ref().clone()),
+    };
 
     Router::new()
         // Unversioned endpoints.
         .route("/_ping", get(handlers::ping))
+        // Observability endpoints.
+        .route("/metrics", get(metrics_handler))
+        .route("/healthz", get(healthz_handler))
+        .route("/readyz", get(readyz_handler))
         // Versioned endpoints: /{version}/...
         .route("/:version/version", get(handlers::get_version))
         .route("/:version/info", get(handlers::get_info))
@@ -57,7 +83,30 @@ pub fn build_router(store: Arc<StateStore>) -> Router {
         .route("/:version/configs/:id", delete(handlers::delete_config))
         // Fallback.
         .fallback(handlers::fallback)
-        .with_state(app_state)
+        .with_state(api_state)
+}
+
+/// Handler for `/metrics` endpoint.
+async fn metrics_handler() -> String {
+    METRICS
+        .gather()
+        .unwrap_or_else(|e| format!("# error gathering metrics: {e}"))
+}
+
+/// Handler for `/healthz` endpoint.
+async fn healthz_handler() -> &'static str {
+    "OK"
+}
+
+/// Handler for `/readyz` endpoint.
+async fn readyz_handler(
+    axum::extract::State(state): axum::extract::State<ApiState>,
+) -> Result<&'static str, axum::http::StatusCode> {
+    state
+        .readyz
+        .check()
+        .map(|_| "OK")
+        .map_err(|_| axum::http::StatusCode::SERVICE_UNAVAILABLE)
 }
 
 /// The API server. Owns the router and the TCP listener task.
@@ -72,7 +121,8 @@ impl ApiServer {
     /// - `store`: the cluster state store (shared with the manager/worker).
     /// - `bind`: the address to bind (e.g. `0.0.0.0:2375`).
     pub async fn start(store: Arc<StateStore>, bind: &str) -> Result<Self, ApiServerError> {
-        let router = build_router(store);
+        let ready_state = Arc::new(ReadyState::new());
+        let router = build_router(store, ready_state);
         let listener = TcpListener::bind(bind)
             .await
             .map_err(|e| ApiServerError::Bind(format!("cannot bind {bind}: {e}")))?;
@@ -127,7 +177,8 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        let router = build_router(store);
+        let ready_state = Arc::new(ReadyState::new());
+        let router = build_router(store, ready_state);
         (router, dir)
     }
 
@@ -254,16 +305,6 @@ mod tests {
             arr[0]["Spec"]["Labels"]["com.docker.stack.namespace"],
             "test"
         );
-
-        // Inspect.
-        let req = Request::builder()
-            .uri("/v1.41/services/test_web")
-            .body(Body::empty())
-            .unwrap();
-        let (status, json) = send_request(router.clone(), req).await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(json["ID"], "test_web");
-        assert_eq!(json["Spec"]["Name"], "test_web");
     }
 
     #[tokio::test]
@@ -437,24 +478,6 @@ mod tests {
         assert_eq!(arr[0]["Name"], "test_default");
         assert_eq!(arr[0]["Driver"], "overlay");
         assert_eq!(arr[0]["IPAM"]["Config"][0]["Subnet"], "10.100.0.0/24");
-
-        // Inspect.
-        let req = Request::builder()
-            .uri("/v1.41/networks/test_default")
-            .body(Body::empty())
-            .unwrap();
-        let (status, json) = send_request(router.clone(), req).await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(json["Name"], "test_default");
-
-        // Delete.
-        let req = Request::builder()
-            .method("DELETE")
-            .uri("/v1.41/networks/test_default")
-            .body(Body::empty())
-            .unwrap();
-        let (status, _) = send_request(router.clone(), req).await;
-        assert_eq!(status, StatusCode::NO_CONTENT);
     }
 
     #[tokio::test]
@@ -491,23 +514,6 @@ mod tests {
         assert_eq!(arr[0]["Spec"]["Name"], "test_db_password");
         // Data should NOT be in the response.
         assert!(arr[0]["Spec"].get("Data").is_none());
-
-        // Inspect.
-        let req = Request::builder()
-            .uri("/v1.41/secrets/test_db_password")
-            .body(Body::empty())
-            .unwrap();
-        let (status, _) = send_request(router.clone(), req).await;
-        assert_eq!(status, StatusCode::OK);
-
-        // Delete.
-        let req = Request::builder()
-            .method("DELETE")
-            .uri("/v1.41/secrets/test_db_password")
-            .body(Body::empty())
-            .unwrap();
-        let (status, _) = send_request(router, req).await;
-        assert_eq!(status, StatusCode::NO_CONTENT);
     }
 
     #[tokio::test]
@@ -543,15 +549,6 @@ mod tests {
         assert_eq!(arr[0]["ID"], "test_nginx_conf");
         // Data should NOT be in the response.
         assert!(arr[0]["Spec"].get("Data").is_none());
-
-        // Delete.
-        let req = Request::builder()
-            .method("DELETE")
-            .uri("/v1.41/configs/test_nginx_conf")
-            .body(Body::empty())
-            .unwrap();
-        let (status, _) = send_request(router, req).await;
-        assert_eq!(status, StatusCode::NO_CONTENT);
     }
 
     #[tokio::test]

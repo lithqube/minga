@@ -16,6 +16,7 @@ serde.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+minga-telemetry = { path = "../minga-telemetry" }
 
 [dev-dependencies]
 futures.workspace = true
