@@ -153,6 +153,231 @@ minga stack deploy -f docker-compose.yml
 
 ---
 
+## Hetzner Cloud (hcloud) Deployment
+
+**Recommended for cloud deployments** — Hetzner provides Talos as a Public ISO and first-class `hcloud` CLI/Terraform support.
+
+### Why hcloud for Minga?
+
+| Feature | Benefit |
+|---------|---------|
+| **Talos Public ISO** | Pre-built ISO with qemu-guest-agent (schematic `ce4c980550dd2ab1b17bbf2b08801c7eb59418eafe8f279833297925d67c7515`) |
+| **Native Load Balancer** | Stable VIP for control plane (`hcloud load-balancer`) — no keepalived needed |
+| **Private Networks** | Isolated cluster traffic via Hetzner Cloud Networks |
+| **Terraform Modules** | `hcloud-talos/talos/hcloud`, `hcloud-k8s/kubernetes/hcloud` for reproducible clusters |
+| **Cost-effective** | CPX22 (2 vCPU, 4 GB) ≈ €4.50/mo per node |
+
+### Quick Start: 3-Node Cluster on hcloud
+
+#### Prerequisites
+- `hcloud` CLI ≥ 1.45 (`brew install hcloud` or download from GitHub)
+- `talosctl` ≥ 1.14
+- Hetzner Cloud API token (`HCLOUD_TOKEN`)
+
+#### 1. Create Control Plane Load Balancer (provides VIP)
+```bash
+# Create LB for control plane API (port 6443)
+hcloud load-balancer create --name minga-cp --network-zone eu-central --type lb11 --label 'type=controlplane'
+# Note the LB IPv4 address (e.g., 49.12.x.x)
+hcloud load-balancer add-service minga-cp --listen-port 6443 --destination-port 6443 --protocol tcp
+LB_IP=$(hcloud load-balancer describe minga-cp -o json | jq -r '.public_net.ipv4.ip')
+```
+
+#### 2. Generate Talos Config (use LB IP as endpoint)
+```bash
+talosctl gen config minga-cluster https://${LB_IP}:6443 \
+  --output-dir ./talos-config \
+  --config-patch @./talos-patches/containerd.yaml \
+  --config-patch @./talos-patches/wireguard.yaml
+# --with-examples=false --with-docs=false  # Avoid 32KB userdata limit
+```
+
+#### 3. Get Talos Public ISO Image ID
+```bash
+# List available images, find Talos (schematic ce4c980550dd2ab1b17bbf2b08801c7eb59418eafe8f279833297925d67c7515)
+hcloud image list --type iso --selector 'os_flavor=talos'
+# Or use the known schematic via factory.talos.dev:
+TALOS_ISO_ID=$(hcloud image list --type iso -o json | jq -r '.[] | select(.description | contains("talos")) | .id' | head -1)
+```
+
+#### 4. Create Control Plane Nodes (3 nodes for HA)
+```bash
+for i in 1 2 3; do
+  hcloud server create \
+    --name "minga-cp${i}" \
+    --type cpx22 \
+    --image "${TALOS_ISO_ID}" \
+    --user-data-from-file ./talos-config/controlplane.yaml \
+    --label type=controlplane \
+    --location nbg1 \
+    --ssh-key <your-ssh-key>  # Only for rescue/debug; Talos has no SSH
+done
+```
+
+#### 5. Add Control Plane Nodes to Load Balancer
+```bash
+hcloud load-balancer add-target minga-cp --label-selector 'type=controlplane'
+```
+
+#### 6. (Optional) Create Worker Nodes
+```bash
+for i in 1 2; do
+  hcloud server create \
+    --name "minga-worker${i}" \
+    --type cpx22 \
+    --image "${TALOS_ISO_ID}" \
+    --user-data-from-file ./talos-config/worker.yaml \
+    --label type=worker \
+    --location nbg1
+done
+```
+
+#### 7. Bootstrap etcd (on first control plane node)
+```bash
+CP1_IP=$(hcloud server ip minga-cp1)
+talosctl bootstrap --nodes "${CP1_IP}" --endpoints "${CP1_IP}"
+```
+
+#### 8. Deploy Minga Binary (via talosctl, no SSH)
+```bash
+for NODE in minga-cp1 minga-cp2 minga-cp3 minga-worker1 minga-worker2; do
+  NODE_IP=$(hcloud server ip "${NODE}")
+  talosctl --nodes "${NODE_IP}" upload ./bin/minga-linux-amd64 /opt/minga/minga
+  talosctl --nodes "${NODE_IP}" upload ./scripts/minga.service /etc/systemd/system/minga.service
+  talosctl --nodes "${NODE_IP}" run --command "systemctl daemon-reload && systemctl enable --now minga"
+done
+```
+
+#### 9. Verify
+```bash
+# Health checks
+for NODE in minga-cp1 minga-cp2 minga-cp3; do
+  IP=$(hcloud server ip "${NODE}")
+  echo "=== ${NODE} (${IP}) ==="
+  curl -sf "http://${IP}:2375/healthz" && echo "healthz: OK"
+  curl -sf "http://${IP}:2375/readyz" && echo "readyz: OK"
+  curl -s  "http://${IP}:2375/metrics" | head -5
+done
+
+# Deploy a stack
+minga stack deploy -f docker-compose.yml
+```
+
+### Single-Node on hcloud (Dev/Test)
+
+```bash
+# 1. Create LB (single node still needs stable endpoint)
+hcloud load-balancer create --name minga-single --network-zone eu-central --type lb11
+hcloud load-balancer add-service minga-single --listen-port 6443 --destination-port 6443 --protocol tcp
+LB_IP=$(hcloud load-balancer describe minga-single -o json | jq -r '.public_net.ipv4.ip')
+
+# 2. Generate config
+talosctl gen config minga-single https://${LB_IP}:6443 --output-dir ./talos-config --config-patch @./talos-patches/containerd.yaml
+
+# 3. Create server
+TALOS_ISO_ID=$(hcloud image list --type iso --selector 'os_flavor=talos' -o json | jq -r '.[0].id')
+hcloud server create --name minga-single --type cpx22 --image "${TALOS_ISO_ID}" --user-data-from-file ./talos-config/controlplane.yaml --label type=controlplane
+
+# 4. Add to LB
+hcloud load-balancer add-target minga-single --label-selector 'type=controlplane'
+
+# 5. Bootstrap (self)
+IP=$(hcloud server ip minga-single)
+talosctl bootstrap --nodes "${IP}" --endpoints "${IP}"
+
+# 6. Deploy Minga (same as step 8 above)
+```
+
+### Terraform Alternative (Reproducible Clusters)
+
+```hcl
+# terraform/main.tf
+terraform {
+  required_version = ">= 1.5"
+  required_providers {
+    hcloud = { source = "hetznercloud/hcloud", version = "~> 1.45" }
+  }
+}
+
+provider "hcloud" { token = var.hcloud_token }
+
+# Talos image (use factory.talos.dev URL or local snapshot)
+data "hcloud_image" "talos" {
+  type = "iso"
+  selectors = { os_flavor = "talos" }
+  most_recent = true
+}
+
+# Load balancer for control plane
+resource "hcloud_load_balancer" "controlplane" {
+  name            = "minga-cp"
+  load_balancer_type = "lb11"
+  network_zone    = "eu-central"
+  target_labels   = { type = "controlplane" }
+  service {
+    listen_port      = 6443
+    destination_port = 6443
+    protocol         = "tcp"
+  }
+}
+
+# Control plane nodes (3 for HA)
+resource "hcloud_server" "controlplane" {
+  count               = 3
+  name                = "minga-cp${count.index + 1}"
+  server_type         = "cpx22"
+  image               = data.hcloud_image.talos.id
+  user_data           = file("${path.module}/talos-config/controlplane.yaml")
+  labels              = { type = "controlplane" }
+  location            = "nbg1"
+  ssh_keys            = [var.ssh_key_name]
+}
+
+# Worker nodes
+resource "hcloud_server" "worker" {
+  count     = 2
+  name      = "minga-worker${count.index + 1}"
+  server_type = "cpx22"
+  image       = data.hcloud_image.talos.id
+  user_data   = file("${path.module}/talos-config/worker.yaml")
+  labels      = { type = "worker" }
+  location    = "nbg1"
+}
+
+output "controlplane_ips" { value = hcloud_server.controlplane[*].ipv4_address }
+output "lb_ip" { value = hcloud_load_balancer.controlplane.ipv4_address }
+```
+
+```bash
+# Deploy
+terraform init && terraform apply
+# Then bootstrap:
+talosctl bootstrap --nodes $(terraform output -raw controlplane_ips | jq -r '.[0]') --endpoints $(terraform output -raw lb_ip)
+```
+
+### Minga-Specific hcloud Notes
+
+| Area | Detail |
+|------|--------|
+| **Containerd socket** | `unix:///run/containerd/containerd.sock` — works out of box |
+| **WireGuard** | Use Talos `machine.network.wireguard` config OR Minga's built-in overlay (both work) |
+| **Private networking** | Create `hcloud network` + attach servers; Minga overlay uses private IPs |
+| **NATS** | Run as Minga sidecar (`minga sidecar nats`) on one node, or external |
+| **Persistent volumes** | Hetzner CSI driver available if needed; Minga local volumes work on local disk |
+| **Upgrades** | `talosctl upgrade --nodes <ip> --image factory.talos.dev/siderolabs/talos:v1.14.x` — zero-downtime with HA |
+| **Backups** | `hcloud server create-snapshot` before upgrades for instant rollback |
+
+### Cost Estimate (3 CP + 2 Worker, CPX22, Nuremberg)
+
+| Resource | Monthly (EUR) |
+|----------|---------------|
+| 5 × CPX22 | ~€22.50 |
+| 1 × LB11 | ~€5.50 |
+| Network | Free (private) |
+| **Total** | **~€28/mo** |
+
+---
+
 ## Air-Gapped / Offline Install
 
 1. **Build Talos ISO with pre-loaded images**:
