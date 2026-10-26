@@ -6,12 +6,15 @@ members = ["crates/*"]
 version = "0.0.1"
 edition = "2021"
 rust-version = "1.80"
-license = "TBD"
-repository = ""
+license = "MIT"
+repository = "https://github.com/lithqube/minga"
 
 [workspace.dependencies]
 anyhow = "1"
+bincode = { version = "2", features = ["serde"] }
 indexmap = { version = "2", features = ["serde"] }
+openraft = { version = "0.9", features = ["serde", "storage-v2"] }
+redb = "2"
 serde = { version = "1", features = ["derive"] }
 serde_path_to_error = "0.1"
 serde_yaml = "0.9"
