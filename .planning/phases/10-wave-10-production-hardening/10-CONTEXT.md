@@ -2,20 +2,16 @@
 
 **Phase:** 10
 **Name:** production-hardening
-**Date:** 2026-10-26
-**Status:** Context gathered — ready for planning
+**Date:** 2026-10-27
+**Status:** Decisions gathered; feasibility gates required before implementation planning. Prior discussion recorded unverified technical assumptions; research findings below supersede those assumptions, not user goals.
 
 ---
 
 ## Domain
 
-Wave 10 delivers **production hardening** for Minga clusters on Talos/hcloud with FIPS/SOC2/VS-NfD/NATO compliance requirements:
+Wave 10 plans **B → C → A**, in sequence for one developer: (B) NATS transport security, (C) file-based secrets, and (A) actual container stdout/stderr capture. **Talos/hcloud is a staging target to validate, not a working deployment claim.** FIPS 140-3, SOC 2, VS-NfD and NATO are distinct stakeholder requirements requiring control mapping and specialist review; none is presently certified or established as compliant.
 
-1. **TLS/mTLS** — NATS cluster + containerd gRPC using Talos built-in PKI
-2. **Secrets management** — Talos-native machine config + Docker Swarm-compatible `/run/secrets/<name>` mounts
-3. **Container log capture** — FIFO pipes with structured JSON, containerd binary log format, policy-aware retention
-
-**Target:** Single-dev team, Talos/hcloud, FIPS/SOC2/VS-NfD/NATO compliance
+**Definition of done:** unmasked Rust quality gate, a functioning Talos/hcloud staging demonstration (or explicit blocker, never a false pass), and corrected complete deployment/security documentation. Talos is designed to run Kubernetes and its documented provisioning path bootstraps etcd/Kubernetes; Minga's independent Raft cluster must be proven possible on this host before implementation is called deployable.
 
 ---
 
@@ -35,17 +31,28 @@ Wave 10 delivers **production hardening** for Minga clusters on Talos/hcloud wit
 
 ---
 
+<decisions>
+## Implementation Decisions
+
+- **D-01:** One-developer sequence is B (NATS TLS) → C (file secrets) → A (container logs); Talos/hcloud host feasibility is an earlier blocking prerequisite.
+- **D-02:** Authenticate NATS client and cluster traffic with distinct workload identities; prefer Talos-issued certificates only if a supported separate issuance path is proved, otherwise use a dedicated workload CA. Do not claim TLS on the local containerd Unix socket.
+- **D-03:** Deliver service secrets as read-only `/run/secrets/<name>` files from a verified, protected node-local store; never distribute their values in Raft or NATS. Talos machine config encryption is not presumed.
+- **D-04:** Prefer separate stdout/stderr FIFOs with background capture and indexed Minga-owned bounded history, contingent on real Linux containerd proof; retain failures under finite quotas and delete successful local logs only after delivery.
+- **D-05:** Definition of done is independently passing unmasked Rust quality gates, authorized Talos/hcloud staging evidence and complete corrected documentation, plus distinct FIPS/SOC 2/VS-NfD/NATO gap mapping; no certification claim.
+
+</decisions>
+
 ## Locked Decisions (This Discussion)
 
 ### TLS (B) — NATS + containerd gRPC
 
 | Decision | Detail |
 |----------|--------|
-| **CA Model** | Talos built-in PKI — Talos manages CA, certs, rotation via `talosctl` |
-| **NATS mTLS** | Client↔server (all nodes) + server↔server (cluster) |
-| **Client Cert Source** | Talos generates per-node certs; Minga reads from `/etc/minga/tls/` (machine config) |
-| **containerd gRPC TLS** | Use Talos CA bundle + node cert/key (Talos 1.14+ supports TLS on containerd socket) |
-| **Minga API TLS** | Deferred — Docker Engine API HTTPS can be added later |
+| **PKI intent** | Prefer Talos-managed certificates if supported; verify whether Talos PKI can issue **separate NATS workload identities**. Do not reuse Talos API/node private keys. If unsupported, plan a dedicated NATS CA with documented offline issuance/rotation. |
+| **NATS mTLS** | Client↔server and server↔server, with server-name verification and rotation/reconnect tests. |
+| **Client Cert Source** | Requested `/etc/minga/tls/` inside Minga's service/container, contingent on an actual Talos extension/pod delivery mechanism. Machine config does **not** imply that files appear there automatically. |
+| **containerd transport** | Talos's local Unix socket is access-controlled by filesystem permissions; TLS on a Unix socket is not established by Talos documentation. Keep local UDS and verify access boundary. Remote TCP containerd mTLS is conditional on a documented daemon config and supported tonic client. |
+| **Minga API TLS** | Deferred as a feature, but staging must restrict unauthenticated/plaintext admin API to localhost or a trusted private boundary; never claim cluster-wide mTLS. |
 
 **Canonical Refs:**
 - `docs/talos-deployment.md` (Talos PKI, machine config)
@@ -57,11 +64,10 @@ Wave 10 delivers **production hardening** for Minga clusters on Talos/hcloud wit
 
 | Decision | Detail |
 |----------|--------|
-| **Backend** | Talos-native machine config (encrypted at rest, root-only readable) |
-| **Secret Values** | Stored in Talos machine config (encrypted, decrypted at boot) |
-| **Mount Mechanism** | OCI spec `mounts` with `type=bind,source=/run/secrets/<name>,target=/run/secrets/<name>` |
-| **Mount Options** | Read-only (`options=["ro"]`) |
-| **Delivery** | File-based (`/run/secrets/<name>`) — Docker Swarm compatible |
+| **Backend intent** | Talos-native provisioning where independently feasible; Talos machine config is **not** a generic encrypted application secret manager. Evaluate Talos user volumes or another supported provisioning path; explicitly define at-rest encryption and key custody. |
+| **Secret Values** | Never put plaintext values in Raft, NATS, CLI output or logs. A metadata-only Raft reference may identify a local provisioned secret, but missing secret must fail closed. |
+| **Mount Mechanism** | OCI spec read-only bind mount of an allowlisted per-task host file to `/run/secrets/<name>` inside the container. Verify source directory, mode/ownership, secure path resolution, no symlink escape and lifecycle cleanup. |
+| **Delivery** | File-based Swarm-compatible destination; verify full Compose top-level and per-service secret semantics; reject unsupported values explicitly. |
 
 **Canonical Refs:**
 - `crates/minga-state/src/types.rs:241` (Secret metadata)
@@ -73,11 +79,11 @@ Wave 10 delivers **production hardening** for Minga clusters on Talos/hcloud wit
 
 | Decision | Detail |
 |----------|--------|
-| **Transport** | FIFO pipes (`mkfifo`) with background readers writing structured JSON |
-| **Format** | Structured JSON per line: `{"timestamp":"...","stream":"stdout|stderr","message":"..."}` |
-| **Read Mechanism** | Use containerd's binary log format + index (standard) |
-| **Retention** | Retain on failure, delete on clean stop (policy-aware) |
-| **Streaming** | Background readers enable live tail + history |
+| **Transport intent** | Separate stdout/stderr FIFOs with readers established before `Tasks.Create`; prove containerd shim opens them on the target Linux runtime without deadlock. |
+| **Format** | Persist framed records with timestamp, stream and bytes (lossless for non-UTF-8), then serialize CLI/event output safely. Bound records and disk usage. |
+| **Read mechanism** | Prior discussion asked for “containerd binary log format + index,” but no standard indexed binary log API has been substantiated. `Tasks.Create` accepts caller-provided stdout/stderr destinations, not a log-read RPC. Research a bounded local index/JSONL implementation; do not claim containerd owns it. |
+| **Retention** | Retain failures within finite TTL/size/quota; delete successful-task local files after confirmed delivery. Recover crash/restart and disk-full behavior; JetStream history has independent expiry. |
+| **Streaming** | Reader can publish to `MINGA_LOGS`; test no loss, ordering, consumer disconnect, and restart recovery. |
 
 **Canonical Refs:**
 - `crates/minga-node/src/containerd/runtime.rs:155` (create_task stdout/stderr)
@@ -87,30 +93,14 @@ Wave 10 delivers **production hardening** for Minga clusters on Talos/hcloud wit
 
 ---
 
-## Code Context (Reusable Assets)
+## Technical verification gates (research takes precedence over earlier assumptions)
 
-| Area | Files | Pattern |
-|------|-------|---------|
-| **NATS TLS** | `minga-bus/src/nats.rs:60-93` | `async_nats::connect()` with `ClientConfig::tls()` |
-| **containerd TLS** | `minga-node/src/containerd/client.rs:1-50` | `tonic::transport::Channel::with_tls()` |
-| **OCI Spec** | `minga-node/src/containerd/oci.rs` | `spec_to_any()` — add `mounts` for secrets |
-| **Runtime Start** | `minga-node/src/containerd/runtime.rs:118` | Add stdout/stderr FIFO paths to `create_task()` |
-| **Runtime Logs** | `minga-node/src/containerd/runtime.rs:347` | Implement `logs()` using binary log format |
-| **Supervisor** | `minga-node/src/supervisor.rs:350-366` | Cleanup log files on task stop (policy-aware) |
-| **Secret Translation** | `minga-api/src/translate.rs:156` | Extend to resolve secret values from Talos config |
-
----
-
-## Compliance Requirements (FIPS/SOC2/VS-NfD/NATO)
-
-| Requirement | Implementation |
-|-------------|----------------|
-| **FIPS 140-2** | Talos PKI uses FIPS-validated crypto; ensure `ring`/`aws-lc-rs` in Cargo.toml |
-| **SOC2** | Audit logging via `minga-telemetry` structured JSON + correlation IDs |
-| **VS-NfD** | German classified — ensure no secret leakage in logs/metrics; `SecretRedactor` in `minga-egress` |
-| **NATO** | mTLS everywhere; certificate rotation automated via Talos |
-
----
+1. **Talos/hcloud host model:** `docs/talos-deployment.md` and `README.md` contain unverified `talosctl upload/run`, systemd, ISO-as-image, `minga node`, and price claims. Talos is immutable and does not provide a conventional systemd/package path. Before calling staging deployable, prototype a documented extension/container mechanism with the required containerd socket, dedicated persistent storage, process supervision and firewall; verify hcloud boot image workflow and actual CLI flags. Correct both docs as part of the phase.
+2. **PKI and TLS:** Talos API certs are not automatically issued for Minga/NATS. Prove issuance/isolation and rotation in staging or use a dedicated CA. The containerd Unix socket is local; protect it with OS permissions, not an invented Talos TLS feature. TLS on a remote TCP endpoint is optional and needs separate testing.
+3. **Secrets:** Talos machine config should not be described as universally encrypted at rest. Prove a supported at-rest encryption/provisioning mechanism, permission isolation, revocation, rotation and cross-node availability; otherwise explicitly block deployment rather than silently substitute plaintext config or Raft values.
+4. **Logs:** Containerd's Tasks API offers caller-specified stdout/stderr destinations, not an indexed binary log retrieval API. Test FIFOs on a real Linux containerd+runc host; if FIFOs fail, document a decision checkpoint and use verified split-file destinations instead.
+5. **Compliance:** FIPS validation applies to specific cryptographic modules/versions/configurations, not the presence of `ring`/`aws-lc-rs` or Talos. SOC 2 is an attestation over organizational controls and audit period; VS-NfD/NATO require applicable national/contract authority and accreditation. Deliver a gap/control matrix and avoid certification claims.
+6. **Only user decisions are binding:** B→C→A order, one developer, Talos/hcloud preference, file secrets, FIFO preference, mTLS for NATS, quality gate + staging + documentation. Alternative technical mechanisms require evidence and should be surfaced as explicit implementation checkpoints.
 
 ## Deferred Ideas (Not in Wave 10)
 
@@ -152,16 +142,12 @@ crates/minga-telemetry/src/                        # Metrics, health, logging
 
 ---
 
-## Discussion Log Summary
+## Discussion Log Summary (user preferences, subject to verification gates)
 
-| Area | Key Decisions |
-|------|---------------|
-| TLS: CA Model | Talos built-in PKI |
-| TLS: NATS mTLS | Client↔server + server↔server |
-| TLS: Client Certs | `/etc/minga/tls/` from machine config |
-| TLS: containerd gRPC | Talos CA + node certs (TLS on socket) |
-| Secrets: Backend | Talos machine config (encrypted) |
-| Secrets: Mount | OCI bind mount `/run/secrets/<name>` ro |
-| Logs: Transport | FIFO + structured JSON background readers |
-| Logs: Read | containerd binary log format + index |
-| Logs: Retention | Policy-aware (retain failures, delete clean stops) |
+| Area | User preference | Feasibility note |
+|------|-----------------|------------------|
+| TLS | Talos PKI, NATS client/server and route mTLS | Dedicated workload PKI issuance may be necessary; do not reuse Talos API identity |
+| containerd | Secured gRPC on Talos | Local UDS is not automatically TLS; isolate socket, investigate remote TLS separately |
+| Secrets | Talos-native file secrets at `/run/secrets/<name>` | Machine-config at-rest encryption and file exposure not established |
+| Logs | FIFO stdout/stderr, JSON records, indexed history | No verified native containerd binary/index format; implement bounded Minga-owned storage |
+| Retention | Keep failures, delete successes | Include bounded TTL and disk quota |

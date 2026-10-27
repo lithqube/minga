@@ -1,5 +1,7 @@
 # Wave 10 Discussion Log
 
+> Historical record of answers and *then-unverified* implementation suggestions. Do not use the rationales below as technical evidence or compliance claims. The corrected decisions and feasibility gates are in `10-CONTEXT.md`; primary-source findings are in `10-RESEARCH.md`.
+
 **Phase:** 10
 **Name:** production-hardening
 **Date:** 2026-10-26
