@@ -1999,6 +1999,7 @@ dependencies = [
 name = "minga-cli"
 version = "0.0.1"
 dependencies = [
+ "axum",
  "clap",
  "futures",
  "minga-api",
@@ -2010,9 +2011,12 @@ dependencies = [
  "minga-sandbox",
  "minga-scheduler",
  "minga-state",
+ "minga-telemetry",
+ "serde_json",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
+ "tower 0.5.3",
  "tracing",
  "tracing-subscriber",
 ]

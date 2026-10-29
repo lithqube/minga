@@ -2,9 +2,14 @@
 
 ## Deployment Guides
 
-- [Talos Linux Deployment](talos-deployment.md) — **Recommended** production deployment target
+- [Talos Linux Deployment](talos-deployment.md) — deployment target; **not yet validated on a Talos host**
 - [Single-Node / Edge](talos-deployment.md#single-node-dev--edge-setup) — Dev/test on one machine
 - [Air-Gapped Install](talos-deployment.md#air-gapped--offline-install) — Offline/isolated environments
+
+## Release
+
+- [Roadmap to v0.1.0](roadmap-v0.1.0.md) — the seven gates, the current blockers, and what is proven vs planned
+- [Wave 10 execution status](../.planning/phases/10-wave-10-production-hardening/10-EXECUTION-STATUS.md) — what the hardening wave actually achieved
 
 ## Architecture Decision Records (ADRs)
 

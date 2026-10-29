@@ -29,3 +29,7 @@ futures.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+axum.workspace = true
+tower.workspace = true
+serde_json.workspace = true
+minga-telemetry = { path = "../minga-telemetry" }

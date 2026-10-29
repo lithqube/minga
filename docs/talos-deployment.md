@@ -1,7 +1,18 @@
 # Deploying Minga on Talos Linux
 
-**Status:** Recommended deployment target
+**Status:** Deployment target — **not yet validated on a Talos host.**
 **Version:** Talos v1.14+
+
+> **Read this before following the guide.** These instructions have not been
+> executed against a Talos host. The commands below are correct for the
+> `minga` binary as it exists today, but two commands that earlier versions
+> of this guide recommended — `minga stack deploy` and `minga ctr version` —
+> **do not exist**. They have been corrected below. The Talos-specific
+> steps (config generation, `talosctl apply-config`, `talosctl bootstrap`,
+> image pre-loading) are unverified.
+>
+> For the current state of the project, including what is proven and what
+> is not, see [`roadmap-v0.1.0.md`](roadmap-v0.1.0.md).
 
 Talos Linux is an immutable, API-driven Linux distribution purpose-built for Kubernetes — but it runs **any containerd workload**. Since Minga targets containerd directly via gRPC (no kubelet), Talos is an ideal host: single-binary OS, atomic upgrades, no SSH, no package manager, secure by default.
 
@@ -114,10 +125,10 @@ WantedBy=multi-user.target
 ### 7. Verify Cluster
 ```bash
 # Check Minga nodes
-minga node ls
+docker node ls --host tcp://<manager-ip>:2375
 
-# Check containerd connectivity
-minga ctr version
+# Check containerd connectivity (on the node itself)
+ctr --address /run/containerd/containerd.sock version
 
 # Check metrics
 curl http://<node-ip>:2375/metrics | head -20
@@ -126,6 +137,15 @@ curl http://<node-ip>:2375/metrics | head -20
 curl http://<node-ip>:2375/healthz
 curl http://<node-ip>:2375/readyz
 ```
+
+> **Note on `docker node ls`.** The Docker-compatible API serves `GET
+> /v1.41/nodes` from Minga's own Raft state. **Node self-registration is not
+> implemented yet**, so this list is expected to come back empty — that is
+> the known Gate 1 blocker, not a misconfiguration. See
+> [`roadmap-v0.1.0.md`](roadmap-v0.1.0.md).
+>
+> The Docker API has **no authentication** and binds `0.0.0.0:2375` by
+> default. Do not expose that port to an untrusted network.
 
 ---
 
@@ -147,8 +167,11 @@ talosctl bootstrap --nodes <node-ip> --endpoints <node-ip>
 
 # 4. Deploy Minga (same as step 6 above)
 
-# 5. Deploy a test stack
-minga stack deploy -f docker-compose.yml
+# 5. Deploy a test stack.
+# `minga deploy` currently translates and prints only — cluster deployment
+# is not yet implemented (roadmap-v0.1.0.md Gate 2). The Docker-compatible
+# API path works today:
+docker stack deploy -c docker-compose.yml minga-test --host tcp://<node-ip>:2375
 ```
 
 ---
@@ -259,8 +282,9 @@ for NODE in minga-cp1 minga-cp2 minga-cp3; do
   curl -s  "http://${IP}:2375/metrics" | head -5
 done
 
-# Deploy a stack
-minga stack deploy -f docker-compose.yml
+# Deploy a stack. The Docker-compatible API path works today; `minga deploy`
+# translates and prints only (roadmap-v0.1.0.md Gate 2).
+docker stack deploy -c docker-compose.yml minga-test --host tcp://<cp1-ip>:2375
 ```
 
 ### Single-Node on hcloud (Dev/Test)
