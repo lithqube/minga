@@ -49,6 +49,7 @@ fn sample_service(id: &str) -> Service {
         resources: ResourceSpec::default(),
         agent: None,
         restart_policy: Default::default(),
+        secrets: vec![],
     }
 }
 

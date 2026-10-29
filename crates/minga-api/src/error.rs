@@ -77,6 +77,11 @@ pub fn conflict(msg: impl Into<String>) -> ApiError {
     ApiError::Conflict(msg.into())
 }
 
+/// Helper: create a bad-request error.
+pub fn bad_request(msg: impl Into<String>) -> ApiError {
+    ApiError::BadRequest(msg.into())
+}
+
 /// Helper: create an internal error.
 pub fn internal(msg: impl Into<String>) -> ApiError {
     ApiError::Internal(msg.into())

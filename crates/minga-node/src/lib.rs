@@ -40,6 +40,7 @@
 pub mod agent;
 pub mod containerd;
 pub mod runtime;
+pub mod secrets;
 pub mod supervisor;
 
 pub use agent::{

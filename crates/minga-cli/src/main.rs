@@ -1,3 +1,4 @@
+mod bus;
 mod sidecar;
 
 use std::collections::BTreeMap;
@@ -156,6 +157,11 @@ struct NodeArgs {
     /// via the MINGA_NATS_URL environment variable.
     #[arg(long, env = "MINGA_NATS_URL")]
     nats_url: Option<String>,
+    /// Directory holding the node-local secret store. Secrets are
+    /// provisioned there by the operator; values never travel through
+    /// Raft or the event bus.
+    #[arg(long, default_value = "/var/lib/minga/secrets")]
+    secret_store: String,
     /// Container runtime: `mock` (in-memory, for testing) or `containerd`
     /// (real containers via containerd's gRPC API).
     #[arg(long, default_value = "mock")]
@@ -398,7 +404,7 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
     let bus: Arc<dyn minga_bus::EventBus> = match &args.nats_url {
         Some(url) => {
             _sidecar = None;
-            match minga_bus::NatsBus::connect(url).await {
+            match bus::connect_bus(url).await {
                 Ok(b) => b,
                 Err(e) => {
                     eprintln!("error: cannot connect to NATS at {url}: {e}");
@@ -451,7 +457,17 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
         "containerd" => {
             tracing::info!(socket = %args.containerd_socket, "connecting to containerd");
             match minga_node::ContainerdRuntime::connect(&args.containerd_socket).await {
-                Ok(rt) => Arc::new(rt),
+                Ok(rt) => {
+                    // Attach the node-local secret store. A task that
+                    // declares a secret fails closed if the value is not
+                    // provisioned here.
+                    let store = minga_node::secrets::SecretStore::new(&args.secret_store);
+                    tracing::info!(
+                        secret_store = %store.root().display(),
+                        "node secret store configured"
+                    );
+                    Arc::new(rt.with_secret_store(store))
+                }
                 Err(e) => {
                     eprintln!(
                         "error: cannot connect to containerd at {}: {e}",
@@ -1011,7 +1027,7 @@ async fn run_agent(cmd: AgentCommand) -> ExitCode {
                 return ExitCode::FAILURE;
             };
 
-            let bus = match minga_bus::NatsBus::connect(&url).await {
+            let bus = match bus::connect_bus(&url).await {
                 Ok(b) => {
                     let bus: Arc<dyn minga_bus::EventBus> = b;
                     bus
@@ -1082,7 +1098,7 @@ async fn run_logs(task_id: &str, follow: bool, tail: usize, nats_url: Option<&st
         return ExitCode::FAILURE;
     };
 
-    let bus = match minga_bus::NatsBus::connect(url).await {
+    let bus = match bus::connect_bus(url).await {
         Ok(b) => {
             let bus: Arc<dyn minga_bus::EventBus> = b;
             bus

@@ -31,6 +31,7 @@
 pub mod memory;
 pub mod nats;
 pub mod subjects;
+pub mod tls;
 
 use std::pin::Pin;
 use std::time::Duration;

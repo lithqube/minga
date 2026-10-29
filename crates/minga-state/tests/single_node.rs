@@ -65,6 +65,7 @@ fn sample_service(id: &str) -> Service {
         },
         agent: None,
         restart_policy: Default::default(),
+        secrets: vec![],
     }
 }
 

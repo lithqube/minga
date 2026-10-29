@@ -152,9 +152,11 @@ async fn full_stack_deploy_workflow() {
     assert_eq!(net_resp["ID"], "myapp_default");
 
     // --- Step 2: Create secret ---
+    //
+    // Metadata only. Minga refuses an inline value: the secret must be
+    // provisioned on the node's secret store, not submitted over the API.
     let secret_body = json!({
         "Name": "myapp_db_password",
-        "Data": "c3VwZXJzZWNyZXQ=",
         "Labels": {"com.docker.stack.namespace": "myapp"}
     });
     let resp = http
@@ -197,7 +199,7 @@ async fn full_stack_deploy_workflow() {
                 "Secrets": [{
                     "SecretID": "myapp_db_password",
                     "SecretName": "myapp_db_password",
-                    "File": {"Name": "db_password", "UID": "0", "GID": "0", "Mode": 292}
+                    "File": {"Name": "db_password", "UID": "0", "GID": "0", "Mode": 0}
                 }]
             },
             "Resources": {

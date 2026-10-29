@@ -220,7 +220,7 @@ volumes:
   pg-data:
 secrets:
   db_password:
-    file: ./secrets/db_password.txt
+    external: true
 configs:
   init_sql:
     file: ./init.sql
@@ -237,6 +237,74 @@ configs:
 
     assert_eq!(translated.configs.len(), 1);
     assert_eq!(translated.configs[0].id, "data_init_sql");
+
+    // The service carries a *reference* to the secret, not a value, and the
+    // reference survives placement into the task spec.
+    let db = translated
+        .services
+        .iter()
+        .find(|s| s.name == "db")
+        .expect("the db service must be translated");
+    assert_eq!(db.secrets.len(), 1);
+    assert_eq!(db.secrets[0].secret_id, "data_db_password");
+    assert_eq!(db.secrets[0].target, "/run/secrets/db_password");
+
+    // No secret *value* may appear in the translated state.
+    let serialized = format!("{db:?}");
+    assert!(
+        !serialized.contains("supersecret"),
+        "no secret value may appear in desired state: {serialized}"
+    );
+}
+
+#[test]
+fn pipeline_rejects_file_backed_secret() {
+    // A `file:` source names a path on the *submitter's* machine, which is
+    // not a path on the node that will run the container. Translation must
+    // fail loudly rather than deliver the wrong bytes.
+    let yaml = r#"
+name: data
+services:
+  db:
+    image: postgres:16
+    secrets:
+      - db_password
+secrets:
+  db_password:
+    file: ./secrets/db_password.txt
+"#;
+    let project = load(yaml);
+    let err = translate_project(&project, "data").expect_err("a file: secret must be refused");
+    let message = err.to_string();
+    assert!(
+        message.contains("file:") && message.contains("not supported"),
+        "the error must explain the refusal, got: {message}"
+    );
+}
+
+#[test]
+fn pipeline_secret_reaches_task_spec() {
+    let yaml = r#"
+name: data
+services:
+  db:
+    image: postgres:16
+    secrets:
+      - db_password
+secrets:
+  db_password:
+    external: true
+"#;
+    let project = load(yaml);
+    let translated = translate_project(&project, "data").unwrap();
+    let db = translated.services.iter().find(|s| s.name == "db").unwrap();
+    let nodes = vec![node(1, 8.0, 1 << 34, 0, &[])];
+    let tasks = place_service(db, &nodes, &[]);
+
+    assert_eq!(tasks.len(), 1);
+    assert_eq!(tasks[0].spec.secrets.len(), 1);
+    assert_eq!(tasks[0].spec.secrets[0].secret_id, "data_db_password");
+    assert_eq!(tasks[0].spec.secrets[0].target, "/run/secrets/db_password");
 }
 
 #[test]

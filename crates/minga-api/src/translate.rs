@@ -15,7 +15,8 @@ use std::collections::HashMap;
 use chrono::Utc;
 use minga_state::types::{
     ClusterNode, Config as MingaConfig, Network, NetworkId, NodeId, NodeStatus as MingaNodeStatus,
-    PortMapping, ResourceSpec, Secret as MingaSecret, Service, ServiceMode, Task, TaskState,
+    PortMapping, ResourceSpec, Secret as MingaSecret, SecretRef, Service, ServiceMode, Task,
+    TaskState,
 };
 
 use crate::models;
@@ -118,6 +119,44 @@ pub fn service_spec_to_state(spec: &models::ServiceSpec) -> Result<Service, Stri
     // typically not set, so we default to empty).
     let constraints: Vec<String> = Vec::new();
 
+    // Secret references from TaskTemplate.ContainerSpec.
+    //
+    // Only references are carried. A Docker `SecretReference` names a
+    // secret and the file it should appear as inside the container.
+    let mut secrets = Vec::new();
+    let mut targets = std::collections::HashSet::new();
+    for reference in container.Secrets.iter().flatten() {
+        if reference.SecretID.is_empty() || reference.SecretName.is_empty() {
+            return Err("secret reference requires SecretID and SecretName".into());
+        }
+        let file = reference.File.as_ref();
+        let name = file.map_or(reference.SecretName.as_str(), |f| f.Name.as_str());
+        if name.is_empty()
+            || matches!(name, "." | "..")
+            || name.starts_with('-')
+            || name.chars().any(|c| c == '/' || c.is_control())
+        {
+            return Err(format!(
+                "secret reference has an invalid file name `{name}`"
+            ));
+        }
+        if file.is_some_and(|f| {
+            (!f.UID.is_empty() && f.UID != "0")
+                || (!f.GID.is_empty() && f.GID != "0")
+                || f.Mode != 0
+        }) {
+            return Err(format!(
+                "secret `{}` has unsupported UID/GID/Mode options",
+                reference.SecretName
+            ));
+        }
+        let target = format!("/run/secrets/{name}");
+        if !targets.insert(target.clone()) {
+            return Err(format!("duplicate secret mount destination `{target}`"));
+        }
+        secrets.push(SecretRef::new(reference.SecretID.clone(), target));
+    }
+
     Ok(Service {
         id: name.clone(),
         name,
@@ -131,6 +170,7 @@ pub fn service_spec_to_state(spec: &models::ServiceSpec) -> Result<Service, Stri
         resources,
         agent: None,
         restart_policy: Default::default(),
+        secrets,
     })
 }
 
@@ -153,6 +193,8 @@ pub fn network_create_to_state(req: &models::NetworkCreateRequest) -> Network {
 }
 
 /// Translates a Docker `SecretSpec` into a Minga `Secret`.
+///
+/// Only metadata is carried. The secret *value* never enters Raft.
 pub fn secret_spec_to_state(spec: &models::SecretSpec) -> MingaSecret {
     MingaSecret {
         id: spec.Name.clone(),
@@ -179,6 +221,36 @@ pub fn service_to_docker(svc: &Service) -> models::Service {
         labels.insert("com.docker.stack.namespace".to_string(), stack.clone());
     }
 
+    // Secret references, outbound. Only identifiers and targets — never a
+    // value. A Docker client inspecting a service sees which secrets it
+    // uses, not what they contain.
+    let secrets: Option<Vec<models::SecretReference>> = if svc.secrets.is_empty() {
+        None
+    } else {
+        Some(
+            svc.secrets
+                .iter()
+                .map(|s| models::SecretReference {
+                    SecretID: s.secret_id.clone(),
+                    SecretName: s.secret_id.clone(),
+                    File: Some(models::FileReference {
+                        Name: s
+                            .target
+                            .rsplit('/')
+                            .next()
+                            .unwrap_or(&s.secret_id)
+                            .to_string(),
+                        // uid/gid/mode are not supported for secrets yet;
+                        // reporting unset values is honest.
+                        UID: String::new(),
+                        GID: String::new(),
+                        Mode: 0,
+                    }),
+                })
+                .collect(),
+        )
+    };
+
     let container_spec = models::ContainerSpec {
         Image: svc.image.clone(),
         Env: svc
@@ -193,6 +265,7 @@ pub fn service_to_docker(svc: &Service) -> models::Service {
                 }
             })
             .collect(),
+        Secrets: secrets,
         ..Default::default()
     };
 
@@ -648,6 +721,39 @@ mod tests {
     }
 
     #[test]
+    fn service_secret_references_reject_unsafe_targets_and_options() {
+        let reference = |name: &str, mode: u32| models::SecretReference {
+            SecretID: "declared".into(),
+            SecretName: "declared".into(),
+            File: Some(models::FileReference {
+                Name: name.into(),
+                UID: "0".into(),
+                GID: "0".into(),
+                Mode: mode,
+            }),
+        };
+        for name in ["../escape", "/etc/passwd", ".", "", "bad\nname"] {
+            let mut spec = sample_docker_spec();
+            spec.TaskTemplate.ContainerSpec.as_mut().unwrap().Secrets =
+                Some(vec![reference(name, 0)]);
+            assert!(service_spec_to_state(&spec).is_err(), "accepted {name:?}");
+        }
+        let mut spec = sample_docker_spec();
+        spec.TaskTemplate.ContainerSpec.as_mut().unwrap().Secrets =
+            Some(vec![reference("safe", 0o444)]);
+        assert!(service_spec_to_state(&spec)
+            .unwrap_err()
+            .contains("unsupported UID/GID/Mode"));
+
+        let mut spec = sample_docker_spec();
+        spec.TaskTemplate.ContainerSpec.as_mut().unwrap().Secrets =
+            Some(vec![reference("same", 0), reference("same", 0)]);
+        assert!(service_spec_to_state(&spec)
+            .unwrap_err()
+            .contains("duplicate secret mount"));
+    }
+
+    #[test]
     fn service_spec_to_state_basic() {
         let spec = sample_docker_spec();
         let svc = service_spec_to_state(&spec).unwrap();
@@ -790,6 +896,7 @@ mod tests {
             resources: ResourceSpec::default(),
             agent: None,
             restart_policy: Default::default(),
+            secrets: vec![],
         };
         let docker = service_to_docker(&svc);
         let env = &docker.Spec.TaskTemplate.ContainerSpec.as_ref().unwrap().Env;

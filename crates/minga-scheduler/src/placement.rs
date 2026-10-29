@@ -95,6 +95,9 @@ pub fn place_service(
         resources: service.resources.clone(),
         kind,
         restart_policy: service.restart_policy.clone(),
+        // Secret references travel with the task so the node can resolve
+        // the value locally. References only — no values in Raft.
+        secrets: service.secrets.clone(),
     };
 
     let mut tasks = Vec::new();
@@ -216,6 +219,7 @@ mod tests {
             resources: ResourceSpec::default(),
             agent: None,
             restart_policy: Default::default(),
+            secrets: vec![],
         }
     }
 

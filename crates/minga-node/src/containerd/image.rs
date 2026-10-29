@@ -1,0 +1,313 @@
+//! Preloaded OCI image metadata resolution for containerd tasks.
+
+use serde_json::Value;
+use sha2::{Digest, Sha256};
+
+use super::client::ContainerdClient;
+use super::proto::Image;
+
+const OCI_MANIFEST: &str = "application/vnd.oci.image.manifest.v1+json";
+const DOCKER_MANIFEST: &str = "application/vnd.docker.distribution.manifest.v2+json";
+const OCI_INDEX: &str = "application/vnd.oci.image.index.v1+json";
+const DOCKER_INDEX: &str = "application/vnd.docker.distribution.manifest.list.v2+json";
+const OCI_CONFIG: &str = "application/vnd.oci.image.config.v1+json";
+const DOCKER_CONFIG: &str = "application/vnd.docker.container.image.v1+json";
+const MAX_IMAGE_METADATA: i64 = 4 * 1024 * 1024;
+
+#[derive(Debug, Clone)]
+pub struct BlobDescriptor {
+    pub media_type: String,
+    pub digest: String,
+    pub size: i64,
+}
+
+impl BlobDescriptor {
+    fn from_json(value: &Value) -> Result<Self, String> {
+        Self::new(
+            value["mediaType"].as_str().unwrap_or_default(),
+            value["digest"].as_str().unwrap_or_default(),
+            value["size"].as_i64().unwrap_or_default(),
+        )
+    }
+
+    pub fn new(media_type: &str, digest: &str, size: i64) -> Result<Self, String> {
+        if size <= 0 || size > MAX_IMAGE_METADATA {
+            return Err("image metadata has invalid or excessive size".into());
+        }
+        validate_digest(digest)?;
+        Ok(Self {
+            media_type: media_type.to_string(),
+            digest: digest.to_string(),
+            size,
+        })
+    }
+
+    pub fn verify(&self, bytes: &[u8]) -> Result<(), String> {
+        if bytes.len() as i64 != self.size {
+            return Err("image metadata size does not match its descriptor".into());
+        }
+        if format!("sha256:{:x}", Sha256::digest(bytes)) != self.digest {
+            return Err("image metadata digest does not match its descriptor".into());
+        }
+        Ok(())
+    }
+}
+
+fn validate_digest(digest: &str) -> Result<(), String> {
+    let hex = digest
+        .strip_prefix("sha256:")
+        .ok_or("only sha256 image digests are supported")?;
+    if hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("malformed sha256 image digest".into());
+    }
+    Ok(())
+}
+
+pub fn select_manifest(index: &Value, architecture: &str) -> Result<BlobDescriptor, String> {
+    let manifests = index["manifests"]
+        .as_array()
+        .ok_or("image index has no manifests")?;
+    manifests
+        .iter()
+        .filter(|entry| {
+            entry["platform"]["os"] == "linux"
+                && entry["platform"]["architecture"] == architecture
+                && entry["platform"]["os.version"].is_null()
+        })
+        .find_map(|entry| {
+            let descriptor = BlobDescriptor::from_json(entry).ok()?;
+            matches!(
+                descriptor.media_type.as_str(),
+                OCI_MANIFEST | DOCKER_MANIFEST
+            )
+            .then_some(descriptor)
+        })
+        .ok_or_else(|| format!("image index has no linux/{architecture} manifest"))
+}
+
+pub fn manifest_config(manifest: &Value) -> Result<BlobDescriptor, String> {
+    let descriptor = BlobDescriptor::from_json(&manifest["config"])?;
+    if !matches!(descriptor.media_type.as_str(), OCI_CONFIG | DOCKER_CONFIG) {
+        return Err("image manifest has unsupported config media type".into());
+    }
+    Ok(descriptor)
+}
+
+pub fn chain_id(diff_ids: &[String]) -> Result<String, String> {
+    let (first, rest) = diff_ids
+        .split_first()
+        .ok_or("image has no unpacked rootfs layers")?;
+    validate_digest(first)?;
+    let mut parent = first.clone();
+    for diff_id in rest {
+        validate_digest(diff_id)?;
+        parent = format!(
+            "sha256:{:x}",
+            Sha256::digest(format!("{parent} {diff_id}").as_bytes())
+        );
+    }
+    Ok(parent)
+}
+
+#[derive(Debug, Clone)]
+pub struct ImageConfiguration {
+    pub args: Vec<String>,
+    pub env: Vec<String>,
+    pub cwd: String,
+    pub uid: u32,
+    pub gid: u32,
+    pub parent_snapshot: String,
+}
+
+impl ImageConfiguration {
+    pub fn parse(value: &Value, architecture: &str) -> Result<Self, String> {
+        if value["os"] != "linux" || value["architecture"] != architecture {
+            return Err(format!("image config is not for linux/{architecture}"));
+        }
+        let config = &value["config"];
+        let args = ["Entrypoint", "Cmd"]
+            .into_iter()
+            .flat_map(|key| {
+                config[key]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+            })
+            .collect::<Vec<_>>();
+        if args.is_empty() || args[0].is_empty() {
+            return Err("image has no executable entrypoint or command".into());
+        }
+        let env = config["Env"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|item| {
+                let s = item.as_str().ok_or("non-string image environment entry")?;
+                if !s.contains('=') || s.starts_with('=') {
+                    return Err("invalid image environment entry");
+                }
+                Ok(s.to_string())
+            })
+            .collect::<Result<Vec<_>, &str>>()?;
+        let cwd = config["WorkingDir"].as_str().unwrap_or_default();
+        let cwd = if cwd.is_empty() { "/" } else { cwd };
+        if !cwd.starts_with('/') {
+            return Err("image working directory must be absolute".into());
+        }
+        let user = config["User"].as_str().unwrap_or_default();
+        let (uid, gid) = if user.is_empty() {
+            (0, 0)
+        } else {
+            let (uid, gid) = user.split_once(':').unwrap_or((user, "0"));
+            (
+                uid.parse()
+                    .map_err(|_| "named image users are not supported")?,
+                gid.parse()
+                    .map_err(|_| "named image groups are not supported")?,
+            )
+        };
+        if value["rootfs"]["type"] != "layers" {
+            return Err("image rootfs is not layered".into());
+        }
+        let diff_ids = value["rootfs"]["diff_ids"]
+            .as_array()
+            .ok_or("image rootfs has no diff IDs")?
+            .iter()
+            .map(|item| {
+                item.as_str()
+                    .map(str::to_string)
+                    .ok_or("invalid rootfs diff ID")
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self {
+            args,
+            env,
+            cwd: cwd.to_string(),
+            uid,
+            gid,
+            parent_snapshot: chain_id(&diff_ids)?,
+        })
+    }
+}
+
+/// Resolve only metadata from an image already present and unpacked in the
+/// `minga` containerd namespace. No registry access is attempted.
+pub async fn load_image(
+    client: &mut ContainerdClient,
+    image: &Image,
+    snapshotter: &str,
+) -> Result<ImageConfiguration, String> {
+    let architecture = match std::env::consts::ARCH {
+        "aarch64" => "arm64",
+        "x86_64" => "amd64",
+        "arm" => "arm",
+        other => return Err(format!("unsupported host architecture: {other}")),
+    };
+    let target = image
+        .target
+        .as_ref()
+        .ok_or("image has no target descriptor")?;
+    let mut descriptor = BlobDescriptor::new(&target.media_type, &target.digest, target.size)?;
+    let bytes = client
+        .read_content(&descriptor)
+        .await
+        .map_err(|error| format!("cannot read preloaded image target: {error}"))?;
+    if matches!(descriptor.media_type.as_str(), OCI_INDEX | DOCKER_INDEX) {
+        let index: Value = serde_json::from_slice(&bytes)
+            .map_err(|error| format!("invalid image index: {error}"))?;
+        descriptor = select_manifest(&index, architecture)?;
+    } else if !matches!(
+        descriptor.media_type.as_str(),
+        OCI_MANIFEST | DOCKER_MANIFEST
+    ) {
+        return Err("unsupported image target media type".into());
+    }
+    let manifest_bytes = if descriptor.digest == target.digest {
+        bytes
+    } else {
+        client
+            .read_content(&descriptor)
+            .await
+            .map_err(|error| format!("cannot read preloaded image manifest: {error}"))?
+    };
+    let manifest: Value = serde_json::from_slice(&manifest_bytes)
+        .map_err(|error| format!("invalid image manifest: {error}"))?;
+    let config_descriptor = manifest_config(&manifest)?;
+    let config_bytes = client
+        .read_content(&config_descriptor)
+        .await
+        .map_err(|error| format!("cannot read preloaded image config: {error}"))?;
+    let config: Value = serde_json::from_slice(&config_bytes)
+        .map_err(|error| format!("invalid image config: {error}"))?;
+    let config = ImageConfiguration::parse(&config, architecture)?;
+    match client
+        .stat_snapshot(snapshotter, &config.parent_snapshot)
+        .await
+        .map_err(|error| format!("cannot inspect unpacked image snapshot: {error}"))?
+    {
+        Some(info) if info.kind == 3 => Ok(config),
+        _ => Err(format!(
+            "image {} is not unpacked for snapshotter {snapshotter}; preload and unpack it in namespace minga",
+            image.name
+        )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn selects_linux_host_manifest_from_multi_platform_index() {
+        let index = serde_json::json!({
+            "manifests": [
+                {"mediaType": "application/vnd.oci.image.manifest.v1+json", "digest": format!("sha256:{}", "a".repeat(64)), "size": 123, "platform": {"os": "linux", "architecture": "amd64"}},
+                {"mediaType": "application/vnd.oci.image.manifest.v1+json", "digest": format!("sha256:{}", "b".repeat(64)), "size": 456, "platform": {"os": "linux", "architecture": "arm64"}}
+            ]
+        });
+        let selected = select_manifest(&index, "arm64").unwrap();
+        assert_eq!(selected.digest, format!("sha256:{}", "b".repeat(64)));
+    }
+
+    #[test]
+    fn config_preserves_entrypoint_command_env_and_workdir() {
+        let json = serde_json::json!({
+            "os": "linux", "architecture": "arm64",
+            "config": {"Entrypoint": ["/bin/sh", "-c"], "Cmd": ["echo ok"], "Env": ["A=1", "B=2"], "WorkingDir": "/app", "User": "1000:1001"},
+            "rootfs": {"type": "layers", "diff_ids": [format!("sha256:{}", "c".repeat(64))]}
+        });
+        let config = ImageConfiguration::parse(&json, "arm64").unwrap();
+        assert_eq!(config.args, vec!["/bin/sh", "-c", "echo ok"]);
+        assert_eq!(config.env, vec!["A=1", "B=2"]);
+        assert_eq!(config.cwd, "/app");
+        assert_eq!((config.uid, config.gid), (1000, 1001));
+        assert_eq!(config.parent_snapshot, format!("sha256:{}", "c".repeat(64)));
+    }
+
+    #[test]
+    fn rejects_empty_command_and_named_user() {
+        let mut json = serde_json::json!({
+            "os": "linux", "architecture": "arm64",
+            "config": {"User": "app"},
+            "rootfs": {"type": "layers", "diff_ids": [format!("sha256:{}", "c".repeat(64))]}
+        });
+        assert!(ImageConfiguration::parse(&json, "arm64").is_err());
+        json["config"]["User"] = serde_json::json!("0");
+        assert!(ImageConfiguration::parse(&json, "arm64").is_err());
+    }
+
+    #[test]
+    fn chain_id_hashes_multiple_diff_ids() {
+        let first = format!("sha256:{}", "a".repeat(64));
+        let second = format!("sha256:{}", "b".repeat(64));
+        assert_eq!(chain_id(std::slice::from_ref(&first)).unwrap(), first);
+        use sha2::{Digest, Sha256};
+        let expected = format!(
+            "sha256:{:x}",
+            Sha256::digest(format!("{first} {second}").as_bytes())
+        );
+        assert_eq!(chain_id(&[first, second]).unwrap(), expected);
+    }
+}

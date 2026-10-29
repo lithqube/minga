@@ -66,6 +66,33 @@ pub struct ResourceSpec {
     pub gpus: u32,
 }
 
+/// A reference to a secret, carried in desired state.
+///
+/// **This holds no secret value.** It names a secret and the path it will
+/// take inside the container. The value itself lives only in the
+/// node-local secret store and is delivered as a read-only file.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SecretRef {
+    /// The cluster-scoped secret ID (e.g. `stack_db_password`).
+    pub secret_id: String,
+    /// The path inside the container, e.g. `/run/secrets/db_password`.
+    pub target: String,
+    /// Optional version/digest of the provisioned value.
+    #[serde(default)]
+    pub version: Option<String>,
+}
+
+impl SecretRef {
+    /// Build a reference to `secret_id` mounted at `target`.
+    pub fn new(secret_id: impl Into<String>, target: impl Into<String>) -> Self {
+        Self {
+            secret_id: secret_id.into(),
+            target: target.into(),
+            version: None,
+        }
+    }
+}
+
 /// A desired service, translated from a Compose service.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Service {
@@ -87,6 +114,9 @@ pub struct Service {
     /// Restart policy for tasks of this service.
     #[serde(default)]
     pub restart_policy: RestartPolicy,
+    /// Secret references for this service. References only — no values.
+    #[serde(default)]
+    pub secrets: Vec<SecretRef>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -138,6 +168,9 @@ pub struct TaskSpec {
     /// Restart policy for failed tasks.
     #[serde(default)]
     pub restart_policy: RestartPolicy,
+    /// Secret references for this task. References only — no values.
+    #[serde(default)]
+    pub secrets: Vec<SecretRef>,
 }
 
 /// Restart policy for a task.
@@ -329,11 +362,27 @@ mod tests {
                 ..Default::default()
             }),
             restart_policy: Default::default(),
+            secrets: vec![SecretRef::new("stack_password", "/run/secrets/db_password")],
         };
         let bytes = bincode::serde::encode_to_vec(&svc, bincode::config::standard()).unwrap();
         let (back, _): (Service, _) =
             bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
         assert_eq!(back, svc);
+    }
+
+    #[test]
+    fn task_spec_roundtrip_carries_secret_references() {
+        let spec = TaskSpec {
+            image: "alpine:3".to_string(),
+            secrets: vec![SecretRef::new("stack_password", "/run/secrets/db_password")],
+            ..Default::default()
+        };
+        let bytes = bincode::serde::encode_to_vec(&spec, bincode::config::standard()).unwrap();
+        let (back, _): (TaskSpec, _) =
+            bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
+        assert_eq!(back, spec);
+        assert_eq!(back.secrets.len(), 1);
+        assert_eq!(back.secrets[0].secret_id, "stack_password");
     }
 
     #[test]

@@ -36,6 +36,7 @@
 pub mod constraints;
 pub mod placement;
 pub mod reconcile;
+pub mod secrets;
 pub mod translate;
 
 use std::sync::Arc;

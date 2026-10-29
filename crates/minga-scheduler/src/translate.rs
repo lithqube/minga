@@ -131,6 +131,23 @@ fn translate_service(
 
     let resources = translate_resources(name, &deploy)?;
 
+    // Secret references. A top-level `file:` source is refused outright:
+    // the submitter's local path is not a path on the node that will run
+    // the container.
+    if let Some((secret, source)) = crate::secrets::unsupported_source_secret(project) {
+        return Err(TranslateError::Service(
+            name.to_string(),
+            format!(
+                "secret `{secret}` uses a `{source}` source, which is not supported. \
+                 Provision the value on every eligible node and use `external: true`"
+            ),
+        ));
+    }
+
+    let declared: std::collections::HashSet<String> = project.secrets.keys().cloned().collect();
+    let secrets = crate::secrets::translate_secret_refs(name, &svc.secrets, &declared, stack)
+        .map_err(|e| TranslateError::Service(name.to_string(), e.to_string()))?;
+
     // Validate that referenced networks exist in the project.
     for net_name in svc.networks.keys() {
         if net_name != DEFAULT_NETWORK && !project.networks.contains_key(net_name) {
@@ -160,6 +177,7 @@ fn translate_service(
         resources,
         agent,
         restart_policy,
+        secrets,
     })
 }
 

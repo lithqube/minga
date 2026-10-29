@@ -14,6 +14,7 @@
 //! [`Runtime`]: crate::runtime::Runtime
 
 pub mod client;
+pub mod image;
 pub mod oci;
 pub mod proto;
 pub mod runtime;

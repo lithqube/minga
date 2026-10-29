@@ -132,6 +132,7 @@ mod tests {
             resources: ResourceSpec::default(),
             agent: None,
             restart_policy: Default::default(),
+            secrets: vec![],
         }
     }
 

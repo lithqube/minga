@@ -18,6 +18,7 @@ use tonic::transport::{Channel, Endpoint};
 use tonic::Request;
 use tower::service_fn;
 
+use super::image::BlobDescriptor;
 use super::proto::*;
 
 #[derive(Debug, Error)]
@@ -133,12 +134,13 @@ impl ContainerdClient {
     pub async fn create_task(
         &mut self,
         container_id: &str,
+        rootfs: Vec<Mount>,
         stdout: &str,
         stderr: &str,
     ) -> Result<u32, ClientError> {
         let request = CreateTaskRequest {
             container_id: container_id.to_string(),
-            rootfs: vec![],
+            rootfs,
             stdin: String::new(),
             stdout: stdout.to_string(),
             stderr: stderr.to_string(),
@@ -237,33 +239,105 @@ impl ContainerdClient {
         }
     }
 
-    /// Pull an image. Streams progress updates; returns when the pull is complete.
-    pub async fn pull_image(&mut self, image_ref: &str) -> Result<Image, ClientError> {
-        let request = PullImageRequest {
-            image: image_ref.to_string(),
-            platform: String::new(), // let containerd pick the platform
+    // --- Content and snapshot services -------------------------------------
+
+    /// Read and authenticate a bounded image metadata blob. Layers are not
+    /// fetched here; the image must already have been unpacked by containerd.
+    pub async fn read_content(
+        &mut self,
+        descriptor: &BlobDescriptor,
+    ) -> Result<Vec<u8>, ClientError> {
+        let request = ReadContentRequest {
+            digest: descriptor.digest.clone(),
+            offset: 0,
+            size: descriptor.size,
         };
-
-        let request = Request::new(request);
-        let codec = ProstCodec::<PullImageRequest, PullImageResponse>::default();
-        let path = PathAndQuery::from_static(paths::IMAGE_PULL);
-
+        let mut request = Request::new(request);
+        request.metadata_mut().insert(
+            "containerd-namespace",
+            "minga".parse().expect("static namespace"),
+        );
         let mut grpc = Grpc::new(self.channel.clone());
+        grpc.ready().await.map_err(|e| ClientError::Rpc {
+            method: paths::CONTENT_READ.into(),
+            message: e.to_string(),
+        })?;
         let response = grpc
-            .server_streaming(request, path, codec)
-            .await
-            .map_err(ClientError::from)?;
-
+            .server_streaming(
+                request,
+                PathAndQuery::from_static(paths::CONTENT_READ),
+                ProstCodec::<ReadContentRequest, ReadContentResponse>::default(),
+            )
+            .await?;
         let mut stream = response.into_inner();
-        let mut last_image = None;
-        while let Some(result) = stream.message().await.map_err(ClientError::from)? {
-            last_image = result.image;
+        let mut data = Vec::with_capacity(descriptor.size as usize);
+        while let Some(chunk) = stream.message().await? {
+            if chunk.offset != data.len() as i64
+                || chunk.data.len() > descriptor.size as usize - data.len()
+            {
+                return Err(ClientError::Rpc {
+                    method: paths::CONTENT_READ.into(),
+                    message: "image metadata stream has invalid offset or size".into(),
+                });
+            }
+            data.extend_from_slice(&chunk.data);
         }
+        descriptor
+            .verify(&data)
+            .map_err(|message| ClientError::Rpc {
+                method: paths::CONTENT_READ.into(),
+                message,
+            })?;
+        Ok(data)
+    }
 
-        last_image.ok_or_else(|| ClientError::Rpc {
-            method: "ImageService/Pull".to_string(),
-            message: "pull completed but no image was returned".to_string(),
-        })
+    pub async fn stat_snapshot(
+        &mut self,
+        snapshotter: &str,
+        key: &str,
+    ) -> Result<Option<SnapshotInfo>, ClientError> {
+        let request = StatSnapshotRequest {
+            snapshotter: snapshotter.into(),
+            key: key.into(),
+        };
+        match self
+            .unary::<StatSnapshotRequest, StatSnapshotResponse>(request, paths::SNAPSHOT_STAT)
+            .await
+        {
+            Ok(response) => Ok(response.info),
+            Err(ClientError::Grpc(status)) if status.code() == tonic::Code::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub async fn prepare_snapshot(
+        &mut self,
+        snapshotter: &str,
+        key: &str,
+        parent: &str,
+    ) -> Result<Vec<Mount>, ClientError> {
+        let request = PrepareSnapshotRequest {
+            snapshotter: snapshotter.into(),
+            key: key.into(),
+            parent: parent.into(),
+            labels: Default::default(),
+        };
+        let response: PrepareSnapshotResponse =
+            self.unary(request, paths::SNAPSHOT_PREPARE).await?;
+        Ok(response.mounts)
+    }
+
+    pub async fn remove_snapshot(
+        &mut self,
+        snapshotter: &str,
+        key: &str,
+    ) -> Result<(), ClientError> {
+        let request = RemoveSnapshotRequest {
+            snapshotter: snapshotter.into(),
+            key: key.into(),
+        };
+        let _: RemoveSnapshotResponse = self.unary(request, paths::SNAPSHOT_REMOVE).await?;
+        Ok(())
     }
 
     // --- Internal -----------------------------------------------------------

@@ -966,11 +966,16 @@ pub struct NetworkListQuery {
 // ---------------------------------------------------------------------------
 
 /// Request body for `POST /secrets/create`.
+///
+/// `Data` is optional: Minga carries secret **metadata** only, and a
+/// non-empty value is rejected rather than stored. Making it optional (as
+/// in Docker's API) lets a metadata-only create succeed.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SecretSpec {
     pub Name: String,
     #[serde(skip_serializing_if = "HashMap::is_empty", default)]
     pub Labels: HashMap<String, String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub Data: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub Templating: Option<Driver>,

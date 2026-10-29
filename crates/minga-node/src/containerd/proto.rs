@@ -39,17 +39,15 @@ pub struct Runtime {
     pub options: Option<prost_types::Any>,
 }
 
-/// `containerd.types.Descriptor`
+/// `containerd.types.Descriptor` (containerd v2.2.1).
 #[derive(Clone, PartialEq, Message)]
 pub struct Descriptor {
     #[prost(string, tag = "1")]
     pub media_type: String,
-    #[prost(bytes = "vec", tag = "2")]
-    pub digest: Vec<u8>,
+    #[prost(string, tag = "2")]
+    pub digest: String,
     #[prost(int64, tag = "3")]
     pub size: i64,
-    #[prost(string, repeated, tag = "4")]
-    pub urls: Vec<String>,
     #[prost(map = "string, string", tag = "5")]
     pub annotations: HashMap<String, String>,
 }
@@ -369,19 +367,80 @@ pub struct GetImageResponse {
     pub image: Option<Image>,
 }
 
+// ---------------------------------------------------------------------------
+// containerd.services.content.v1 and snapshots.v1
+// ---------------------------------------------------------------------------
+
 #[derive(Clone, PartialEq, Message)]
-pub struct PullImageRequest {
+pub struct ReadContentRequest {
     #[prost(string, tag = "1")]
-    pub image: String,
-    #[prost(string, tag = "2")]
-    pub platform: String,
+    pub digest: String,
+    #[prost(int64, tag = "2")]
+    pub offset: i64,
+    #[prost(int64, tag = "3")]
+    pub size: i64,
 }
 
 #[derive(Clone, PartialEq, Message)]
-pub struct PullImageResponse {
-    #[prost(message, optional, tag = "1")]
-    pub image: Option<Image>,
+pub struct ReadContentResponse {
+    #[prost(int64, tag = "1")]
+    pub offset: i64,
+    #[prost(bytes = "vec", tag = "2")]
+    pub data: Vec<u8>,
 }
+
+#[derive(Clone, PartialEq, Message)]
+pub struct StatSnapshotRequest {
+    #[prost(string, tag = "1")]
+    pub snapshotter: String,
+    #[prost(string, tag = "2")]
+    pub key: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct SnapshotInfo {
+    #[prost(string, tag = "1")]
+    pub name: String,
+    #[prost(string, tag = "2")]
+    pub parent: String,
+    #[prost(int32, tag = "3")]
+    pub kind: i32,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct StatSnapshotResponse {
+    #[prost(message, optional, tag = "1")]
+    pub info: Option<SnapshotInfo>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct PrepareSnapshotRequest {
+    #[prost(string, tag = "1")]
+    pub snapshotter: String,
+    #[prost(string, tag = "2")]
+    pub key: String,
+    #[prost(string, tag = "3")]
+    pub parent: String,
+    #[prost(map = "string, string", tag = "4")]
+    pub labels: HashMap<String, String>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct PrepareSnapshotResponse {
+    #[prost(message, repeated, tag = "1")]
+    pub mounts: Vec<Mount>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct RemoveSnapshotRequest {
+    #[prost(string, tag = "1")]
+    pub snapshotter: String,
+    #[prost(string, tag = "2")]
+    pub key: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct RemoveSnapshotResponse {}
 
 // ---------------------------------------------------------------------------
 // gRPC service paths
@@ -403,12 +462,28 @@ pub mod paths {
     pub const TASK_WAIT: &str = "/containerd.services.tasks.v1.Tasks/Wait";
 
     pub const IMAGE_GET: &str = "/containerd.services.images.v1.Images/Get";
-    pub const IMAGE_PULL: &str = "/containerd.services.images.v1.Images/Pull";
+    pub const CONTENT_READ: &str = "/containerd.services.content.v1.Content/Read";
+    pub const SNAPSHOT_STAT: &str = "/containerd.services.snapshots.v1.Snapshots/Stat";
+    pub const SNAPSHOT_PREPARE: &str = "/containerd.services.snapshots.v1.Snapshots/Prepare";
+    pub const SNAPSHOT_REMOVE: &str = "/containerd.services.snapshots.v1.Snapshots/Remove";
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn descriptor_digest_is_wire_string() {
+        let descriptor = Descriptor {
+            media_type: "application/vnd.oci.image.index.v1+json".into(),
+            digest: format!("sha256:{}", "a".repeat(64)),
+            size: 99,
+            annotations: HashMap::new(),
+        };
+        let encoded = descriptor.encode_to_vec();
+        let decoded = Descriptor::decode(encoded.as_slice()).unwrap();
+        assert_eq!(decoded.digest, descriptor.digest);
+    }
 
     #[test]
     fn container_roundtrip() {
@@ -417,7 +492,7 @@ mod tests {
             labels: HashMap::from([("app".to_string(), "nginx".to_string())]),
             image: "docker.io/library/nginx:latest".to_string(),
             spec: Some(prost_types::Any {
-                type_url: "types.containerd.io/opencontainers.runtime.spec.v1.Spec".to_string(),
+                type_url: "types.containerd.io/opencontainers/runtime-spec/1/Spec".to_string(),
                 value: b"{}".to_vec(),
             }),
             snapshotter: "overlayfs".to_string(),

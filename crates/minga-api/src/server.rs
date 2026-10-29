@@ -481,12 +481,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_secret_with_inline_data_is_rejected() {
+        let (router, _dir) = test_router().await;
+
+        // Docker's API allows an inline value. Minga must refuse it rather
+        // than accept and silently discard the bytes.
+        let body = serde_json::json!({
+            "Name": "test_inline_secret",
+            "Data": "c2VjcmV0MTIz"
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1.41/secrets/create")
+            .header("Content-Type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        let (status, json) = send_request(router.clone(), req).await;
+
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "inline secret data must be refused, got: {json}"
+        );
+        assert!(
+            json["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("inline data"),
+            "the error must explain why, got: {json}"
+        );
+        // The value must not appear anywhere in the response.
+        assert!(
+            !json.to_string().contains("c2VjcmV0MTIz"),
+            "the secret value must never be echoed: {json}"
+        );
+
+        // And nothing was created.
+        let req = Request::builder()
+            .uri("/v1.41/secrets")
+            .body(Body::empty())
+            .unwrap();
+        let (status, json) = send_request(router.clone(), req).await;
+        assert_eq!(status, StatusCode::OK);
+        let arr = json.as_array().unwrap();
+        assert!(
+            arr.iter().all(|s| s["Name"] != "test_inline_secret"),
+            "the refused secret must not exist: {json}"
+        );
+    }
+
+    #[tokio::test]
     async fn create_and_list_secret() {
         let (router, _dir) = test_router().await;
 
+        // Metadata only: Minga never accepts a secret value over the API.
         let body = serde_json::json!({
             "Name": "test_db_password",
-            "Data": "c2VjcmV0MTIz",
             "Labels": {"com.docker.stack.namespace": "test"}
         });
 

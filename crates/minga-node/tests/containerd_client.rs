@@ -97,7 +97,7 @@ async fn tasks_create_reaches_the_real_service() {
     };
 
     let result = client
-        .create_task("minga-nonexistent-container-probe", "", "")
+        .create_task("minga-nonexistent-container-probe", vec![], "", "")
         .await;
     match result {
         Err(minga_node::containerd::client::ClientError::Grpc(status)) => {

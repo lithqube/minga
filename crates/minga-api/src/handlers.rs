@@ -14,7 +14,7 @@ use axum::{
 use minga_state::StateStore;
 
 use crate::{
-    error::{conflict, not_found, ok_message, ApiError, ApiResult},
+    error::{bad_request, conflict, not_found, ok_message, ApiError, ApiResult},
     models::{self, Filters},
     translate,
 };
@@ -194,6 +194,14 @@ pub async fn create_service(
     Json(spec): Json<models::ServiceSpec>,
 ) -> ApiResult<(StatusCode, Json<models::ServiceCreateResponse>)> {
     let svc = translate::service_spec_to_state(&spec).map_err(ApiError::BadRequest)?;
+    for reference in &svc.secrets {
+        if app.store.get_secret(&reference.secret_id).await?.is_none() {
+            return Err(bad_request(format!(
+                "secret `{}` is not declared; create its metadata and provision it on eligible nodes first",
+                reference.secret_id
+            )));
+        }
+    }
 
     // Check for existing service with the same name.
     if let Some(existing) = app.store.get_service(&svc.id).await? {
@@ -278,6 +286,14 @@ pub async fn update_service(
 
     // Translate the new spec, preserving the ID.
     let mut svc = translate::service_spec_to_state(&spec).map_err(ApiError::BadRequest)?;
+    for reference in &svc.secrets {
+        if app.store.get_secret(&reference.secret_id).await?.is_none() {
+            return Err(bad_request(format!(
+                "secret `{}` is not declared; create its metadata and provision it on eligible nodes first",
+                reference.secret_id
+            )));
+        }
+    }
     svc.id = existing.id.clone();
     svc.name = existing.name.clone();
 
@@ -485,10 +501,25 @@ pub async fn list_secrets(
 }
 
 /// `POST /v{version}/secrets/create` — create a secret.
+///
+/// Only **metadata** is accepted. Docker's API allows an inline `Data`
+/// payload, but Minga has no secure path for a value submitted over the
+/// wire: it would have to travel through the API, into Raft, and out to
+/// every node. Accepting the field and silently dropping it would report
+/// success for a secret that does not exist, so a non-empty `Data` is
+/// refused with a clear error instead.
 pub async fn create_secret(
     State(app): State<Arc<AppState>>,
     Json(spec): Json<models::SecretSpec>,
 ) -> ApiResult<(StatusCode, Json<models::SecretCreateResponse>)> {
+    if !spec.Data.is_empty() {
+        return Err(bad_request(
+            "creating a secret with inline data is not supported: \
+             Minga secrets carry metadata only, and the value must be \
+             provisioned on the node's secret store",
+        ));
+    }
+
     if let Some(existing) = app.store.get_secret(&spec.Name).await? {
         return Err(conflict(format!("secret {} already exists", existing.name)));
     }

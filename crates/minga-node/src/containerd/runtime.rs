@@ -7,12 +7,11 @@
 //!
 //! ```text
 //! start(task_id, spec):
-//!   1. Ensure image is pulled (ImageService.Get → Pull if missing)
-//!   2. Generate OCI spec from TaskSpec
-//!   3. Create container (ContainerService.Create) with OCI spec as Any
-//!   4. Create task (TaskService.Create) from the container
-//!   5. Start task (TaskService.Start)
-//!   → returns container_id (= task_id)
+//!   1. Require an image preloaded and unpacked in namespace `minga`
+//!   2. Read and authenticate OCI metadata; derive process and parent snapshot
+//!   3. Prepare a writable snapshot and generate the OCI spec
+//!   4. Create container and task with the snapshot's rootfs mounts
+//!   5. Start task; rollback snapshot/container/task on failure
 //!
 //! stop(container_id):
 //!   1. Kill task with SIGTERM (TaskService.Kill)
@@ -32,14 +31,19 @@ use minga_state::types::{TaskId, TaskSpec};
 use tokio::sync::Mutex;
 
 use super::client::{ClientError, ContainerdClient};
+use super::image;
 use super::oci;
-use super::proto::{Container, ProcessStatus, Runtime as ProtoRuntime};
+use super::proto::{Container, Image, ProcessStatus, Runtime as ProtoRuntime};
 use crate::runtime::{
     ContainerInfo, ContainerLog, ContainerState, ContainerStatus, Runtime, RuntimeError,
 };
+use crate::secrets::SecretStore;
 
 /// Grace period after SIGTERM before sending SIGKILL.
 const GRACE_PERIOD: Duration = Duration::from_secs(10);
+
+/// How long to wait for the process to exit after SIGKILL.
+const KILL_GRACE_PERIOD: Duration = Duration::from_secs(10);
 
 /// How long to wait between SIGTERM and checking if the process exited.
 const KILL_CHECK_INTERVAL: Duration = Duration::from_millis(500);
@@ -50,6 +54,18 @@ const DEFAULT_SNAPSHOTTER: &str = "overlayfs";
 /// Default containerd runtime (runc v2).
 const DEFAULT_RUNTIME_NAME: &str = "io.containerd.runc.v2";
 
+/// Whether a client error means "the resource is already gone".
+///
+/// containerd answers with `NotFound` when a task, container or snapshot
+/// does not exist. That is the normal case when cleaning up after a
+/// previous attempt, so it must not be reported as a failure.
+fn is_missing(error: &ClientError) -> bool {
+    matches!(
+        error,
+        ClientError::Grpc(status) if status.code() == tonic::Code::NotFound
+    )
+}
+
 /// A container runtime backed by containerd.
 pub struct ContainerdRuntime {
     client: Arc<Mutex<ContainerdClient>>,
@@ -57,6 +73,8 @@ pub struct ContainerdRuntime {
     containers: Arc<Mutex<HashSet<String>>>,
     snapshotter: String,
     runtime_name: String,
+    /// Node-local secret store used to resolve secret references.
+    secret_store: Option<SecretStore>,
 }
 
 impl ContainerdRuntime {
@@ -75,7 +93,48 @@ impl ContainerdRuntime {
             containers: Arc::new(Mutex::new(HashSet::new())),
             snapshotter: DEFAULT_SNAPSHOTTER.to_string(),
             runtime_name: DEFAULT_RUNTIME_NAME.to_string(),
+            secret_store: None,
         }
+    }
+
+    /// Attach a node-local secret store.
+    ///
+    /// Without one, a task that declares secrets **fails closed** — the
+    /// container is not created. A missing secret must stop the task, never
+    /// start it with an empty credential.
+    pub fn with_secret_store(mut self, store: SecretStore) -> Self {
+        self.secret_store = Some(store);
+        self
+    }
+
+    /// Resolve the task's secret references into mounts.
+    ///
+    /// Fails closed: if a secret is missing, unsafe or the node has no
+    /// secret store configured, the task is not started. The error names
+    /// the secret but never its value.
+    fn resolve_secrets(&self, spec: &TaskSpec) -> Result<Vec<oci::SecretMount>, RuntimeError> {
+        if spec.secrets.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let store = self.secret_store.as_ref().ok_or_else(|| {
+            RuntimeError::Start(format!(
+                "task declares {} secret(s) but no node secret store is configured",
+                spec.secrets.len()
+            ))
+        })?;
+
+        let resolved = store
+            .resolve_all(&spec.secrets)
+            .map_err(|e| RuntimeError::Start(format!("secret resolution failed: {e}")))?;
+
+        Ok(resolved
+            .into_iter()
+            .map(|(secret_ref, path)| oci::SecretMount {
+                source: path,
+                target: secret_ref.target,
+            })
+            .collect())
     }
 
     /// Override the snapshotter (default: overlayfs).
@@ -90,25 +149,131 @@ impl ContainerdRuntime {
         self
     }
 
-    /// Ensure the image exists; pull it if missing.
-    async fn ensure_image(&self, image_ref: &str) -> Result<(), RuntimeError> {
+    /// Require an image already available in Minga's containerd namespace.
+    ///
+    /// The Images service has no Pull RPC. Image retrieval and unpacking
+    /// must be performed by an explicit provisioning step until Minga has a
+    /// supported registry/transfer implementation.
+    async fn ensure_image(&self, image_ref: &str) -> Result<Image, RuntimeError> {
         let mut client = self.client.lock().await;
-
         match client.get_image(image_ref).await {
-            Ok(Some(_)) => {
-                tracing::debug!(image = %image_ref, "image already present");
-                Ok(())
-            }
-            Ok(None) => {
-                tracing::info!(image = %image_ref, "pulling image");
-                client
-                    .pull_image(image_ref)
-                    .await
-                    .map_err(|e| RuntimeError::Start(format!("pull {image_ref}: {e}")))?;
-                tracing::info!(image = %image_ref, "image pulled");
-                Ok(())
-            }
+            Ok(Some(image)) => Ok(image),
+            Ok(None) => Err(RuntimeError::Start(format!(
+                "image {image_ref} is not preloaded in the minga containerd namespace; preload and unpack it before starting this task"
+            ))),
             Err(e) => Err(RuntimeError::Start(format!("check image {image_ref}: {e}"))),
+        }
+    }
+
+    /// Clear leftovers from a previous attempt at the same task ID.
+    ///
+    /// A container, its task and its writable snapshot all share the task ID,
+    /// so a restart must remove them first. Resources that are already gone
+    /// are not an error.
+    async fn cleanup_existing(
+        client: &mut ContainerdClient,
+        container_id: &str,
+        snapshot_key: &str,
+        snapshotter: &str,
+    ) -> Result<(), RuntimeError> {
+        let mut errors = Vec::new();
+        if let Err(error) = client.kill_task(container_id, 9).await {
+            if !is_missing(&error) {
+                errors.push(format!("kill stale task: {error}"));
+            }
+        }
+        if let Err(error) = client.delete_task(container_id).await {
+            if !is_missing(&error) {
+                errors.push(format!("delete stale task: {error}"));
+            }
+        }
+        if let Err(error) = client.delete_container(container_id).await {
+            if !is_missing(&error) {
+                errors.push(format!("delete stale container: {error}"));
+            }
+        }
+        if let Err(error) = client.remove_snapshot(snapshotter, snapshot_key).await {
+            if !is_missing(&error) {
+                errors.push(format!("remove stale snapshot: {error}"));
+            }
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(RuntimeError::Start(format!(
+                "clear previous attempt for {container_id}: {}",
+                errors.join(", ")
+            )))
+        }
+    }
+
+    /// Wait for a task to reach the stopped state.
+    ///
+    /// Returns `true` when the task is stopped or already gone, `false` when
+    /// the deadline passed with the task still running.
+    async fn wait_for_stop(
+        client: &Arc<Mutex<ContainerdClient>>,
+        container_id: &str,
+        deadline: std::time::Instant,
+    ) -> bool {
+        loop {
+            let status = {
+                let mut guard = client.lock().await;
+                match guard.get_task(container_id).await {
+                    Ok(process) => Some(
+                        ProcessStatus::try_from(process.status).unwrap_or(ProcessStatus::Unknown),
+                    ),
+                    Err(ClientError::Grpc(status)) if status.code() == tonic::Code::NotFound => {
+                        None // task is gone
+                    }
+                    Err(_) => return true,
+                }
+            };
+            match status {
+                Some(ProcessStatus::Stopped) | None => return true,
+                Some(_) => {}
+            }
+
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(KILL_CHECK_INTERVAL).await;
+        }
+    }
+
+    /// Report incomplete rollback, so a leaked task/snapshot is never silent.
+    async fn rollback_start(
+        client: &mut ContainerdClient,
+        container_id: &str,
+        snapshot_key: &str,
+        snapshotter: &str,
+        container_created: bool,
+        task_created: bool,
+        task_may_be_running: bool,
+    ) -> String {
+        let mut errors = Vec::new();
+        if task_may_be_running {
+            if let Err(error) = client.kill_task(container_id, 9).await {
+                errors.push(format!("kill task: {error}"));
+            }
+        }
+        if task_created {
+            if let Err(error) = client.delete_task(container_id).await {
+                errors.push(format!("delete task: {error}"));
+            }
+        }
+        if container_created {
+            if let Err(error) = client.delete_container(container_id).await {
+                errors.push(format!("delete container: {error}"));
+            }
+        }
+        if let Err(error) = client.remove_snapshot(snapshotter, snapshot_key).await {
+            errors.push(format!("remove snapshot: {error}"));
+        }
+        if errors.is_empty() {
+            String::new()
+        } else {
+            format!("; rollback incomplete: {}", errors.join(", "))
         }
     }
 }
@@ -116,16 +281,30 @@ impl ContainerdRuntime {
 #[async_trait]
 impl Runtime for ContainerdRuntime {
     async fn start(&self, task_id: &TaskId, spec: &TaskSpec) -> Result<String, RuntimeError> {
-        // Use the task_id as the container ID for traceability.
         let container_id = task_id.clone();
+        let secret_mounts = self.resolve_secrets(spec)?;
+        let image = self.ensure_image(&spec.image).await?;
 
-        // 1. Ensure image is available.
-        self.ensure_image(&spec.image).await?;
+        let mut client = self.client.lock().await;
+        let config = image::load_image(&mut client, &image, &self.snapshotter)
+            .await
+            .map_err(RuntimeError::Start)?;
 
-        // 2. Generate OCI spec.
-        let oci_any = oci::spec_to_any(&container_id, spec).map_err(RuntimeError::Start)?;
+        let snapshot_key = format!("minga-{container_id}");
 
-        // 3. Create the containerd container.
+        // A previous attempt at this task ID may have left a container, a
+        // task or a snapshot behind. Clear them before creating new ones.
+        Self::cleanup_existing(&mut client, &container_id, &snapshot_key, &self.snapshotter)
+            .await?;
+
+        let mounts = client
+            .prepare_snapshot(&self.snapshotter, &snapshot_key, &config.parent_snapshot)
+            .await
+            .map_err(|error| RuntimeError::Start(format!("prepare snapshot: {error}")))?;
+
+        let oci_any = oci::spec_to_any_with_image(&container_id, spec, &secret_mounts, &config)
+            .map_err(RuntimeError::Start)?;
+
         let container = Container {
             id: container_id.clone(),
             labels: HashMap::from([
@@ -135,35 +314,56 @@ impl Runtime for ContainerdRuntime {
             image: spec.image.clone(),
             spec: Some(oci_any),
             snapshotter: self.snapshotter.clone(),
-            snapshot_key: String::new(), // containerd assigns this
+            snapshot_key: snapshot_key.clone(),
             runtime: Some(ProtoRuntime {
                 name: self.runtime_name.clone(),
                 options: None,
             }),
         };
 
-        let mut client = self.client.lock().await;
         client
             .create_container(container)
             .await
-            .map_err(|e| RuntimeError::Start(format!("create container: {e}")))?;
+            .map_err(|error| RuntimeError::Start(format!("create container: {error}")))?;
+        let container_created = true;
+
+        let pid = match client.create_task(&container_id, mounts, "", "").await {
+            Ok(pid) => pid,
+            Err(error) => {
+                let rollback = Self::rollback_start(
+                    &mut client,
+                    &container_id,
+                    &snapshot_key,
+                    &self.snapshotter,
+                    container_created,
+                    false,
+                    false,
+                )
+                .await;
+                return Err(RuntimeError::Start(format!(
+                    "create task: {error}{rollback}"
+                )));
+            }
+        };
+        let task_created = true;
+
+        if let Err(error) = client.start_task(&container_id).await {
+            let rollback = Self::rollback_start(
+                &mut client,
+                &container_id,
+                &snapshot_key,
+                &self.snapshotter,
+                container_created,
+                task_created,
+                true,
+            )
+            .await;
+            return Err(RuntimeError::Start(format!(
+                "start task: {error}{rollback}"
+            )));
+        }
+
         drop(client);
-
-        // 4. Create the task.
-        let mut client = self.client.lock().await;
-        let pid = client
-            .create_task(&container_id, "", "")
-            .await
-            .map_err(|e| RuntimeError::Start(format!("create task: {e}")))?;
-
-        // 5. Start the task.
-        client
-            .start_task(&container_id)
-            .await
-            .map_err(|e| RuntimeError::Start(format!("start task: {e}")))?;
-        drop(client);
-
-        // Track the container.
         self.containers.lock().await.insert(container_id.clone());
 
         tracing::info!(
@@ -171,6 +371,7 @@ impl Runtime for ContainerdRuntime {
             container = %container_id,
             image = %spec.image,
             pid,
+            snapshot_key,
             "containerd: started container"
         );
 
@@ -194,40 +395,43 @@ impl Runtime for ContainerdRuntime {
             }
         }
 
-        // 2. Wait for graceful exit (poll task status).
+        // 2. Wait for the graceful exit.
+        //
+        // The client guard must be released first: `wait_for_stop` locks the
+        // same mutex to read the task status.
+        drop(client);
         let deadline = std::time::Instant::now() + GRACE_PERIOD;
-        loop {
-            match client.get_task(container_id).await {
-                Ok(process) => {
-                    let status =
-                        ProcessStatus::try_from(process.status).unwrap_or(ProcessStatus::Unknown);
-                    if status == ProcessStatus::Stopped {
-                        break;
-                    }
-                }
-                Err(ClientError::Grpc(status)) if status.code() == tonic::Code::NotFound => {
-                    break; // task is gone
-                }
-                Err(_) => break,
-            }
-
-            if std::time::Instant::now() >= deadline {
-                // Grace period expired — force kill.
-                tracing::warn!(container = %container_id, "grace period expired, sending SIGKILL");
-                let _ = client.kill_task(container_id, 9).await;
-                break;
-            }
+        if !Self::wait_for_stop(&self.client, container_id, deadline).await {
+            // Grace period expired — force kill, then wait again. containerd
+            // refuses to delete a task whose process is still alive, so the
+            // delete below must not run until the process is really gone.
+            tracing::warn!(container = %container_id, "grace period expired, sending SIGKILL");
+            let mut client = self.client.lock().await;
+            let _ = client.kill_task(container_id, 9).await;
             drop(client);
-            tokio::time::sleep(KILL_CHECK_INTERVAL).await;
-            client = self.client.lock().await;
+            let deadline = std::time::Instant::now() + KILL_GRACE_PERIOD;
+            if !Self::wait_for_stop(&self.client, container_id, deadline).await {
+                return Err(RuntimeError::Stop(format!(
+                    "task {container_id} is still running after SIGKILL"
+                )));
+            }
         }
+        let mut client = self.client.lock().await;
 
-        // 3. Delete the task.
+        // 3. Delete the task, then the container.
+        //
+        // Order matters: containerd refuses to delete a container that still
+        // has a task, and a task whose container is already gone can never
+        // be deleted again — it would be stranded in the namespace forever.
+        // A failed task delete must therefore abort before the container is
+        // removed, not be logged and ignored.
         match client.delete_task(container_id).await {
             Ok(_) => {}
             Err(ClientError::Grpc(status)) if status.code() == tonic::Code::NotFound => {}
             Err(e) => {
-                tracing::warn!(container = %container_id, error = %e, "failed to delete task");
+                return Err(RuntimeError::Stop(format!(
+                    "delete task {container_id}: {e}"
+                )));
             }
         }
 
@@ -247,6 +451,16 @@ impl Runtime for ContainerdRuntime {
         // 5. Remove from tracking.
         self.containers.lock().await.remove(container_id);
 
+        // 6. Remove the writable snapshot prepared for this container.
+        let mut client = self.client.lock().await;
+        if let Err(error) = client
+            .remove_snapshot(&self.snapshotter, &format!("minga-{container_id}"))
+            .await
+        {
+            tracing::warn!(container = %container_id, error = %error, "failed to remove snapshot");
+        }
+        drop(client);
+
         tracing::info!(container = %container_id, "containerd: stopped container");
         Ok(())
     }
@@ -254,7 +468,7 @@ impl Runtime for ContainerdRuntime {
     async fn list(&self) -> Vec<ContainerInfo> {
         let mut client = self.client.lock().await;
         let containers = match client
-            .list_containers(vec!["labels.minga/task_id exists".to_string()])
+            .list_containers(vec!["labels.minga.task_id!=empty".to_string()])
             .await
         {
             Ok(cs) => cs,

@@ -20,7 +20,12 @@ fn socket_path() -> String {
 }
 
 fn containerd_available_at(path: &str) -> bool {
-    Path::new(path).exists()
+    let exists = Path::new(path).exists();
+    assert!(
+        exists || std::env::var_os("MINGA_REQUIRE_CONTAINERD").is_none(),
+        "required containerd socket is absent: {path}"
+    );
+    exists
 }
 
 fn test_spec(image: &str) -> TaskSpec {
@@ -44,14 +49,24 @@ async fn containerd_start_list_status_stop() {
     let runtime = match ContainerdRuntime::connect(&socket).await {
         Ok(rt) => rt,
         Err(e) => {
+            assert!(
+                std::env::var_os("MINGA_REQUIRE_CONTAINERD").is_none(),
+                "required containerd connection failed: {e}"
+            );
             eprintln!("SKIP: cannot connect to containerd: {e}");
             return;
         }
     };
 
-    // Use a tiny image that's quick to pull.
-    let spec = test_spec("docker.io/library/busybox:latest");
-    let task_id = "minga-test-busybox-001".to_string();
+    // The image must be preloaded and unpacked in the `minga` namespace.
+    //
+    // Redis is used because its default command is a long-running server:
+    // BusyBox's default command is `sh`, which exits immediately when stdin
+    // is closed, so a BusyBox container can never be observed in the
+    // Running state. Redis is also the image the reference production
+    // stack runs.
+    let spec = test_spec("docker.io/library/redis:8.10.2-alpine");
+    let task_id = "minga-test-redis-001".to_string();
 
     // Start the container.
     let container_id = runtime
@@ -83,6 +98,35 @@ async fn containerd_start_list_status_stop() {
 }
 
 #[tokio::test]
+async fn missing_image_fails_with_preload_instruction() {
+    let socket = socket_path();
+    if !containerd_available_at(&socket) {
+        eprintln!("SKIP: containerd not available at {socket}");
+        return;
+    }
+    let runtime = match ContainerdRuntime::connect(&socket).await {
+        Ok(rt) => rt,
+        Err(e) => {
+            assert!(
+                std::env::var_os("MINGA_REQUIRE_CONTAINERD").is_none(),
+                "required containerd connection failed: {e}"
+            );
+            eprintln!("SKIP: cannot connect to containerd: {e}");
+            return;
+        }
+    };
+    let spec = test_spec("docker.io/library/minga-nonexistent-image:never");
+    let err = runtime
+        .start(&"minga-missing-image-probe".to_string(), &spec)
+        .await
+        .expect_err("missing image must fail closed");
+    assert!(
+        err.to_string().contains("preload") || err.to_string().contains("pre-provision"),
+        "missing image should explain the provisioning requirement: {err}"
+    );
+}
+
+#[tokio::test]
 async fn containerd_stop_nonexistent_is_graceful() {
     let socket = socket_path();
     if !containerd_available_at(&socket) {
@@ -93,6 +137,10 @@ async fn containerd_stop_nonexistent_is_graceful() {
     let runtime = match ContainerdRuntime::connect(&socket).await {
         Ok(rt) => rt,
         Err(e) => {
+            assert!(
+                std::env::var_os("MINGA_REQUIRE_CONTAINERD").is_none(),
+                "required containerd connection failed: {e}"
+            );
             eprintln!("SKIP: cannot connect to containerd: {e}");
             return;
         }
@@ -116,6 +164,10 @@ async fn containerd_list_empty_when_no_containers() {
     let runtime = match ContainerdRuntime::connect(&socket).await {
         Ok(rt) => rt,
         Err(e) => {
+            assert!(
+                std::env::var_os("MINGA_REQUIRE_CONTAINERD").is_none(),
+                "required containerd connection failed: {e}"
+            );
             eprintln!("SKIP: cannot connect to containerd: {e}");
             return;
         }

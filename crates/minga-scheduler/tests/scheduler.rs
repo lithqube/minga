@@ -43,6 +43,7 @@ fn make_service(id: &str, replicas: u32) -> Service {
         resources: ResourceSpec::default(),
         agent: None,
         restart_policy: Default::default(),
+        secrets: vec![],
     }
 }
 

@@ -12,6 +12,8 @@ use std::collections::HashMap;
 use minga_state::types::TaskSpec;
 use serde::Serialize;
 
+use super::image::ImageConfiguration;
+
 /// OCI runtime spec version.
 const OCI_VERSION: &str = "1.0.2";
 
@@ -174,6 +176,51 @@ fn default_capabilities() -> OciCapabilities {
         permitted: caps,
         ambient: vec![],
     }
+}
+
+/// A resolved secret, ready to be mounted.
+///
+/// `source` is a path Minga constructed on the node; `target` is the
+/// in-container path. Neither is user-supplied text at this point.
+#[derive(Debug, Clone)]
+pub struct SecretMount {
+    pub source: std::path::PathBuf,
+    pub target: String,
+}
+
+/// Generate an OCI runtime spec from a Minga task spec.
+///
+/// The `container_id` is used as the hostname and in annotations.
+/// Port mappings and resource limits from the spec are translated to
+/// OCI linux resources and annotations.
+///
+/// `secret_mounts` are the resolved secrets to deliver as read-only files
+/// under `/run/secrets/`. They are mounted with `ro`, `nosuid`, `nodev` and
+/// `noexec` so a workload cannot modify, execute or gain privileges from a
+/// secret file.
+pub fn spec_from_task_with_secrets(
+    container_id: &str,
+    spec: &TaskSpec,
+    secret_mounts: &[SecretMount],
+) -> OciSpec {
+    let mut oci = spec_from_task(container_id, spec);
+
+    for secret in secret_mounts {
+        oci.mounts.push(OciMount {
+            destination: secret.target.clone(),
+            mount_type: "bind".to_string(),
+            source: secret.source.display().to_string(),
+            options: vec![
+                "bind".to_string(),
+                "ro".to_string(),
+                "nosuid".to_string(),
+                "nodev".to_string(),
+                "noexec".to_string(),
+            ],
+        });
+    }
+
+    oci
 }
 
 /// Generate an OCI runtime spec from a Minga task spec.
@@ -352,13 +399,68 @@ pub fn spec_from_task(container_id: &str, spec: &TaskSpec) -> OciSpec {
 
 /// Serialize the OCI spec to JSON bytes, suitable for packing into a
 /// `google.protobuf.Any` with type URL
-/// `types.containerd.io/opencontainers.runtime.spec.v1.Spec`.
+/// `types.containerd.io/opencontainers/runtime-spec/1/Spec`.
 pub fn spec_to_any(container_id: &str, spec: &TaskSpec) -> Result<prost_types::Any, String> {
     let oci = spec_from_task(container_id, spec);
     let json =
         serde_json::to_vec(&oci).map_err(|e| format!("failed to serialize OCI spec: {e}"))?;
     Ok(prost_types::Any {
-        type_url: "types.containerd.io/opencontainers.runtime.spec.v1.Spec".to_string(),
+        type_url: "types.containerd.io/opencontainers/runtime-spec/1/Spec".to_string(),
+        value: json,
+    })
+}
+
+/// Serialize an OCI spec that includes secret mounts.
+pub fn spec_to_any_with_secrets(
+    container_id: &str,
+    spec: &TaskSpec,
+    secret_mounts: &[SecretMount],
+) -> Result<prost_types::Any, String> {
+    let oci = spec_from_task_with_secrets(container_id, spec, secret_mounts);
+    let json =
+        serde_json::to_vec(&oci).map_err(|e| format!("failed to serialize OCI spec: {e}"))?;
+    Ok(prost_types::Any {
+        type_url: "types.containerd.io/opencontainers/runtime-spec/1/Spec".to_string(),
+        value: json,
+    })
+}
+
+/// Serialize a runnable OCI spec using the selected image's process defaults.
+/// Explicit task environment entries override image values by key.
+pub fn spec_to_any_with_image(
+    container_id: &str,
+    spec: &TaskSpec,
+    secret_mounts: &[SecretMount],
+    image: &ImageConfiguration,
+) -> Result<prost_types::Any, String> {
+    if image.args.is_empty() || image.args[0].is_empty() {
+        return Err("image has no executable command".into());
+    }
+    let mut oci = spec_from_task_with_secrets(container_id, spec, secret_mounts);
+    oci.process.args = image.args.clone();
+    oci.process.cwd = image.cwd.clone();
+    oci.process.user = OciUser {
+        uid: image.uid,
+        gid: image.gid,
+    };
+    let mut env = image.env.clone();
+    let mut overrides: Vec<_> = spec.env.iter().collect();
+    overrides.sort_by_key(|(key, _)| *key);
+    for (key, value) in overrides {
+        env.retain(|entry| match entry.split_once('=') {
+            Some((name, _)) => name != key,
+            None => true,
+        });
+        env.push(format!("{key}={value}"));
+    }
+    if !env.iter().any(|entry| entry.starts_with("PATH=")) {
+        env.push("PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".into());
+    }
+    oci.process.env = env;
+    let json = serde_json::to_vec(&oci)
+        .map_err(|error| format!("failed to serialize OCI spec: {error}"))?;
+    Ok(prost_types::Any {
+        type_url: "types.containerd.io/opencontainers/runtime-spec/1/Spec".into(),
         value: json,
     })
 }
@@ -376,6 +478,32 @@ mod tests {
             resources: ResourceSpec::default(),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn preloaded_image_process_defaults_and_task_env_override() {
+        let mut task = base_spec();
+        task.env.insert("A".into(), "override".into());
+        let image = ImageConfiguration {
+            args: vec!["/bin/sh".into(), "-c".into(), "echo ok".into()],
+            env: vec!["A=image".into(), "PATH=/bin".into(), "B=keep".into()],
+            cwd: "/app".into(),
+            uid: 1000,
+            gid: 1001,
+            parent_snapshot: "unused".into(),
+        };
+        let any = spec_to_any_with_image("c1", &task, &[], &image).unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&any.value).unwrap();
+        assert_eq!(
+            json["process"]["args"],
+            serde_json::json!(["/bin/sh", "-c", "echo ok"])
+        );
+        assert_eq!(json["process"]["cwd"], "/app");
+        assert_eq!(json["process"]["user"]["uid"], 1000);
+        assert_eq!(
+            json["process"]["env"],
+            serde_json::json!(["PATH=/bin", "B=keep", "A=override"])
+        );
     }
 
     #[test]
@@ -518,11 +646,81 @@ mod tests {
     }
 
     #[test]
+    fn secret_mount_is_read_only_and_confined() {
+        let mut ts = base_spec();
+        ts.secrets = vec![minga_state::types::SecretRef::new(
+            "stack_password",
+            "/run/secrets/db_password",
+        )];
+
+        let mount = SecretMount {
+            source: std::path::PathBuf::from("/var/lib/minga/secrets/abc123.secret"),
+            target: "/run/secrets/db_password".to_string(),
+        };
+        let spec = spec_from_task_with_secrets("c1", &ts, std::slice::from_ref(&mount));
+
+        let m = spec
+            .mounts
+            .iter()
+            .find(|m| m.destination == "/run/secrets/db_password")
+            .expect("the secret mount must be present");
+
+        assert_eq!(m.mount_type, "bind");
+        assert_eq!(m.source, "/var/lib/minga/secrets/abc123.secret");
+        // Read-only, and no privilege can be gained from the file.
+        assert!(m.options.contains(&"ro".to_string()));
+        assert!(m.options.contains(&"nosuid".to_string()));
+        assert!(m.options.contains(&"nodev".to_string()));
+        assert!(m.options.contains(&"noexec".to_string()));
+        assert!(m.options.contains(&"bind".to_string()));
+    }
+
+    #[test]
+    fn secret_mounts_preserve_existing_mounts() {
+        let ts = base_spec();
+        let mount = SecretMount {
+            source: std::path::PathBuf::from("/var/lib/minga/secrets/abc123.secret"),
+            target: "/run/secrets/db_password".to_string(),
+        };
+        let plain = spec_from_task("c1", &ts);
+        let with_secret = spec_from_task_with_secrets("c1", &ts, std::slice::from_ref(&mount));
+
+        assert_eq!(
+            with_secret.mounts.len(),
+            plain.mounts.len() + 1,
+            "adding a secret must not disturb the standard mounts"
+        );
+        for m in &plain.mounts {
+            assert!(
+                with_secret
+                    .mounts
+                    .iter()
+                    .any(|w| w.destination == m.destination),
+                "standard mount {} must survive",
+                m.destination
+            );
+        }
+    }
+
+    #[test]
+    fn spec_without_secrets_has_no_secret_mount() {
+        let ts = base_spec();
+        let spec = spec_from_task("c1", &ts);
+        assert!(
+            !spec
+                .mounts
+                .iter()
+                .any(|m| m.destination.starts_with("/run/secrets/")),
+            "a task with no secrets must have no secret mount"
+        );
+    }
+
+    #[test]
     fn spec_to_any_produces_valid_any() {
         let any = spec_to_any("c1", &base_spec()).unwrap();
         assert_eq!(
             any.type_url,
-            "types.containerd.io/opencontainers.runtime.spec.v1.Spec"
+            "types.containerd.io/opencontainers/runtime-spec/1/Spec"
         );
         // The value should be valid JSON
         let json: serde_json::Value = serde_json::from_slice(&any.value).unwrap();

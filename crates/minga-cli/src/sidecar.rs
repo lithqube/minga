@@ -26,6 +26,8 @@ pub enum SidecarError {
     #[error("failed to write config file: {0}")]
     ConfigWrite(String),
 
+    #[error("plaintext NATS sidecar may only listen on loopback")]
+    InsecureListener,
     #[error("failed to spawn nats-server: {0}")]
     Spawn(String),
 
@@ -37,6 +39,45 @@ pub enum SidecarError {
 
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+}
+
+/// TLS material for the NATS **server** side.
+///
+/// Paths point at files the `nats-server` process reads itself. Minga never
+/// parses the key and never copies it into the generated config — the config
+/// only carries the path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerTls {
+    /// PEM file with the server certificate.
+    pub cert_file: PathBuf,
+    /// PEM file with the server private key.
+    pub key_file: PathBuf,
+    /// PEM file with the CA that signs client certificates.
+    pub ca_file: PathBuf,
+    /// Verify client certificates against `ca_file`.
+    pub verify: bool,
+    /// Map the client certificate identity to NATS permissions.
+    pub verify_and_map: bool,
+}
+
+/// Cluster (route) TLS for a NATS server.
+///
+/// Separate from the client-facing TLS: routes are a different trust
+/// relationship and must not silently reuse the client material.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClusterTls {
+    /// Shared cluster identity; every route peer must use the same name.
+    pub name: String,
+    /// PEM file with the server certificate used for routes.
+    pub cert_file: PathBuf,
+    /// PEM file with the server private key used for routes.
+    pub key_file: PathBuf,
+    /// PEM file with the CA that signs peer server certificates.
+    pub ca_file: PathBuf,
+    /// Route listen port.
+    pub port: u16,
+    /// Peer routes, e.g. `nats://10.0.0.2:6222`.
+    pub routes: Vec<String>,
 }
 
 /// Options for the NATS sidecar.
@@ -54,6 +95,15 @@ pub struct SidecarOptions {
     pub max_memory_store: String,
     /// JetStream max file store (e.g. "1GB").
     pub max_file_store: String,
+    /// Address the client listener binds to.
+    ///
+    /// Defaults to loopback. A plaintext sidecar must never bind on a public
+    /// interface; remote nodes require an explicitly configured TLS server.
+    pub listen_addr: String,
+    /// Client-facing TLS. `None` means plaintext (development only).
+    pub tls: Option<ServerTls>,
+    /// Cluster route TLS. `None` means no cluster configuration.
+    pub cluster: Option<ClusterTls>,
 }
 
 impl Default for SidecarOptions {
@@ -65,6 +115,9 @@ impl Default for SidecarOptions {
             monitor_port: 8222,
             max_memory_store: "64MB".to_string(),
             max_file_store: "1GB".to_string(),
+            listen_addr: "127.0.0.1".to_string(),
+            tls: None,
+            cluster: None,
         }
     }
 }
@@ -78,6 +131,9 @@ pub struct NatsSidecar {
 impl NatsSidecar {
     /// Spawn `nats-server` with the given options and wait for readiness.
     pub async fn start(opts: &SidecarOptions) -> Result<Self, SidecarError> {
+        if opts.tls.is_none() && opts.listen_addr != "127.0.0.1" && opts.listen_addr != "::1" {
+            return Err(SidecarError::InsecureListener);
+        }
         // Create data directories.
         let nats_dir = opts.data_dir.join("nats");
         let jetstream_dir = nats_dir.join("jetstream");
@@ -167,34 +223,78 @@ impl Drop for NatsSidecar {
 
 /// Generate the NATS server config as a string.
 fn generate_config(opts: &SidecarOptions, jetstream_dir: &Path) -> String {
-    format!(
-        r#"# Minga NATS server config (generated — do not edit)
-# Node: {}
-# Data dir: {}
+    let mut out = String::new();
 
-listen: 0.0.0.0:{}
-server_name: minga-{}
+    out.push_str("# Minga NATS server config (generated - do not edit)\n");
+    out.push_str(&format!("# Node: {}\n", opts.node_id));
+    out.push_str(&format!("# Data dir: {}\n\n", opts.data_dir.display()));
 
-# Monitoring — localhost only
-http: "127.0.0.1:{}"
+    out.push_str(&format!(
+        "listen: {}:{}\n",
+        opts.listen_addr, opts.client_port
+    ));
+    out.push_str(&format!("server_name: minga-{}\n\n", opts.node_id));
 
-# JetStream storage limits (pinned, not 75% defaults)
-max_memory_store: {}
-max_file_store: {}
+    // Monitoring - localhost only. The monitoring endpoint is not protected by
+    // client-certificate verification, so it must never listen on a routable
+    // address.
+    out.push_str(&format!("http: \"127.0.0.1:{}\"\n\n", opts.monitor_port));
 
-jetstream {{
-    store_dir: "{}"
-}}
-"#,
-        opts.node_id,
-        opts.data_dir.display(),
-        opts.client_port,
-        opts.node_id,
-        opts.monitor_port,
-        opts.max_memory_store,
-        opts.max_file_store,
-        jetstream_dir.display(),
-    )
+    // Client-facing TLS.
+    if let Some(tls) = &opts.tls {
+        out.push_str("tls {\n");
+        out.push_str(&format!("    cert_file: \"{}\"\n", tls.cert_file.display()));
+        out.push_str(&format!("    key_file: \"{}\"\n", tls.key_file.display()));
+        out.push_str(&format!("    ca_file: \"{}\"\n", tls.ca_file.display()));
+        out.push_str(&format!("    verify: {}\n", tls.verify));
+        if tls.verify_and_map {
+            // Map the verified client certificate identity onto NATS
+            // permissions, so a valid certificate is not automatically a
+            // cluster administrator.
+            out.push_str("    verify_and_map: true\n");
+        }
+        out.push_str("}\n\n");
+    }
+
+    // Cluster routes - a separate trust relationship from client TLS.
+    if let Some(cluster) = &opts.cluster {
+        out.push_str("cluster {\n");
+        out.push_str(&format!("    name: {}\n", cluster.name));
+        out.push_str(&format!("    port: {}\n", cluster.port));
+        if !cluster.routes.is_empty() {
+            out.push_str("    routes = [\n");
+            for route in &cluster.routes {
+                out.push_str(&format!("        \"{route}\",\n"));
+            }
+            out.push_str("    ]\n");
+        }
+        out.push_str("    tls {\n");
+        out.push_str(&format!(
+            "        cert_file: \"{}\"\n",
+            cluster.cert_file.display()
+        ));
+        out.push_str(&format!(
+            "        key_file: \"{}\"\n",
+            cluster.key_file.display()
+        ));
+        out.push_str(&format!(
+            "        ca_file: \"{}\"\n",
+            cluster.ca_file.display()
+        ));
+        out.push_str("        verify: true\n");
+        out.push_str("    }\n");
+        out.push_str("}\n\n");
+    }
+
+    out.push_str("# JetStream storage limits (pinned, not 75% defaults)\n");
+    out.push_str(&format!("max_memory_store: {}\n", opts.max_memory_store));
+    out.push_str(&format!("max_file_store: {}\n\n", opts.max_file_store));
+
+    out.push_str("jetstream {\n");
+    out.push_str(&format!("    store_dir: \"{}\"\n", jetstream_dir.display()));
+    out.push_str("}\n");
+
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -251,17 +351,30 @@ mod tests {
             monitor_port: 8222,
             max_memory_store: "64MB".to_string(),
             max_file_store: "1GB".to_string(),
+            ..SidecarOptions::default()
         };
         let jetstream_dir = Path::new("/var/lib/minga/nats/jetstream");
         let config = generate_config(&opts, jetstream_dir);
 
-        assert!(config.contains("listen: 0.0.0.0:4222"));
+        assert!(config.contains("listen: 127.0.0.1:4222"));
         assert!(config.contains("server_name: minga-1"));
         assert!(config.contains("http: \"127.0.0.1:8222\""));
         assert!(config.contains("max_memory_store: 64MB"));
         assert!(config.contains("max_file_store: 1GB"));
         assert!(config.contains("jetstream {"));
         assert!(config.contains("store_dir: \"/var/lib/minga/nats/jetstream\""));
+    }
+
+    #[tokio::test]
+    async fn plaintext_sidecar_rejects_public_listener() {
+        let opts = SidecarOptions {
+            listen_addr: "0.0.0.0".to_string(),
+            ..SidecarOptions::default()
+        };
+        assert!(matches!(
+            NatsSidecar::start(&opts).await,
+            Err(SidecarError::InsecureListener)
+        ));
     }
 
     #[test]
@@ -273,14 +386,102 @@ mod tests {
             monitor_port: 18222,
             max_memory_store: "128MB".to_string(),
             max_file_store: "2GB".to_string(),
+            ..SidecarOptions::default()
         };
         let config = generate_config(&opts, Path::new("/tmp/minga-test/nats/jetstream"));
 
-        assert!(config.contains("listen: 0.0.0.0:14222"));
+        assert!(config.contains("listen: 127.0.0.1:14222"));
         assert!(config.contains("server_name: minga-3"));
         assert!(config.contains("http: \"127.0.0.1:18222\""));
         assert!(config.contains("max_memory_store: 128MB"));
         assert!(config.contains("max_file_store: 2GB"));
+    }
+
+    #[test]
+    fn config_without_tls_has_no_tls_block() {
+        let opts = SidecarOptions::default();
+        let config = generate_config(&opts, Path::new("/var/lib/minga/nats/jetstream"));
+
+        assert!(!config.contains("tls {"));
+        assert!(!config.contains("verify_and_map"));
+        assert!(!config.contains("cluster {"));
+    }
+
+    #[test]
+    fn config_with_tls_emits_client_tls_block() {
+        let opts = SidecarOptions {
+            tls: Some(ServerTls {
+                cert_file: PathBuf::from("/etc/minga/tls/server-cert.pem"),
+                key_file: PathBuf::from("/etc/minga/tls/server-key.pem"),
+                ca_file: PathBuf::from("/etc/minga/tls/ca.pem"),
+                verify: true,
+                verify_and_map: true,
+            }),
+            ..SidecarOptions::default()
+        };
+        let config = generate_config(&opts, Path::new("/var/lib/minga/nats/jetstream"));
+
+        assert!(config.contains("tls {"));
+        assert!(config.contains("cert_file: \"/etc/minga/tls/server-cert.pem\""));
+        assert!(config.contains("key_file: \"/etc/minga/tls/server-key.pem\""));
+        assert!(config.contains("ca_file: \"/etc/minga/tls/ca.pem\""));
+        assert!(config.contains("verify: true"));
+        assert!(config.contains("verify_and_map: true"));
+    }
+
+    #[test]
+    fn config_with_cluster_tls_emits_separate_route_block() {
+        let opts = SidecarOptions {
+            cluster: Some(ClusterTls {
+                name: "minga-cluster".to_string(),
+                cert_file: PathBuf::from("/etc/minga/tls/route-cert.pem"),
+                key_file: PathBuf::from("/etc/minga/tls/route-key.pem"),
+                ca_file: PathBuf::from("/etc/minga/tls/route-ca.pem"),
+                port: 6222,
+                routes: vec!["nats://10.0.0.2:6222".to_string()],
+            }),
+            ..SidecarOptions::default()
+        };
+        let config = generate_config(&opts, Path::new("/var/lib/minga/nats/jetstream"));
+
+        assert!(config.contains("cluster {"));
+        assert!(config.contains("port: 6222"));
+        assert!(config.contains("\"nats://10.0.0.2:6222\""));
+        // Route material is distinct from any client material.
+        assert!(config.contains("cert_file: \"/etc/minga/tls/route-cert.pem\""));
+        assert!(config.contains("key_file: \"/etc/minga/tls/route-key.pem\""));
+        assert!(config.contains("ca_file: \"/etc/minga/tls/route-ca.pem\""));
+    }
+
+    #[test]
+    fn config_never_embeds_key_material() {
+        let opts = SidecarOptions {
+            tls: Some(ServerTls {
+                cert_file: PathBuf::from("/etc/minga/tls/server-cert.pem"),
+                key_file: PathBuf::from("/etc/minga/tls/server-key.pem"),
+                ca_file: PathBuf::from("/etc/minga/tls/ca.pem"),
+                verify: true,
+                verify_and_map: true,
+            }),
+            ..SidecarOptions::default()
+        };
+        let config = generate_config(&opts, Path::new("/var/lib/minga/nats/jetstream"));
+
+        // Only the *path* to the key may appear - never PEM content.
+        assert!(!config.contains("PRIVATE KEY"));
+        assert!(!config.contains("BEGIN CERTIFICATE"));
+    }
+
+    #[test]
+    fn config_honours_restricted_listen_address() {
+        let opts = SidecarOptions {
+            listen_addr: "127.0.0.1".to_string(),
+            ..SidecarOptions::default()
+        };
+        let config = generate_config(&opts, Path::new("/var/lib/minga/nats/jetstream"));
+
+        assert!(config.contains("listen: 127.0.0.1:4222"));
+        assert!(!config.contains("listen: 0.0.0.0"));
     }
 
     #[test]

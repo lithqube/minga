@@ -67,15 +67,105 @@ impl NatsBus {
     }
 
     /// Connect to a NATS server and set up streams/KV buckets.
+    ///
+    /// This is the **plaintext** constructor. It exists for localhost and
+    /// development use only; production callers should use
+    /// [`NatsBus::connect_secure`], which requires TLS material and refuses
+    /// to downgrade.
     pub async fn connect(url: &str) -> Result<Arc<Self>> {
         Self::connect_with_ttl(url, DEFAULT_LEASE_TTL).await
     }
 
-    /// Connect with a custom lease TTL.
+    /// Connect with a custom lease TTL (plaintext — see [`NatsBus::connect`]).
     pub async fn connect_with_ttl(url: &str, lease_ttl: Duration) -> Result<Arc<Self>> {
         let client = async_nats::connect(url)
             .await
             .map_err(|e| BusError::Connection(e.to_string()))?;
+        let js = jetstream::new(client.clone());
+
+        Self::setup_streams(&js).await?;
+        let status_kv = Self::setup_kv(&js, "MINGA_STATUS").await?;
+        let leases_kv = Self::setup_kv(&js, "MINGA_LEASES").await?;
+
+        Ok(Arc::new(Self {
+            client,
+            js,
+            status_kv,
+            leases_kv,
+            lease_ttl,
+            consumers: Mutex::new(HashMap::new()),
+        }))
+    }
+
+    /// Connect to a NATS server over **TLS**, with client certificate
+    /// authentication.
+    ///
+    /// The TLS material is validated before the connection is attempted, and
+    /// the connection is configured with `require_tls(true)`: a server that
+    /// does not offer TLS fails the handshake instead of silently accepting
+    /// plaintext.
+    ///
+    /// `url` must use the `tls://` scheme and name the host the server
+    /// certificate is expected to carry. `config.expected_server_name` is the
+    /// name checked against the certificate's SANs.
+    pub async fn connect_secure(
+        url: &str,
+        config: &crate::tls::NatsTlsConfig,
+    ) -> Result<Arc<Self>> {
+        config
+            .preflight()
+            .map_err(|e| BusError::Connection(format!("TLS preflight failed: {e}")))?;
+
+        config
+            .validate_url(url)
+            .map_err(|e| BusError::Connection(format!("TLS URL rejected: {e}")))?;
+
+        let options = config
+            .connect_options()
+            .map_err(|e| BusError::Connection(format!("TLS configuration failed: {e}")))?;
+
+        let client = async_nats::connect_with_options(url, options)
+            .await
+            .map_err(|e| BusError::Connection(format!("TLS connection failed: {e}")))?;
+
+        let js = jetstream::new(client.clone());
+
+        Self::setup_streams(&js).await?;
+        let status_kv = Self::setup_kv(&js, "MINGA_STATUS").await?;
+        let leases_kv = Self::setup_kv(&js, "MINGA_LEASES").await?;
+
+        Ok(Arc::new(Self {
+            client,
+            js,
+            status_kv,
+            leases_kv,
+            lease_ttl: DEFAULT_LEASE_TTL,
+            consumers: Mutex::new(HashMap::new()),
+        }))
+    }
+
+    /// Connect over TLS with a custom lease TTL.
+    pub async fn connect_secure_with_ttl(
+        url: &str,
+        config: &crate::tls::NatsTlsConfig,
+        lease_ttl: Duration,
+    ) -> Result<Arc<Self>> {
+        config
+            .preflight()
+            .map_err(|e| BusError::Connection(format!("TLS preflight failed: {e}")))?;
+
+        config
+            .validate_url(url)
+            .map_err(|e| BusError::Connection(format!("TLS URL rejected: {e}")))?;
+
+        let options = config
+            .connect_options()
+            .map_err(|e| BusError::Connection(format!("TLS configuration failed: {e}")))?;
+
+        let client = async_nats::connect_with_options(url, options)
+            .await
+            .map_err(|e| BusError::Connection(format!("TLS connection failed: {e}")))?;
+
         let js = jetstream::new(client.clone());
 
         Self::setup_streams(&js).await?;
