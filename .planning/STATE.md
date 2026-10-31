@@ -1,7 +1,7 @@
 # Planning state
 
 **Phase:** 11 — First production release (`v0.1.0`)
-**Status:** Gate 1 (cluster membership) landed; Gate 2 (`minga deploy`) is next
+**Status:** Gates 1 (cluster membership) and 2 (`minga deploy`) landed; Gate 3 (CNI networking + DNS) is next — the largest single item
 **Plans:** See `docs/roadmap-v0.1.0.md` — 7 gates
 **Last Activity:** 2026-10-31
 
@@ -18,7 +18,7 @@ Waves 1–9 predate this GSD planning workspace and their claims were **not** in
 **What Phase 11 adds.** A source audit plus a new executable probe (`crates/minga-cli/tests/deploy_path_probe.rs`, 3 tests) established four blockers that prevent a real deployment, none of which the earlier waves exposed because the tests supplied their own scaffolding:
 
 - **B1 — no node registration. FIXED in Gate 1 (see above).** Nodes self-register with a lease; zero-eligible-node deploys fail with HTTP 409.
-- **B2 — `minga deploy` does not deploy.** It translates and prints (`crates/minga-cli/src/main.rs:288-300`). The Docker API path does write to Raft and does work.
+- **B2 — `minga deploy` does not deploy. FIXED in Gate 2.** `minga deploy` is now a client of the Docker Engine API (the shared write path): networks/secrets/configs are created idempotently, services created or updated, then task placement is awaited (`--wait`) and reported per service; unplaceable services fail the deploy with the API's 409 message. Stacks with volumes fail loudly (no volume API surface yet). One naming fix landed with it: the API's outbound `ServiceSpec.Name` is now the unique state ID (`stack.service`), not the colliding bare Compose name.
 - **B3 — no container network.** `minga-net` generates configuration only; no `wg`/`nft`/`ip` call exists, the `OverlayManager` is never invoked by the node path, task IPs are always empty, and the OCI network namespace has no interface.
 - **B4 — Compose fidelity.** `command`, `entrypoint`, `labels`, `healthcheck`, volumes and placement constraints parse but are dropped before reaching the container.
 
@@ -26,4 +26,4 @@ Waves 1–9 predate this GSD planning workspace and their claims were **not** in
 
 **10-01 host gate remains BLOCKED** by user choice: Talos staging is out of scope for `v0.1.0` and no hcloud provisioning is authorized. OrbStack Ubuntu is Linux evidence only. Do not advance Talos-dependent claims or compliance qualification — FIPS, SOC 2, VS-NfD and NATO are **not assessed**, which is different from not applicable.
 
-**Immediate next action:** Gate 2 — `minga deploy` writes the translated stack through the Docker API path (shared write path with `docker stack deploy`), then waits and reports per-service placement outcome.
+**Immediate next action:** Gate 3 — real CNI: per-task IPAM from `Task.ips`, a bridge per overlay network, port publishing via the bridge plugin's portmap capability, and DNS for `service.minga.local`. Do not start before checking Gate 1's live evidence: CNI with no schedulable tasks cannot be tested.

@@ -327,7 +327,11 @@ pub fn service_to_docker(svc: &Service) -> models::Service {
         CreatedAt: Some(Utc::now()),
         UpdatedAt: Some(Utc::now()),
         Spec: models::ServiceSpec {
-            Name: Some(svc.name.clone()),
+            // Docker's `Name` is the unique service identifier. Minga's
+            // `svc.name` is the bare Compose name and collides across
+            // stacks; the state ID (`stack.service`) is the unique one —
+            // and posting this spec back re-derives the same service.
+            Name: Some(svc.id.clone()),
             Labels: labels,
             TaskTemplate: models::TaskTemplate {
                 ContainerSpec: Some(container_spec),

@@ -38,7 +38,7 @@ Sequential implementation for one developer: B (NATS TLS/transport boundary) →
 **Status:** In progress
 
 - [x] Gate 1 — cluster knows its own nodes: self-registration + lease, `POST /nodes`, `POST /nodes/{id}/update`, zero-eligible-node deploys are hard errors. Also landed: Raft write forwarding, scheduler on API nodes, sidecar NATS config fix, bounded Raft frames, JetStream setup retry.
-- [ ] Gate 2 — `minga deploy` deploys (shared write path with the Docker API).
+- [x] Gate 2 — `minga deploy` deploys (shared write path with the Docker API; per-service placement report; verified live with the real `docker` CLI against `minga api`).
 - [ ] Gate 3 — containers talk to each other (CNI + DNS).
 - [ ] Gate 4 — Compose fidelity (command/entrypoint/labels/healthcheck/volumes/constraints reach the container).
 - [ ] Gate 5 — transport security and secrets staging (Raft mTLS, API auth, NATS credentials, PKI).

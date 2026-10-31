@@ -2014,6 +2014,7 @@ dependencies = [
  "minga-scheduler",
  "minga-state",
  "minga-telemetry",
+ "reqwest",
  "serde_json",
  "tempfile",
  "thiserror 2.0.21",

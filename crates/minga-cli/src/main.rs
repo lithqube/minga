@@ -1,4 +1,5 @@
 mod bus;
+mod deploy;
 mod sidecar;
 
 use std::collections::BTreeMap;
@@ -33,6 +34,12 @@ enum Command {
         compose: ComposeArgs,
         /// Stack name.
         stack: String,
+        /// URL of a `minga api` server. Can also be set via MINGA_API_URL.
+        #[arg(long, env = "MINGA_API_URL", default_value = "http://127.0.0.1:2375")]
+        api_url: String,
+        /// Seconds to wait for tasks to be placed before failing.
+        #[arg(long, default_value = "30")]
+        wait: u64,
     },
     /// Overlay network management.
     Net {
@@ -304,18 +311,32 @@ async fn main() -> ExitCode {
             };
             print_plan(&loaded);
         }
-        Command::Deploy { compose, stack } => {
+        Command::Deploy {
+            compose,
+            stack,
+            api_url,
+            wait,
+        } => {
             let Some(loaded) = load(&compose) else {
                 return ExitCode::FAILURE;
             };
-            match minga_scheduler::translate_project(&loaded.project, &stack) {
-                Ok(translated) => print_translated(&translated),
+            let translated = match minga_scheduler::translate_project(&loaded.project, &stack) {
+                Ok(t) => t,
                 Err(e) => {
                     eprintln!("error: {e}");
                     return ExitCode::FAILURE;
                 }
+            };
+            print_translated(&translated);
+            let opts = deploy::DeployOptions {
+                api_url,
+                stack,
+                wait: Duration::from_secs(wait),
+            };
+            if let Err(e) = deploy::deploy_stack(&translated, &opts).await {
+                eprintln!("error: {e}");
+                return ExitCode::FAILURE;
             }
-            tracing::info!(%stack, "cluster deployment: not implemented yet (translation only)");
         }
         Command::Net { cmd } => return run_net(cmd),
         Command::Wg { cmd } => return run_wg(cmd),
