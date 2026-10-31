@@ -149,6 +149,10 @@ struct NodeArgs {
     /// Peer node as id=address (repeatable). Include all other nodes.
     #[arg(long = "peer")]
     peers: Vec<String>,
+    /// Node label as key=value (repeatable). Advertised to the cluster and
+    /// usable in placement constraints (e.g. node.labels.gpu == true).
+    #[arg(long = "label")]
+    labels: Vec<String>,
     /// Reconcile interval in seconds.
     #[arg(long, default_value = "2")]
     interval: u64,
@@ -269,6 +273,21 @@ fn parse_peers(raw: &[String]) -> Result<BTreeMap<u64, String>, String> {
     Ok(peers)
 }
 
+/// Parses `--label key=value` into a map. Values may contain `=`.
+fn parse_labels(raw: &[String]) -> Result<std::collections::HashMap<String, String>, String> {
+    let mut labels = std::collections::HashMap::new();
+    for l in raw {
+        let (key, value) = l
+            .split_once('=')
+            .ok_or_else(|| format!("invalid label {l:?}, expected key=value"))?;
+        if key.is_empty() {
+            return Err(format!("invalid label {l:?}, key must not be empty"));
+        }
+        labels.insert(key.to_string(), value.to_string());
+    }
+    Ok(labels)
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     tracing_subscriber::fmt()
@@ -346,7 +365,7 @@ async fn run_api(args: ApiArgs) -> ExitCode {
         }
     };
 
-    let server = match minga_api::ApiServer::start(state, &args.api_bind).await {
+    let server = match minga_api::ApiServer::start(state.clone(), &args.api_bind).await {
         Ok(s) => s,
         Err(e) => {
             eprintln!("error: cannot start API server: {e}");
@@ -354,13 +373,24 @@ async fn run_api(args: ApiArgs) -> ExitCode {
         }
     };
 
+    // The reconcile loop must exist on every Raft voter: the scheduler is
+    // leadership-gated, and an API-only node can be elected leader. Without
+    // this, a cluster whose leader is an API node places no tasks.
+    let scheduler = minga_scheduler::Scheduler::new(state);
+    let reconcile = scheduler.run(Duration::from_secs(2));
+    tokio::pin!(reconcile);
+
     println!("Docker Engine API listening on http://{}", server.addr());
     println!("Try: curl http://{}/_ping", server.addr());
     println!("     DOCKER_HOST=tcp://{} docker service ls", server.addr());
 
     // Wait forever (until SIGTERM/SIGINT).
-    tokio::signal::ctrl_c().await.ok();
-    tracing::info!("shutting down API server");
+    tokio::select! {
+        _ = &mut reconcile => {},
+        _ = tokio::signal::ctrl_c() => {
+            tracing::info!("shutting down API server");
+        },
+    }
     server.shutdown();
 
     ExitCode::SUCCESS
@@ -392,6 +422,30 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
         Ok(s) => Arc::new(s),
         Err(e) => {
             eprintln!("error: cannot open state store: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // Announce this node to the cluster and keep the membership lease
+    // renewed. Without this the scheduler cannot see the node and every
+    // deploy would place zero tasks.
+    let labels = match parse_labels(&args.labels) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let identity = minga_node::NodeIdentity {
+        node_id: args.node_id,
+        address: args.bind.clone(),
+        labels,
+        capacity: minga_node::host_capacity(),
+    };
+    let membership = match minga_node::NodeMembership::start(state.clone(), identity).await {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("error: cannot register node in cluster: {e}");
             return ExitCode::FAILURE;
         }
     };
@@ -558,13 +612,28 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
         tokio::select! {
             _ = scheduler.run(interval) => {},
             _ = supervisor.run(interval) => {},
+            _ = tokio::signal::ctrl_c() => {
+                tracing::info!(node_id = args.node_id, "shutting down manager");
+            },
         }
     } else {
         tracing::info!(
             node_id = args.node_id,
             "starting worker loop (supervisor only)"
         );
-        supervisor.run(interval).await;
+        tokio::select! {
+            _ = supervisor.run(interval) => {},
+            _ = tokio::signal::ctrl_c() => {
+                tracing::info!(node_id = args.node_id, "shutting down worker");
+            },
+        }
+    }
+
+    // Mark the node as left so the scheduler stops placing tasks on it
+    // immediately instead of waiting for the lease to expire.
+    if let Err(e) = membership.leave().await {
+        tracing::error!(node_id = args.node_id, error = %e, "failed to leave the cluster");
+        return ExitCode::FAILURE;
     }
 
     ExitCode::SUCCESS

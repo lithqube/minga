@@ -11,6 +11,9 @@ use axum::{
     http::StatusCode,
     Json,
 };
+use minga_state::types::{
+    unix_now, ClusterNode, NodeStatus as MingaNodeStatus, ResourceSpec, Service as StateService,
+};
 use minga_state::StateStore;
 
 use crate::{
@@ -42,6 +45,30 @@ fn label_filters(filters: &Filters) -> Vec<String> {
 /// Checks if a name matches any of the name filters.
 fn name_matches(name: &str, filters: &[String]) -> bool {
     filters.is_empty() || filters.iter().any(|f| f == name)
+}
+
+/// Deploy-time hard failure: rejects a service that would get zero tasks
+/// (no eligible node, or no free capacity) instead of letting the deploy
+/// succeed silently. Replicated services scaled to 0 always pass.
+///
+/// On update, `updating` excludes the service's own current tasks from
+/// capacity accounting — they are replaced, so their resources free up.
+async fn ensure_placeable(
+    app: &AppState,
+    svc: &StateService,
+    updating: Option<&str>,
+) -> ApiResult<()> {
+    let nodes = app.store.list_nodes().await?;
+    let all_tasks = app.store.list_tasks().await?;
+    let tasks: Vec<_> = match updating {
+        Some(id) => all_tasks
+            .into_iter()
+            .filter(|t| t.service_id != id)
+            .collect(),
+        None => all_tasks,
+    };
+    minga_scheduler::check_placeable(svc, &nodes, &tasks, unix_now())
+        .map_err(|e| conflict(e.to_string()))
 }
 
 // ---------------------------------------------------------------------------
@@ -138,6 +165,111 @@ pub async fn get_node(
     Ok(Json(translate::node_to_docker(node, is_leader)))
 }
 
+/// `POST /v{version}/nodes` — register a node out-of-band (Minga extension).
+pub async fn create_node(
+    State(app): State<Arc<AppState>>,
+    Json(req): Json<models::NodeCreateRequest>,
+) -> ApiResult<(StatusCode, Json<models::Node>)> {
+    if req.address.trim().is_empty() {
+        return Err(bad_request("node address must not be empty"));
+    }
+
+    let nodes = app.store.list_nodes().await?;
+    let id = match req.id {
+        Some(id) => {
+            if nodes.iter().any(|n| n.id == id) {
+                return Err(conflict(format!("node {id} already exists")));
+            }
+            id
+        }
+        None => nodes.iter().map(|n| n.id).max().unwrap_or(0) + 1,
+    };
+    if nodes.iter().any(|n| n.address == req.address) {
+        return Err(conflict(format!(
+            "node address {} is already registered",
+            req.address
+        )));
+    }
+
+    let node = ClusterNode {
+        id,
+        address: req.address,
+        labels: req.labels,
+        status: MingaNodeStatus::Active,
+        capacity: ResourceSpec {
+            cpus: req.cpus.unwrap_or(1.0),
+            memory_bytes: req.memory_bytes.unwrap_or(0),
+            gpus: req.gpus.unwrap_or(0),
+        },
+        wg_public_key: None,
+        wg_endpoint: None,
+        overlay_ip: None,
+        // Operator-registered nodes carry no lease: they stay eligible
+        // until explicitly removed or drained.
+        last_seen_unix: None,
+    };
+    app.store.upsert_node(node.clone()).await?;
+    tracing::info!(node = id, address = %node.address, "node registered via API");
+
+    let is_leader = app.store.current_leader().await == Some(id);
+    Ok((
+        StatusCode::CREATED,
+        Json(translate::node_to_docker(&node, is_leader)),
+    ))
+}
+
+/// `POST /v{version}/nodes/{id}/update` — update labels and availability.
+///
+/// Only what Minga can honestly do is accepted: label replacement and
+/// `active`/`drain` availability. Role is derived from Raft leadership and
+/// names are `node-{id}`; requests to change either fail loudly.
+pub async fn update_node(
+    State(app): State<Arc<AppState>>,
+    Path((_version, id)): Path<(String, String)>,
+    Query(_query): Query<models::NodeUpdateQuery>,
+    Json(spec): Json<models::NodeSpec>,
+) -> ApiResult<Json<models::Node>> {
+    let nodes = app.store.list_nodes().await?;
+    let mut node = nodes
+        .into_iter()
+        .find(|n| n.id.to_string() == id || n.address == id)
+        .ok_or_else(|| not_found("node", &id))?;
+
+    let is_leader = app.store.current_leader().await == Some(node.id);
+    let current_role = if is_leader { "manager" } else { "worker" };
+    if !spec.Role.is_empty() && spec.Role != current_role {
+        return Err(conflict(format!(
+            "changing node role ({current_role} → {}) is not supported",
+            spec.Role
+        )));
+    }
+    if let Some(name) = &spec.Name {
+        let current = format!("node-{}", node.id);
+        if *name != current {
+            return Err(bad_request(format!(
+                "renaming nodes is not supported (current name: {current})"
+            )));
+        }
+    }
+
+    node.status = match spec.Availability.as_str() {
+        "" | "active" => MingaNodeStatus::Active,
+        "drain" => MingaNodeStatus::Draining,
+        "pause" => {
+            return Err(bad_request(
+                "pause availability is not supported: Minga has no pause semantics, use drain",
+            ));
+        }
+        other => return Err(bad_request(format!("unknown availability {other:?}"))),
+    };
+    node.labels = spec.Labels;
+
+    app.store.upsert_node(node.clone()).await?;
+    tracing::info!(node = node.id, status = ?node.status, "node updated via API");
+
+    Ok(Json(translate::node_to_docker(&node, is_leader)))
+}
+
 // ---------------------------------------------------------------------------
 // Services
 // ---------------------------------------------------------------------------
@@ -210,6 +342,8 @@ pub async fn create_service(
             existing.name
         )));
     }
+
+    ensure_placeable(&app, &svc, None).await?;
 
     app.store.upsert_service(svc.clone()).await?;
 
@@ -296,6 +430,8 @@ pub async fn update_service(
     }
     svc.id = existing.id.clone();
     svc.name = existing.name.clone();
+
+    ensure_placeable(&app, &svc, Some(&svc.id)).await?;
 
     app.store.upsert_service(svc.clone()).await?;
 
@@ -652,4 +788,120 @@ pub async fn fallback() -> ApiResult<StatusCode> {
     Err(ApiError::NotFound(
         "endpoint not implemented by Minga".to_string(),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use minga_state::types::{NodeStatus, Task, TaskSpec, TaskState};
+    use std::collections::{BTreeMap, HashMap};
+
+    /// An AppState with a single active node of `cpus` CPUs.
+    async fn app_with_node(cpus: f64) -> (Arc<AppState>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            StateStore::open(1, "127.0.0.1:0", dir.path(), BTreeMap::new())
+                .await
+                .unwrap(),
+        );
+        store
+            .upsert_node(ClusterNode {
+                id: 1,
+                address: "127.0.0.1:50051".to_string(),
+                labels: HashMap::new(),
+                status: NodeStatus::Active,
+                capacity: ResourceSpec {
+                    cpus,
+                    memory_bytes: 0,
+                    gpus: 0,
+                },
+                wg_public_key: None,
+                wg_endpoint: None,
+                overlay_ip: None,
+                last_seen_unix: None,
+            })
+            .await
+            .unwrap();
+        (Arc::new(AppState::new(store)), dir)
+    }
+
+    fn spec(name: &str, nano_cpus: i64) -> models::ServiceSpec {
+        serde_json::from_value(serde_json::json!({
+            "Name": name,
+            "TaskTemplate": {
+                "ContainerSpec": {"Image": "nginx:latest"},
+                "Resources": {"Limits": {"NanoCPUs": nano_cpus}}
+            },
+            "Mode": {"Replicated": {"Replicas": 1}}
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn update_excludes_the_services_own_tasks_from_capacity() {
+        let (app, _dir) = app_with_node(1.0).await;
+
+        // web takes half the node's CPU and (simulated) is running there.
+        let _ = create_service(State(app.clone()), Json(spec("web", 500_000_000)))
+            .await
+            .expect("web should fit");
+        app.store
+            .upsert_task(Task {
+                id: "web.1".to_string(),
+                service_id: "web".to_string(),
+                node_id: 1,
+                state: TaskState::Running,
+                spec: TaskSpec {
+                    resources: ResourceSpec {
+                        cpus: 0.5,
+                        memory_bytes: 0,
+                        gpus: 0,
+                    },
+                    ..Default::default()
+                },
+                ips: HashMap::new(),
+            })
+            .await
+            .unwrap();
+
+        // Another service asking for more than the remaining 0.5 CPU fails.
+        let err = create_service(State(app.clone()), Json(spec("other", 600_000_000)))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ApiError::Conflict(ref m) if m.contains("insufficient capacity")),
+            "expected insufficient-capacity conflict, got {err:?}"
+        );
+
+        // Updating web itself may use up to the full node: its own task's
+        // capacity is freed by the replacement.
+        let _ = update_service(
+            State(app.clone()),
+            Path(("v1.41".to_string(), "web".to_string())),
+            Query(
+                serde_json::from_value::<models::ServiceUpdateQuery>(serde_json::json!({}))
+                    .unwrap(),
+            ),
+            Json(spec("web", 900_000_000)),
+        )
+        .await
+        .expect("update may reuse the capacity of the task it replaces");
+
+        // But not more than the whole node.
+        let err = update_service(
+            State(app.clone()),
+            Path(("v1.41".to_string(), "web".to_string())),
+            Query(
+                serde_json::from_value::<models::ServiceUpdateQuery>(serde_json::json!({}))
+                    .unwrap(),
+            ),
+            Json(spec("web", 1_500_000_000)),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, ApiError::Conflict(ref m) if m.contains("insufficient capacity")),
+            "expected insufficient-capacity conflict, got {err:?}"
+        );
+    }
 }

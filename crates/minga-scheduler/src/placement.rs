@@ -2,8 +2,9 @@
 //!
 //! Phase 0 uses a **spread** strategy — replicas are distributed as evenly
 //! as possible across eligible nodes (round-robin), with resource-capacity
-//! checking. A node is eligible if it is active, passes all of the
-//! service's placement constraints, and has enough remaining CPU, memory
+//! checking. A node is eligible if it is active, its membership lease is
+//! valid at `now_unix` (or it carries no lease), it passes all of the
+//! service's placement constraints, and it has enough remaining CPU, memory
 //! and GPUs.
 //!
 //! Task IDs are deterministic: `{service_id}.{slot}` for replicated
@@ -15,10 +16,82 @@ use std::collections::HashMap;
 
 use minga_state::types::{
     ClusterNode, NodeId, NodeStatus, ResourceSpec, Service, ServiceMode, Task, TaskSpec, TaskState,
-    WorkloadKind,
+    WorkloadKind, NODE_LEASE_TTL_SECS,
 };
 
 use crate::constraints;
+
+/// A node counts for placement if it is active, its lease is valid at
+/// `now_unix`, and it matches all of the service's constraints.
+fn is_eligible(n: &ClusterNode, service: &Service, now_unix: u64) -> bool {
+    n.status == NodeStatus::Active
+        && n.is_live_at(now_unix, NODE_LEASE_TTL_SECS)
+        && service
+            .constraints
+            .iter()
+            .all(|raw| constraints::matches_str(raw, n))
+}
+
+/// Why a service cannot be placed right now.
+///
+/// Deploy-time checks ([`check_placeable`]) surface this as a hard error;
+/// the reconcile loop keeps placement best-effort and retries.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum PlacementError {
+    /// No node is active, live and constraint-compatible.
+    #[error(
+        "no eligible nodes for service {service}: 0 of {nodes} registered node(s) are active, live and match constraints {constraints:?}"
+    )]
+    NoEligibleNodes {
+        service: String,
+        nodes: usize,
+        constraints: Vec<String>,
+    },
+    /// Eligible nodes exist but none has room for even one task.
+    #[error(
+        "insufficient capacity for service {service}: {eligible} eligible node(s), none with enough free CPU/memory/GPU"
+    )]
+    InsufficientCapacity { service: String, eligible: usize },
+}
+
+/// Deploy-time hard check: fails if `service` would get zero tasks.
+///
+/// A service that asks for nothing (replicated with `replicas = 0`) always
+/// passes. Use this on write paths (service create/update, deploy); the
+/// reconcile loop itself stays best-effort.
+pub fn check_placeable(
+    service: &Service,
+    nodes: &[ClusterNode],
+    existing_tasks: &[Task],
+    now_unix: u64,
+) -> Result<(), PlacementError> {
+    let wants_tasks = match service.mode {
+        ServiceMode::Replicated => service.replicas > 0,
+        ServiceMode::Global => true,
+    };
+    if !wants_tasks {
+        return Ok(());
+    }
+
+    let eligible = nodes
+        .iter()
+        .filter(|n| is_eligible(n, service, now_unix))
+        .count();
+    if eligible == 0 {
+        return Err(PlacementError::NoEligibleNodes {
+            service: service.id.clone(),
+            nodes: nodes.len(),
+            constraints: service.constraints.clone(),
+        });
+    }
+    if place_service(service, nodes, existing_tasks, now_unix).is_empty() {
+        return Err(PlacementError::InsufficientCapacity {
+            service: service.id.clone(),
+            eligible,
+        });
+    }
+    Ok(())
+}
 
 /// Computes the desired tasks for a service given the current cluster.
 ///
@@ -27,22 +100,18 @@ use crate::constraints;
 /// reconcile loop will retry on the next pass when the cluster changes.
 ///
 /// `existing_tasks` should be all tasks in the cluster (not just this
-/// service's), so that resource accounting is cross-service.
+/// service's), so that resource accounting is cross-service. `now_unix` is
+/// the current unix time, used to exclude nodes with expired leases.
 pub fn place_service(
     service: &Service,
     nodes: &[ClusterNode],
     existing_tasks: &[Task],
+    now_unix: u64,
 ) -> Vec<Task> {
     // --- filter eligible nodes ------------------------------------------------
     let eligible: Vec<&ClusterNode> = nodes
         .iter()
-        .filter(|n| n.status == NodeStatus::Active)
-        .filter(|n| {
-            service
-                .constraints
-                .iter()
-                .all(|raw| constraints::matches_str(raw, n))
-        })
+        .filter(|n| is_eligible(n, service, now_unix))
         .collect();
 
     if eligible.is_empty() {
@@ -198,6 +267,7 @@ mod tests {
             wg_public_key: None,
             wg_endpoint: None,
             overlay_ip: None,
+            last_seen_unix: None,
         }
     }
 
@@ -231,7 +301,7 @@ mod tests {
             node(3, 4.0, 1 << 30, 0, &[]),
         ];
         let service = svc("web", 2, ServiceMode::Replicated);
-        let tasks = place_service(&service, &nodes, &[]);
+        let tasks = place_service(&service, &nodes, &[], 0);
         assert_eq!(tasks.len(), 2);
         // Round-robin: slot 1 → node 1, slot 2 → node 2
         assert_eq!(tasks[0].node_id, 1);
@@ -245,7 +315,7 @@ mod tests {
     fn replicated_more_replicas_than_nodes() {
         let nodes = vec![node(1, 8.0, 1 << 30, 0, &[]), node(2, 8.0, 1 << 30, 0, &[])];
         let service = svc("web", 4, ServiceMode::Replicated);
-        let tasks = place_service(&service, &nodes, &[]);
+        let tasks = place_service(&service, &nodes, &[], 0);
         assert_eq!(tasks.len(), 4);
         // Round-robin: 1→1, 2→2, 3→1, 4→2
         let node_ids: Vec<u64> = tasks.iter().map(|t| t.node_id).collect();
@@ -260,7 +330,7 @@ mod tests {
             node(3, 4.0, 1 << 30, 0, &[]),
         ];
         let service = svc("agent", 0, ServiceMode::Global);
-        let tasks = place_service(&service, &nodes, &[]);
+        let tasks = place_service(&service, &nodes, &[], 0);
         assert_eq!(tasks.len(), 3);
         let node_ids: Vec<u64> = tasks.iter().map(|t| t.node_id).collect();
         assert_eq!(node_ids, vec![1, 2, 3]);
@@ -277,7 +347,7 @@ mod tests {
         ];
         let mut service = svc("train", 2, ServiceMode::Replicated);
         service.constraints = vec!["node.labels.gpu == true".to_string()];
-        let tasks = place_service(&service, &nodes, &[]);
+        let tasks = place_service(&service, &nodes, &[], 0);
         assert_eq!(tasks.len(), 2);
         assert!(tasks.iter().all(|t| t.node_id == 1 || t.node_id == 3));
     }
@@ -287,7 +357,7 @@ mod tests {
         let nodes = vec![node(1, 4.0, 1 << 30, 0, &[])];
         let mut service = svc("web", 1, ServiceMode::Replicated);
         service.constraints = vec!["node.labels.gpu == true".to_string()];
-        let tasks = place_service(&service, &nodes, &[]);
+        let tasks = place_service(&service, &nodes, &[], 0);
         assert!(tasks.is_empty());
     }
 
@@ -301,7 +371,7 @@ mod tests {
             memory_bytes: 0,
             gpus: 0,
         };
-        let tasks = place_service(&service, &nodes, &[]);
+        let tasks = place_service(&service, &nodes, &[], 0);
         assert_eq!(tasks.len(), 2);
         // Slot 1 → node 1 (round-robin start), slot 2 → node 2
         // (node 1 is full after slot 1)
@@ -337,7 +407,7 @@ mod tests {
             },
             ips: HashMap::new(),
         }];
-        let tasks = place_service(&service, &nodes, &existing);
+        let tasks = place_service(&service, &nodes, &existing, 0);
         assert_eq!(tasks.len(), 2);
         // Both replicas must go to node 2 (node 1 only has 1 CPU left).
         assert!(tasks.iter().all(|t| t.node_id == 2));
@@ -370,7 +440,7 @@ mod tests {
             },
             ips: HashMap::new(),
         }];
-        let tasks = place_service(&service, &nodes, &existing);
+        let tasks = place_service(&service, &nodes, &existing, 0);
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].node_id, 1);
     }
@@ -381,7 +451,7 @@ mod tests {
         n1.status = NodeStatus::Draining;
         let nodes = vec![n1, node(2, 4.0, 1 << 30, 0, &[])];
         let service = svc("web", 2, ServiceMode::Replicated);
-        let tasks = place_service(&service, &nodes, &[]);
+        let tasks = place_service(&service, &nodes, &[], 0);
         assert_eq!(tasks.len(), 2);
         assert!(tasks.iter().all(|t| t.node_id == 2));
     }
@@ -399,7 +469,7 @@ mod tests {
             memory_bytes: 1 << 30,
             gpus: 1,
         };
-        let tasks = place_service(&service, &nodes, &[]);
+        let tasks = place_service(&service, &nodes, &[], 0);
         // Node 1 has 2 GPUs, node 2 has 1. 3 replicas × 1 GPU each.
         // Round-robin: slot 1 → node 1, slot 2 → node 2, slot 3 → node 1.
         assert_eq!(tasks.len(), 3);
@@ -415,10 +485,93 @@ mod tests {
     fn deterministic_task_ids() {
         let nodes = vec![node(1, 4.0, 1 << 30, 0, &[]), node(2, 4.0, 1 << 30, 0, &[])];
         let service = svc("web", 2, ServiceMode::Replicated);
-        let tasks_a = place_service(&service, &nodes, &[]);
-        let tasks_b = place_service(&service, &nodes, &[]);
+        let tasks_a = place_service(&service, &nodes, &[], 0);
+        let tasks_b = place_service(&service, &nodes, &[], 0);
         let ids_a: Vec<&str> = tasks_a.iter().map(|t| t.id.as_str()).collect();
         let ids_b: Vec<&str> = tasks_b.iter().map(|t| t.id.as_str()).collect();
         assert_eq!(ids_a, ids_b);
+    }
+
+    #[test]
+    fn expired_lease_makes_node_ineligible() {
+        let mut stale = node(1, 4.0, 1 << 30, 0, &[]);
+        stale.last_seen_unix = Some(1_000);
+        let fresh = node(2, 4.0, 1 << 30, 0, &[]);
+        let mut leased = fresh.clone();
+        leased.last_seen_unix = Some(1_000 + NODE_LEASE_TTL_SECS);
+
+        let service = svc("web", 1, ServiceMode::Replicated);
+        // One second past the TTL boundary: node 1's lease is expired,
+        // node 2's is still valid.
+        let now = 1_000 + NODE_LEASE_TTL_SECS + 1;
+        let tasks = place_service(&service, &[stale, leased], &[], now);
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].node_id, 2);
+    }
+
+    #[test]
+    fn node_without_lease_is_always_live() {
+        let service = svc("web", 1, ServiceMode::Replicated);
+        // `node()` builds lease-less (operator-registered) nodes.
+        let tasks = place_service(&service, &[node(1, 4.0, 1 << 30, 0, &[])], &[], u64::MAX);
+        assert_eq!(tasks.len(), 1);
+    }
+
+    #[test]
+    fn check_placeable_rejects_when_no_nodes_registered() {
+        let service = svc("web", 1, ServiceMode::Replicated);
+        let err = check_placeable(&service, &[], &[], 0).unwrap_err();
+        assert_eq!(
+            err,
+            PlacementError::NoEligibleNodes {
+                service: "web".to_string(),
+                nodes: 0,
+                constraints: vec![],
+            }
+        );
+    }
+
+    #[test]
+    fn check_placeable_rejects_on_unmatched_constraints() {
+        let nodes = vec![node(1, 4.0, 1 << 30, 0, &[])];
+        let mut service = svc("web", 1, ServiceMode::Replicated);
+        service.constraints = vec!["node.labels.gpu == true".to_string()];
+        let err = check_placeable(&service, &nodes, &[], 0).unwrap_err();
+        assert!(matches!(
+            err,
+            PlacementError::NoEligibleNodes { nodes: 1, .. }
+        ));
+    }
+
+    #[test]
+    fn check_placeable_rejects_on_insufficient_capacity() {
+        let nodes = vec![node(1, 1.0, 1 << 30, 0, &[])];
+        let mut service = svc("web", 1, ServiceMode::Replicated);
+        service.resources = ResourceSpec {
+            cpus: 2.0,
+            memory_bytes: 0,
+            gpus: 0,
+        };
+        let err = check_placeable(&service, &nodes, &[], 0).unwrap_err();
+        assert_eq!(
+            err,
+            PlacementError::InsufficientCapacity {
+                service: "web".to_string(),
+                eligible: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn check_placeable_allows_zero_replica_scale_down() {
+        let service = svc("web", 0, ServiceMode::Replicated);
+        assert!(check_placeable(&service, &[], &[], 0).is_ok());
+    }
+
+    #[test]
+    fn check_placeable_accepts_placeable_service() {
+        let nodes = vec![node(1, 4.0, 1 << 30, 0, &[])];
+        let service = svc("web", 2, ServiceMode::Replicated);
+        assert!(check_placeable(&service, &nodes, &[], 0).is_ok());
     }
 }

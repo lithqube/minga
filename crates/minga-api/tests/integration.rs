@@ -49,6 +49,7 @@ async fn start_test_server() -> (ApiServer, String, tempfile::TempDir) {
             wg_public_key: None,
             wg_endpoint: None,
             overlay_ip: None,
+            last_seen_unix: None,
         })
         .await
         .unwrap();

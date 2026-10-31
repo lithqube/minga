@@ -26,9 +26,17 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
+use crate::command::{StateCommand, StateResponse};
+use crate::error::StateError;
 use crate::TypeConfig;
 
 // --- wire protocol ------------------------------------------------------------
+
+/// Maximum accepted frame size. Bounds the `vec![0u8; len]` allocation
+/// that follows the length prefix: without a cap, any unauthenticated
+/// peer that can open a TCP connection controls a 4 GiB allocation.
+/// 64 MiB leaves room for snapshot chunks (openraft default: 3 MiB).
+const MAX_FRAME_BYTES: u32 = 64 * 1024 * 1024;
 
 /// A Raft RPC sent over the wire.
 #[derive(Debug, Serialize, Deserialize)]
@@ -36,6 +44,10 @@ enum RaftRequest {
     AppendEntries(AppendEntriesRequest<TypeConfig>),
     Vote(VoteRequest<u64>),
     InstallSnapshot(InstallSnapshotRequest<TypeConfig>),
+    /// A client write forwarded to the leader. Followers cannot accept
+    /// writes; the API and node registration must work from any node.
+    /// Boxed: `StateCommand` is much larger than the raft RPC variants.
+    ClientWrite(Box<StateCommand>),
 }
 
 /// The reply to a [`RaftRequest`]. Errors are carried as strings; the
@@ -45,6 +57,7 @@ enum RaftReply {
     AppendEntries(Result<AppendEntriesResponse<u64>, String>),
     Vote(Result<VoteResponse<u64>, String>),
     InstallSnapshot(Result<InstallSnapshotResponse<u64>, String>),
+    ClientWrite(Result<StateResponse, String>),
 }
 
 /// Transport-level error (IO, encode/decode). Wraps into `RPCError`.
@@ -112,8 +125,13 @@ impl TcpNetwork {
         stream.flush().await?;
 
         // Read length-prefixed response.
-        let len = stream.read_u32().await? as usize;
-        let mut buf = vec![0u8; len];
+        let len = stream.read_u32().await?;
+        if len > MAX_FRAME_BYTES {
+            return Err(TransportError::Decode(format!(
+                "frame length {len} exceeds {MAX_FRAME_BYTES} byte cap"
+            )));
+        }
+        let mut buf = vec![0u8; len as usize];
         stream.read_exact(&mut buf).await?;
 
         let (reply, _): (RaftReply, usize) =
@@ -177,6 +195,30 @@ impl RaftNetwork<TypeConfig> for TcpNetwork {
     }
 }
 
+/// Forwards a client write to the leader at `addr`. Returns the applied
+/// [`StateResponse`]; an error means the write did not commit (the peer
+/// is unreachable or no longer leader — retry to rediscover the leader).
+pub(crate) async fn forward_write(
+    addr: &str,
+    cmd: &StateCommand,
+) -> Result<StateResponse, StateError> {
+    let network = TcpNetwork {
+        target: 0,
+        addr: addr.to_string(),
+    };
+    let reply = network
+        .send(RaftRequest::ClientWrite(Box::new(cmd.clone())))
+        .await
+        .map_err(|e| StateError::Raft(format!("forward to leader at {addr}: {e}")))?;
+    match reply {
+        RaftReply::ClientWrite(Ok(resp)) => Ok(resp),
+        RaftReply::ClientWrite(Err(msg)) => Err(StateError::Raft(msg)),
+        _ => Err(StateError::Raft(
+            "wrong reply type for forwarded write".into(),
+        )),
+    }
+}
+
 // --- server side --------------------------------------------------------------
 
 /// Starts a TCP server that handles incoming Raft RPCs.
@@ -221,8 +263,13 @@ async fn handle_connection(
     raft: Raft<TypeConfig>,
 ) -> Result<(), TransportError> {
     // Read length-prefixed request.
-    let len = stream.read_u32().await? as usize;
-    let mut buf = vec![0u8; len];
+    let len = stream.read_u32().await?;
+    if len > MAX_FRAME_BYTES {
+        return Err(TransportError::Decode(format!(
+            "frame length {len} exceeds {MAX_FRAME_BYTES} byte cap"
+        )));
+    }
+    let mut buf = vec![0u8; len as usize];
     stream.read_exact(&mut buf).await?;
 
     let (request, _): (RaftRequest, usize) =
@@ -242,6 +289,10 @@ async fn handle_connection(
         RaftRequest::InstallSnapshot(rpc) => match raft.install_snapshot(rpc).await {
             Ok(resp) => RaftReply::InstallSnapshot(Ok(resp)),
             Err(e) => RaftReply::InstallSnapshot(Err(e.to_string())),
+        },
+        RaftRequest::ClientWrite(cmd) => match raft.client_write(*cmd).await {
+            Ok(resp) => RaftReply::ClientWrite(Ok(resp.data)),
+            Err(e) => RaftReply::ClientWrite(Err(e.to_string())),
         },
     };
 

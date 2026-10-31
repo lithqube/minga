@@ -919,6 +919,7 @@ mod tests {
             wg_public_key: None,
             wg_endpoint: None,
             overlay_ip: None,
+            last_seen_unix: None,
         };
         let docker = node_to_docker(&node, true);
         assert_eq!(docker.ID, "1");
@@ -939,6 +940,7 @@ mod tests {
             wg_public_key: None,
             wg_endpoint: None,
             overlay_ip: None,
+            last_seen_unix: None,
         };
         let docker = node_to_docker(&node, false);
         assert_eq!(docker.Spec.Role, "worker");
@@ -956,6 +958,7 @@ mod tests {
             wg_public_key: None,
             wg_endpoint: None,
             overlay_ip: None,
+            last_seen_unix: None,
         };
         let docker = node_to_docker(&node, false);
         assert_eq!(docker.Status.State, "down");

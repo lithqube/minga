@@ -39,6 +39,7 @@
 
 pub mod agent;
 pub mod containerd;
+pub mod registration;
 pub mod runtime;
 pub mod secrets;
 pub mod supervisor;
@@ -48,6 +49,7 @@ pub use agent::{
     MockAgentExecutor, WasmtimeAgentExecutor,
 };
 pub use containerd::ContainerdRuntime;
+pub use registration::{host_capacity, register_self, NodeIdentity, NodeMembership};
 pub use runtime::{
     shared_runtime, ContainerInfo, ContainerStatus, MockRuntime, Runtime, RuntimeError,
 };

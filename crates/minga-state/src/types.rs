@@ -48,6 +48,37 @@ pub struct ClusterNode {
     /// This node's IP in the WireGuard overlay mesh.
     #[serde(default)]
     pub overlay_ip: Option<String>,
+    /// Unix time of the node's last lease renewal. `None` means the node
+    /// was registered out-of-band (e.g. `POST /nodes`) and carries no
+    /// lease: it is considered live regardless of age.
+    #[serde(default)]
+    pub last_seen_unix: Option<u64>,
+}
+
+/// How often a self-registered node renews its lease, in seconds.
+pub const NODE_RENEW_INTERVAL_SECS: u64 = 10;
+
+/// How long a node's lease remains valid without renewal, in seconds.
+/// Three renewal intervals: tolerates one missed renewal plus clock skew.
+pub const NODE_LEASE_TTL_SECS: u64 = 3 * NODE_RENEW_INTERVAL_SECS;
+
+impl ClusterNode {
+    /// Whether the node's lease is valid at `now_unix`. Nodes without a
+    /// lease (`last_seen_unix: None`) are always live.
+    pub fn is_live_at(&self, now_unix: u64, ttl_secs: u64) -> bool {
+        match self.last_seen_unix {
+            None => true,
+            Some(ts) => now_unix.saturating_sub(ts) <= ttl_secs,
+        }
+    }
+}
+
+/// Current unix time in seconds.
+pub fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

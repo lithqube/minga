@@ -31,6 +31,7 @@
 //!     wg_public_key: None,
 //!     wg_endpoint: None,
 //!     overlay_ip: None,
+//!     last_seen_unix: None,
 //! }).await?;
 //!
 //! let nodes = store.list_nodes().await?;

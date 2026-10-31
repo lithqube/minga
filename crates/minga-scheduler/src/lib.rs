@@ -47,7 +47,7 @@ use minga_state::{StateError, StateStore};
 use thiserror::Error;
 
 pub use constraints::{evaluate, matches_str, parse_constraint, Constraint, ConstraintOp};
-pub use placement::place_service;
+pub use placement::{check_placeable, place_service, PlacementError};
 pub use reconcile::{plan, ReconcileAction};
 pub use translate::{parse_memory, translate_project, TranslateError, TranslatedStack};
 
@@ -100,7 +100,7 @@ impl Scheduler {
         let services = self.state.list_services().await?;
         let tasks = self.state.list_tasks().await?;
 
-        let actions = plan(&services, &tasks, &nodes);
+        let actions = plan(&services, &tasks, &nodes, minga_state::types::unix_now());
 
         for action in &actions {
             match action {

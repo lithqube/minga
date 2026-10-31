@@ -12,7 +12,7 @@ use tokio::time::timeout;
 use crate::command::{StateCommand, StateResponse};
 use crate::error::StateError;
 use crate::log_store::RedbLogStore;
-use crate::network::{serve_raft_rpc, TcpNetworkFactory};
+use crate::network::{forward_write, serve_raft_rpc, TcpNetworkFactory};
 use crate::state_machine::RedbStateMachine;
 use crate::types::{
     ClusterNode, Config as StateConfig, ConfigId, Network, NetworkId, NodeId, Secret, SecretId,
@@ -153,12 +153,58 @@ impl StateStore {
     // --- write operations (go through Raft) -----------------------------------
 
     /// Proposes a command to Raft and waits for it to be committed.
+    ///
+    /// Only the leader accepts writes. If this node is a follower, the
+    /// command is forwarded to the current leader over the Raft RPC
+    /// transport; if leadership changed mid-flight the command is
+    /// retried against the new leader. Bounded attempts: a cluster
+    /// without a stable leader fails the write instead of spinning.
     async fn propose(&self, cmd: StateCommand) -> Result<StateResponse, StateError> {
-        let result = timeout(DEFAULT_TIMEOUT, self.raft.client_write(cmd))
-            .await
-            .map_err(|_| StateError::storage("write timed out"))?
-            .map_err(|e| StateError::Raft(e.to_string()))?;
-        Ok(result.data)
+        const MAX_ATTEMPTS: usize = 3;
+
+        for attempt in 1..=MAX_ATTEMPTS {
+            let result = timeout(DEFAULT_TIMEOUT, self.raft.client_write(cmd.clone()))
+                .await
+                .map_err(|_| StateError::storage("write timed out"))?;
+
+            match result {
+                Ok(response) => return Ok(response.data),
+                Err(err) => {
+                    let forward = err.forward_to_leader();
+                    match forward {
+                        Some(fwd) if attempt < MAX_ATTEMPTS => {
+                            let addr = fwd.leader_node.as_ref().map(|n| n.addr.clone());
+                            match addr {
+                                Some(addr) => {
+                                    tracing::debug!(
+                                        attempt,
+                                        leader_addr = %addr,
+                                        "forwarding write to leader"
+                                    );
+                                    match forward_write(&addr, &cmd).await {
+                                        Ok(resp) => return Ok(resp),
+                                        Err(e) => {
+                                            tracing::warn!(
+                                                attempt,
+                                                error = %e,
+                                                "forwarded write failed; rediscovering leader"
+                                            );
+                                        }
+                                    }
+                                }
+                                // Leader unknown: wait for the election to
+                                // settle, then retry locally.
+                                None => {
+                                    tokio::time::sleep(Duration::from_millis(200)).await;
+                                }
+                            }
+                        }
+                        _ => return Err(StateError::Raft(err.to_string())),
+                    }
+                }
+            }
+        }
+        unreachable!("loop returns on success, final failure, or exhausts attempts")
     }
 
     pub async fn upsert_node(&self, node: ClusterNode) -> Result<(), StateError> {

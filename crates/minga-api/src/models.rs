@@ -395,6 +395,36 @@ pub struct NodeListQuery {
     pub filters: Option<String>,
 }
 
+/// Request body for `POST /nodes` — register a node out-of-band.
+///
+/// Minga extension: the Docker API has no node-create route (Swarm nodes
+/// join via tokens). Nodes created here carry no membership lease; they
+/// stay eligible for placement until an operator removes or drains them.
+/// Nodes started via `minga manager`/`minga worker` register themselves.
+#[derive(Debug, Clone, Deserialize)]
+pub struct NodeCreateRequest {
+    /// Raft node ID. If omitted, one more than the highest existing ID.
+    pub id: Option<u64>,
+    /// Address the node's Raft RPC is reachable on.
+    pub address: String,
+    #[serde(default)]
+    pub labels: HashMap<String, String>,
+    /// Advertised CPU count. Defaults to 1.
+    pub cpus: Option<f64>,
+    /// Advertised memory in bytes. Defaults to 0 (no memory to offer).
+    pub memory_bytes: Option<u64>,
+    /// Advertised GPU count. Defaults to 0.
+    pub gpus: Option<u32>,
+}
+
+/// Query params for `POST /nodes/{id}/update`. Docker sends `version`;
+/// Minga does not do optimistic concurrency, so it is accepted and ignored.
+#[derive(Debug, Clone, Deserialize)]
+pub struct NodeUpdateQuery {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+}
+
 // ---------------------------------------------------------------------------
 // Services
 // ---------------------------------------------------------------------------

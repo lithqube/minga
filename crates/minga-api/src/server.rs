@@ -52,8 +52,12 @@ pub fn build_router(store: Arc<StateStore>, ready_state: Arc<ReadyState>) -> Rou
         .route("/:version/version", get(handlers::get_version))
         .route("/:version/info", get(handlers::get_info))
         // Nodes.
-        .route("/:version/nodes", get(handlers::list_nodes))
+        .route(
+            "/:version/nodes",
+            get(handlers::list_nodes).post(handlers::create_node),
+        )
         .route("/:version/nodes/:id", get(handlers::get_node))
+        .route("/:version/nodes/:id/update", post(handlers::update_node))
         // Services.
         .route("/:version/services", get(handlers::list_services))
         .route("/:version/services/create", post(handlers::create_service))
@@ -169,14 +173,45 @@ mod tests {
     use std::collections::BTreeMap;
     use tower::ServiceExt;
 
-    /// Creates a test state store and router.
+    /// Creates a test state store and router, with one active node
+    /// registered — the state any cluster serving the API is really in.
     async fn test_router() -> (Router, tempfile::TempDir) {
+        test_router_with_node(true).await
+    }
+
+    /// Same as [`test_router`], but with no registered node, for the
+    /// zero-eligible-node failure paths.
+    async fn test_router_without_node() -> (Router, tempfile::TempDir) {
+        test_router_with_node(false).await
+    }
+
+    async fn test_router_with_node(register: bool) -> (Router, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(
             StateStore::open(1, "127.0.0.1:0", dir.path(), BTreeMap::new())
                 .await
                 .unwrap(),
         );
+        if register {
+            store
+                .upsert_node(minga_state::types::ClusterNode {
+                    id: 1,
+                    address: "127.0.0.1:50051".to_string(),
+                    labels: Default::default(),
+                    status: minga_state::types::NodeStatus::Active,
+                    capacity: minga_state::types::ResourceSpec {
+                        cpus: 8.0,
+                        memory_bytes: 32 * 1024 * 1024 * 1024,
+                        gpus: 0,
+                    },
+                    wg_public_key: None,
+                    wg_endpoint: None,
+                    overlay_ip: None,
+                    last_seen_unix: None,
+                })
+                .await
+                .unwrap();
+        }
         let ready_state = Arc::new(ReadyState::new());
         let router = build_router(store, ready_state);
         (router, dir)
@@ -242,7 +277,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_nodes_empty() {
+    async fn list_nodes() {
         let (router, _dir) = test_router().await;
         let req = Request::builder()
             .uri("/v1.41/nodes")
@@ -250,8 +285,10 @@ mod tests {
             .unwrap();
         let (status, json) = send_request(router, req).await;
         assert_eq!(status, StatusCode::OK);
-        // The test node itself should be registered.
-        assert!(json.is_array());
+        let arr = json.as_array().unwrap();
+        assert_eq!(arr.len(), 1, "the registered test node must be listed");
+        assert_eq!(arr[0]["ID"], "1");
+        assert_eq!(arr[0]["Status"]["State"], "ready");
     }
 
     #[tokio::test]
@@ -659,5 +696,205 @@ mod tests {
         assert!(response.contains("OK"), "response: {response}");
 
         server.shutdown();
+    }
+
+    #[tokio::test]
+    async fn create_node_registers_and_inspects() {
+        let (router, _dir) = test_router().await;
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1.41/nodes")
+            .header("Content-Type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "address": "10.0.0.2:50051",
+                    "labels": {"gpu": "true"},
+                    "cpus": 4.0,
+                    "memory_bytes": 8589934592u64
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let (status, json) = send_request(router.clone(), req).await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(json["ID"], "2", "next free id after the test node");
+        assert_eq!(json["Spec"]["Labels"]["gpu"], "true");
+        assert_eq!(
+            json["Description"]["Resources"]["NanoCPUs"],
+            4_000_000_000u64
+        );
+
+        let req = Request::builder()
+            .uri("/v1.41/nodes/2")
+            .body(Body::empty())
+            .unwrap();
+        let (status, json) = send_request(router, req).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["Status"]["State"], "ready");
+        assert_eq!(json["Status"]["Addr"], "10.0.0.2:50051");
+    }
+
+    #[tokio::test]
+    async fn create_node_rejects_duplicates_and_empty_address() {
+        let (router, _dir) = test_router().await;
+
+        // Duplicate id: the test node is 1.
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1.41/nodes")
+            .header("Content-Type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&serde_json::json!({"id": 1, "address": "10.0.0.9:50051"}))
+                    .unwrap(),
+            ))
+            .unwrap();
+        let (status, _) = send_request(router.clone(), req).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+
+        // Duplicate address.
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1.41/nodes")
+            .header("Content-Type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&serde_json::json!({"address": "127.0.0.1:50051"})).unwrap(),
+            ))
+            .unwrap();
+        let (status, _) = send_request(router.clone(), req).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+
+        // Empty address.
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1.41/nodes")
+            .header("Content-Type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&serde_json::json!({"address": "  "})).unwrap(),
+            ))
+            .unwrap();
+        let (status, _) = send_request(router, req).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn update_node_drains_and_relabels() {
+        let (router, _dir) = test_router().await;
+
+        // Node 1 is the only node, hence the leader: role "manager".
+        let body = serde_json::json!({
+            "Name": "node-1",
+            "Role": "manager",
+            "Availability": "drain",
+            "Labels": {"zone": "b"}
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1.41/nodes/1/update?version=5")
+            .header("Content-Type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        let (status, _) = send_request(router.clone(), req).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let req = Request::builder()
+            .uri("/v1.41/nodes/1")
+            .body(Body::empty())
+            .unwrap();
+        let (status, json) = send_request(router, req).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["Status"]["State"], "down", "drained node is down");
+        assert_eq!(json["Spec"]["Labels"]["zone"], "b");
+        assert!(
+            json["Spec"]["Labels"].get("minga.node.id").is_some(),
+            "the render-time id label is still attached"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_node_rejects_what_minga_cannot_do() {
+        let (router, _dir) = test_router().await;
+
+        // Role change: node 1 is the only node, hence the leader.
+        let body = serde_json::json!({"Role": "worker", "Availability": "active"});
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1.41/nodes/1/update")
+            .header("Content-Type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        let (status, json) = send_request(router.clone(), req).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(json["message"].as_str().unwrap().contains("role"));
+
+        // Pause has no Minga semantics.
+        let body = serde_json::json!({"Role": "manager", "Availability": "pause"});
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1.41/nodes/1/update")
+            .header("Content-Type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        let (status, json) = send_request(router.clone(), req).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(json["message"].as_str().unwrap().contains("pause"));
+
+        // Rename.
+        let body =
+            serde_json::json!({"Name": "fancy", "Role": "manager", "Availability": "active"});
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1.41/nodes/1/update")
+            .header("Content-Type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        let (status, _) = send_request(router.clone(), req).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        // Unknown node.
+        let body = serde_json::json!({"Role": "worker", "Availability": "active"});
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1.41/nodes/999/update")
+            .header("Content-Type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        let (status, _) = send_request(router, req).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn create_service_fails_loudly_without_nodes() {
+        let (router, _dir) = test_router_without_node().await;
+
+        let spec = serde_json::json!({
+            "Name": "nowhere_to_run",
+            "TaskTemplate": {"ContainerSpec": {"Image": "nginx:latest"}},
+            "Mode": {"Replicated": {"Replicas": 1}}
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1.41/services/create")
+            .header("Content-Type", "application/json")
+            .body(Body::from(serde_json::to_vec(&spec).unwrap()))
+            .unwrap();
+        let (status, json) = send_request(router.clone(), req).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(
+            json["message"]
+                .as_str()
+                .unwrap()
+                .contains("no eligible nodes"),
+            "error must name the cause: {json}"
+        );
+
+        // Nothing was written to state.
+        let req = Request::builder()
+            .uri("/v1.41/services")
+            .body(Body::empty())
+            .unwrap();
+        let (status, json) = send_request(router, req).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(json.as_array().unwrap().is_empty());
     }
 }

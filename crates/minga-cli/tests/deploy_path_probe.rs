@@ -1,21 +1,13 @@
-//! Regression test for the cluster-membership gap.
-//!
-//! A cluster with no registered nodes cannot place any task. The failure
-//! mode is silent: the scheduler logs a warning and returns no actions, so
-//! a deploy looks successful while nothing runs.
+//! Regression test for the cluster-membership path (roadmap Gate 1).
 //!
 //! This test pins the *shape* of the deployment path:
 //!
-//!   1. a service created through the Docker-compatible API lands in Raft,
-//!   2. with a node registered, the scheduler places tasks and the
-//!      supervisor starts them.
-//!
-//! The assertions below deliberately do **not** assert that the cluster
-//! registers its own nodes — that is production behaviour owned by the
-//! node startup path, and asserting it here would only duplicate it. What
-//! they do assert is that the rest of the path is intact, so that when
-//! node registration lands, this test immediately covers the whole chain
-//! end to end.
+//!   1. a node registers itself through the production registration path
+//!      ([`minga_node::register_self`]), not through test scaffolding,
+//!   2. a service created through the Docker-compatible API lands in Raft,
+//!   3. the scheduler places tasks and the supervisor starts them,
+//!   4. with no registered node, service creation fails loudly (409)
+//!      instead of succeeding silently with zero tasks running.
 //!
 //! See `docs/roadmap-v0.1.0.md` (Gate 1) for the release gate this
 //! belongs to.
@@ -24,8 +16,9 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use minga_bus::MemoryBus;
+use minga_node::NodeIdentity;
 use minga_scheduler::Scheduler;
-use minga_state::types::{ClusterNode, NodeStatus, ResourceSpec};
+use minga_state::types::ResourceSpec;
 use minga_state::StateStore;
 
 /// Starts a single-node state store (which becomes its own leader).
@@ -37,6 +30,20 @@ async fn store() -> (Arc<StateStore>, tempfile::TempDir) {
             .unwrap(),
     );
     (store, dir)
+}
+
+/// The identity a real node would announce with these settings.
+fn identity(id: u64) -> NodeIdentity {
+    NodeIdentity {
+        node_id: id,
+        address: format!("127.0.0.1:{}", 50051 + id),
+        labels: Default::default(),
+        capacity: ResourceSpec {
+            cpus: 8.0,
+            memory_bytes: 32 * 1024 * 1024 * 1024,
+            gpus: 0,
+        },
+    }
 }
 
 /// A service spec equivalent to what `docker stack deploy` POSTs.
@@ -76,26 +83,14 @@ async fn post_service(router: axum::Router, spec: serde_json::Value) -> u16 {
     resp.status().as_u16()
 }
 
-fn node(id: u64) -> ClusterNode {
-    ClusterNode {
-        id,
-        address: format!("127.0.0.1:{}", 50051 + id),
-        labels: Default::default(),
-        status: NodeStatus::Active,
-        capacity: ResourceSpec {
-            cpus: 8.0,
-            memory_bytes: 32 * 1024 * 1024 * 1024,
-            gpus: 0,
-        },
-        wg_public_key: None,
-        wg_endpoint: None,
-        overlay_ip: None,
-    }
-}
-
 #[tokio::test]
 async fn docker_api_service_creation_lands_in_raft() {
     let (store, _dir) = store().await;
+
+    // The node registers itself, exactly as `minga manager` does at startup.
+    minga_node::register_self(&store, &identity(1))
+        .await
+        .unwrap();
 
     let ready_state = Arc::new(minga_telemetry::ReadyState::new());
     let router = minga_api::build_router(store.clone(), ready_state);
@@ -119,29 +114,22 @@ async fn docker_api_service_creation_lands_in_raft() {
 }
 
 #[tokio::test]
-async fn scheduler_places_nothing_when_the_cluster_has_no_nodes() {
+async fn service_creation_fails_loudly_when_no_node_is_registered() {
     let (store, _dir) = store().await;
 
     let ready_state = Arc::new(minga_telemetry::ReadyState::new());
     let router = minga_api::build_router(store.clone(), ready_state);
-    post_service(router, service_spec("probe_web", "nginx:1.27", 2)).await;
 
-    // With no node registered there is nothing to place onto. This is the
-    // silent failure the roadmap's Gate 1 exists to close: today it warns
-    // rather than erroring. The assertion pins the current, observable
-    // behaviour so that when node registration lands, this expectation is
-    // the one that must change.
-    assert!(
-        store.list_nodes().await.unwrap().is_empty(),
-        "no production code registers nodes yet; a cluster starts empty"
+    // Nobody registered: the cluster has zero nodes. The deploy must be a
+    // hard failure, not a silent success with nothing running.
+    let status = post_service(router, service_spec("probe_web", "nginx:1.27", 2)).await;
+    assert_eq!(
+        status, 409,
+        "a service that matches zero eligible nodes must be rejected"
     );
-
-    let bus = MemoryBus::new();
-    let scheduler = Scheduler::with_bus(store.clone(), bus);
-    let actions = scheduler.reconcile_once().await.unwrap();
     assert!(
-        actions.is_empty(),
-        "with no eligible node the scheduler must not create tasks, got {actions:?}"
+        store.list_services().await.unwrap().is_empty(),
+        "a rejected service must not reach Raft state"
     );
     assert!(store.list_tasks().await.unwrap().is_empty());
 }
@@ -150,13 +138,17 @@ async fn scheduler_places_nothing_when_the_cluster_has_no_nodes() {
 async fn a_registered_node_lets_the_service_run_end_to_end() {
     let (store, _dir) = store().await;
 
+    // Register the node through the production path — the same call
+    // `minga manager`/`minga worker` makes at startup.
+    minga_node::register_self(&store, &identity(1))
+        .await
+        .unwrap();
+    assert_eq!(store.list_nodes().await.unwrap().len(), 1);
+
     let ready_state = Arc::new(minga_telemetry::ReadyState::new());
     let router = minga_api::build_router(store.clone(), ready_state);
-    post_service(router, service_spec("probe_web", "nginx:1.27", 2)).await;
-
-    // Register a node the way a real cluster eventually will.
-    store.upsert_node(node(1)).await.unwrap();
-    assert_eq!(store.list_nodes().await.unwrap().len(), 1);
+    let status = post_service(router, service_spec("probe_web", "nginx:1.27", 2)).await;
+    assert_eq!(status, 201);
 
     let bus = MemoryBus::new();
     let scheduler = Scheduler::with_bus(store.clone(), bus.clone());

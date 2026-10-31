@@ -83,9 +83,7 @@ impl NatsBus {
             .map_err(|e| BusError::Connection(e.to_string()))?;
         let js = jetstream::new(client.clone());
 
-        Self::setup_streams(&js).await?;
-        let status_kv = Self::setup_kv(&js, "MINGA_STATUS").await?;
-        let leases_kv = Self::setup_kv(&js, "MINGA_LEASES").await?;
+        let (status_kv, leases_kv) = Self::setup_when_ready(&js).await?;
 
         Ok(Arc::new(Self {
             client,
@@ -130,9 +128,7 @@ impl NatsBus {
 
         let js = jetstream::new(client.clone());
 
-        Self::setup_streams(&js).await?;
-        let status_kv = Self::setup_kv(&js, "MINGA_STATUS").await?;
-        let leases_kv = Self::setup_kv(&js, "MINGA_LEASES").await?;
+        let (status_kv, leases_kv) = Self::setup_when_ready(&js).await?;
 
         Ok(Arc::new(Self {
             client,
@@ -168,9 +164,7 @@ impl NatsBus {
 
         let js = jetstream::new(client.clone());
 
-        Self::setup_streams(&js).await?;
-        let status_kv = Self::setup_kv(&js, "MINGA_STATUS").await?;
-        let leases_kv = Self::setup_kv(&js, "MINGA_LEASES").await?;
+        let (status_kv, leases_kv) = Self::setup_when_ready(&js).await?;
 
         Ok(Arc::new(Self {
             client,
@@ -180,6 +174,41 @@ impl NatsBus {
             lease_ttl,
             consumers: Mutex::new(HashMap::new()),
         }))
+    }
+
+    /// Creates streams and KV buckets, waiting for JetStream to be ready.
+    ///
+    /// A freshly started `nats-server` accepts TCP connections before its
+    /// JetStream storage is initialized; creating streams or KV buckets in
+    /// that window fails with internal errors (`meta.inf.tmp: no such file
+    /// or directory`). Retry for a bounded period instead of failing the
+    /// whole node startup on a lost race.
+    async fn setup_when_ready(
+        js: &JetStream,
+    ) -> Result<(jetstream::kv::Store, jetstream::kv::Store)> {
+        const MAX_ATTEMPTS: u32 = 20; // 20 × 500ms = 10s
+        for attempt in 1..=MAX_ATTEMPTS {
+            match Self::setup_all(js).await {
+                Ok(pair) => return Ok(pair),
+                Err(e) if attempt < MAX_ATTEMPTS => {
+                    tracing::debug!(
+                        attempt,
+                        error = %e,
+                        "JetStream not ready yet; retrying"
+                    );
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        unreachable!("loop returns on success or final failure")
+    }
+
+    async fn setup_all(js: &JetStream) -> Result<(jetstream::kv::Store, jetstream::kv::Store)> {
+        Self::setup_streams(js).await?;
+        let status_kv = Self::setup_kv(js, "MINGA_STATUS").await?;
+        let leases_kv = Self::setup_kv(js, "MINGA_LEASES").await?;
+        Ok((status_kv, leases_kv))
     }
 
     async fn setup_streams(js: &JetStream) -> Result<()> {

@@ -32,6 +32,7 @@ fn sample_node(id: u64, addr: &str) -> ClusterNode {
         wg_public_key: None,
         wg_endpoint: None,
         overlay_ip: None,
+        last_seen_unix: None,
     }
 }
 
@@ -98,6 +99,36 @@ async fn open_cluster() -> (StateStore, StateStore, StateStore, String, String, 
     std::mem::forget(dir3);
 
     (store1, store2, store3, addr1, addr2, addr3)
+}
+
+#[tokio::test]
+async fn follower_writes_forward_to_the_leader() {
+    let (store1, store2, store3, _, _, _) = open_cluster().await;
+
+    let stores = [&store1, &store2, &store3];
+    let mut follower: Option<&StateStore> = None;
+    for store in stores {
+        if !store.is_leader().await {
+            follower = Some(store);
+            break;
+        }
+    }
+    let follower = follower.expect("a 3-node cluster has followers");
+
+    // A write issued against a follower must commit via the leader —
+    // node registration and the Docker API depend on this from any node.
+    follower
+        .upsert_service(sample_service("forwarded-svc"))
+        .await
+        .expect("follower write must forward to the leader");
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    for store in [&store1, &store2, &store3] {
+        assert!(
+            store.get_service("forwarded-svc").await.unwrap().is_some(),
+            "the forwarded write must replicate to every node"
+        );
+    }
 }
 
 #[tokio::test]

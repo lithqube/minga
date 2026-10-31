@@ -286,12 +286,16 @@ fn generate_config(opts: &SidecarOptions, jetstream_dir: &Path) -> String {
         out.push_str("}\n\n");
     }
 
-    out.push_str("# JetStream storage limits (pinned, not 75% defaults)\n");
-    out.push_str(&format!("max_memory_store: {}\n", opts.max_memory_store));
-    out.push_str(&format!("max_file_store: {}\n\n", opts.max_file_store));
-
+    out.push_str("# JetStream, with storage limits pinned (not 75% defaults).\n");
+    out.push_str("# The limits are only valid inside the jetstream block; at top level\n");
+    out.push_str("# nats-server 2.x rejects them as unknown fields.\n");
     out.push_str("jetstream {\n");
     out.push_str(&format!("    store_dir: \"{}\"\n", jetstream_dir.display()));
+    out.push_str(&format!(
+        "    max_memory_store: {}\n",
+        opts.max_memory_store
+    ));
+    out.push_str(&format!("    max_file_store: {}\n", opts.max_file_store));
     out.push_str("}\n");
 
     out
