@@ -593,10 +593,15 @@ impl EventBus for NatsBus {
     async fn publish_log(&self, task_id: &str, entry: &LogEntry) -> Result<()> {
         let subject = subjects::task_log(task_id);
         let payload = entry.to_bytes()?;
+        // Double await: the first yields a PublishAckFuture (message sent),
+        // the second the server's acknowledgment (message stored). Without
+        // the ack, a reader racing a publisher can miss entries.
         self.js
             .publish(subject, Bytes::from(payload))
             .await
-            .map_err(|e| BusError::Publish(format!("log: {e}")))?;
+            .map_err(|e| BusError::Publish(format!("log: {e}")))?
+            .await
+            .map_err(|e| BusError::Publish(format!("log ack: {e}")))?;
         Ok(())
     }
 
