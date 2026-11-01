@@ -841,7 +841,7 @@ async fn docker_cli_version_via_testcontainer() {
     };
     eprintln!("docker version output: {output}");
     assert!(
-        output.contains("0.0.1") || output.contains("minga"),
+        output.contains(env!("CARGO_PKG_VERSION")) || output.contains("minga"),
         "docker version should show minga server version, got: {output}"
     );
 }

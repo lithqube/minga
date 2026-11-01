@@ -1,0 +1,61 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  quality:
+    name: fmt, clippy, workspace tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install nats-server (bus tests require the binary)
+        run: |
+          curl -fsSL "https://github.com/nats-io/nats-server/releases/download/v2.10.22/nats-server-v2.10.22-linux-amd64.tar.gz" \
+            | sudo tar -xz -C /usr/local/bin --strip-components=1 --wildcards '*/nats-server'
+          nats-server --version
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Workspace tests
+        run: cargo test --workspace
+
+  containerd:
+    name: Daemon-backed tests (never silently skipped)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install containerd
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y containerd
+          sudo systemctl start containerd
+          containerd --version
+
+      - name: Preload images into the minga namespace
+        run: |
+          sudo ctr -n minga images pull docker.io/library/redis:8.10.2-alpine
+          sudo ctr -n minga images pull docker.io/library/busybox:latest
+          sudo ctr -n minga images pull docker.io/library/nginx:1.27
+
+      - name: Daemon-backed suites (fail closed when the daemon is absent)
+        run: sudo MINGA_REQUIRE_CONTAINERD=1 cargo test -p minga-node --test containerd --test containerd_client

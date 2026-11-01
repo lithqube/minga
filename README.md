@@ -8,9 +8,9 @@ A single-binary container and agent orchestrator for **edge, on-prem and air-gap
 
 Named after the [minga](https://en.wikipedia.org/wiki/Minga) of Chiloé, where a community moves a whole house together.
 
-> **Status: pre-`v0.1.0`.** The orchestrator core works: Compose parsing that fails loudly on unknown keys, Raft consensus, a scheduler, a node supervisor, a Swarm-compatible Docker Engine API (v1.41), a **real containerd runtime proven against a live daemon**, NATS/JetStream with TLS, WASM sandboxes, an LLM egress proxy, and Prometheus metrics with health endpoints. 563 tests across 11 crates.
+> **Status: `v0.1.0`.** The orchestrator core works: Compose parsing that fails loudly on unknown keys, Raft consensus (with mTLS and write forwarding), a scheduler, self-registering nodes with membership leases, a node supervisor, a Swarm-compatible Docker Engine API (v1.41, bearer-token authenticated), a **real containerd runtime proven against a live daemon**, per-task netns/bridge networking with IPAM and embedded DNS, real container logs, NATS/JetStream with TLS, WASM sandboxes, an LLM egress proxy, and Prometheus metrics with health endpoints. ~700 tests across 11 crates; every shipped claim above was verified by execution (see `.planning/STATE.md`).
 >
-> **It is not yet production-ready**, and this README does not pretend otherwise. Four gaps block a real deployment: nodes do not register themselves with the cluster, `minga deploy` translates but does not deploy, containers have no network or DNS, and several Compose keys (`command`, `entrypoint`, `labels`, `healthcheck`, volumes) are parsed then dropped. The Docker-compatible API also has **no authentication**. The full picture, with file and line evidence, is in the [**v0.1.0 roadmap**](docs/roadmap-v0.1.0.md).
+> What `v0.1.0` deliberately does **not** do: pull images (preload them into the `minga` containerd namespace), multi-node WireGuard mesh, healthcheck enforcement, spec-update reprovisioning, automatic rollback, or host-local port hairpinning. The full picture is in the [**v0.1.0 roadmap**](docs/roadmap-v0.1.0.md) and the [changelog](CHANGELOG.md).
 >
 > The Talos deployment guide is written but **has not been validated on a Talos host**. FIPS, SOC 2, VS-NfD and NATO are **not assessed** — which is not the same as not applicable.
 
@@ -29,7 +29,7 @@ Minga ships as **one small binary**. No Docker daemon, no Kubernetes, no etcd. I
 - **Compose-native** — `docker compose` files deploy unchanged. Full spec parsing with variable interpolation, profiles, merge keys, and `x-` extensions. Unknown keys fail loudly with suggestions instead of being silently skipped.
 - **Swarm-compatible API** — speaks enough of the Docker Engine API to work with existing tooling (`docker stack deploy`, `docker service ls`, …).
 - **Raft consensus** — desired state and placement go through [openraft](https://docs.rs/openraft), persisted in [redb](https://docs.rs/redb). No external etcd.
-- **Overlay networking** — WireGuard mesh between nodes, nftables/eBPF for service load-balancing and ingress.
+- **Overlay networking** — per-task IPs from deterministic IPAM, bridge + netns per task, DNAT port publishing, and embedded service-discovery DNS. (WireGuard mesh between nodes is generated as config but not yet applied.)
 - **Agent-first workloads** — wasmtime and Firecracker sandbox pools, LLM egress proxy with per-workload token and cost budgets.
 - **Observability built-in** — Prometheus metrics (`/metrics`), health endpoints (`/healthz`, `/readyz`), structured JSON logging with correlation IDs.
 - **Air-gapped ready** — no cloud dependencies, offline image distribution, vendored builds.
@@ -38,7 +38,10 @@ Minga ships as **one small binary**. No Docker daemon, no Kubernetes, no etcd. I
 ## Quick start
 
 ```bash
-# Build from source
+# Install the release binary (linux/amd64, linux/arm64)
+curl -fsSL https://raw.githubusercontent.com/lithqube/minga/main/install.sh | sh
+
+# Or build from source
 cargo build --release
 
 # Validate a Compose file — checks syntax, references, port conflicts,
@@ -329,15 +332,15 @@ Requirements: Rust 1.80+ (stable), with `rustfmt` and `clippy` components.
 - [x] **Observability (Wave 9)** — Prometheus metrics (`/metrics`), health endpoints (`/healthz`, `/readyz`), structured JSON logging with correlation IDs. `minga-telemetry` crate. [ADR 0004](docs/adr/0004-observability.md). Integrated into `minga-api` and `minga-node`.
 - [x] **NATS TLS (Wave 10)** — mTLS between nodes: explicit CA and client identity, TLS-only connector, no insecure escape hatch, mandatory SAN verification, a missing or malformed CA/cert/key is a hard error. Real `nats-server` integration tests in `crates/minga-bus/tests/nats_tls.rs`. The plaintext sidecar is restricted to loopback.
 
-**Roadmap to `v0.1.0`** — full detail in [`docs/roadmap-v0.1.0.md`](docs/roadmap-v0.1.0.md). Seven gates, each with an executable exit criterion:
+**Roadmap to `v0.1.0`** — full detail in [`docs/roadmap-v0.1.0.md`](docs/roadmap-v0.1.0.md). Seven gates, each with an executable exit criterion; the evidence for every checkmark is in `.planning/STATE.md`:
 
-- [ ] **Gate 1 — cluster membership.** Nodes register themselves; `POST /nodes`; placement failure is an error, not a warning. *(Critical path — a cluster currently has zero nodes, so nothing can be scheduled.)*
-- [ ] **Gate 2 — `minga deploy` deploys.** It must write to Raft and report placement per service. *(Today it translates and prints.)*
-- [ ] **Gate 3 — containers talk to each other.** A real CNI data plane: bridge per network, veth per task, IPAM, port publishing, service DNS.
-- [ ] **Gate 4 — Compose fidelity.** `command`, `entrypoint`, `labels`, `healthcheck`, volumes and placement constraints reach the container; unsupported semantics fail loudly.
-- [ ] **Gate 5 — transport security and secrets.** Bounded Raft frames, Raft mTLS, Docker API authentication, NATS credentials, a PKI lifecycle, and secret staging with rotation.
-- [ ] **Gate 6 — logs.** Real FIFO capture, durable history, acknowledged replay, per-task authorization, gap-free follow.
-- [ ] **Gate 7 — shippable.** CI on every push, release artifacts for linux/amd64 and linux/arm64, a changelog, and documentation that matches reality.
+- [x] **Gate 1 — cluster membership.** Nodes register themselves with a lease; `POST /nodes` + update; zero-eligible-node deploys fail with HTTP 409.
+- [x] **Gate 2 — `minga deploy` deploys.** Writes through the shared Docker-API path; per-service placement report; verified with the real `docker` CLI.
+- [x] **Gate 3 — containers talk to each other.** Bridge + veth + netns per task, IPAM, DNAT publishing, embedded service DNS — verified container-to-container by name.
+- [x] **Gate 4 — Compose fidelity.** `command`, `entrypoint`, `labels`, `healthcheck`, volumes and placement constraints reach the container; Traefik v3 routes to a Minga service.
+- [x] **Gate 5 — transport security and secrets.** Raft mTLS (bounded frames), API bearer auth, NATS credentials, `minga tls` PKI, content-addressed secret staging.
+- [x] **Gate 6 — logs.** Real FIFO capture, JetStream history, gap-free follow across a supervisor restart.
+- [x] **Gate 7 — shippable.** CI on every push (including daemon-backed tests with `MINGA_REQUIRE_CONTAINERD=1`), release artifacts for linux/amd64 and linux/arm64, `install.sh`, changelog, corrected docs.
 
 ## Documentation
 

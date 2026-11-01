@@ -167,10 +167,11 @@ talosctl bootstrap --nodes <node-ip> --endpoints <node-ip>
 
 # 4. Deploy Minga (same as step 6 above)
 
-# 5. Deploy a test stack.
-# `minga deploy` currently translates and prints only — cluster deployment
-# is not yet implemented (roadmap-v0.1.0.md Gate 2). The Docker-compatible
-# API path works today:
+# 5. Deploy a test stack. `minga deploy` writes the stack through the
+# Docker-compatible API and reports placement per service. Point it at the
+# API (and pass the token if --api-token is set):
+minga deploy -c docker-compose.yml minga-test --api-url http://<node-ip>:2375
+# The Docker CLI works against the same API:
 docker stack deploy -c docker-compose.yml minga-test --host tcp://<node-ip>:2375
 ```
 
@@ -282,8 +283,10 @@ for NODE in minga-cp1 minga-cp2 minga-cp3; do
   curl -s  "http://${IP}:2375/metrics" | head -5
 done
 
-# Deploy a stack. The Docker-compatible API path works today; `minga deploy`
-# translates and prints only (roadmap-v0.1.0.md Gate 2).
+# Deploy a stack. `minga deploy` deploys through the Docker-compatible API
+# and reports placement per service; the Docker CLI works against the same
+# API:
+minga deploy -c docker-compose.yml minga-test --api-url http://<cp1-ip>:2375
 docker stack deploy -c docker-compose.yml minga-test --host tcp://<cp1-ip>:2375
 ```
 
