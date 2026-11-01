@@ -45,9 +45,19 @@ curl -fsSL -o "$tmp/SHA256SUMS" "$base/SHA256SUMS"
 tar -xzf "$tmp/$archive" -C "$tmp"
 
 # nats-server goes next to minga: the manager's NATS sidecar looks there.
-if [ -w "$PREFIX" ]; then sudo=""; else sudo="sudo"; fi
+if mkdir -p "$PREFIX" 2>/dev/null && [ -w "$PREFIX" ]; then
+    sudo=""
+else
+    sudo="sudo"
+    $sudo mkdir -p "$PREFIX"
+fi
 $sudo install -m 0755 "$tmp/minga" "$PREFIX/minga"
 $sudo install -m 0755 "$tmp/nats-server" "$PREFIX/nats-server"
 
-echo "installed: $PREFIX/minga, $PREFIX/nats-server"
+# Licenses: Minga (MIT) and the bundled nats-server (Apache 2.0).
+share="${PREFIX%/bin}/share/minga"
+$sudo mkdir -p "$share"
+$sudo install -m 0644 "$tmp/LICENSE" "$tmp/NATS-LICENSE" "$share/"
+
+echo "installed: $PREFIX/minga, $PREFIX/nats-server (licenses in $share)"
 "$PREFIX/minga" --version

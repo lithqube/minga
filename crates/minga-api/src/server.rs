@@ -160,7 +160,17 @@ impl ApiServer {
         bind: &str,
         auth_token: Option<String>,
     ) -> Result<Self, ApiServerError> {
-        // `minga api` has no bus: ready means Raft knows a leader.
+        let listener = TcpListener::bind(bind)
+            .await
+            .map_err(|e| ApiServerError::Bind(format!("cannot bind {bind}: {e}")))?;
+
+        let addr = listener
+            .local_addr()
+            .map_err(|e| ApiServerError::Bind(format!("cannot get local addr: {e}")))?
+            .to_string();
+
+        // `minga api` has no bus: ready means Raft knows a leader. Spawned
+        // only once startup can no longer fail, so a failed bind leaks no task.
         let ready_state = ReadyState::without_bus();
         let probe = {
             let (store, ready) = (store.clone(), ready_state.clone());
@@ -175,14 +185,6 @@ impl ApiServer {
             })
         };
         let router = build_router_with_auth(store, Arc::new(ready_state), auth_token);
-        let listener = TcpListener::bind(bind)
-            .await
-            .map_err(|e| ApiServerError::Bind(format!("cannot bind {bind}: {e}")))?;
-
-        let addr = listener
-            .local_addr()
-            .map_err(|e| ApiServerError::Bind(format!("cannot get local addr: {e}")))?
-            .to_string();
 
         let handle = tokio::spawn(async move {
             if let Err(e) = axum::serve(listener, router).await {

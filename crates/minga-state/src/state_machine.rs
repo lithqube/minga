@@ -161,9 +161,9 @@ impl RedbStateMachine {
                 t.remove(id.to_string().as_str()).map_err(sm_io_err)?;
                 Ok(StateResponse::Ok)
             }
-            StateCommand::RenewNodeLease(node) => {
+            StateCommand::RenewNodeLease { id, last_seen_unix } => {
                 let mut t = tx.open_table(NODES_TABLE).map_err(sm_io_err)?;
-                let key = node.id.to_string();
+                let key = id.to_string();
                 let existing: Option<ClusterNode> = t
                     .get(key.as_str())
                     .map_err(sm_io_err)?
@@ -173,8 +173,10 @@ impl RedbStateMachine {
                     })
                     .transpose()
                     .map_err(|e| sm_storage_err(ErrorSubject::Store, ErrorVerb::Read, e))?;
-                let mut record = existing.unwrap_or_else(|| node.clone());
-                record.last_seen_unix = node.last_seen_unix;
+                let Some(mut record) = existing else {
+                    return Ok(StateResponse::NotFound);
+                };
+                record.last_seen_unix = Some(*last_seen_unix);
                 if record.status != NodeStatus::Draining {
                     record.status = NodeStatus::Active;
                 }

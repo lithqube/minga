@@ -304,7 +304,8 @@ impl Supervisor {
         #[cfg(target_os = "linux")]
         self.sync_dns().await;
 
-        let running = self.running_count().await + self.running_agent_count().await;
+        // running_count() already includes agents.
+        let running = self.running_count().await;
         minga_telemetry::METRICS
             .tasks_total
             .with_label_values(&["running"])

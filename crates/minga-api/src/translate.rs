@@ -60,9 +60,13 @@ pub fn service_spec_to_state(spec: &models::ServiceSpec) -> Result<Service, Stri
     }
 
     // Docker's defaults when a field is absent: condition `any`, and
-    // MaxAttempts 0 means unlimited. Durations are nanoseconds.
+    // MaxAttempts 0 means unlimited. Durations are nanoseconds; state
+    // keeps whole seconds, rounded up so a positive delay never becomes 0.
     let restart_policy = match &spec.TaskTemplate.RestartPolicy {
-        None => RestartPolicy::default(),
+        None => RestartPolicy {
+            condition: RestartCondition::Any,
+            ..RestartPolicy::default()
+        },
         Some(p) => RestartPolicy {
             condition: match p.Condition.as_deref() {
                 None | Some("any") => RestartCondition::Any,
@@ -74,9 +78,9 @@ pub fn service_spec_to_state(spec: &models::ServiceSpec) -> Result<Service, Stri
                     ))
                 }
             },
-            delay_secs: p
-                .Delay
-                .map_or(RestartPolicy::default().delay_secs, |n| n / 1_000_000_000),
+            delay_secs: p.Delay.map_or(RestartPolicy::default().delay_secs, |n| {
+                n.div_ceil(1_000_000_000)
+            }),
             max_attempts: p
                 .MaxAttempts
                 .filter(|&n| n > 0)
@@ -1026,6 +1030,25 @@ mod tests {
         let svc = service_spec_to_state(&spec).unwrap();
         assert_eq!(svc.replicas, 1);
         assert_eq!(svc.mode, ServiceMode::Replicated);
+    }
+
+    #[test]
+    fn service_spec_to_state_restart_policy_defaults_and_rounding() {
+        // Absent policy: Docker restarts on any exit.
+        let mut spec = sample_docker_spec();
+        spec.TaskTemplate.RestartPolicy = None;
+        let svc = service_spec_to_state(&spec).unwrap();
+        assert_eq!(svc.restart_policy.condition, RestartCondition::Any);
+
+        // A 500ms delay must not become "no delay".
+        spec.TaskTemplate.RestartPolicy = Some(models::RestartPolicy {
+            Condition: Some("on-failure".to_string()),
+            Delay: Some(500_000_000),
+            ..Default::default()
+        });
+        let svc = service_spec_to_state(&spec).unwrap();
+        assert_eq!(svc.restart_policy.condition, RestartCondition::OnFailure);
+        assert_eq!(svc.restart_policy.delay_secs, 1);
     }
 
     #[test]
