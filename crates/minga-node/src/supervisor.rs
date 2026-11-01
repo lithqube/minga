@@ -368,7 +368,10 @@ impl Supervisor {
         if binds == current {
             return;
         }
-        if let Some(server) = net.server.lock().unwrap().take() {
+        // The guard must drop before the await: an `if let` scrutinee
+        // temporary lives for the whole body.
+        let server = net.server.lock().unwrap().take();
+        if let Some(server) = server {
             server.shutdown().await;
         }
         if binds.is_empty() {
