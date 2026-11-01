@@ -40,7 +40,7 @@ Sequential implementation for one developer: B (NATS TLS/transport boundary) →
 - [x] Gate 1 — cluster knows its own nodes: self-registration + lease, `POST /nodes`, `POST /nodes/{id}/update`, zero-eligible-node deploys are hard errors. Also landed: Raft write forwarding, scheduler on API nodes, sidecar NATS config fix, bounded Raft frames, JetStream setup retry.
 - [x] Gate 2 — `minga deploy` deploys (shared write path with the Docker API; per-service placement report; verified live with the real `docker` CLI against `minga api`).
 - [x] Gate 3 — containers talk to each other (bridge + veth + netns per task, IPAM into `TaskSpec.ips`, iptables DNAT publishing, embedded DNS on bridge gateways). Verified live on OrbStack Ubuntu; multi-node WireGuard and host-local hairpin are known limits.
-- [ ] Gate 4 — Compose fidelity (command/entrypoint/labels/healthcheck/volumes/constraints reach the container).
+- [x] Gate 4 — Compose fidelity (command/entrypoint/labels/healthcheck/volumes/constraints reach the container; task lifecycle states and NetworksAttachments in the API). Verified: Traefik v3 swarm provider routes to a Minga service, 10/10 200 OK.
 - [ ] Gate 5 — transport security and secrets staging (Raft mTLS, API auth, NATS credentials, PKI).
 - [ ] Gate 6 — real container logs (`ContainerdRuntime::logs`).
 - [ ] Gate 7 — shippable: CI, release artifacts, docs corrected.

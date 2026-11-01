@@ -163,6 +163,83 @@ fn translate_service(
         }
     }
 
+    // Command/entrypoint override the image defaults at runtime.
+    let command = svc
+        .command
+        .as_ref()
+        .map(|c| c.clone().into_vec())
+        .unwrap_or_default();
+    let entrypoint = svc
+        .entrypoint
+        .as_ref()
+        .map(|e| e.clone().into_vec())
+        .unwrap_or_default();
+
+    // Labels: service labels plus the stack namespace label (Docker marks
+    // stack resources the same way). A valueless label means empty string.
+    let mut labels: HashMap<String, String> = svc
+        .labels
+        .0
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone().unwrap_or_default()))
+        .collect();
+    labels.insert("com.docker.stack.namespace".to_string(), stack.to_string());
+
+    // Healthcheck: durations are Go-style ("30s", "1m30s").
+    let healthcheck = svc
+        .healthcheck
+        .as_ref()
+        .map(|h| minga_state::types::Healthcheck {
+            test: h.test.clone().map(|t| t.into_vec()).unwrap_or_default(),
+            interval_secs: h.interval.as_deref().and_then(parse_duration_secs),
+            timeout_secs: h.timeout.as_deref().and_then(parse_duration_secs),
+            start_period_secs: h.start_period.as_deref().and_then(parse_duration_secs),
+            retries: h.retries,
+        });
+
+    // Volumes: named volumes and binds are supported. Anonymous volumes
+    // (no source) are materialized as node-local named volumes. tmpfs and
+    // the other exotic kinds are refused loudly rather than dropped.
+    let mut mounts = Vec::new();
+    for vol in &svc.volumes {
+        use minga_compose::VolumeKind;
+        match vol.kind {
+            VolumeKind::Volume => {
+                let source = vol
+                    .source
+                    .clone()
+                    .map(|s| volume_id(stack, &s))
+                    .unwrap_or_else(|| volume_id(stack, &format!("anon-{name}-{}", mounts.len())));
+                mounts.push(minga_state::types::ServiceMount {
+                    kind: minga_state::types::MountKind::Volume,
+                    source,
+                    target: vol.target.clone(),
+                    read_only: vol.read_only,
+                });
+            }
+            VolumeKind::Bind => {
+                let Some(source) = vol.source.clone() else {
+                    return Err(TranslateError::Service(
+                        name.to_string(),
+                        format!("bind mount `{}` has no source path", vol.target),
+                    ));
+                };
+                mounts.push(minga_state::types::ServiceMount {
+                    kind: minga_state::types::MountKind::Bind,
+                    source,
+                    target: vol.target.clone(),
+                    read_only: vol.read_only,
+                });
+            }
+            other => {
+                return Err(TranslateError::Service(
+                    name.to_string(),
+                    format!("volume kind {other:?} is not supported (use named volumes or binds)"),
+                ));
+            }
+        }
+    }
+
     // Build the agent spec from the extension, if present.
     let agent = agent_ext.map(agent_extension_to_spec);
 
@@ -183,6 +260,11 @@ fn translate_service(
         agent,
         restart_policy,
         secrets,
+        command,
+        entrypoint,
+        labels,
+        healthcheck,
+        mounts,
     })
 }
 
@@ -759,5 +841,68 @@ mod tests {
             minga_state::types::RestartCondition::Any
         );
         assert_eq!(result.restart_policy.delay_secs, 10);
+    }
+}
+
+#[cfg(test)]
+mod fidelity_tests {
+    use super::*;
+
+    const FIDELITY: &str = r#"
+services:
+  worker:
+    image: busybox:1
+    command: ["sleep", "3600"]
+    entrypoint: ["/bin/sh", "-c"]
+    labels:
+      traefik.enable: "true"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q localhost || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    volumes:
+      - data:/data
+      - /etc/minga:/config:ro
+    deploy:
+      placement:
+        constraints:
+          - node.labels.zone == edge
+volumes:
+  data:
+"#;
+
+    #[test]
+    fn compose_fields_reach_state_service() {
+        let project = minga_compose::load(FIDELITY, &minga_compose::LoadOptions::default())
+            .expect("compose should load")
+            .project;
+        let stack = translate_project(&project, "shop").unwrap();
+        let svc = &stack.services[0];
+
+        assert_eq!(svc.command, vec!["sleep", "3600"]);
+        assert_eq!(svc.entrypoint, vec!["/bin/sh", "-c"]);
+        assert_eq!(svc.labels.get("traefik.enable").unwrap(), "true");
+        assert_eq!(
+            svc.labels.get("com.docker.stack.namespace").unwrap(),
+            "shop"
+        );
+
+        let hc = svc.healthcheck.as_ref().expect("healthcheck carried");
+        assert_eq!(hc.test[0], "CMD-SHELL");
+        assert_eq!(hc.interval_secs, Some(10));
+        assert_eq!(hc.timeout_secs, Some(3));
+        assert_eq!(hc.retries, Some(5));
+
+        assert_eq!(svc.constraints, vec!["node.labels.zone == edge"]);
+
+        assert_eq!(svc.mounts.len(), 2);
+        assert_eq!(svc.mounts[0].source, "shop_data");
+        assert_eq!(svc.mounts[0].target, "/data");
+        assert!(!svc.mounts[0].read_only);
+        assert_eq!(svc.mounts[1].kind, minga_state::types::MountKind::Bind);
+        assert_eq!(svc.mounts[1].source, "/etc/minga");
+        assert_eq!(svc.mounts[1].target, "/config");
+        assert!(svc.mounts[1].read_only);
     }
 }

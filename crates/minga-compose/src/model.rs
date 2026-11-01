@@ -82,6 +82,17 @@ pub enum StringOrList {
     List(Vec<String>),
 }
 
+impl StringOrList {
+    /// The value as an argv vector. A single string is one argv entry
+    /// (Compose shell-form semantics are the caller's concern).
+    pub fn into_vec(self) -> Vec<String> {
+        match self {
+            StringOrList::String(s) => vec![s],
+            StringOrList::List(v) => v,
+        }
+    }
+}
+
 impl<'de> Deserialize<'de> for StringOrList {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         match Value::deserialize(d)? {

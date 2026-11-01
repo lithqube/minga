@@ -22,6 +22,7 @@ minga-telemetry = { path = "../minga-telemetry" }
 futures.workspace = true
 rcgen = "0.13"
 reqwest.workspace = true
+serde_json.workspace = true
 tempfile.workspace = true
 testcontainers.workspace = true
 tokio = { workspace = true, features = ["test-util"] }

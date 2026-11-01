@@ -287,17 +287,21 @@ pub async fn list_services(
 
     let services = app.store.list_services().await?;
     let tasks = app.store.list_tasks().await?;
+    let networks = app.store.list_networks().await?;
 
     let result: Vec<models::Service> = services
         .iter()
         .filter(|s| {
-            // Label filter: check MINGA_STACK env as a proxy for labels.
+            // Label filter: state labels first, MINGA_STACK env as fallback.
             let labels_ok = if label_filters.is_empty() {
                 true
             } else {
-                let mut pseudo_labels = std::collections::HashMap::new();
-                if let Some(stack) = s.env.get("MINGA_STACK") {
-                    pseudo_labels.insert("com.docker.stack.namespace".to_string(), stack.clone());
+                let mut pseudo_labels = s.labels.clone();
+                if pseudo_labels.is_empty() {
+                    if let Some(stack) = s.env.get("MINGA_STACK") {
+                        pseudo_labels
+                            .insert("com.docker.stack.namespace".to_string(), stack.clone());
+                    }
                 }
                 models::labels_match(&pseudo_labels, &label_filters)
             };
@@ -312,7 +316,7 @@ pub async fn list_services(
             docker_svc.TaskList = tasks
                 .iter()
                 .filter(|t| t.service_id == s.id)
-                .map(translate::task_to_docker)
+                .map(|t| translate::task_to_docker(t, &networks))
                 .collect();
             docker_svc
         })
@@ -366,6 +370,7 @@ pub async fn get_service(
 ) -> ApiResult<Json<models::Service>> {
     let services = app.store.list_services().await?;
     let tasks = app.store.list_tasks().await?;
+    let networks = app.store.list_networks().await?;
 
     let svc = services
         .iter()
@@ -376,7 +381,7 @@ pub async fn get_service(
     docker_svc.TaskList = tasks
         .iter()
         .filter(|t| t.service_id == svc.id)
-        .map(translate::task_to_docker)
+        .map(|t| translate::task_to_docker(t, &networks))
         .collect();
 
     Ok(Json(docker_svc))
@@ -458,6 +463,7 @@ pub async fn list_tasks(
 
     let tasks = app.store.list_tasks().await?;
     let services = app.store.list_services().await?;
+    let networks = app.store.list_networks().await?;
 
     let result: Vec<models::Task> = tasks
         .iter()
@@ -507,7 +513,7 @@ pub async fn list_tasks(
             }
             true
         })
-        .map(translate::task_to_docker)
+        .map(|t| translate::task_to_docker(t, &networks))
         .collect();
 
     Ok(Json(result))
@@ -523,8 +529,9 @@ pub async fn get_task(
         .get_task(&id)
         .await?
         .ok_or_else(|| not_found("task", &id))?;
+    let networks = app.store.list_networks().await?;
 
-    Ok(Json(translate::task_to_docker(&task)))
+    Ok(Json(translate::task_to_docker(&task, &networks)))
 }
 
 // ---------------------------------------------------------------------------

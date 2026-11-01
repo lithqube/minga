@@ -35,15 +35,6 @@ pub async fn deploy_stack(
     translated: &TranslatedStack,
     opts: &DeployOptions,
 ) -> Result<(), String> {
-    if !translated.volumes.is_empty() {
-        let names: Vec<&str> = translated.volumes.iter().map(|v| v.name.as_str()).collect();
-        return Err(format!(
-            "stack declares volume(s) {}; volumes cannot be deployed yet: \
-             the API has no volume surface (roadmap Gate 4)",
-            names.join(", ")
-        ));
-    }
-
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(15))
         .build()

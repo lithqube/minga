@@ -109,14 +109,29 @@ impl StateStore {
             }
         }
 
-        // Wait for a leader to be elected (any node, not just us).
-        let wait = raft.wait(Some(DEFAULT_TIMEOUT));
-        wait.metrics(
-            |m| m.current_leader.is_some(),
-            "waiting for leader election",
-        )
-        .await
-        .map_err(|e| StateError::storage(format!("leader election: {e}")))?;
+        // Wait for a leader to be elected (any node, not just us). A node
+        // whose peers are down must not die: a 2-voter cluster can only
+        // recover from a restart if the surviving node waits. Log loudly
+        // every interval so a misconfigured cluster is still visible.
+        loop {
+            let wait = raft.wait(Some(DEFAULT_TIMEOUT));
+            let result = wait
+                .metrics(
+                    |m| m.current_leader.is_some(),
+                    "waiting for leader election",
+                )
+                .await;
+            match result {
+                Ok(_) => break,
+                Err(e) => {
+                    tracing::warn!(
+                        node_id,
+                        error = %e,
+                        "no cluster leader yet; waiting for peers"
+                    );
+                }
+            }
+        }
 
         Ok(Self {
             raft,

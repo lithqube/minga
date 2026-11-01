@@ -9,6 +9,7 @@ license.workspace = true
 [dependencies]
 axum.workspace = true
 chrono.workspace = true
+minga-net = { path = "../minga-net" }
 minga-scheduler = { path = "../minga-scheduler" }
 minga-state = { path = "../minga-state" }
 minga-telemetry = { path = "../minga-telemetry" }

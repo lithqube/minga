@@ -1962,6 +1962,7 @@ dependencies = [
  "axum",
  "chrono",
  "minga-bus",
+ "minga-net",
  "minga-scheduler",
  "minga-state",
  "minga-telemetry",

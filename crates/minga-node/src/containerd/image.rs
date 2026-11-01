@@ -111,7 +111,10 @@ pub fn chain_id(diff_ids: &[String]) -> Result<String, String> {
 
 #[derive(Debug, Clone)]
 pub struct ImageConfiguration {
-    pub args: Vec<String>,
+    /// Image Entrypoint (may be empty).
+    pub entrypoint: Vec<String>,
+    /// Image Cmd (may be empty).
+    pub cmd: Vec<String>,
     pub env: Vec<String>,
     pub cwd: String,
     pub uid: u32,
@@ -120,23 +123,32 @@ pub struct ImageConfiguration {
 }
 
 impl ImageConfiguration {
+    /// The default argv: entrypoint + cmd. Docker override semantics
+    /// (task entrypoint/command replacing parts of this) live in
+    /// `oci::spec_to_any_with_image`.
+    pub fn args(&self) -> Vec<String> {
+        [self.entrypoint.clone(), self.cmd.clone()].concat()
+    }
+}
+
+impl ImageConfiguration {
     pub fn parse(value: &Value, architecture: &str) -> Result<Self, String> {
         if value["os"] != "linux" || value["architecture"] != architecture {
             return Err(format!("image config is not for linux/{architecture}"));
         }
         let config = &value["config"];
-        let args = ["Entrypoint", "Cmd"]
-            .into_iter()
-            .flat_map(|key| {
-                config[key]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .filter_map(Value::as_str)
-                    .map(str::to_string)
-            })
-            .collect::<Vec<_>>();
-        if args.is_empty() || args[0].is_empty() {
+        let argv_of = |key: &str| -> Vec<String> {
+            config[key]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        };
+        let entrypoint = argv_of("Entrypoint");
+        let cmd = argv_of("Cmd");
+        if entrypoint.is_empty() && cmd.is_empty() {
             return Err("image has no executable entrypoint or command".into());
         }
         let env = config["Env"]
@@ -182,7 +194,8 @@ impl ImageConfiguration {
             })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
-            args,
+            entrypoint,
+            cmd,
             env,
             cwd: cwd.to_string(),
             uid,
@@ -279,7 +292,7 @@ mod tests {
             "rootfs": {"type": "layers", "diff_ids": [format!("sha256:{}", "c".repeat(64))]}
         });
         let config = ImageConfiguration::parse(&json, "arm64").unwrap();
-        assert_eq!(config.args, vec!["/bin/sh", "-c", "echo ok"]);
+        assert_eq!(config.args(), vec!["/bin/sh", "-c", "echo ok"]);
         assert_eq!(config.env, vec!["A=1", "B=2"]);
         assert_eq!(config.cwd, "/app");
         assert_eq!((config.uid, config.gid), (1000, 1001));

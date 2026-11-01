@@ -141,15 +141,22 @@ async fn redeploy_is_idempotent() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn deploy_with_volumes_fails_loudly() {
-    let (_store, url, _dir) = cluster().await;
+async fn deploy_with_volumes_lands_and_mounts() {
+    let (store, url, _dir) = cluster().await;
 
     let (ok, out) = run_deploy(COMPOSE_WITH_VOLUME, "datastack", &url, &[]);
-    assert!(!ok, "a stack with volumes must not deploy silently");
-    assert!(
-        out.contains("volumes cannot be deployed yet"),
-        "the error must name the cause:\n{out}"
-    );
+    assert!(ok, "a stack with volumes deploys:\n{out}");
+
+    // The mount reference reaches state: kind Volume, stack-prefixed id.
+    let services = store.list_services().await.unwrap();
+    let db = services
+        .iter()
+        .find(|s| s.id == "datastack.db")
+        .expect("db service in state");
+    assert_eq!(db.mounts.len(), 1);
+    assert_eq!(db.mounts[0].kind, minga_state::types::MountKind::Volume);
+    assert_eq!(db.mounts[0].source, "datastack_data");
+    assert_eq!(db.mounts[0].target, "/var/lib/postgresql/data");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

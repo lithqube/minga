@@ -45,7 +45,9 @@ use std::time::Duration;
 use minga_bus::{
     subjects, Command, EventBus, LogEntry, LogStream, TaskActualState, TaskStatusReport,
 };
-use minga_state::types::{NodeId, RestartCondition, Task, TaskId, TaskSpec, WorkloadKind};
+use minga_state::types::{
+    NodeId, RestartCondition, Task, TaskId, TaskSpec, TaskState, WorkloadKind,
+};
 use minga_state::{StateError, StateStore};
 use thiserror::Error;
 use tokio::sync::Mutex;
@@ -787,6 +789,30 @@ impl Supervisor {
         }
     }
 
+    /// Records a lifecycle transition on the task record in Raft. Docker
+    /// API consumers (Traefik included) read task state from the API,
+    /// which reads this record — without it every task looks `pending`
+    /// forever. High-frequency status still goes through the bus;
+    /// lifecycle transitions are rare and belong on the record the
+    /// scheduler owns.
+    async fn mark_task_state(&self, task_id: &TaskId, state: minga_state::types::TaskState) {
+        match self.state.get_task(task_id).await {
+            Ok(Some(mut task)) => {
+                if task.state != state {
+                    task.state = state;
+                    if let Err(e) = self.state.upsert_task(task).await {
+                        tracing::warn!(task = %task_id, error = %e, "failed to record task state");
+                    }
+                }
+            }
+            // Bus-assigned tasks can exist without a Raft record.
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!(task = %task_id, error = %e, "failed to read task for state mark")
+            }
+        }
+    }
+
     /// Execute a single command received from the bus.
     async fn execute_command(&self, cmd: Command) -> usize {
         match cmd {
@@ -830,6 +856,7 @@ impl Supervisor {
                                 .lock()
                                 .await
                                 .insert(task_id.clone(), container_id);
+                            self.mark_task_state(&task_id, TaskState::Running).await;
                             self.bus_assigned.lock().await.insert(task_id);
                             1
                         }
@@ -859,6 +886,7 @@ impl Supervisor {
                                     "started agent (bus command)"
                                 );
                                 self.running_agents.lock().await.insert(task_id.clone());
+                                self.mark_task_state(&task_id, TaskState::Running).await;
                                 self.bus_assigned.lock().await.insert(task_id);
                                 1
                             }
@@ -891,6 +919,7 @@ impl Supervisor {
                                 node = self.node_id,
                                 "stopped container (bus command)"
                             );
+                            self.mark_task_state(&task_id, TaskState::Stopped).await;
                             1
                         }
                         Err(e) => {
@@ -1034,6 +1063,7 @@ impl Supervisor {
                         );
                         running.insert(task.id.clone(), container_id);
                         actions += 1;
+                        self.mark_task_state(&task.id, TaskState::Running).await;
                     }
                     Err(e) => {
                         tracing::error!(
@@ -1061,6 +1091,7 @@ impl Supervisor {
                             );
                             running_agents.insert(task.id.clone());
                             actions += 1;
+                            self.mark_task_state(&task.id, TaskState::Running).await;
                         }
                         Err(e) => {
                             tracing::error!(
@@ -1234,6 +1265,11 @@ mod tests {
             agent: None,
             restart_policy: Default::default(),
             secrets: vec![],
+            command: vec![],
+            entrypoint: vec![],
+            labels: HashMap::new(),
+            healthcheck: None,
+            mounts: vec![],
         }];
 
         let mut t1 = make_task("shop.web.1", 1);

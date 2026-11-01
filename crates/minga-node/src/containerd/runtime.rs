@@ -75,6 +75,10 @@ pub struct ContainerdRuntime {
     runtime_name: String,
     /// Node-local secret store used to resolve secret references.
     secret_store: Option<SecretStore>,
+    /// Directory under which named volumes are materialized
+    /// (`<data_dir>/volumes`). Required to start tasks with named-volume
+    /// mounts.
+    volume_dir: Option<PathBuf>,
     /// Node networking: netns/bridge/port setup, plus cluster state for
     /// network subnet resolution. Required to start tasks with IPs.
     #[cfg(target_os = "linux")]
@@ -101,6 +105,7 @@ impl ContainerdRuntime {
             snapshotter: DEFAULT_SNAPSHOTTER.to_string(),
             runtime_name: DEFAULT_RUNTIME_NAME.to_string(),
             secret_store: None,
+            volume_dir: None,
             #[cfg(target_os = "linux")]
             networking: None,
         }
@@ -237,6 +242,48 @@ impl ContainerdRuntime {
                 tracing::warn!(task = %task_id, error = %e, "network teardown failed");
             }
         }
+    }
+
+    /// Attach the node's volume directory. Without one, a task mounting a
+    /// named volume **fails closed** — silently skipping the mount would
+    /// start the container against different data than declared.
+    pub fn with_volume_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.volume_dir = Some(dir.into());
+        self
+    }
+
+    /// Resolves the task's mounts: named volumes are materialized as
+    /// directories under the node's volume dir; missing bind sources are
+    /// created (Docker behavior). Returns the spec with concrete host
+    /// paths.
+    async fn resolve_mounts(&self, spec: &TaskSpec) -> Result<TaskSpec, RuntimeError> {
+        if spec.mounts.is_empty() {
+            return Ok(spec.clone());
+        }
+        let mut spec = spec.clone();
+        for m in &mut spec.mounts {
+            match m.kind {
+                minga_state::types::MountKind::Volume => {
+                    let root = self.volume_dir.as_ref().ok_or_else(|| {
+                        RuntimeError::Start(format!(
+                            "task mounts named volume `{}` but no node volume dir is configured",
+                            m.source
+                        ))
+                    })?;
+                    let dir = root.join(&m.source);
+                    tokio::fs::create_dir_all(&dir).await.map_err(|e| {
+                        RuntimeError::Start(format!("create volume dir {}: {e}", dir.display()))
+                    })?;
+                    m.source = dir.display().to_string();
+                }
+                minga_state::types::MountKind::Bind => {
+                    tokio::fs::create_dir_all(&m.source).await.map_err(|e| {
+                        RuntimeError::Start(format!("create bind source {}: {e}", m.source))
+                    })?;
+                }
+            }
+        }
+        Ok(spec)
     }
 
     /// Override the snapshotter (default: overlayfs).
@@ -385,6 +432,7 @@ impl Runtime for ContainerdRuntime {
     async fn start(&self, task_id: &TaskId, spec: &TaskSpec) -> Result<String, RuntimeError> {
         let container_id = task_id.clone();
         let secret_mounts = self.resolve_secrets(spec)?;
+        let spec = &self.resolve_mounts(spec).await?;
 
         #[cfg(target_os = "linux")]
         let network = self.prepare_network(&container_id, spec).await?;

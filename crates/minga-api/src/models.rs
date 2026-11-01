@@ -464,6 +464,12 @@ pub struct TaskTemplate {
     pub LogDriver: Option<Driver>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ForceUpdate: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub Runtime: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub Placement: Option<Placement>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub Platforms: Vec<Platform>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -812,6 +818,25 @@ pub struct Task {
     pub AssignedGenericResources: Option<Vec<GenericResource>>,
     pub Status: TaskStatus,
     pub DesiredState: String,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub NetworksAttachments: Vec<NetworkAttachment>,
+}
+
+/// A task's attachment to a network, with its assigned addresses.
+/// This is what service-discovery consumers (Traefik's swarm provider)
+/// read to route to a task.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NetworkAttachment {
+    pub Network: NetworkAttachmentNetwork,
+    pub Addresses: Vec<String>,
+}
+
+/// The network half of a [`NetworkAttachment`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NetworkAttachmentNetwork {
+    pub ID: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub Name: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1112,9 +1137,40 @@ pub struct ConfigListQuery {
 pub type Filters = HashMap<String, Vec<String>>;
 
 /// Parses a Docker `filters` query parameter (JSON-encoded).
+///
+/// Both wire forms are accepted: `{"label": ["a", "b"]}` and Docker's
+/// canonical `{"label": {"a": true, "b": true}}` — the latter is what the
+/// Go client (and Traefik) sends. An unparseable value yields empty
+/// filters, which means *everything matches*; that is Docker's own
+/// fallback semantics.
 pub fn parse_filters(raw: Option<&str>) -> Filters {
-    raw.and_then(|s| serde_json::from_str(s).ok())
-        .unwrap_or_default()
+    let Some(s) = raw else {
+        return Filters::default();
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(s) else {
+        return Filters::default();
+    };
+    let mut out = Filters::new();
+    let Some(obj) = value.as_object() else {
+        return out;
+    };
+    for (key, val) in obj {
+        let values: Vec<String> = match val {
+            serde_json::Value::Array(items) => items
+                .iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect(),
+            serde_json::Value::Object(map) => map
+                .iter()
+                .filter(|(_, enabled)| enabled.as_bool().unwrap_or(false))
+                .map(|(name, _)| name.clone())
+                .collect(),
+            serde_json::Value::String(single) => vec![single.clone()],
+            _ => Vec::new(),
+        };
+        out.insert(key.clone(), values);
+    }
+    out
 }
 
 /// Checks if a label map matches all `label` filters.
@@ -1146,6 +1202,26 @@ mod tests {
             &vec!["com.docker.stack.namespace=mystack".to_string()]
         );
         assert_eq!(f.get("name").unwrap(), &vec!["web".to_string()]);
+    }
+
+    #[test]
+    fn parse_filters_canonical_go_client_form() {
+        // The form Docker's Go client (and Traefik) sends.
+        let raw = r#"{"service":{"shop.web":true,"shop.api":true},"desired-state":{"running":true},"service":{"shop.web":true},"dangling":{"x":false}}"#;
+        let f = parse_filters(Some(raw));
+        assert!(f
+            .get("desired-state")
+            .unwrap()
+            .contains(&"running".to_string()));
+        assert!(f.get("dangling").unwrap().is_empty());
+
+        let raw = r#"{"service":{"shop.web":true},"desired-state":{"running":true}}"#;
+        let f = parse_filters(Some(raw));
+        assert_eq!(f.get("service").unwrap(), &vec!["shop.web".to_string()]);
+        assert_eq!(
+            f.get("desired-state").unwrap(),
+            &vec!["running".to_string()]
+        );
     }
 
     #[test]
@@ -1387,6 +1463,7 @@ mod tests {
                 ContainerStatus: None,
             },
             DesiredState: "running".to_string(),
+            NetworksAttachments: vec![],
         };
         let json = serde_json::to_value(&task).unwrap();
         assert_eq!(json["ID"], "task1");

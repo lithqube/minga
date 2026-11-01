@@ -114,10 +114,54 @@ pub fn service_spec_to_state(spec: &models::ServiceSpec) -> Result<Service, Stri
         None => (1, ServiceMode::Replicated),
     };
 
-    // Placement constraints from TaskTemplate (not in ServiceSpec directly,
-    // but Docker CLI sends them in TaskSpec for tasks; for services they're
-    // typically not set, so we default to empty).
-    let constraints: Vec<String> = Vec::new();
+    // Placement constraints from TaskTemplate.Placement.
+    let constraints: Vec<String> = spec
+        .TaskTemplate
+        .Placement
+        .as_ref()
+        .map(|p| p.Constraints.clone())
+        .unwrap_or_default();
+
+    // Command/args override the image defaults at runtime.
+    let command = container.Command.clone();
+    let entrypoint = container.Args.clone();
+
+    // Healthcheck. Docker API durations are nanoseconds; state is seconds.
+    let nanos = |v: Option<u64>| v.map(|n| n / 1_000_000_000);
+    let healthcheck = container
+        .Healthcheck
+        .as_ref()
+        .map(|h| minga_state::types::Healthcheck {
+            test: h.Test.clone(),
+            interval_secs: nanos(h.Interval),
+            timeout_secs: nanos(h.Timeout),
+            start_period_secs: nanos(h.StartPeriod),
+            retries: h.Retries.and_then(|r| u32::try_from(r).ok()),
+        });
+
+    // Mounts: named volumes and binds are supported; anything else is
+    // refused rather than dropped.
+    let mut mounts = Vec::new();
+    for m in &container.Mounts {
+        let kind = match m.mount_type.as_str() {
+            "volume" => minga_state::types::MountKind::Volume,
+            "bind" => minga_state::types::MountKind::Bind,
+            other => {
+                return Err(format!(
+                    "mount type {other:?} is not supported (use volumes or binds)"
+                ));
+            }
+        };
+        let Some(source) = m.Source.clone() else {
+            return Err(format!("mount for target `{}` has no source", m.Target));
+        };
+        mounts.push(minga_state::types::ServiceMount {
+            kind,
+            source,
+            target: m.Target.clone(),
+            read_only: m.ReadOnly.unwrap_or(false),
+        });
+    }
 
     // Secret references from TaskTemplate.ContainerSpec.
     //
@@ -171,6 +215,11 @@ pub fn service_spec_to_state(spec: &models::ServiceSpec) -> Result<Service, Stri
         agent: None,
         restart_policy: Default::default(),
         secrets,
+        command,
+        entrypoint,
+        labels: spec.Labels.clone(),
+        healthcheck,
+        mounts,
     })
 }
 
@@ -216,9 +265,13 @@ pub fn config_spec_to_state(spec: &models::ConfigSpec) -> MingaConfig {
 
 /// Translates a Minga `Service` into a Docker `Service` API response.
 pub fn service_to_docker(svc: &Service) -> models::Service {
-    let mut labels: HashMap<String, String> = HashMap::new();
-    if let Some(stack) = svc.env.get("MINGA_STACK") {
-        labels.insert("com.docker.stack.namespace".to_string(), stack.clone());
+    // State labels are authoritative (they always carry the stack
+    // namespace); fall back to the env marker for pre-Gate-4 records.
+    let mut labels = svc.labels.clone();
+    if labels.is_empty() {
+        if let Some(stack) = svc.env.get("MINGA_STACK") {
+            labels.insert("com.docker.stack.namespace".to_string(), stack.clone());
+        }
     }
 
     // Secret references, outbound. Only identifiers and targets — never a
@@ -251,6 +304,33 @@ pub fn service_to_docker(svc: &Service) -> models::Service {
         )
     };
 
+    let nanos = |v: Option<u64>| v.map(|s| s * 1_000_000_000);
+    let healthcheck = svc.healthcheck.as_ref().map(|h| models::Healthcheck {
+        Test: h.test.clone(),
+        Interval: nanos(h.interval_secs),
+        Timeout: nanos(h.timeout_secs),
+        Retries: h.retries.map(i64::from),
+        StartPeriod: nanos(h.start_period_secs),
+        StartInterval: None,
+    });
+
+    let mounts: Vec<models::Mount> = svc
+        .mounts
+        .iter()
+        .map(|m| models::Mount {
+            mount_type: match m.kind {
+                minga_state::types::MountKind::Volume => "volume".to_string(),
+                minga_state::types::MountKind::Bind => "bind".to_string(),
+            },
+            Source: Some(m.source.clone()),
+            Target: m.target.clone(),
+            ReadOnly: Some(m.read_only),
+            BindOptions: None,
+            VolumeOptions: None,
+            TmpfsOptions: None,
+        })
+        .collect();
+
     let container_spec = models::ContainerSpec {
         Image: svc.image.clone(),
         Env: svc
@@ -265,6 +345,10 @@ pub fn service_to_docker(svc: &Service) -> models::Service {
                 }
             })
             .collect(),
+        Command: svc.command.clone(),
+        Args: svc.entrypoint.clone(),
+        Mounts: mounts,
+        Healthcheck: healthcheck,
         Secrets: secrets,
         ..Default::default()
     };
@@ -343,6 +427,18 @@ pub fn service_to_docker(svc: &Service) -> models::Service {
                 Networks: networks.clone(),
                 LogDriver: None,
                 ForceUpdate: None,
+                Runtime: None,
+                Placement: if svc.constraints.is_empty() {
+                    None
+                } else {
+                    Some(models::Placement {
+                        Constraints: svc.constraints.clone(),
+                        Preferences: vec![],
+                        Platforms: None,
+                        MaxReplicas: None,
+                    })
+                },
+                Platforms: vec![],
             },
             Mode: Some(mode),
             UpdateConfig: None,
@@ -423,7 +519,11 @@ pub fn node_to_docker(node: &ClusterNode, is_leader: bool) -> models::Node {
 }
 
 /// Translates a Minga `Task` into a Docker `Task` API response.
-pub fn task_to_docker(task: &Task) -> models::Task {
+///
+/// `networks` (the cluster network list) resolves attachment names and
+/// subnet prefixes for `NetworksAttachments` — the field Traefik's swarm
+/// provider reads to discover a task's IP.
+pub fn task_to_docker(task: &Task, networks: &[Network]) -> models::Task {
     let (state, desired_state) = match task.state {
         TaskState::Pending => ("pending", "running"),
         TaskState::Assigned => ("assigned", "running"),
@@ -457,13 +557,44 @@ pub fn task_to_docker(task: &Task) -> models::Task {
         ..Default::default()
     };
 
+    // Real IP assignments, in the shape service-discovery consumers read.
+    // Addresses must carry the subnet prefix — Traefik's swarm provider
+    // fails to parse a bare IP and yields a nil server URL. Auto-allocated
+    // networks have no subnet in state; the prefix comes from the same
+    // deterministic rule the scheduler and the node use.
+    let attachments: Vec<models::NetworkAttachment> = task
+        .spec
+        .ips
+        .iter()
+        .map(|(net_id, ip)| {
+            let net = networks.iter().find(|n| &n.id == net_id);
+            let prefix: Option<u8> = match net.and_then(|n| n.subnet.as_deref()) {
+                Some(s) => s.rsplit('/').next().and_then(|p| p.parse().ok()),
+                None => minga_net::ipam::allocate_subnet(net_id)
+                    .ok()
+                    .map(|c| c.prefix_len()),
+            };
+            let address = match prefix {
+                Some(p) => format!("{ip}/{p}"),
+                None => ip.clone(),
+            };
+            models::NetworkAttachment {
+                Network: models::NetworkAttachmentNetwork {
+                    ID: net_id.clone(),
+                    Name: net.map(|n| n.name.clone()),
+                },
+                Addresses: vec![address],
+            }
+        })
+        .collect();
+
     models::Task {
         ID: task.id.clone(),
         Version: models::Version { Index: Some(1) },
         CreatedAt: Some(Utc::now()),
         UpdatedAt: Some(Utc::now()),
         Name: Some(format!("{}.{}", task.service_id, slot.unwrap_or(0))),
-        Labels: HashMap::new(),
+        Labels: task.spec.labels.clone(),
         Spec: models::TaskSpec {
             ContainerSpec: Some(container_spec),
             Resources: None,
@@ -487,6 +618,7 @@ pub fn task_to_docker(task: &Task) -> models::Task {
             ContainerStatus: None,
         },
         DesiredState: desired_state.to_string(),
+        NetworksAttachments: attachments,
     }
 }
 
@@ -901,6 +1033,11 @@ mod tests {
             agent: None,
             restart_policy: Default::default(),
             secrets: vec![],
+            command: vec![],
+            entrypoint: vec![],
+            labels: HashMap::new(),
+            healthcheck: None,
+            mounts: vec![],
         };
         let docker = service_to_docker(&svc);
         let env = &docker.Spec.TaskTemplate.ContainerSpec.as_ref().unwrap().Env;
@@ -983,7 +1120,7 @@ mod tests {
                 ..Default::default()
             },
         };
-        let docker = task_to_docker(&task);
+        let docker = task_to_docker(&task, &[]);
         assert_eq!(docker.ID, "svc1.1");
         assert_eq!(docker.ServiceID, "svc1");
         assert_eq!(docker.NodeID, "1");
@@ -1007,7 +1144,7 @@ mod tests {
                 ..Default::default()
             },
         };
-        let docker = task_to_docker(&task);
+        let docker = task_to_docker(&task, &[]);
         assert_eq!(docker.Status.State, "pending");
         assert_eq!(docker.DesiredState, "running");
     }
@@ -1027,7 +1164,7 @@ mod tests {
                 ..Default::default()
             },
         };
-        let docker = task_to_docker(&task);
+        let docker = task_to_docker(&task, &[]);
         assert_eq!(docker.Status.State, "failed");
         assert_eq!(docker.DesiredState, "shutdown");
     }

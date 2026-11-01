@@ -142,6 +142,11 @@ mod tests {
             agent: None,
             restart_policy: Default::default(),
             secrets: vec![],
+            command: vec![],
+            entrypoint: vec![],
+            labels: HashMap::new(),
+            healthcheck: None,
+            mounts: vec![],
         }
     }
 

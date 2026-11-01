@@ -148,6 +148,59 @@ pub struct Service {
     /// Secret references for this service. References only — no values.
     #[serde(default)]
     pub secrets: Vec<SecretRef>,
+    /// Overrides the image's Cmd. Empty = image default.
+    #[serde(default)]
+    pub command: Vec<String>,
+    /// Overrides the image's Entrypoint. Empty = image default.
+    #[serde(default)]
+    pub entrypoint: Vec<String>,
+    /// Service labels (Compose `labels` / Docker `Spec.Labels`). The stack
+    /// namespace label is included.
+    #[serde(default)]
+    pub labels: HashMap<String, String>,
+    /// Container healthcheck, carried for inspection and (later)
+    /// supervisor enforcement.
+    #[serde(default)]
+    pub healthcheck: Option<Healthcheck>,
+    /// Volume and bind mounts.
+    #[serde(default)]
+    pub mounts: Vec<ServiceMount>,
+}
+
+/// A container healthcheck (Compose/Docker shape).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Healthcheck {
+    /// e.g. `["CMD-SHELL", "curl -f localhost"]`, `["CMD", ...]` or `["NONE"]`.
+    pub test: Vec<String>,
+    #[serde(default)]
+    pub interval_secs: Option<u64>,
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
+    #[serde(default)]
+    pub start_period_secs: Option<u64>,
+    #[serde(default)]
+    pub retries: Option<u32>,
+}
+
+/// What backs a [`ServiceMount`].
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum MountKind {
+    /// A named volume; the node materializes it under its volume dir.
+    Volume,
+    /// A host path bind-mounted as-is.
+    Bind,
+}
+
+/// A volume or bind mount declared by a service.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ServiceMount {
+    pub kind: MountKind,
+    /// Volume ID (stack-prefixed) for `Volume`, host path for `Bind`.
+    pub source: String,
+    /// Path inside the container.
+    pub target: String,
+    #[serde(default)]
+    pub read_only: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -204,6 +257,22 @@ pub struct TaskSpec {
     /// through the event bus to the node's runtime.
     #[serde(default)]
     pub ips: HashMap<NetworkId, String>,
+    /// Overrides the image's Cmd. Empty = image default.
+    #[serde(default)]
+    pub command: Vec<String>,
+    /// Overrides the image's Entrypoint. Empty = image default.
+    #[serde(default)]
+    pub entrypoint: Vec<String>,
+    /// Service labels, propagated onto the container and the task API
+    /// response (Traefik's swarm provider reads them).
+    #[serde(default)]
+    pub labels: HashMap<String, String>,
+    /// Container healthcheck, carried for inspection.
+    #[serde(default)]
+    pub healthcheck: Option<Healthcheck>,
+    /// Volume and bind mounts to apply in the OCI spec.
+    #[serde(default)]
+    pub mounts: Vec<ServiceMount>,
 }
 
 /// Restart policy for a task.
@@ -396,6 +465,11 @@ mod tests {
             }),
             restart_policy: Default::default(),
             secrets: vec![SecretRef::new("stack_password", "/run/secrets/db_password")],
+            command: vec![],
+            entrypoint: vec![],
+            labels: HashMap::new(),
+            healthcheck: None,
+            mounts: vec![],
         };
         let bytes = bincode::serde::encode_to_vec(&svc, bincode::config::standard()).unwrap();
         let (back, _): (Service, _) =

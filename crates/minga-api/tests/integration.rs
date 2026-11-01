@@ -194,8 +194,9 @@ async fn full_stack_deploy_workflow() {
                 "Env": ["NGINX_HOST=localhost", "NGINX_PORT=80"],
                 "Mounts": [{
                     "Type": "bind",
-                    "Target": "/etc/nginx/conf.d/default.conf",
-                    "Config": {"ConfigName": "myapp_nginx_conf"}
+                    "Source": "/etc/minga/nginx",
+                    "Target": "/etc/nginx/conf.d",
+                    "ReadOnly": true
                 }],
                 "Secrets": [{
                     "SecretID": "myapp_db_password",

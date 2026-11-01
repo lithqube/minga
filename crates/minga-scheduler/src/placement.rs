@@ -201,6 +201,11 @@ pub fn place_service(
         secrets: service.secrets.clone(),
         // Filled in per task below.
         ips: HashMap::new(),
+        command: service.command.clone(),
+        entrypoint: service.entrypoint.clone(),
+        labels: service.labels.clone(),
+        healthcheck: service.healthcheck.clone(),
+        mounts: service.mounts.clone(),
     };
 
     let mut tasks = Vec::new();
@@ -349,6 +354,11 @@ mod tests {
             agent: None,
             restart_policy: Default::default(),
             secrets: vec![],
+            command: vec![],
+            entrypoint: vec![],
+            labels: HashMap::new(),
+            healthcheck: None,
+            mounts: vec![],
         }
     }
 

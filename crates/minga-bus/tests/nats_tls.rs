@@ -134,15 +134,68 @@ fn write_file(path: &Path, contents: &str, private: bool) {
 struct TlsServer {
     child: Child,
     port: u16,
+    /// The monitoring (HTTP) port, when the config asked for one.
+    monitor_port: Option<u16>,
+    /// The cluster route port, when the config asked for one.
+    route_port: Option<u16>,
     _dir: tempfile::TempDir,
 }
 
-/// Find a free TCP port by binding and releasing it.
-fn free_port() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
-    drop(listener);
-    port
+/// Ports that `nats-server` allocated for itself.
+///
+/// `nats-server` can pick its own ports (port `-1` in the config) and
+/// write them to a JSON ports file. Letting the server allocate the port
+/// removes the race that a "find a free port, then bind it later" probe
+/// has: between the probe releasing the port and the server binding it,
+/// another process can take it, and the server then either fails to bind
+/// or — worse — the test connects to a stranger's listener.
+#[derive(Debug, Clone, Copy)]
+struct ServerPorts {
+    client: u16,
+    monitor: Option<u16>,
+    route: Option<u16>,
+}
+
+/// Parse the JSON ports file `nats-server` writes when
+/// `--ports_file_dir` is given.
+fn parse_ports_file(path: &Path) -> Option<ServerPorts> {
+    let body = std::fs::read_to_string(path).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&body).ok()?;
+
+    // The file maps a listener kind ("nats", "monitoring", "cluster") to a
+    // list of URLs. Each URL is `scheme://host:port`.
+    let port_of = |kind: &str| -> Option<u16> {
+        value
+            .get(kind)?
+            .as_array()?
+            .first()?
+            .as_str()?
+            .rsplit(':')
+            .next()?
+            .parse()
+            .ok()
+    };
+
+    Some(ServerPorts {
+        client: port_of("nats")?,
+        monitor: port_of("monitoring"),
+        route: port_of("cluster"),
+    })
+}
+
+/// Find the ports file `nats-server` wrote into `dir`.
+///
+/// The file is named `<binary>_<pid>.ports`, so it is found by globbing
+/// for `*.ports` rather than by reconstructing the name.
+fn find_ports_file(dir: &Path) -> Option<PathBuf> {
+    let mut candidates: Vec<PathBuf> = std::fs::read_dir(dir)
+        .ok()?
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "ports"))
+        .collect();
+    candidates.sort();
+    candidates.pop()
 }
 
 /// Locate the `nats-server` binary.
@@ -178,6 +231,10 @@ fn nats_server_bin() -> Option<PathBuf> {
 
 /// Start a `nats-server` with the given config.
 ///
+/// The config is expected to request ports of `-1`, which makes
+/// `nats-server` allocate them itself; the allocated ports are read back
+/// from the ports file it writes.
+///
 /// Returns `None` when the `nats-server` binary is not installed — the
 /// caller decides whether that is a skip or a failure.
 fn start_server(config_body: &str, dir: tempfile::TempDir) -> Option<TlsServer> {
@@ -188,6 +245,8 @@ fn start_server(config_body: &str, dir: tempfile::TempDir) -> Option<TlsServer> 
     let child = Command::new(&bin)
         .arg("-c")
         .arg(&config_path)
+        .arg("--ports_file_dir")
+        .arg(dir.path())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
@@ -195,9 +254,45 @@ fn start_server(config_body: &str, dir: tempfile::TempDir) -> Option<TlsServer> 
 
     Some(TlsServer {
         child,
-        port: free_port(),
+        port: 0,
+        monitor_port: None,
+        route_port: None,
         _dir: dir,
     })
+}
+
+/// Wait for `nats-server` to write its ports file, then adopt the ports it
+/// allocated.
+///
+/// This replaces a "probe a free port, then wait for a TCP connect"
+/// readiness check, which had two failure modes: the probe could hand the
+/// port to another process before the server bound it, and a successful
+/// TCP connect said nothing about whether the listener was the NATS
+/// server under test.
+fn adopt_allocated_ports(server: &mut TlsServer) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        if let Ok(Some(status)) = server.child.try_wait() {
+            let mut stderr = String::new();
+            if let Some(mut pipe) = server.child.stderr.take() {
+                use std::io::Read;
+                let _ = pipe.read_to_string(&mut stderr);
+            }
+            panic!("nats-server exited early: {status}\n--- stderr ---\n{stderr}");
+        }
+        if let Some(path) = find_ports_file(server._dir.path()) {
+            if let Some(ports) = parse_ports_file(&path) {
+                server.port = ports.client;
+                server.monitor_port = ports.monitor;
+                server.route_port = ports.route;
+                return;
+            }
+        }
+        if Instant::now() >= deadline {
+            panic!("nats-server did not report its allocated ports");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 /// A NATS server requiring a client certificate signed by `pki.ca_pem`.
@@ -210,11 +305,11 @@ fn start_tls_server(pki: &Pki) -> TlsServer {
     write_file(&cert_path, &pki.server_cert_pem, false);
     write_file(&key_path, &pki.server_key_pem, true);
 
-    let port = free_port();
+    // `-1` asks nats-server to allocate the port itself.
     let config = format!(
-        r#"listen: 127.0.0.1:{port}
+        r#"listen: 127.0.0.1:-1
 server_name: minga-tls-test
-http: "127.0.0.1:{monitor}"
+http: "127.0.0.1:-1"
 
 tls {{
     cert_file: "{cert}"
@@ -228,7 +323,6 @@ jetstream {{
     store_dir: "{store}"
 }}
 "#,
-        monitor = free_port(),
         cert = cert_path.display(),
         key = key_path.display(),
         ca = ca_path.display(),
@@ -236,21 +330,22 @@ jetstream {{
     );
 
     let mut server = start_server(&config, dir).expect("nats-server binary not found");
-    server.port = port;
+    adopt_allocated_ports(&mut server);
     server
 }
 
-/// Wait until the server accepts TCP connections, or fail.
-fn wait_ready(server: &mut TlsServer) {
+/// Wait until the server's client listener accepts connections.
+///
+/// The port is the one `nats-server` allocated for itself, so this
+/// confirms the right listener is up rather than a stranger's socket that
+/// happens to sit on the same number.
+fn wait_ready(server: &TlsServer) {
     let deadline = Instant::now() + Duration::from_secs(20);
     while Instant::now() < deadline {
-        if let Ok(Some(status)) = server.child.try_wait() {
-            panic!("nats-server exited early: {status}");
-        }
         if std::net::TcpStream::connect(("127.0.0.1", server.port)).is_ok() {
             return;
         }
-        std::thread::sleep(Duration::from_millis(100));
+        std::thread::sleep(Duration::from_millis(50));
     }
     panic!("nats-server did not become ready on port {}", server.port);
 }
@@ -287,8 +382,8 @@ async fn tls_client_with_valid_certificate_connects() {
     }
 
     let pki = make_pki();
-    let mut server = start_tls_server(&pki);
-    wait_ready(&mut server);
+    let server = start_tls_server(&pki);
+    wait_ready(&server);
 
     let dir = tempfile::tempdir().unwrap();
     let cfg = client_config(dir.path(), &pki, &pki.ca_pem);
@@ -315,8 +410,8 @@ async fn tls_client_with_wrong_ca_is_rejected() {
     }
 
     let pki = make_pki();
-    let mut server = start_tls_server(&pki);
-    wait_ready(&mut server);
+    let server = start_tls_server(&pki);
+    wait_ready(&server);
 
     let dir = tempfile::tempdir().unwrap();
     // Trust the *other* CA, so the server certificate does not verify.
@@ -340,8 +435,8 @@ async fn tls_client_without_certificate_is_rejected() {
     }
 
     let pki = make_pki();
-    let mut server = start_tls_server(&pki);
-    wait_ready(&mut server);
+    let server = start_tls_server(&pki);
+    wait_ready(&server);
 
     let dir = tempfile::tempdir().unwrap();
     let ca_path = dir.path().join("ca.pem");
@@ -368,8 +463,8 @@ async fn plaintext_client_is_rejected_by_tls_server() {
     }
 
     let pki = make_pki();
-    let mut server = start_tls_server(&pki);
-    wait_ready(&mut server);
+    let server = start_tls_server(&pki);
+    wait_ready(&server);
 
     let url = format!("nats://localhost:{}", server.port);
     let result = NatsBus::connect(&url).await;
@@ -423,9 +518,8 @@ async fn plaintext_server_still_accepts_plaintext_client() {
     }
 
     let dir = tempfile::tempdir().unwrap();
-    let port = free_port();
     let config = format!(
-        r#"listen: 127.0.0.1:{port}
+        r#"listen: 127.0.0.1:-1
 server_name: minga-plain-test
 jetstream {{
     store_dir: "{store}"
@@ -434,8 +528,7 @@ jetstream {{
         store = dir.path().join("jetstream").display(),
     );
     let mut server = start_server(&config, dir).expect("nats-server binary not found");
-    server.port = port;
-    wait_ready(&mut server);
+    adopt_allocated_ports(&mut server);
 
     let url = format!("nats://localhost:{}", server.port);
     let bus = NatsBus::connect(&url)
@@ -462,17 +555,20 @@ async fn two_servers_form_a_cluster_over_tls_routes() {
     write_file(&cert_path, &pki.server_cert_pem, false);
     write_file(&key_path, &pki.server_key_pem, true);
 
-    let client_port_a = free_port();
-    let client_port_b = free_port();
-    let route_port_a = free_port();
-    let route_port_b = free_port();
-    let monitor_a = free_port();
-    let monitor_b = free_port();
-
+    // Server A starts first and allocates its own route port; server B is
+    // then told to dial it. Only one side needs the route configured —
+    // NATS forms the route from the solicited connection, and the peer
+    // accepts it. This is what lets both servers use self-allocated ports
+    // without a chicken-and-egg problem.
+    //
+    // JetStream will not start in a cluster without a configured route, so
+    // A is given a placeholder route to a port nothing listens on. NATS
+    // accepts a configured-but-not-yet-reachable route at startup and
+    // retries it, which is exactly the behaviour needed here.
     let config_a = format!(
-        r#"listen: 127.0.0.1:{client_port_a}
+        r#"listen: 127.0.0.1:-1
 server_name: minga-node-a
-http: "127.0.0.1:{monitor_a}"
+http: "127.0.0.1:-1"
 
 tls {{
     cert_file: "{cert}"
@@ -484,9 +580,9 @@ tls {{
 
 cluster {{
     name: minga-cluster
-    port: {route_port_a}
+    port: -1
     routes = [
-        "nats://127.0.0.1:{route_port_b}"
+        "nats://127.0.0.1:{placeholder_route}"
     ]
     tls {{
         cert_file: "{cert}"
@@ -500,16 +596,24 @@ jetstream {{
     store_dir: "{store_a}"
 }}
 "#,
+        placeholder_route = 1,
         cert = cert_path.display(),
         key = key_path.display(),
         ca = ca_path.display(),
         store_a = dir.path().join("js-a").display(),
     );
 
+    let dir_a = tempfile::tempdir().unwrap();
+    let mut server_a = start_server(&config_a, dir_a).expect("nats-server binary not found");
+    adopt_allocated_ports(&mut server_a);
+    let route_port_a = server_a
+        .route_port
+        .expect("server A must have allocated a route port");
+
     let config_b = format!(
-        r#"listen: 127.0.0.1:{client_port_b}
+        r#"listen: 127.0.0.1:-1
 server_name: minga-node-b
-http: "127.0.0.1:{monitor_b}"
+http: "127.0.0.1:-1"
 
 tls {{
     cert_file: "{cert}"
@@ -521,7 +625,7 @@ tls {{
 
 cluster {{
     name: minga-cluster
-    port: {route_port_b}
+    port: -1
     routes = [
         "nats://127.0.0.1:{route_port_a}"
     ]
@@ -537,21 +641,21 @@ jetstream {{
     store_dir: "{store_b}"
 }}
 "#,
+        route_port_a = route_port_a,
         cert = cert_path.display(),
         key = key_path.display(),
         ca = ca_path.display(),
         store_b = dir.path().join("js-b").display(),
     );
 
-    let dir_a = tempfile::tempdir().unwrap();
     let dir_b = tempfile::tempdir().unwrap();
-    let mut server_a = start_server(&config_a, dir_a).expect("nats-server binary not found");
-    server_a.port = client_port_a;
     let mut server_b = start_server(&config_b, dir_b).expect("nats-server binary not found");
-    server_b.port = client_port_b;
+    adopt_allocated_ports(&mut server_b);
 
-    wait_ready(&mut server_a);
-    wait_ready(&mut server_b);
+    let monitor_a = server_a
+        .monitor_port
+        .expect("server A must have allocated a monitoring port");
+    let _ = &mut server_b;
 
     // Give the route connection a moment to form, then check the route
     // count reported by the monitoring endpoint.
@@ -603,8 +707,8 @@ async fn secure_bus_supports_events_status_and_logs() {
     }
 
     let pki = make_pki();
-    let mut server = start_tls_server(&pki);
-    wait_ready(&mut server);
+    let server = start_tls_server(&pki);
+    wait_ready(&server);
 
     let dir = tempfile::tempdir().unwrap();
     let cfg = client_config(dir.path(), &pki, &pki.ca_pem);

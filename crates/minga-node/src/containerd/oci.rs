@@ -236,6 +236,22 @@ pub fn spec_from_task_with_secrets(
         }
     }
 
+    // Volume/bind mounts. Sources are host paths — volume sources were
+    // already materialized by the runtime.
+    for m in &spec.mounts {
+        oci.mounts.push(OciMount {
+            destination: m.target.clone(),
+            mount_type: "bind".to_string(),
+            source: m.source.clone(),
+            options: vec![
+                "bind".to_string(),
+                if m.read_only { "ro" } else { "rw" }.to_string(),
+                "nosuid".to_string(),
+                "nodev".to_string(),
+            ],
+        });
+    }
+
     for secret in secret_mounts {
         oci.mounts.push(OciMount {
             destination: secret.target.clone(),
@@ -466,11 +482,27 @@ pub fn spec_to_any_with_image(
     image: &ImageConfiguration,
     network: Option<&NetworkSpec>,
 ) -> Result<prost_types::Any, String> {
-    if image.args.is_empty() || image.args[0].is_empty() {
+    // Docker override semantics: an explicit task entrypoint replaces the
+    // image Entrypoint (keeping image Cmd unless a task command is given);
+    // an explicit task command replaces the image Cmd (keeping the image
+    // Entrypoint).
+    let args = if !spec.entrypoint.is_empty() {
+        let cmd = if spec.command.is_empty() {
+            image.cmd.clone()
+        } else {
+            spec.command.clone()
+        };
+        [spec.entrypoint.clone(), cmd].concat()
+    } else if !spec.command.is_empty() {
+        [image.entrypoint.clone(), spec.command.clone()].concat()
+    } else {
+        image.args()
+    };
+    if args.is_empty() || args[0].is_empty() {
         return Err("image has no executable command".into());
     }
     let mut oci = spec_from_task_with_secrets(container_id, spec, secret_mounts, network);
-    oci.process.args = image.args.clone();
+    oci.process.args = args;
     oci.process.cwd = image.cwd.clone();
     oci.process.user = OciUser {
         uid: image.uid,
@@ -518,7 +550,8 @@ mod tests {
         let mut task = base_spec();
         task.env.insert("A".into(), "override".into());
         let image = ImageConfiguration {
-            args: vec!["/bin/sh".into(), "-c".into(), "echo ok".into()],
+            entrypoint: vec!["/bin/sh".into(), "-c".into()],
+            cmd: vec!["echo ok".into()],
             env: vec!["A=image".into(), "PATH=/bin".into(), "B=keep".into()],
             cwd: "/app".into(),
             uid: 1000,
@@ -765,5 +798,103 @@ mod tests {
     fn spec_no_new_privileges() {
         let spec = spec_from_task("c1", &base_spec());
         assert!(spec.process.no_new_privileges);
+    }
+}
+
+#[cfg(test)]
+mod override_tests {
+    use super::*;
+    use minga_state::types::TaskSpec;
+
+    fn image() -> ImageConfiguration {
+        ImageConfiguration {
+            entrypoint: vec!["/entry".into()],
+            cmd: vec!["img-cmd".into()],
+            env: vec![],
+            cwd: "/".into(),
+            uid: 0,
+            gid: 0,
+            parent_snapshot: "unused".into(),
+        }
+    }
+
+    fn args_of(spec: &TaskSpec) -> Vec<String> {
+        let any = spec_to_any_with_image("c1", spec, &[], &image(), None).unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&any.value).unwrap();
+        serde_json::from_value(json["process"]["args"].clone()).unwrap()
+    }
+
+    #[test]
+    fn image_defaults_when_no_overrides() {
+        assert_eq!(args_of(&TaskSpec::default()), vec!["/entry", "img-cmd"]);
+    }
+
+    #[test]
+    fn command_replaces_image_cmd_keeps_entrypoint() {
+        let spec = TaskSpec {
+            command: vec!["run".into(), "--fast".into()],
+            ..Default::default()
+        };
+        assert_eq!(args_of(&spec), vec!["/entry", "run", "--fast"]);
+    }
+
+    #[test]
+    fn entrypoint_replaces_image_entrypoint_keeps_cmd() {
+        let spec = TaskSpec {
+            entrypoint: vec!["/custom".into()],
+            ..Default::default()
+        };
+        assert_eq!(args_of(&spec), vec!["/custom", "img-cmd"]);
+    }
+
+    #[test]
+    fn entrypoint_and_command_replace_both() {
+        let spec = TaskSpec {
+            entrypoint: vec!["/custom".into()],
+            command: vec!["go".into()],
+            ..Default::default()
+        };
+        assert_eq!(args_of(&spec), vec!["/custom", "go"]);
+    }
+
+    #[test]
+    fn mounts_become_bind_mounts_with_ro_flag() {
+        let spec = TaskSpec {
+            mounts: vec![
+                minga_state::types::ServiceMount {
+                    kind: minga_state::types::MountKind::Volume,
+                    source: "/var/lib/minga/volumes/shop_data".into(),
+                    target: "/data".into(),
+                    read_only: false,
+                },
+                minga_state::types::ServiceMount {
+                    kind: minga_state::types::MountKind::Bind,
+                    source: "/etc/hosts".into(),
+                    target: "/etc/hosts".into(),
+                    read_only: true,
+                },
+            ],
+            ..Default::default()
+        };
+        let any = spec_to_any_with_image("c1", &spec, &[], &image(), None).unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&any.value).unwrap();
+        let mounts = json["mounts"].as_array().unwrap();
+        let data = mounts
+            .iter()
+            .find(|m| m["destination"] == "/data")
+            .expect("data mount present");
+        assert_eq!(data["source"], "/var/lib/minga/volumes/shop_data");
+        assert!(data["options"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("rw")));
+        let hosts = mounts
+            .iter()
+            .find(|m| m["destination"] == "/etc/hosts")
+            .expect("hosts mount present");
+        assert!(hosts["options"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("ro")));
     }
 }
