@@ -9,6 +9,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::time::Duration;
 
 use minga_node::{ContainerStatus, ContainerdRuntime, Runtime};
 use minga_state::types::{ResourceSpec, TaskSpec};
@@ -177,4 +178,90 @@ async fn containerd_list_empty_when_no_containers() {
     let containers = runtime.list().await;
     // Should not panic; may be empty or contain other containers.
     eprintln!("list returned {} containers", containers.len());
+}
+
+#[tokio::test]
+async fn containerd_logs_capture_stdout_and_stderr() {
+    let socket = socket_path();
+    if !containerd_available_at(&socket) {
+        eprintln!("SKIP: containerd not available at {socket}");
+        return;
+    }
+
+    let runtime = match ContainerdRuntime::connect(&socket).await {
+        Ok(rt) => rt,
+        Err(e) => {
+            assert!(
+                std::env::var_os("MINGA_REQUIRE_CONTAINERD").is_none(),
+                "required containerd connection failed: {e}"
+            );
+            eprintln!("SKIP: cannot connect to containerd: {e}");
+            return;
+        }
+    };
+    let logs_dir = tempfile::tempdir().unwrap();
+    let runtime = runtime.with_logs_dir(logs_dir.path());
+
+    let task_id = "minga-test-logs-001".to_string();
+    let spec = minga_state::types::TaskSpec {
+        image: "docker.io/library/busybox:latest".to_string(),
+        command: vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "echo out-line-001; echo err-line-002 >&2; sleep 30".to_string(),
+        ],
+        ..Default::default()
+    };
+
+    runtime
+        .start(&task_id, &spec)
+        .await
+        .expect("failed to start log container");
+
+    // The FIFO reader drains asynchronously; give it a moment.
+    let mut chunks = Vec::new();
+    for _ in 0..20 {
+        chunks = runtime.logs(&task_id, 0).await;
+        if chunks.len() >= 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    let stdout: Vec<&[u8]> = chunks
+        .iter()
+        .filter(|c| c.stream == minga_node::runtime::LogStream::Stdout)
+        .map(|c| c.data.as_slice())
+        .collect();
+    let stderr: Vec<&[u8]> = chunks
+        .iter()
+        .filter(|c| c.stream == minga_node::runtime::LogStream::Stderr)
+        .map(|c| c.data.as_slice())
+        .collect();
+    assert!(
+        stdout
+            .iter()
+            .any(|c| c.windows(12).any(|w| w == b"out-line-001")),
+        "stdout must contain the marker line, got {stdout:?}"
+    );
+    assert!(
+        stderr
+            .iter()
+            .any(|c| c.windows(12).any(|w| w == b"err-line-002")),
+        "stderr must contain the marker line, got {stderr:?}"
+    );
+
+    runtime
+        .stop(&task_id)
+        .await
+        .expect("failed to stop log container");
+
+    // Reader and FIFOs are cleaned up on stop.
+    assert!(
+        !logs_dir
+            .path()
+            .join(format!("{task_id}.stdout.fifo"))
+            .exists(),
+        "FIFO must be removed on stop"
+    );
 }

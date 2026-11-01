@@ -813,7 +813,9 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
                             .expect("containerd runtime has networking"),
                         state.clone(),
                     );
-                    let rt = rt.with_volume_dir(format!("{}/volumes", args.data_dir));
+                    let rt = rt
+                        .with_volume_dir(format!("{}/volumes", args.data_dir))
+                        .with_logs_dir(format!("{}/logs", args.data_dir));
                     Arc::new(rt.with_secret_store(store))
                 }
                 Err(e) => {

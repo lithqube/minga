@@ -718,6 +718,17 @@ impl Supervisor {
             let chunks = self.runtime.logs(container_id, 0).await;
             let mut offsets = self.log_offsets.lock().await;
             let offset = offsets.entry(task_id.clone()).or_insert(0);
+            // The runtime's capture is bounded; if it dropped entries we
+            // already counted, re-baseline instead of skipping forever.
+            if *offset > chunks.len() {
+                tracing::warn!(
+                    task = %task_id,
+                    offset = *offset,
+                    available = chunks.len(),
+                    "log capture truncated before publishing; re-baselining"
+                );
+                *offset = chunks.len();
+            }
             for chunk in chunks.iter().skip(*offset) {
                 let entry = LogEntry {
                     task_id: task_id.clone(),

@@ -35,7 +35,7 @@ use super::image;
 use super::oci;
 use super::proto::{Container, Image, ProcessStatus, Runtime as ProtoRuntime};
 use crate::runtime::{
-    ContainerInfo, ContainerLog, ContainerState, ContainerStatus, Runtime, RuntimeError,
+    ContainerInfo, ContainerLog, ContainerState, ContainerStatus, LogStream, Runtime, RuntimeError,
 };
 use crate::secrets::SecretStore;
 
@@ -53,6 +53,109 @@ const DEFAULT_SNAPSHOTTER: &str = "overlayfs";
 
 /// Default containerd runtime (runc v2).
 const DEFAULT_RUNTIME_NAME: &str = "io.containerd.runc.v2";
+
+/// Maximum captured log bytes per task (drop-oldest beyond this).
+const LOG_RING_BYTES: usize = 1024 * 1024;
+
+/// A bounded, append-only log capture for one container.
+#[derive(Default)]
+struct LogRing {
+    inner: std::sync::Mutex<(usize, std::collections::VecDeque<ContainerLog>)>,
+}
+
+impl LogRing {
+    fn push(&self, log: ContainerLog) {
+        let mut guard = self.inner.lock().unwrap();
+        let (bytes, deque) = &mut *guard;
+        *bytes += log.data.len();
+        deque.push_back(log);
+        while *bytes > LOG_RING_BYTES {
+            if let Some(old) = deque.pop_front() {
+                *bytes -= old.data.len();
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn snapshot(&self) -> Vec<ContainerLog> {
+        self.inner.lock().unwrap().1.iter().cloned().collect()
+    }
+}
+
+/// Creates a FIFO at `path` (0600).
+fn make_fifo(path: &std::path::Path) -> Result<(), std::io::Error> {
+    let raw = std::ffi::CString::new(path.display().to_string().as_bytes().to_vec())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "bad fifo path"))?;
+    // SAFETY: mkfifo with a valid C string and sane mode.
+    let rc = unsafe { libc::mkfifo(raw.as_ptr(), 0o600) };
+    if rc != 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+/// Drains a FIFO into `ring` until aborted. Opened O_RDWR nonblocking so
+/// the open never blocks and reads never report EOF while containerd
+/// lazily opens the writer end.
+async fn fifo_reader(fifo: PathBuf, stream: LogStream, ring: Arc<LogRing>) {
+    use std::os::unix::io::AsRawFd;
+
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&fifo)
+    {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::error!(fifo = %fifo.display(), error = %e, "log fifo open failed");
+            return;
+        }
+    };
+    // SAFETY: fcntl on a valid fd.
+    unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) };
+    let fd = match tokio::io::unix::AsyncFd::new(file) {
+        Ok(fd) => fd,
+        Err(e) => {
+            tracing::error!(fifo = %fifo.display(), error = %e, "log fifo async setup failed");
+            return;
+        }
+    };
+
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let mut guard = match fd.readable().await {
+            Ok(g) => g,
+            Err(e) => {
+                tracing::error!(fifo = %fifo.display(), error = %e, "log fifo readable failed");
+                return;
+            }
+        };
+        let result = guard.try_io(|inner| {
+            // SAFETY: buf is a valid writable region; fd is valid.
+            let n = unsafe { libc::read(inner.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
+            if n < 0 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(n as usize)
+            }
+        });
+        match result {
+            Ok(Ok(0)) => {}
+            Ok(Ok(n)) => ring.push(ContainerLog {
+                stream,
+                data: buf[..n].to_vec(),
+            }),
+            Ok(Err(e)) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            Ok(Err(e)) => {
+                tracing::error!(fifo = %fifo.display(), error = %e, "log fifo read failed");
+                return;
+            }
+            Err(_not_ready) => {}
+        }
+    }
+}
 
 /// Whether a client error means "the resource is already gone".
 ///
@@ -79,6 +182,13 @@ pub struct ContainerdRuntime {
     /// (`<data_dir>/volumes`). Required to start tasks with named-volume
     /// mounts.
     volume_dir: Option<PathBuf>,
+    /// Directory for log FIFOs (`<data_dir>/logs`). When set, container
+    /// stdout/stderr are captured into bounded per-task rings.
+    logs_dir: Option<PathBuf>,
+    /// Per-container log rings (bounded, drop-oldest) and their readers.
+    log_rings: Arc<Mutex<HashMap<String, Arc<LogRing>>>>,
+    /// Reader task handles, aborted on stop.
+    log_readers: Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>>,
     /// Node networking: netns/bridge/port setup, plus cluster state for
     /// network subnet resolution. Required to start tasks with IPs.
     #[cfg(target_os = "linux")]
@@ -106,6 +216,9 @@ impl ContainerdRuntime {
             runtime_name: DEFAULT_RUNTIME_NAME.to_string(),
             secret_store: None,
             volume_dir: None,
+            logs_dir: None,
+            log_rings: Arc::new(Mutex::new(HashMap::new())),
+            log_readers: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(target_os = "linux")]
             networking: None,
         }
@@ -250,6 +363,20 @@ impl ContainerdRuntime {
         }))
     }
 
+    /// Stops a container's log reader and drops its ring and FIFOs.
+    async fn teardown_logs(&self, container_id: &str) {
+        if let Some(handle) = self.log_readers.lock().await.remove(container_id) {
+            handle.abort();
+        }
+        self.log_rings.lock().await.remove(container_id);
+        if let Some(logs_dir) = &self.logs_dir {
+            for suffix in ["stdout.fifo", "stderr.fifo"] {
+                let _ =
+                    tokio::fs::remove_file(logs_dir.join(format!("{container_id}.{suffix}"))).await;
+            }
+        }
+    }
+
     /// Tears down a task's network, tolerating its absence.
     #[cfg(target_os = "linux")]
     async fn teardown_network(&self, task_id: &str) {
@@ -300,6 +427,13 @@ impl ContainerdRuntime {
             }
         }
         Ok(spec)
+    }
+
+    /// Attach the log capture directory. With it, container stdout/stderr
+    /// go to per-task FIFOs drained into bounded rings ([`Runtime::logs`]).
+    pub fn with_logs_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.logs_dir = Some(dir.into());
+        self
     }
 
     /// Override the snapshotter (default: overlayfs).
@@ -481,6 +615,47 @@ impl Runtime for ContainerdRuntime {
             .await
             .map_err(|error| RuntimeError::Start(format!("prepare snapshot: {error}")))?;
 
+        // Log capture: real FIFO destinations for stdout/stderr, drained
+        // into a bounded ring by a per-container reader.
+        let (mut stdout, mut stderr) = (String::new(), String::new());
+        if let Some(logs_dir) = &self.logs_dir {
+            tokio::fs::create_dir_all(logs_dir)
+                .await
+                .map_err(|e| RuntimeError::Start(format!("create logs dir: {e}")))?;
+            stdout = logs_dir
+                .join(format!("{container_id}.stdout.fifo"))
+                .display()
+                .to_string();
+            stderr = logs_dir
+                .join(format!("{container_id}.stderr.fifo"))
+                .display()
+                .to_string();
+            for fifo in [&stdout, &stderr] {
+                let path = PathBuf::from(fifo);
+                let _ = tokio::fs::remove_file(&path).await; // stale from a previous attempt
+                make_fifo(&path)
+                    .map_err(|e| RuntimeError::Start(format!("mkfifo {}: {e}", path.display())))?;
+            }
+            let ring = Arc::new(LogRing::default());
+            self.log_rings
+                .lock()
+                .await
+                .insert(container_id.clone(), ring.clone());
+            let out_path = PathBuf::from(&stdout);
+            let err_path = PathBuf::from(&stderr);
+            let out_ring = ring.clone();
+            let handle = tokio::spawn(async move {
+                tokio::join!(
+                    fifo_reader(out_path, LogStream::Stdout, out_ring),
+                    fifo_reader(err_path, LogStream::Stderr, ring),
+                );
+            });
+            self.log_readers
+                .lock()
+                .await
+                .insert(container_id.clone(), handle);
+        }
+
         let oci_any = oci::spec_to_any_with_image(
             &container_id,
             spec,
@@ -509,11 +684,15 @@ impl Runtime for ContainerdRuntime {
         if let Err(error) = client.create_container(container).await {
             #[cfg(target_os = "linux")]
             self.teardown_network(&container_id).await;
+            self.teardown_logs(&container_id).await;
             return Err(RuntimeError::Start(format!("create container: {error}")));
         }
         let container_created = true;
 
-        let pid = match client.create_task(&container_id, mounts, "", "").await {
+        let pid = match client
+            .create_task(&container_id, mounts, &stdout, &stderr)
+            .await
+        {
             Ok(pid) => pid,
             Err(error) => {
                 let rollback = Self::rollback_start(
@@ -528,6 +707,7 @@ impl Runtime for ContainerdRuntime {
                 .await;
                 #[cfg(target_os = "linux")]
                 self.teardown_network(&container_id).await;
+                self.teardown_logs(&container_id).await;
                 return Err(RuntimeError::Start(format!(
                     "create task: {error}{rollback}"
                 )));
@@ -548,6 +728,7 @@ impl Runtime for ContainerdRuntime {
             .await;
             #[cfg(target_os = "linux")]
             self.teardown_network(&container_id).await;
+            self.teardown_logs(&container_id).await;
             return Err(RuntimeError::Start(format!(
                 "start task: {error}{rollback}"
             )));
@@ -653,6 +834,7 @@ impl Runtime for ContainerdRuntime {
 
         #[cfg(target_os = "linux")]
         self.teardown_network(container_id).await;
+        self.teardown_logs(container_id).await;
 
         if let Some(store) = &self.secret_store {
             store.cleanup_task(container_id);
@@ -755,11 +937,17 @@ impl Runtime for ContainerdRuntime {
         }
     }
 
-    async fn logs(&self, _container_id: &str, _tail: usize) -> Vec<ContainerLog> {
-        // TODO: read container logs via containerd's log API (binary log path
-        // from OCI spec `logPath` or via `TaskService` log streams).
-        // For now, return empty — log streaming from real containers is a follow-up.
-        Vec::new()
+    async fn logs(&self, container_id: &str, tail: usize) -> Vec<ContainerLog> {
+        let rings = self.log_rings.lock().await;
+        let Some(ring) = rings.get(container_id) else {
+            return Vec::new();
+        };
+        let snap = ring.snapshot();
+        if tail == 0 || snap.len() <= tail {
+            snap
+        } else {
+            snap[snap.len() - tail..].to_vec()
+        }
     }
 }
 
