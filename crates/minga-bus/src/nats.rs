@@ -353,7 +353,9 @@ impl EventBus for NatsBus {
         self.js
             .publish(subject.to_string(), Bytes::copy_from_slice(payload))
             .await
-            .map_err(|e| BusError::Publish(e.to_string()))?;
+            .map_err(|e| BusError::Publish(e.to_string()))?
+            .await
+            .map_err(|e| BusError::Publish(format!("ack: {e}")))?;
         Ok(())
     }
 
@@ -411,7 +413,9 @@ impl EventBus for NatsBus {
         self.js
             .publish(subject, Bytes::from(payload))
             .await
-            .map_err(|e| BusError::Command(format!("publish: {e}")))?;
+            .map_err(|e| BusError::Command(format!("publish: {e}")))?
+            .await
+            .map_err(|e| BusError::Command(format!("publish ack: {e}")))?;
         Ok(())
     }
 
