@@ -7,6 +7,10 @@ on:
 permissions:
   contents: write
 
+env:
+  # Bundled next to `minga`; the manager's NATS sidecar looks there first.
+  NATS_VERSION: v2.10.22
+
 jobs:
   build:
     name: ${{ matrix.target }}
@@ -14,10 +18,16 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # nats_sha256: from the upstream release's SHA256SUMS, pinned so
+          # a replaced archive fails before it is extracted or executed.
           - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
+            nats_arch: amd64
+            nats_sha256: db0b3ccbe4cbdd3872ae7486ec4f6b0f85824632a0789f4da2e0a8518390483e
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
+            nats_arch: arm64
+            nats_sha256: b4da77b2b194dc5fcf13a1df0dad59ba7e87ae4423f254c50534015b7c8a2369
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -31,16 +41,46 @@ jobs:
       - name: Build the release binary
         run: cargo build --release -p minga-cli --target ${{ matrix.target }}
 
+      - name: Fetch and verify nats-server
+        run: |
+          archive="nats-server-${NATS_VERSION}-linux-${{ matrix.nats_arch }}.tar.gz"
+          curl -fsSL -o "$archive" "https://github.com/nats-io/nats-server/releases/download/${NATS_VERSION}/${archive}"
+          echo "${{ matrix.nats_sha256 }}  ${archive}" | sha256sum -c -
+          tar -xzf "$archive" --strip-components=1 --wildcards '*/nats-server' '*/LICENSE'
+          mv LICENSE NATS-LICENSE
+          ./nats-server --version
+
       - name: Package
         run: |
           mkdir -p dist
-          cp "target/${{ matrix.target }}/release/minga" dist/
+          cp "target/${{ matrix.target }}/release/minga" nats-server NATS-LICENSE dist/
           cp install.sh README.md LICENSE CHANGELOG.md dist/
-          tar -C dist -czf "minga-${{ matrix.target }}.tar.gz" minga install.sh README.md LICENSE CHANGELOG.md
+          tar -C dist -czf "minga-${{ matrix.target }}.tar.gz" minga nats-server NATS-LICENSE install.sh README.md LICENSE CHANGELOG.md
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: minga-${{ matrix.target }}
+          path: minga-${{ matrix.target }}.tar.gz
+
+  publish:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        run: cd dist && sha256sum minga-*.tar.gz > SHA256SUMS && cat SHA256SUMS
 
       - name: Upload release assets
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            minga-${{ matrix.target }}.tar.gz
+            dist/minga-*.tar.gz
+            dist/SHA256SUMS
             install.sh

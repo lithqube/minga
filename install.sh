@@ -30,21 +30,34 @@ case "$arch" in
 esac
 
 if [ "$VERSION" = "latest" ]; then
-    url="https://github.com/$REPO/releases/latest/download/minga-$target.tar.gz"
+    base="https://github.com/$REPO/releases/latest/download"
 else
-    url="https://github.com/$REPO/releases/download/$VERSION/minga-$target.tar.gz"
+    base="https://github.com/$REPO/releases/download/$VERSION"
 fi
+archive="minga-$target.tar.gz"
 
-echo "downloading minga ($target) from $url"
+echo "downloading minga ($target) from $base/$archive"
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
-curl -fsSL "$url" | tar -xz -C "$tmp"
+curl -fsSL -o "$tmp/$archive" "$base/$archive"
+curl -fsSL -o "$tmp/SHA256SUMS" "$base/SHA256SUMS"
+(cd "$tmp" && grep " $archive\$" SHA256SUMS | sha256sum -c -)
+tar -xzf "$tmp/$archive" -C "$tmp"
 
-if [ -w "$PREFIX" ]; then
-    install -m 0755 "$tmp/minga" "$PREFIX/minga"
+# nats-server goes next to minga: the manager's NATS sidecar looks there.
+if mkdir -p "$PREFIX" 2>/dev/null && [ -w "$PREFIX" ]; then
+    sudo=""
 else
-    sudo install -m 0755 "$tmp/minga" "$PREFIX/minga"
+    sudo="sudo"
+    $sudo mkdir -p "$PREFIX"
 fi
+$sudo install -m 0755 "$tmp/minga" "$PREFIX/minga"
+$sudo install -m 0755 "$tmp/nats-server" "$PREFIX/nats-server"
 
-echo "installed: $PREFIX/minga"
+# Licenses: Minga (MIT) and the bundled nats-server (Apache 2.0).
+share="${PREFIX%/bin}/share/minga"
+$sudo mkdir -p "$share"
+$sudo install -m 0644 "$tmp/LICENSE" "$tmp/NATS-LICENSE" "$share/"
+
+echo "installed: $PREFIX/minga, $PREFIX/nats-server (licenses in $share)"
 "$PREFIX/minga" --version

@@ -304,6 +304,13 @@ impl Supervisor {
         #[cfg(target_os = "linux")]
         self.sync_dns().await;
 
+        // running_count() already includes agents.
+        let running = self.running_count().await;
+        minga_telemetry::METRICS
+            .tasks_total
+            .with_label_values(&["running"])
+            .set(running as f64);
+
         Ok(actions)
     }
 
@@ -497,6 +504,7 @@ impl Supervisor {
 
                 match exec.start(&task_id, agent_spec).await {
                     Ok(agent_id) => {
+                        minga_telemetry::METRICS.task_restarts_total.inc();
                         tracing::info!(
                             task = %task_id,
                             agent = %agent_id,
@@ -624,6 +632,7 @@ impl Supervisor {
             match &new_spec.kind {
                 WorkloadKind::Container => match self.runtime.start(&task_id, &new_spec).await {
                     Ok(new_container_id) => {
+                        minga_telemetry::METRICS.task_restarts_total.inc();
                         tracing::info!(
                             task = %task_id,
                             container = %new_container_id,
@@ -654,6 +663,7 @@ impl Supervisor {
                     };
                     match exec.start(&task_id, agent_spec).await {
                         Ok(agent_id) => {
+                            minga_telemetry::METRICS.task_restarts_total.inc();
                             tracing::info!(
                                 task = %task_id,
                                 agent = %agent_id,
@@ -860,6 +870,7 @@ impl Supervisor {
                 match &spec.kind {
                     WorkloadKind::Container => match self.runtime.start(&task_id, &spec).await {
                         Ok(container_id) => {
+                            minga_telemetry::METRICS.task_starts_total.inc();
                             tracing::info!(
                                 task = %task_id,
                                 container = %container_id,
@@ -893,6 +904,7 @@ impl Supervisor {
                         };
                         match exec.start(&task_id, agent_spec).await {
                             Ok(agent_id) => {
+                                minga_telemetry::METRICS.task_starts_total.inc();
                                 tracing::info!(
                                     task = %task_id,
                                     agent = %agent_id,
@@ -927,6 +939,7 @@ impl Supervisor {
                 if let Some(id) = container_id {
                     match self.runtime.stop(&id).await {
                         Ok(()) => {
+                            minga_telemetry::METRICS.task_stops_total.inc();
                             tracing::info!(
                                 task = %task_id,
                                 container = %id,
@@ -950,6 +963,7 @@ impl Supervisor {
                     if let Some(exec) = &self.agent_executor {
                         match exec.stop(&task_id).await {
                             Ok(()) => {
+                                minga_telemetry::METRICS.task_stops_total.inc();
                                 tracing::info!(
                                     task = %task_id,
                                     node = self.node_id,
@@ -1069,6 +1083,7 @@ impl Supervisor {
             match &task.spec.kind {
                 WorkloadKind::Container => match self.runtime.start(&task.id, &task.spec).await {
                     Ok(container_id) => {
+                        minga_telemetry::METRICS.task_starts_total.inc();
                         tracing::info!(
                             task = %task.id,
                             container = %container_id,
@@ -1097,6 +1112,7 @@ impl Supervisor {
                     };
                     match exec.start(&task.id, agent_spec).await {
                         Ok(agent_id) => {
+                            minga_telemetry::METRICS.task_starts_total.inc();
                             tracing::info!(
                                 task = %task.id,
                                 agent = %agent_id,
@@ -1141,6 +1157,7 @@ impl Supervisor {
             self.log_offsets.lock().await.remove(&task_id);
             match self.runtime.stop(&container_id).await {
                 Ok(()) => {
+                    minga_telemetry::METRICS.task_stops_total.inc();
                     tracing::info!(
                         task = %task_id,
                         container = %container_id,
@@ -1166,6 +1183,7 @@ impl Supervisor {
             if let Some(exec) = &self.agent_executor {
                 match exec.stop(&task_id).await {
                     Ok(()) => {
+                        minga_telemetry::METRICS.task_stops_total.inc();
                         tracing::info!(
                             task = %task_id,
                             node = self.node_id,

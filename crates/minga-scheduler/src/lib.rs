@@ -96,6 +96,9 @@ impl Scheduler {
         if !self.state.is_leader().await {
             return Ok(Vec::new());
         }
+        let _timer = minga_telemetry::METRICS
+            .scheduler_reconcile_duration_seconds
+            .start_timer();
 
         let nodes = self.state.list_nodes().await?;
         let services = self.state.list_services().await?;
@@ -120,6 +123,10 @@ impl Scheduler {
                         "creating task"
                     );
                     self.state.upsert_task(task.as_ref().clone()).await?;
+                    minga_telemetry::METRICS
+                        .scheduler_placement_decisions_total
+                        .with_label_values(&["placed"])
+                        .inc();
 
                     // Publish assign command to the bus.
                     if let Some(bus) = &self.bus {

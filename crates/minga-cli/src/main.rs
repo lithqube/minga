@@ -240,6 +240,10 @@ struct NodeArgs {
     /// Upstream LLM API URL for the egress proxy.
     #[arg(long, default_value = "https://api.openai.com")]
     egress_upstream: String,
+    /// Bind address for `/metrics`, `/healthz` and `/readyz`
+    /// (e.g. 0.0.0.0:9100). Not served when unset.
+    #[arg(long, env = "MINGA_METRICS_BIND")]
+    metrics_bind: Option<String>,
 }
 
 #[derive(Args)]
@@ -391,12 +395,22 @@ fn parse_labels(raw: &[String]) -> Result<std::collections::HashMap<String, Stri
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .with_writer(std::io::stderr)
-        .init();
+    let cli = Cli::parse();
+    // Long-running roles log JSON for collectors; one-shot commands stay
+    // human-readable.
+    if matches!(
+        cli.command,
+        Command::Manager(_) | Command::Worker(_) | Command::Api(_)
+    ) {
+        minga_telemetry::init_logging();
+    } else {
+        tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .with_writer(std::io::stderr)
+            .init();
+    }
 
-    match Cli::parse().command {
+    match cli.command {
         Command::Manager(args) => return run_node(args, true).await,
         Command::Worker(args) => return run_node(args, false).await,
         Command::Validate(args) => {
@@ -774,6 +788,32 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
             }
         }
     };
+
+    // Readiness: Raft knows a leader and the bus answers.
+    let ready = minga_telemetry::ReadyState::new();
+    {
+        let (state, bus, ready, node_id) =
+            (state.clone(), bus.clone(), ready.clone(), args.node_id);
+        tokio::spawn(async move {
+            loop {
+                ready.set_raft_ready(state.current_leader().await.is_some());
+                ready.set_bus_connected(bus.is_alive(node_id).await.is_ok());
+                minga_telemetry::METRICS
+                    .raft_leader
+                    .set(if state.is_leader().await { 1.0 } else { 0.0 });
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        });
+    }
+    if let Some(bind) = &args.metrics_bind {
+        match minga_telemetry::serve(bind, ready).await {
+            Ok(addr) => tracing::info!(%addr, "metrics and health endpoints listening"),
+            Err(e) => {
+                eprintln!("error: cannot bind metrics endpoint {bind}: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
 
     // Node networking (Linux + real containers only): netns/bridge setup
     // for tasks and DNS service discovery. Mock workloads never join

@@ -273,6 +273,21 @@ impl StateStore {
         Ok(())
     }
 
+    /// Refreshes node `id`'s lease atomically in the state machine; a
+    /// draining node stays draining. Returns `false` when the node has no
+    /// record (it was removed): renewal never recreates one. See
+    /// [`StateCommand::RenewNodeLease`].
+    pub async fn renew_node_lease(
+        &self,
+        id: NodeId,
+        last_seen_unix: u64,
+    ) -> Result<bool, StateError> {
+        let response = self
+            .propose(StateCommand::RenewNodeLease { id, last_seen_unix })
+            .await?;
+        Ok(response != StateResponse::NotFound)
+    }
+
     pub async fn remove_node(&self, id: NodeId) -> Result<(), StateError> {
         self.propose(StateCommand::RemoveNode(id)).await?;
         Ok(())

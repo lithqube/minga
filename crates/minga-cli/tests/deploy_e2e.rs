@@ -160,6 +160,56 @@ async fn deploy_with_volumes_lands_and_mounts() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deploy_keeps_restart_policy_and_agent_spec() {
+    let (store, url, _dir) = cluster().await;
+
+    // Both fields cross the Docker API on the way to Raft; neither may be
+    // lost or reset to a default in that round trip.
+    let compose = r#"
+services:
+  worker:
+    image: busybox:1.36
+    deploy:
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+        max_attempts: 3
+  researcher:
+    x-minga-agent:
+      module: /opt/minga/modules/researcher.wasm
+      fuel_limit: 1000
+      token_budget: 500
+"#;
+    let (ok, out) = run_deploy(compose, "mixed", &url, &[]);
+    assert!(ok, "deploy should succeed:\n{out}");
+
+    let worker = store.get_service("mixed.worker").await.unwrap().unwrap();
+    assert_eq!(
+        worker.restart_policy,
+        minga_state::types::RestartPolicy {
+            condition: minga_state::types::RestartCondition::OnFailure,
+            delay_secs: 5,
+            max_attempts: Some(3),
+        }
+    );
+    assert!(worker.agent.is_none());
+
+    let researcher = store
+        .get_service("mixed.researcher")
+        .await
+        .unwrap()
+        .unwrap();
+    let agent = researcher.agent.expect("agent spec reaches state");
+    assert_eq!(agent.module_ref, "/opt/minga/modules/researcher.wasm");
+    assert_eq!(agent.fuel_limit, Some(1000));
+    assert_eq!(agent.token_budget, Some(500));
+    assert!(
+        !researcher.labels.contains_key("minga.agent"),
+        "the transport label is not a user label"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unplaceable_service_fails_the_deploy() {
     let (store, url, _dir) = cluster().await;
 

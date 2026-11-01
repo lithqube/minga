@@ -120,25 +120,15 @@ impl NodeMembership {
             tick.tick().await; // first tick fires immediately; skip it
             loop {
                 tick.tick().await;
-                let result = renew_store.get_node(node_id).await.map(|existing| {
-                    let mut node = existing.unwrap_or_else(|| identity.cluster_node());
-                    node.last_seen_unix = Some(unix_now());
-                    // A renewal revives the record unless an operator has
-                    // deliberately drained it.
-                    if node.status != NodeStatus::Draining {
-                        node.status = NodeStatus::Active;
-                    }
-                    node
-                });
-                let node = match result {
-                    Ok(node) => node,
-                    Err(e) => {
-                        tracing::error!(node_id, error = %e, "lease renewal: read failed");
-                        continue;
-                    }
-                };
-                if let Err(e) = renew_store.upsert_node(node).await {
-                    tracing::error!(node_id, error = %e, "lease renewal: write failed");
+                // The state machine revives the record unless an operator
+                // has drained it, in the same log entry as the timestamp.
+                match renew_store.renew_node_lease(node_id, unix_now()).await {
+                    Ok(true) => {}
+                    Ok(false) => tracing::warn!(
+                        node_id,
+                        "lease renewal: node record was removed; not recreating it"
+                    ),
+                    Err(e) => tracing::error!(node_id, error = %e, "lease renewal failed"),
                 }
             }
         });
@@ -261,6 +251,28 @@ mod tests {
         let drained = store.get_node(1).await.unwrap().unwrap();
         assert_eq!(drained.status, NodeStatus::Draining);
         assert!(drained.is_live_at(unix_now(), NODE_LEASE_TTL_SECS));
+
+        membership.leave().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn renewal_does_not_recreate_a_removed_node() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            StateStore::open(1, "127.0.0.1:0", dir.path(), BTreeMap::new())
+                .await
+                .unwrap(),
+        );
+
+        let membership = NodeMembership::start(store.clone(), identity(1))
+            .await
+            .unwrap();
+
+        // Removed while the membership is still renewing: it must stay gone,
+        // or the scheduler would place tasks on it again.
+        store.remove_node(1).await.unwrap();
+        tokio::time::sleep(Duration::from_secs(NODE_RENEW_INTERVAL_SECS + 2)).await;
+        assert!(store.get_node(1).await.unwrap().is_none());
 
         membership.leave().await.unwrap();
     }

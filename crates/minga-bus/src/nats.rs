@@ -350,6 +350,10 @@ impl NatsBus {
 #[async_trait]
 impl EventBus for NatsBus {
     async fn publish_event(&self, subject: &str, payload: &[u8]) -> Result<()> {
+        let _timer = minga_telemetry::METRICS
+            .bus_publish_latency_seconds
+            .with_label_values(&["events"])
+            .start_timer();
         self.js
             .publish(subject.to_string(), Bytes::copy_from_slice(payload))
             .await
@@ -405,6 +409,10 @@ impl EventBus for NatsBus {
     }
 
     async fn send_command(&self, node_id: u64, cmd: &Command) -> Result<()> {
+        let _timer = minga_telemetry::METRICS
+            .bus_publish_latency_seconds
+            .with_label_values(&["commands"])
+            .start_timer();
         let subject = match cmd {
             Command::Assign { .. } => subjects::ctl_assign(node_id),
             Command::Stop { .. } => subjects::ctl_stop(node_id),
@@ -595,6 +603,10 @@ impl EventBus for NatsBus {
     }
 
     async fn publish_log(&self, task_id: &str, entry: &LogEntry) -> Result<()> {
+        let _timer = minga_telemetry::METRICS
+            .bus_publish_latency_seconds
+            .with_label_values(&["logs"])
+            .start_timer();
         let subject = subjects::task_log(task_id);
         let payload = entry.to_bytes()?;
         // Double await: the first yields a PublishAckFuture (message sent),
