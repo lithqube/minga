@@ -35,7 +35,7 @@ Sequential implementation for one developer: B (NATS TLS/transport boundary) →
 **Depends on:** Phase 10.
 **Plans:** `docs/roadmap-v0.1.0.md` — 7 executable gates
 **Mode:** standard
-**Status:** In progress
+**Status:** Done — all 7 gates landed 2026-10-31…2026-11-01; evidence per gate in `.planning/STATE.md`
 
 - [x] Gate 1 — cluster knows its own nodes: self-registration + lease, `POST /nodes`, `POST /nodes/{id}/update`, zero-eligible-node deploys are hard errors. Also landed: Raft write forwarding, scheduler on API nodes, sidecar NATS config fix, bounded Raft frames, JetStream setup retry.
 - [x] Gate 2 — `minga deploy` deploys (shared write path with the Docker API; per-service placement report; verified live with the real `docker` CLI against `minga api`).
@@ -43,4 +43,4 @@ Sequential implementation for one developer: B (NATS TLS/transport boundary) →
 - [x] Gate 4 — Compose fidelity (command/entrypoint/labels/healthcheck/volumes/constraints reach the container; task lifecycle states and NetworksAttachments in the API). Verified: Traefik v3 swarm provider routes to a Minga service, 10/10 200 OK.
 - [x] Gate 5 — transport security and secrets staging (Raft mTLS verified live, API bearer auth 401/200 live, NATS token, `minga tls` PKI, content-addressed per-task secret staging with rotation semantics).
 - [x] Gate 6 — real container logs (FIFO destinations, per-container bounded readers, JetStream history). Verified live: separated streams, backlog + follow surviving a supervisor restart.
-- [ ] Gate 7 — shippable: CI, release artifacts, docs corrected.
+- [x] Gate 7 — shippable: CI (incl. daemon-backed job with `MINGA_REQUIRE_CONTAINERD=1`), linux/amd64 + linux/arm64 release workflow, `install.sh`, v0.1.0 version bump, CHANGELOG, corrected README/Talos docs; clean-checkout proof green.
