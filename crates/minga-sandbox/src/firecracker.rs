@@ -27,7 +27,6 @@ use crate::runtime::{
 #[derive(Debug, Default)]
 pub struct FirecrackerRuntime {
     sandboxes: Mutex<HashMap<String, FirecrackerSandbox>>,
-    counter: Mutex<u64>,
 }
 
 #[derive(Debug)]
