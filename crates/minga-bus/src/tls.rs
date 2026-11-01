@@ -267,7 +267,14 @@ impl NatsTlsConfig {
         let client_certs = read_pem_certs(&self.cert_file)?;
         let client_key = read_pem_key(&self.key_file)?;
 
-        let builder = ClientConfig::builder().with_root_certificates(roots);
+        // Explicit provider: both ring and aws-lc-rs are linked in this
+        // workspace, so rustls cannot auto-detect one.
+        let builder = ClientConfig::builder_with_provider(std::sync::Arc::new(
+            async_nats::rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .map_err(|e| TlsError::Build(format!("TLS protocol setup: {e}")))?
+        .with_root_certificates(roots);
         let config = builder
             .with_client_auth_cert(client_certs, client_key)
             .map_err(|e| TlsError::Build(format!("client certificate rejected: {e}")))?;
@@ -385,9 +392,12 @@ mod tests {
         (ca_pem, leaf_cert.pem(), leaf_key.serialize_pem())
     }
 
+    /// Serializes tests that mutate the process-global environment.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn env_returns_none_when_nothing_is_set() {
-        // SAFETY: single-threaded test process; env is process-global.
+        let _guard = ENV_LOCK.lock().unwrap();
         for var in [
             "MINGA_NATS_TLS_CA",
             "MINGA_NATS_TLS_CERT",
@@ -401,7 +411,7 @@ mod tests {
 
     #[test]
     fn env_rejects_partial_configuration() {
-        // SAFETY: single-threaded test process; env is process-global.
+        let _guard = ENV_LOCK.lock().unwrap();
         std::env::set_var("MINGA_NATS_TLS_CA", "/tmp/ca.pem");
         let err = NatsTlsConfig::from_env().unwrap_err();
         assert!(matches!(err, TlsError::Incomplete { .. }));

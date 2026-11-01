@@ -95,6 +95,9 @@ pub struct SidecarOptions {
     pub max_memory_store: String,
     /// JetStream max file store (e.g. "1GB").
     pub max_file_store: String,
+    /// Client authentication token. When set, every client (including the
+    /// manager itself) must present it to connect.
+    pub client_token: Option<String>,
     /// Address the client listener binds to.
     ///
     /// Defaults to loopback. A plaintext sidecar must never bind on a public
@@ -115,6 +118,7 @@ impl Default for SidecarOptions {
             monitor_port: 8222,
             max_memory_store: "64MB".to_string(),
             max_file_store: "1GB".to_string(),
+            client_token: None,
             listen_addr: "127.0.0.1".to_string(),
             tls: None,
             cluster: None,
@@ -233,7 +237,11 @@ fn generate_config(opts: &SidecarOptions, jetstream_dir: &Path) -> String {
         "listen: {}:{}\n",
         opts.listen_addr, opts.client_port
     ));
-    out.push_str(&format!("server_name: minga-{}\n\n", opts.node_id));
+    out.push_str(&format!("server_name: minga-{}\n", opts.node_id));
+    if let Some(token) = &opts.client_token {
+        out.push_str(&format!("authorization: {{ token: \"{token}\" }}\n"));
+    }
+    out.push('\n');
 
     // Monitoring - localhost only. The monitoring endpoint is not protected by
     // client-certificate verification, so it must never listen on a routable

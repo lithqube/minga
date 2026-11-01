@@ -12,7 +12,7 @@ use tokio::time::timeout;
 use crate::command::{StateCommand, StateResponse};
 use crate::error::StateError;
 use crate::log_store::RedbLogStore;
-use crate::network::{forward_write, serve_raft_rpc, TcpNetworkFactory};
+use crate::network::{forward_write, serve_raft_rpc, RaftTlsConfig, TcpNetworkFactory};
 use crate::state_machine::RedbStateMachine;
 use crate::types::{
     ClusterNode, Config as StateConfig, ConfigId, Network, NetworkId, NodeId, Secret, SecretId,
@@ -30,6 +30,8 @@ pub struct StateStore {
     reader: RedbStateMachine,
     node_id: NodeId,
     rpc_server: tokio::task::JoinHandle<()>,
+    /// Client TLS config for forwarded writes (mTLS), when enabled.
+    tls_client: Option<std::sync::Arc<rustls::ClientConfig>>,
 }
 
 impl StateStore {
@@ -45,6 +47,31 @@ impl StateStore {
         bind_addr: impl Into<String>,
         data_dir: impl AsRef<Path>,
         peers: BTreeMap<NodeId, String>,
+    ) -> Result<Self, StateError> {
+        Self::open_inner(node_id, bind_addr, data_dir, peers, None).await
+    }
+
+    /// Opens or creates a state store with mTLS on the Raft transport.
+    ///
+    /// Every peer (voters, and forwarded client writes) must present a
+    /// certificate signed by the cluster CA; anything else fails the TLS
+    /// handshake before it can vote, replicate or write.
+    pub async fn open_secure(
+        node_id: NodeId,
+        bind_addr: impl Into<String>,
+        data_dir: impl AsRef<Path>,
+        peers: BTreeMap<NodeId, String>,
+        tls: RaftTlsConfig,
+    ) -> Result<Self, StateError> {
+        Self::open_inner(node_id, bind_addr, data_dir, peers, Some(tls)).await
+    }
+
+    async fn open_inner(
+        node_id: NodeId,
+        bind_addr: impl Into<String>,
+        data_dir: impl AsRef<Path>,
+        peers: BTreeMap<NodeId, String>,
+        tls: Option<RaftTlsConfig>,
     ) -> Result<Self, StateError> {
         let data_dir = data_dir.as_ref();
         tokio::fs::create_dir_all(data_dir).await?;
@@ -75,12 +102,29 @@ impl StateStore {
 
         let bind_addr = bind_addr.into();
 
-        let raft = Raft::new(node_id, config, TcpNetworkFactory, log_store, state_machine)
+        let (factory, server_tls, client_tls) = match &tls {
+            Some(config) => {
+                let client = config
+                    .client_config()
+                    .map_err(|e| StateError::storage(e.to_string()))?;
+                let server = config
+                    .server_config()
+                    .map_err(|e| StateError::storage(e.to_string()))?;
+                (
+                    TcpNetworkFactory::new_tls(client.clone()),
+                    Some(server),
+                    Some(client),
+                )
+            }
+            None => (TcpNetworkFactory::new_plain(), None, None),
+        };
+
+        let raft = Raft::new(node_id, config, factory, log_store, state_machine)
             .await
             .map_err(|e| StateError::Fatal(e.to_string()))?;
 
         // Start the RPC server so peers can reach this node.
-        let rpc_server = serve_raft_rpc(raft.clone(), &bind_addr)
+        let rpc_server = serve_raft_rpc(raft.clone(), &bind_addr, server_tls)
             .await
             .map_err(|e| StateError::storage(format!("rpc server bind {bind_addr}: {e}")))?;
 
@@ -138,6 +182,7 @@ impl StateStore {
             reader,
             node_id,
             rpc_server,
+            tls_client: client_tls,
         })
     }
 
@@ -196,7 +241,8 @@ impl StateStore {
                                         leader_addr = %addr,
                                         "forwarding write to leader"
                                     );
-                                    match forward_write(&addr, &cmd).await {
+                                    match forward_write(&addr, &cmd, self.tls_client.clone()).await
+                                    {
                                         Ok(resp) => return Ok(resp),
                                         Err(e) => {
                                             tracing::warn!(

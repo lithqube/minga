@@ -21,6 +21,7 @@ minga-node = { path = "../minga-node" }
 minga-sandbox = { path = "../minga-sandbox" }
 minga-scheduler = { path = "../minga-scheduler" }
 minga-state = { path = "../minga-state" }
+rcgen = { version = "0.13", features = ["x509-parser"] }
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true

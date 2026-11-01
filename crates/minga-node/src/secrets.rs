@@ -61,10 +61,106 @@ pub enum SecretResolveError {
     DuplicateTarget(String),
 }
 
+/// A secret staged for one task: content-addressed and immutable.
+///
+/// The staged path is a hard link to the provisioned file (same inode —
+/// the value is never copied, never logged). Its name is the SHA-256 of
+/// the content, so:
+///
+/// - The mount source cannot be swapped after validation: replacing the
+///   provisioned file yields a *different* staged name, so a running
+///   task's mount always points at the version it started with.
+/// - Rotation is observable: a new task stages the new hash, an old task
+///   keeps the old inode. `version` is the hash — safe to log and record.
+#[derive(Debug, Clone)]
+pub struct StagedSecret {
+    /// The reference this stage satisfies, with `version` set.
+    pub secret_ref: SecretRef,
+    /// The immutable staged path to bind-mount read-only.
+    pub staged_path: PathBuf,
+}
+
 /// A resolver over a node-local secret store directory.
 #[derive(Debug, Clone)]
 pub struct SecretStore {
     root: PathBuf,
+}
+
+impl SecretStore {
+    /// Resolve every reference for a task and stage each into an
+    /// immutable, content-addressed copy under `root/staged/<task_id>/`.
+    ///
+    /// The staged file is a fresh inode named by the SHA-256 of the
+    /// content (a copy, not a link: the store's anti-tamper rules require
+    /// provisioned files to have exactly one link). Same-hash restages
+    /// reuse the existing file. This is the rotation model: the operator
+    /// replaces the provisioned file; new tasks stage the new hash while
+    /// running tasks keep the inode they started with.
+    pub fn stage_all(
+        &self,
+        task_id: &str,
+        refs: &[SecretRef],
+    ) -> Result<Vec<StagedSecret>, SecretResolveError> {
+        if refs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let resolved = self.resolve_all(refs)?;
+
+        let staged_dir = self.root.join("staged").join(task_id);
+        std::fs::create_dir_all(&staged_dir).map_err(|e| SecretResolveError::Unreadable {
+            name: format!("staged/{task_id}"),
+            reason: e.to_string(),
+        })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&staged_dir, std::fs::Permissions::from_mode(0o700));
+        }
+
+        let mut out = Vec::with_capacity(resolved.len());
+        for (secret_ref, source) in resolved {
+            let content = std::fs::read(&source).map_err(|e| SecretResolveError::Unreadable {
+                name: secret_ref.secret_id.clone(),
+                reason: e.to_string(),
+            })?;
+            let version = format!("{:x}", Sha256::digest(&content));
+            let staged_path = staged_dir.join(&version);
+            if !staged_path.exists() {
+                std::fs::write(&staged_path, &content).map_err(|e| {
+                    SecretResolveError::Unreadable {
+                        name: secret_ref.secret_id.clone(),
+                        reason: format!("stage: {e}"),
+                    }
+                })?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = std::fs::set_permissions(
+                        &staged_path,
+                        std::fs::Permissions::from_mode(0o400),
+                    );
+                }
+            }
+            out.push(StagedSecret {
+                secret_ref: SecretRef {
+                    version: Some(version),
+                    ..secret_ref
+                },
+                staged_path,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Removes a task's staged secrets. Idempotent.
+    pub fn cleanup_task(&self, task_id: &str) {
+        let dir = self.root.join("staged").join(task_id);
+        if let Err(e) = std::fs::remove_dir_all(&dir) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(task = %task_id, error = %e, "secret staging cleanup failed");
+            }
+        }
+    }
 }
 
 impl SecretStore {
@@ -397,5 +493,61 @@ mod tests {
 
         let ids = store.provisioned_ids();
         assert_eq!(ids.len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod staging_tests {
+    use super::*;
+    use minga_state::types::SecretRef;
+
+    fn provision(root: &Path, secret_id: &str, value: &str) {
+        let path = root.join(SecretStore::file_name_for(secret_id));
+        std::fs::write(&path, value).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+    }
+
+    #[test]
+    fn rotated_secret_is_visible_to_a_new_task_not_an_old_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SecretStore::new(dir.path());
+        let secret = SecretRef::new("db_password", "/run/secrets/db_password");
+
+        provision(dir.path(), "db_password", "v1-value");
+        let staged_a = store
+            .stage_all("task.a", std::slice::from_ref(&secret))
+            .unwrap();
+        let version_a = staged_a[0].secret_ref.version.clone().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&staged_a[0].staged_path).unwrap(),
+            "v1-value"
+        );
+
+        // Operator rotates the secret.
+        provision(dir.path(), "db_password", "v2-value");
+        let staged_b = store
+            .stage_all("task.b", std::slice::from_ref(&secret))
+            .unwrap();
+        let version_b = staged_b[0].secret_ref.version.clone().unwrap();
+
+        assert_ne!(version_a, version_b, "rotation must change the version");
+        assert_eq!(
+            std::fs::read_to_string(&staged_b[0].staged_path).unwrap(),
+            "v2-value"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&staged_a[0].staged_path).unwrap(),
+            "v1-value",
+            "the old task's staged inode keeps the old value"
+        );
+
+        // Cleanup removes only the task's own staging.
+        store.cleanup_task("task.b");
+        assert!(!staged_b[0].staged_path.exists());
+        assert!(staged_a[0].staged_path.exists());
     }
 }

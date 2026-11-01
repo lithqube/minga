@@ -36,8 +36,15 @@ pub enum ConnectError {
 ///
 /// The returned bus is boxed as `Arc<dyn EventBus>` so all callers share one
 /// type regardless of transport.
-pub async fn connect_bus(url: &str) -> Result<Arc<dyn EventBus>, ConnectError> {
+pub async fn connect_bus(
+    url: &str,
+    token: Option<&str>,
+) -> Result<Arc<dyn EventBus>, ConnectError> {
     let tls = NatsTlsConfig::from_env().map_err(|e| ConnectError::TlsConfig(e.to_string()))?;
+    // Explicit flag wins; MINGA_NATS_TOKEN is the fallback.
+    let token: Option<String> = token
+        .map(String::from)
+        .or_else(|| std::env::var("MINGA_NATS_TOKEN").ok());
 
     match tls {
         Some(config) => {
@@ -53,6 +60,8 @@ pub async fn connect_bus(url: &str) -> Result<Arc<dyn EventBus>, ConnectError> {
             // Plaintext is a loopback-only development mode. A remote
             // worker or manager must provision TLS material instead of
             // accidentally sending bus traffic across the network in clear.
+            // A token adds credential-checking but does not make plaintext
+            // routable.
             let authority = url.strip_prefix("nats://").and_then(|rest| {
                 if rest.contains(['/', '?', '@', ',']) {
                     return None;
@@ -69,13 +78,14 @@ pub async fn connect_bus(url: &str) -> Result<Arc<dyn EventBus>, ConnectError> {
                         .to_string(),
                 ));
             }
-            let bus =
-                minga_bus::NatsBus::connect(url)
-                    .await
-                    .map_err(|e| ConnectError::Connect {
-                        url: url.to_string(),
-                        reason: e.to_string(),
-                    })?;
+            let bus = match &token {
+                Some(token) => minga_bus::NatsBus::connect_with_token(url, token).await,
+                None => minga_bus::NatsBus::connect(url).await,
+            }
+            .map_err(|e| ConnectError::Connect {
+                url: url.to_string(),
+                reason: e.to_string(),
+            })?;
             Ok(bus)
         }
     }
@@ -101,7 +111,7 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        match rt.block_on(connect_bus("tls://localhost:4222")) {
+        match rt.block_on(connect_bus("tls://localhost:4222", None)) {
             Ok(_) => panic!("tls:// without material must be refused"),
             Err(ConnectError::TlsConfig(_)) => {}
             Err(other) => panic!("unexpected error variant: {other}"),

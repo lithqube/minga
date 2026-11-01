@@ -23,12 +23,113 @@ use openraft::raft::{
 };
 use openraft::{BasicNode, Raft};
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::command::{StateCommand, StateResponse};
 use crate::error::StateError;
 use crate::TypeConfig;
+
+// --- transport security ---------------------------------------------------------
+
+/// The SAN every Minga node certificate carries. Any cluster peer must
+/// present a certificate signed by the cluster CA with this name — one
+/// identity, no per-node PKI bookkeeping.
+pub const MINGA_NODE_NAME: &str = "minga-node";
+
+/// TLS material for the Raft transport (PEM paths). The same certificate
+/// is used for the server and client roles (mTLS).
+#[derive(Debug, Clone)]
+pub struct RaftTlsConfig {
+    /// PEM file with the cluster CA certificate.
+    pub ca_cert: std::path::PathBuf,
+    /// PEM file with this node's certificate (SAN `minga-node`).
+    pub cert: std::path::PathBuf,
+    /// PEM file with this node's private key.
+    pub key: std::path::PathBuf,
+}
+
+impl RaftTlsConfig {
+    fn load_cert_chain(
+        path: &std::path::Path,
+    ) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>, std::io::Error> {
+        rustls_pemfile::certs(&mut std::io::BufReader::new(std::fs::File::open(path)?))
+            .collect::<Result<Vec<_>, _>>()
+    }
+
+    fn load_key(
+        path: &std::path::Path,
+    ) -> Result<rustls::pki_types::PrivateKeyDer<'static>, std::io::Error> {
+        let mut rd = std::io::BufReader::new(std::fs::File::open(path)?);
+        loop {
+            match rustls_pemfile::read_one(&mut rd)? {
+                Some(rustls_pemfile::Item::Pkcs1Key(k)) => return Ok(k.into()),
+                Some(rustls_pemfile::Item::Pkcs8Key(k)) => return Ok(k.into()),
+                Some(rustls_pemfile::Item::Sec1Key(k)) => return Ok(k.into()),
+                Some(_) => continue,
+                None => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("no private key in {}", path.display()),
+                    ))
+                }
+            }
+        }
+    }
+
+    /// Client side: verify the peer against the CA and the node SAN, and
+    /// present our certificate (mTLS).
+    pub fn client_config(&self) -> Result<std::sync::Arc<rustls::ClientConfig>, std::io::Error> {
+        let mut roots = rustls::RootCertStore::empty();
+        for cert in Self::load_cert_chain(&self.ca_cert)? {
+            roots
+                .add(cert)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+        }
+        let certs = Self::load_cert_chain(&self.cert)?;
+        let key = Self::load_key(&self.key)?;
+        // Explicit provider: the workspace links rustls with both ring
+        // and aws-lc-rs available, so auto-detection is ambiguous.
+        let config = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?
+        .with_root_certificates(roots)
+        .with_client_auth_cert(certs, key)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+        Ok(std::sync::Arc::new(config))
+    }
+
+    /// Server side: require every peer to present a certificate signed by
+    /// the cluster CA. An uncredentialed peer fails the handshake — it
+    /// cannot vote, replicate, or be forwarded writes.
+    pub fn server_config(&self) -> Result<std::sync::Arc<rustls::ServerConfig>, std::io::Error> {
+        let mut roots = rustls::RootCertStore::empty();
+        for cert in Self::load_cert_chain(&self.ca_cert)? {
+            roots
+                .add(cert)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+        }
+        let client_verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
+            std::sync::Arc::new(roots),
+            std::sync::Arc::new(rustls::crypto::ring::default_provider()),
+        )
+        .build()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+        let certs = Self::load_cert_chain(&self.cert)?;
+        let key = Self::load_key(&self.key)?;
+        let config = rustls::ServerConfig::builder_with_provider(std::sync::Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?
+        .with_client_cert_verifier(client_verifier)
+        .with_single_cert(certs, key)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+        Ok(std::sync::Arc::new(config))
+    }
+}
 
 // --- wire protocol ------------------------------------------------------------
 
@@ -87,9 +188,28 @@ where
 
 // --- client side --------------------------------------------------------------
 
+/// A stream that is either plain TCP or TLS-over-TCP.
+trait AsyncReadWrite: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncReadWrite for T {}
+type BoxStream = Box<dyn AsyncReadWrite>;
+
 /// A network factory that creates TCP-based Raft network clients.
 #[derive(Debug, Clone, Default)]
-pub struct TcpNetworkFactory;
+pub struct TcpNetworkFactory {
+    tls: Option<std::sync::Arc<rustls::ClientConfig>>,
+}
+
+impl TcpNetworkFactory {
+    /// Plaintext transport (development and tests).
+    pub fn new_plain() -> Self {
+        Self { tls: None }
+    }
+
+    /// mTLS transport: every connection is encrypted and authenticated.
+    pub fn new_tls(config: std::sync::Arc<rustls::ClientConfig>) -> Self {
+        Self { tls: Some(config) }
+    }
+}
 
 impl RaftNetworkFactory<TypeConfig> for TcpNetworkFactory {
     type Network = TcpNetwork;
@@ -98,16 +218,28 @@ impl RaftNetworkFactory<TypeConfig> for TcpNetworkFactory {
         TcpNetwork {
             target,
             addr: node.addr.clone(),
+            tls: self.tls.clone(),
         }
     }
 }
 
 /// A TCP-based Raft network client. Connects to the target node on each
 /// RPC (simple, no connection pooling — sufficient for Phase 0).
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct TcpNetwork {
     target: u64,
     addr: String,
+    tls: Option<std::sync::Arc<rustls::ClientConfig>>,
+}
+
+impl std::fmt::Debug for TcpNetwork {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TcpNetwork")
+            .field("target", &self.target)
+            .field("addr", &self.addr)
+            .field("tls", &self.tls.is_some())
+            .finish()
+    }
 }
 
 impl TcpNetwork {
@@ -117,7 +249,17 @@ impl TcpNetwork {
             .map_err(|e| TransportError::Encode(e.to_string()))?;
 
         tracing::trace!(target = self.target, addr = %self.addr, "raft rpc send");
-        let mut stream = TcpStream::connect(&self.addr).await?;
+        let stream = TcpStream::connect(&self.addr).await?;
+        let mut stream: BoxStream = match &self.tls {
+            Some(config) => {
+                let name = rustls::pki_types::ServerName::try_from(MINGA_NODE_NAME)
+                    .map_err(|e| TransportError::Decode(e.to_string()))?
+                    .to_owned();
+                let connector = tokio_rustls::TlsConnector::from(config.clone());
+                Box::new(connector.connect(name, stream).await?)
+            }
+            None => Box::new(stream),
+        };
 
         // Write length-prefixed request.
         stream.write_u32(encoded.len() as u32).await?;
@@ -201,10 +343,12 @@ impl RaftNetwork<TypeConfig> for TcpNetwork {
 pub(crate) async fn forward_write(
     addr: &str,
     cmd: &StateCommand,
+    tls: Option<std::sync::Arc<rustls::ClientConfig>>,
 ) -> Result<StateResponse, StateError> {
     let network = TcpNetwork {
         target: 0,
         addr: addr.to_string(),
+        tls,
     };
     let reply = network
         .send(RaftRequest::ClientWrite(Box::new(cmd.clone())))
@@ -231,16 +375,37 @@ pub(crate) async fn forward_write(
 pub async fn serve_raft_rpc(
     raft: Raft<TypeConfig>,
     bind_addr: &str,
+    tls: Option<std::sync::Arc<rustls::ServerConfig>>,
 ) -> Result<tokio::task::JoinHandle<()>, std::io::Error> {
     let listener = TcpListener::bind(bind_addr).await?;
-    tracing::info!(addr = bind_addr, "raft rpc server listening");
+    tracing::info!(
+        addr = bind_addr,
+        tls = tls.is_some(),
+        "raft rpc server listening"
+    );
 
     let handle = tokio::spawn(async move {
         loop {
             match listener.accept().await {
                 Ok((stream, peer)) => {
                     let raft = raft.clone();
+                    let tls = tls.clone();
                     tokio::spawn(async move {
+                        // When TLS is configured, an uncredentialed peer
+                        // fails the handshake here and never reaches Raft.
+                        let stream: BoxStream = match tls {
+                            Some(config) => {
+                                let acceptor = tokio_rustls::TlsAcceptor::from(config);
+                                match acceptor.accept(stream).await {
+                                    Ok(s) => Box::new(s),
+                                    Err(e) => {
+                                        tracing::debug!(%peer, error = %e, "raft rpc TLS handshake rejected");
+                                        return;
+                                    }
+                                }
+                            }
+                            None => Box::new(stream),
+                        };
                         if let Err(e) = handle_connection(stream, raft).await {
                             tracing::debug!(%peer, error = %e, "raft rpc connection closed");
                         }
@@ -258,8 +423,8 @@ pub async fn serve_raft_rpc(
 }
 
 /// Handles a single Raft RPC connection: read request, dispatch, write reply.
-async fn handle_connection(
-    mut stream: TcpStream,
+async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
+    mut stream: S,
     raft: Raft<TypeConfig>,
 ) -> Result<(), TransportError> {
     // Read length-prefixed request.

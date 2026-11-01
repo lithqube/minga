@@ -43,7 +43,7 @@
 mod command;
 mod error;
 mod log_store;
-mod network;
+pub mod network;
 mod state_machine;
 mod store;
 pub mod types;

@@ -37,6 +37,9 @@ enum Command {
         /// URL of a `minga api` server. Can also be set via MINGA_API_URL.
         #[arg(long, env = "MINGA_API_URL", default_value = "http://127.0.0.1:2375")]
         api_url: String,
+        /// Bearer token when the API requires one (MINGA_API_TOKEN).
+        #[arg(long, env = "MINGA_API_TOKEN")]
+        api_token: Option<String>,
         /// Seconds to wait for tasks to be placed before failing.
         #[arg(long, default_value = "30")]
         wait: u64,
@@ -50,6 +53,11 @@ enum Command {
     Wg {
         #[command(subcommand)]
         cmd: WgCommand,
+    },
+    /// Cluster PKI: issue the CA and node certificates for Raft mTLS.
+    Tls {
+        #[command(subcommand)]
+        cmd: TlsCommand,
     },
     /// Run the Docker Engine API server (Swarm-compatible REST API).
     Api(ApiArgs),
@@ -88,6 +96,29 @@ enum AgentCommand {
         /// NATS server URL (e.g. nats://localhost:4222).
         #[arg(long, env = "MINGA_NATS_URL")]
         nats_url: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum TlsCommand {
+    /// Create a cluster CA: writes ca.pem and ca-key.pem.
+    ///
+    /// The CA key is the cluster's root of trust — keep it offline.
+    /// Refuses to overwrite existing files.
+    InitCa {
+        /// Directory to write ca.pem and ca-key.pem into.
+        #[arg(long)]
+        dir: String,
+    },
+    /// Issue a node certificate signed by the cluster CA:
+    /// writes node.pem and node-key.pem (SAN `minga-node`).
+    IssueNode {
+        /// Directory containing ca.pem and ca-key.pem.
+        #[arg(long)]
+        ca_dir: String,
+        /// Directory to write node.pem and node-key.pem into.
+        #[arg(long)]
+        out_dir: String,
     },
 }
 
@@ -156,6 +187,16 @@ struct NodeArgs {
     /// Peer node as id=address (repeatable). Include all other nodes.
     #[arg(long = "peer")]
     peers: Vec<String>,
+    /// PEM file with the cluster CA certificate. Enables mTLS on the Raft
+    /// transport; all three raft-tls flags are required together.
+    #[arg(long)]
+    raft_tls_ca: Option<String>,
+    /// PEM file with this node's Raft certificate (SAN `minga-node`).
+    #[arg(long)]
+    raft_tls_cert: Option<String>,
+    /// PEM file with this node's Raft private key.
+    #[arg(long)]
+    raft_tls_key: Option<String>,
     /// Node label as key=value (repeatable). Advertised to the cluster and
     /// usable in placement constraints (e.g. node.labels.gpu == true).
     #[arg(long = "label")]
@@ -168,6 +209,11 @@ struct NodeArgs {
     /// via the MINGA_NATS_URL environment variable.
     #[arg(long, env = "MINGA_NATS_URL")]
     nats_url: Option<String>,
+    /// NATS client token. The sidecar config requires the same token;
+    /// workers must present it when connecting to the manager's NATS.
+    /// Can also be set via MINGA_NATS_TOKEN.
+    #[arg(long, env = "MINGA_NATS_TOKEN")]
+    nats_token: Option<String>,
     /// Directory holding the node-local secret store. Secrets are
     /// provisioned there by the operator; values never travel through
     /// Raft or the event bus.
@@ -220,9 +266,24 @@ struct ApiArgs {
     /// Peer node as id=address (repeatable). Include all other nodes.
     #[arg(long = "peer")]
     peers: Vec<String>,
+    /// PEM file with the cluster CA certificate. Enables mTLS on the Raft
+    /// transport; all three raft-tls flags are required together.
+    #[arg(long)]
+    raft_tls_ca: Option<String>,
+    /// PEM file with this node's Raft certificate (SAN `minga-node`).
+    #[arg(long)]
+    raft_tls_cert: Option<String>,
+    /// PEM file with this node's Raft private key.
+    #[arg(long)]
+    raft_tls_key: Option<String>,
     /// Address to bind the Docker Engine API server (e.g. 0.0.0.0:2375).
     #[arg(long, default_value = "0.0.0.0:2375")]
     api_bind: String,
+    /// Bearer token required on every API request. Strongly recommended
+    /// when binding anything other than localhost — without it, the API
+    /// is unauthenticated remote code execution by design.
+    #[arg(long, env = "MINGA_API_TOKEN")]
+    api_token: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -280,6 +341,39 @@ fn parse_peers(raw: &[String]) -> Result<BTreeMap<u64, String>, String> {
     Ok(peers)
 }
 
+/// Opens the cluster state store, with mTLS when the three raft-tls
+/// flags are present. Partial TLS flags are a hard error.
+#[allow(clippy::too_many_arguments)]
+async fn open_store(
+    node_id: u64,
+    bind: &str,
+    data_dir: &str,
+    peers: BTreeMap<u64, String>,
+    ca: &Option<String>,
+    cert: &Option<String>,
+    key: &Option<String>,
+) -> Result<Arc<minga_state::StateStore>, String> {
+    let store = match (ca, cert, key) {
+        (Some(ca), Some(cert), Some(key)) => {
+            let tls = minga_state::network::RaftTlsConfig {
+                ca_cert: ca.into(),
+                cert: cert.into(),
+                key: key.into(),
+            };
+            minga_state::StateStore::open_secure(node_id, bind, data_dir, peers, tls).await
+        }
+        (None, None, None) => minga_state::StateStore::open(node_id, bind, data_dir, peers).await,
+        _ => {
+            return Err(
+                "--raft-tls-ca, --raft-tls-cert and --raft-tls-key must be given together".into(),
+            );
+        }
+    };
+    store
+        .map(Arc::new)
+        .map_err(|e| format!("cannot open state store: {e}"))
+}
+
 /// Parses `--label key=value` into a map. Values may contain `=`.
 fn parse_labels(raw: &[String]) -> Result<std::collections::HashMap<String, String>, String> {
     let mut labels = std::collections::HashMap::new();
@@ -315,6 +409,7 @@ async fn main() -> ExitCode {
             compose,
             stack,
             api_url,
+            api_token,
             wait,
         } => {
             let Some(loaded) = load(&compose) else {
@@ -330,6 +425,7 @@ async fn main() -> ExitCode {
             print_translated(&translated);
             let opts = deploy::DeployOptions {
                 api_url,
+                api_token,
                 stack,
                 wait: Duration::from_secs(wait),
             };
@@ -340,6 +436,7 @@ async fn main() -> ExitCode {
         }
         Command::Net { cmd } => return run_net(cmd),
         Command::Wg { cmd } => return run_wg(cmd),
+        Command::Tls { cmd } => return run_tls(cmd),
         Command::Api(args) => return run_api(args).await,
         Command::Sandbox { cmd } => return run_sandbox(cmd).await,
         Command::Egress(args) => return run_egress(args).await,
@@ -376,23 +473,34 @@ async fn run_api(args: ApiArgs) -> ExitCode {
         "starting Docker Engine API server"
     );
 
-    let state = match minga_state::StateStore::open(args.node_id, &args.bind, &args.data_dir, peers)
-        .await
+    let state = match open_store(
+        args.node_id,
+        &args.bind,
+        &args.data_dir,
+        peers,
+        &args.raft_tls_ca,
+        &args.raft_tls_cert,
+        &args.raft_tls_key,
+    )
+    .await
     {
-        Ok(s) => Arc::new(s),
+        Ok(s) => s,
         Err(e) => {
-            eprintln!("error: cannot open state store: {e}");
+            eprintln!("error: {e}");
             return ExitCode::FAILURE;
         }
     };
 
-    let server = match minga_api::ApiServer::start(state.clone(), &args.api_bind).await {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("error: cannot start API server: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
+    let server =
+        match minga_api::ApiServer::start_with_auth(state.clone(), &args.api_bind, args.api_token)
+            .await
+        {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("error: cannot start API server: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
 
     // The reconcile loop must exist on every Raft voter: the scheduler is
     // leadership-gated, and an API-only node can be elected leader. Without
@@ -417,6 +525,137 @@ async fn run_api(args: ApiArgs) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// Cluster PKI operations: CA creation and node certificate issuance.
+fn run_tls(cmd: TlsCommand) -> ExitCode {
+    match cmd {
+        TlsCommand::InitCa { dir } => {
+            let dir = PathBuf::from(&dir);
+            let ca_pem = dir.join("ca.pem");
+            let ca_key_pem = dir.join("ca-key.pem");
+            for path in [&ca_pem, &ca_key_pem] {
+                if path.exists() {
+                    eprintln!(
+                        "error: {} already exists; refusing to overwrite",
+                        path.display()
+                    );
+                    return ExitCode::FAILURE;
+                }
+            }
+            let key = match rcgen::KeyPair::generate() {
+                Ok(k) => k,
+                Err(e) => {
+                    eprintln!("error: key generation failed: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let mut params =
+                rcgen::CertificateParams::new(Vec::<String>::new()).expect("ca params");
+            params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+            let ca = match params.self_signed(&key) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("error: CA self-signing failed: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            if let Err(e) = std::fs::create_dir_all(&dir)
+                .and_then(|()| std::fs::write(&ca_pem, ca.pem()))
+                .and_then(|()| std::fs::write(&ca_key_pem, key.serialize_pem()))
+            {
+                eprintln!("error: writing CA material: {e}");
+                return ExitCode::FAILURE;
+            }
+            println!("cluster CA written to {}", dir.display());
+            println!(
+                "  keep {} offline; it signs every node",
+                ca_key_pem.display()
+            );
+        }
+        TlsCommand::IssueNode { ca_dir, out_dir } => {
+            let ca_dir = PathBuf::from(&ca_dir);
+            let out_dir = PathBuf::from(&out_dir);
+            let read = |name: &str| -> Result<Vec<u8>, String> {
+                std::fs::read(ca_dir.join(name))
+                    .map_err(|e| format!("cannot read {name} from {}: {e}", ca_dir.display()))
+            };
+            let (ca_pem_raw, ca_key_raw) = match (read("ca.pem"), read("ca-key.pem")) {
+                (Ok(a), Ok(b)) => (a, b),
+                (Err(e), _) | (_, Err(e)) => {
+                    eprintln!("error: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let ca_key =
+                match rcgen::KeyPair::from_pem(std::str::from_utf8(&ca_key_raw).unwrap_or("")) {
+                    Ok(k) => k,
+                    Err(e) => {
+                        eprintln!("error: parsing ca-key.pem: {e}");
+                        return ExitCode::FAILURE;
+                    }
+                };
+            let mut ca_params = match rcgen::CertificateParams::from_ca_cert_pem(
+                std::str::from_utf8(&ca_pem_raw).unwrap_or(""),
+            ) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("error: parsing ca.pem: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+            let ca = match ca_params.self_signed(&ca_key) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("error: re-creating CA: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+
+            let key = match rcgen::KeyPair::generate() {
+                Ok(k) => k,
+                Err(e) => {
+                    eprintln!("error: key generation failed: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let mut params = rcgen::CertificateParams::new(vec![
+                minga_state::network::MINGA_NODE_NAME.to_string(),
+            ])
+            .expect("node params");
+            params.subject_alt_names = vec![rcgen::SanType::DnsName(
+                minga_state::network::MINGA_NODE_NAME
+                    .try_into()
+                    .expect("san"),
+            )];
+            let cert = match params.signed_by(&key, &ca, &ca_key) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("error: signing node certificate: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let node_pem = out_dir.join("node.pem");
+            let node_key_pem = out_dir.join("node-key.pem");
+            if let Err(e) = std::fs::create_dir_all(&out_dir)
+                .and_then(|()| std::fs::write(&node_pem, cert.pem()))
+                .and_then(|()| std::fs::write(&node_key_pem, key.serialize_pem()))
+            {
+                eprintln!("error: writing node material: {e}");
+                return ExitCode::FAILURE;
+            }
+            println!("node certificate written to {}", out_dir.display());
+            println!("  start the node with:");
+            println!(
+                "    --raft-tls-ca {} --raft-tls-cert {} --raft-tls-key {}",
+                ca_dir.join("ca.pem").display(),
+                node_pem.display(),
+                node_key_pem.display()
+            );
+        }
+    }
+    ExitCode::SUCCESS
+}
+
 /// Runs a node (manager or worker): opens the state store, starts the
 /// supervisor, and (for managers) the scheduler.
 async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
@@ -437,12 +676,20 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
         "starting minga node"
     );
 
-    let state = match minga_state::StateStore::open(args.node_id, &args.bind, &args.data_dir, peers)
-        .await
+    let state = match open_store(
+        args.node_id,
+        &args.bind,
+        &args.data_dir,
+        peers,
+        &args.raft_tls_ca,
+        &args.raft_tls_cert,
+        &args.raft_tls_key,
+    )
+    .await
     {
-        Ok(s) => Arc::new(s),
+        Ok(s) => s,
         Err(e) => {
-            eprintln!("error: cannot open state store: {e}");
+            eprintln!("error: {e}");
             return ExitCode::FAILURE;
         }
     };
@@ -479,7 +726,7 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
     let bus: Arc<dyn minga_bus::EventBus> = match &args.nats_url {
         Some(url) => {
             _sidecar = None;
-            match bus::connect_bus(url).await {
+            match bus::connect_bus(url, args.nats_token.as_deref()).await {
                 Ok(b) => b,
                 Err(e) => {
                     eprintln!("error: cannot connect to NATS at {url}: {e}");
@@ -499,6 +746,7 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
             let opts = SidecarOptions {
                 data_dir: PathBuf::from(&args.data_dir),
                 node_id: args.node_id,
+                client_token: args.nats_token.clone(),
                 ..SidecarOptions::default()
             };
             let sidecar = match NatsSidecar::start(&opts).await {
@@ -510,7 +758,11 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
             };
             let url = sidecar.client_url().to_string();
             tracing::info!(url = %url, "NATS sidecar ready");
-            match minga_bus::NatsBus::connect(&url).await {
+            let connect = match &args.nats_token {
+                Some(token) => minga_bus::NatsBus::connect_with_token(&url, token).await,
+                None => minga_bus::NatsBus::connect(&url).await,
+            };
+            match connect {
                 Ok(b) => {
                     _sidecar = Some(sidecar);
                     b
@@ -1149,7 +1401,7 @@ async fn run_agent(cmd: AgentCommand) -> ExitCode {
                 return ExitCode::FAILURE;
             };
 
-            let bus = match bus::connect_bus(&url).await {
+            let bus = match bus::connect_bus(&url, None).await {
                 Ok(b) => {
                     let bus: Arc<dyn minga_bus::EventBus> = b;
                     bus
@@ -1220,7 +1472,7 @@ async fn run_logs(task_id: &str, follow: bool, tail: usize, nats_url: Option<&st
         return ExitCode::FAILURE;
     };
 
-    let bus = match bus::connect_bus(url).await {
+    let bus = match bus::connect_bus(url, None).await {
         Ok(b) => {
             let bus: Arc<dyn minga_bus::EventBus> = b;
             bus

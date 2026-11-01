@@ -7,6 +7,7 @@
 use std::sync::Arc;
 
 use axum::{
+    response::IntoResponse,
     routing::{delete, get, post},
     Router,
 };
@@ -22,6 +23,8 @@ struct ApiState {
     app_state: Arc<AppState>,
     _healthz: Healthz,
     readyz: Readyz,
+    /// Bearer token required on all endpoints, when set.
+    auth_token: Option<Arc<str>>,
 }
 
 /// Allow extracting `Arc<AppState>` from `ApiState` for existing handlers.
@@ -31,14 +34,62 @@ impl axum::extract::FromRef<ApiState> for Arc<AppState> {
     }
 }
 
+/// Constant-time string comparison (no early exit on length or content).
+fn constant_time_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    let mut diff = a.len() ^ b.len();
+    for i in 0..a.len().max(b.len()) {
+        diff |= (a.get(i % a.len().max(1)).copied().unwrap_or(0)
+            ^ b.get(i % b.len().max(1)).copied().unwrap_or(0)) as usize;
+    }
+    diff == 0
+}
+
+/// Bearer-token gate. When a token is configured, every request must
+/// carry `Authorization: Bearer <token>`; anything else is a 401 with a
+/// Docker-compatible error body.
+async fn bearer_auth(
+    axum::extract::State(state): axum::extract::State<ApiState>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    if let Some(expected) = &state.auth_token {
+        let presented = req
+            .headers()
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "));
+        match presented {
+            Some(token) if constant_time_eq(token, expected) => next.run(req).await,
+            _ => (
+                axum::http::StatusCode::UNAUTHORIZED,
+                axum::Json(serde_json::json!({"message": "authentication required"})),
+            )
+                .into_response(),
+        }
+    } else {
+        next.run(req).await
+    }
+}
+
 /// Builds the axum router with all Docker Engine API routes.
 pub fn build_router(store: Arc<StateStore>, ready_state: Arc<ReadyState>) -> Router {
+    build_router_with_auth(store, ready_state, None)
+}
+
+/// Builds the router, requiring a bearer token when `auth_token` is set.
+pub fn build_router_with_auth(
+    store: Arc<StateStore>,
+    ready_state: Arc<ReadyState>,
+    auth_token: Option<String>,
+) -> Router {
     let app_state = Arc::new(AppState::new(store));
 
     let api_state = ApiState {
         app_state,
         _healthz: Healthz,
         readyz: Readyz::new(ready_state.as_ref().clone()),
+        auth_token: auth_token.map(Arc::from),
     };
 
     Router::new()
@@ -87,6 +138,10 @@ pub fn build_router(store: Arc<StateStore>, ready_state: Arc<ReadyState>) -> Rou
         .route("/:version/configs/:id", delete(handlers::delete_config))
         // Fallback.
         .fallback(handlers::fallback)
+        .layer(axum::middleware::from_fn_with_state(
+            api_state.clone(),
+            bearer_auth,
+        ))
         .with_state(api_state)
 }
 
@@ -125,8 +180,18 @@ impl ApiServer {
     /// - `store`: the cluster state store (shared with the manager/worker).
     /// - `bind`: the address to bind (e.g. `0.0.0.0:2375`).
     pub async fn start(store: Arc<StateStore>, bind: &str) -> Result<Self, ApiServerError> {
+        Self::start_with_auth(store, bind, None).await
+    }
+
+    /// Starts the API server; when `auth_token` is set, every request
+    /// must carry it as `Authorization: Bearer <token>`.
+    pub async fn start_with_auth(
+        store: Arc<StateStore>,
+        bind: &str,
+        auth_token: Option<String>,
+    ) -> Result<Self, ApiServerError> {
         let ready_state = Arc::new(ReadyState::new());
-        let router = build_router(store, ready_state);
+        let router = build_router_with_auth(store, ready_state, auth_token);
         let listener = TcpListener::bind(bind)
             .await
             .map_err(|e| ApiServerError::Bind(format!("cannot bind {bind}: {e}")))?;
@@ -861,6 +926,48 @@ mod tests {
             .unwrap();
         let (status, _) = send_request(router, req).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn bearer_auth_rejects_and_accepts() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            StateStore::open(1, "127.0.0.1:0", dir.path(), BTreeMap::new())
+                .await
+                .unwrap(),
+        );
+        let router = build_router_with_auth(
+            store,
+            Arc::new(ReadyState::new()),
+            Some("s3cret-token".to_string()),
+        );
+
+        // No header → 401.
+        let req = Request::builder()
+            .uri("/v1.41/version")
+            .body(Body::empty())
+            .unwrap();
+        let (status, _) = send_request(router.clone(), req).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        // Wrong token → 401.
+        let req = Request::builder()
+            .uri("/v1.41/version")
+            .header("Authorization", "Bearer wrong")
+            .body(Body::empty())
+            .unwrap();
+        let (status, _) = send_request(router.clone(), req).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        // Right token → 200.
+        let req = Request::builder()
+            .uri("/v1.41/version")
+            .header("Authorization", "Bearer s3cret-token")
+            .body(Body::empty())
+            .unwrap();
+        let (status, json) = send_request(router, req).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["ApiVersion"], "1.41");
     }
 
     #[tokio::test]

@@ -16,6 +16,8 @@ use minga_state::types::{Service as StateService, ServiceMode};
 pub struct DeployOptions {
     /// Base URL of a `minga api` server, e.g. `http://127.0.0.1:2375`.
     pub api_url: String,
+    /// Bearer token, when the API requires one.
+    pub api_token: Option<String>,
     /// Stack name (already applied to entity IDs by translation).
     pub stack: String,
     /// How long to wait for tasks to appear before reporting failure.
@@ -35,8 +37,18 @@ pub async fn deploy_stack(
     translated: &TranslatedStack,
     opts: &DeployOptions,
 ) -> Result<(), String> {
+    let mut headers = reqwest::header::HeaderMap::new();
+    if let Some(token) = &opts.api_token {
+        headers.insert(
+            reqwest::header::AUTHORIZATION,
+            format!("Bearer {token}")
+                .parse()
+                .map_err(|_| "API token is not valid header data".to_string())?,
+        );
+    }
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(15))
+        .default_headers(headers)
         .build()
         .map_err(|e| format!("cannot build HTTP client: {e}"))?;
     let base = format!("{}/v1.41", opts.api_url.trim_end_matches('/'));

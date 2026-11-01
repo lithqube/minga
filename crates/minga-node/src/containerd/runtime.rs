@@ -121,12 +121,19 @@ impl ContainerdRuntime {
         self
     }
 
-    /// Resolve the task's secret references into mounts.
+    /// Resolve and stage the task's secret references into mounts.
     ///
     /// Fails closed: if a secret is missing, unsafe or the node has no
     /// secret store configured, the task is not started. The error names
-    /// the secret but never its value.
-    fn resolve_secrets(&self, spec: &TaskSpec) -> Result<Vec<oci::SecretMount>, RuntimeError> {
+    /// the secret but never its value. Staging is per-task and
+    /// content-addressed: the mounted file is an immutable copy named by
+    /// the content hash, so a rotated secret is visible to a new task
+    /// and never changes under a running one.
+    fn resolve_secrets(
+        &self,
+        task_id: &str,
+        spec: &TaskSpec,
+    ) -> Result<Vec<oci::SecretMount>, RuntimeError> {
         if spec.secrets.is_empty() {
             return Ok(Vec::new());
         }
@@ -138,15 +145,24 @@ impl ContainerdRuntime {
             ))
         })?;
 
-        let resolved = store
-            .resolve_all(&spec.secrets)
-            .map_err(|e| RuntimeError::Start(format!("secret resolution failed: {e}")))?;
+        let staged = store
+            .stage_all(task_id, &spec.secrets)
+            .map_err(|e| RuntimeError::Start(format!("secret staging failed: {e}")))?;
 
-        Ok(resolved
+        for s in &staged {
+            tracing::info!(
+                task = %task_id,
+                secret = %s.secret_ref.secret_id,
+                version = s.secret_ref.version.as_deref().unwrap_or(""),
+                "secret staged"
+            );
+        }
+
+        Ok(staged
             .into_iter()
-            .map(|(secret_ref, path)| oci::SecretMount {
-                source: path,
-                target: secret_ref.target,
+            .map(|s| oci::SecretMount {
+                source: s.staged_path,
+                target: s.secret_ref.target,
             })
             .collect())
     }
@@ -431,7 +447,7 @@ impl ContainerdRuntime {
 impl Runtime for ContainerdRuntime {
     async fn start(&self, task_id: &TaskId, spec: &TaskSpec) -> Result<String, RuntimeError> {
         let container_id = task_id.clone();
-        let secret_mounts = self.resolve_secrets(spec)?;
+        let secret_mounts = self.resolve_secrets(&container_id, spec)?;
         let spec = &self.resolve_mounts(spec).await?;
 
         #[cfg(target_os = "linux")]
@@ -637,6 +653,10 @@ impl Runtime for ContainerdRuntime {
 
         #[cfg(target_os = "linux")]
         self.teardown_network(container_id).await;
+
+        if let Some(store) = &self.secret_store {
+            store.cleanup_task(container_id);
+        }
 
         tracing::info!(container = %container_id, "containerd: stopped container");
         Ok(())

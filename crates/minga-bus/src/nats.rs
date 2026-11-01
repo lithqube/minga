@@ -78,9 +78,40 @@ impl NatsBus {
 
     /// Connect with a custom lease TTL (plaintext — see [`NatsBus::connect`]).
     pub async fn connect_with_ttl(url: &str, lease_ttl: Duration) -> Result<Arc<Self>> {
-        let client = async_nats::connect(url)
-            .await
-            .map_err(|e| BusError::Connection(e.to_string()))?;
+        Self::connect_inner(url, lease_ttl, None).await
+    }
+
+    /// Connect with token authentication (plaintext transport — for mTLS,
+    /// see [`NatsBus::connect_secure`]). A compromised token alone must
+    /// not be sufficient in production: pair with TLS.
+    pub async fn connect_with_token(url: &str, token: &str) -> Result<Arc<Self>> {
+        Self::connect_inner(url, DEFAULT_LEASE_TTL, Some(token)).await
+    }
+
+    /// This workspace links rustls with both ring and aws-lc-rs enabled
+    /// (via dev/test dependencies), so auto-detection is ambiguous and
+    /// panics in some binaries. Pin the process default; a provider
+    /// already installed by the host application always wins.
+    fn ensure_crypto_provider() {
+        let _ = async_nats::rustls::crypto::ring::default_provider().install_default();
+    }
+
+    async fn connect_inner(
+        url: &str,
+        lease_ttl: Duration,
+        token: Option<&str>,
+    ) -> Result<Arc<Self>> {
+        Self::ensure_crypto_provider();
+        let client = match token {
+            Some(token) => {
+                async_nats::ConnectOptions::new()
+                    .token(token.to_string())
+                    .connect(url)
+                    .await
+            }
+            None => async_nats::connect(url).await,
+        }
+        .map_err(|e| BusError::Connection(e.to_string()))?;
         let js = jetstream::new(client.clone());
 
         let (status_kv, leases_kv) = Self::setup_when_ready(&js).await?;
@@ -122,6 +153,7 @@ impl NatsBus {
             .connect_options()
             .map_err(|e| BusError::Connection(format!("TLS configuration failed: {e}")))?;
 
+        Self::ensure_crypto_provider();
         let client = async_nats::connect_with_options(url, options)
             .await
             .map_err(|e| BusError::Connection(format!("TLS connection failed: {e}")))?;
@@ -158,6 +190,7 @@ impl NatsBus {
             .connect_options()
             .map_err(|e| BusError::Connection(format!("TLS configuration failed: {e}")))?;
 
+        Self::ensure_crypto_provider();
         let client = async_nats::connect_with_options(url, options)
             .await
             .map_err(|e| BusError::Connection(format!("TLS connection failed: {e}")))?;
