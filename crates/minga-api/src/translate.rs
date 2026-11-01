@@ -982,7 +982,6 @@ mod tests {
                 resources: ResourceSpec::default(),
                 ..Default::default()
             },
-            ips: HashMap::new(),
         };
         let docker = task_to_docker(&task);
         assert_eq!(docker.ID, "svc1.1");
@@ -1007,7 +1006,6 @@ mod tests {
                 resources: ResourceSpec::default(),
                 ..Default::default()
             },
-            ips: HashMap::new(),
         };
         let docker = task_to_docker(&task);
         assert_eq!(docker.Status.State, "pending");
@@ -1028,7 +1026,6 @@ mod tests {
                 resources: ResourceSpec::default(),
                 ..Default::default()
             },
-            ips: HashMap::new(),
         };
         let docker = task_to_docker(&task);
         assert_eq!(docker.Status.State, "failed");

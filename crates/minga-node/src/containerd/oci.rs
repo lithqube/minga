@@ -188,6 +188,15 @@ pub struct SecretMount {
     pub target: String,
 }
 
+/// Container networking: a prepared netns plus the resolver config.
+#[derive(Debug, Clone)]
+pub struct NetworkSpec {
+    /// Path of the task's prepared network namespace.
+    pub netns_path: String,
+    /// Per-task resolv.conf to bind-mount read-only at /etc/resolv.conf.
+    pub resolv_conf: Option<std::path::PathBuf>,
+}
+
 /// Generate an OCI runtime spec from a Minga task spec.
 ///
 /// The `container_id` is used as the hostname and in annotations.
@@ -202,8 +211,30 @@ pub fn spec_from_task_with_secrets(
     container_id: &str,
     spec: &TaskSpec,
     secret_mounts: &[SecretMount],
+    network: Option<&NetworkSpec>,
 ) -> OciSpec {
     let mut oci = spec_from_task(container_id, spec);
+
+    if let Some(net) = network {
+        for ns in &mut oci.linux.namespaces {
+            if ns.ns_type == "network" {
+                ns.path = Some(net.netns_path.clone());
+            }
+        }
+        if let Some(resolv) = &net.resolv_conf {
+            oci.mounts.push(OciMount {
+                destination: "/etc/resolv.conf".to_string(),
+                mount_type: "bind".to_string(),
+                source: resolv.display().to_string(),
+                options: vec![
+                    "bind".to_string(),
+                    "ro".to_string(),
+                    "nosuid".to_string(),
+                    "nodev".to_string(),
+                ],
+            });
+        }
+    }
 
     for secret in secret_mounts {
         oci.mounts.push(OciMount {
@@ -415,8 +446,9 @@ pub fn spec_to_any_with_secrets(
     container_id: &str,
     spec: &TaskSpec,
     secret_mounts: &[SecretMount],
+    network: Option<&NetworkSpec>,
 ) -> Result<prost_types::Any, String> {
-    let oci = spec_from_task_with_secrets(container_id, spec, secret_mounts);
+    let oci = spec_from_task_with_secrets(container_id, spec, secret_mounts, network);
     let json =
         serde_json::to_vec(&oci).map_err(|e| format!("failed to serialize OCI spec: {e}"))?;
     Ok(prost_types::Any {
@@ -432,11 +464,12 @@ pub fn spec_to_any_with_image(
     spec: &TaskSpec,
     secret_mounts: &[SecretMount],
     image: &ImageConfiguration,
+    network: Option<&NetworkSpec>,
 ) -> Result<prost_types::Any, String> {
     if image.args.is_empty() || image.args[0].is_empty() {
         return Err("image has no executable command".into());
     }
-    let mut oci = spec_from_task_with_secrets(container_id, spec, secret_mounts);
+    let mut oci = spec_from_task_with_secrets(container_id, spec, secret_mounts, network);
     oci.process.args = image.args.clone();
     oci.process.cwd = image.cwd.clone();
     oci.process.user = OciUser {
@@ -492,7 +525,7 @@ mod tests {
             gid: 1001,
             parent_snapshot: "unused".into(),
         };
-        let any = spec_to_any_with_image("c1", &task, &[], &image).unwrap();
+        let any = spec_to_any_with_image("c1", &task, &[], &image, None).unwrap();
         let json: serde_json::Value = serde_json::from_slice(&any.value).unwrap();
         assert_eq!(
             json["process"]["args"],
@@ -657,7 +690,7 @@ mod tests {
             source: std::path::PathBuf::from("/var/lib/minga/secrets/abc123.secret"),
             target: "/run/secrets/db_password".to_string(),
         };
-        let spec = spec_from_task_with_secrets("c1", &ts, std::slice::from_ref(&mount));
+        let spec = spec_from_task_with_secrets("c1", &ts, std::slice::from_ref(&mount), None);
 
         let m = spec
             .mounts
@@ -683,7 +716,8 @@ mod tests {
             target: "/run/secrets/db_password".to_string(),
         };
         let plain = spec_from_task("c1", &ts);
-        let with_secret = spec_from_task_with_secrets("c1", &ts, std::slice::from_ref(&mount));
+        let with_secret =
+            spec_from_task_with_secrets("c1", &ts, std::slice::from_ref(&mount), None);
 
         assert_eq!(
             with_secret.mounts.len(),

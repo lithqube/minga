@@ -12,7 +12,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use minga_state::types::{ClusterNode, NodeId, Service, Task, TaskId};
+use minga_state::types::{ClusterNode, Network, NodeId, Service, Task, TaskId};
 
 use crate::placement::place_service;
 
@@ -32,11 +32,13 @@ pub enum ReconcileAction {
 /// - `services`: the desired services (from Raft state).
 /// - `tasks`: the current tasks (from Raft state).
 /// - `nodes`: the current cluster nodes (from Raft state).
+/// - `networks`: the cluster networks (from Raft state), for task IPs.
 /// - `now_unix`: current unix time, for node-lease liveness.
 pub fn plan(
     services: &[Service],
     tasks: &[Task],
     nodes: &[ClusterNode],
+    networks: &[Network],
     now_unix: u64,
 ) -> Vec<ReconcileAction> {
     let mut actions = Vec::new();
@@ -54,7 +56,7 @@ pub fn plan(
 
     // --- per-service: create missing, remove stale ----------------------------
     for service in services {
-        let desired = place_service(service, nodes, tasks, now_unix);
+        let desired = place_service(service, nodes, tasks, networks, now_unix);
         let desired_ids: HashSet<&str> = desired.iter().map(|t| t.id.as_str()).collect();
 
         let existing = existing_by_service
@@ -156,7 +158,6 @@ mod tests {
                 resources: ResourceSpec::default(),
                 ..Default::default()
             },
-            ips: HashMap::new(),
         }
     }
 
@@ -174,7 +175,7 @@ mod tests {
     fn new_service_creates_tasks() {
         let nodes = vec![node(1), node(2)];
         let services = vec![svc("web", 2)];
-        let actions = plan(&services, &[], &nodes, 0);
+        let actions = plan(&services, &[], &nodes, &[], 0);
         assert_eq!(task_ids(&actions), vec!["+web.1", "+web.2"]);
     }
 
@@ -183,8 +184,8 @@ mod tests {
         let nodes = vec![node(1), node(2)];
         let services = vec![svc("web", 2)];
         // Place first to get the exact task IDs placement would produce.
-        let desired = place_service(&services[0], &nodes, &[], 0);
-        let actions = plan(&services, &desired, &nodes, 0);
+        let desired = place_service(&services[0], &nodes, &[], &[], 0);
+        let actions = plan(&services, &desired, &nodes, &[], 0);
         assert!(actions.is_empty());
     }
 
@@ -194,7 +195,7 @@ mod tests {
         // Service scaled from 1 to 2 replicas.
         let services = vec![svc("web", 2)];
         let existing = vec![task("web.1", "web", 1)];
-        let actions = plan(&services, &existing, &nodes, 0);
+        let actions = plan(&services, &existing, &nodes, &[], 0);
         // web.1 already exists, web.2 is new.
         assert_eq!(task_ids(&actions), vec!["+web.2"]);
     }
@@ -209,7 +210,7 @@ mod tests {
             task("web.2", "web", 2),
             task("web.3", "web", 1),
         ];
-        let actions = plan(&services, &existing, &nodes, 0);
+        let actions = plan(&services, &existing, &nodes, &[], 0);
         let mut ids = task_ids(&actions);
         ids.sort();
         assert_eq!(ids, vec!["-web.2", "-web.3"]);
@@ -220,7 +221,7 @@ mod tests {
         let nodes = vec![node(1)];
         let services: Vec<Service> = vec![];
         let existing = vec![task("web.1", "web", 1), task("web.2", "web", 1)];
-        let actions = plan(&services, &existing, &nodes, 0);
+        let actions = plan(&services, &existing, &nodes, &[], 0);
         let mut ids = task_ids(&actions);
         ids.sort();
         assert_eq!(ids, vec!["-web.1", "-web.2"]);
@@ -233,7 +234,7 @@ mod tests {
         service.constraints = vec!["node.labels.gpu == true".to_string()];
         // Node 1 has no gpu label → no eligible nodes → task should be removed.
         let existing = vec![task("web.1", "web", 1)];
-        let actions = plan(&[service], &existing, &nodes, 0);
+        let actions = plan(&[service], &existing, &nodes, &[], 0);
         assert_eq!(task_ids(&actions), vec!["-web.1"]);
     }
 
@@ -242,7 +243,7 @@ mod tests {
         let nodes = vec![node(1), node(2)];
         let services = vec![svc("web", 1), svc("api", 2)];
         let existing = vec![task("web.1", "web", 1)];
-        let actions = plan(&services, &existing, &nodes, 0);
+        let actions = plan(&services, &existing, &nodes, &[], 0);
         let mut ids = task_ids(&actions);
         ids.sort();
         assert_eq!(ids, vec!["+api.1", "+api.2"]);
@@ -253,7 +254,7 @@ mod tests {
         let nodes = vec![node(1), node(2), node(3)];
         let mut service = svc("agent", 0);
         service.mode = ServiceMode::Global;
-        let actions = plan(&[service], &[], &nodes, 0);
+        let actions = plan(&[service], &[], &nodes, &[], 0);
         let mut ids = task_ids(&actions);
         ids.sort();
         assert_eq!(ids, vec!["+agent.1", "+agent.2", "+agent.3"]);

@@ -15,11 +15,11 @@
 use std::collections::HashMap;
 
 use minga_state::types::{
-    ClusterNode, NodeId, NodeStatus, ResourceSpec, Service, ServiceMode, Task, TaskSpec, TaskState,
-    WorkloadKind, NODE_LEASE_TTL_SECS,
+    ClusterNode, Network, NetworkId, NodeId, NodeStatus, ResourceSpec, Service, ServiceMode, Task,
+    TaskSpec, TaskState, WorkloadKind, NODE_LEASE_TTL_SECS,
 };
 
-use crate::constraints;
+use crate::{constraints, netassign};
 
 /// A node counts for placement if it is active, its lease is valid at
 /// `now_unix`, and it matches all of the service's constraints.
@@ -63,6 +63,7 @@ pub fn check_placeable(
     service: &Service,
     nodes: &[ClusterNode],
     existing_tasks: &[Task],
+    networks: &[Network],
     now_unix: u64,
 ) -> Result<(), PlacementError> {
     let wants_tasks = match service.mode {
@@ -84,7 +85,7 @@ pub fn check_placeable(
             constraints: service.constraints.clone(),
         });
     }
-    if place_service(service, nodes, existing_tasks, now_unix).is_empty() {
+    if place_service(service, nodes, existing_tasks, networks, now_unix).is_empty() {
         return Err(PlacementError::InsufficientCapacity {
             service: service.id.clone(),
             eligible,
@@ -102,10 +103,13 @@ pub fn check_placeable(
 /// `existing_tasks` should be all tasks in the cluster (not just this
 /// service's), so that resource accounting is cross-service. `now_unix` is
 /// the current unix time, used to exclude nodes with expired leases.
+/// `networks` is the full cluster network list, used to assign a
+/// deterministic IP per task and network ([`crate::netassign`]).
 pub fn place_service(
     service: &Service,
     nodes: &[ClusterNode],
     existing_tasks: &[Task],
+    networks: &[Network],
     now_unix: u64,
 ) -> Vec<Task> {
     // --- filter eligible nodes ------------------------------------------------
@@ -157,6 +161,34 @@ pub fn place_service(
         None => WorkloadKind::Container,
     };
 
+    // One IPAM per joined network, seeded with live allocations: tasks
+    // created in this call cannot collide with existing tasks or each
+    // other. Agent workloads share the host sandbox and get no IPs.
+    let is_agent = service.agent.is_some();
+    let mut ipams: Vec<(NetworkId, minga_net::Ipam)> = if is_agent {
+        Vec::new()
+    } else {
+        service
+            .networks
+            .iter()
+            .filter_map(|net_id| {
+                let network = networks.iter().find(|n| &n.id == net_id)?;
+                netassign::ipam_for(network, existing_tasks)
+                    .map_err(|e| {
+                        tracing::warn!(
+                            service = %service.id,
+                            network = %net_id,
+                            error = %e,
+                            "cannot set up IPAM for network"
+                        );
+                        e
+                    })
+                    .ok()
+                    .map(|ipam| (net_id.clone(), ipam))
+            })
+            .collect()
+    };
+
     let spec = TaskSpec {
         image: service.image.clone(),
         env: service.env.clone(),
@@ -167,6 +199,8 @@ pub fn place_service(
         // Secret references travel with the task so the node can resolve
         // the value locally. References only — no values in Raft.
         secrets: service.secrets.clone(),
+        // Filled in per task below.
+        ips: HashMap::new(),
     };
 
     let mut tasks = Vec::new();
@@ -182,13 +216,15 @@ pub fn place_service(
                     );
                     continue;
                 }
+                let task_id = format!("{}.{}", service.id, node.id);
+                let mut spec = spec.clone();
+                spec.ips = allocate_ips(&task_id, &mut ipams);
                 tasks.push(Task {
-                    id: format!("{}.{}", service.id, node.id),
+                    id: task_id,
                     service_id: service.id.clone(),
                     node_id: node.id,
                     state: TaskState::Pending,
-                    spec: spec.clone(),
-                    ips: HashMap::new(),
+                    spec,
                 });
                 consume(avail, &service.resources);
             }
@@ -203,13 +239,15 @@ pub fn place_service(
                     let idx = (start + i) % candidates.len();
                     let (node, avail) = &mut candidates[idx];
                     if fits(avail, &service.resources) {
+                        let task_id = format!("{}.{}", service.id, slot);
+                        let mut spec = spec.clone();
+                        spec.ips = allocate_ips(&task_id, &mut ipams);
                         tasks.push(Task {
-                            id: format!("{}.{}", service.id, slot),
+                            id: task_id,
                             service_id: service.id.clone(),
                             node_id: node.id,
                             state: TaskState::Pending,
-                            spec: spec.clone(),
-                            ips: HashMap::new(),
+                            spec,
                         });
                         consume(avail, &service.resources);
                         placed = true;
@@ -228,6 +266,27 @@ pub fn place_service(
     }
 
     tasks
+}
+
+/// Allocates an IP for `task_id` on each IPAM-tracked network. A network
+/// whose subnet is exhausted logs a warning and yields no IP — placement
+/// itself stays best-effort.
+fn allocate_ips(
+    task_id: &str,
+    ipams: &mut [(NetworkId, minga_net::Ipam)],
+) -> HashMap<NetworkId, String> {
+    let mut ips = HashMap::new();
+    for (net_id, ipam) in ipams.iter_mut() {
+        match ipam.allocate(task_id) {
+            Ok(ip) => {
+                ips.insert(net_id.clone(), ip.to_string());
+            }
+            Err(e) => {
+                tracing::warn!(task = %task_id, network = %net_id, error = %e, "no IP allocated")
+            }
+        }
+    }
+    ips
 }
 
 /// Returns true if `avail` has enough resources for `request`.
@@ -301,7 +360,7 @@ mod tests {
             node(3, 4.0, 1 << 30, 0, &[]),
         ];
         let service = svc("web", 2, ServiceMode::Replicated);
-        let tasks = place_service(&service, &nodes, &[], 0);
+        let tasks = place_service(&service, &nodes, &[], &[], 0);
         assert_eq!(tasks.len(), 2);
         // Round-robin: slot 1 → node 1, slot 2 → node 2
         assert_eq!(tasks[0].node_id, 1);
@@ -315,7 +374,7 @@ mod tests {
     fn replicated_more_replicas_than_nodes() {
         let nodes = vec![node(1, 8.0, 1 << 30, 0, &[]), node(2, 8.0, 1 << 30, 0, &[])];
         let service = svc("web", 4, ServiceMode::Replicated);
-        let tasks = place_service(&service, &nodes, &[], 0);
+        let tasks = place_service(&service, &nodes, &[], &[], 0);
         assert_eq!(tasks.len(), 4);
         // Round-robin: 1→1, 2→2, 3→1, 4→2
         let node_ids: Vec<u64> = tasks.iter().map(|t| t.node_id).collect();
@@ -330,7 +389,7 @@ mod tests {
             node(3, 4.0, 1 << 30, 0, &[]),
         ];
         let service = svc("agent", 0, ServiceMode::Global);
-        let tasks = place_service(&service, &nodes, &[], 0);
+        let tasks = place_service(&service, &nodes, &[], &[], 0);
         assert_eq!(tasks.len(), 3);
         let node_ids: Vec<u64> = tasks.iter().map(|t| t.node_id).collect();
         assert_eq!(node_ids, vec![1, 2, 3]);
@@ -347,7 +406,7 @@ mod tests {
         ];
         let mut service = svc("train", 2, ServiceMode::Replicated);
         service.constraints = vec!["node.labels.gpu == true".to_string()];
-        let tasks = place_service(&service, &nodes, &[], 0);
+        let tasks = place_service(&service, &nodes, &[], &[], 0);
         assert_eq!(tasks.len(), 2);
         assert!(tasks.iter().all(|t| t.node_id == 1 || t.node_id == 3));
     }
@@ -357,7 +416,7 @@ mod tests {
         let nodes = vec![node(1, 4.0, 1 << 30, 0, &[])];
         let mut service = svc("web", 1, ServiceMode::Replicated);
         service.constraints = vec!["node.labels.gpu == true".to_string()];
-        let tasks = place_service(&service, &nodes, &[], 0);
+        let tasks = place_service(&service, &nodes, &[], &[], 0);
         assert!(tasks.is_empty());
     }
 
@@ -371,7 +430,7 @@ mod tests {
             memory_bytes: 0,
             gpus: 0,
         };
-        let tasks = place_service(&service, &nodes, &[], 0);
+        let tasks = place_service(&service, &nodes, &[], &[], 0);
         assert_eq!(tasks.len(), 2);
         // Slot 1 → node 1 (round-robin start), slot 2 → node 2
         // (node 1 is full after slot 1)
@@ -405,9 +464,8 @@ mod tests {
                 },
                 ..Default::default()
             },
-            ips: HashMap::new(),
         }];
-        let tasks = place_service(&service, &nodes, &existing, 0);
+        let tasks = place_service(&service, &nodes, &existing, &[], 0);
         assert_eq!(tasks.len(), 2);
         // Both replicas must go to node 2 (node 1 only has 1 CPU left).
         assert!(tasks.iter().all(|t| t.node_id == 2));
@@ -438,9 +496,8 @@ mod tests {
                 },
                 ..Default::default()
             },
-            ips: HashMap::new(),
         }];
-        let tasks = place_service(&service, &nodes, &existing, 0);
+        let tasks = place_service(&service, &nodes, &existing, &[], 0);
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].node_id, 1);
     }
@@ -451,7 +508,7 @@ mod tests {
         n1.status = NodeStatus::Draining;
         let nodes = vec![n1, node(2, 4.0, 1 << 30, 0, &[])];
         let service = svc("web", 2, ServiceMode::Replicated);
-        let tasks = place_service(&service, &nodes, &[], 0);
+        let tasks = place_service(&service, &nodes, &[], &[], 0);
         assert_eq!(tasks.len(), 2);
         assert!(tasks.iter().all(|t| t.node_id == 2));
     }
@@ -469,7 +526,7 @@ mod tests {
             memory_bytes: 1 << 30,
             gpus: 1,
         };
-        let tasks = place_service(&service, &nodes, &[], 0);
+        let tasks = place_service(&service, &nodes, &[], &[], 0);
         // Node 1 has 2 GPUs, node 2 has 1. 3 replicas × 1 GPU each.
         // Round-robin: slot 1 → node 1, slot 2 → node 2, slot 3 → node 1.
         assert_eq!(tasks.len(), 3);
@@ -485,8 +542,8 @@ mod tests {
     fn deterministic_task_ids() {
         let nodes = vec![node(1, 4.0, 1 << 30, 0, &[]), node(2, 4.0, 1 << 30, 0, &[])];
         let service = svc("web", 2, ServiceMode::Replicated);
-        let tasks_a = place_service(&service, &nodes, &[], 0);
-        let tasks_b = place_service(&service, &nodes, &[], 0);
+        let tasks_a = place_service(&service, &nodes, &[], &[], 0);
+        let tasks_b = place_service(&service, &nodes, &[], &[], 0);
         let ids_a: Vec<&str> = tasks_a.iter().map(|t| t.id.as_str()).collect();
         let ids_b: Vec<&str> = tasks_b.iter().map(|t| t.id.as_str()).collect();
         assert_eq!(ids_a, ids_b);
@@ -504,7 +561,7 @@ mod tests {
         // One second past the TTL boundary: node 1's lease is expired,
         // node 2's is still valid.
         let now = 1_000 + NODE_LEASE_TTL_SECS + 1;
-        let tasks = place_service(&service, &[stale, leased], &[], now);
+        let tasks = place_service(&service, &[stale, leased], &[], &[], now);
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].node_id, 2);
     }
@@ -513,14 +570,20 @@ mod tests {
     fn node_without_lease_is_always_live() {
         let service = svc("web", 1, ServiceMode::Replicated);
         // `node()` builds lease-less (operator-registered) nodes.
-        let tasks = place_service(&service, &[node(1, 4.0, 1 << 30, 0, &[])], &[], u64::MAX);
+        let tasks = place_service(
+            &service,
+            &[node(1, 4.0, 1 << 30, 0, &[])],
+            &[],
+            &[],
+            u64::MAX,
+        );
         assert_eq!(tasks.len(), 1);
     }
 
     #[test]
     fn check_placeable_rejects_when_no_nodes_registered() {
         let service = svc("web", 1, ServiceMode::Replicated);
-        let err = check_placeable(&service, &[], &[], 0).unwrap_err();
+        let err = check_placeable(&service, &[], &[], &[], 0).unwrap_err();
         assert_eq!(
             err,
             PlacementError::NoEligibleNodes {
@@ -536,7 +599,7 @@ mod tests {
         let nodes = vec![node(1, 4.0, 1 << 30, 0, &[])];
         let mut service = svc("web", 1, ServiceMode::Replicated);
         service.constraints = vec!["node.labels.gpu == true".to_string()];
-        let err = check_placeable(&service, &nodes, &[], 0).unwrap_err();
+        let err = check_placeable(&service, &nodes, &[], &[], 0).unwrap_err();
         assert!(matches!(
             err,
             PlacementError::NoEligibleNodes { nodes: 1, .. }
@@ -552,7 +615,7 @@ mod tests {
             memory_bytes: 0,
             gpus: 0,
         };
-        let err = check_placeable(&service, &nodes, &[], 0).unwrap_err();
+        let err = check_placeable(&service, &nodes, &[], &[], 0).unwrap_err();
         assert_eq!(
             err,
             PlacementError::InsufficientCapacity {
@@ -565,13 +628,13 @@ mod tests {
     #[test]
     fn check_placeable_allows_zero_replica_scale_down() {
         let service = svc("web", 0, ServiceMode::Replicated);
-        assert!(check_placeable(&service, &[], &[], 0).is_ok());
+        assert!(check_placeable(&service, &[], &[], &[], 0).is_ok());
     }
 
     #[test]
     fn check_placeable_accepts_placeable_service() {
         let nodes = vec![node(1, 4.0, 1 << 30, 0, &[])];
         let service = svc("web", 2, ServiceMode::Replicated);
-        assert!(check_placeable(&service, &nodes, &[], 0).is_ok());
+        assert!(check_placeable(&service, &nodes, &[], &[], 0).is_ok());
     }
 }

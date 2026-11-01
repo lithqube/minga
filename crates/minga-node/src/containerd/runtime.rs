@@ -75,6 +75,13 @@ pub struct ContainerdRuntime {
     runtime_name: String,
     /// Node-local secret store used to resolve secret references.
     secret_store: Option<SecretStore>,
+    /// Node networking: netns/bridge/port setup, plus cluster state for
+    /// network subnet resolution. Required to start tasks with IPs.
+    #[cfg(target_os = "linux")]
+    networking: Option<(
+        Arc<crate::netns::NetworkSetup>,
+        Arc<minga_state::StateStore>,
+    )>,
 }
 
 impl ContainerdRuntime {
@@ -94,6 +101,8 @@ impl ContainerdRuntime {
             snapshotter: DEFAULT_SNAPSHOTTER.to_string(),
             runtime_name: DEFAULT_RUNTIME_NAME.to_string(),
             secret_store: None,
+            #[cfg(target_os = "linux")]
+            networking: None,
         }
     }
 
@@ -135,6 +144,99 @@ impl ContainerdRuntime {
                 target: secret_ref.target,
             })
             .collect())
+    }
+
+    /// Attach node networking: tasks with IP assignments get a prepared
+    /// netns (bridge + veth + published ports + resolv.conf).
+    ///
+    /// Without this, a task that carries IP assignments **fails closed** —
+    /// starting it would produce a container with no interfaces, which is
+    /// the silent-failure mode networking exists to eliminate.
+    #[cfg(target_os = "linux")]
+    pub fn with_networking(
+        mut self,
+        setup: Arc<crate::netns::NetworkSetup>,
+        state: Arc<minga_state::StateStore>,
+    ) -> Self {
+        self.networking = Some((setup, state));
+        self
+    }
+
+    /// Prepares the task's network namespace when the task has IPs.
+    #[cfg(target_os = "linux")]
+    async fn prepare_network(
+        &self,
+        task_id: &str,
+        spec: &TaskSpec,
+    ) -> Result<Option<oci::NetworkSpec>, RuntimeError> {
+        if spec.ips.is_empty() {
+            return Ok(None);
+        }
+        let (setup, state) = self.networking.as_ref().ok_or_else(|| {
+            RuntimeError::Start(format!(
+                "task has IP assignments on {} network(s) but node networking is not configured",
+                spec.ips.len()
+            ))
+        })?;
+
+        let networks = state
+            .list_networks()
+            .await
+            .map_err(|e| RuntimeError::Start(format!("list networks: {e}")))?;
+
+        let mut attachments = Vec::new();
+        for (net_id, raw_ip) in &spec.ips {
+            let network = networks.iter().find(|n| &n.id == net_id).ok_or_else(|| {
+                RuntimeError::Start(format!("task IP references unknown network {net_id}"))
+            })?;
+            let subnet = crate::netns::subnet_for(net_id, network.subnet.as_deref())
+                .map_err(|e| RuntimeError::Start(e.to_string()))?;
+            let ip = raw_ip.parse().map_err(|e| {
+                RuntimeError::Start(format!("task IP {raw_ip:?} on {net_id} is invalid: {e}"))
+            })?;
+            attachments.push(crate::netns::TaskNetAttachment {
+                network_id: net_id.clone(),
+                ip,
+                subnet,
+            });
+        }
+        // Deterministic primary network (default route + resolver).
+        attachments.sort_by(|a, b| a.network_id.cmp(&b.network_id));
+
+        let search: Vec<String> = match spec.env.get("MINGA_STACK") {
+            Some(stack) => vec![
+                format!("{stack}.{}", minga_net::MINGA_DOMAIN),
+                minga_net::MINGA_DOMAIN.to_string(),
+            ],
+            None => vec![minga_net::MINGA_DOMAIN.to_string()],
+        };
+
+        let netns = setup
+            .setup_task(task_id, &attachments, &spec.ports, &search)
+            .await
+            .map_err(|e| RuntimeError::Start(format!("network setup: {e}")))?;
+
+        tracing::info!(
+            task_id = %task_id,
+            netns = %netns.netns_path.display(),
+            ips = ?spec.ips,
+            "containerd: task network prepared"
+        );
+
+        Ok(Some(oci::NetworkSpec {
+            netns_path: netns.netns_path.display().to_string(),
+            resolv_conf: Some(netns.resolv_conf),
+        }))
+    }
+
+    /// Tears down a task's network, tolerating its absence.
+    #[cfg(target_os = "linux")]
+    async fn teardown_network(&self, task_id: &str) {
+        if let Some((setup, _)) = &self.networking {
+            if let Err(e) = setup.teardown_task(task_id).await {
+                tracing::warn!(task = %task_id, error = %e, "network teardown failed");
+            }
+        }
     }
 
     /// Override the snapshotter (default: overlayfs).
@@ -283,6 +385,19 @@ impl Runtime for ContainerdRuntime {
     async fn start(&self, task_id: &TaskId, spec: &TaskSpec) -> Result<String, RuntimeError> {
         let container_id = task_id.clone();
         let secret_mounts = self.resolve_secrets(spec)?;
+
+        #[cfg(target_os = "linux")]
+        let network = self.prepare_network(&container_id, spec).await?;
+        #[cfg(not(target_os = "linux"))]
+        let network: Option<oci::NetworkSpec> = {
+            if !spec.ips.is_empty() {
+                return Err(RuntimeError::Start(
+                    "task networking requires Linux (netns + bridges)".into(),
+                ));
+            }
+            None
+        };
+
         let image = self.ensure_image(&spec.image).await?;
 
         let mut client = self.client.lock().await;
@@ -302,8 +417,14 @@ impl Runtime for ContainerdRuntime {
             .await
             .map_err(|error| RuntimeError::Start(format!("prepare snapshot: {error}")))?;
 
-        let oci_any = oci::spec_to_any_with_image(&container_id, spec, &secret_mounts, &config)
-            .map_err(RuntimeError::Start)?;
+        let oci_any = oci::spec_to_any_with_image(
+            &container_id,
+            spec,
+            &secret_mounts,
+            &config,
+            network.as_ref(),
+        )
+        .map_err(RuntimeError::Start)?;
 
         let container = Container {
             id: container_id.clone(),
@@ -321,10 +442,11 @@ impl Runtime for ContainerdRuntime {
             }),
         };
 
-        client
-            .create_container(container)
-            .await
-            .map_err(|error| RuntimeError::Start(format!("create container: {error}")))?;
+        if let Err(error) = client.create_container(container).await {
+            #[cfg(target_os = "linux")]
+            self.teardown_network(&container_id).await;
+            return Err(RuntimeError::Start(format!("create container: {error}")));
+        }
         let container_created = true;
 
         let pid = match client.create_task(&container_id, mounts, "", "").await {
@@ -340,6 +462,8 @@ impl Runtime for ContainerdRuntime {
                     false,
                 )
                 .await;
+                #[cfg(target_os = "linux")]
+                self.teardown_network(&container_id).await;
                 return Err(RuntimeError::Start(format!(
                     "create task: {error}{rollback}"
                 )));
@@ -358,6 +482,8 @@ impl Runtime for ContainerdRuntime {
                 true,
             )
             .await;
+            #[cfg(target_os = "linux")]
+            self.teardown_network(&container_id).await;
             return Err(RuntimeError::Start(format!(
                 "start task: {error}{rollback}"
             )));
@@ -460,6 +586,9 @@ impl Runtime for ContainerdRuntime {
             tracing::warn!(container = %container_id, error = %error, "failed to remove snapshot");
         }
         drop(client);
+
+        #[cfg(target_os = "linux")]
+        self.teardown_network(container_id).await;
 
         tracing::info!(container = %container_id, "containerd: stopped container");
         Ok(())

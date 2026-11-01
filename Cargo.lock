@@ -2062,6 +2062,7 @@ dependencies = [
  "serde",
  "tempfile",
  "thiserror 2.0.21",
+ "tokio",
  "tracing",
  "x25519-dalek",
 ]
@@ -2076,6 +2077,7 @@ dependencies = [
  "hyper-util",
  "libc",
  "minga-bus",
+ "minga-net",
  "minga-sandbox",
  "minga-state",
  "minga-telemetry",
@@ -2114,6 +2116,7 @@ dependencies = [
  "bincode",
  "minga-bus",
  "minga-compose",
+ "minga-net",
  "minga-state",
  "minga-telemetry",
  "serde",

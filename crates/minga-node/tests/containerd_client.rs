@@ -56,9 +56,12 @@ async fn tasks_list_reaches_the_real_service() {
         .expect("Tasks/List should reach the real containerd task service");
 
     // We do not assert emptiness — other containers may be running. We
-    // assert that we got a well-formed response.
+    // assert that we got a well-formed response. The task's identity is
+    // its `id`: containerd 2.x leaves `container_id` empty in List
+    // responses (verified against 2.2.1), so asserting it is populated
+    // would only ever pass on an empty list.
     for task in &response {
-        assert!(!task.container_id.is_empty());
+        assert!(!task.id.is_empty());
     }
 }
 

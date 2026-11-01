@@ -171,9 +171,6 @@ pub struct Task {
     pub node_id: NodeId,
     pub state: TaskState,
     pub spec: TaskSpec,
-    /// IP addresses assigned to this task, keyed by network ID.
-    #[serde(default)]
-    pub ips: HashMap<NetworkId, String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -202,6 +199,11 @@ pub struct TaskSpec {
     /// Secret references for this task. References only — no values.
     #[serde(default)]
     pub secrets: Vec<SecretRef>,
+    /// IP addresses assigned to this task, keyed by network ID. Lives on
+    /// the spec (not only the task record) so it travels with the task
+    /// through the event bus to the node's runtime.
+    #[serde(default)]
+    pub ips: HashMap<NetworkId, String>,
 }
 
 /// Restart policy for a task.

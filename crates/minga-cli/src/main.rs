@@ -523,6 +523,19 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
         }
     };
 
+    // Node networking (Linux + real containers only): netns/bridge setup
+    // for tasks and DNS service discovery. Mock workloads never join
+    // overlay networks, so they need neither.
+    #[cfg(target_os = "linux")]
+    let networking: Option<Arc<minga_node::NetworkSetup>> = if args.runtime == "containerd" {
+        Some(Arc::new(minga_node::NetworkSetup::new(format!(
+            "{}/net",
+            args.data_dir
+        ))))
+    } else {
+        None
+    };
+
     // Construct the container runtime based on --runtime flag.
     let runtime: Arc<dyn minga_node::Runtime> = match args.runtime.as_str() {
         "mock" => {
@@ -540,6 +553,13 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
                     tracing::info!(
                         secret_store = %store.root().display(),
                         "node secret store configured"
+                    );
+                    #[cfg(target_os = "linux")]
+                    let rt = rt.with_networking(
+                        networking
+                            .clone()
+                            .expect("containerd runtime has networking"),
+                        state.clone(),
                     );
                     Arc::new(rt.with_secret_store(store))
                 }
@@ -612,6 +632,7 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
     };
 
     // Create the supervisor with optional agent executor.
+    #[allow(unused_mut)]
     let supervisor = match &agent_executor {
         Some(exec) => minga_node::Supervisor::with_agent_executor(
             state.clone(),
@@ -621,6 +642,16 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
             args.node_id,
         ),
         None => minga_node::Supervisor::with_bus(state.clone(), runtime, bus.clone(), args.node_id),
+    };
+    #[cfg(target_os = "linux")]
+    let supervisor = match networking {
+        Some(setup) => {
+            let upstream = minga_node::system_upstream_resolver();
+            tracing::info!(upstream = ?upstream, "dns: upstream resolver");
+            let net = minga_node::supervisor::SupervisorNetworking::new(setup, upstream);
+            supervisor.with_networking(net)
+        }
+        None => supervisor,
     };
     let interval = Duration::from_secs(args.interval);
 

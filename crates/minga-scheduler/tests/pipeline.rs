@@ -101,7 +101,7 @@ services:
         node(2, 8.0, 1 << 34, 0, &[]),
         node(3, 8.0, 1 << 34, 0, &[]),
     ];
-    let actions = plan(&translated.services, &[], &nodes, 0);
+    let actions = plan(&translated.services, &[], &nodes, &[], 0);
 
     // web: 2 replicas, api: 3 replicas → 5 create actions.
     let creates: Vec<&str> = actions
@@ -126,7 +126,7 @@ services:
             _ => None,
         })
         .collect();
-    let actions2 = plan(&translated.services, &tasks, &nodes, 0);
+    let actions2 = plan(&translated.services, &tasks, &nodes, &[], 0);
     assert!(actions2.is_empty(), "reconcile should be idempotent");
 }
 
@@ -193,12 +193,12 @@ networks:
     ];
 
     // Inference: 1 replica, GPU constraint → nodes 1 or 3.
-    let inference_tasks = place_service(inference, &nodes, &[], 0);
+    let inference_tasks = place_service(inference, &nodes, &[], &[], 0);
     assert_eq!(inference_tasks.len(), 1);
     assert!(inference_tasks[0].node_id == 1 || inference_tasks[0].node_id == 3);
 
     // Sensors: global → one per node.
-    let sensors_tasks = place_service(sensors, &nodes, &[], 0);
+    let sensors_tasks = place_service(sensors, &nodes, &[], &[], 0);
     assert_eq!(sensors_tasks.len(), 3);
     let sensor_nodes: Vec<u64> = sensors_tasks.iter().map(|t| t.node_id).collect();
     assert_eq!(sensor_nodes, vec![1, 2, 3]);
@@ -300,7 +300,7 @@ secrets:
     let translated = translate_project(&project, "data").unwrap();
     let db = translated.services.iter().find(|s| s.name == "db").unwrap();
     let nodes = vec![node(1, 8.0, 1 << 34, 0, &[])];
-    let tasks = place_service(db, &nodes, &[], 0);
+    let tasks = place_service(db, &nodes, &[], &[], 0);
 
     assert_eq!(tasks.len(), 1);
     assert_eq!(tasks[0].spec.secrets.len(), 1);
@@ -323,7 +323,7 @@ services:
     let nodes = vec![node(1, 8.0, 1 << 34, 0, &[]), node(2, 8.0, 1 << 34, 0, &[])];
 
     // Initial deploy: 3 tasks created.
-    let actions = plan(&translated.services, &[], &nodes, 0);
+    let actions = plan(&translated.services, &[], &nodes, &[], 0);
     assert_eq!(actions.len(), 3);
 
     // Simulate the tasks being created.
@@ -338,7 +338,7 @@ services:
     // Scale down to 1 replica.
     let mut scaled = translated.clone();
     scaled.services[0].replicas = 1;
-    let actions = plan(&scaled.services, &tasks, &nodes, 0);
+    let actions = plan(&scaled.services, &tasks, &nodes, &[], 0);
     let removes: Vec<&str> = actions
         .iter()
         .filter_map(|a| match a {
@@ -394,7 +394,7 @@ services:
     let project = load(yaml);
     let translated = translate_project(&project, "test").unwrap();
     let nodes = vec![node(1, 4.0, 1 << 34, 0, &[])];
-    let tasks = place_service(&translated.services[0], &nodes, &[], 0);
+    let tasks = place_service(&translated.services[0], &nodes, &[], &[], 0);
     assert_eq!(tasks.len(), 1);
     assert_eq!(tasks[0].state, TaskState::Pending);
     assert_eq!(tasks[0].spec.image, "nginx:latest");
@@ -497,7 +497,7 @@ fn agent_service_full_pipeline() {
 
     // Place tasks on nodes.
     let nodes = vec![node(1, 8.0, 1 << 34, 0, &[]), node(2, 8.0, 1 << 34, 0, &[])];
-    let tasks = place_service(svc, &nodes, &[], 0);
+    let tasks = place_service(svc, &nodes, &[], &[], 0);
     assert_eq!(tasks.len(), 2, "should place 2 replicas");
 
     // Verify tasks have agent workload kind.
@@ -557,7 +557,7 @@ fn mixed_container_and_agent_pipeline() {
     let all_tasks: Vec<_> = translated
         .services
         .iter()
-        .flat_map(|svc| place_service(svc, &nodes, &[], 0))
+        .flat_map(|svc| place_service(svc, &nodes, &[], &[], 0))
         .collect();
     assert_eq!(all_tasks.len(), 2);
 
@@ -590,7 +590,7 @@ fn agent_service_reconcile_creates_agent_tasks() {
     let translated = translate_project(&project, "test").unwrap();
     let nodes = vec![node(1, 4.0, 1 << 30, 0, &[])];
 
-    let actions = plan(&translated.services, &[], &nodes, 0);
+    let actions = plan(&translated.services, &[], &nodes, &[], 0);
     assert_eq!(actions.len(), 1);
 
     match &actions[0] {

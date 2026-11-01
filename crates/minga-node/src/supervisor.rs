@@ -94,6 +94,80 @@ struct RestartState {
 /// Tracks restart state per task ID.
 type RestartStates = Arc<Mutex<HashMap<TaskId, RestartState>>>;
 
+/// Node networking for the supervisor: DNS service discovery backed by
+/// cluster state. The data plane itself (netns/bridges) is applied by the
+/// container runtime; the supervisor keeps DNS records and listeners in
+/// sync with the tasks placed here.
+#[cfg(target_os = "linux")]
+pub struct SupervisorNetworking {
+    setup: Arc<crate::netns::NetworkSetup>,
+    dns_store: Arc<std::sync::RwLock<minga_net::DnsStore>>,
+    upstream: Option<std::net::SocketAddr>,
+    server: std::sync::Mutex<Option<minga_net::DnsServer>>,
+    current_binds: std::sync::Mutex<Vec<std::net::SocketAddr>>,
+}
+
+#[cfg(target_os = "linux")]
+impl SupervisorNetworking {
+    pub fn new(
+        setup: Arc<crate::netns::NetworkSetup>,
+        upstream: Option<std::net::SocketAddr>,
+    ) -> Self {
+        Self {
+            setup,
+            dns_store: Arc::new(std::sync::RwLock::new(minga_net::DnsStore::new())),
+            upstream,
+            server: std::sync::Mutex::new(None),
+            current_binds: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+}
+
+/// Builds DNS records from services and this node's tasks: every
+/// non-terminal task IP is registered under both the service FQDN
+/// (`web.shop.minga.local`) and its own task FQDN. Pure data — compiled
+/// wherever Linux or tests run.
+#[cfg(any(target_os = "linux", test))]
+fn build_dns_store(
+    services: &[minga_state::types::Service],
+    tasks: &[minga_state::types::Task],
+) -> minga_net::DnsStore {
+    use minga_state::types::TaskState;
+
+    let mut store = minga_net::DnsStore::new();
+    for task in tasks {
+        if matches!(task.state, TaskState::Stopped | TaskState::Failed) {
+            continue;
+        }
+        let Some(svc) = services.iter().find(|s| s.id == task.service_id) else {
+            continue;
+        };
+        let stack = svc
+            .env
+            .get("MINGA_STACK")
+            .map(String::as_str)
+            .unwrap_or("default");
+        // The DNS name is the short service name. `svc.id` is always
+        // `stack.name`; `svc.name` is only bare on the Compose path —
+        // the API path re-derives it as the full ID.
+        let prefix = format!("{stack}.");
+        let short = svc.id.strip_prefix(&prefix).unwrap_or(&svc.name);
+        for raw_ip in task.spec.ips.values() {
+            let Ok(ip) = raw_ip.parse::<std::net::Ipv4Addr>() else {
+                continue;
+            };
+            // Docker semantics: the bare service name resolves directly
+            // (musl-based images have no search-domain support, so the
+            // short name must exist as a record, not only via `search`).
+            store.add(short, ip);
+            store.add(format!("tasks.{short}"), ip);
+            store.add(minga_net::dns::service_fqdn(short, stack), ip);
+            store.add(minga_net::dns::task_fqdn(&task.id, short, stack), ip);
+        }
+    }
+    store
+}
+
 /// The node supervisor. Runs a reconcile loop that converges the local
 /// container/agent state with the tasks assigned to this node.
 ///
@@ -113,6 +187,8 @@ pub struct Supervisor {
     bus_assigned: BusAssignedTasks,
     log_offsets: LogOffsets,
     restart_states: RestartStates,
+    #[cfg(target_os = "linux")]
+    networking: Option<SupervisorNetworking>,
 }
 
 impl Supervisor {
@@ -128,6 +204,8 @@ impl Supervisor {
             bus_assigned: Arc::new(Mutex::new(HashSet::new())),
             log_offsets: Arc::new(Mutex::new(HashMap::new())),
             restart_states: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(target_os = "linux")]
+            networking: None,
         }
     }
 
@@ -150,6 +228,8 @@ impl Supervisor {
             bus_assigned: Arc::new(Mutex::new(HashSet::new())),
             log_offsets: Arc::new(Mutex::new(HashMap::new())),
             restart_states: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(target_os = "linux")]
+            networking: None,
         }
     }
 
@@ -172,7 +252,17 @@ impl Supervisor {
             bus_assigned: Arc::new(Mutex::new(HashSet::new())),
             log_offsets: Arc::new(Mutex::new(HashMap::new())),
             restart_states: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(target_os = "linux")]
+            networking: None,
         }
+    }
+
+    /// Attach node networking (DNS service discovery). The runtime applies
+    /// the data plane; the supervisor syncs DNS records and listeners.
+    #[cfg(target_os = "linux")]
+    pub fn with_networking(mut self, networking: SupervisorNetworking) -> Self {
+        self.networking = Some(networking);
+        self
     }
 
     /// Returns the set of task IDs currently running on this node (containers + agents).
@@ -208,7 +298,92 @@ impl Supervisor {
         // --- Restart policy: check failed containers, restart if needed -------
         actions += self.check_restarts().await;
 
+        // --- DNS: keep records and listeners in sync with placement ----------
+        #[cfg(target_os = "linux")]
+        self.sync_dns().await;
+
         Ok(actions)
+    }
+
+    /// Rebuilds DNS records from cluster state and reconciles the DNS
+    /// server's listen addresses with the networks' bridge gateways.
+    /// Runs every pass: the record rebuild is cheap and idempotent, and
+    /// the server restarts only when the bind set actually changes.
+    #[cfg(target_os = "linux")]
+    async fn sync_dns(&self) {
+        let Some(net) = &self.networking else {
+            return;
+        };
+
+        let services = match self.state.list_services().await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!(error = %e, "dns sync: list services failed");
+                return;
+            }
+        };
+        let tasks = match self.state.list_tasks().await {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::error!(error = %e, "dns sync: list tasks failed");
+                return;
+            }
+        };
+        let networks = match self.state.list_networks().await {
+            Ok(n) => n,
+            Err(e) => {
+                tracing::error!(error = %e, "dns sync: list networks failed");
+                return;
+            }
+        };
+
+        // Only this node's tasks answer from this node's listener — the
+        // records are the same cluster-wide, but only local tasks are
+        // reachable through this node's bridges.
+        let my_tasks: Vec<_> = tasks
+            .iter()
+            .filter(|t| t.node_id == self.node_id)
+            .cloned()
+            .collect();
+        let store = build_dns_store(&services, &my_tasks);
+        tracing::debug!(
+            records = store.len(),
+            services = services.len(),
+            my_tasks = my_tasks.len(),
+            "dns: records rebuilt"
+        );
+        *net.dns_store.write().unwrap() = store;
+
+        let mut binds: Vec<std::net::SocketAddr> = networks
+            .iter()
+            .filter_map(|n| net.setup.gateway_for(&n.id, n.subnet.as_deref()))
+            .map(|ip| std::net::SocketAddr::new(std::net::IpAddr::V4(ip), 53))
+            .collect();
+        binds.sort();
+        binds.dedup();
+
+        let current = net.current_binds.lock().unwrap().clone();
+        if binds == current {
+            return;
+        }
+        if let Some(server) = net.server.lock().unwrap().take() {
+            server.shutdown().await;
+        }
+        if binds.is_empty() {
+            *net.current_binds.lock().unwrap() = binds;
+            return;
+        }
+        match minga_net::DnsServer::start(binds.clone(), net.dns_store.clone(), net.upstream).await
+        {
+            Ok(server) => {
+                tracing::info!(binds = ?binds, "dns: service discovery listening");
+                *net.server.lock().unwrap() = Some(server);
+                *net.current_binds.lock().unwrap() = binds;
+            }
+            Err(e) => {
+                tracing::error!(error = %e, binds = ?binds, "dns: server start failed");
+            }
+        }
     }
 
     /// Check running containers for failures and restart them according
@@ -1028,7 +1203,6 @@ mod tests {
                 resources: ResourceSpec::default(),
                 ..Default::default()
             },
-            ips: HashMap::new(),
         }
     }
 
@@ -1040,6 +1214,78 @@ mod tests {
             resources: ResourceSpec::default(),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn dns_store_maps_service_and_task_names_to_ips() {
+        use minga_state::types::ServiceMode;
+
+        let services = vec![minga_state::types::Service {
+            id: "shop.web".to_string(),
+            name: "web".to_string(),
+            image: "nginx:1.27".to_string(),
+            replicas: 2,
+            mode: ServiceMode::Replicated,
+            constraints: vec![],
+            env: HashMap::from([("MINGA_STACK".to_string(), "shop".to_string())]),
+            ports: vec![],
+            networks: vec!["shop_default".to_string()],
+            resources: ResourceSpec::default(),
+            agent: None,
+            restart_policy: Default::default(),
+            secrets: vec![],
+        }];
+
+        let mut t1 = make_task("shop.web.1", 1);
+        t1.service_id = "shop.web".to_string();
+        t1.state = TaskState::Running;
+        t1.spec
+            .ips
+            .insert("shop_default".to_string(), "10.100.0.2".to_string());
+        let mut t2 = make_task("shop.web.2", 1);
+        t2.service_id = "shop.web".to_string();
+        t2.state = TaskState::Running;
+        t2.spec
+            .ips
+            .insert("shop_default".to_string(), "10.100.0.3".to_string());
+        // A stopped task must not answer.
+        let mut t3 = make_task("shop.web.3", 1);
+        t3.service_id = "shop.web".to_string();
+        t3.state = TaskState::Stopped;
+        t3.spec
+            .ips
+            .insert("shop_default".to_string(), "10.100.0.4".to_string());
+
+        let store = build_dns_store(&services, &[t1.clone(), t2.clone(), t3.clone()]);
+
+        let svc_ips = store.resolve("web.shop.minga.local");
+        assert_eq!(svc_ips.len(), 2);
+        assert!(svc_ips.contains(&"10.100.0.2".parse().unwrap()));
+        assert!(svc_ips.contains(&"10.100.0.3".parse().unwrap()));
+
+        // Bare names resolve directly (musl has no search domains).
+        assert_eq!(store.resolve("web").len(), 2);
+        assert_eq!(store.resolve("tasks.web").len(), 2);
+
+        let task_ips = store.resolve("shop.web.1.web.shop.minga.local");
+        assert_eq!(
+            task_ips,
+            vec!["10.100.0.2".parse::<std::net::Ipv4Addr>().unwrap()]
+        );
+
+        assert!(store.resolve("other.shop.minga.local").is_empty());
+
+        // The API path re-derives `name` as the full ID; DNS must still
+        // use the short name.
+        let mut api_svc = services[0].clone();
+        api_svc.name = "shop.web".to_string();
+        let store = build_dns_store(&[api_svc], &[t1, t2, t3]);
+        let svc_ips = store.resolve("web.shop.minga.local");
+        assert_eq!(
+            svc_ips.len(),
+            2,
+            "API-form name must derive the short DNS name"
+        );
     }
 
     fn spec_to_payload(spec: &TaskSpec) -> Vec<u8> {
@@ -1330,7 +1576,6 @@ mod tests {
                 }),
                 ..Default::default()
             },
-            ips: HashMap::new(),
         }
     }
 
@@ -1698,7 +1943,6 @@ mod tests {
             node_id: 1,
             state: TaskState::Pending,
             spec,
-            ips: HashMap::new(),
         };
         store.upsert_task(task).await.unwrap();
 
@@ -1733,7 +1977,6 @@ mod tests {
             node_id: 1,
             state: TaskState::Pending,
             spec,
-            ips: HashMap::new(),
         };
         store.upsert_task(task).await.unwrap();
 
@@ -1772,7 +2015,6 @@ mod tests {
             node_id: 1,
             state: TaskState::Pending,
             spec,
-            ips: HashMap::new(),
         };
         store.upsert_task(task).await.unwrap();
 

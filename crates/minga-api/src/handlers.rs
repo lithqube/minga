@@ -60,6 +60,7 @@ async fn ensure_placeable(
 ) -> ApiResult<()> {
     let nodes = app.store.list_nodes().await?;
     let all_tasks = app.store.list_tasks().await?;
+    let networks = app.store.list_networks().await?;
     let tasks: Vec<_> = match updating {
         Some(id) => all_tasks
             .into_iter()
@@ -67,7 +68,7 @@ async fn ensure_placeable(
             .collect(),
         None => all_tasks,
     };
-    minga_scheduler::check_placeable(svc, &nodes, &tasks, unix_now())
+    minga_scheduler::check_placeable(svc, &nodes, &tasks, &networks, unix_now())
         .map_err(|e| conflict(e.to_string()))
 }
 
@@ -859,7 +860,6 @@ mod tests {
                     },
                     ..Default::default()
                 },
-                ips: HashMap::new(),
             })
             .await
             .unwrap();

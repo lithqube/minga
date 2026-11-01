@@ -34,6 +34,7 @@
 //! ```
 
 pub mod constraints;
+pub mod netassign;
 pub mod placement;
 pub mod reconcile;
 pub mod secrets;
@@ -99,8 +100,15 @@ impl Scheduler {
         let nodes = self.state.list_nodes().await?;
         let services = self.state.list_services().await?;
         let tasks = self.state.list_tasks().await?;
+        let networks = self.state.list_networks().await?;
 
-        let actions = plan(&services, &tasks, &nodes, minga_state::types::unix_now());
+        let actions = plan(
+            &services,
+            &tasks,
+            &nodes,
+            &networks,
+            minga_state::types::unix_now(),
+        );
 
         for action in &actions {
             match action {

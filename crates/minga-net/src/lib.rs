@@ -36,12 +36,14 @@
 
 pub mod cidr;
 pub mod dns;
+pub mod dns_server;
 pub mod ipam;
 pub mod overlay;
 pub mod wireguard;
 
 pub use cidr::{Cidr, CidrError, DEFAULT_SUPERNET, DEFAULT_WG_PORT};
 pub use dns::{DnsStore, MINGA_DOMAIN};
+pub use dns_server::DnsServer;
 pub use ipam::{Ipam, IpamError};
 pub use overlay::{OverlayError, OverlayManager, PeerInfo};
 pub use wireguard::{InterfaceConfig, KeyPair, Peer, WgError};

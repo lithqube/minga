@@ -39,6 +39,8 @@
 
 pub mod agent;
 pub mod containerd;
+#[cfg(target_os = "linux")]
+pub mod netns;
 pub mod registration;
 pub mod runtime;
 pub mod secrets;
@@ -49,8 +51,12 @@ pub use agent::{
     MockAgentExecutor, WasmtimeAgentExecutor,
 };
 pub use containerd::ContainerdRuntime;
+#[cfg(target_os = "linux")]
+pub use netns::{system_upstream_resolver, NetworkSetup, TaskNetAttachment};
 pub use registration::{host_capacity, register_self, NodeIdentity, NodeMembership};
 pub use runtime::{
     shared_runtime, ContainerInfo, ContainerStatus, MockRuntime, Runtime, RuntimeError,
 };
+#[cfg(target_os = "linux")]
+pub use supervisor::SupervisorNetworking;
 pub use supervisor::{Supervisor, SupervisorError};

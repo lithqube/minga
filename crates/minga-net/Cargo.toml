@@ -13,6 +13,7 @@ ipnet.workspace = true
 rand.workspace = true
 serde = { workspace = true, features = ["derive"] }
 thiserror.workspace = true
+tokio.workspace = true
 tracing.workspace = true
 x25519-dalek.workspace = true
 

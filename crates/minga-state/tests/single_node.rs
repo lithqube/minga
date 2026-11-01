@@ -83,7 +83,6 @@ fn sample_task(id: &str, service_id: &str, node_id: u64) -> Task {
             resources: ResourceSpec::default(),
             ..Default::default()
         },
-        ips: HashMap::new(),
     }
 }
 

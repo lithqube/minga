@@ -98,7 +98,7 @@ fn translate_service(
 
     // Environment: ListOrMap → HashMap. Keys with no value (pass-through
     // from the deploy environment) are resolved here from the process env.
-    let env: HashMap<String, String> = svc
+    let mut env: HashMap<String, String> = svc
         .environment
         .0
         .iter()
@@ -110,6 +110,11 @@ fn translate_service(
             (k.clone(), val)
         })
         .collect();
+    // Stack marker: the API path derives the same env from the Docker
+    // stack-namespace label. Every consumer (DNS names, outbound labels,
+    // filter pseudo-labels) reads it from here.
+    env.entry("MINGA_STACK".to_string())
+        .or_insert_with(|| stack.to_string());
 
     // Ports: take the start of each range (Phase 0 — no port range expansion).
     let ports = svc
