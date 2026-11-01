@@ -127,7 +127,7 @@ impl RaftLogStorage<TypeConfig> for RedbLogStore {
         // Find the last log entry.
         {
             let table = tx.open_table(LOGS_TABLE).map_err(io_err)?;
-            if let Some(result) = table.range(0..u64::MAX).map_err(io_err)?.last() {
+            if let Some(result) = table.range(0..u64::MAX).map_err(io_err)?.next_back() {
                 let (_key, value) = result.map_err(io_err)?;
                 let entry: Entry<TypeConfig> =
                     bincode::serde::decode_from_slice(value.value(), bincode::config::standard())

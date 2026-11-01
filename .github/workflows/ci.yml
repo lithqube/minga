@@ -58,4 +58,4 @@ jobs:
           sudo ctr -n minga images pull docker.io/library/nginx:1.27
 
       - name: Daemon-backed suites (fail closed when the daemon is absent)
-        run: sudo MINGA_REQUIRE_CONTAINERD=1 cargo test -p minga-node --test containerd --test containerd_client
+        run: sudo -E env "PATH=$PATH" MINGA_REQUIRE_CONTAINERD=1 cargo test -p minga-node --test containerd --test containerd_client
