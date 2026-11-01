@@ -7,6 +7,10 @@ on:
 permissions:
   contents: write
 
+env:
+  # Bundled next to `minga`; the manager's NATS sidecar looks there first.
+  NATS_VERSION: v2.10.22
+
 jobs:
   build:
     name: ${{ matrix.target }}
@@ -16,8 +20,10 @@ jobs:
         include:
           - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
+            nats_arch: amd64
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
+            nats_arch: arm64
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -31,16 +37,43 @@ jobs:
       - name: Build the release binary
         run: cargo build --release -p minga-cli --target ${{ matrix.target }}
 
+      - name: Fetch nats-server
+        run: |
+          curl -fsSL "https://github.com/nats-io/nats-server/releases/download/${NATS_VERSION}/nats-server-${NATS_VERSION}-linux-${{ matrix.nats_arch }}.tar.gz" \
+            | tar -xz --strip-components=1 --wildcards '*/nats-server'
+          ./nats-server --version
+
       - name: Package
         run: |
           mkdir -p dist
-          cp "target/${{ matrix.target }}/release/minga" dist/
+          cp "target/${{ matrix.target }}/release/minga" nats-server dist/
           cp install.sh README.md LICENSE CHANGELOG.md dist/
-          tar -C dist -czf "minga-${{ matrix.target }}.tar.gz" minga install.sh README.md LICENSE CHANGELOG.md
+          tar -C dist -czf "minga-${{ matrix.target }}.tar.gz" minga nats-server install.sh README.md LICENSE CHANGELOG.md
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: minga-${{ matrix.target }}
+          path: minga-${{ matrix.target }}.tar.gz
+
+  publish:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        run: cd dist && sha256sum minga-*.tar.gz > SHA256SUMS && cat SHA256SUMS
 
       - name: Upload release assets
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            minga-${{ matrix.target }}.tar.gz
+            dist/minga-*.tar.gz
+            dist/SHA256SUMS
             install.sh

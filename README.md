@@ -31,9 +31,9 @@ Minga ships as **one small binary**. No Docker daemon, no Kubernetes, no etcd. I
 - **Raft consensus** — desired state and placement go through [openraft](https://docs.rs/openraft), persisted in [redb](https://docs.rs/redb). No external etcd.
 - **Overlay networking** — per-task IPs from deterministic IPAM, bridge + netns per task, DNAT port publishing, and embedded service-discovery DNS. (WireGuard mesh between nodes is generated as config but not yet applied.)
 - **Agent-first workloads** — wasmtime and Firecracker sandbox pools, LLM egress proxy with per-workload token and cost budgets.
-- **Observability built-in** — Prometheus metrics (`/metrics`), health endpoints (`/healthz`, `/readyz`), structured JSON logging with correlation IDs.
+- **Observability built-in** — Prometheus metrics (`/metrics`), health endpoints (`/healthz`, `/readyz`) on `minga api` and on nodes via `--metrics-bind`, structured JSON logs for the long-running roles. (Correlation IDs across bus hops are not propagated yet.)
 - **Air-gapped ready** — no cloud dependencies, offline image distribution, vendored builds.
-- **One binary** — manager, worker, and CLI in a single statically-linked executable.
+- **One binary** — manager, worker, and CLI in a single executable (glibc-linked; the release bundles `nats-server` alongside it).
 
 ## Quick start
 
@@ -86,7 +86,7 @@ services in startup order:
   │  ┌──────────┐                                                        │
   │  │minga-    │                                                        │
   │  │telemetry │  Prometheus metrics, health endpoints,                │
-  │  │(metrics,  │  structured JSON logging with correlation IDs         │
+  │  │(metrics,  │  structured JSON logging                              │
   │  │ healthz) │                                                        │
   │  └──────────┘                                                        │
   └───────────────────────────────────────────────────────────────────────────┘
@@ -115,7 +115,7 @@ Decisions are recorded as [ADRs](docs/adr/) in the repo.
 | `minga-net` | **Done** | Overlay networking: CIDR utilities, deterministic IPAM (hash-based allocation, linear probing), WireGuard keypair generation (X25519) + `wg-quick` config generation, DNS service discovery (`minga.local`), `OverlayManager` coordinator. 70 tests. |
 | `minga-sandbox` | **Done** | Agent sandboxes: `SandboxRuntime` trait with `MockSandboxRuntime` (testing), `WasmtimeRuntime` (real WASM execution with fuel metering, memory limits, timeouts), `WarmPool` (pre-warmed sandbox pool with acquire/release, background replenish/evict), `FirecrackerRuntime` stub (Linux + KVM). Wired into the supervisor via `WasmtimeAgentExecutor`. CLI: `minga sandbox run`, `minga sandbox info`. 36 tests. |
 | `minga-egress` | **Done** | LLM egress proxy (axum): per-workload token budgets with sliding windows, LRU response caching with TTL, secret redaction (10 built-in rules: API keys, AWS keys, JWTs, credit cards, etc.), reverse proxy with token metering from `usage.total_tokens`. Wired into the node via `--egress-bind` / `--egress-upstream` flags. CLI: `minga egress --bind --upstream --default-budget`. 53 tests. |
-| `minga-telemetry` | **Done** | Observability crate: Prometheus metrics registry (`minga_*` prefix), `/metrics` endpoint, `/healthz` (liveness), `/readyz` (readiness: Raft + bus), structured JSON logging via `tracing` with correlation IDs from bus headers. Integrated into `minga-api` and `minga-node`. 0 tests (integration via other crates). |
+| `minga-telemetry` | **Done** | Observability crate: Prometheus metrics registry (`minga_*` prefix), `/metrics` endpoint, `/healthz` (liveness), `/readyz` (readiness: Raft + bus), structured JSON logging via `tracing` (`MINGA_LOG_LEVEL`). Served by `minga api` and, with `--metrics-bind`, by `minga manager`/`minga worker`. Correlation IDs are not propagated yet. |
 
 ## Deployment Topologies
 
@@ -329,7 +329,7 @@ Requirements: Rust 1.80+ (stable), with `rustfmt` and `clippy` components.
 - [x] **Agent sandboxes** — `minga-sandbox` crate: `SandboxRuntime` trait with `MockSandboxRuntime`, `WasmtimeRuntime` (real WASM execution via wasmtime 24 with fuel metering, memory limits, timeouts, output capture), `WarmPool` (pre-warmed pool with acquire/release/run, background replenish + idle eviction, pool stats), `FirecrackerRuntime` stub (Linux + KVM). WASM module contract: exports `memory` + `run(input_len: i32) -> i32`, input at offset 1024, output at offset 0 with 4-byte LE length prefix. CLI: `minga sandbox run --module foo.wasm --input '{"q":"hi"}'`, `minga sandbox info`. 36 tests (38 on Linux).
 - [x] **LLM egress proxy** — `minga-egress` crate: axum reverse proxy with per-workload token budgets (`BudgetTracker`, sliding window, register/unregister/check/record), LRU response caching (`ResponseCache`, FNV-1a key, TTL, only caches 2xx), secret redaction (`SecretRedactor`, 10 built-in regex rules: OpenAI/Anthropic keys, AWS keys, JWTs, credit cards, emails, hex secrets, private keys, bearer tokens), token metering from `usage.total_tokens` with char/4 fallback. Workload identified via `X-Minga-Workload` header. CLI: `minga egress --bind 0.0.0.0:8080 --upstream https://api.openai.com --default-budget 100000`. 53 tests.
 - [x] **Agent workloads end-to-end** — `x-minga-agent` Compose extension declares agent services (WASM module, fuel/memory/timeout limits, token budget, egress URL, prompt). Flows through the full pipeline: compose parsing → scheduler translation (`WorkloadKind::Agent` on `TaskSpec`) → Raft placement → bus dispatch → supervisor (`AgentExecutor` trait: `MockAgentExecutor`, `WasmtimeAgentExecutor`) → WASM sandbox execution. Egress proxy co-located on the node. CLI: `minga node --sandbox-runtime wasmtime --module-dir ./modules --egress-bind 127.0.0.1:8080 --egress-upstream https://api.openai.com`, `minga agent ls`. [ADR 0003](docs/adr/0003-agent-workloads.md). 3 new pipeline integration tests (full agent pipeline, mixed container+agent, reconcile creates agent tasks).
-- [x] **Observability (Wave 9)** — Prometheus metrics (`/metrics`), health endpoints (`/healthz`, `/readyz`), structured JSON logging with correlation IDs. `minga-telemetry` crate. [ADR 0004](docs/adr/0004-observability.md). Integrated into `minga-api` and `minga-node`.
+- [x] **Observability (Wave 9)** — Prometheus metrics (`/metrics`), health endpoints (`/healthz`, `/readyz`), structured JSON logging. `minga-telemetry` crate. [ADR 0004](docs/adr/0004-observability.md). Integrated into `minga-api` and `minga-node`.
 - [x] **NATS TLS (Wave 10)** — mTLS between nodes: explicit CA and client identity, TLS-only connector, no insecure escape hatch, mandatory SAN verification, a missing or malformed CA/cert/key is a hard error. Real `nats-server` integration tests in `crates/minga-bus/tests/nats_tls.rs`. The plaintext sidecar is restricted to loopback.
 
 **Roadmap to `v0.1.0`** — full detail in [`docs/roadmap-v0.1.0.md`](docs/roadmap-v0.1.0.md). Seven gates, each with an executable exit criterion; the evidence for every checkmark is in `.planning/STATE.md`:

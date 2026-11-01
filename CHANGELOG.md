@@ -1,5 +1,32 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+- `minga deploy` kept neither `deploy.restart_policy` nor `x-minga-agent`:
+  the Docker-API round trip reset the restart policy to its default (and
+  always reported `any`), and rejected agent services for having no image.
+  Both now reach state; the agent spec travels as the `minga.agent` label.
+- `/readyz` always answered 503. It now reflects a known Raft leader (and,
+  on nodes, a reachable bus).
+- Metrics were registered but never updated. Task starts/stops/restarts,
+  running tasks, scheduler reconcile duration and placements, Raft
+  leadership and bus publish latency now move.
+- A lease renewal could undo an operator's drain that landed between its
+  read and its write. Renewal is now one atomic Raft command.
+
+### Added
+- `--metrics-bind` (`MINGA_METRICS_BIND`) on `minga manager`/`minga worker`
+  serves `/metrics`, `/healthz` and `/readyz`.
+- JSON logs on stderr for `manager`, `worker` and `api`; level from
+  `MINGA_LOG_LEVEL`, then `RUST_LOG`, default `info`.
+- Release archives bundle `nats-server`, and the release publishes
+  `SHA256SUMS`; `install.sh` verifies the checksum and installs both.
+
+### Upgrade note
+- Lease renewal uses a new Raft command. Upgrade every node before
+  relying on mixed versions: an older node cannot apply it.
+
 ## [0.1.0] — 2026-11-01
 
 First production-shaped release: a single binary an operator can install on

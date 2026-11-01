@@ -161,6 +161,29 @@ impl RedbStateMachine {
                 t.remove(id.to_string().as_str()).map_err(sm_io_err)?;
                 Ok(StateResponse::Ok)
             }
+            StateCommand::RenewNodeLease(node) => {
+                let mut t = tx.open_table(NODES_TABLE).map_err(sm_io_err)?;
+                let key = node.id.to_string();
+                let existing: Option<ClusterNode> = t
+                    .get(key.as_str())
+                    .map_err(sm_io_err)?
+                    .map(|v| {
+                        bincode::serde::decode_from_slice(v.value(), bincode::config::standard())
+                            .map(|(n, _)| n)
+                    })
+                    .transpose()
+                    .map_err(|e| sm_storage_err(ErrorSubject::Store, ErrorVerb::Read, e))?;
+                let mut record = existing.unwrap_or_else(|| node.clone());
+                record.last_seen_unix = node.last_seen_unix;
+                if record.status != NodeStatus::Draining {
+                    record.status = NodeStatus::Active;
+                }
+                let bytes = bincode::serde::encode_to_vec(&record, bincode::config::standard())
+                    .map_err(|e| sm_storage_err(ErrorSubject::Store, ErrorVerb::Write, e))?;
+                t.insert(key.as_str(), bytes.as_slice())
+                    .map_err(sm_io_err)?;
+                Ok(StateResponse::Ok)
+            }
             StateCommand::UpsertService(svc) => {
                 let mut t = tx.open_table(SERVICES_TABLE).map_err(sm_io_err)?;
                 let bytes = bincode::serde::encode_to_vec(svc, bincode::config::standard())

@@ -8,12 +8,13 @@ static INIT: OnceLock<()> = OnceLock::new();
 /// Safe to call multiple times — subsequent calls are no-ops.
 pub fn init_logging() {
     INIT.get_or_init(|| {
-        let env_filter = EnvFilter::try_from_default_env()
-            .or_else(|_| EnvFilter::try_new("info,minga=debug"))
-            .expect("valid log filter");
+        let env_filter = EnvFilter::try_from_env("MINGA_LOG_LEVEL")
+            .or_else(|_| EnvFilter::try_from_default_env())
+            .unwrap_or_else(|_| EnvFilter::new("info"));
 
         let json_layer = fmt::layer()
             .json()
+            .with_writer(std::io::stderr)
             .with_current_span(true)
             .with_span_list(true)
             .with_target(true)

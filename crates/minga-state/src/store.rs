@@ -273,6 +273,13 @@ impl StateStore {
         Ok(())
     }
 
+    /// Refreshes `node`'s lease atomically in the state machine; a
+    /// draining node stays draining. See [`StateCommand::RenewNodeLease`].
+    pub async fn renew_node_lease(&self, node: ClusterNode) -> Result<(), StateError> {
+        self.propose(StateCommand::RenewNodeLease(node)).await?;
+        Ok(())
+    }
+
     pub async fn remove_node(&self, id: NodeId) -> Result<(), StateError> {
         self.propose(StateCommand::RemoveNode(id)).await?;
         Ok(())

@@ -14,12 +14,16 @@ use std::collections::HashMap;
 
 use chrono::Utc;
 use minga_state::types::{
-    ClusterNode, Config as MingaConfig, Network, NetworkId, NodeId, NodeStatus as MingaNodeStatus,
-    PortMapping, ResourceSpec, Secret as MingaSecret, SecretRef, Service, ServiceMode, Task,
-    TaskState,
+    AgentSpec, ClusterNode, Config as MingaConfig, Network, NetworkId, NodeId,
+    NodeStatus as MingaNodeStatus, PortMapping, ResourceSpec, RestartCondition, RestartPolicy,
+    Secret as MingaSecret, SecretRef, Service, ServiceMode, Task, TaskState,
 };
 
 use crate::models;
+
+/// Service label that carries an agent workload's spec (JSON) through the
+/// Docker API, which has no field for it. Stripped from state labels.
+pub const AGENT_LABEL: &str = "minga.agent";
 
 // ---------------------------------------------------------------------------
 // Inbound: Docker → Minga
@@ -42,9 +46,43 @@ pub fn service_spec_to_state(spec: &models::ServiceSpec) -> Result<Service, Stri
         .as_ref()
         .ok_or_else(|| format!("service '{name}': TaskTemplate.ContainerSpec is required"))?;
 
-    if container.Image.is_empty() {
+    let agent = spec
+        .Labels
+        .get(AGENT_LABEL)
+        .map(|raw| {
+            serde_json::from_str::<AgentSpec>(raw)
+                .map_err(|e| format!("service '{name}': invalid {AGENT_LABEL} label: {e}"))
+        })
+        .transpose()?;
+
+    if container.Image.is_empty() && agent.is_none() {
         return Err(format!("service '{name}': ContainerSpec.Image is required"));
     }
+
+    // Docker's defaults when a field is absent: condition `any`, and
+    // MaxAttempts 0 means unlimited. Durations are nanoseconds.
+    let restart_policy = match &spec.TaskTemplate.RestartPolicy {
+        None => RestartPolicy::default(),
+        Some(p) => RestartPolicy {
+            condition: match p.Condition.as_deref() {
+                None | Some("any") => RestartCondition::Any,
+                Some("on-failure") => RestartCondition::OnFailure,
+                Some("none") => RestartCondition::None,
+                Some(other) => {
+                    return Err(format!(
+                        "service '{name}': unknown restart condition {other:?}"
+                    ))
+                }
+            },
+            delay_secs: p
+                .Delay
+                .map_or(RestartPolicy::default().delay_secs, |n| n / 1_000_000_000),
+            max_attempts: p
+                .MaxAttempts
+                .filter(|&n| n > 0)
+                .map(|n| u32::try_from(n).unwrap_or(u32::MAX)),
+        },
+    };
 
     // Parse env list ("KEY=VAL") into a map.
     let mut env: HashMap<String, String> = HashMap::new();
@@ -212,12 +250,17 @@ pub fn service_spec_to_state(spec: &models::ServiceSpec) -> Result<Service, Stri
         ports,
         networks,
         resources,
-        agent: None,
-        restart_policy: Default::default(),
+        agent,
+        restart_policy,
         secrets,
         command,
         entrypoint,
-        labels: spec.Labels.clone(),
+        labels: spec
+            .Labels
+            .iter()
+            .filter(|(k, _)| k.as_str() != AGENT_LABEL)
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
         healthcheck,
         mounts,
     })
@@ -272,6 +315,12 @@ pub fn service_to_docker(svc: &Service) -> models::Service {
         if let Some(stack) = svc.env.get("MINGA_STACK") {
             labels.insert("com.docker.stack.namespace".to_string(), stack.clone());
         }
+    }
+    if let Some(agent) = &svc.agent {
+        labels.insert(
+            AGENT_LABEL.to_string(),
+            serde_json::to_string(agent).expect("AgentSpec has only JSON-safe fields"),
+        );
     }
 
     // Secret references, outbound. Only identifiers and targets — never a
@@ -421,8 +470,17 @@ pub fn service_to_docker(svc: &Service) -> models::Service {
                 ContainerSpec: Some(container_spec),
                 Resources: Some(resources),
                 RestartPolicy: Some(models::RestartPolicy {
-                    Condition: Some("any".to_string()),
-                    ..Default::default()
+                    Condition: Some(
+                        match svc.restart_policy.condition {
+                            RestartCondition::None => "none",
+                            RestartCondition::OnFailure => "on-failure",
+                            RestartCondition::Any => "any",
+                        }
+                        .to_string(),
+                    ),
+                    Delay: Some(svc.restart_policy.delay_secs * 1_000_000_000),
+                    MaxAttempts: svc.restart_policy.max_attempts.map(u64::from),
+                    Window: None,
                 }),
                 Networks: networks.clone(),
                 LogDriver: None,

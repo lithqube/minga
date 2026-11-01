@@ -30,21 +30,24 @@ case "$arch" in
 esac
 
 if [ "$VERSION" = "latest" ]; then
-    url="https://github.com/$REPO/releases/latest/download/minga-$target.tar.gz"
+    base="https://github.com/$REPO/releases/latest/download"
 else
-    url="https://github.com/$REPO/releases/download/$VERSION/minga-$target.tar.gz"
+    base="https://github.com/$REPO/releases/download/$VERSION"
 fi
+archive="minga-$target.tar.gz"
 
-echo "downloading minga ($target) from $url"
+echo "downloading minga ($target) from $base/$archive"
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
-curl -fsSL "$url" | tar -xz -C "$tmp"
+curl -fsSL -o "$tmp/$archive" "$base/$archive"
+curl -fsSL -o "$tmp/SHA256SUMS" "$base/SHA256SUMS"
+(cd "$tmp" && grep " $archive\$" SHA256SUMS | sha256sum -c -)
+tar -xzf "$tmp/$archive" -C "$tmp"
 
-if [ -w "$PREFIX" ]; then
-    install -m 0755 "$tmp/minga" "$PREFIX/minga"
-else
-    sudo install -m 0755 "$tmp/minga" "$PREFIX/minga"
-fi
+# nats-server goes next to minga: the manager's NATS sidecar looks there.
+if [ -w "$PREFIX" ]; then sudo=""; else sudo="sudo"; fi
+$sudo install -m 0755 "$tmp/minga" "$PREFIX/minga"
+$sudo install -m 0755 "$tmp/nats-server" "$PREFIX/nats-server"
 
-echo "installed: $PREFIX/minga"
+echo "installed: $PREFIX/minga, $PREFIX/nats-server"
 "$PREFIX/minga" --version

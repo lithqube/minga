@@ -12,7 +12,7 @@ use axum::{
     Router,
 };
 use minga_state::StateStore;
-use minga_telemetry::{Healthz, ReadyState, Readyz, METRICS};
+use minga_telemetry::{ReadyState, METRICS};
 use tokio::net::TcpListener;
 
 use crate::handlers::{self, AppState};
@@ -21,8 +21,6 @@ use crate::handlers::{self, AppState};
 #[derive(Clone)]
 struct ApiState {
     app_state: Arc<AppState>,
-    _healthz: Healthz,
-    readyz: Readyz,
     /// Bearer token required on all endpoints, when set.
     auth_token: Option<Arc<str>>,
 }
@@ -87,18 +85,12 @@ pub fn build_router_with_auth(
 
     let api_state = ApiState {
         app_state,
-        _healthz: Healthz,
-        readyz: Readyz::new(ready_state.as_ref().clone()),
         auth_token: auth_token.map(Arc::from),
     };
 
     Router::new()
         // Unversioned endpoints.
         .route("/_ping", get(handlers::ping))
-        // Observability endpoints.
-        .route("/metrics", get(metrics_handler))
-        .route("/healthz", get(healthz_handler))
-        .route("/readyz", get(readyz_handler))
         // Versioned endpoints: /{version}/...
         .route("/:version/version", get(handlers::get_version))
         .route("/:version/info", get(handlers::get_info))
@@ -138,40 +130,18 @@ pub fn build_router_with_auth(
         .route("/:version/configs/:id", delete(handlers::delete_config))
         // Fallback.
         .fallback(handlers::fallback)
-        .layer(axum::middleware::from_fn_with_state(
-            api_state.clone(),
-            bearer_auth,
-        ))
-        .with_state(api_state)
+        .with_state(api_state.clone())
+        // Observability endpoints: /metrics, /healthz, /readyz.
+        .merge(minga_telemetry::router(ready_state.as_ref().clone()))
+        .layer(axum::middleware::from_fn_with_state(api_state, bearer_auth))
 }
 
-/// Handler for `/metrics` endpoint.
-async fn metrics_handler() -> String {
-    METRICS
-        .gather()
-        .unwrap_or_else(|e| format!("# error gathering metrics: {e}"))
-}
-
-/// Handler for `/healthz` endpoint.
-async fn healthz_handler() -> &'static str {
-    "OK"
-}
-
-/// Handler for `/readyz` endpoint.
-async fn readyz_handler(
-    axum::extract::State(state): axum::extract::State<ApiState>,
-) -> Result<&'static str, axum::http::StatusCode> {
-    state
-        .readyz
-        .check()
-        .map(|_| "OK")
-        .map_err(|_| axum::http::StatusCode::SERVICE_UNAVAILABLE)
-}
-
-/// The API server. Owns the router and the TCP listener task.
+/// The API server. Owns the router, the TCP listener task and the
+/// readiness probe.
 pub struct ApiServer {
     addr: String,
     handle: tokio::task::JoinHandle<()>,
+    probe: tokio::task::JoinHandle<()>,
 }
 
 impl ApiServer {
@@ -190,8 +160,21 @@ impl ApiServer {
         bind: &str,
         auth_token: Option<String>,
     ) -> Result<Self, ApiServerError> {
-        let ready_state = Arc::new(ReadyState::new());
-        let router = build_router_with_auth(store, ready_state, auth_token);
+        // `minga api` has no bus: ready means Raft knows a leader.
+        let ready_state = ReadyState::without_bus();
+        let probe = {
+            let (store, ready) = (store.clone(), ready_state.clone());
+            tokio::spawn(async move {
+                loop {
+                    ready.set_raft_ready(store.current_leader().await.is_some());
+                    METRICS
+                        .raft_leader
+                        .set(if store.is_leader().await { 1.0 } else { 0.0 });
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                }
+            })
+        };
+        let router = build_router_with_auth(store, Arc::new(ready_state), auth_token);
         let listener = TcpListener::bind(bind)
             .await
             .map_err(|e| ApiServerError::Bind(format!("cannot bind {bind}: {e}")))?;
@@ -209,7 +192,11 @@ impl ApiServer {
 
         tracing::info!(addr = %addr, "Docker Engine API server listening");
 
-        Ok(Self { addr, handle })
+        Ok(Self {
+            addr,
+            handle,
+            probe,
+        })
     }
 
     /// The address the server is bound to.
@@ -220,6 +207,7 @@ impl ApiServer {
     /// Stops the API server.
     pub fn shutdown(self) {
         self.handle.abort();
+        self.probe.abort();
     }
 }
 

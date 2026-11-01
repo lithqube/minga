@@ -30,6 +30,13 @@ pub enum StateCommand {
 
     UpsertConfig(Config),
     RemoveConfig(ConfigId),
+
+    /// Refreshes a node's lease in one log entry: sets `last_seen_unix`,
+    /// revives the node unless it is draining, and inserts the given
+    /// record if none exists. Read-modify-write from a client would race
+    /// an operator's drain. Appended last: bincode encodes the variant
+    /// index, so existing log entries keep decoding.
+    RenewNodeLease(ClusterNode),
 }
 
 /// The response returned by the state machine after applying a command.
