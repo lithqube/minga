@@ -105,3 +105,14 @@ They manage disjoint data and fail independently. Disk caps are pinned explicitl
 | Extend Raft for heartbeats/status | Rejected — violates stated principle, couples liveness to quorum |
 | Redis Streams / RabbitMQ / Kafka | Rejected — wrong scale for edge |
 | Defer bus, ship supervisor with direct gRPC | Rejected as sequencing — the trait makes the bus cheap now |
+
+## Implementation status (2026-11-01)
+
+- **Built:** `MemoryBus` and `NatsBus`, the streams and KV buckets above, NATS mTLS and token auth (`MINGA_NATS_TLS_*`, `--nats-token`), and the manager-spawned sidecar. The sidecar listens on loopback only, so remote workers need an external TLS NATS server.
+- **Not built:** `SpoolingBus`, so workers have no offline spool.
+- **Deviation: liveness.** Placement reads a lease kept in Raft (`ClusterNode.last_seen_unix`, renewed by the atomic `RenewNodeLease` command), not `MINGA_LEASES`. The bus lease is refreshed but unused. That puts heartbeats through consensus, against this ADR.
+- **Deviation: task state.** The supervisor writes lifecycle transitions (`running`/`stopped`) to the Raft task record so Docker API consumers see them. High-frequency status still goes over the bus.
+- **Deviation: dispatch.** Supervisors also reconcile against their local Raft replica, which needs every node to be a Raft member.
+- **Release:** archives bundle `nats-server` (checksum-pinned) with `SHA256SUMS`, as decided above.
+
+[docs/architecture.md](../architecture.md) describes the plan to remove these deviations (workers leave Raft).

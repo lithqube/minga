@@ -2,17 +2,29 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.80%2B-orange.svg)](https://www.rust-lang.org)
-[![Status](https://img.shields.io/badge/status-roadmap%20to%20v0.1.0-in%20progress.svg)]()
+[![Status](https://img.shields.io/badge/status-v0.1.0-blue.svg)](CHANGELOG.md)
 
-A single-binary container and agent orchestrator for **edge, on-prem and air-gapped sites**, written in Rust. It runs Compose files natively, speaks enough of the Docker Swarm API to replace it, and treats AI-agent workloads — sandboxes, durable runs, budgets, GPUs — as first-class objects.
+A single-binary container and agent orchestrator for **edge, on-prem and air-gapped sites**, written in Rust. It runs Compose files natively, speaks enough of the Docker Swarm API to replace it, and treats AI-agent workloads as first-class objects (WASM sandboxes and an LLM egress proxy today).
 
 Named after the [minga](https://en.wikipedia.org/wiki/Minga) of Chiloé, where a community moves a whole house together.
 
-> **Status: `v0.1.0`.** The orchestrator core works: Compose parsing that fails loudly on unknown keys, Raft consensus (with mTLS and write forwarding), a scheduler, self-registering nodes with membership leases, a node supervisor, a Swarm-compatible Docker Engine API (v1.41, bearer-token authenticated), a **real containerd runtime proven against a live daemon**, per-task netns/bridge networking with IPAM and embedded DNS, real container logs, NATS/JetStream with TLS, WASM sandboxes, an LLM egress proxy, and Prometheus metrics with health endpoints. ~700 tests across 11 crates; every shipped claim above was verified by execution (see `.planning/STATE.md`).
+> **Status: `v0.1.0`.** What works, verified by execution on macOS and on Linux (OrbStack Ubuntu, containerd 2.2.1):
 >
-> What `v0.1.0` deliberately does **not** do: pull images (preload them into the `minga` containerd namespace), multi-node WireGuard mesh, healthcheck enforcement, spec-update reprovisioning, automatic rollback, or host-local port hairpinning. The full picture is in the [**v0.1.0 roadmap**](docs/roadmap-v0.1.0.md) and the [changelog](CHANGELOG.md).
+> - **Compose and deploy:** Compose parsing that fails loudly on unknown keys, and `minga deploy` through the Swarm-compatible Docker Engine API (v1.41, optional bearer token).
+> - **Control plane:** Raft consensus with mTLS and write forwarding, a scheduler, and self-registering nodes with membership leases.
+> - **Runtime and networking:** a node supervisor driving a **real containerd runtime**, per-task netns/bridge networking with IPAM and embedded DNS, and real container logs.
+> - **Platform:** NATS/JetStream with TLS, WASM sandboxes, an LLM egress proxy, and Prometheus metrics with health endpoints.
 >
-> The Talos deployment guide is written but **has not been validated on a Talos host**. FIPS, SOC 2, VS-NfD and NATO are **not assessed** — which is not the same as not applicable.
+> **Not in `v0.1.0`:**
+>
+> - Image pull: preload images into the `minga` containerd namespace instead.
+> - Container networking across nodes: there's no WireGuard mesh yet.
+> - Joining a node to a running cluster: Raft membership is fixed at bootstrap.
+> - Healthcheck enforcement, spec-update reprovisioning, automatic rollback, and host-local port hairpinning.
+>
+> Details: [changelog](CHANGELOG.md), [roadmap](docs/roadmap-v0.1.0.md), [architecture notes](docs/architecture.md).
+>
+> The Talos guide has **not been validated on a Talos host**. FIPS, SOC 2, VS-NfD and NATO are **not assessed**, which is not the same as "not applicable".
 
 ## Why Minga
 
@@ -20,36 +32,173 @@ Docker Swarm is a fine orchestrator for a datacenter, but it was not built for t
 
 - **Edge sites** with a handful of ARM boards, intermittent connectivity, and no tolerance for a heavyweight control plane.
 - **Air-gapped environments** where pulling images from a registry is not an option and every dependency must be vendored.
-- **Agent workloads** where you need sandboxed execution (wasmtime, Firecracker), token budgets, and LLM egress control — not just "run a container."
+- **Agent workloads** that need sandboxed execution, token budgets and LLM egress control, not just "run a container".
 
-Minga ships as **one small binary**. No Docker daemon, no Kubernetes, no etcd. It reads a `compose.yaml` and makes it run across a cluster of nodes, with Raft for consensus and an overlay network for service discovery.
+Minga ships as **one binary** (plus the `nats-server` it supervises). There's no Docker daemon, no Kubernetes and no etcd. It reads a `compose.yaml` and runs it, with Raft for desired state and NATS/JetStream for status, logs and liveness.
 
 ## Features
 
-- **Compose-native** — `docker compose` files deploy unchanged. Full spec parsing with variable interpolation, profiles, merge keys, and `x-` extensions. Unknown keys fail loudly with suggestions instead of being silently skipped.
-- **Swarm-compatible API** — speaks enough of the Docker Engine API to work with existing tooling (`docker stack deploy`, `docker service ls`, …).
-- **Raft consensus** — desired state and placement go through [openraft](https://docs.rs/openraft), persisted in [redb](https://docs.rs/redb). No external etcd.
-- **Overlay networking** — per-task IPs from deterministic IPAM, bridge + netns per task, DNAT port publishing, and embedded service-discovery DNS. (WireGuard mesh between nodes is generated as config but not yet applied.)
-- **Agent-first workloads** — wasmtime and Firecracker sandbox pools, LLM egress proxy with per-workload token and cost budgets.
-- **Observability built-in** — Prometheus metrics (`/metrics`), health endpoints (`/healthz`, `/readyz`) on `minga api` and on nodes via `--metrics-bind`, structured JSON logs for the long-running roles. (Correlation IDs across bus hops are not propagated yet.)
-- **Air-gapped ready** — no cloud dependencies, offline image distribution, vendored builds.
-- **One binary** — manager, worker, and CLI in a single executable (glibc-linked; the release bundles `nats-server` alongside it).
+- **Compose-native.** Full spec parsing with interpolation, profiles, merge keys and `x-` extensions. Unknown keys fail loudly with suggestions. `command`, `entrypoint`, `labels`, `healthcheck` (carried, not enforced), volumes, bind mounts, placement constraints and `deploy.restart_policy` reach the container.
+- **Swarm-compatible API.** Services, tasks, nodes, networks, secrets and configs, with label filters. `docker stack deploy`, `docker service ls`, `docker node ls` and Traefik v3's swarm provider work against `minga api`.
+- **Raft consensus.** Desired state and placement go through [openraft](https://docs.rs/openraft), persisted in [redb](https://docs.rs/redb). mTLS on the Raft transport and bounded frames. No external etcd.
+- **Container networking on a node.** Deterministic per-task IPs from IPAM (a /24 per network from `10.100.0.0/16`), one bridge per network, a netns and veth pair per task, iptables DNAT for published ports, and embedded DNS (`<svc>`, `tasks.<svc>`, `<svc>.<stack>.minga.local`). Cross-node traffic needs the WireGuard mesh, which is generated as config but not applied yet.
+- **Secrets and logs.** Secrets are external references staged per task and content-addressed, so rotation never changes a running task's files. `minga logs [-f]` shows separated stdout/stderr from a JetStream-retained backlog.
+- **Agent workloads.** `x-minga-agent` Compose services run as WASM modules under wasmtime with fuel and timeout limits. An LLM egress proxy enforces per-workload token budgets, caches responses and redacts secrets. Today the WASM guest gets no host I/O: no WASI, no network, so it can't reach the proxy yet. Memory limits aren't enforced, and Firecracker is a stub.
+- **Observability.** `/metrics`, `/healthz` and `/readyz` on `minga api`, and on manager and worker nodes via `--metrics-bind`. JSON logs on stderr for long-running roles.
+- **Air-gap friendly.** Release archives bundle a checksum-pinned `nats-server`, and `install.sh` verifies `SHA256SUMS`. Images are preloaded with `ctr` because there's no registry pull.
 
-## Quick start
+## Architecture
 
-```bash
-# Install the release binary (linux/amd64, linux/arm64)
-curl -fsSL https://raw.githubusercontent.com/lithqube/minga/main/install.sh | sh
+Every role is the same `minga` binary. The manager runs the scheduler and the node supervisor, and spawns `nats-server` as a child process. Workers run the supervisor only. `minga api` serves the Docker Engine API and runs its own leadership-gated scheduler.
 
-# Or build from source
-cargo build --release
+```mermaid
+flowchart LR
+  subgraph clients[Clients]
+    deploy["minga deploy"]
+    docker["docker CLI / Traefik"]
+    logs["minga logs"]
+  end
 
-# Validate a Compose file — checks syntax, references, port conflicts,
-# dependency cycles, and prints the startup order
-cargo run -p minga-cli -- validate -c compose.yaml --profile debug
+  subgraph mgr["minga manager (host A)"]
+    sched["Scheduler<br/>(leader only)"]
+    supA["Supervisor"]
+    nats[("nats-server sidecar<br/>JetStream")]
+  end
+
+  subgraph apiproc["minga api (host A)"]
+    api["Docker Engine API v1.41<br/>+ /metrics /healthz /readyz"]
+    sched2["Scheduler<br/>(leader only)"]
+  end
+
+  subgraph wrk["minga worker (host B…N)"]
+    supB["Supervisor"]
+  end
+
+  raft[("Raft state<br/>openraft + redb<br/>desired state, placement")]
+
+  deploy -- HTTP --> api
+  docker -- HTTP --> api
+  api -- writes --> raft
+  sched -- reads/writes --> raft
+  sched2 -- reads/writes --> raft
+  sched -- assign/stop --> nats
+  supA -- reads --> raft
+  supB -- reads --> raft
+  supA -- status, logs, leases --> nats
+  supB -- status, logs, leases --> nats
+  logs -- reads --> nats
+  supA --> ctrA["containerd + netns/bridge"]
+  supB --> ctrB["containerd + netns/bridge"]
 ```
 
-Example output:
+> In `v0.1.0` **every `minga` process is a Raft voter**, including workers and `minga api`, and membership is fixed when the cluster first starts. Only desired state should go through Raft. Node lease renewals still do, as one atomic command every 10s. [docs/architecture.md](docs/architecture.md) explains why this matters for cluster size and quorum, and what replaces it.
+
+### How a deploy becomes a running container
+
+```mermaid
+sequenceDiagram
+  participant U as minga deploy
+  participant A as minga api
+  participant R as Raft (leader)
+  participant S as Scheduler (leader)
+  participant B as NATS JetStream
+  participant N as Supervisor (target node)
+  participant C as containerd
+
+  U->>A: POST /networks/create, /secrets/create, /services/create
+  A->>A: check placeable (else 409)
+  A->>R: upsert service (forwarded to leader)
+  loop every interval
+    S->>R: list nodes, services, tasks
+    S->>R: upsert task (node, IPs)
+    S->>B: Assign command
+  end
+  N->>B: pull Assign, refresh lease
+  N->>R: reconcile against local Raft replica (catch-up path)
+  N->>N: netns + veth + IP, stage secrets
+  N->>C: create container + task (FIFO stdout/stderr)
+  N->>R: mark task running
+  N->>B: status report, log chunks
+  U->>A: GET /tasks until placed
+```
+
+### Networking on one node
+
+```mermaid
+flowchart TB
+  subgraph host[Host]
+    dnat["iptables DNAT<br/>published ports"]
+    br["bridge per network<br/>gateway = embedded DNS"]
+    subgraph t1[task netns]
+      c1["container<br/>10.100.n.2"]
+    end
+    subgraph t2[task netns]
+      c2["container<br/>10.100.n.3"]
+    end
+  end
+  ext((client)) --> dnat --> br
+  br <-- veth --> c1
+  br <-- veth --> c2
+  c1 -. "web / tasks.web / web.stack.minga.local" .-> br
+```
+
+### Design principles
+
+- **Rust on the hot path.** Per-packet, per-request and per-sandbox work stays in Rust. Go components (embedded NATS) run as separate processes; there's no FFI. See [ADR 0001](docs/adr/0001-language-split.md).
+- **Only desired state goes through Raft.** Heartbeats, task status and agent run steps belong on JetStream ([ADR 0002](docs/adr/0002-event-bus-nats.md)). Node leases don't follow this yet; see the note above.
+- **Compose files deploy unchanged.** Unknown keys fail loudly instead of being skipped.
+- **Simplicity over complexity.** One binary, and no external dependencies for consensus or storage.
+
+## Crate layout
+
+| Crate | Purpose |
+| --- | --- |
+| `minga-cli` | The `minga` binary: `manager`, `worker`, `api`, `deploy`, `validate`, `logs`, `tls`, `net`, `wg`, `sandbox`, `egress`, `agent`. Also manages the NATS sidecar. |
+| `minga-compose` | Compose Specification parser and validator: interpolation, profiles, merge keys, `x-minga-agent`, cycle and port-conflict detection. |
+| `minga-state` | Cluster state: openraft + redb, a TCP transport with optional mTLS, write forwarding to the leader, and an atomic lease-renewal command. |
+| `minga-scheduler` | Compose → state translation, spread placement with constraints and capacity checks, per-task IP assignment, and the reconcile loop. |
+| `minga-api` | Docker Engine API v1.41 subset (axum) with bearer-token auth and two-way translation between Docker and state types. |
+| `minga-node` | Node supervisor. Containerd runtime over gRPC (OCI spec, FIFO log capture), netns/bridge/DNAT networking, embedded DNS, secret staging, restart policies, agent executor, self-registration. |
+| `minga-bus` | `EventBus` trait with `MemoryBus` and `NatsBus` (JetStream commands, events, logs, KV status, leases) and NATS TLS. |
+| `minga-net` | CIDR and IPAM, the DNS record store, WireGuard keys and `wg-quick` config generation (not applied yet). |
+| `minga-sandbox` | `SandboxRuntime` trait: `WasmtimeRuntime` (fuel, timeout), `WarmPool`, a `FirecrackerRuntime` stub. |
+| `minga-egress` | LLM egress proxy: per-workload token budgets, LRU response cache, secret redaction. |
+| `minga-telemetry` | Prometheus registry, `/metrics`, `/healthz`, `/readyz` router, JSON logging. |
+
+## Quick start: one Linux host
+
+You need Linux, root (the supervisor creates netns, bridges and iptables rules), containerd, and images preloaded into the `minga` namespace.
+
+```bash
+# Install minga and the bundled nats-server (verifies SHA256SUMS)
+curl -fsSL https://raw.githubusercontent.com/lithqube/minga/main/install.sh | sh
+
+# Preload the images your stack uses: there is no registry pull yet
+sudo ctr -n minga images pull docker.io/library/nginx:1.27
+```
+
+Today `minga api` is its own Raft voter, so a single host runs two processes that peer with each other:
+
+```bash
+# Terminal 1: manager (scheduler + supervisor + NATS sidecar on 127.0.0.1:4222)
+sudo minga manager --node-id 1 --bind 127.0.0.1:7001 --peer 2=127.0.0.1:7002 \
+  --data-dir /var/lib/minga --runtime containerd --metrics-bind 127.0.0.1:9100
+```
+
+```bash
+# Terminal 2: Docker Engine API on :2375
+sudo MINGA_API_TOKEN=change-me minga api --node-id 2 --bind 127.0.0.1:7002 \
+  --peer 1=127.0.0.1:7001 --data-dir /var/lib/minga-api --api-bind 127.0.0.1:2375
+```
+
+```bash
+# Deploy, inspect, read logs
+MINGA_API_TOKEN=change-me minga deploy -c compose.yaml shop
+curl -s 127.0.0.1:9100/readyz
+minga logs -f <task-id> --nats-url nats://127.0.0.1:4222
+```
+
+`minga validate -c compose.yaml` checks a Compose file offline and prints the startup order:
 
 ```
 project plant-7
@@ -60,299 +209,78 @@ services in startup order:
   debug-ui         registry.local/debug-ui:latest           1 replica(s)  ports 9000->9000/tcp
 ```
 
-## Architecture
+For systemd, [`scripts/minga.service`](scripts/minga.service) runs either role from an environment file.
 
-```
-                    ┌──────────────────────────────────────┐
-                    │              minga binary              │
-                    │  ┌─────────┐  ┌─────────┐  ┌───────┐ │
-                    │  │   CLI   │  │ Manager │  │Worker │ │
-                    │  └────┬────┘  └────┬────┘  └───┬───┘ │
-                    └───────┼────────────┼───────────┼─────┘
-                            │            │           │
-  ┌─────────────────────────┼────────────┼───────────┼─────────────────────────┐
-  │                         ▼            ▼           ▼                         │
-  │  ┌──────────┐   ┌──────────────┐  ┌──────────┐  ┌──────────────────────┐   │
-  │  │minga-    │   │ minga-state   │  │minga-    │  │ minga-api             │   │
-  │  │compose   │   │ (openraft +   │  │scheduler │  │ (Docker Engine API    │   │
-  │  │          │   │  redb, Raft)  │  │          │  │  subset + gRPC)       │   │
-  │  └──────────┘   └──────────────┘  └────┬─────┘  └──────────────────────┘   │
-  │                                          │                                 │
-  │  ┌──────────┐   ┌──────────┐   ┌────────▼─────┐  ┌──────────────────────┐ │
-  │  │minga-node│   │minga-net  │   │minga-sandbox │  │ minga-egress          │ │
-  │  │(containerd│   │(WireGuard,│   │(wasmtime,    │  │ (LLM proxy, budgets,  │ │
-  │  │ supervisor)│  │ nftables) │   │ Firecracker) │  │  caching, redaction)  │ │
-  │  └──────────┘   └──────────┘   └──────────────┘  └──────────────────────┘ │
-  │  ┌──────────┐                                                        │
-  │  │minga-    │                                                        │
-  │  │telemetry │  Prometheus metrics, health endpoints,                │
-  │  │(metrics,  │  structured JSON logging                              │
-  │  │ healthz) │                                                        │
-  │  └──────────┘                                                        │
-  └───────────────────────────────────────────────────────────────────────────┘
+## Deployment topologies
+
+```mermaid
+flowchart TB
+  subgraph single["1 · Single host (verified on Linux)"]
+    m1["minga manager<br/>+ nats sidecar"] <-->|Raft| a1["minga api"]
+    m1 --> ct1[containerd]
+  end
+
+  subgraph multi["2 · Multi-node cluster (control plane only)"]
+    direction LR
+    natsx[("external NATS<br/>tls://, token")]
+    mA["manager 1"] <-->|Raft mTLS| mB["manager 2"]
+    mB <-->|Raft mTLS| mC["manager 3 / api"]
+    w1["worker"] <-->|Raft mTLS| mA
+    mA & mB & mC & w1 -->|status, logs, commands| natsx
+  end
 ```
 
-### Design principles
-
-- **Rust on the hot path.** Per-packet, per-request, per-sandbox work stays in Rust. Any Go component (e.g. embedded NATS) runs as a separate process behind a versioned gRPC contract. No FFI between languages.
-- **Only desired state goes through Raft.** Heartbeats, task status, and agent run steps go through JetStream — not the consensus log.
-- **Compose files deploy unchanged.** Unknown keys fail loudly instead of being skipped.
-- **Simplicity over complexity.** One binary, one footprint, no external dependencies for consensus or storage.
-
-Decisions are recorded as [ADRs](docs/adr/) in the repo.
-
-## Crate layout
-
-| Crate | Status | Purpose |
-| --- | --- | --- |
-| `minga-cli` | **Done** | The `minga` binary: `validate`, `deploy` (translation), `manager`, and `worker` subcommands wired to the scheduler and supervisor. |
-| `minga-compose` | **Done** | Compose Specification parser and validator. Full interpolation, profiles, merge keys, `x-` extensions (including `x-minga-agent` for agent workloads), dependency cycle detection, port conflict detection. 39 tests. |
-| `minga-state` | **Done** | Cluster state: openraft + redb. Multi-node Raft with TCP networking, leader election, failover, persistent log and state machine. `WorkloadKind` discriminant on `TaskSpec` (Container / Agent). 21 tests. |
-| `minga-scheduler` | **Done** | Placement engine: Compose → state entities (containers + agents via `x-minga-agent`), spread placement with constraints and resource awareness, reconcile loop. 58 tests. |
-| `minga-node` | **Done** | Node supervisor: `Runtime` trait with `MockRuntime` (testing) and `ContainerdRuntime` (real containers via containerd gRPC), plus `AgentExecutor` trait with `MockAgentExecutor` and `WasmtimeAgentExecutor` (WASM sandboxes). OCI spec generation, graceful shutdown (SIGTERM→SIGKILL), image pull. Reconcile loop starts/stops containers and agents from Raft + bus, dispatching by `WorkloadKind`. 67 tests. |
-| `minga-bus` | **Done** | Event bus abstraction: `EventBus` trait with `MemoryBus` (in-process) and `NatsBus` (NATS/JetStream). Commands, events, KV status, liveness leases, request/reply. 24 tests. |
-| `minga-api` | **Done** | Docker Engine API v1.41 REST subset: services, tasks, nodes, networks, secrets, configs CRUD with label filters. Bidirectional translation between Docker API types and Minga state. `minga api` CLI subcommand. Real `docker` CLI verified via testcontainers. 76 tests. |
-| `minga-net` | **Done** | Overlay networking: CIDR utilities, deterministic IPAM (hash-based allocation, linear probing), WireGuard keypair generation (X25519) + `wg-quick` config generation, DNS service discovery (`minga.local`), `OverlayManager` coordinator. 70 tests. |
-| `minga-sandbox` | **Done** | Agent sandboxes: `SandboxRuntime` trait with `MockSandboxRuntime` (testing), `WasmtimeRuntime` (real WASM execution with fuel metering, memory limits, timeouts), `WarmPool` (pre-warmed sandbox pool with acquire/release, background replenish/evict), `FirecrackerRuntime` stub (Linux + KVM). Wired into the supervisor via `WasmtimeAgentExecutor`. CLI: `minga sandbox run`, `minga sandbox info`. 36 tests. |
-| `minga-egress` | **Done** | LLM egress proxy (axum): per-workload token budgets with sliding windows, LRU response caching with TTL, secret redaction (10 built-in rules: API keys, AWS keys, JWTs, credit cards, etc.), reverse proxy with token metering from `usage.total_tokens`. Wired into the node via `--egress-bind` / `--egress-upstream` flags. CLI: `minga egress --bind --upstream --default-budget`. 53 tests. |
-| `minga-telemetry` | **Done** | Observability crate: Prometheus metrics registry (`minga_*` prefix), `/metrics` endpoint, `/healthz` (liveness), `/readyz` (readiness: Raft + bus), structured JSON logging via `tracing` (`MINGA_LOG_LEVEL`). Served by `minga api` and, with `--metrics-bind`, by `minga manager`/`minga worker`. Correlation IDs are not propagated yet. |
-
-## Deployment Topologies
-
-Minga runs anywhere containerd runs. Here are the recommended topologies for different environments.
-
-### 1. Cloud-Native (Hetzner Cloud / Talos Linux) — **Recommended for Production**
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                        Hetzner Cloud                            │
-│  ┌──────────────────────────────────────────────────────────┐  │
-│  │  Load Balancer (LB11) — :6443 (talosctl, API)            │  │
-│  └──────────────┬───────────────────────────────────────────┘  │
-│                 │                                               │
-│  ┌──────────────┴───────────────────────────────────────────┐  │
-│  │              Private Network (10.0.0.0/16)               │  │
-│  │  ┌─────────┐ ┌─────────┐ ┌─────────┐ ┌─────────┐       │  │
-│  │  │ minga-  │ │ minga-  │ │ minga-  │ │ minga-  │       │  │
-│  │  │  cp1    │ │  cp2    │ │  cp3    │ │ worker1 │       │  │
-│  │  │ Talos   │ │ Talos   │ │ Talos   │ │ Talos   │       │  │
-│  │  │ (mgr)   │ │ (mgr)   │ │ (mgr)   │ │ (wrk)   │       │  │
-│  │  └────┬────┘ └────┬────┘ └────┬────┘ └────┬────┘       │  │
-│  └───────┼────────────┼────────────┼──────────┼────────────┘  │
-│          │            │            │          │               │
-│    ┌─────┴─────┐ ┌────┴────┐ ┌────┴────┐ ┌──┴────┐          │
-│    │ containerd│ │ containerd│ │ containerd│ │containerd    │
-│    │ (unix sock)│ │ (unix sock)│ │ (unix sock)│ │ (unix sock)  │
-│    └─────┬─────┘ └────┬────┘ └────┬────┘ └──┬────┘          │
-│          │            │            │          │               │
-│    ┌─────┴────────────┴────────────┴──────────┴────┐        │
-│    │           WireGuard Mesh (minga-net)          │        │
-│    │  IPAM: 10.200.0.0/16 (deterministic, hash)    │        │
-│    │  DNS:  *.minga.local                          │        │
-│    └───────────────────────────────────────────────┘        │
-└─────────────────────────────────────────────────────────────┘
-```
-
-**Key characteristics:**
-- **Talos Linux** — immutable, API-driven, no SSH, atomic upgrades via `talosctl upgrade`
-- **3 control plane nodes** — Raft HA (openraft), NATS leader on one CP
-- **Load balancer** — stable VIP for talosctl, Docker API, and Minga API
-- **Private network** — isolated cluster traffic, WireGuard mesh
-- **Cost** — ~€28/mo for 3 CP + 2 Worker (CPX22, Nuremberg)
-
-**Setup:** See [docs/talos-deployment.md](docs/talos-deployment.md#hetzner-cloud-hcloud-deployment) for step-by-step `hcloud` CLI and Terraform.
-
----
-
-### 2. Edge / On-Prem (Talos on Bare Metal) — **Recommended for Edge**
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                      Edge Site (e.g., factory)                  │
-│  ┌──────────────────────────────────────────────────────────┐  │
-│  │  Control Plane (3 nodes, e.g., Raspberry Pi CM4 / x86)   │  │
-│  │  ┌────────┐ ┌────────┐ ┌────────┐                         │  │
-│  │  │ minga  │ │ minga  │ │ minga  │  ← Raft + NATS          │  │
-│  │  │ cp1    │ │ cp2    │ │ cp3    │  ← Talos (PXE/ISO)      │  │
-│  │  └────┬───┘ └────┬───┘ └────┬───┘                         │  │
-│  └───────┼────────────┼──────────┼───────────────────────────┘  │
-│          │            │          │                              │
-│  ┌───────┴────────────┴──────────┴──────────┐                  │
-│  │          Worker Nodes (N x ARM/x86)       │                  │
-│  │  ┌────────┐ ┌────────┐ ┌────────┐         │                  │
-│  │  │ minga  │ │ minga  │ │ minga  │  ← Talos worker        │  │
-│  │  │ w1     │ │ w2     │ │ wN     │         │                  │
-│  │  └────┬───┘ └────┬───┘ └────┬───┘         │                  │
-│  └───────┼────────────┼──────────┼────────────┘                  │
-│          │            │          │                               │
-│    ┌─────┴────────────┴──────────┴────┐                         │
-│    │      WireGuard Mesh (minga-net)  │                         │
-│    │  IPAM: 10.200.0.0/16             │                         │
-│    │  DNS:  *.minga.local             │                         │
-│    └──────────────────────────────────┘                         │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-**Key characteristics:**
-- **Talos Linux** — same as cloud, but PXE/ISO install on bare metal
-- **No load balancer needed** — control plane IPs stable; use DNS round-robin or keepalived if VIP desired
-- **Air-gapped friendly** — pre-load images in Talos ISO, `talosctl images load` offline
-- **ARM64 + x86_64 mixed** — deterministic IPAM works across architectures
-
-**Setup:** See [docs/talos-deployment.md](docs/talos-deployment.md#quick-start-3-node-cluster) for bare-metal PXE/ISO install.
-
----
-
-### 3. Air-Gapped / Isolated (Talos ISO + Offline Images)
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    Air-Gapped Environment                       │
-│  ┌──────────────────────────────────────────────────────────┐  │
-│  │  1. Build Talos ISO with pre-loaded images               │  │
-│  │     talosctl image factory --output iso \                 │  │
-│  │       --extra-registry registry.local \                   │  │
-│  │       --extra-image registry.local/minga:latest          │  │
-│  └──────────────────────────┬───────────────────────────────┘  │
-│                             │                                  │
-│  ┌──────────────────────────┴───────────────────────────────┐  │
-│  │  2. Boot nodes from ISO (PXE, USB, virt-install)         │  │
-│  │     - No internet access required                        │  │
-│  │     - All images baked into ISO                          │  │
-│  └──────────────────────────┬───────────────────────────────┘  │
-│                             │                                  │
-│  ┌──────────────────────────┴───────────────────────────────┐  │
-│  │  3. Apply machine config (generate on admin machine,     │  │
-│  │     transfer via USB):                                    │  │
-│  │     talosctl apply-config --insecure --nodes <ip>        │  │
-│  │       --file controlplane.yaml                            │  │
-│  └──────────────────────────┬───────────────────────────────┘  │
-│                             │                                  │
-│  ┌──────────────────────────┴───────────────────────────────┐  │
-│  │  4. Bootstrap etcd, deploy Minga binary via talosctl     │  │
-│  │     talosctl bootstrap --nodes <cp1-ip>                   │  │
-│  │     talosctl --nodes <ip> upload minga /opt/minga/minga  │  │
-│  │     talosctl --nodes <ip> run --command "systemctl ...   │  │
-│  └──────────────────────────────────────────────────────────┘  │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-**Key characteristics:**
-- **Zero internet access** at target site
-- **All dependencies vendored** in Talos ISO (containerd, Minga, images)
-- **Single admin machine** with internet generates config/ISO
-- **USB/PXE transfer** for config and ISO
-
----
-
-### 4. Development / Single-Node (Talos or Linux)
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    Single Node (Laptop/VM)                      │
-│  ┌──────────────────────────────────────────────────────────┐  │
-│  │  Single Talos node (control plane + worker)              │  │
-│  │  ┌────────────────────────────────────────────────────┐  │  │
-│  │  │ minga-manager + minga-worker                       │  │  │
-│  │  │ Raft (single node), NATS (embedded sidecar)        │  │  │
-│  │  │ containerd (unix:///run/containerd/containerd.sock)│  │  │
-│  │  └────────────────────────────────────────────────────┘  │  │
-│  └──────────────────────────────────────────────────────────┘  │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-**Key characteristics:**
-- **Single Talos node** — self-bootstraps, no LB needed
-- **Or native Linux** — any distro with containerd (`apt install containerd` / `dnf install containerd`)
-- **Minga binary** — `minga node --containerd-socket unix:///run/containerd/containerd.sock`
-- **NATS sidecar** — `minga sidecar nats` (manager spawns it)
-
----
-
-### 5. Kubernetes Alternative (Not Recommended, but Possible)
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    Kubernetes Cluster                           │
-│  ┌──────────────────────────────────────────────────────────┐  │
-│  │  Minga as a DaemonSet on each node                       │  │
-│  │  - HostPath: /run/containerd/containerd.sock             │  │
-│  │  - HostNetwork: true (for WireGuard)                     │  │
-│  │  - Privileged: true (for nftables, WireGuard)            │  │
-│  │  - ConfigMap: Minga config                               │  │
-│  └──────────────────────────────────────────────────────────┘  │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-> **Not recommended** — Minga replaces Kubernetes for these workloads. Running inside K8s defeats the purpose (extra layer, no air-gap, complex networking).
-
----
+1. **Single host.** This is the verified path: containers reach each other by service name, and published ports work. It's the quick start above.
+2. **Multi-node.** Raft (with `--raft-tls-*`) and scheduling across nodes work. Two limits: every node must be listed with `--peer` and started together, and containers on different nodes can't reach each other yet. The manager's NATS sidecar listens only on loopback, so remote workers need an external NATS server reached with a `tls://` URL plus `MINGA_NATS_TLS_CA`, `MINGA_NATS_TLS_CERT`, `MINGA_NATS_TLS_KEY` and `MINGA_NATS_TLS_SERVER_NAME` (and `--nats-token`). Issue Raft certificates with `minga tls init-ca` and `minga tls issue-node`.
+3. **Talos Linux / Hetzner Cloud.** Written up in [docs/talos-deployment.md](docs/talos-deployment.md), but **not validated**. Talos has no systemd and no shell, so Minga would have to ship as a Talos system extension, which doesn't exist yet.
+4. **Air-gapped.** Copy the release archive (with `minga`, `nats-server` and the licenses) and image tarballs to the site. Then run `ctr -n minga images import <image>.tar` on each node and start the roles as above. No step needs a network connection.
 
 ## Development
 
 ```bash
-# Clone
-git clone https://github.com/lithqube/minga.git
-cd minga
-
-# Build
+git clone https://github.com/lithqube/minga.git && cd minga
 cargo build
-
-# Run all tests
-cargo test
-
-# Lint (must be clean before committing)
-cargo clippy --all-targets -- -D warnings
-
-# Format
 cargo fmt --all
-
-# Run the CLI
+cargo clippy --all-targets -- -D warnings
+cargo test --workspace          # bus tests need `nats-server` on PATH
 cargo run -p minga-cli -- --help
 ```
 
-Requirements: Rust 1.80+ (stable), with `rustfmt` and `clippy` components.
+Requirements: Rust 1.80+ with `rustfmt` and `clippy`, and `nats-server` for the bus suites. On Linux, the daemon-backed suites run with `sudo -E env "PATH=$PATH" MINGA_REQUIRE_CONTAINERD=1 cargo test -p minga-node --test containerd --test containerd_client`, which fails instead of skipping when containerd is missing. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Roadmap
 
-- [x] **Compose parser & validator** — full spec parsing, interpolation, profiles, validation
-- [x] **Raft state store** — openraft + redb, multi-node consensus over TCP, leader election, failover, persistent state
-- [x] **Scheduler** — Compose → state translation, spread placement with constraints, resource-aware reconcile loop
-- [x] **Node supervisor** — `Runtime` trait + `MockRuntime`, reconcile loop that starts/stops containers from Raft-assigned tasks
-- [x] **Phase 0 gate** — a 10-service Compose stack runs on 3 nodes (E2E integration test)
-- [x] **Event bus (NATS/JetStream)** — `minga-bus` crate: `EventBus` trait, `MemoryBus`, `NatsBus` — [ADR 0002](docs/adr/0002-event-bus-nats.md), [evaluation](docs/research/nats-evaluation.md)
-- [x] **Bus integration** — scheduler publishes assign/stop commands, supervisor pulls commands + reports status + refreshes leases, CLI wired with `--nats-url`
-- [x] **NATS sidecar lifecycle** — manager spawns `nats-server` as a child process with generated config (JetStream enabled, pinned storage limits, readiness probe, `kill_on_drop` cleanup). Workers require `--nats-url` to connect to the manager's NATS server.
-- [x] **Containerd runtime** — `ContainerdRuntime` implementing the `Runtime` trait via containerd's gRPC API (Unix socket). OCI spec generation from `TaskSpec`, preloaded-image metadata resolution (manifest, index, config, parent snapshot — containerd has no Pull RPC, so images must be preloaded and unpacked in namespace `minga`), container/task lifecycle, graceful shutdown (SIGTERM → grace → SIGKILL, with the task deleted before the container — containerd refuses to delete a container that still has a task). CLI: `--runtime containerd --containerd-socket /run/containerd/containerd.sock`. The lifecycle test passes against a live containerd daemon with `MINGA_REQUIRE_CONTAINERD=1` so a missing daemon cannot silently skip.
-- [x] **Overlay networking (config only)** — `minga-net` crate: CIDR/IPAM (deterministic allocation from 10.100.0.0/16), WireGuard keypairs + `wg-quick` config generation, DNS service discovery data model (`minga.local`), `OverlayManager` coordinator. State types extended: `Network.subnet`, `ClusterNode.wg_*`, `Task.ips`. CLI: `minga net create/inspect/alloc-subnet`, `minga wg keygen/pubkey/config`. **No kernel effect yet**: nothing calls `wg`, `ip`, `nft` or `iptables`, task IPs are never assigned, and the overlay manager is not invoked by the node path. A real CNI data plane is roadmap Gate 3.
-- [x] **Docker Engine API** — `minga-api` crate: Docker Engine API v1.41 REST subset (axum). Services, tasks, nodes, networks, secrets, configs — full CRUD with label filters. Bidirectional translation between Docker API types and Minga Raft state. `minga api` CLI subcommand (`--bind`, `--node-id`, `--data-dir`, `--peers`). Real `docker` CLI verified end-to-end via testcontainers (`docker service ls`, `docker node ls`, `docker info`, `docker version`). 76 tests (64 unit + 11 integration + 1 doc).
-- [x] **Agent sandboxes** — `minga-sandbox` crate: `SandboxRuntime` trait with `MockSandboxRuntime`, `WasmtimeRuntime` (real WASM execution via wasmtime 24 with fuel metering, memory limits, timeouts, output capture), `WarmPool` (pre-warmed pool with acquire/release/run, background replenish + idle eviction, pool stats), `FirecrackerRuntime` stub (Linux + KVM). WASM module contract: exports `memory` + `run(input_len: i32) -> i32`, input at offset 1024, output at offset 0 with 4-byte LE length prefix. CLI: `minga sandbox run --module foo.wasm --input '{"q":"hi"}'`, `minga sandbox info`. 36 tests (38 on Linux).
-- [x] **LLM egress proxy** — `minga-egress` crate: axum reverse proxy with per-workload token budgets (`BudgetTracker`, sliding window, register/unregister/check/record), LRU response caching (`ResponseCache`, FNV-1a key, TTL, only caches 2xx), secret redaction (`SecretRedactor`, 10 built-in regex rules: OpenAI/Anthropic keys, AWS keys, JWTs, credit cards, emails, hex secrets, private keys, bearer tokens), token metering from `usage.total_tokens` with char/4 fallback. Workload identified via `X-Minga-Workload` header. CLI: `minga egress --bind 0.0.0.0:8080 --upstream https://api.openai.com --default-budget 100000`. 53 tests.
-- [x] **Agent workloads end-to-end** — `x-minga-agent` Compose extension declares agent services (WASM module, fuel/memory/timeout limits, token budget, egress URL, prompt). Flows through the full pipeline: compose parsing → scheduler translation (`WorkloadKind::Agent` on `TaskSpec`) → Raft placement → bus dispatch → supervisor (`AgentExecutor` trait: `MockAgentExecutor`, `WasmtimeAgentExecutor`) → WASM sandbox execution. Egress proxy co-located on the node. CLI: `minga node --sandbox-runtime wasmtime --module-dir ./modules --egress-bind 127.0.0.1:8080 --egress-upstream https://api.openai.com`, `minga agent ls`. [ADR 0003](docs/adr/0003-agent-workloads.md). 3 new pipeline integration tests (full agent pipeline, mixed container+agent, reconcile creates agent tasks).
-- [x] **Observability (Wave 9)** — Prometheus metrics (`/metrics`), health endpoints (`/healthz`, `/readyz`), structured JSON logging. `minga-telemetry` crate. [ADR 0004](docs/adr/0004-observability.md). Integrated into `minga-api` and `minga-node`.
-- [x] **NATS TLS (Wave 10)** — mTLS between nodes: explicit CA and client identity, TLS-only connector, no insecure escape hatch, mandatory SAN verification, a missing or malformed CA/cert/key is a hard error. Real `nats-server` integration tests in `crates/minga-bus/tests/nats_tls.rs`. The plaintext sidecar is restricted to loopback.
+`v0.1.0` closed seven gates, each with an executable exit criterion ([docs/roadmap-v0.1.0.md](docs/roadmap-v0.1.0.md)):
 
-**Roadmap to `v0.1.0`** — full detail in [`docs/roadmap-v0.1.0.md`](docs/roadmap-v0.1.0.md). Seven gates, each with an executable exit criterion; the evidence for every checkmark is in `.planning/STATE.md`:
+- [x] Gate 1: cluster membership (self-registration, leases, 409 on unplaceable deploys)
+- [x] Gate 2: `minga deploy` deploys through the shared API write path
+- [x] Gate 3: container networking on a node (bridge, netns, DNAT, DNS)
+- [x] Gate 4: Compose fidelity (Traefik v3 routes to a Minga service)
+- [x] Gate 5: transport security and secrets (Raft mTLS, API token, NATS credentials, `minga tls`, secret staging)
+- [x] Gate 6: real container logs
+- [x] Gate 7: shippable (CI, release artifacts, `install.sh`, changelog)
 
-- [x] **Gate 1 — cluster membership.** Nodes register themselves with a lease; `POST /nodes` + update; zero-eligible-node deploys fail with HTTP 409.
-- [x] **Gate 2 — `minga deploy` deploys.** Writes through the shared Docker-API path; per-service placement report; verified with the real `docker` CLI.
-- [x] **Gate 3 — containers talk to each other.** Bridge + veth + netns per task, IPAM, DNAT publishing, embedded service DNS — verified container-to-container by name.
-- [x] **Gate 4 — Compose fidelity.** `command`, `entrypoint`, `labels`, `healthcheck`, volumes and placement constraints reach the container; Traefik v3 routes to a Minga service.
-- [x] **Gate 5 — transport security and secrets.** Raft mTLS (bounded frames), API bearer auth, NATS credentials, `minga tls` PKI, content-addressed secret staging.
-- [x] **Gate 6 — logs.** Real FIFO capture, JetStream history, gap-free follow across a supervisor restart.
-- [x] **Gate 7 — shippable.** CI on every push (including daemon-backed tests with `MINGA_REQUIRE_CONTAINERD=1`), release artifacts for linux/amd64 and linux/arm64, `install.sh`, changelog, corrected docs.
+Next, in order (rationale in [docs/architecture.md](docs/architecture.md)):
+
+1. Tag `v0.1.0` with the Phase 0 fixes (see [Unreleased](CHANGELOG.md)).
+2. Image pull (content transfer + unpack).
+3. Managers-only Raft: workers become pure JetStream clients, liveness moves to `MINGA_LEASES`, and nodes can join a running cluster.
+4. A multi-node WireGuard mesh on top of the per-node data plane.
+5. Spec-update reprovisioning and healthcheck enforcement.
+6. Host capabilities for agent sandboxes: WASI, egress-only networking, host-injected workload identity, memory limits.
 
 ## Documentation
 
-- [Design document](docs/design.md) — scope, feature gap vs Swarm, tech stack, roadmap
-- [**Roadmap to v0.1.0**](docs/roadmap-v0.1.0.md) — the seven release gates, with the current blockers and their evidence
-- [ADR 0001: Language split](docs/adr/0001-language-split.md) — why Rust, when Go is acceptable
-- [ADR 0002: Event bus](docs/adr/0002-event-bus-nats.md) — NATS/JetStream behind `minga-bus`
-- [ADR 0003: Agent workloads](docs/adr/0003-agent-workloads.md) — WASM sandboxes + LLM egress in the orchestration pipeline
-- [ADR 0004: Observability](docs/adr/0004-observability.md) — Prometheus metrics, health endpoints, structured logging
-- [Talos Deployment Guide](docs/talos-deployment.md) — **Comprehensive**: bare metal, Hetzner Cloud (hcloud), air-gapped, single-node, Terraform
-- [NATS/JetStream evaluation](docs/research/nats-evaluation.md) — should Minga adopt NATS as its event bus, and how
-- [CLAUDE.md](CLAUDE.md) — project conventions for AI-assisted development
+- [Architecture notes](docs/architecture.md): how the pieces fit today, known structural limits, and the plan
+- [Roadmap to v0.1.0](docs/roadmap-v0.1.0.md): the seven release gates and their evidence
+- [ADR 0001: Language split](docs/adr/0001-language-split.md)
+- [ADR 0002: Event bus](docs/adr/0002-event-bus-nats.md): NATS/JetStream behind `minga-bus`
+- [ADR 0003: Agent workloads](docs/adr/0003-agent-workloads.md)
+- [ADR 0004: Observability](docs/adr/0004-observability.md)
+- [Talos deployment guide](docs/talos-deployment.md) (not validated)
+- [NATS/JetStream evaluation](docs/research/nats-evaluation.md)
+- [Design document](docs/design.md)
+- [CLAUDE.md](CLAUDE.md): project conventions for AI-assisted development
 
 ## Contributing
 
@@ -360,4 +288,4 @@ Contributions are welcome. Please read [CONTRIBUTING.md](CONTRIBUTING.md) before
 
 ## License
 
-[MIT](LICENSE) — Copyright (c) 2026 Minga contributors.
+[MIT](LICENSE). Copyright (c) 2026 Minga contributors. Release archives also contain `nats-server`, licensed under Apache 2.0 (`NATS-LICENSE`).

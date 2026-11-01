@@ -171,3 +171,13 @@ WASM modules are referenced by `module_ref` (a filesystem path on the node). Dis
 | Separate agent orchestrator service | Rejected — violates the "one binary" principle; agents belong in the same pipeline |
 | Distribute WASM modules through Raft now | Rejected as premature — module distribution is a Phase 2 concern; the `module_ref` indirection covers it |
 | Global egress proxy (one per cluster) | Rejected — wrong for edge/air-gapped; per-node proxy matches the deployment model |
+
+## Implementation status (2026-11-01)
+
+- **Working:** `x-minga-agent` parsing, scheduler translation, placement, supervisor dispatch by kind, and the wasmtime executor with fuel and timeout limits. Since `minga deploy` goes through the Docker API, the agent spec travels as the `minga.agent` service label, and the label is removed again before state.
+- **Missing: host imports.** Modules are instantiated with none: no WASI, network, env or clock. A WASI module fails to instantiate, and a guest can't reach the egress proxy. `MINGA_EGRESS_URL` is set in an environment the guest can't read.
+- **Missing: limits.** `memory_limit` and `token_budget` are carried but not enforced.
+- **Missing: identity.** The egress proxy identifies workloads by the `X-Minga-Workload` header, which the caller controls. The host should inject identity instead.
+- **Missing: Firecracker.** `FirecrackerRuntime` is a stub.
+
+Until host capabilities land, agents are pure compute: input bytes in, output bytes out.

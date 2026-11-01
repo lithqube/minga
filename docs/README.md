@@ -1,31 +1,34 @@
-# Minga Documentation
+# Minga documentation
 
-## Deployment Guides
+## Start here
 
-- [Talos Linux Deployment](talos-deployment.md) — deployment target; **not yet validated on a Talos host**
-- [Single-Node / Edge](talos-deployment.md#single-node-dev--edge-setup) — Dev/test on one machine
-- [Air-Gapped Install](talos-deployment.md#air-gapped--offline-install) — Offline/isolated environments
+- [Project README](../README.md): what works, quick start, diagrams
+- [Architecture notes](architecture.md): how the pieces fit today, structural limits, and the plan
+- [Changelog](../CHANGELOG.md)
 
-## Release
+## Architecture decision records
 
-- [Roadmap to v0.1.0](roadmap-v0.1.0.md) — the seven gates, the current blockers, and what is proven vs planned
-- [Wave 10 execution status](../.planning/phases/10-wave-10-production-hardening/10-EXECUTION-STATUS.md) — what the hardening wave actually achieved
-
-## Architecture Decision Records (ADRs)
-
-- [ADR 0001: Language Split](adr/0001-language-split.md)
-- [ADR 0002: Event Bus — NATS](adr/0002-event-bus-nats.md)
-- [ADR 0003: Agent Workloads](adr/0003-agent-workloads.md)
+- [ADR 0001: Language split](adr/0001-language-split.md): Rust everywhere, Go only as a separate process
+- [ADR 0002: Event bus: NATS/JetStream](adr/0002-event-bus-nats.md)
+- [ADR 0003: Agent workloads](adr/0003-agent-workloads.md)
 - [ADR 0004: Observability](adr/0004-observability.md)
 
-## Operations
+Each ADR ends with an *Implementation status* section saying what shipped and where the code deviates.
 
-- [Observability (Metrics, Health, Logging)](adr/0004-observability.md)
-- [Restart Policies](docs/RESTART_POLICIES.md) (TBD)
-- [Agent Sandbox Lifecycle](docs/AGENT_LIFECYCLE.md) (TBD)
+## Deployment
+
+- [Quick start: one Linux host](../README.md#quick-start-one-linux-host): the verified path
+- [systemd unit](../scripts/minga.service) and [environment example](../scripts/minga.env.example)
+- [Talos Linux and Hetzner Cloud](talos-deployment.md): **not validated**. Minga on Talos needs a system extension, which doesn't exist yet.
+
+## History and research
+
+- [Roadmap to v0.1.0](roadmap-v0.1.0.md): the seven release gates (historical, all closed)
+- [NATS/JetStream evaluation](research/nats-evaluation.md): the research behind ADR 0002
+- [Design document](design.md): link to the living design doc
+- [Wave 9 plan](../Wave-9-PLAN.md): historical wave plan
 
 ## Development
 
-- [Wave Plans](Wave-9-PLAN.md) — Current and historical wave plans
-- [Contributing](../CONTRIBUTING.md) (TBD)
-- [Coding Standards](../CLAUDE.md)
+- [Contributing](../CONTRIBUTING.md)
+- [Project conventions](../CLAUDE.md)

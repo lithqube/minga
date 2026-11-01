@@ -1,34 +1,41 @@
+# Runs one Minga role (manager or worker) under systemd on a Linux host.
+# Install: copy to /etc/systemd/system/minga.service, write
+# /etc/minga/minga.env from scripts/minga.env.example, then
+#   systemctl daemon-reload && systemctl enable --now minga
+#
+# Not for Talos: Talos has no systemd (see docs/talos-deployment.md).
+
 [Unit]
-Description=Minga Node Supervisor
+Description=Minga node (role from /etc/minga/minga.env)
 Documentation=https://github.com/lithqube/minga
 After=network-online.target containerd.service
-Wants=network-online.target containerd.service
+Wants=network-online.target
+Requires=containerd.service
 
 [Service]
-Type=notify
-# Environment variables can be overridden via /etc/minga/minga.env
-EnvironmentFile=-/etc/minga/minga.env
-ExecStart=/opt/minga/minga node \
-  --containerd-socket ${CONTAINERD_SOCKET:-unix:///run/containerd/containerd.sock} \
-  --nats-url ${NATS_URL:-nats://localhost:4222} \
-  --node-id ${NODE_ID:-$(hostname)} \
-  --data-dir ${DATA_DIR:-/var/lib/minga} \
-  --log-level ${LOG_LEVEL:-info}
+# minga does not speak sd_notify; the process is ready once it logs
+# "starting manager loops" / "starting worker loop".
+Type=simple
+EnvironmentFile=/etc/minga/minga.env
+# MINGA_NATS_URL, MINGA_NATS_TOKEN, MINGA_NATS_TLS_* and MINGA_METRICS_BIND
+# are read from the environment directly. $MINGA_EXTRA_ARGS is split on
+# whitespace (peers, labels, Raft TLS flags).
+ExecStart=/usr/local/bin/minga ${MINGA_ROLE} \
+  --node-id ${MINGA_NODE_ID} \
+  --bind ${MINGA_BIND} \
+  --data-dir /var/lib/minga \
+  --runtime containerd \
+  --containerd-socket /run/containerd/containerd.sock \
+  $MINGA_EXTRA_ARGS
+# minga shuts down gracefully (marks the node Left) on SIGINT only.
+KillSignal=SIGINT
+TimeoutStopSec=30
 Restart=on-failure
 RestartSec=5
 LimitNOFILE=1048576
-LimitNPROC=1048576
-TasksMax=infinity
-TimeoutStartSec=120
-TimeoutStopSec=30
-
-# Security hardening
-NoNewPrivileges=yes
-PrivateTmp=yes
-ProtectSystem=strict
-ProtectHome=yes
-ReadWritePaths=/var/lib/minga /run/containerd
-CapabilityBoundingSet=CAP_DAC_OVERRIDE CAP_SYS_RESOURCE CAP_SYS_ADMIN
+# Runs as root with full capabilities: the supervisor creates network
+# namespaces, bridges, veth pairs and iptables rules. Sandboxing options
+# (ProtectSystem, CapabilityBoundingSet, ...) have not been tested.
 
 [Install]
 WantedBy=multi-user.target
