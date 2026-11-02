@@ -2,6 +2,20 @@
 
 ## [Unreleased]
 
+### Security
+- The LLM egress proxy no longer trusts the self-asserted `X-Minga-Workload`
+  header. Each agent run gets a per-sandbox token (`MINGA_EGRESS_TOKEN`,
+  sent as `X-Minga-Sandbox-Token`) that the node mints and revokes when the
+  run ends. Requests without a live token get 401, and a workload header
+  that contradicts the token gets 403. `minga egress` prints the token it
+  mints for `default` at startup. Breaking for direct proxy clients.
+- Agents hold no provider credentials. `--egress-credential <secret-id>`
+  (`--credential` on `minga egress`) loads the key from the node secret
+  store, and the proxy injects it as `Authorization: Bearer` or `x-api-key`
+  (`--egress-credential-header`). Credential headers the client sends are
+  dropped; only `accept`, `anthropic-version` and `anthropic-beta` pass
+  through. The key is redacted from proxy errors and upstream error bodies.
+
 ### Fixed
 - `minga deploy` kept neither `deploy.restart_policy` nor `x-minga-agent`:
   the Docker-API round trip reset the restart policy to its default (and

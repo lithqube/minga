@@ -12,6 +12,7 @@ bincode.workspace = true
 hyper-util.workspace = true
 libc.workspace = true
 minga-bus = { path = "../minga-bus" }
+minga-egress = { path = "../minga-egress" }
 minga-net = { path = "../minga-net" }
 minga-sandbox = { path = "../minga-sandbox" }
 minga-state = { path = "../minga-state" }

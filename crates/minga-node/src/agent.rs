@@ -230,6 +230,7 @@ pub struct WasmtimeAgentExecutor {
     module_dir: std::path::PathBuf,
     results: Mutex<HashMap<String, AgentRunResult>>,
     statuses: Mutex<HashMap<String, AgentStatus>>,
+    egress_tokens: Option<Arc<minga_egress::SandboxTokens>>,
 }
 
 impl WasmtimeAgentExecutor {
@@ -245,7 +246,15 @@ impl WasmtimeAgentExecutor {
             module_dir: module_dir.as_ref().to_path_buf(),
             results: Mutex::new(HashMap::new()),
             statuses: Mutex::new(HashMap::new()),
+            egress_tokens: None,
         })
+    }
+
+    /// Mints a per-run egress token from `tokens` for every agent this
+    /// executor starts, so the co-located proxy knows which task is calling.
+    pub fn with_egress_tokens(mut self, tokens: Arc<minga_egress::SandboxTokens>) -> Self {
+        self.egress_tokens = Some(tokens);
+        self
     }
 
     /// Creates a wasmtime agent executor with the current directory as module base.
@@ -290,6 +299,14 @@ impl AgentExecutor for WasmtimeAgentExecutor {
                 .env
                 .insert("MINGA_EGRESS_URL".to_string(), url.clone());
         }
+        // Revoked when `start` returns, i.e. when the run ends.
+        let _egress_token = self.egress_tokens.as_ref().map(|tokens| {
+            let token = tokens.issue(&id);
+            sandbox_spec
+                .env
+                .insert("MINGA_EGRESS_TOKEN".to_string(), token.as_str().to_string());
+            token
+        });
 
         // Prepare input: use the prompt as input data.
         let input = spec

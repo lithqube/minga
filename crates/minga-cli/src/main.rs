@@ -241,6 +241,13 @@ struct NodeArgs {
     /// Upstream LLM API URL for the egress proxy.
     #[arg(long, default_value = "https://api.openai.com")]
     egress_upstream: String,
+    /// Secret ID in --secret-store holding the upstream API key. The egress
+    /// proxy injects it; agents never hold it.
+    #[arg(long)]
+    egress_credential: Option<String>,
+    /// Header the egress proxy sends the key in.
+    #[arg(long, default_value = "authorization", value_parser = ["authorization", "x-api-key"])]
+    egress_credential_header: String,
     /// Bind address for `/metrics`, `/healthz` and `/readyz`
     /// (e.g. 0.0.0.0:9100). Not served when unset.
     #[arg(long, env = "MINGA_METRICS_BIND")]
@@ -329,6 +336,37 @@ struct EgressArgs {
     /// Disable response caching.
     #[arg(long)]
     no_cache: bool,
+    /// Directory holding the node-local secret store.
+    #[arg(long, default_value = "/var/lib/minga/secrets")]
+    secret_store: String,
+    /// Secret ID in --secret-store holding the upstream API key, injected
+    /// into every upstream request.
+    #[arg(long)]
+    credential: Option<String>,
+    /// Header the key is sent in.
+    #[arg(long, default_value = "authorization", value_parser = ["authorization", "x-api-key"])]
+    credential_header: String,
+}
+
+/// Reads the egress proxy's upstream key from the node secret store.
+fn load_upstream_auth(
+    secret_store: &str,
+    secret_id: Option<&str>,
+    header: &str,
+) -> Result<Option<minga_egress::UpstreamAuth>, String> {
+    let Some(id) = secret_id else {
+        return Ok(None);
+    };
+    let key = minga_node::secrets::SecretStore::new(secret_store)
+        .read_value(id)
+        .map_err(|e| e.to_string())?;
+    if key.is_empty() {
+        return Err(format!("secret `{id}` is empty"));
+    }
+    Ok(Some(match header {
+        "authorization" => minga_egress::UpstreamAuth::Bearer(key),
+        _ => minga_egress::UpstreamAuth::ApiKey(key),
+    }))
 }
 
 /// Parses `--peer id=address` into a BTreeMap.
@@ -874,6 +912,9 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
         }
     };
 
+    // Shared by the agent executor (mints) and the egress proxy (checks).
+    let egress_tokens = Arc::new(minga_egress::SandboxTokens::new());
+
     // Construct the agent executor if --sandbox-runtime is set.
     let agent_executor: Option<Arc<dyn minga_node::AgentExecutor>> = match &args.sandbox_runtime {
         Some(rt) => match rt.as_str() {
@@ -884,7 +925,7 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
             "wasmtime" => {
                 tracing::info!(module_dir = %args.module_dir, "using WasmtimeAgentExecutor");
                 match minga_node::WasmtimeAgentExecutor::new(&args.module_dir).await {
-                    Ok(exec) => Some(Arc::new(exec)),
+                    Ok(exec) => Some(Arc::new(exec.with_egress_tokens(egress_tokens.clone()))),
                     Err(e) => {
                         eprintln!("error: cannot create wasmtime agent executor: {e}");
                         return ExitCode::FAILURE;
@@ -906,13 +947,25 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
     {
         tracing::info!(bind = %bind, upstream = %args.egress_upstream, "starting egress proxy");
         let budgets = Arc::new(minga_egress::BudgetTracker::new());
+        let upstream_auth = match load_upstream_auth(
+            &args.secret_store,
+            args.egress_credential.as_deref(),
+            &args.egress_credential_header,
+        ) {
+            Ok(a) => a,
+            Err(e) => {
+                eprintln!("error: cannot load egress credential: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
         let config = minga_egress::EgressProxyConfig {
             upstream_url: args.egress_upstream.clone(),
             timeout: Duration::from_secs(60),
             cache_config: Some(minga_egress::CacheConfig::default()),
             redact_errors: true,
+            upstream_auth,
         };
-        let mut proxy = minga_egress::EgressProxy::new(config, budgets);
+        let mut proxy = minga_egress::EgressProxy::new(config, budgets, egress_tokens.clone());
         match proxy.start(bind).await {
             Ok(addr) => {
                 println!("LLM egress proxy listening on http://{addr}");
@@ -1396,6 +1449,17 @@ async fn run_egress(args: EgressArgs) -> ExitCode {
         minga_egress::Budget::new(args.default_budget, Duration::from_secs(args.budget_window)),
     );
 
+    let upstream_auth = match load_upstream_auth(
+        &args.secret_store,
+        args.credential.as_deref(),
+        &args.credential_header,
+    ) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("error: cannot load upstream credential: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
     let config = minga_egress::EgressProxyConfig {
         upstream_url: args.upstream.clone(),
         timeout: Duration::from_secs(60),
@@ -1405,9 +1469,13 @@ async fn run_egress(args: EgressArgs) -> ExitCode {
             Some(minga_egress::CacheConfig::default())
         },
         redact_errors: true,
+        upstream_auth,
     };
 
-    let mut proxy = minga_egress::EgressProxy::new(config, budgets);
+    // No agent executor here to mint tokens, so mint one for "default".
+    let tokens = Arc::new(minga_egress::SandboxTokens::new());
+    let default_token = tokens.issue("default");
+    let mut proxy = minga_egress::EgressProxy::new(config, budgets, tokens);
 
     let addr = match proxy.start(&args.bind).await {
         Ok(a) => a,
@@ -1422,7 +1490,10 @@ async fn run_egress(args: EgressArgs) -> ExitCode {
     println!("  health:    http://{addr}/health");
     println!("  budgets:   http://{addr}/budgets");
     println!("  proxy:     http://{addr}/v1/chat/completions");
-    println!("  workload:  set X-Minga-Workload header to identify the workload");
+    println!(
+        "  identity:  send X-Minga-Sandbox-Token: {}",
+        default_token.as_str()
+    );
 
     // Wait forever (until SIGINT).
     tokio::signal::ctrl_c().await.ok();

@@ -20,14 +20,17 @@
 //! - [`BudgetTracker`] — per-workload token budgets with time windows.
 //! - [`ResponseCache`] — LRU cache for LLM API responses.
 //! - [`SecretRedactor`] — regex-based secret/PII redaction.
+//! - [`SandboxTokens`] — per-sandbox tokens that bind requests to a workload.
 //! - [`EgressProxy`] — axum-based reverse proxy server.
 
 mod budget;
 mod cache;
+mod identity;
 mod proxy;
 mod redact;
 
 pub use budget::{Budget, BudgetStatus, BudgetTracker, BudgetTrackerError};
 pub use cache::{CacheConfig, CacheStats, ResponseCache};
-pub use proxy::{EgressProxy, EgressProxyConfig, EgressProxyError};
+pub use identity::{SandboxToken, SandboxTokens, SANDBOX_TOKEN_HEADER};
+pub use proxy::{EgressProxy, EgressProxyConfig, EgressProxyError, UpstreamAuth};
 pub use redact::{RedactionRule, SecretRedactor};

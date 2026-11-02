@@ -136,8 +136,8 @@ New subcommand: `minga agent ls` — list running/completed agents.
 The egress proxy runs **on the worker node** (co-located with the agent executor), not as a separate service. This means:
 
 - Agent WASM modules reach the LLM API only through the local proxy (`127.0.0.1:PORT`).
-- Token budgets are enforced per-workload at the proxy, keyed by the `X-Minga-Workload` header.
-- Secrets (API keys) never cross the bus or Raft — they live in the proxy's environment.
+- Token budgets are enforced per-workload at the proxy, keyed by the workload the request's sandbox token was minted for (see Implementation status).
+- Secrets (API keys) never cross the bus or Raft, and agents never hold them: the proxy reads the provider key from the node secret store and injects it in transit.
 - In air-gapped deployments, the proxy can point at a local model server instead of a cloud API.
 
 ## Module distribution strategy
@@ -172,12 +172,16 @@ WASM modules are referenced by `module_ref` (a filesystem path on the node). Dis
 | Distribute WASM modules through Raft now | Rejected as premature — module distribution is a Phase 2 concern; the `module_ref` indirection covers it |
 | Global egress proxy (one per cluster) | Rejected — wrong for edge/air-gapped; per-node proxy matches the deployment model |
 
-## Implementation status (2026-11-01)
+## Implementation status (2026-11-02)
 
 - **Working:** `x-minga-agent` parsing, scheduler translation, placement, supervisor dispatch by kind, and the wasmtime executor with fuel and timeout limits. Since `minga deploy` goes through the Docker API, the agent spec travels as the `minga.agent` service label, and the label is removed again before state.
 - **Missing: host imports.** Modules are instantiated with none: no WASI, network, env or clock. A WASI module fails to instantiate, and a guest can't reach the egress proxy. `MINGA_EGRESS_URL` is set in an environment the guest can't read.
 - **Missing: limits.** `memory_limit` and `token_budget` are carried but not enforced.
-- **Missing: identity.** The egress proxy identifies workloads by the `X-Minga-Workload` header, which the caller controls. The host should inject identity instead.
+- **Identity: per-sandbox token.** When `WasmtimeAgentExecutor` starts a run it mints a random 256-bit token for the task (`minga_egress::SandboxTokens`), puts it in the sandbox env as `MINGA_EGRESS_TOKEN`, and revokes it when the run ends. The proxy serves only requests whose `X-Minga-Sandbox-Token` maps to a live token, and takes the workload from that mapping. A request without one gets 401; an `X-Minga-Workload` that names a different workload gets 403. The registry lives in memory, shared by the executor and the proxy inside one `minga worker`. The standalone `minga egress` mints one `default` token at startup and prints it.
+  - *Why a token and not a per-sandbox listener:* wasmtime guests have no sockets. Once host imports land, the HTTP call leaves the node process, so a listener per sandbox would see the same caller every time. A token works for that host import, which can attach it without the guest ever seeing it, and also for Firecracker, where the guest does open sockets. It costs one map lookup, with no ports to allocate and no listeners to tear down.
+  - *Limit:* while it runs, a guest can read its own token and hand it to another process on the node. That process can spend this task's budget but never sees the provider key, and the token is dead once the run ends.
+- **Credential injection.** `--egress-credential <secret-id>` (or `--credential` on `minga egress`) reads the provider key from the node secret store via `SecretStore::read_value`, with the same checks as task secrets. The proxy sends it as `Authorization: Bearer` or, with `--egress-credential-header x-api-key`, as `x-api-key`. Of the client's headers, only `accept`, `anthropic-version` and `anthropic-beta` are forwarded. Anything else, including the client's own `Authorization`/`x-api-key`, the sandbox token and `X-Minga-Workload`, is dropped. The key is a literal `SecretRedactor` rule, and upstream error bodies (status ≥ 400) are redacted along with the proxy's own errors. The key is read once at startup, so rotating it needs a restart.
+- **Known gaps in the proxy:** the response cache is keyed by method, path and body but not by workload, so one workload can be served another's cached answer. On a node, no budgets are registered, so every request gets 429 until `token_budget` is enforced (below).
 - **Missing: Firecracker.** `FirecrackerRuntime` is a stub.
 
 Until host capabilities land, agents are pure compute: input bytes in, output bytes out.
