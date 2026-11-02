@@ -1,0 +1,70 @@
+---
+// Renders nothing until there is something real to show: no placeholder logos, counts or quotes.
+import { site } from '../config/site';
+import Testimonial from './Testimonial.astro';
+
+const { testimonials, adopters, mentions, shareUsageUrl } = site.socialProof;
+const stats = (
+  [
+    ['stars', site.stats.stars],
+    ['forks', site.stats.forks],
+    ['contributors', site.stats.contributors],
+  ] as const
+).filter(([, v]) => v !== null);
+const hasContent = testimonials.length + adopters.length + mentions.length + stats.length > 0;
+---
+
+{hasContent && (
+  <section class="section" aria-labelledby="proof-title">
+    <div class="wrap">
+      <h2 id="proof-title">Who uses it</h2>
+      {stats.length > 0 && (
+        <p class="mono">
+          {stats.map(([k, v]) => `${v} ${k}`).join(' · ')} on <a href={site.repoUrl}>GitHub</a>
+        </p>
+      )}
+      {testimonials.length > 0 && (
+        <div class="grid grid-2">
+          {testimonials.map((t) => (
+            <Testimonial {...t} />
+          ))}
+        </div>
+      )}
+      {adopters.length > 0 && (
+        <>
+          <h3>Teams running Minga</h3>
+          <ul>
+            {adopters.map((a) => (
+              <li>
+                <a href={a.url}>{a.name}</a>
+              </li>
+            ))}
+          </ul>
+        </>
+      )}
+      {mentions.length > 0 && (
+        <>
+          <h3>Writing and talks</h3>
+          <ul>
+            {mentions.map((m) => (
+              <li>
+                <a href={m.url}>{m.title}</a> <span class="muted">({m.kind})</span>
+              </li>
+            ))}
+          </ul>
+        </>
+      )}
+    </div>
+  </section>
+)}
+{!hasContent && shareUsageUrl && (
+  <p class="wrap muted share">
+    Running Minga somewhere? <a href={shareUsageUrl}>Tell us in an issue</a>.
+  </p>
+)}
+
+<style>
+  .share {
+    padding-bottom: 32px;
+  }
+</style>

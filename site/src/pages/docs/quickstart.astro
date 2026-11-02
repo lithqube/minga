@@ -1,0 +1,28 @@
+---
+import Callout from '../../components/Callout.astro';
+import DocsLayout from '../../layouts/DocsLayout.astro';
+import { readmeSection, renderRepoMarkdown } from '../../lib/repo';
+
+// Both sections come straight from README.md, so this page can't drift from the verified path.
+const md = [
+  readmeSection('Quick start: one Linux host').replace(/^## .+\n/, ''),
+  readmeSection('Deployment topologies'),
+].join('\n\n');
+const doc = await renderRepoMarkdown(md, 'README.md');
+---
+
+<DocsLayout
+  title="Quickstart: one Linux host"
+  description="Install Minga, preload images, start the manager and the Docker Engine API, and deploy a Compose stack on one Linux host."
+  crumbs={[
+    { name: 'Docs', path: '/docs/' },
+    { name: 'Quickstart', path: '/docs/quickstart/' },
+  ]}
+  sources={['README.md']}
+  headings={doc.headings}
+>
+  <Callout>
+    Verified by execution on Linux with containerd 2.2.1. Multi-node and Talos have the limits listed below.
+  </Callout>
+  <Fragment set:html={doc.html} />
+</DocsLayout>

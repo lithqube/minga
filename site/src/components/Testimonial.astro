@@ -1,0 +1,30 @@
+---
+import type { Testimonial } from '../config/site';
+
+type Props = Testimonial;
+const { quote, name, role, org, sourceUrl } = Astro.props;
+---
+
+<figure class="card">
+  <blockquote cite={sourceUrl}>
+    <p>{quote}</p>
+  </blockquote>
+  <figcaption>
+    <strong>{name}</strong>, {role}
+    {org && `, ${org}`} · <a href={sourceUrl}>source</a>
+  </figcaption>
+</figure>
+
+<style>
+  figure {
+    margin: 0;
+  }
+  blockquote {
+    margin: 0 0 12px;
+    font-size: 1.05rem;
+  }
+  figcaption {
+    color: var(--muted);
+    font-size: var(--step--1);
+  }
+</style>

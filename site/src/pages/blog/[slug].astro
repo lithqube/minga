@@ -1,0 +1,33 @@
+---
+import { getCollection, render } from 'astro:content';
+import DocsLayout from '../../layouts/DocsLayout.astro';
+import { site } from '../../config/site';
+import { blogPostingLd } from '../../lib/seo';
+
+export async function getStaticPaths() {
+  const posts = await getCollection('blog', (p) => !p.data.draft);
+  return posts.map((post) => ({ params: { slug: post.id }, props: { post } }));
+}
+const { post } = Astro.props;
+const { Content, headings } = await render(post);
+const path = `/blog/${post.id}/`;
+const author = post.data.author ?? site.maintainer.name;
+---
+
+<DocsLayout
+  title={post.data.title}
+  description={post.data.description}
+  crumbs={[
+    { name: 'Blog', path: '/blog/' },
+    { name: post.data.title, path },
+  ]}
+  headings={headings}
+  current="/blog/"
+  type="article"
+  jsonLd={[blogPostingLd({ ...post.data, path, author })]}
+>
+  <p class="mono muted">
+    <time datetime={post.data.pubDate.toISOString()}>{post.data.pubDate.toISOString().slice(0, 10)}</time> · {author}
+  </p>
+  <Content />
+</DocsLayout>

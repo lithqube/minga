@@ -1,0 +1,49 @@
+---
+// Hidden until the head script runs, so there is never a dead control without JS.
+---
+
+<button type="button" class="theme-toggle" id="theme-toggle" aria-pressed="true" hidden>
+  <span class="label">Dark theme</span>
+</button>
+
+<script>
+  const btn = document.getElementById('theme-toggle')!;
+  const root = document.documentElement;
+  const current = () => root.dataset.theme ?? (matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark');
+  const paint = () => {
+    const dark = current() === 'dark';
+    btn.setAttribute('aria-pressed', String(dark));
+    btn.querySelector('.label')!.textContent = dark ? 'Dark theme' : 'Light theme';
+  };
+  btn.hidden = false;
+  paint();
+  btn.addEventListener('click', () => {
+    const next = current() === 'dark' ? 'light' : 'dark';
+    root.dataset.theme = next;
+    try {
+      localStorage.setItem('theme', next);
+    } catch {
+      /* private mode: the choice lasts for this page only */
+    }
+    paint();
+  });
+</script>
+
+<style>
+  .theme-toggle {
+    min-height: 44px;
+    padding: 6px 12px;
+    font: var(--step--1) var(--mono);
+    color: var(--text);
+    background: transparent;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    white-space: nowrap;
+  }
+  .theme-toggle:hover {
+    border-color: var(--accent);
+  }
+  .theme-toggle:active {
+    background: color-mix(in srgb, var(--accent) 12%, transparent);
+  }
+</style>

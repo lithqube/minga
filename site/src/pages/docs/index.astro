@@ -1,0 +1,16 @@
+---
+import DocsLayout from '../../layouts/DocsLayout.astro';
+import { renderRepoFile } from '../../lib/repo';
+
+const doc = await renderRepoFile('docs/README.md');
+---
+
+<DocsLayout
+  title="Documentation"
+  description="Minga documentation: quickstart, architecture notes, decision records, deployment guides and the changelog."
+  crumbs={[{ name: 'Docs', path: '/docs/' }]}
+  sources={['docs/README.md']}
+  headings={doc.headings}
+>
+  <Fragment set:html={doc.html} />
+</DocsLayout>

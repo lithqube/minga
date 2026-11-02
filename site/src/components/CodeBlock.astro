@@ -1,0 +1,61 @@
+---
+// Build-time highlighted code. `lang="console"` renders "$ " prompts that are never selected or copied.
+import { Code } from 'astro:components';
+import { shikiConfig } from '../lib/rehype';
+
+interface Props {
+  code: string;
+  lang?: string;
+  title?: string;
+  /** Shown under the code, muted, without a copy button. */
+  output?: string;
+  /** Heading over `output`; say where the sample comes from when it was not captured from a run. */
+  outputLabel?: string;
+  copy?: boolean;
+}
+const { code, lang = 'bash', title, output, outputLabel = 'Expected output', copy = true } = Astro.props;
+const lines = code.replace(/\n$/, '').split('\n');
+const copyText =
+  lang === 'console'
+    ? lines
+        .filter((l) => l.startsWith('$ '))
+        .map((l) => l.slice(2))
+        .join('\n')
+    : code.trim();
+// Built as a string: whitespace inside <pre> is significant, and the formatter would reflow JSX children.
+const esc = (t: string) => t.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+const consoleHtml = lines
+  .map((l) =>
+    l.startsWith('$ ')
+      ? `<span class="prompt">$ </span>${esc(l.slice(2))}`
+      : `<span class="${l.includes('[ok ]') ? 'out ok' : 'out'}">${esc(l)}</span>`,
+  )
+  .join('\n');
+---
+
+<figure class="code" data-copy={copy ? copyText : undefined} data-nocopy={copy ? undefined : ''}>
+  {title && <figcaption class="code-title">{title}</figcaption>}
+  {lang === 'console' ? (
+    <pre tabindex="0" aria-label={title ? `Terminal: ${title}` : 'Terminal'} set:html={consoleHtml} />
+  ) : (
+    <Code code={code.trim()} lang={lang as never} theme={shikiConfig.theme} />
+  )}
+  {output && (
+    <div data-nocopy>
+      <p class="code-title">{outputLabel}</p>
+      <pre tabindex="0" aria-label="Expected output" class="out" set:html={esc(output.trim())} />
+    </div>
+  )}
+</figure>
+
+<style>
+  figure {
+    margin: 0 0 1em;
+  }
+  figure :global(pre) {
+    margin: 0;
+  }
+  [data-nocopy] {
+    margin-top: 8px;
+  }
+</style>

@@ -1,0 +1,41 @@
+---
+// Repo docs that have no dedicated page of their own.
+import Callout from '../../components/Callout.astro';
+import DocsLayout from '../../layouts/DocsLayout.astro';
+import { renderRepoFile } from '../../lib/repo';
+import { site } from '../../config/site';
+
+export function getStaticPaths() {
+  return [
+    { params: { slug: 'talos-deployment' }, props: { rel: 'docs/talos-deployment.md', unvalidated: true } },
+    { params: { slug: 'design' }, props: { rel: 'docs/design.md', unvalidated: false } },
+    {
+      params: { slug: 'research/nats-evaluation' },
+      props: { rel: 'docs/research/nats-evaluation.md', unvalidated: false },
+    },
+  ];
+}
+const { rel, unvalidated } = Astro.props;
+const doc = await renderRepoFile(rel);
+const firstPara = doc.html.match(/<p>([\s\S]*?)<\/p>/)?.[1].replace(/<[^>]+>/g, '') ?? doc.title;
+const description = firstPara.length > 155 ? `${firstPara.slice(0, 152).trimEnd()}…` : firstPara;
+---
+
+<DocsLayout
+  title={doc.title}
+  description={description}
+  crumbs={[
+    { name: 'Docs', path: '/docs/' },
+    { name: doc.title, path: Astro.url.pathname.slice(site.base.length - 1) },
+  ]}
+  sources={[rel]}
+  headings={doc.headings}
+>
+  {unvalidated && (
+    <Callout kind="unvalidated">
+      this guide has not been validated end to end on a Talos host. Treat it as a plan, and check the README for the
+      current status.
+    </Callout>
+  )}
+  <Fragment set:html={doc.html} />
+</DocsLayout>
