@@ -402,3 +402,90 @@ async fn nats_command_roundtrip() {
         .expect("failed to receive command");
     assert_eq!(received, cmd);
 }
+
+#[tokio::test]
+async fn nats_poison_command_is_terminated_and_recorded() {
+    let Some(bus) = connect().await else {
+        return;
+    };
+    let node_id = 9001;
+
+    // A payload that never decodes, followed by a valid command.
+    bus.jetstream()
+        .publish(
+            minga_bus::subjects::ctl_assign(node_id),
+            "not bincode".into(),
+        )
+        .await
+        .expect("publish poison")
+        .await
+        .expect("poison ack");
+    let good = minga_bus::Command::Stop {
+        task_id: "task-after-poison".to_string(),
+    };
+    bus.send_command(node_id, &good)
+        .await
+        .expect("send good command");
+
+    let err = bus
+        .next_command(node_id)
+        .await
+        .expect_err("poison must not decode");
+    assert!(
+        matches!(err, minga_bus::BusError::Serialization(_)),
+        "{err}"
+    );
+
+    // Terminated, not redelivered: the next fetch yields the valid command.
+    let received = bus.next_command(node_id).await.expect("next command");
+    assert_eq!(received, good);
+
+    // The consumer is bounded.
+    let info = bus
+        .jetstream()
+        .get_stream("MINGA_COMMANDS")
+        .await
+        .expect("commands stream")
+        .consumer_info(format!("node-{node_id}"))
+        .await
+        .expect("consumer info")
+        .clone();
+    assert_eq!(info.config.max_deliver, 5);
+    assert!(!info.config.backoff.is_empty());
+
+    // JetStream's MSG_TERMINATED advisory lands in the dead-letter stream.
+    let dead_letters = bus
+        .jetstream()
+        .get_stream("MINGA_DEAD_LETTERS")
+        .await
+        .expect("dead-letter stream");
+    let subject =
+        format!("$JS.EVENT.ADVISORY.CONSUMER.MSG_TERMINATED.MINGA_COMMANDS.node-{node_id}");
+    let mut advisory = None;
+    for _ in 0..50 {
+        if let Ok(msg) = dead_letters.get_last_raw_message_by_subject(&subject).await {
+            advisory = Some(msg);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let advisory = advisory.expect("no MSG_TERMINATED advisory recorded");
+    let body: serde_json::Value =
+        serde_json::from_slice(&advisory.payload).expect("advisory is JSON");
+    assert_eq!(body["stream"], "MINGA_COMMANDS");
+    assert_eq!(body["consumer"], format!("node-{node_id}"));
+    assert!(
+        body["reason"].as_str().is_some_and(|r| !r.is_empty()),
+        "advisory should carry the term reason: {body}"
+    );
+
+    // The advisory names the sequence, not the body: a work-queue stream
+    // has already dropped the terminated message.
+    let seq = body["stream_seq"].as_u64().expect("stream_seq");
+    let commands = bus
+        .jetstream()
+        .get_stream("MINGA_COMMANDS")
+        .await
+        .expect("commands stream");
+    assert!(commands.get_raw_message(seq).await.is_err());
+}

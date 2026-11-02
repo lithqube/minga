@@ -17,6 +17,16 @@
 - A lease renewal could undo an operator's drain that landed between its
   read and its write. Renewal is now one atomic Raft command, and it never
   recreates a node record that was removed.
+- A bus message that could never be handled redelivered forever, and ack
+  failures were silently dropped. Every explicit-ack JetStream consumer now
+  stops after 5 deliveries (backoff 30s, 1m, 2m, 5m); a payload that does
+  not decode is terminated with its decode error as the reason, and failed
+  acks are logged. JetStream has no dead-letter queue, so its
+  `MAX_DELIVERIES` and `MSG_TERMINATED` advisories are kept in a new
+  `MINGA_DEAD_LETTERS` stream (7 days, 64 MiB). The advisory holds the
+  stream sequence, not the body; the body survives only while the source
+  stream retains it. `minga_bus_dead_letters_total{topic,reason}` counts
+  messages this node dead-lettered.
 
 ### Added
 - `--metrics-bind` (`MINGA_METRICS_BIND`) on `minga manager`/`minga worker`

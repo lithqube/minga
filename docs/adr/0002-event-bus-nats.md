@@ -50,6 +50,9 @@ minga.ctl.node.{id}.drain  core NATS   synchronous drain         [req/reply]
 | `MINGA_EVENTS` | `minga.node.>`, `minga.task.>`, `minga.egress.>` | Limits | MaxAge 72h |
 | `MINGA_COMMANDS` | `minga.ctl.node.>` | WorkQueue | MaxAge 24h, AckWait 30s |
 | `MINGA_LOGS` | `minga.log.>` | Limits | MaxBytes 512 MiB, MaxAge 24h |
+| `MINGA_DEAD_LETTERS` | `$JS.EVENT.ADVISORY.CONSUMER.MAX_DELIVERIES.>`, `$JS.EVENT.ADVISORY.CONSUMER.MSG_TERMINATED.>` | Limits | MaxBytes 64 MiB, MaxAge 7d |
+
+Every explicit-ack consumer sets MaxDeliver 5 and BackOff 30s, 1m, 2m, 5m (the first entry is the ack wait). A payload that can never be handled is terminated (`+TERM <reason>`); a transient failure is nak'd with a delay. JetStream has no dead-letter queue, so `MINGA_DEAD_LETTERS` keeps the advisories it emits instead of a hand-rolled copy. An advisory names the stream sequence, not the body, so handlers must tolerate a missing payload.
 
 ## KV buckets
 
@@ -106,9 +109,10 @@ They manage disjoint data and fail independently. Disk caps are pinned explicitl
 | Redis Streams / RabbitMQ / Kafka | Rejected — wrong scale for edge |
 | Defer bus, ship supervisor with direct gRPC | Rejected as sequencing — the trait makes the bus cheap now |
 
-## Implementation status (2026-11-01)
+## Implementation status (2026-11-02)
 
-- **Built:** `MemoryBus` and `NatsBus`, the streams and KV buckets above (logs live under `minga.log.>`, not `minga.task.>`), NATS mTLS (`MINGA_NATS_TLS_*`), and the manager-spawned sidecar. The sidecar listens on loopback only, so a multi-node cluster points every manager and worker at one external TLS NATS server.
+- **Built:** `MemoryBus` and `NatsBus`, the streams and KV buckets above (logs live under `minga.log.>`, not `minga.task.>`), NATS mTLS (`MINGA_NATS_TLS_*`), and the manager-spawned sidecar.
+- **Bounded redelivery:** the command, event and log consumers carry MaxDeliver and BackOff; undecodable commands and log entries are terminated with a reason; failed acks are logged; `MINGA_DEAD_LETTERS` records the advisories and `minga_bus_dead_letters_total` counts what each node terminated (or nak'd on its last delivery). Server-side max-delivery give-ups appear only in the stream, not the counter. Nothing reads `MINGA_DEAD_LETTERS` yet. The sidecar listens on loopback only, so a multi-node cluster points every manager and worker at one external TLS NATS server.
 - **Token auth applies only to plaintext loopback connections.** When TLS is configured, the client ignores `--nats-token`/`MINGA_NATS_TOKEN`, so external TLS connections are certificate-only.
 - **Not built:** `SpoolingBus`, so workers have no offline spool.
 - **Deviation: liveness.** Placement reads a lease kept in Raft (`ClusterNode.last_seen_unix`, renewed by the atomic `RenewNodeLease` command), not `MINGA_LEASES`. The bus lease is refreshed but unused. That puts heartbeats through consensus, against this ADR.
