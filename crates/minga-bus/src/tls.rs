@@ -76,7 +76,9 @@ pub struct NatsTlsConfig {
     pub cert_file: PathBuf,
     /// PEM file holding the client private key.
     pub key_file: PathBuf,
-    /// The DNS name (or IP) the server certificate must carry in its SANs.
+    /// The DNS name (or IP) the server certificate must carry in its SANs,
+    /// or a comma-separated list of them for a NATS cluster
+    /// (`nats-1.internal,nats-2.internal,nats-3.internal`).
     ///
     /// Required: without it, a certificate valid for *any* name signed by the
     /// CA would be accepted.
@@ -104,7 +106,7 @@ impl NatsTlsConfig {
     /// * `MINGA_NATS_TLS_CA` — CA PEM path
     /// * `MINGA_NATS_TLS_CERT` — client certificate PEM path
     /// * `MINGA_NATS_TLS_KEY` — client key PEM path
-    /// * `MINGA_NATS_TLS_SERVER_NAME` — expected server DNS name
+    /// * `MINGA_NATS_TLS_SERVER_NAME` — expected server DNS name(s), comma-separated
     ///
     /// Returns `None` when **none** of the variables are set (plaintext
     /// development mode). Returns an error when only some are set — a
@@ -210,7 +212,15 @@ impl NatsTlsConfig {
     ///    server certificate's SANs against the host in the connect URI, so
     ///    pinning the two together is what makes the name check meaningful —
     ///    a certificate valid for a different name is rejected.
+    ///
+    /// A comma-separated seed list is checked URL by URL, each host against
+    /// the comma-separated `expected_server_name`.
     pub fn validate_url(&self, url: &str) -> Result<(), TlsError> {
+        url.split(',')
+            .try_for_each(|url| self.validate_one_url(url.trim()))
+    }
+
+    fn validate_one_url(&self, url: &str) -> Result<(), TlsError> {
         let rest = url
             .strip_prefix("tls://")
             .ok_or_else(|| TlsError::SchemeNotTls {
@@ -232,7 +242,11 @@ impl NatsTlsConfig {
         };
         let host = host.trim_start_matches('[').trim_end_matches(']');
 
-        if !host.eq_ignore_ascii_case(&self.expected_server_name) {
+        if !self
+            .expected_server_name
+            .split(',')
+            .any(|name| host.eq_ignore_ascii_case(name.trim()))
+        {
             return Err(TlsError::ServerNameMismatch {
                 host: host.to_string(),
                 expected: self.expected_server_name.clone(),
@@ -494,5 +508,20 @@ mod tests {
 
         let cfg = NatsTlsConfig::new(&ca_path, &cert_path, &key_path, "  ");
         assert!(matches!(cfg.preflight(), Err(TlsError::Incomplete { .. })));
+    }
+
+    #[test]
+    fn seed_list_is_checked_url_by_url() {
+        let cfg = NatsTlsConfig::new("ca", "cert", "key", "nats-1.internal, nats-2.internal");
+        cfg.validate_url("tls://nats-1.internal:4222,tls://nats-2.internal:4222")
+            .expect("every host is an expected name");
+        assert!(matches!(
+            cfg.validate_url("tls://nats-1.internal:4222,tls://rogue:4222"),
+            Err(TlsError::ServerNameMismatch { .. })
+        ));
+        assert!(matches!(
+            cfg.validate_url("tls://nats-1.internal:4222,nats://nats-2.internal:4222"),
+            Err(TlsError::SchemeNotTls { .. })
+        ));
     }
 }

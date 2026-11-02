@@ -30,6 +30,15 @@
 //! |---|---|---|
 //! | `MINGA_STATUS` | `task.{id}`, `node.{id}` | Latest actual state |
 //! | `MINGA_LEASES` | `lease.node.{id}` | Liveness (timestamp-based) |
+//!
+//! # High availability
+//!
+//! Every constructor takes a comma-separated seed list
+//! (`tls://nats-1:4222,tls://nats-2:4222,tls://nats-3:4222`) and connects
+//! only to those servers, ignoring the ones a server advertises, so a TLS
+//! connection never reaches a host the operator did not name. Streams and
+//! buckets are created with one replica; [`NatsBus::ensure_replicas`]
+//! raises the ones in [`REPLICATED`] on a NATS cluster.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -73,6 +82,17 @@ const NAK_DELAY: Duration = Duration::from_secs(5);
 /// Stream that keeps the advisories JetStream publishes for failed deliveries.
 const DEAD_LETTER_STREAM: &str = "MINGA_DEAD_LETTERS";
 
+/// Streams (KV buckets are `KV_`-prefixed streams) that losing one NATS
+/// server must not lose. `MINGA_LOGS` stays at one replica: it is the
+/// largest stream, best effort, and edge disks are small.
+const REPLICATED: [&str; 5] = [
+    "MINGA_EVENTS",
+    "MINGA_COMMANDS",
+    DEAD_LETTER_STREAM,
+    "KV_MINGA_STATUS",
+    "KV_MINGA_LEASES",
+];
+
 // ---------------------------------------------------------------------------
 // NatsBus
 // ---------------------------------------------------------------------------
@@ -95,6 +115,57 @@ impl NatsBus {
     /// JetStream access (stream inspection, admin operations).
     pub fn jetstream(&self) -> &JetStream {
         &self.js
+    }
+
+    /// Raises the [`REPLICATED`] streams and buckets to `replicas` copies.
+    ///
+    /// Only ever scales up: every node runs this on connect, and a node
+    /// left at the default of 1 must not shrink what a manager raised.
+    /// `replicas` must not exceed the JetStream servers in the cluster;
+    /// the server rejects the update otherwise.
+    ///
+    /// A freshly formed cluster answers "no suitable peers" until every
+    /// server has joined JetStream, so this retries for up to 10 seconds,
+    /// like stream setup does.
+    pub async fn ensure_replicas(&self, replicas: usize) -> Result<()> {
+        const MAX_ATTEMPTS: u32 = 20; // 20 × 500ms = 10s
+        for attempt in 1..=MAX_ATTEMPTS {
+            match self.raise_replicas(replicas).await {
+                Ok(()) => return Ok(()),
+                Err(e) if attempt < MAX_ATTEMPTS => {
+                    tracing::debug!(attempt, error = %e, "cannot raise replicas yet; retrying");
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        unreachable!("loop returns on success or final failure")
+    }
+
+    async fn raise_replicas(&self, replicas: usize) -> Result<()> {
+        for name in REPLICATED {
+            let mut stream = self
+                .js
+                .get_stream(name)
+                .await
+                .map_err(|e| BusError::Other(format!("{name}: {e}")))?;
+            let mut config = stream
+                .info()
+                .await
+                .map_err(|e| BusError::Other(format!("{name} info: {e}")))?
+                .config
+                .clone();
+            if config.num_replicas >= replicas {
+                continue;
+            }
+            config.num_replicas = replicas;
+            self.js
+                .update_stream(config)
+                .await
+                .map_err(|e| BusError::Other(format!("{name} to {replicas} replicas: {e}")))?;
+            tracing::info!(stream = name, replicas, "raised stream replicas");
+        }
+        Ok(())
     }
 
     /// Connect to a NATS server and set up streams/KV buckets.
@@ -133,16 +204,14 @@ impl NatsBus {
         token: Option<&str>,
     ) -> Result<Arc<Self>> {
         Self::ensure_crypto_provider();
-        let client = match token {
-            Some(token) => {
-                async_nats::ConnectOptions::new()
-                    .token(token.to_string())
-                    .connect(url)
-                    .await
-            }
-            None => async_nats::connect(url).await,
+        let mut options = async_nats::ConnectOptions::new().ignore_discovered_servers();
+        if let Some(token) = token {
+            options = options.token(token.to_string());
         }
-        .map_err(|e| BusError::Connection(e.to_string()))?;
+        let client = options
+            .connect(seed_list(url))
+            .await
+            .map_err(|e| BusError::Connection(e.to_string()))?;
         let js = jetstream::new(client.clone());
 
         let (status_kv, leases_kv) = Self::setup_when_ready(&js).await?;
@@ -185,9 +254,10 @@ impl NatsBus {
             .map_err(|e| BusError::Connection(format!("TLS configuration failed: {e}")))?;
 
         Self::ensure_crypto_provider();
-        let client = async_nats::connect_with_options(url, options)
-            .await
-            .map_err(|e| BusError::Connection(format!("TLS connection failed: {e}")))?;
+        let client =
+            async_nats::connect_with_options(seed_list(url), options.ignore_discovered_servers())
+                .await
+                .map_err(|e| BusError::Connection(format!("TLS connection failed: {e}")))?;
 
         let js = jetstream::new(client.clone());
 
@@ -222,9 +292,10 @@ impl NatsBus {
             .map_err(|e| BusError::Connection(format!("TLS configuration failed: {e}")))?;
 
         Self::ensure_crypto_provider();
-        let client = async_nats::connect_with_options(url, options)
-            .await
-            .map_err(|e| BusError::Connection(format!("TLS connection failed: {e}")))?;
+        let client =
+            async_nats::connect_with_options(seed_list(url), options.ignore_discovered_servers())
+                .await
+                .map_err(|e| BusError::Connection(format!("TLS connection failed: {e}")))?;
 
         let js = jetstream::new(client.clone());
 
@@ -328,12 +399,17 @@ impl NatsBus {
     }
 
     async fn setup_kv(js: &JetStream, bucket: &str) -> Result<jetstream::kv::Store> {
+        // Get before create: an update would reset replicas raised by
+        // `ensure_replicas` back to one.
+        if let Ok(store) = js.get_key_value(bucket).await {
+            return Ok(store);
+        }
         let config = KvConfig {
             bucket: bucket.to_string(),
             history: 1,
             ..Default::default()
         };
-        js.create_or_update_key_value(config)
+        js.create_key_value(config)
             .await
             .map_err(|e| BusError::Kv(format!("{bucket}: {e}")))
     }
@@ -811,6 +887,11 @@ fn now_millis() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+/// Splits a comma-separated seed list into the URLs async-nats accepts.
+fn seed_list(url: &str) -> Vec<&str> {
+    url.split(',').map(str::trim).collect()
 }
 
 /// Makes `config` an explicit-ack consumer with bounded, backed-off

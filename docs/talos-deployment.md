@@ -99,9 +99,13 @@ talosctl bootstrap --nodes <cp1-ip> --endpoints <cp1-ip>
 Talos can't install a binary and a systemd unit, so Minga has to be packaged as a Talos system extension with an extension service. Until that exists, this step can't be done. Each node's service must run one role:
 
 ```bash
-# Every manager and worker uses the same external TLS NATS server (certificate-only;
-# --nats-token is ignored over TLS). A manager without --nats-url would spawn a
-# private loopback sidecar and split the cluster's bus.
+# Every manager and worker uses the same external TLS NATS server or cluster
+# (certificate-only; --nats-token is ignored over TLS). A manager without
+# --nats-url would spawn a private loopback sidecar and split the cluster's bus.
+# For a 3-server NATS cluster, list all three in --nats-url
+# (tls://nats-1:4222,tls://nats-2:4222,tls://nats-3:4222), name all three in
+# MINGA_NATS_TLS_SERVER_NAME (nats-1,nats-2,nats-3), and add --nats-replicas 3
+# on the managers.
 export MINGA_NATS_TLS_CA=… MINGA_NATS_TLS_CERT=… MINGA_NATS_TLS_KEY=… MINGA_NATS_TLS_SERVER_NAME=…
 
 # Managers: scheduler + supervisor
@@ -374,7 +378,7 @@ talosctl bootstrap --nodes $(terraform output -raw controlplane_ips | jq -r '.[0
 | **Containerd socket** | Path `/run/containerd/containerd.sock` (no `unix://` prefix); unverified on Talos |
 | **WireGuard** | Minga's mesh isn't applied yet; containers on different nodes can't reach each other |
 | **Private networking** | Create `hcloud network` + attach servers; Minga overlay uses private IPs |
-| **NATS** | A manager without `--nats-url` spawns a loopback-only sidecar. Multi-node: point every manager and worker at one external TLS NATS (`--nats-url tls://…`, `MINGA_NATS_TLS_*`, certificate-only) |
+| **NATS** | A manager without `--nats-url` spawns a loopback-only sidecar. Multi-node: point every manager and worker at one external TLS NATS server or cluster (`--nats-url tls://…[,tls://…]`, `MINGA_NATS_TLS_*`, certificate-only; `--nats-replicas 3` on a 3-server cluster) |
 | **Persistent volumes** | Hetzner CSI driver available if needed; Minga local volumes work on local disk |
 | **Upgrades** | `talosctl upgrade --nodes <ip> --image factory.talos.dev/siderolabs/talos:v1.14.x` — zero-downtime with HA |
 | **Backups** | `hcloud server create-snapshot` before upgrades for instant rollback |
@@ -416,7 +420,7 @@ talosctl bootstrap --nodes $(terraform output -raw controlplane_ips | jq -r '.[0
 | Area | Detail |
 |------|--------|
 | **Containerd socket** | Minga's default is the path `/run/containerd/containerd.sock`, with no `unix://` prefix. Check which containerd instance Talos exposes there before relying on it. |
-| **NATS** | A manager without `--nats-url` spawns `nats-server` (bundled in the release archive) on 127.0.0.1:4222. Multi-node: run one external TLS NATS server and set `--nats-url tls://…` plus `MINGA_NATS_TLS_CA/CERT/KEY/SERVER_NAME` on **every** manager and worker. Over TLS, `--nats-token` is ignored. |
+| **NATS** | A manager without `--nats-url` spawns `nats-server` (bundled in the release archive) on 127.0.0.1:4222. Multi-node: run an external TLS NATS server (or a 3-server cluster with `--nats-replicas 3` on managers) and set `--nats-url tls://…` (comma-separated for a cluster) plus `MINGA_NATS_TLS_CA/CERT/KEY/SERVER_NAME` on **every** manager and worker. Over TLS, `--nats-token` is ignored. |
 | **WireGuard** | Not used by Minga yet. |
 | **Raft** | Static membership: every node must be in every `--peer` list and start together. Use `--raft-tls-ca/cert/key` from `minga tls`. |
 | **Persistent data** | `/var/lib/minga` (Raft log, state, secrets, volumes) must persist across Talos upgrades. |

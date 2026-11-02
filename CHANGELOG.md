@@ -29,6 +29,15 @@
   messages this node dead-lettered.
 
 ### Added
+- High-availability NATS: `--nats-url` takes a comma-separated seed list
+  (`MINGA_NATS_TLS_SERVER_NAME` a matching list of names), and
+  `--nats-replicas` (`MINGA_NATS_REPLICAS`, 1–5) keeps that many copies of
+  the command, event and dead-letter streams and the status and lease
+  buckets. Replicas only go up: a node left at the default of 1 never
+  lowers them, and the KV buckets are no longer reset on every connect.
+  Logs stay at one copy. The client talks only to the servers it was
+  given, not ones a server advertises. The built-in sidecar is still a
+  single server, so replicas above 1 need `--nats-url`.
 - `--metrics-bind` (`MINGA_METRICS_BIND`) on `minga manager`/`minga worker`
   serves `/metrics`, `/healthz` and `/readyz`.
 - JSON logs on stderr for `manager`, `worker` and `api`; level from
