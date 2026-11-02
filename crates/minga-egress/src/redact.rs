@@ -140,6 +140,25 @@ impl SecretRedactor {
         Self { rules }
     }
 
+    /// Adds a rule that redacts one known secret verbatim. It runs first,
+    /// so a broader rule can't redact only part of it and leave the rest.
+    pub fn with_literal(mut self, name: &str, secret: &str) -> Self {
+        if secret.is_empty() {
+            return self;
+        }
+        if let Ok(regex) = Regex::new(&regex::escape(secret)) {
+            self.rules.insert(
+                0,
+                CompiledRule {
+                    name: name.to_string(),
+                    regex,
+                    replacement: "***REDACTED***".to_string(),
+                },
+            );
+        }
+        self
+    }
+
     /// Redacts all matched secrets in the input text.
     pub fn redact(&self, text: &str) -> String {
         let mut result = text.to_string();

@@ -45,7 +45,7 @@ These are deliberate `v0.1.0` trade-offs, listed so nobody builds on them by acc
    The 5,000-node target in ADR 0001 can't be reached this way.
 2. **Liveness goes through Raft.** This breaks the "only desired state through Raft" rule, though the lease is now an atomic command. The lease is the node's wall clock compared with the leader's, so clock skew over 30s misjudges liveness. The bus lease (`refresh_lease`/`is_alive`) is maintained but placement doesn't use it.
 3. **Two dispatch paths.** Workers start tasks from bus commands and by reconciling against their Raft replica. Bus-assigned tasks are exempt from Raft-driven stops, so a lost Stop command can orphan a container. `minga api`'s scheduler publishes no bus commands, so its tasks rely on the Raft path alone.
-4. **Agent sandboxes have no host capabilities.** Modules are instantiated with zero imports: no WASI, network, env or clock. `memory_limit` and `token_budget` aren't enforced, and the egress proxy trusts a guest-supplied `X-Minga-Workload` header.
+4. **Agent sandboxes have no host capabilities.** Modules are instantiated with zero imports: no WASI, network, env or clock. `memory_limit` and `token_budget` aren't enforced. The egress proxy is ready for them: it identifies callers by a per-run token the node mints, and it injects the provider key itself (ADR 0003).
 5. **No container networking across nodes.** Bridges, netns and DNAT are per host. WireGuard config is generated but never applied.
 
 ## Target shape

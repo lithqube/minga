@@ -2140,6 +2140,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "lru",
+ "rand 0.8.8",
  "regex",
  "reqwest",
  "serde",
@@ -2176,6 +2177,7 @@ dependencies = [
  "hyper-util",
  "libc",
  "minga-bus",
+ "minga-egress",
  "minga-net",
  "minga-sandbox",
  "minga-state",

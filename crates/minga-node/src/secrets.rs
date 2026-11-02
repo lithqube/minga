@@ -271,6 +271,19 @@ impl SecretStore {
         Ok(path)
     }
 
+    /// Read a secret's value for use inside this process, with the same
+    /// file checks as [`SecretStore::resolve`]. Used for credentials the node
+    /// itself presents (the egress proxy's upstream key), never mounted.
+    pub fn read_value(&self, secret_id: &str) -> Result<String, SecretResolveError> {
+        // `resolve` validates a mount target; this value is never mounted.
+        let path = self.resolve(&SecretRef::new(secret_id, "/run/secrets/value"))?;
+        let raw = std::fs::read_to_string(&path).map_err(|e| SecretResolveError::Unreadable {
+            name: secret_id.to_string(),
+            reason: e.to_string(),
+        })?;
+        Ok(raw.trim_end().to_string())
+    }
+
     /// Resolve every reference in a task, failing closed on the first
     /// problem.
     ///
@@ -467,6 +480,18 @@ mod tests {
         assert!(matches!(
             store.resolve(&secret_ref),
             Err(SecretResolveError::UnsafePermissions { .. })
+        ));
+    }
+
+    #[test]
+    fn read_value_trims_trailing_newline() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SecretStore::new(dir.path());
+        write_secret(dir.path(), "llm_key", "provider-key\n");
+        assert_eq!(store.read_value("llm_key").unwrap(), "provider-key");
+        assert!(matches!(
+            store.read_value("missing"),
+            Err(SecretResolveError::NotProvisioned(_))
         ));
     }
 
