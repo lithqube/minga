@@ -6,18 +6,21 @@
 //! fails the TLS handshake before it can vote.
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Duration;
 
 use minga_state::network::{RaftTlsConfig, MINGA_NODE_NAME};
 use minga_state::types::{ClusterNode, NodeStatus, ResourceSpec};
 use minga_state::StateStore;
 
-static PORT: AtomicU16 = AtomicU16::new(53000);
-
-fn next_addr() -> String {
-    let port = PORT.fetch_add(1, Ordering::SeqCst);
-    format!("127.0.0.1:{port}")
+/// Returns `N` distinct free localhost addresses chosen by the OS, so parallel
+/// runs of this suite (other worktrees, leftover processes) never share ports.
+fn free_addrs<const N: usize>() -> [String; N] {
+    // Hold every listener until all are bound so the OS can't hand out a port twice.
+    let listeners: [std::net::TcpListener; N] =
+        std::array::from_fn(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap());
+    // shortcut: the port is free between this drop and StateStore binding it; pass a
+    // bound listener into StateStore::open if another process ever wins that race.
+    listeners.map(|l| l.local_addr().unwrap().to_string())
 }
 
 /// A generated cluster CA plus PEMs written under `dir`.
@@ -86,8 +89,7 @@ async fn tls_cluster_elects_and_replicates() {
     let pki = Pki::new();
     let tls1 = pki.issue("n1");
     let tls2 = pki.issue("n2");
-    let addr1 = next_addr();
-    let addr2 = next_addr();
+    let [addr1, addr2] = free_addrs();
 
     let dir1 = tempfile::tempdir().unwrap();
     let dir2 = tempfile::tempdir().unwrap();
@@ -124,8 +126,7 @@ async fn tls_cluster_elects_and_replicates() {
 async fn uncredentialed_peer_cannot_join() {
     let pki = Pki::new();
     let tls1 = pki.issue("n1");
-    let addr1 = next_addr();
-    let addr2 = next_addr();
+    let [addr1, addr2] = free_addrs();
 
     // Node 1 runs with TLS; node 2 connects WITHOUT any credentials.
     let dir1 = tempfile::tempdir().unwrap();
@@ -153,8 +154,7 @@ async fn foreign_ca_peer_cannot_join() {
     let tls1 = pki.issue("n1");
     let foreign = Pki::new();
     let tls2_foreign = foreign.issue("n2");
-    let addr1 = next_addr();
-    let addr2 = next_addr();
+    let [addr1, addr2] = free_addrs();
 
     let dir1 = tempfile::tempdir().unwrap();
     let _store1 = StateStore::open_secure(1, &addr1, dir1.path(), BTreeMap::new(), tls1)

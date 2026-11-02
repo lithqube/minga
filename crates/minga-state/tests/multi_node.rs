@@ -1,21 +1,57 @@
 //! Integration tests for multi-node Raft clusters.
 //!
-//! These tests start 2-3 StateStore nodes on localhost with unique ports,
+//! These tests start 2-3 StateStore nodes on localhost with OS-assigned ports,
 //! verify leader election, log replication, and leader failover.
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::atomic::{AtomicU16, Ordering};
+use std::future::Future;
 use std::time::Duration;
 
 use minga_state::types::{ClusterNode, NodeStatus, ResourceSpec, Service, ServiceMode};
 use minga_state::StateStore;
 
-/// Unique port counter for parallel test isolation.
-static PORT: AtomicU16 = AtomicU16::new(52000);
+/// Upper bound for any wait in this file, so a broken cluster fails instead of hanging.
+const WAIT: Duration = Duration::from_secs(30);
 
-fn next_addr() -> String {
-    let port = PORT.fetch_add(1, Ordering::SeqCst);
-    format!("127.0.0.1:{port}")
+/// Returns `N` distinct free localhost addresses chosen by the OS, so parallel
+/// runs of this suite (other worktrees, leftover processes) never share ports.
+fn free_addrs<const N: usize>() -> [String; N] {
+    // Hold every listener until all are bound so the OS can't hand out a port twice.
+    let listeners: [std::net::TcpListener; N] =
+        std::array::from_fn(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap());
+    // shortcut: the port is free between this drop and StateStore binding it; pass a
+    // bound listener into StateStore::open if another process ever wins that race.
+    listeners.map(|l| l.local_addr().unwrap().to_string())
+}
+
+/// Polls `check` until it returns true, panicking with `what` after [`WAIT`].
+async fn eventually<F, Fut>(what: &str, mut check: F)
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = bool>,
+{
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while !check().await {
+        assert!(tokio::time::Instant::now() < deadline, "timed out: {what}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Waits until one of `stores` reports itself leader and returns it.
+async fn leader<'a>(stores: &[&'a StateStore]) -> &'a StateStore {
+    let deadline = tokio::time::Instant::now() + WAIT;
+    loop {
+        for store in stores {
+            if store.is_leader().await {
+                return store;
+            }
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for a leader"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 fn sample_node(id: u64, addr: &str) -> ClusterNode {
@@ -64,9 +100,7 @@ fn sample_service(id: &str) -> Service {
 /// All three nodes are started concurrently. Node 1 initializes the cluster
 /// with all three members.
 async fn open_cluster() -> (StateStore, StateStore, StateStore, String, String, String) {
-    let addr1 = next_addr();
-    let addr2 = next_addr();
-    let addr3 = next_addr();
+    let [addr1, addr2, addr3] = free_addrs();
 
     let mut peers: BTreeMap<u64, String> = BTreeMap::new();
     peers.insert(2, addr2.clone());
@@ -84,16 +118,18 @@ async fn open_cluster() -> (StateStore, StateStore, StateStore, String, String, 
     let dir2 = tempfile::tempdir().unwrap();
     let dir3 = tempfile::tempdir().unwrap();
 
-    // Start all three nodes concurrently.
-    let (r1, r2, r3) = tokio::join!(
-        StateStore::open(1, &addr1, dir1.path(), peers),
-        StateStore::open(2, &addr2, dir2.path(), peers2),
-        StateStore::open(3, &addr3, dir3.path(), peers3),
-    );
-
-    let store1 = r1.unwrap();
-    let store2 = r2.unwrap();
-    let store3 = r3.unwrap();
+    // Start all three nodes concurrently. `open` waits for a leader with no
+    // deadline, so bound it here; try_join stops at the first failed node.
+    let (store1, store2, store3) = tokio::time::timeout(WAIT, async {
+        tokio::try_join!(
+            StateStore::open(1, &addr1, dir1.path(), peers),
+            StateStore::open(2, &addr2, dir2.path(), peers2),
+            StateStore::open(3, &addr3, dir3.path(), peers3),
+        )
+    })
+    .await
+    .expect("3-node cluster did not start in time")
+    .unwrap();
 
     // Leak the tempdirs — they'll be cleaned up on process exit.
     // (We can't return them because the stores borrow from them... actually
@@ -127,18 +163,19 @@ async fn follower_writes_forward_to_the_leader() {
         .await
         .expect("follower write must forward to the leader");
 
-    tokio::time::sleep(Duration::from_millis(500)).await;
     for store in [&store1, &store2, &store3] {
-        assert!(
-            store.get_service("forwarded-svc").await.unwrap().is_some(),
-            "the forwarded write must replicate to every node"
-        );
+        eventually(
+            "the forwarded write must replicate to every node",
+            || async move { store.get_service("forwarded-svc").await.unwrap().is_some() },
+        )
+        .await;
     }
 }
 
 #[tokio::test]
 async fn three_nodes_elect_leader() {
     let (store1, store2, store3, _, _, _) = open_cluster().await;
+    leader(&[&store1, &store2, &store3]).await;
 
     // Exactly one node should be the leader.
     let l1 = store1.is_leader().await;
@@ -169,22 +206,18 @@ async fn write_replicates_to_all_nodes() {
     let (store1, store2, store3, addr1, _, _) = open_cluster().await;
 
     // Find the leader and write to it.
-    let leader = if store1.is_leader().await {
-        &store1
-    } else if store2.is_leader().await {
-        &store2
-    } else {
-        &store3
-    };
+    let leader = leader(&[&store1, &store2, &store3]).await;
 
     leader.upsert_node(sample_node(1, &addr1)).await.unwrap();
     leader.upsert_service(sample_service("web")).await.unwrap();
 
     // All nodes should see the write (eventually — replication is async).
-    // Wait for the followers to catch up.
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
     for (i, store) in [&store1, &store2, &store3].iter().enumerate() {
+        eventually("followers replicate the node and service", || async move {
+            store.get_node(1).await.unwrap().is_some()
+                && store.get_service("web").await.unwrap().is_some()
+        })
+        .await;
         let node = store.get_node(1).await.unwrap();
         assert!(node.is_some(), "node {i} should see the replicated node");
         assert_eq!(node.unwrap().id, 1);
@@ -203,13 +236,7 @@ async fn write_replicates_to_all_nodes() {
 async fn multiple_writes_replicate() {
     let (store1, store2, store3, _, _, _) = open_cluster().await;
 
-    let leader = if store1.is_leader().await {
-        &store1
-    } else if store2.is_leader().await {
-        &store2
-    } else {
-        &store3
-    };
+    let leader = leader(&[&store1, &store2, &store3]).await;
 
     // Write 5 services.
     for i in 0..5 {
@@ -219,12 +246,12 @@ async fn multiple_writes_replicate() {
             .unwrap();
     }
 
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
     // All nodes should see all 5 services.
     for store in [&store1, &store2, &store3] {
-        let services = store.list_services().await.unwrap();
-        assert_eq!(services.len(), 5, "expected 5 services on all nodes");
+        eventually("expected 5 services on all nodes", || async move {
+            store.list_services().await.unwrap().len() == 5
+        })
+        .await;
     }
 
     store1.shutdown().await.unwrap();
@@ -240,15 +267,9 @@ async fn leader_failover() {
     let mut nodes: Vec<(u64, Option<StateStore>)> =
         vec![(1, Some(store1)), (2, Some(store2)), (3, Some(store3))];
 
-    // Identify the leader by checking each node.
-    let mut leader_id = 0u64;
-    for (id, store) in &nodes {
-        if store.as_ref().unwrap().is_leader().await {
-            leader_id = *id;
-            break;
-        }
-    }
-    assert_ne!(leader_id, 0, "a leader should be elected");
+    let stores: Vec<&StateStore> = nodes.iter().map(|(_, s)| s.as_ref().unwrap()).collect();
+    let leader_id = leader(&stores).await.node_id();
+    drop(stores);
 
     // Write some data before failover.
     for (id, store) in &nodes {
@@ -270,25 +291,9 @@ async fn leader_failover() {
     }
 
     // Wait for the remaining nodes to elect a new leader.
-    let mut new_leader_id = 0u64;
-    for _ in 0..30 {
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        for (id, store) in &nodes {
-            if *id == leader_id {
-                continue;
-            }
-            if let Some(s) = store {
-                if s.is_leader().await {
-                    new_leader_id = *id;
-                    break;
-                }
-            }
-        }
-        if new_leader_id != 0 {
-            break;
-        }
-    }
-    assert_ne!(new_leader_id, 0, "a new leader should be elected");
+    let survivors: Vec<&StateStore> = nodes.iter().filter_map(|(_, s)| s.as_ref()).collect();
+    let new_leader_id = leader(&survivors).await.node_id();
+    drop(survivors);
     assert_ne!(new_leader_id, leader_id, "new leader should be different");
 
     // Write after failover should work.
@@ -304,16 +309,16 @@ async fn leader_failover() {
     }
 
     // Both surviving nodes should see both writes.
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    for (id, store) in &nodes {
-        if *id == leader_id {
-            continue;
-        }
-        let s = store.as_ref().unwrap();
-        let before = s.get_service("before-failover").await.unwrap();
-        assert!(before.is_some(), "node {id}: pre-failover write visible");
-        let after = s.get_service("after-failover").await.unwrap();
-        assert!(after.is_some(), "node {id}: post-failover write visible");
+    for (_, store) in &nodes {
+        let Some(s) = store else { continue };
+        eventually(
+            "survivors see pre- and post-failover writes",
+            || async move {
+                s.get_service("before-failover").await.unwrap().is_some()
+                    && s.get_service("after-failover").await.unwrap().is_some()
+            },
+        )
+        .await;
     }
 
     // Shut down remaining nodes.
@@ -327,8 +332,7 @@ async fn leader_failover() {
 #[tokio::test]
 async fn two_node_cluster() {
     // A 2-node cluster should also work (majority = 2).
-    let addr1 = next_addr();
-    let addr2 = next_addr();
+    let [addr1, addr2] = free_addrs();
 
     let mut peers1: BTreeMap<u64, String> = BTreeMap::new();
     peers1.insert(2, addr2.clone());
@@ -339,30 +343,35 @@ async fn two_node_cluster() {
     let dir1 = tempfile::tempdir().unwrap();
     let dir2 = tempfile::tempdir().unwrap();
 
-    let (r1, r2) = tokio::join!(
-        StateStore::open(1, &addr1, dir1.path(), peers1),
-        StateStore::open(2, &addr2, dir2.path(), peers2),
-    );
-
-    let store1 = r1.unwrap();
-    let store2 = r2.unwrap();
+    let (store1, store2) = tokio::time::timeout(WAIT, async {
+        tokio::try_join!(
+            StateStore::open(1, &addr1, dir1.path(), peers1),
+            StateStore::open(2, &addr2, dir2.path(), peers2),
+        )
+    })
+    .await
+    .expect("2-node cluster did not start in time")
+    .unwrap();
     std::mem::forget(dir1);
     std::mem::forget(dir2);
 
     // One leader.
-    let l1 = store1.is_leader().await;
-    let l2 = store2.is_leader().await;
-    assert_ne!(l1, l2, "exactly one of two nodes should be leader");
+    let leader = leader(&[&store1, &store2]).await;
+    let l1 = leader.node_id() == store1.node_id();
+    assert_ne!(
+        store1.is_leader().await,
+        store2.is_leader().await,
+        "exactly one of two nodes should be leader"
+    );
 
     // Write and replicate.
-    let leader = if l1 { &store1 } else { &store2 };
     leader.upsert_service(sample_service("test")).await.unwrap();
 
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
     let follower = if l1 { &store2 } else { &store1 };
-    let svc = follower.get_service("test").await.unwrap();
-    assert!(svc.is_some(), "follower should see replicated write");
+    eventually("follower should see replicated write", || async move {
+        follower.get_service("test").await.unwrap().is_some()
+    })
+    .await;
 
     store1.shutdown().await.unwrap();
     store2.shutdown().await.unwrap();
