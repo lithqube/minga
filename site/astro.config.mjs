@@ -3,7 +3,7 @@ import { defineConfig } from 'astro/config';
 import sitemap from '@astrojs/sitemap';
 import { unified } from '@astrojs/markdown-remark';
 import { site } from './src/config/site';
-import { mermaidPlugin, rehypeA11y, shikiConfig, syntaxHighlight } from './src/lib/rehype';
+import { mermaidPlugin, rehypeA11y, rehypeDiagramScroll, shikiConfig, syntaxHighlight } from './src/lib/rehype';
 
 export default defineConfig({
   site: site.siteUrl,
@@ -13,7 +13,7 @@ export default defineConfig({
   build: { format: 'directory' },
   integrations: [sitemap()],
   markdown: {
-    processor: unified({ rehypePlugins: [/** @type {never} */ (mermaidPlugin), rehypeA11y] }),
+    processor: unified({ rehypePlugins: [/** @type {never} */ (mermaidPlugin), rehypeDiagramScroll, rehypeA11y] }),
     shikiConfig,
     syntaxHighlight: /** @type {never} */ (syntaxHighlight),
   },

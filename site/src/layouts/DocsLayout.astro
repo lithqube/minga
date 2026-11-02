@@ -171,8 +171,9 @@ const next = idx >= 0 && idx < docsOrder.length - 1 ? docsOrder[idx + 1] : null;
   .docs-nav a,
   .docs-nav-mobile a,
   .toc a {
-    display: inline-block;
-    padding: 5px 0;
+    display: inline-flex;
+    align-items: center;
+    min-height: 44px;
     color: var(--text);
     text-decoration: none;
     font-size: 0.93rem;
@@ -227,6 +228,11 @@ const next = idx >= 0 && idx < docsOrder.length - 1 ? docsOrder[idx + 1] : null;
     gap: 6px;
     font-size: var(--step--1);
     color: var(--muted);
+  }
+  .crumbs a {
+    display: inline-flex;
+    align-items: center;
+    min-height: 44px;
   }
   .crumbs li + li::before {
     content: '›';

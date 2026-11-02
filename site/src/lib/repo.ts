@@ -9,6 +9,7 @@ import { REPO_ROOT } from './paths';
 import {
   mermaidPlugin,
   rehypeA11y,
+  rehypeDiagramScroll,
   rehypeRepoLinks,
   rehypeUnreleasedPill,
   shikiConfig,
@@ -16,7 +17,7 @@ import {
 } from './rehype';
 
 const renderer = await unified({
-  rehypePlugins: [rehypeRepoLinks, rehypeUnreleasedPill, mermaidPlugin as never, rehypeA11y],
+  rehypePlugins: [rehypeRepoLinks, rehypeUnreleasedPill, mermaidPlugin as never, rehypeDiagramScroll, rehypeA11y],
 }).createRenderer({ shikiConfig, syntaxHighlight: syntaxHighlight as never });
 
 export function readRepo(rel: string): string {

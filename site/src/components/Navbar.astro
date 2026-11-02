@@ -93,8 +93,15 @@ const isCurrent = (href: string) => here.startsWith(url(href));
     }
   }
   .version {
+    position: relative;
     color: var(--muted);
     text-decoration: none;
+  }
+  /* The pill stays small; the invisible hit area around it is 44px tall. */
+  .version::before {
+    content: '';
+    position: absolute;
+    inset: -13px -6px;
   }
   .links-desktop {
     display: none;
@@ -110,8 +117,10 @@ const isCurrent = (href: string) => here.startsWith(url(href));
     gap: 4px;
   }
   nav a {
-    display: inline-block;
-    padding: 10px 8px;
+    display: inline-flex;
+    align-items: center;
+    min-height: 44px;
+    padding: 0 8px;
     color: var(--text);
     text-decoration: none;
     font: 0.92rem var(--mono);
@@ -131,7 +140,13 @@ const isCurrent = (href: string) => here.startsWith(url(href));
     display: none;
     font: 0.92rem var(--mono);
     color: var(--text);
-    padding: 10px 4px;
+    min-height: 44px;
+    align-items: center;
+    padding: 0 4px;
+  }
+  /* The global details margin would push Menu up and stretch the header. */
+  .menu {
+    margin: 0;
   }
   .menu summary {
     min-height: 44px;
@@ -163,7 +178,7 @@ const isCurrent = (href: string) => here.startsWith(url(href));
   @media (min-width: 1040px) {
     .links-desktop,
     .gh {
-      display: block;
+      display: inline-flex;
     }
     .menu {
       display: none;
