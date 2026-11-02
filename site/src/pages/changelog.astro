@@ -1,0 +1,18 @@
+---
+import DocsLayout from '../layouts/DocsLayout.astro';
+import { renderRepoFile } from '../lib/repo';
+
+// The "[Unreleased]" pill is added in the markdown pipeline (rehypeUnreleasedPill).
+const doc = await renderRepoFile('CHANGELOG.md');
+---
+
+<DocsLayout
+  title="Changelog"
+  description="Release notes for every Minga version, including what changed, what was fixed and the upgrade notes."
+  crumbs={[{ name: 'Changelog', path: '/changelog/' }]}
+  sources={['CHANGELOG.md']}
+  headings={doc.headings}
+  current="/changelog/"
+>
+  <Fragment set:html={doc.html} />
+</DocsLayout>

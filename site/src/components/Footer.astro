@@ -1,0 +1,133 @@
+---
+import { site, url } from '../config/site';
+import { latestRelease } from '../lib/repo';
+
+const { version } = latestRelease();
+const social = Object.entries(site.social).filter(([, v]) => v) as [string, string][];
+const socialLabel: Record<string, string> = {
+  discord: 'Discord',
+  mailingList: 'Mailing list',
+  twitter: 'X / Twitter',
+  mastodon: 'Mastodon',
+};
+---
+
+<footer class="site-footer">
+  <div class="wrap cols">
+    <nav aria-label="Project">
+      <h2>Project</h2>
+      <ul>
+        <li>
+          <a href={url('/docs/')}>Documentation</a>
+        </li>
+        <li>
+          <a href={url('/docs/quickstart/')}>Quickstart</a>
+        </li>
+        <li>
+          <a href={url('/architecture/')}>Architecture</a>
+        </li>
+        <li>
+          <a href={url('/adr/')}>Decision records</a>
+        </li>
+        <li>
+          <a href={url('/roadmap/')}>Roadmap</a>
+        </li>
+        <li>
+          <a href={url('/changelog/')}>Changelog</a>
+        </li>
+      </ul>
+    </nav>
+    <nav aria-label="GitHub">
+      <h2>GitHub</h2>
+      <ul>
+        <li>
+          <a href={site.repoUrl}>Repository</a>
+        </li>
+        <li>
+          <a href={site.issuesUrl}>Issues</a>
+        </li>
+        {site.discussionsUrl && (
+          <li>
+            <a href={site.discussionsUrl}>Discussions</a>
+          </li>
+        )}
+        <li>
+          <a href={site.releasesUrl}>Releases</a>
+        </li>
+        <li>
+          <a href={site.contributingUrl}>Contribution guide</a>
+        </li>
+        <li>
+          <a href={site.securityUrl}>Reporting security issues</a>
+        </li>
+      </ul>
+    </nav>
+    {(social.length > 0 || site.newsletter) && (
+      <nav aria-label="Elsewhere">
+        <h2>Elsewhere</h2>
+        <ul>
+          {social.map(([k, v]) => (
+            <li>
+              <a href={v}>{socialLabel[k] ?? k}</a>
+            </li>
+          ))}
+          {site.newsletter && (
+            <li>
+              <a href={site.newsletter.url}>{site.newsletter.name} newsletter</a>
+            </li>
+          )}
+        </ul>
+      </nav>
+    )}
+    <div>
+      <h2>Status</h2>
+      <p>
+        v{version} · {site.maintenanceStatus}
+      </p>
+      <p>
+        <a href={site.licenseUrl}>{site.license} license</a> · © 2026 Minga contributors. Release archives also contain
+        nats-server (Apache 2.0).
+      </p>
+    </div>
+  </div>
+  <div class="wrap fine">
+    <p>
+      Named after the <span lang="es">minga</span> of Chiloé, where a community moves a whole house together.
+    </p>
+    <p class="muted">
+      Docker and the Docker logo are trademarks or registered trademarks of Docker, Inc. in the United States and/or
+      other countries. Minga is not affiliated with Docker, Inc.
+    </p>
+  </div>
+</footer>
+
+<style>
+  .site-footer {
+    border-top: 1px solid var(--border);
+    padding: 48px 0 32px;
+    font-size: 0.95rem;
+  }
+  .cols {
+    display: grid;
+    gap: 24px;
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  }
+  h2 {
+    font-size: var(--step--1);
+    color: var(--muted);
+    margin: 0 0 8px;
+  }
+  ul {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+  }
+  li a {
+    display: inline-block;
+    padding: 4px 0;
+  }
+  .fine {
+    margin-top: 32px;
+    font-size: var(--step--1);
+  }
+</style>

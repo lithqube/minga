@@ -1,0 +1,73 @@
+---
+import { getCollection } from 'astro:content';
+import DocsLayout from '../../layouts/DocsLayout.astro';
+import { site, url } from '../../config/site';
+import { articles } from '../../data/writing';
+
+const posts = (await getCollection('blog', (p) => !p.data.draft)).sort((a, b) => +b.data.pubDate - +a.data.pubDate);
+const fmt = (d: Date) => d.toISOString().slice(0, 10);
+---
+
+<DocsLayout
+  title="Blog"
+  description="Technical writing about Minga: release notes with context, design decisions and field reports, plus the maintainer's articles on cloud-native architecture."
+  crumbs={[{ name: 'Blog', path: '/blog/' }]}
+  current="/blog/"
+>
+  {posts.length === 0 ? (
+    <p>
+      No posts yet. Release notes live in the <a href={url('/changelog/')}>changelog</a>.
+    </p>
+  ) : (
+    <ul class="posts">
+      {posts.map((p) => (
+        <li>
+          <h2>
+            <a href={url(`/blog/${p.id}/`)}>{p.data.title}</a>
+          </h2>
+          <p class="mono muted">{fmt(p.data.pubDate)}</p>
+          <p>{p.data.description}</p>
+        </li>
+      ))}
+    </ul>
+  )}
+  {site.newsletter && (
+    <section aria-labelledby="related">
+      <h2 id="related">Related writing by the maintainer</h2>
+      <p class="muted">
+        From the <a href={site.newsletter.url}>{site.newsletter.name}</a> newsletter’s {site.newsletter.series} series.
+        These live on Substack.
+      </p>
+      <ul class="posts">
+        {articles.map((a) => (
+          <li>
+            <h3>
+              <a href={a.url}>{a.title}</a>
+            </h3>
+            <p class="mono muted">{a.date}</p>
+            <p>{a.summary}</p>
+          </li>
+        ))}
+      </ul>
+    </section>
+  )}
+</DocsLayout>
+
+<style>
+  .posts {
+    list-style: none;
+    padding: 0;
+  }
+  .posts li {
+    border-bottom: 1px solid var(--border);
+    padding: 8px 0 12px;
+  }
+  .posts h2,
+  .posts h3 {
+    font-size: var(--step-1);
+    margin: 0.6em 0 0.2em;
+  }
+  .posts p {
+    margin: 0 0 0.4em;
+  }
+</style>

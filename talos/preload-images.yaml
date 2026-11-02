@@ -1,0 +1,53 @@
+# Preload workload images into the `minga` containerd namespace on Talos.
+#
+# Minga has no registry pull yet; tasks run only images already unpacked in
+# the `minga` namespace. Talos has no `ctr` on the host, so this Job runs
+# the ctr bundled in the Minga image against the host containerd socket.
+# It uses the Kubernetes that every bootstrapped Talos cluster already has.
+#
+# Usage:
+#   talosctl kubeconfig
+#   # edit the image list below, then:
+#   kubectl apply -f talos/preload-images.yaml
+#   kubectl -n kube-system logs job/minga-preload-images
+#
+# Multi-node: change kind to DaemonSet (and drop `backoffLimit`), or run the
+# Job once per node with a nodeSelector. Air-gapped: import instead of pull —
+# copy the image tarballs over and use:
+#   args: ["-n", "minga", "images", "import", "/images/nginx.tar"]
+# with the tarballs bind-mounted from a UserVolume.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: minga-preload-images
+  namespace: kube-system
+spec:
+  backoffLimit: 3
+  template:
+    spec:
+      restartPolicy: Never
+      # Single-node clusters are control-plane nodes: tolerate the default
+      # NoSchedule taint so the Job can run there.
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: ctr
+          image: ghcr.io/lithqube/minga:latest
+          command: ["/usr/local/bin/ctr"]
+          # One pull per line; add every image your stacks reference.
+          args:
+            - "-n"
+            - "minga"
+            - "images"
+            - "pull"
+            - "docker.io/library/nginx:1.27"
+          securityContext:
+            privileged: true
+          volumeMounts:
+            - name: containerd-socket
+              mountPath: /run/containerd/containerd.sock
+      volumes:
+        - name: containerd-socket
+          hostPath:
+            path: /run/containerd/containerd.sock
+            type: Socket

@@ -104,6 +104,18 @@ Additional expectations:
 
   Other assistants use their own equivalent trailer. The point is transparency, not a specific tool.
 
+## Releasing
+
+1. Bump `version` in the root `[workspace.package]` and move the CHANGELOG
+   `[Unreleased]` entries into a new `## [X.Y.Z] — <date>` section.
+2. `git tag vX.Y.Z && git push --tags`. The release workflow refuses a tag
+   that doesn't match the workspace version.
+3. The workflow builds the Linux archives (x86_64, aarch64), publishes them
+   with `SHA256SUMS` and `install.sh` as release assets, and pushes the
+   multi-arch image to `ghcr.io/lithqube/minga` (`vX.Y.Z`, `X.Y`, `latest`).
+4. To validate the pipeline without a release: **Actions → Release → Run
+   workflow**. It builds everything and pushes only the `:edge` image.
+
 ## Pull requests
 
 1. **Open an issue first** for anything beyond a small fix. This avoids wasted work and lets the design be discussed before code is written.

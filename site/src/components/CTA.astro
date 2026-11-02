@@ -1,0 +1,33 @@
+---
+import { url } from '../config/site';
+
+interface Props {
+  title: string;
+  text?: string;
+  actions: { label: string; href: string; variant?: 'primary' | 'secondary' }[];
+}
+const { title, text, actions } = Astro.props;
+---
+
+<section class="section cta" aria-labelledby="cta-title">
+  <div class="wrap">
+    <h2 id="cta-title">{title}</h2>
+    {text && <p class="lede">{text}</p>}
+    <div class="actions grid-cta">
+      {actions.map((a) => (
+        <a class={`btn ${a.variant === 'primary' ? 'btn-primary' : 'btn-secondary'}`} href={url(a.href)}>
+          {a.label}
+        </a>
+      ))}
+    </div>
+  </div>
+</section>
+
+<style>
+  @media (max-width: 639px) {
+    .grid-cta {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+    }
+  }
+</style>
