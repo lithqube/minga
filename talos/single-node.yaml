@@ -1,0 +1,91 @@
+# Minga single-node on Talos: manager + API on one host, as Talos
+# ContainerConfig documents (no system extension, no custom boot asset;
+# Talos pulls the image with CRI). Requires Talos v1.14+.
+#
+# scripts/setup-talos-minga.sh appends these documents to the control-plane
+# machine config after substituting __MINGA_IMAGE__ and __MINGA_API_TOKEN__.
+# To apply by hand instead: substitute the tokens and append the documents
+# to controlplane.yaml, then `talosctl apply-config`.
+#
+# The API token is stored in the machine config: treat the machine config
+# as sensitive (it already contains the cluster CA keys).
+---
+apiVersion: v1alpha1
+kind: UserVolumeConfig
+name: minga-state
+volumeType: directory
+---
+apiVersion: v1alpha1
+kind: UserVolumeConfig
+name: minga-api-state
+volumeType: directory
+---
+apiVersion: v1alpha1
+kind: ContainerConfig
+name: minga-manager
+image: __MINGA_IMAGE__
+args:
+  - manager
+  - --node-id=1
+  - --bind=127.0.0.1:7001
+  - --peer=2=127.0.0.1:7002
+  # The data dir must be the SAME path in the container and on the host:
+  # the OCI specs minga writes (resolv.conf, secrets, volume binds) are
+  # resolved by runc on the host. A UserVolume mounts at /var/mnt/<name>
+  # on the host, so use that identical path inside.
+  - --data-dir=/var/mnt/minga-state
+  - --runtime=containerd
+  - --containerd-socket=/run/containerd/containerd.sock
+  - --metrics-bind=0.0.0.0:9100
+# The supervisor creates netns, bridges, veth pairs and iptables rules in
+# the host network namespace: privileged + host network are required.
+network:
+  mode: host
+security:
+  profile: privileged
+mounts:
+  - userVolume:
+      name: minga-state
+      destination: /var/mnt/minga-state
+  - hostPath:
+      source: /run/containerd/containerd.sock
+      destination: /run/containerd/containerd.sock
+  # Netns handles created here (`ip netns add`) must be visible to runc,
+  # which runs on the host: shared propagation in both directions.
+  - hostPath:
+      source: /run/netns
+      destination: /var/run/netns
+      options:
+        - rbind
+        - rshared
+dependsOn:
+  networks:
+    - addresses
+---
+apiVersion: v1alpha1
+kind: ContainerConfig
+name: minga-api
+image: __MINGA_IMAGE__
+args:
+  - api
+  - --node-id=2
+  - --bind=127.0.0.1:7002
+  - --peer=1=127.0.0.1:7001
+  - --data-dir=/var/mnt/minga-api-state
+  - --api-bind=0.0.0.0:2375
+environment:
+  - MINGA_API_TOKEN=__MINGA_API_TOKEN__
+# The API role only writes to its mounted state volume: restricted works.
+network:
+  mode: host
+security:
+  profile: restricted
+mounts:
+  - userVolume:
+      name: minga-api-state
+      destination: /var/mnt/minga-api-state
+dependsOn:
+  containers:
+    - minga-manager
+  networks:
+    - addresses

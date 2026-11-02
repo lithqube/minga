@@ -111,6 +111,11 @@ if [ "$UNINSTALL" = "1" ]; then
         echo "removed systemd unit"
     fi
     $sudo_bin rm -f "$PREFIX/minga" "$PREFIX/nats-server"
+    # Only remove a ctr this script installed (marker written at install).
+    if [ -f "${PREFIX%/bin}/share/minga/.ctr-installed" ]; then
+        $sudo_bin rm -f "$PREFIX/ctr"
+        echo "removed $PREFIX/ctr"
+    fi
     $sudo_bin rm -rf "${PREFIX%/bin}/share/minga"
     echo "removed $PREFIX/minga, $PREFIX/nats-server and licenses"
     echo "kept /etc/minga and /var/lib/minga; remove them by hand if unneeded"
@@ -153,12 +158,24 @@ $sudo_bin mkdir -p "$PREFIX"
 $sudo_bin install -m 0755 "$tmp/minga" "$PREFIX/minga"
 $sudo_bin install -m 0755 "$tmp/nats-server" "$PREFIX/nats-server"
 
-# Licenses: Minga (MIT) and the bundled nats-server (Apache 2.0).
 share="${PREFIX%/bin}/share/minga"
 $sudo_bin mkdir -p "$share"
+
+# ctr preloads workload images into the `minga` containerd namespace.
+# Installed only when the host has none: never shadow a distro ctr.
+ctr_note="ctr already on PATH; bundled one not installed"
+if [ -f "$tmp/ctr" ] && ! command -v ctr >/dev/null 2>&1; then
+    $sudo_bin install -m 0755 "$tmp/ctr" "$PREFIX/ctr"
+    ctr_note="installed: $PREFIX/ctr"
+    # Marker so --uninstall only removes a ctr this script installed.
+    $sudo_bin touch "$share/.ctr-installed"
+fi
+
+# Licenses: Minga (MIT) and the bundled nats-server (Apache 2.0).
 $sudo_bin install -m 0644 "$tmp/LICENSE" "$tmp/NATS-LICENSE" "$share/"
 
 echo "installed: $PREFIX/minga, $PREFIX/nats-server (licenses in $share)"
+echo "$ctr_note"
 
 if [ "$WITH_SYSTEMD" = "1" ]; then
     [ -d /run/systemd/system ] || fail "--with-systemd needs a systemd host; install binaries only and write your own supervisor unit"

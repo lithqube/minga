@@ -14,6 +14,9 @@ permissions:
 env:
   # Bundled next to `minga`; the manager's NATS sidecar looks there first.
   NATS_VERSION: v2.10.22
+  # Bundled as `ctr`: workload images are preloaded into the `minga`
+  # containerd namespace with it (there is no registry pull yet).
+  CONTAINERD_VERSION: v2.1.4
 
 jobs:
   build:
@@ -22,19 +25,42 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # nats_sha256: from the upstream release's SHA256SUMS, pinned so
-          # a replaced archive fails before it is extracted or executed.
+          # nats_sha256 / ctr_sha256: from the upstream release's SHA256SUMS,
+          # pinned so a replaced archive fails before it is extracted.
           - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             nats_arch: amd64
             nats_sha256: db0b3ccbe4cbdd3872ae7486ec4f6b0f85824632a0789f4da2e0a8518390483e
+            ctr_arch: amd64
+            ctr_sha256: 316d510a0428276d931023f72c09fdff1a6ba81d6cc36f31805fea6a3c88f515
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             nats_arch: arm64
             nats_sha256: b4da77b2b194dc5fcf13a1df0dad59ba7e87ae4423f254c50534015b7c8a2369
+            ctr_arch: arm64
+            ctr_sha256: 846d13bc2bf1c01ae2f20d13beb9b3a1e50b52c86e955b4ac7d658f5847f2b0e
     runs-on: ${{ matrix.os }}
+    # Build against bullseye's glibc 2.31: binaries then run on Debian 11+,
+    # Ubuntu 20.04+, Fedora 34+ (glibc is forward-compatible, not backward).
+    container: debian:bullseye-slim
     steps:
+      # Toolchain first: actions/checkout needs git + ca-certificates,
+      # and bullseye-slim ships neither. Bullseye is EOL: its packages
+      # live on archive.debian.org now (immutable; build tools only).
+      - name: Install build tools
+        run: |
+          printf 'Acquire::Check-Valid-Until "false";\n' > /etc/apt/apt.conf.d/99no-check-valid-until
+          sed -i 's|^deb http://deb.debian.org|deb http://archive.debian.org|' /etc/apt/sources.list
+          apt-get update
+          apt-get install -y --no-install-recommends git curl ca-certificates build-essential pkg-config perl
+
       - uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: |
+          curl -fsSL https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          rustup target add ${{ matrix.target }}
 
       - name: Tag must match the workspace version
         if: github.event_name == 'push'
@@ -45,10 +71,6 @@ jobs:
             echo "::error::tag v$tag does not match workspace version $ws; bump [workspace.package] in Cargo.toml first"
             exit 1
           fi
-
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@v2
 
@@ -64,15 +86,24 @@ jobs:
           mv LICENSE NATS-LICENSE
           ./nats-server --version
 
+      - name: Fetch and verify ctr
+        run: |
+          archive="containerd-${CONTAINERD_VERSION}-linux-${{ matrix.ctr_arch }}.tar.gz"
+          curl -fsSL -o "$archive" "https://github.com/containerd/containerd/releases/download/${CONTAINERD_VERSION}/${archive}"
+          echo "${{ matrix.ctr_sha256 }}  ${archive}" | sha256sum -c -
+          tar -xzf "$archive" bin/ctr
+          mv bin/ctr ctr && rmdir bin
+          ./ctr version
+
       - name: Package
         run: |
           mkdir -p dist
-          cp "target/${{ matrix.target }}/release/minga" nats-server NATS-LICENSE dist/
+          cp "target/${{ matrix.target }}/release/minga" nats-server ctr NATS-LICENSE dist/
           cp install.sh README.md LICENSE CHANGELOG.md dist/
           # install.sh --with-systemd copies these out of the archive.
           cp scripts/minga.service scripts/minga.env.example dist/
           tar -C dist -czf "minga-${{ matrix.target }}.tar.gz" \
-            minga nats-server NATS-LICENSE install.sh README.md LICENSE CHANGELOG.md \
+            minga nats-server ctr NATS-LICENSE install.sh README.md LICENSE CHANGELOG.md \
             minga.service minga.env.example
 
       - uses: actions/upload-artifact@v4

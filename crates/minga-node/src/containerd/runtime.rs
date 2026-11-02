@@ -596,7 +596,10 @@ impl Runtime for ContainerdRuntime {
             None
         };
 
-        let image = self.ensure_image(&spec.image).await?;
+        // containerd keys images by fully-qualified reference; Compose files
+        // habitually use the short form (`nginx:1.27`).
+        let image_ref = image::normalize_ref(&spec.image);
+        let image = self.ensure_image(&image_ref).await?;
 
         let mut client = self.client.lock().await;
         let config = image::load_image(&mut client, &image, &self.snapshotter)
@@ -671,7 +674,7 @@ impl Runtime for ContainerdRuntime {
                 ("minga/task_id".to_string(), task_id.clone()),
                 ("minga/image".to_string(), spec.image.clone()),
             ]),
-            image: spec.image.clone(),
+            image: image_ref.clone(),
             spec: Some(oci_any),
             snapshotter: self.snapshotter.clone(),
             snapshot_key: snapshot_key.clone(),
