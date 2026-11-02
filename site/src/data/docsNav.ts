@@ -10,7 +10,7 @@ export const docsNav = [
   },
   {
     group: 'Deploy',
-    items: [{ label: 'Talos Linux', href: '/docs/talos-deployment/', badge: 'not validated' }],
+    items: [{ label: 'Talos Linux', href: '/docs/talos-deployment/', badge: 'partially validated' }],
   },
   {
     group: 'Reference',

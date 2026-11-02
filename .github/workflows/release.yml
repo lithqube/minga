@@ -3,13 +3,20 @@ name: Release
 on:
   push:
     tags: ["v*"]
+  # Manual run validates the whole pipeline without cutting a release:
+  # builds the archives and pushes ghcr.io/<owner>/minga:edge only.
+  workflow_dispatch:
 
 permissions:
   contents: write
+  packages: write
 
 env:
   # Bundled next to `minga`; the manager's NATS sidecar looks there first.
   NATS_VERSION: v2.10.22
+  # Bundled as `ctr`: workload images are preloaded into the `minga`
+  # containerd namespace with it (there is no registry pull yet).
+  CONTAINERD_VERSION: v2.1.4
 
 jobs:
   build:
@@ -18,23 +25,52 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # nats_sha256: from the upstream release's SHA256SUMS, pinned so
-          # a replaced archive fails before it is extracted or executed.
+          # nats_sha256 / ctr_sha256: from the upstream release's SHA256SUMS,
+          # pinned so a replaced archive fails before it is extracted.
           - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             nats_arch: amd64
             nats_sha256: db0b3ccbe4cbdd3872ae7486ec4f6b0f85824632a0789f4da2e0a8518390483e
+            ctr_arch: amd64
+            ctr_sha256: 316d510a0428276d931023f72c09fdff1a6ba81d6cc36f31805fea6a3c88f515
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             nats_arch: arm64
             nats_sha256: b4da77b2b194dc5fcf13a1df0dad59ba7e87ae4423f254c50534015b7c8a2369
+            ctr_arch: arm64
+            ctr_sha256: 846d13bc2bf1c01ae2f20d13beb9b3a1e50b52c86e955b4ac7d658f5847f2b0e
     runs-on: ${{ matrix.os }}
+    # Build against bullseye's glibc 2.31: binaries then run on Debian 11+,
+    # Ubuntu 20.04+, Fedora 34+ (glibc is forward-compatible, not backward).
+    container: debian:bullseye-slim
     steps:
+      # Toolchain first: actions/checkout needs git + ca-certificates,
+      # and bullseye-slim ships neither. Bullseye is EOL: its packages
+      # live on archive.debian.org now (immutable; build tools only).
+      - name: Install build tools
+        run: |
+          printf 'Acquire::Check-Valid-Until "false";\n' > /etc/apt/apt.conf.d/99no-check-valid-until
+          sed -i 's|^deb http://deb.debian.org|deb http://archive.debian.org|' /etc/apt/sources.list
+          apt-get update
+          apt-get install -y --no-install-recommends git curl ca-certificates build-essential pkg-config perl
+
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
+      - name: Install Rust
+        run: |
+          curl -fsSL https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          rustup target add ${{ matrix.target }}
+
+      - name: Tag must match the workspace version
+        if: github.event_name == 'push'
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          ws=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
+          if [ "$tag" != "$ws" ]; then
+            echo "::error::tag v$tag does not match workspace version $ws; bump [workspace.package] in Cargo.toml first"
+            exit 1
+          fi
 
       - uses: Swatinem/rust-cache@v2
 
@@ -50,21 +86,87 @@ jobs:
           mv LICENSE NATS-LICENSE
           ./nats-server --version
 
+      - name: Fetch and verify ctr
+        run: |
+          archive="containerd-${CONTAINERD_VERSION}-linux-${{ matrix.ctr_arch }}.tar.gz"
+          curl -fsSL -o "$archive" "https://github.com/containerd/containerd/releases/download/${CONTAINERD_VERSION}/${archive}"
+          echo "${{ matrix.ctr_sha256 }}  ${archive}" | sha256sum -c -
+          tar -xzf "$archive" bin/ctr
+          mv bin/ctr ctr && rmdir bin
+          ./ctr version
+
       - name: Package
         run: |
           mkdir -p dist
-          cp "target/${{ matrix.target }}/release/minga" nats-server NATS-LICENSE dist/
+          cp "target/${{ matrix.target }}/release/minga" nats-server ctr NATS-LICENSE dist/
           cp install.sh README.md LICENSE CHANGELOG.md dist/
-          tar -C dist -czf "minga-${{ matrix.target }}.tar.gz" minga nats-server NATS-LICENSE install.sh README.md LICENSE CHANGELOG.md
+          # install.sh --with-systemd copies these out of the archive.
+          cp scripts/minga.service scripts/minga.env.example dist/
+          tar -C dist -czf "minga-${{ matrix.target }}.tar.gz" \
+            minga nats-server ctr NATS-LICENSE install.sh README.md LICENSE CHANGELOG.md \
+            minga.service minga.env.example
 
       - uses: actions/upload-artifact@v4
         with:
           name: minga-${{ matrix.target }}
           path: minga-${{ matrix.target }}.tar.gz
 
+  image:
+    name: Push image to GHCR
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      # Layout the Dockerfile expects: linux-<arch>/ per platform, LICENSE
+      # at the context root. Copy-only layers, so the arm64 image needs no
+      # emulated compile — QEMU is only for the apt layer.
+      - name: Assemble the build context
+        run: |
+          mkdir -p dist/linux-amd64 dist/linux-arm64
+          tar -xzf artifacts/minga-x86_64-unknown-linux-gnu.tar.gz -C dist/linux-amd64
+          tar -xzf artifacts/minga-aarch64-unknown-linux-gnu.tar.gz -C dist/linux-arm64
+          cp LICENSE dist/
+
+      - uses: docker/setup-qemu-action@v3
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/metadata-action@v5
+        id: meta
+        with:
+          images: ghcr.io/${{ github.repository }}
+          flavor: latest=false
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/') }}
+            type=raw,value=edge,enable=${{ github.event_name == 'workflow_dispatch' }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: dist
+          file: ./Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
   publish:
     name: Publish release
     needs: build
+    if: github.event_name == 'push'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -80,6 +182,7 @@ jobs:
       - name: Upload release assets
         uses: softprops/action-gh-release@v2
         with:
+          generate_release_notes: true
           files: |
             dist/minga-*.tar.gz
             dist/SHA256SUMS

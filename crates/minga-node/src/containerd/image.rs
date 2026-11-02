@@ -53,6 +53,45 @@ impl BlobDescriptor {
     }
 }
 
+/// Expand a Docker-style short image reference to its fully-qualified
+/// form, matching what `ctr`/containerd store on pull: `nginx:1.27` is
+/// `docker.io/library/nginx:1.27`, a tagless name gets `:latest`. A name
+/// whose first component contains `.` or `:` (or is `localhost`) already
+/// names a registry and is returned unchanged.
+pub fn normalize_ref(raw: &str) -> String {
+    let (name_tag, digest) = match raw.split_once('@') {
+        Some((n, d)) => (n, Some(d)),
+        None => (raw, None),
+    };
+    // A colon after the last slash introduces a tag; an earlier colon is a
+    // registry port. With no slash at all any colon is a tag separator
+    // (`localhost:5000` is repo `localhost`, tag `5000` in Docker).
+    let (name, tag) = match (name_tag.rfind(':'), name_tag.rfind('/')) {
+        (Some(c), s) if Some(c) > s => (&name_tag[..c], Some(&name_tag[c + 1..])),
+        _ => (name_tag, None),
+    };
+    let mut out = match name.split_once('/') {
+        Some((first, _)) if first.contains('.') || first.contains(':') || first == "localhost" => {
+            name.to_string()
+        }
+        Some(_) => format!("docker.io/{name}"),
+        None => format!("docker.io/library/{name}"),
+    };
+    if let Some(t) = tag {
+        out.push(':');
+        out.push_str(t);
+    }
+    match digest {
+        Some(d) => {
+            out.push('@');
+            out.push_str(d);
+        }
+        None if tag.is_none() => out.push_str(":latest"),
+        None => {}
+    }
+    out
+}
+
 fn validate_digest(digest: &str) -> Result<(), String> {
     let hex = digest
         .strip_prefix("sha256:")
@@ -271,6 +310,47 @@ pub async fn load_image(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normalizes_docker_hub_short_refs() {
+        assert_eq!(normalize_ref("nginx:1.27"), "docker.io/library/nginx:1.27");
+        assert_eq!(normalize_ref("nginx"), "docker.io/library/nginx:latest");
+        assert_eq!(normalize_ref("user/repo:tag"), "docker.io/user/repo:tag");
+    }
+
+    #[test]
+    fn keeps_qualified_refs_unchanged() {
+        for r in [
+            "registry.local/vllm:0.6.3",
+            "localhost:5000/img:v1",
+            "ghcr.io/x/y:latest",
+        ] {
+            assert_eq!(normalize_ref(r), r);
+        }
+        // ...but a tagless qualified name still gains :latest.
+        assert_eq!(normalize_ref("ghcr.io/x/y"), "ghcr.io/x/y:latest");
+        assert_eq!(
+            normalize_ref("10.0.0.1:5000/img"),
+            "10.0.0.1:5000/img:latest"
+        );
+    }
+
+    #[test]
+    fn normalizes_digest_refs_without_adding_a_tag() {
+        let d = format!("sha256:{}", "a".repeat(64));
+        assert_eq!(
+            normalize_ref(&format!("redis@{d}")),
+            format!("docker.io/library/redis@{d}")
+        );
+        assert_eq!(
+            normalize_ref(&format!("img:tag@{d}")),
+            format!("docker.io/library/img:tag@{d}")
+        );
+        assert_eq!(
+            normalize_ref(&format!("registry.local/img@{d}")),
+            format!("registry.local/img@{d}")
+        );
+    }
 
     #[test]
     fn selects_linux_host_manifest_from_multi_platform_index() {

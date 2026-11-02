@@ -1,19 +1,14 @@
 # Deploying Minga on Talos Linux
 
-**Status:** Deployment target — **not yet validated on a Talos host.**
-**Version:** Talos v1.14+
+**Status:** **Installable; validated through workload start.** On docker-provisioned Talos v1.14.5: the config assembled and validated (`talosctl validate`), both Minga containers pulled from a registry mirror and ran, the manager booted healthy (NATS sidecar, containerd, scheduler/supervisor loops), `/readyz` answered, the API served with token auth, the preload Job pulled an image into the `minga` namespace with the bundled `ctr`, and an nginx stack was placed, started and listened in its netns (veth, IP, routes, DNAT verified; task→host ICMP worked). **Not yet reproduced:** host→task packet delivery in that nested environment (packets never left the node stack; bare-metal validation pending — the same Minga networking is verified on plain Linux hosts). Bare-metal and hcloud multi-node are not hardware-validated.
+**Version:** Talos v1.14+ (older versions lack `ContainerConfig`)
 
-> **Read this before following the guide.**
->
-> **Not validated:** nothing here has been run against a Talos host.
->
-> **The Minga install step can't work as previously written.** Talos has no shell, no systemd, and no API to copy a binary in and start it: `talosctl` has no `upload` or `run`. Running Minga on Talos needs a **Talos system extension** that ships `minga` and `nats-server`, and that extension doesn't exist yet. Step 6 describes what it must run.
->
-> **The Talos-side steps are standard but unverified here:** `talosctl gen config`, `apply-config`, `bootstrap`, and the hcloud commands.
->
-> The verified way to run Minga today is a plain Linux host; see the [README quick start](../README.md#quick-start-one-linux-host). For current limits, see [architecture.md](architecture.md).
-
-Talos Linux is an immutable, API-driven Linux distribution purpose-built for Kubernetes — but it runs **any containerd workload**. Since Minga targets containerd directly via gRPC (no kubelet), Talos is an ideal host: single-binary OS, atomic upgrades, no SSH, no package manager, secure by default.
+> **How Minga runs on Talos.** Talos v1.14 runs arbitrary OCI images directly via
+> [`ContainerConfig`](https://docs.siderolabs.com/talos/v1.14/reference/configuration/container/containerconfig)
+> machine-config documents — no system extension, no custom boot asset, no imager.
+> Talos pulls `ghcr.io/lithqube/minga` (multi-arch; bundles `nats-server` and `ctr`)
+> with CRI and starts the containers privileged with host networking. State lives on
+> `UserVolumeConfig` volumes under `/var/mnt`.
 
 ---
 
@@ -21,423 +16,315 @@ Talos Linux is an immutable, API-driven Linux distribution purpose-built for Kub
 
 | Property | Benefit for Minga |
 |----------|-------------------|
-| **Immutable OS** | No config drift; Minga would arrive as a system extension (not built yet) |
-| **Atomic upgrades** | `talosctl upgrade` → reboot; rollback is one command |
+| **Immutable OS** | No config drift; Minga arrives as two `ContainerConfig` documents in the machine config |
+| **Atomic upgrades** | `talosctl upgrade` → reboot; rollback is one command. The Minga image tag survives upgrades |
 | **No SSH / no shell** | Reduced attack surface; all ops via `talosctl` API |
 | **Containerd built-in** | `/run/containerd/containerd.sock` exposed by default — Minga connects directly |
-| **WireGuard native** | Talos can run WireGuard itself. Minga's own mesh isn't applied yet, so cross-node container traffic doesn't work either way |
-| **Edge/air-gap ready** | ISO/PXE install; no registry pull at boot if images pre-loaded |
+| **Kubernetes included** | Used exactly once here: the image-preload Job below. Minga workloads don't touch kubelet |
+| **Edge/air-gap ready** | ISO/PXE install; the image can come from any registry mirror (`machine.registries`) |
 
 ---
 
-## Quick Start: 3-Node Cluster
+## Single-Node Quick Start
+
+The scripted path (`scripts/setup-talos-minga.sh`) does all of this; the manual
+steps are documented below it.
 
 ### Prerequisites
-- `talosctl` ≥ 1.14
-- 3 x86_64 or arm64 machines (bare metal, VMs, or cloud)
-- Minga binary (`minga-linux-amd64` or `minga-linux-arm64`)
+- `talosctl` ≥ 1.14, `curl`, `openssl`
+- One x86_64 or arm64 machine booted into Talos **maintenance mode** (fresh ISO/PXE boot)
+- Network access from the node to `ghcr.io` (or to your registry mirror)
 
-### 1. Generate Talos Config
-```bash
-talosctl gen config minga-cluster https://<control-plane-vip>:6443 \
-  --output-dir ./talos-config \
-  --config-patch @./talos-patches/containerd.yaml
-```
-- `<control-plane-vip>`: a stable IP/VIP for the control plane (keepalived, metalLB, or cloud LB)
-- The containerd patch below is the only one Minga needs. To use Talos's own WireGuard (section 3), add `--config-patch @./talos-patches/wireguard.yaml` to this command.
-
-### 2. Containerd Patch (`talos-patches/containerd.yaml`)
-```yaml
-machine:
-  containerd:
-    # Expose containerd socket to host (default in Talos 1.14+)
-    # Minga connects to the path /run/containerd/containerd.sock (unverified on Talos)
-    # If you need remote containerd access:
-    # config:
-    #   grpc:
-    #     address: /run/containerd/containerd.sock
-    #     uid: 0
-    #     gid: 0
-```
-
-### 3. WireGuard Patch (`talos-patches/wireguard.yaml`) — optional, not used by Minga yet
-
-> Minga doesn't apply its WireGuard mesh in `v0.1.0`, so this patch doesn't give containers cross-node connectivity. You can skip it; the `gen config` commands in this guide leave it out.
-
-```yaml
-machine:
-  network:
-    wireguard:
-      - name: minga-overlay
-        privateKey: <base64-private-key>
-        listenPort: 51820
-        peers:
-          - publicKey: <base64-peer-pubkey>
-            endpoint: <peer-ip>:51820
-            allowedIPs: ["10.200.0.0/16"]
-```
-
-### 4. Apply Config to Nodes
-```bash
-# Control plane node 1 (bootstrap)
-talosctl apply-config --insecure --nodes <cp1-ip> --file ./talos-config/controlplane.yaml
-
-# Control plane nodes 2-3
-talosctl apply-config --insecure --nodes <cp2-ip>,<cp3-ip> --file ./talos-config/controlplane.yaml
-
-# Worker nodes (if any)
-talosctl apply-config --insecure --nodes <worker1-ip>,<worker2-ip> --file ./talos-config/worker.yaml
-```
-
-### 5. Bootstrap etcd (once, on CP1)
-```bash
-talosctl bootstrap --nodes <cp1-ip> --endpoints <cp1-ip>
-```
-
-### 6. Run Minga (open problem: needs a system extension)
-
-Talos can't install a binary and a systemd unit, so Minga has to be packaged as a Talos system extension with an extension service. Until that exists, this step can't be done. Each node's service must run one role:
+### Scripted
 
 ```bash
-# Every manager and worker uses the same external TLS NATS server (certificate-only;
-# --nats-token is ignored over TLS). A manager without --nats-url would spawn a
-# private loopback sidecar and split the cluster's bus.
-export MINGA_NATS_TLS_CA=… MINGA_NATS_TLS_CERT=… MINGA_NATS_TLS_KEY=… MINGA_NATS_TLS_SERVER_NAME=…
-
-# Managers: scheduler + supervisor
-minga manager --node-id <n> --bind <node-ip>:7001 --peer <id>=<ip>:7001 [--peer …] \
-  --nats-url tls://<nats-host>:4222 --data-dir /var/lib/minga --runtime containerd \
-  --containerd-socket /run/containerd/containerd.sock --metrics-bind <node-ip>:9100
-
-# Workers: supervisor only
-minga worker --node-id <n> --bind <node-ip>:7001 --peer … --nats-url tls://<nats-host>:4222 \
-  --data-dir /var/lib/minga --runtime containerd --metrics-bind <node-ip>:9100
-
-# Docker API: today it is its own Raft voter, so give it an id, list it in every --peer set,
-# and give it its own data directory (it must not share the manager's Raft databases)
-MINGA_API_TOKEN=… minga api --node-id <n> --bind <node-ip>:7002 --peer … \
-  --data-dir /var/lib/minga-api --api-bind <private-ip>:2375
+./scripts/setup-talos-minga.sh --node <node-ip>
 ```
 
-What the extension service must provide:
-- root with network admin rights (netns, bridges, veth, iptables)
-- the containerd socket
-- persistent `/var/lib/minga`
-- SIGINT on stop (Minga's graceful shutdown)
-- workload images preloaded in containerd namespace `minga`
+The script:
+1. `talosctl gen config` for a single-node cluster named `minga-cluster`.
+2. Appends the Minga documents from [`talos/single-node.yaml`](../talos/single-node.yaml)
+   (two `UserVolumeConfig`s + two `ContainerConfig`s) to `controlplane.yaml`,
+   substituting the image reference (`--image`) and a generated API token (`--api-token`).
+3. Validates the assembled config (`talosctl validate --mode metal`).
+4. `apply-config --insecure`, waits for the API, bootstraps etcd.
+5. Waits for both containers in `talosctl get containerinstancestatus`, then
+   checks `http://<node-ip>:9100/readyz` from your host.
+6. Fetches the kubeconfig and prints the API token, the preload step and the
+   deploy command. Keep the printed workdir path: re-applying that
+   `controlplane.yaml` (with any edits) is how you change Minga's config later.
 
-Raft membership is fixed at first start, so start every node together with the full `--peer` list. Use `minga tls init-ca` and `minga tls issue-node` for `--raft-tls-*`.
-
-### 7. Verify
+### Manual equivalent
 
 ```bash
-# Health (node metrics endpoint from --metrics-bind)
-curl -s http://<node-ip>:9100/readyz
-curl -s http://<node-ip>:9100/metrics | grep '^minga_'
-
-# Docker API (bearer token required when MINGA_API_TOKEN is set)
-curl -s -H "Authorization: Bearer $MINGA_API_TOKEN" http://<api-ip>:2375/v1.41/nodes
-# The docker CLI sends the token via "HttpHeaders" in ~/.docker/config.json:
-#   {"HttpHeaders": {"Authorization": "Bearer <token>"}}
-docker -H tcp://<api-ip>:2375 node ls
+talosctl gen config minga-cluster https://<node-ip>:6443 --output-dir ./talos-config
+# Substitute __MINGA_IMAGE__ and __MINGA_API_TOKEN__ in talos/single-node.yaml,
+# append the result to talos-config/controlplane.yaml as extra YAML documents, then:
+talosctl validate --mode metal --config ./talos-config/controlplane.yaml
+talosctl apply-config --insecure --nodes <node-ip> --file ./talos-config/controlplane.yaml
+talosctl bootstrap --nodes <node-ip>
+talosctl get containerinstancestatus   # minga-manager, minga-api → running
+curl -s http://<node-ip>:9100/readyz   # OK
 ```
 
-> Keep `:2375` and the Raft ports on a private network or firewall them. The API token is the only thing between the network and container creation.
+What runs where:
+
+| Container | Role | Why privileged / host network | State |
+|-----------|------|-------------------------------|-------|
+| `minga-manager` | `manager` (scheduler + supervisor + NATS sidecar) | Creates netns, bridges, veth pairs, iptables DNAT in the host netns | `minga-state` volume → `/var/mnt/minga-state` |
+| `minga-api` | `api` (Docker Engine API on `:2375`) | `restricted` profile is enough; host net so Raft peers on loopback work | `minga-api-state` volume → `/var/mnt/minga-api-state` |
+
+Two path rules follow from running Minga in a container while runc runs on
+the host. First, `--data-dir` must be the **same path** in the container and
+on the host (hence the `/var/mnt/…` destinations above): the OCI specs Minga
+writes — per-task `resolv.conf`, staged secrets, named-volume binds — are
+resolved by runc against the host filesystem. Second, Compose **bind** mounts
+name host paths: they only work if you mount that host path into the manager
+container at the identical destination. Named volumes (under the data dir)
+need nothing extra.
+
+The API bearer token lives in the machine config — which already contains the
+cluster CA keys, so treat it as sensitive regardless. Firewall `:2375`, the Raft
+ports (`7001`/`7002`) and `:9100` to your management network.
+
+### Preload workload images
+
+Minga has no registry pull: tasks run only images already unpacked in the
+`minga` containerd namespace. Talos has no `ctr` on the host, so preload via the
+Kubernetes every Talos cluster already has — the Job uses the `ctr` bundled in
+the Minga image:
+
+```bash
+talosctl kubeconfig   # the script already did this
+# edit the image list in talos/preload-images.yaml, then:
+kubectl apply -f talos/preload-images.yaml
+kubectl -n kube-system logs job/minga-preload-images
+```
+
+Air-gapped: put image tarballs on a `UserVolume` and switch the Job's args to
+`["-n", "minga", "images", "import", "/images/<name>.tar"]` with the volume mounted.
+
+### Deploy
+
+```bash
+MINGA_API_TOKEN=<token> minga deploy -c compose.yaml shop --api-url http://<node-ip>:2375
+docker -H tcp://<node-ip>:2375 service ls   # same API (token via HttpHeaders in config.json)
+```
 
 ---
 
-## Single-Node (Dev / Edge) Setup
+## Multi-Node
 
-For a single machine running both control plane + worker:
+Everything from single-node applies, plus the three standing multi-node rules
+(from the [README](../README.md#deployment-topologies)): fixed Raft membership at
+first start (`--peer` every node, start together), no cross-node container mesh
+yet, and **one external TLS NATS server for every manager and worker** — a
+manager left without `--nats-url` spawns a private loopback sidecar and splits
+the bus, and over TLS the connection is certificate-only (`--nats-token` ignored).
 
-```bash
-# 1. Generate single-node config
-talosctl gen config minga-single https://<node-ip>:6443 \
-  --output-dir ./talos-config \
-  --config-patch @./talos-patches/containerd.yaml
+Per node, append a `ContainerConfig` (image, `args`, `environment` adjusted) and
+a `UserVolumeConfig` to that node's machine config:
 
-# 2. Apply
-talosctl apply-config --insecure --nodes <node-ip> --file ./talos-config/controlplane.yaml
-
-# 3. Bootstrap (single node = self-bootstrap)
-talosctl bootstrap --nodes <node-ip> --endpoints <node-ip>
-
-# 4. Run Minga: see step 6 above (needs the system extension)
-
-# 5. Deploy a test stack. `minga deploy` writes the stack through the
-# Docker-compatible API and reports placement per service. Point it at the
-# API (and pass the token if --api-token is set):
-minga deploy -c docker-compose.yml minga-test --api-url http://<node-ip>:2375
-# The Docker CLI works against the same API:
-docker stack deploy -c docker-compose.yml minga-test --host tcp://<node-ip>:2375
+```yaml
+---
+apiVersion: v1alpha1
+kind: UserVolumeConfig
+name: minga-state
+volumeType: directory
+---
+apiVersion: v1alpha1
+kind: ContainerConfig
+name: minga-manager   # or minga-worker with the worker role in args
+image: ghcr.io/lithqube/minga:vX.Y.Z   # pin by digest
+args:
+  - manager
+  - --node-id=<n>
+  - --bind=<node-ip>:7001
+  - --peer=1=<ip1>:7001
+  - --peer=2=<ip2>:7001            # … every node, ids unique
+  - --nats-url=tls://<nats-host>:4222
+  # Must be identical in the container and on the host: runc resolves the
+  # OCI bind sources minga writes (resolv.conf, secrets, volume binds).
+  - --data-dir=/var/mnt/minga-state
+  - --runtime=containerd
+  - --containerd-socket=/run/containerd/containerd.sock
+  - --metrics-bind=<node-ip>:9100
+environment:
+  - MINGA_NATS_TLS_CA=/etc/minga/nats-ca.pem
+  - MINGA_NATS_TLS_CERT=/etc/minga/nats-client.pem
+  - MINGA_NATS_TLS_KEY=/etc/minga/nats-client-key.pem
+  - MINGA_NATS_TLS_SERVER_NAME=<nats-host>
+network:
+  mode: host
+security:
+  profile: privileged
+mounts:
+  - userVolume:
+      name: minga-state
+      destination: /var/mnt/minga-state
+  - hostPath:
+      source: /run/containerd/containerd.sock
+      destination: /run/containerd/containerd.sock
+  # Netns handles must be visible to runc on the host (shared propagation).
+  - hostPath:
+      source: /run/netns
+      destination: /var/run/netns
+      options:
+        - rbind
+        - rshared
+  # The NATS CA/client certificates referenced above. Bake them into an
+  # ExtensionServiceConfig-mounted configFile, or place them on the volume.
+dependsOn:
+  networks:
+    - addresses
 ```
+
+Issue Raft (`--raft-tls-*`) and NATS certificates with `minga tls init-ca` and
+`minga tls issue-node`. Preload workload images on **every** node: convert the
+preload Job to a DaemonSet.
+
+### Changing Minga's configuration later
+
+Re-`apply-config` the full `controlplane.yaml` (with the documents) after edits.
+Do **not** `talosctl patch machineconfig` a `ContainerConfig`: strategic merge
+concatenates list fields (mounts, args) instead of replacing them. A config
+change restarts the affected container; image pulls retry with backoff.
 
 ---
 
 ## Hetzner Cloud (hcloud) Deployment
 
-**Recommended for cloud deployments** — Hetzner provides Talos as a Public ISO and first-class `hcloud` CLI/Terraform support.
+**Not hardware-validated.** The Talos/hcloud steps are standard; the Minga part
+is the single/multi-node config above, with one hcloud-specific note: cloud-init
+user data has a 32 KiB limit — generate configs with `--with-docs=false --with-examples=false`
+so the appended Minga documents fit.
 
 ### Why hcloud for Minga?
 
 | Feature | Benefit |
 |---------|---------|
 | **Talos Public ISO** | Pre-built ISO with qemu-guest-agent (schematic `ce4c980550dd2ab1b17bbf2b08801c7eb59418eafe8f279833297925d67c7515`) |
-| **Native Load Balancer** | Stable VIP for control plane (`hcloud load-balancer`) — no keepalived needed |
-| **Private Networks** | Isolated cluster traffic via Hetzner Cloud Networks |
-| **Terraform Modules** | `hcloud-talos/talos/hcloud`, `hcloud-k8s/kubernetes/hcloud` for reproducible clusters |
+| **Native Load Balancer** | Stable VIP for the control plane API — no keepalived needed |
+| **Private Networks** | Raft (`7001`/`7002`), NATS (`4222`), metrics (`9100`) and the API (`2375`) go here only |
+| **Terraform Modules** | `hcloud-talos/talos/hcloud` for reproducible clusters |
 | **Cost-effective** | CPX22 (2 vCPU, 4 GB) ≈ €4.50/mo per node |
 
 ### Quick Start: 3-Node Cluster on hcloud
 
 #### Prerequisites
-- `hcloud` CLI ≥ 1.45 (`brew install hcloud` or download from GitHub)
-- `talosctl` ≥ 1.14
-- Hetzner Cloud API token (`HCLOUD_TOKEN`)
+- `hcloud` CLI ≥ 1.45, `talosctl` ≥ 1.14, `HCLOUD_TOKEN`
 
-#### 1. Create Control Plane Load Balancer (provides VIP)
+#### 1. Control-plane Load Balancer (VIP)
 ```bash
-# Create LB for control plane API (port 6443)
 hcloud load-balancer create --name minga-cp --network-zone eu-central --type lb11 --label 'type=controlplane'
-# Note the LB IPv4 address (e.g., 49.12.x.x)
 hcloud load-balancer add-service minga-cp --listen-port 6443 --destination-port 6443 --protocol tcp
 LB_IP=$(hcloud load-balancer describe minga-cp -o json | jq -r '.public_net.ipv4.ip')
 ```
 
-#### 2. Generate Talos Config (use LB IP as endpoint)
+#### 2. Generate Talos config (LB IP as endpoint)
 ```bash
 talosctl gen config minga-cluster https://${LB_IP}:6443 \
-  --output-dir ./talos-config \
-  --config-patch @./talos-patches/containerd.yaml
-# --with-examples=false --with-docs=false  # Avoid 32KB userdata limit
+  --output-dir ./talos-config --with-docs=false --with-examples=false
+# Append the per-node Minga documents (multi-node section above) to
+# controlplane.yaml / worker.yaml here, then talosctl validate --mode metal.
 ```
 
-#### 3. Get Talos Public ISO Image ID
+#### 3. Talos Public ISO image id
 ```bash
-# List available images, find Talos (schematic ce4c980550dd2ab1b17bbf2b08801c7eb59418eafe8f279833297925d67c7515)
-hcloud image list --type iso --selector 'os_flavor=talos'
-# Or use the known schematic via factory.talos.dev:
-TALOS_ISO_ID=$(hcloud image list --type iso -o json | jq -r '.[] | select(.description | contains("talos")) | .id' | head -1)
+TALOS_ISO_ID=$(hcloud image list --type iso --selector 'os_flavor=talos' -o json | jq -r '.[0].id')
 ```
 
-#### 4. Create Control Plane Nodes (3 nodes for HA)
+#### 4. Control-plane nodes (3 for HA)
 ```bash
 for i in 1 2 3; do
-  hcloud server create \
-    --name "minga-cp${i}" \
-    --type cpx22 \
-    --image "${TALOS_ISO_ID}" \
+  hcloud server create --name "minga-cp${i}" --type cpx22 --image "${TALOS_ISO_ID}" \
     --user-data-from-file ./talos-config/controlplane.yaml \
-    --label type=controlplane \
-    --location nbg1 \
-    --ssh-key <your-ssh-key>  # Only for rescue/debug; Talos has no SSH
+    --label type=controlplane --location nbg1
 done
-```
-
-#### 5. Add Control Plane Nodes to Load Balancer
-```bash
 hcloud load-balancer add-target minga-cp --label-selector 'type=controlplane'
 ```
 
-#### 6. (Optional) Create Worker Nodes
+#### 5. Workers (optional)
 ```bash
 for i in 1 2; do
-  hcloud server create \
-    --name "minga-worker${i}" \
-    --type cpx22 \
-    --image "${TALOS_ISO_ID}" \
-    --user-data-from-file ./talos-config/worker.yaml \
-    --label type=worker \
-    --location nbg1
+  hcloud server create --name "minga-worker${i}" --type cpx22 --image "${TALOS_ISO_ID}" \
+    --user-data-from-file ./talos-config/worker.yaml --label type=worker --location nbg1
 done
 ```
 
-#### 7. Bootstrap etcd (on first control plane node)
+#### 6. Bootstrap etcd (first control-plane node)
 ```bash
 CP1_IP=$(hcloud server ip minga-cp1)
 talosctl bootstrap --nodes "${CP1_IP}" --endpoints "${CP1_IP}"
 ```
 
-#### 8. Run Minga
-
-Same open problem as [step 6](#6-run-minga-open-problem-needs-a-system-extension): it needs a Talos system extension. Put the Raft (`7001`/`7002`), NATS (`4222`), metrics (`9100`) and API (`2375`) ports on the hcloud private network only.
-
-#### 9. Verify
+#### 7. Preload images and verify
 ```bash
+talosctl kubeconfig
+kubectl apply -f talos/preload-images.yaml   # DaemonSet form for multi-node
 for NODE in minga-cp1 minga-cp2 minga-cp3; do
-  IP=$(hcloud server ip "${NODE}")   # use private IPs if ports are firewalled
+  IP=$(hcloud server ip "${NODE}")
   echo "=== ${NODE} (${IP}) ==="
-  curl -sf "http://${IP}:9100/healthz" && echo "healthz: OK"
-  curl -sf "http://${IP}:9100/readyz" && echo "readyz: OK"
+  curl -sf "http://${IP}:9100/readyz" && echo " readyz: OK"
 done
-
-# Deploy a stack through the Docker-compatible API on the node running `minga api`:
 MINGA_API_TOKEN=… minga deploy -c docker-compose.yml minga-test --api-url http://<api-ip>:2375
 ```
 
-### Single-Node on hcloud (Dev/Test)
+### Single-node on hcloud (dev/test)
 
-```bash
-# 1. Create LB (single node still needs stable endpoint)
-hcloud load-balancer create --name minga-single --network-zone eu-central --type lb11
-hcloud load-balancer add-service minga-single --listen-port 6443 --destination-port 6443 --protocol tcp
-LB_IP=$(hcloud load-balancer describe minga-single -o json | jq -r '.public_net.ipv4.ip')
-
-# 2. Generate config
-talosctl gen config minga-single https://${LB_IP}:6443 --output-dir ./talos-config --config-patch @./talos-patches/containerd.yaml
-
-# 3. Create server
-TALOS_ISO_ID=$(hcloud image list --type iso --selector 'os_flavor=talos' -o json | jq -r '.[0].id')
-hcloud server create --name minga-single --type cpx22 --image "${TALOS_ISO_ID}" --user-data-from-file ./talos-config/controlplane.yaml --label type=controlplane
-
-# 4. Add to LB
-hcloud load-balancer add-target minga-single --label-selector 'type=controlplane'
-
-# 5. Bootstrap (self)
-IP=$(hcloud server ip minga-single)
-talosctl bootstrap --nodes "${IP}" --endpoints "${IP}"
-
-# 6. Deploy Minga (same as step 8 above)
-```
-
-### Terraform Alternative (Reproducible Clusters)
-
-```hcl
-# terraform/main.tf
-terraform {
-  required_version = ">= 1.5"
-  required_providers {
-    hcloud = { source = "hetznercloud/hcloud", version = "~> 1.45" }
-  }
-}
-
-provider "hcloud" { token = var.hcloud_token }
-
-# Talos image (use factory.talos.dev URL or local snapshot)
-data "hcloud_image" "talos" {
-  type = "iso"
-  selectors = { os_flavor = "talos" }
-  most_recent = true
-}
-
-# Load balancer for control plane
-resource "hcloud_load_balancer" "controlplane" {
-  name            = "minga-cp"
-  load_balancer_type = "lb11"
-  network_zone    = "eu-central"
-  target_labels   = { type = "controlplane" }
-  service {
-    listen_port      = 6443
-    destination_port = 6443
-    protocol         = "tcp"
-  }
-}
-
-# Control plane nodes (3 for HA)
-resource "hcloud_server" "controlplane" {
-  count               = 3
-  name                = "minga-cp${count.index + 1}"
-  server_type         = "cpx22"
-  image               = data.hcloud_image.talos.id
-  user_data           = file("${path.module}/talos-config/controlplane.yaml")
-  labels              = { type = "controlplane" }
-  location            = "nbg1"
-  ssh_keys            = [var.ssh_key_name]
-}
-
-# Worker nodes
-resource "hcloud_server" "worker" {
-  count     = 2
-  name      = "minga-worker${count.index + 1}"
-  server_type = "cpx22"
-  image       = data.hcloud_image.talos.id
-  user_data   = file("${path.module}/talos-config/worker.yaml")
-  labels      = { type = "worker" }
-  location    = "nbg1"
-}
-
-output "controlplane_ips" { value = hcloud_server.controlplane[*].ipv4_address }
-output "lb_ip" { value = hcloud_load_balancer.controlplane.ipv4_address }
-```
-
-```bash
-# Deploy
-terraform init && terraform apply
-# Then bootstrap:
-talosctl bootstrap --nodes $(terraform output -raw controlplane_ips | jq -r '.[0]') --endpoints $(terraform output -raw lb_ip)
-```
-
-### Minga-Specific hcloud Notes
-
-| Area | Detail |
-|------|--------|
-| **Containerd socket** | Path `/run/containerd/containerd.sock` (no `unix://` prefix); unverified on Talos |
-| **WireGuard** | Minga's mesh isn't applied yet; containers on different nodes can't reach each other |
-| **Private networking** | Create `hcloud network` + attach servers; Minga overlay uses private IPs |
-| **NATS** | A manager without `--nats-url` spawns a loopback-only sidecar. Multi-node: point every manager and worker at one external TLS NATS (`--nats-url tls://…`, `MINGA_NATS_TLS_*`, certificate-only) |
-| **Persistent volumes** | Hetzner CSI driver available if needed; Minga local volumes work on local disk |
-| **Upgrades** | `talosctl upgrade --nodes <ip> --image factory.talos.dev/siderolabs/talos:v1.14.x` — zero-downtime with HA |
-| **Backups** | `hcloud server create-snapshot` before upgrades for instant rollback |
-
-### Cost Estimate (3 CP + 2 Worker, CPX22, Nuremberg)
-
-| Resource | Monthly (EUR) |
-|----------|---------------|
-| 5 × CPX22 | ~€22.50 |
-| 1 × LB11 | ~€5.50 |
-| Network | Free (private) |
-| **Total** | **~€28/mo** |
+Same flow with one server and the single-node documents; an LB is still useful
+for a stable endpoint. Use `talos/single-node.yaml` via the setup script's
+manual equivalent.
 
 ---
 
-## Air-Gapped / Offline Install
+## Operations on Talos
 
-1. **Build Talos ISO with pre-loaded images**:
-   ```bash
-   # Using talosctl image factory or siderolabs/imager
-   talosctl image factory \
-     --output iso \
-     --arch amd64 \
-     --install-disk /dev/sda \
-     --extra-registry <local-registry> \
-     --extra-image <local-registry>/minga:latest
-   ```
+| Task | Command |
+|------|---------|
+| Container status | `talosctl get containerinstancestatus` (resources in the `containers` namespace) |
+| Image pull status | `talosctl get containerimagestatus` |
+| Volumes | `talosctl get volumestatus` (`u-minga-state`, `u-minga-api-state`) |
+| Logs | `talosctl logs --namespace taloscontainers minga-manager` (or `minga-api`) |
+| Config change | edit + re-`apply-config` the full machine config (not `patch machineconfig`) |
+| Minga upgrade | bump the image tag/digest in the documents, re-`apply-config`; every node before relying on mixed versions |
 
-2. **Boot nodes from ISO** (PXE, USB, or virt-install)
+Notes:
 
-3. **Apply config** (same as above, but `--insecure` not needed if certs pre-provisioned)
+- `ContainerConfig` containers are **not** Talos services: `talosctl service`
+  doesn't apply. Talos restarts them automatically 5s after exit.
+- A stop/restart reaches Minga as SIGTERM/SIGKILL, not the SIGINT its graceful
+  node-leave path expects, so a restarted node can linger in `active` until its
+  lease expires (~30s) — drain first if you need a clean handoff.
+- Talos upgrades (`talosctl upgrade`) keep the machine config: the Minga
+  containers come back with the same image reference. This is why digest
+  pinning is recommended for production.
 
-4. **Workload images.** Minga isn't a container image. It needs the system extension from step 6. The images your stacks use must be present in containerd namespace `minga`; there is no registry pull yet. How to import them on Talos hasn't been worked out.
+## Known limits (unchanged by this guide)
 
----
-
-## Minga-Specific Talos Considerations
-
-| Area | Detail |
-|------|--------|
-| **Containerd socket** | Minga's default is the path `/run/containerd/containerd.sock`, with no `unix://` prefix. Check which containerd instance Talos exposes there before relying on it. |
-| **NATS** | A manager without `--nats-url` spawns `nats-server` (bundled in the release archive) on 127.0.0.1:4222. Multi-node: run one external TLS NATS server and set `--nats-url tls://…` plus `MINGA_NATS_TLS_CA/CERT/KEY/SERVER_NAME` on **every** manager and worker. Over TLS, `--nats-token` is ignored. |
-| **WireGuard** | Not used by Minga yet. |
-| **Raft** | Static membership: every node must be in every `--peer` list and start together. Use `--raft-tls-ca/cert/key` from `minga tls`. |
-| **Persistent data** | `/var/lib/minga` (Raft log, state, secrets, volumes) must persist across Talos upgrades. |
-| **Shutdown** | Minga shuts down gracefully on SIGINT and marks the node `Left`; the service must send SIGINT, not SIGTERM. |
-
----
+- No cross-node container mesh (WireGuard) yet; published ports are host-local.
+- No registry pull: every workload image must be preloaded in the `minga` namespace.
+- Placement pauses if a worker wins the Raft election.
+- Talos compliance certifications (FIPS, SOC 2, VS-NfD, NATO) are **not assessed** — which is not the same as not applicable.
 
 ## Troubleshooting
 
-| Symptom | Fix |
-|---------|-----|
-| `cannot connect to containerd` | Pass a filesystem path to `--containerd-socket`, not a `unix://` URL. Run as root. |
-| `/readyz` returns 503 | The body says why: `raft not ready` (no leader; check that every `--peer` is up) or `bus not connected` (check `--nats-url`, TLS env, token). |
-| Deploy succeeds, no tasks placed | No eligible node. Check `docker node ls` for `Ready`/`active`, constraints, and capacity. Unplaceable services get HTTP 409. |
-| Containers on different nodes can't talk | Expected in `v0.1.0`: there's no cross-node mesh yet. |
+| Symptom | Cause → Fix |
+|---------|-------------|
+| `failed to start container: network setup: ip … No such file or directory` | The image lacks `iproute2`/`iptables`/`procps` — the release image bundles them; a custom-built image must too |
+| `failed to fulfil mount request: open /var/… no such file or directory` | Path identity broken: `--data-dir` (or a Compose bind source) differs between container and host. Use the `/var/mnt/<volume>` layout from the examples |
+| `namespace path: lstat /var/run/netns/…: no such file or directory` | `/run/netns` not mounted into the manager container with `rshared` — runc on the host can't see the handle |
+| `image <ref> is not preloaded in the minga containerd namespace` | Preload it (`talos/preload-images.yaml`). Minga normalizes short refs to `docker.io/library/…`; the preload stores exactly that |
+| Container stuck `pulling` in `containerimagestatus` | Node can't reach the registry. For a private/mirror registry configure `machine.registries.mirrors` (and `tls.insecureSkipVerify` only if you must) |
+| `cannot connect to containerd` | Pass a filesystem path to `--containerd-socket`, not a `unix://` URL; the mount in the document must match |
+| `/readyz` returns 503 | The body says why: `raft not ready` (no leader; check that every `--peer` is up) or `bus not connected` (check `--nats-url`, TLS env) |
+| Deploy succeeds, no tasks placed | No eligible node. Check `/v1.41/nodes` for `Ready`/`active`, constraints, and capacity. Unplaceable services get HTTP 409 |
+| Containers on different nodes can't talk | Expected for now: there's no cross-node mesh yet |
 
 ---
 
 ## References
 
-- [Talos Documentation](https://docs.siderolabs.com/talos/v1.14/)
-- [Minga Design Doc](https://claude.ai/code/artifact/084e961f-88e4-45e2-aa1a-c8a76928b575)
-- [ADR 0004: Observability](../docs/adr/0004-observability.md)
+- [Talos `ContainerConfig`](https://docs.siderolabs.com/talos/v1.14/reference/configuration/container/containerconfig), [`UserVolumeConfig`](https://docs.siderolabs.com/talos/v1.14/reference/configuration/block/uservolumeconfig), [registry mirrors](https://docs.siderolabs.com/talos/v1.14/configure-your-talos-cluster/images-container-runtime/pull-through-cache)
+- [Hetzner Talos](https://docs.siderolabs.com/talos/v1.14/talos-guides/install/cloud-platforms/hetzner)
 - [Architecture notes](architecture.md)

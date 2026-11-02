@@ -17,6 +17,12 @@
 - A lease renewal could undo an operator's drain that landed between its
   read and its write. Renewal is now one atomic Raft command, and it never
   recreates a node record that was removed.
+- Short image references (`nginx:1.27`, the form Compose files habitually
+  use) never started: containerd keys images by fully-qualified reference
+  (`docker.io/library/nginx:1.27`), and Minga looked up and created with
+  the raw string. References are now normalized to the Docker fully
+  qualified form before the presence check and container creation; the
+  original string is kept on the `minga/image` container label.
 
 ### Added
 - `--metrics-bind` (`MINGA_METRICS_BIND`) on `minga manager`/`minga worker`
@@ -28,6 +34,41 @@
   `SHA256SUMS`; `install.sh` verifies the checksum, installs both binaries,
   creates a missing `MINGA_PREFIX`, and installs the licenses under
   `share/minga`.
+- The release workflow pushes a multi-arch image (`linux/amd64`,
+  `linux/arm64`) to `ghcr.io/lithqube/minga`, built from the same binaries
+  as the archives and tagged `vX.Y.Z`, `X.Y` and `latest`. A manual
+  workflow run validates the pipeline by pushing only the `:edge` tag.
+- `install.sh` is now a small CLI: `--version`/`--prefix` (env equivalents
+  kept), `--with-systemd` (installs the unit and an `/etc/minga/minga.env`
+  template; the archive now carries both files), `--uninstall` (keeps
+  `/etc/minga` and `/var/lib/minga`), and `MINGA_BASE_URL` for mirrors and
+  air-gapped sites.
+- The release workflow refuses a tag that doesn't match the workspace
+  version in `Cargo.toml`.
+- Talos install path. On Talos v1.14+ Minga runs as `ContainerConfig`
+  containers pulled from the registry — no system extension or custom boot
+  asset. `talos/single-node.yaml` holds the documents (plus
+  `talos/preload-images.yaml`, a Kubernetes Job that preloads workload
+  images into the `minga` namespace with the bundled `ctr`), and
+  `scripts/setup-talos-minga.sh` is functional: gen config, append
+  documents, validate, apply, bootstrap, verify `/readyz`. Validated on
+  docker-provisioned Talos v1.14.5: containers running, `/readyz` OK, API
+  with token auth, image preload via the Job, nginx task placed, started
+  and listening with correct netns wiring (published-port delivery in the
+  nested environment showed a one-directional anomaly; bare-metal
+  validation pending).
+- The image and the release archive now bundle a checksum-pinned `ctr`
+  (containerd v2.1.4). `install.sh` installs it only when the host has no
+  `ctr` on PATH (never shadowing a distro one) and records a marker so
+  `--uninstall` removes only what it installed.
+- The image bundles `iproute2`, `iptables` and `procps`: the supervisor
+  shells out to `ip`, `iptables` and `sysctl`. Container deployments
+  (including the Talos `ContainerConfig` path) also need `/run/netns`
+  mounted with shared propagation so runc on the host sees the handles.
+- Release binaries are built on Debian bullseye (glibc 2.31 floor): they
+  run on Debian 11+, Ubuntu 20.04+, Fedora 32+ — previously the
+  ubuntu-24.04 build required glibc 2.39, excluding Debian 12 and
+  Ubuntu 22.04.
 
 ### Documentation
 - README rewritten against the current CLI. It now has Mermaid diagrams (process architecture, deploy sequence, node networking, topologies), a verified single-host quick start, and an honest multi-node section (external TLS NATS, static Raft membership).

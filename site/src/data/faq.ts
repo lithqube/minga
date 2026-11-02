@@ -48,8 +48,13 @@ export const faq: Faq[] = [
   },
   {
     q: 'How do I install on an air-gapped site?',
-    a: 'Copy the release archive (minga, nats-server and the licenses) and your image tarballs to the site. Run <code>ctr -n minga images import &lt;image&gt;.tar</code> on each node and start the roles. Once a release is tagged, <code>install.sh</code> verifies <code>SHA256SUMS</code>; until then, build the binary from source before you go offline.',
+    a: 'Copy the release archive (minga, nats-server, ctr and the licenses) and your image tarballs to the site. Run <code>ctr -n minga images import &lt;image&gt;.tar</code> on each node and start the roles. Once a release is tagged, <code>install.sh</code> verifies <code>SHA256SUMS</code>; until then, build the binary from source before you go offline.',
     sources: ['README.md'],
+  },
+  {
+    q: 'Does it run on Talos Linux?',
+    a: 'Yes, on Talos v1.14+: Minga runs as two privileged <code>ContainerConfig</code> containers pulled from the registry — no system extension or custom boot asset. <code>scripts/setup-talos-minga.sh</code> generates, validates and applies the machine config and waits for readiness; workload images preload with a Kubernetes Job that uses the bundled <code>ctr</code>. Validated through workload start on docker-provisioned Talos; bare metal is pending.',
+    sources: ['docs/talos-deployment.md', 'talos/single-node.yaml'],
   },
   {
     q: 'I published a port. Why might it not answer on the same host?',

@@ -1,207 +1,142 @@
 #!/usr/bin/env bash
-# setup-talos-minga.sh
-# Automated Talos + Minga cluster setup for 3-node or single-node deployments.
+# setup-talos-minga.sh — install Minga (manager + API) on a single Talos node.
+#
+# The node must be booted into Talos maintenance mode (fresh ISO/PXE boot).
+# Minga runs as two Talos ContainerConfig containers pulled from a registry;
+# no system extension or custom boot asset is involved. Requires Talos v1.14+.
 #
 # Usage:
-#   ./setup-talos-minga.sh --cluster-size 3 --nodes "10.0.0.1,10.0.0.2,10.0.0.3" --vip 10.0.0.100
-#   ./setup-talos-minga.sh --cluster-size 1 --nodes "10.0.0.5" --vip 10.0.0.5
+#   ./setup-talos-minga.sh --node 10.0.0.5
+#   ./setup-talos-minga.sh --node 10.0.0.5 --image ghcr.io/lithqube/minga:v0.1.1
 #
-# Requirements:
-#   - talosctl >= 1.14
-#   - minga binary in ./bin/minga-linux-<arch>
-#   - SSH access to nodes (for initial Talos install) OR PXE/ISO boot
-
+# Flags:
+#   --node IP          node address (required; maintenance mode)
+#   --image REF        minga image (default: ghcr.io/lithqube/minga:latest;
+#                      pin a digest for production)
+#   --api-token TOK    Docker-API bearer token (default: generated, printed)
+#   --cluster-name N   Talos cluster name (default: minga-cluster)
+#   --talos-version V  talosctl gen config version (default: talosctl's own)
+#   --skip-kubeconfig  do not fetch the kubeconfig at the end
+#
+# Multi-node is out of scope here: every manager and worker must share one
+# external TLS NATS server and a fixed peer list — see docs/talos-deployment.md.
 set -euo pipefail
 
-# NOT FUNCTIONAL: kept for reference until a Talos system extension exists.
-# The Minga install step below uses `talosctl upload` / `talosctl run` and a
-# systemd unit. Talos has neither an exec API nor systemd, and the unit also
-# calls `minga node`, which does not exist (the roles are `minga manager`
-# and `minga worker`). See docs/talos-deployment.md.
-echo "error: setup-talos-minga.sh is not functional yet; see docs/talos-deployment.md" >&2
-exit 1
-
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-WORKDIR="${SCRIPT_DIR}/talos-workdir"
-MINGA_BIN="${SCRIPT_DIR}/bin/minga-linux-amd64"  # or arm64
-CLUSTER_SIZE=3
-NODE_IPS=""
-VIP=""
-TALOS_VERSION="v1.14.0"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
+NODE_IP=""
+IMAGE="ghcr.io/lithqube/minga:latest"
+API_TOKEN=""
 CLUSTER_NAME="minga-cluster"
-OUTPUT_DIR="${WORKDIR}/talos-config"
-PATCH_DIR="${SCRIPT_DIR}/talos-patches"
+TALOS_VERSION=""
+FETCH_KUBECONFIG=1
 
-# Colors
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-NC='\033[0m'
+usage() { sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'; }
 
-log() { echo -e "${GREEN}[INFO]${NC} $*"; }
-warn() { echo -e "${YELLOW}[WARN]${NC} $*"; }
-err() { echo -e "${RED}[ERR]${NC} $*" >&2; }
+err() { echo "error: $*" >&2; exit 1; }
 
-usage() {
-  cat <<EOF
-Usage: $0 [options]
-  --cluster-size N    Number of nodes (1 or 3) [default: 3]
-  --nodes "ip1,ip2"   Comma-separated node IPs
-  --vip IP            Control plane VIP (for 3-node) or node IP (for 1-node)
-  --talos-version V   Talos version [default: v1.14.0]
-  --cluster-name N    Cluster name [default: minga-cluster]
-  --minga-bin PATH    Path to minga binary [default: ./bin/minga-linux-amd64]
-  --workdir DIR       Working directory [default: ./talos-workdir]
-  -h, --help          Show this help
-EOF
-  exit 1
-}
-
-# Parse args
 while [[ $# -gt 0 ]]; do
-  case $1 in
-    --cluster-size) CLUSTER_SIZE="$2"; shift 2 ;;
-    --nodes) NODE_IPS="$2"; shift 2 ;;
-    --vip) VIP="$2"; shift 2 ;;
-    --talos-version) TALOS_VERSION="$2"; shift 2 ;;
-    --cluster-name) CLUSTER_NAME="$2"; shift 2 ;;
-    --minga-bin) MINGA_BIN="$2"; shift 2 ;;
-    --workdir) WORKDIR="$2"; shift 2 ;;
-    -h|--help) usage ;;
-    *) err "Unknown option: $1"; usage ;;
-  esac
+    case "$1" in
+        --node) NODE_IP="${2:?--node needs an IP}"; shift 2 ;;
+        --image) IMAGE="${2:?--image needs a reference}"; shift 2 ;;
+        --api-token) API_TOKEN="${2:?--api-token needs a value}"; shift 2 ;;
+        --cluster-name) CLUSTER_NAME="${2:?--cluster-name needs a value}"; shift 2 ;;
+        --talos-version) TALOS_VERSION="${2:?--talos-version needs a value}"; shift 2 ;;
+        --skip-kubeconfig) FETCH_KUBECONFIG=0; shift ;;
+        -h | --help) usage; exit 0 ;;
+        *) err "unknown argument: $1 (try --help)" ;;
+    esac
 done
 
-# Validate
-if [[ -z "$NODE_IPS" || -z "$VIP" ]]; then
-  err "Missing required arguments: --nodes and --vip"
-  usage
+[[ -n "$NODE_IP" ]] || err "--node is required"
+command -v talosctl >/dev/null 2>&1 || err "talosctl not found (>= v1.14 required)"
+command -v curl >/dev/null 2>&1 || err "curl not found"
+if [[ -z "$API_TOKEN" ]]; then
+    API_TOKEN="$(openssl rand -hex 16)"
 fi
 
-if [[ ! -f "$MINGA_BIN" ]]; then
-  err "Minga binary not found at $MINGA_BIN"
-  exit 1
+WORKDIR="$(mktemp -d /tmp/minga-talos.XXXXXX)"
+echo "workdir: $WORKDIR"
+
+# 1. Base cluster config. The preload Job tolerates the control-plane
+#    NoSchedule taint itself, so no patches are needed.
+gen_args=(gen config "$CLUSTER_NAME" "https://$NODE_IP:6443"
+    --output-dir "$WORKDIR")
+if [[ -n "$TALOS_VERSION" ]]; then
+    gen_args+=(--talos-version "$TALOS_VERSION")
 fi
+talosctl "${gen_args[@]}" >/dev/null
 
-if ! command -v talosctl &>/dev/null; then
-  err "talosctl not found in PATH"
-  exit 1
-fi
+# 2. Append the Minga documents (UserVolumes + ContainerConfigs).
+sed -e "s|__MINGA_IMAGE__|${IMAGE}|g" \
+    -e "s|__MINGA_API_TOKEN__|${API_TOKEN}|g" \
+    "${REPO_ROOT}/talos/single-node.yaml" > "$WORKDIR/minga-docs.yaml"
+{
+    echo "---"
+    cat "$WORKDIR/minga-docs.yaml"
+} >> "$WORKDIR/controlplane.yaml"
 
-IFS=',' read -ra NODES <<< "$NODE_IPS"
-if [[ ${#NODES[@]} -ne $CLUSTER_SIZE ]]; then
-  err "Number of nodes (${#NODES[@]}) doesn't match cluster-size ($CLUSTER_SIZE)"
-  exit 1
-fi
+# 3. Validate the assembled config before touching the node.
+talosctl validate --mode metal --config "$WORKDIR/controlplane.yaml"
 
-# Create directories
-mkdir -p "$WORKDIR" "$OUTPUT_DIR" "$PATCH_DIR"
+# 4. Apply (maintenance mode is unauthenticated: --insecure), then use the
+#    generated talosconfig for everything after.
+talosctl apply-config --insecure --nodes "$NODE_IP" --file "$WORKDIR/controlplane.yaml"
+export TALOSCONFIG="$WORKDIR/talosconfig"
+talosctl config endpoint "$NODE_IP" >/dev/null
+talosctl config node "$NODE_IP" >/dev/null
 
-# Generate patches
-cat > "$PATCH_DIR/containerd.yaml" <<'EOF'
-machine:
-  containerd:
-    # Expose containerd socket to host (default in Talos 1.14+)
-    # Minga connects at unix:///run/containerd/containerd.sock
-EOF
-
-cat > "$PATCH_DIR/wireguard.yaml" <<'EOF'
-machine:
-  network:
-    wireguard:
-      - name: minga-overlay
-        privateKey: GENERATE_AT_RUNTIME
-        listenPort: 51820
-        peers: []
-EOF
-
-log "Generating Talos config for $CLUSTER_NAME..."
-talosctl gen config "$CLUSTER_NAME" "https://$VIP:6443" \
-  --output-dir "$OUTPUT_DIR" \
-  --config-patch @"$PATCH_DIR/containerd.yaml" \
-  --config-patch @"$PATCH_DIR/wireguard.yaml" \
-  --talos-version "$TALOS_VERSION"
-
-# Install Talos on nodes
-log "Installing Talos on nodes..."
-for NODE in "${NODES[@]}"; do
-  log "  Installing on $NODE..."
-  if [[ $CLUSTER_SIZE -eq 1 ]]; then
-    talosctl apply-config --insecure --nodes "$NODE" --file "$OUTPUT_DIR/controlplane.yaml"
-  else
-    # First node gets controlplane, others get worker (will be promoted)
-    if [[ "$NODE" == "${NODES[0]}" ]]; then
-      talosctl apply-config --insecure --nodes "$NODE" --file "$OUTPUT_DIR/controlplane.yaml"
-    else
-      talosctl apply-config --insecure --nodes "$NODE" --file "$OUTPUT_DIR/worker.yaml"
+echo "waiting for the Talos API (node reboots into the applied config)..."
+for _ in $(seq 1 60); do
+    if talosctl version --short >/dev/null 2>&1; then
+        break
     fi
-  fi
+    sleep 5
 done
+talosctl version --short >/dev/null 2>&1 || err "Talos API never came up"
 
-# Wait for nodes to come up
-log "Waiting for nodes to be ready..."
-sleep 30
+# 5. Bootstrap Kubernetes (also what the preload Job needs).
+if ! talosctl get member --namespace cluster 2>/dev/null | grep -q .; then
+    talosctl bootstrap --nodes "$NODE_IP" || true
+fi
 
-# Bootstrap etcd (first control plane node)
-log "Bootstrapping etcd on ${NODES[0]}..."
-talosctl bootstrap --nodes "${NODES[0]}" --endpoints "${NODES[0]}"
+# 6. Wait for the two Minga containers.
+echo "waiting for minga-manager and minga-api (first pull can take a minute)..."
+for _ in $(seq 1 60); do
+    count=$(talosctl get containerstatus 2>/dev/null | grep -E "minga-(manager|api)" | grep -ci "running" || true)
+    if [ "$count" = "2" ]; then
+        break
+    fi
+    sleep 5
+done
+talosctl get containerstatus || true
 
-# Wait for cluster to stabilize
-log "Waiting for cluster to stabilize..."
-sleep 20
+# 7. Ready check from the host: the manager's metrics endpoint is on 9100.
+for _ in $(seq 1 30); do
+    if curl -fsS "http://$NODE_IP:9100/readyz" >/dev/null 2>&1; then
+        break
+    fi
+    sleep 5
+done
+if ! curl -fsS "http://$NODE_IP:9100/readyz"; then
+    err "manager /readyz did not come up; check: talosctl logs --namespace taloscontainers minga-manager"
+fi
+echo
 
-# Deploy Minga binary and systemd unit
-log "Deploying Minga to all nodes..."
-for NODE in "${NODES[@]}"; do
-  log "  Deploying to $NODE..."
-  talosctl --nodes "$NODE" upload "$MINGA_BIN" /opt/minga/minga
-  
-  # Generate systemd unit with node-specific config
-  cat > /tmp/minga.service <<EOF
-[Unit]
-Description=Minga Node Supervisor
-After=network-online.target containerd.service
-Wants=network-online.target containerd.service
+if [[ "$FETCH_KUBECONFIG" = "1" ]]; then
+    talosctl kubeconfig --nodes "$NODE_IP" --force
+fi
 
-[Service]
-Type=notify
-ExecStart=/opt/minga/minga node \\
-  --containerd-socket unix:///run/containerd/containerd.sock \\
-  --nats-url nats://${NODES[0]}:4222 \\
-  --node-id $(echo "$NODE" | tr '.' '-')
-Restart=on-failure
-RestartSec=5
-LimitNOFILE=1048576
+cat <<EOF
 
-[Install]
-WantedBy=multi-user.target
+Minga is installed on $NODE_IP.
+  manager:   readyz http://$NODE_IP:9100/readyz  (metrics on :9100)
+  Docker API: http://$NODE_IP:2375  token: $API_TOKEN
+
+Next:
+  1. Preload workload images: edit talos/preload-images.yaml, then
+     kubectl apply -f talos/preload-images.yaml
+  2. Deploy:  MINGA_API_TOKEN=$API_TOKEN minga deploy -c compose.yaml <stack> --api-url http://$NODE_IP:2375
+  3. Logs:    talosctl logs --namespace taloscontainers minga-manager   (or minga-api)
 EOF
-  talosctl --nodes "$NODE" upload /tmp/minga.service /etc/systemd/system/minga.service
-  talosctl --nodes "$NODE" run --command "systemctl daemon-reload && systemctl enable --now minga"
-done
-
-# Wait for Minga to start
-log "Waiting for Minga to start..."
-sleep 10
-
-# Verify
-log "Verifying cluster..."
-for NODE in "${NODES[@]}"; do
-  log "  Checking $NODE..."
-  if talosctl --nodes "$NODE" run --command "curl -sf http://localhost:2375/healthz" >/dev/null; then
-    log "    healthz: OK"
-  else
-    warn "    healthz: FAILED"
-  fi
-  if talosctl --nodes "$NODE" run --command "curl -sf http://localhost:2375/readyz" >/dev/null; then
-    log "    readyz: OK"
-  else
-    warn "    readyz: FAILED (may need time for Raft election)"
-  fi
-done
-
-log "Cluster setup complete!"
-log "Next steps:"
-log "  1. Deploy a stack: minga stack deploy -f docker-compose.yml"
-log "  2. Check nodes: minga node ls"
-log "  3. View metrics: curl http://${NODES[0]}:2375/metrics"
