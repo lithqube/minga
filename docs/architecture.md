@@ -12,7 +12,7 @@ flowchart LR
     W["minga worker<br/>supervisor"]
   end
   R[("openraft + redb<br/>services, tasks, nodes,<br/>networks, secrets refs")]
-  N[("NATS JetStream<br/>MINGA_COMMANDS · MINGA_EVENTS<br/>MINGA_LOGS · MINGA_STATUS · MINGA_LEASES")]
+  N[("NATS JetStream<br/>MINGA_COMMANDS · MINGA_EVENTS<br/>MINGA_LOGS · MINGA_DEAD_LETTERS<br/>MINGA_STATUS · MINGA_LEASES")]
   M & A & W <--> R
   M -- sidecar child process --> N
   M & W -- commands, status, logs --> N

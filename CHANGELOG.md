@@ -31,6 +31,16 @@
 - A lease renewal could undo an operator's drain that landed between its
   read and its write. Renewal is now one atomic Raft command, and it never
   recreates a node record that was removed.
+- A bus message that could never be handled redelivered forever, and ack
+  failures were silently dropped. Every explicit-ack JetStream consumer now
+  stops after 5 deliveries (backoff 30s, 1m, 2m, 5m); a payload that does
+  not decode is terminated with its decode error as the reason, and failed
+  acks are logged. JetStream has no dead-letter queue, so its
+  `MAX_DELIVERIES` and `MSG_TERMINATED` advisories are kept in a new
+  `MINGA_DEAD_LETTERS` stream (7 days, 64 MiB). The advisory holds the
+  stream sequence, not the body; the body survives only while the source
+  stream retains it. `minga_bus_dead_letters_total{topic,reason}` counts
+  messages this node dead-lettered.
 - Short image references (`nginx:1.27`, the form Compose files habitually
   use) never started: containerd keys images by fully-qualified reference
   (`docker.io/library/nginx:1.27`), and Minga looked up and created with
@@ -39,6 +49,15 @@
   original string is kept on the `minga/image` container label.
 
 ### Added
+- High-availability NATS: `--nats-url` takes a comma-separated seed list
+  (`MINGA_NATS_TLS_SERVER_NAME` a matching list of names), and
+  `--nats-replicas` (`MINGA_NATS_REPLICAS`, 1–5) keeps that many copies of
+  the command, event and dead-letter streams and the status and lease
+  buckets. Replicas only go up: a node left at the default of 1 never
+  lowers them, and the KV buckets are no longer reset on every connect.
+  Logs stay at one copy. The client talks only to the servers it was
+  given, not ones a server advertises. The built-in sidecar is still a
+  single server, so replicas above 1 need `--nats-url`.
 - `--metrics-bind` (`MINGA_METRICS_BIND`) on `minga manager`/`minga worker`
   serves `/metrics`, `/healthz` and `/readyz`.
 - JSON logs on stderr for `manager`, `worker` and `api`; level from

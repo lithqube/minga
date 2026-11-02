@@ -118,9 +118,13 @@ docker -H tcp://<node-ip>:2375 service ls   # same API (token via HttpHeaders in
 Everything from single-node applies, plus the three standing multi-node rules
 (from the [README](../README.md#deployment-topologies)): fixed Raft membership at
 first start (`--peer` every node, start together), no cross-node container mesh
-yet, and **one external TLS NATS server for every manager and worker** — a
-manager left without `--nats-url` spawns a private loopback sidecar and splits
-the bus, and over TLS the connection is certificate-only (`--nats-token` ignored).
+yet, and **one external TLS NATS server or cluster for every manager and
+worker** — a manager left without `--nats-url` spawns a private loopback sidecar
+and splits the bus, and over TLS the connection is certificate-only
+(`--nats-token` ignored). For a 3-server NATS cluster, list all three in
+`--nats-url` (`tls://nats-1:4222,tls://nats-2:4222,tls://nats-3:4222`), name
+all three in `MINGA_NATS_TLS_SERVER_NAME` (`nats-1,nats-2,nats-3`), and add
+`--nats-replicas=3` on the managers so losing one NATS server loses no bus state.
 
 Per node, append a `ContainerConfig` (image, `args`, `environment` adjusted) and
 a `UserVolumeConfig` to that node's machine config:

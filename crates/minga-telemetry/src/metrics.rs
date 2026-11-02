@@ -31,6 +31,7 @@ pub struct Metrics {
 
     // Bus metrics
     pub bus_publish_latency_seconds: HistogramVec,
+    pub bus_dead_letters_total: CounterVec,
 
     // Agent executor metrics
     pub agent_pool_idle: Gauge,
@@ -128,6 +129,18 @@ impl Metrics {
             .register(Box::new(bus_publish_latency_seconds.clone()))
             .expect("register bus_publish_latency_seconds");
 
+        let bus_dead_letters_total = CounterVec::new(
+            prometheus::Opts::new(
+                "minga_bus_dead_letters_total",
+                "Bus messages JetStream will not redeliver (terminated or max deliveries)",
+            ),
+            &["topic", "reason"],
+        )
+        .expect("minga_bus_dead_letters_total");
+        registry
+            .register(Box::new(bus_dead_letters_total.clone()))
+            .expect("register bus_dead_letters_total");
+
         let agent_pool_idle = Gauge::new("minga_agent_pool_idle", "Idle agent executor sandboxes")
             .expect("minga_agent_pool_idle");
         registry
@@ -171,6 +184,7 @@ impl Metrics {
             raft_leader,
             raft_replication_lag,
             bus_publish_latency_seconds,
+            bus_dead_letters_total,
             agent_pool_idle,
             agent_pool_busy,
             agent_pool_total,

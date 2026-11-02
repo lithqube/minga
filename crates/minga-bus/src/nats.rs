@@ -12,6 +12,17 @@
 //! | `MINGA_EVENTS` | `minga.node.>`, `minga.task.>`, `minga.egress.>` | Limits (72h) | Status reports, lifecycle events |
 //! | `MINGA_COMMANDS` | `minga.ctl.node.>` | WorkQueue (24h) | Task assign/stop commands |
 //! | `MINGA_LOGS` | `minga.log.>` | Limits (512 MiB, 24h) | Container log chunks |
+//! | `MINGA_DEAD_LETTERS` | `$JS.EVENT.ADVISORY.CONSUMER.{MAX_DELIVERIES,MSG_TERMINATED}.>` | Limits (64 MiB, 7d) | Record of failed deliveries |
+//!
+//! # Failed deliveries
+//!
+//! JetStream has no dead-letter queue. Every explicit-ack consumer is
+//! bounded to [`MAX_DELIVER`] deliveries with [`REDELIVERY_BACKOFF`]; after
+//! that, or after a `+TERM`, the server stops redelivering and publishes an
+//! advisory, which `MINGA_DEAD_LETTERS` keeps. The advisory names the stream
+//! sequence, not the payload: the body is recoverable only while the source
+//! stream still retains it, and the work-queue `MINGA_COMMANDS` drops a
+//! terminated message at once.
 //!
 //! # KV buckets
 //!
@@ -19,6 +30,15 @@
 //! |---|---|---|
 //! | `MINGA_STATUS` | `task.{id}`, `node.{id}` | Latest actual state |
 //! | `MINGA_LEASES` | `lease.node.{id}` | Liveness (timestamp-based) |
+//!
+//! # High availability
+//!
+//! Every constructor takes a comma-separated seed list
+//! (`tls://nats-1:4222,tls://nats-2:4222,tls://nats-3:4222`) and connects
+//! only to those servers, ignoring the ones a server advertises, so a TLS
+//! connection never reaches a host the operator did not name. Streams and
+//! buckets are created with one replica; [`NatsBus::ensure_replicas`]
+//! raises the ones in [`REPLICATED`] on a NATS cluster.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -28,6 +48,7 @@ use async_nats::jetstream::consumer::pull::Config as PullConsumerConfig;
 use async_nats::jetstream::consumer::{AckPolicy, DeliverPolicy};
 use async_nats::jetstream::kv::{Config as KvConfig, Operation as KvOperation};
 use async_nats::jetstream::stream::{Config as StreamConfig, RetentionPolicy};
+use async_nats::jetstream::AckKind;
 use async_nats::jetstream::{self, Context as JetStream};
 use async_nats::Client;
 use async_trait::async_trait;
@@ -41,6 +62,36 @@ use crate::{
 
 /// Default lease TTL: 15 seconds.
 const DEFAULT_LEASE_TTL: Duration = Duration::from_secs(15);
+
+/// Deliveries before JetStream stops redelivering a message and publishes a
+/// `MAX_DELIVERIES` advisory.
+const MAX_DELIVER: i64 = 5;
+
+/// Redelivery delays after a missed ack. JetStream uses the first entry as
+/// the ack wait and requires fewer entries than [`MAX_DELIVER`].
+const REDELIVERY_BACKOFF: [Duration; 4] = [
+    Duration::from_secs(30),
+    Duration::from_secs(60),
+    Duration::from_secs(120),
+    Duration::from_secs(300),
+];
+
+/// Redelivery delay for a message nak'd after a transient failure.
+const NAK_DELAY: Duration = Duration::from_secs(5);
+
+/// Stream that keeps the advisories JetStream publishes for failed deliveries.
+const DEAD_LETTER_STREAM: &str = "MINGA_DEAD_LETTERS";
+
+/// Streams (KV buckets are `KV_`-prefixed streams) that losing one NATS
+/// server must not lose. `MINGA_LOGS` stays at one replica: it is the
+/// largest stream, best effort, and edge disks are small.
+const REPLICATED: [&str; 5] = [
+    "MINGA_EVENTS",
+    "MINGA_COMMANDS",
+    DEAD_LETTER_STREAM,
+    "KV_MINGA_STATUS",
+    "KV_MINGA_LEASES",
+];
 
 // ---------------------------------------------------------------------------
 // NatsBus
@@ -64,6 +115,57 @@ impl NatsBus {
     /// JetStream access (stream inspection, admin operations).
     pub fn jetstream(&self) -> &JetStream {
         &self.js
+    }
+
+    /// Raises the [`REPLICATED`] streams and buckets to `replicas` copies.
+    ///
+    /// Only ever scales up: every node runs this on connect, and a node
+    /// left at the default of 1 must not shrink what a manager raised.
+    /// `replicas` must not exceed the JetStream servers in the cluster;
+    /// the server rejects the update otherwise.
+    ///
+    /// A freshly formed cluster answers "no suitable peers" until every
+    /// server has joined JetStream, so this retries for up to 10 seconds,
+    /// like stream setup does.
+    pub async fn ensure_replicas(&self, replicas: usize) -> Result<()> {
+        const MAX_ATTEMPTS: u32 = 20; // 20 × 500ms = 10s
+        for attempt in 1..=MAX_ATTEMPTS {
+            match self.raise_replicas(replicas).await {
+                Ok(()) => return Ok(()),
+                Err(e) if attempt < MAX_ATTEMPTS => {
+                    tracing::debug!(attempt, error = %e, "cannot raise replicas yet; retrying");
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        unreachable!("loop returns on success or final failure")
+    }
+
+    async fn raise_replicas(&self, replicas: usize) -> Result<()> {
+        for name in REPLICATED {
+            let mut stream = self
+                .js
+                .get_stream(name)
+                .await
+                .map_err(|e| BusError::Other(format!("{name}: {e}")))?;
+            let mut config = stream
+                .info()
+                .await
+                .map_err(|e| BusError::Other(format!("{name} info: {e}")))?
+                .config
+                .clone();
+            if config.num_replicas >= replicas {
+                continue;
+            }
+            config.num_replicas = replicas;
+            self.js
+                .update_stream(config)
+                .await
+                .map_err(|e| BusError::Other(format!("{name} to {replicas} replicas: {e}")))?;
+            tracing::info!(stream = name, replicas, "raised stream replicas");
+        }
+        Ok(())
     }
 
     /// Connect to a NATS server and set up streams/KV buckets.
@@ -102,16 +204,14 @@ impl NatsBus {
         token: Option<&str>,
     ) -> Result<Arc<Self>> {
         Self::ensure_crypto_provider();
-        let client = match token {
-            Some(token) => {
-                async_nats::ConnectOptions::new()
-                    .token(token.to_string())
-                    .connect(url)
-                    .await
-            }
-            None => async_nats::connect(url).await,
+        let mut options = async_nats::ConnectOptions::new().ignore_discovered_servers();
+        if let Some(token) = token {
+            options = options.token(token.to_string());
         }
-        .map_err(|e| BusError::Connection(e.to_string()))?;
+        let client = options
+            .connect(seed_list(url))
+            .await
+            .map_err(|e| BusError::Connection(e.to_string()))?;
         let js = jetstream::new(client.clone());
 
         let (status_kv, leases_kv) = Self::setup_when_ready(&js).await?;
@@ -154,9 +254,10 @@ impl NatsBus {
             .map_err(|e| BusError::Connection(format!("TLS configuration failed: {e}")))?;
 
         Self::ensure_crypto_provider();
-        let client = async_nats::connect_with_options(url, options)
-            .await
-            .map_err(|e| BusError::Connection(format!("TLS connection failed: {e}")))?;
+        let client =
+            async_nats::connect_with_options(seed_list(url), options.ignore_discovered_servers())
+                .await
+                .map_err(|e| BusError::Connection(format!("TLS connection failed: {e}")))?;
 
         let js = jetstream::new(client.clone());
 
@@ -191,9 +292,10 @@ impl NatsBus {
             .map_err(|e| BusError::Connection(format!("TLS configuration failed: {e}")))?;
 
         Self::ensure_crypto_provider();
-        let client = async_nats::connect_with_options(url, options)
-            .await
-            .map_err(|e| BusError::Connection(format!("TLS connection failed: {e}")))?;
+        let client =
+            async_nats::connect_with_options(seed_list(url), options.ignore_discovered_servers())
+                .await
+                .map_err(|e| BusError::Connection(format!("TLS connection failed: {e}")))?;
 
         let js = jetstream::new(client.clone());
 
@@ -289,16 +391,25 @@ impl NatsBus {
             .await
             .map_err(|e| BusError::Other(format!("MINGA_LOGS: {e}")))?;
 
+        js.get_or_create_stream(dead_letter_stream_config())
+            .await
+            .map_err(|e| BusError::Other(format!("{DEAD_LETTER_STREAM}: {e}")))?;
+
         Ok(())
     }
 
     async fn setup_kv(js: &JetStream, bucket: &str) -> Result<jetstream::kv::Store> {
+        // Get before create: an update would reset replicas raised by
+        // `ensure_replicas` back to one.
+        if let Ok(store) = js.get_key_value(bucket).await {
+            return Ok(store);
+        }
         let config = KvConfig {
             bucket: bucket.to_string(),
             history: 1,
             ..Default::default()
         };
-        js.create_or_update_key_value(config)
+        js.create_key_value(config)
             .await
             .map_err(|e| BusError::Kv(format!("{bucket}: {e}")))
     }
@@ -322,15 +433,16 @@ impl NatsBus {
             .map_err(|e| BusError::Command(format!("get stream: {e}")))?;
 
         let consumer_name = format!("node-{node_id}");
-        let config = PullConsumerConfig {
-            durable_name: Some(consumer_name.clone()),
+        let config = bounded(PullConsumerConfig {
+            durable_name: Some(consumer_name),
             filter_subject: subjects::ctl_node_wildcard(node_id),
-            ack_policy: AckPolicy::Explicit,
             ..Default::default()
-        };
+        });
 
+        // Create-or-update, so a durable consumer created before the
+        // delivery bounds existed picks them up.
         let consumer = stream
-            .get_or_create_consumer(&consumer_name, config)
+            .create_consumer(config)
             .await
             .map_err(|e| BusError::Command(format!("get consumer: {e}")))?;
 
@@ -372,11 +484,10 @@ impl EventBus for NatsBus {
 
         let filter_subjects: Vec<String> = patterns.iter().map(|s| s.to_string()).collect();
         // Pull consumers need no delivery subject, unlike push consumers.
-        let config = PullConsumerConfig {
+        let config = bounded(PullConsumerConfig {
             filter_subjects,
-            ack_policy: AckPolicy::Explicit,
             ..Default::default()
-        };
+        });
 
         let consumer = stream
             .create_consumer(config)
@@ -391,7 +502,9 @@ impl EventBus for NatsBus {
         let event_stream = messages.filter_map(|msg| async move {
             match msg {
                 Ok(m) => {
-                    let _ = m.ack().await;
+                    if let Err(e) = m.ack().await {
+                        tracing::warn!(error = %e, subject = %m.subject, "event ack failed; JetStream will redeliver");
+                    }
                     Some(BusEvent {
                         subject: m.subject.to_string(),
                         payload: m.payload.to_vec(),
@@ -445,7 +558,13 @@ impl EventBus for NatsBus {
             .ok_or_else(|| BusError::Command("fetch returned no messages".to_string()))?
             .map_err(|e| BusError::Command(format!("message error: {e}")))?;
 
-        let cmd = Command::from_bytes(&msg.payload)?;
+        let cmd = match Command::from_bytes(&msg.payload) {
+            Ok(cmd) => cmd,
+            Err(e) => {
+                reject(&self.client, &msg, "commands", &e).await;
+                return Err(e);
+            }
+        };
         msg.ack()
             .await
             .map_err(|e| BusError::Command(format!("ack: {e}")))?;
@@ -638,12 +757,11 @@ impl EventBus for NatsBus {
         // DeliverPolicy::New means this subscription only sees entries
         // published from now on — the retained backlog is read separately
         // via `log_history`.
-        let config = PullConsumerConfig {
+        let config = bounded(PullConsumerConfig {
             filter_subjects: vec![filter],
-            ack_policy: AckPolicy::Explicit,
             deliver_policy: DeliverPolicy::New,
             ..Default::default()
-        };
+        });
 
         let consumer = stream
             .create_consumer(config)
@@ -655,21 +773,28 @@ impl EventBus for NatsBus {
             .await
             .map_err(|e| BusError::Subscribe(format!("log messages: {e}")))?;
 
-        let log_stream = messages.filter_map(|msg| async move {
-            match msg {
-                Ok(m) => {
-                    let _ = m.ack().await;
-                    match LogEntry::from_bytes(&m.payload) {
-                        Ok(entry) => Some(entry),
+        let client = self.client.clone();
+        let log_stream = messages.filter_map(move |msg| {
+            let client = client.clone();
+            async move {
+                match msg {
+                    Ok(m) => match LogEntry::from_bytes(&m.payload) {
+                        Ok(entry) => {
+                            if let Err(e) = m.ack().await {
+                                tracing::warn!(error = %e, subject = %m.subject, "log ack failed; JetStream will redeliver");
+                            }
+                            Some(entry)
+                        }
                         Err(e) => {
                             tracing::warn!(error = %e, "failed to deserialize log entry");
+                            reject(&client, &m, "logs", &e).await;
                             None
                         }
+                    },
+                    Err(e) => {
+                        tracing::warn!(error = %e, "log stream error");
+                        None
                     }
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "log stream error");
-                    None
                 }
             }
         });
@@ -762,4 +887,132 @@ fn now_millis() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+/// Splits a comma-separated seed list into the URLs async-nats accepts.
+fn seed_list(url: &str) -> Vec<&str> {
+    url.split(',').map(str::trim).collect()
+}
+
+/// Makes `config` an explicit-ack consumer with bounded, backed-off
+/// redelivery, so a poison message cannot redeliver forever.
+fn bounded(config: PullConsumerConfig) -> PullConsumerConfig {
+    PullConsumerConfig {
+        ack_policy: AckPolicy::Explicit,
+        max_deliver: MAX_DELIVER,
+        backoff: REDELIVERY_BACKOFF.to_vec(),
+        ..config
+    }
+}
+
+/// Limits-retention stream that captures the advisories JetStream publishes
+/// when it gives up on a message (max deliveries reached, or `+TERM`).
+fn dead_letter_stream_config() -> StreamConfig {
+    StreamConfig {
+        name: DEAD_LETTER_STREAM.to_string(),
+        subjects: vec![
+            "$JS.EVENT.ADVISORY.CONSUMER.MAX_DELIVERIES.>".to_string(),
+            "$JS.EVENT.ADVISORY.CONSUMER.MSG_TERMINATED.>".to_string(),
+        ],
+        retention: RetentionPolicy::Limits,
+        max_bytes: 64 * 1024 * 1024,
+        max_age: Duration::from_secs(7 * 24 * 3600),
+        ..Default::default()
+    }
+}
+
+/// How a message whose handling failed is settled.
+#[derive(Debug, PartialEq)]
+enum Rejection {
+    /// Poison: it will never succeed, stop redelivery now.
+    Term(String),
+    /// Transient: redeliver after a delay.
+    Nak(Duration),
+}
+
+fn rejection_for(err: &BusError) -> Rejection {
+    match err {
+        BusError::Serialization(reason) => Rejection::Term(reason.clone()),
+        _ => Rejection::Nak(NAK_DELAY),
+    }
+}
+
+/// Terms (poison) or naks (transient) a message whose handling failed,
+/// counting it as dead-lettered when JetStream will not redeliver it.
+async fn reject(client: &Client, msg: &jetstream::Message, topic: &str, err: &BusError) {
+    let delivered = msg.info().map(|i| i.delivered).unwrap_or(0);
+    let (result, dead_letter) = match rejection_for(err) {
+        Rejection::Term(reason) => {
+            // async-nats' AckKind::Term carries no reason; the raw `+TERM
+            // <reason>` puts it into the MSG_TERMINATED advisory.
+            let result = match &msg.reply {
+                Some(reply) => client
+                    .publish(reply.clone(), Bytes::from(format!("+TERM {reason}")))
+                    .await
+                    .map_err(|e| e.to_string()),
+                None => Err("no reply subject".to_string()),
+            };
+            (result, Some("terminated"))
+        }
+        Rejection::Nak(delay) => (
+            msg.ack_with(AckKind::Nak(Some(delay)))
+                .await
+                .map_err(|e| e.to_string()),
+            (delivered >= MAX_DELIVER).then_some("max_deliveries"),
+        ),
+    };
+    match result {
+        Ok(()) => {
+            if let Some(reason) = dead_letter {
+                tracing::warn!(topic, subject = %msg.subject, delivered, reason, error = %err, "message dead-lettered");
+                minga_telemetry::METRICS
+                    .bus_dead_letters_total
+                    .with_label_values(&[topic, reason])
+                    .inc();
+            }
+        }
+        Err(e) => {
+            tracing::warn!(topic, subject = %msg.subject, error = %e, "reject failed; JetStream will redeliver after the ack wait");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bounded_consumer_caps_redelivery() {
+        let config = bounded(PullConsumerConfig {
+            ack_policy: AckPolicy::None,
+            ..Default::default()
+        });
+        assert_eq!(config.ack_policy, AckPolicy::Explicit);
+        assert_eq!(config.max_deliver, MAX_DELIVER);
+        // JetStream rejects a consumer whose backoff list is not shorter
+        // than max_deliver.
+        assert!((config.backoff.len() as i64) < config.max_deliver);
+        assert_eq!(config.backoff[0], Duration::from_secs(30));
+    }
+
+    #[test]
+    fn dead_letter_stream_captures_both_advisories() {
+        let config = dead_letter_stream_config();
+        assert_eq!(config.retention, RetentionPolicy::Limits);
+        assert!(config.max_age > Duration::ZERO && config.max_bytes > 0);
+        assert!(config.subjects.iter().any(|s| s.contains("MAX_DELIVERIES")));
+        assert!(config.subjects.iter().any(|s| s.contains("MSG_TERMINATED")));
+    }
+
+    #[test]
+    fn decode_errors_are_poison_others_are_transient() {
+        assert_eq!(
+            rejection_for(&BusError::Serialization("bad".into())),
+            Rejection::Term("bad".into())
+        );
+        assert_eq!(
+            rejection_for(&BusError::Command("handler busy".into())),
+            Rejection::Nak(NAK_DELAY)
+        );
+    }
 }

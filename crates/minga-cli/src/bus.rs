@@ -34,11 +34,16 @@ pub enum ConnectError {
 /// `MINGA_NATS_TLS_CA`, `MINGA_NATS_TLS_CERT`, `MINGA_NATS_TLS_KEY` and
 /// `MINGA_NATS_TLS_SERVER_NAME` select secure mode.
 ///
+/// In secure mode `url` may be a comma-separated seed list for a NATS
+/// cluster. `replicas` raises the replicated streams and buckets (see
+/// `NatsBus::ensure_replicas`); pass 1 to leave them as they are.
+///
 /// The returned bus is boxed as `Arc<dyn EventBus>` so all callers share one
 /// type regardless of transport.
 pub async fn connect_bus(
     url: &str,
     token: Option<&str>,
+    replicas: usize,
 ) -> Result<Arc<dyn EventBus>, ConnectError> {
     let tls = NatsTlsConfig::from_env().map_err(|e| ConnectError::TlsConfig(e.to_string()))?;
     // Explicit flag wins; MINGA_NATS_TOKEN is the fallback.
@@ -46,16 +51,14 @@ pub async fn connect_bus(
         .map(String::from)
         .or_else(|| std::env::var("MINGA_NATS_TOKEN").ok());
 
-    match tls {
-        Some(config) => {
-            let bus = minga_bus::NatsBus::connect_secure(url, &config)
-                .await
-                .map_err(|e| ConnectError::Connect {
-                    url: url.to_string(),
-                    reason: e.to_string(),
-                })?;
-            Ok(bus)
-        }
+    let connect_error = |e: minga_bus::BusError| ConnectError::Connect {
+        url: url.to_string(),
+        reason: e.to_string(),
+    };
+    let bus = match tls {
+        Some(config) => minga_bus::NatsBus::connect_secure(url, &config)
+            .await
+            .map_err(connect_error)?,
         None => {
             // Plaintext is a loopback-only development mode. A remote
             // worker or manager must provision TLS material instead of
@@ -78,17 +81,15 @@ pub async fn connect_bus(
                         .to_string(),
                 ));
             }
-            let bus = match &token {
+            match &token {
                 Some(token) => minga_bus::NatsBus::connect_with_token(url, token).await,
                 None => minga_bus::NatsBus::connect(url).await,
             }
-            .map_err(|e| ConnectError::Connect {
-                url: url.to_string(),
-                reason: e.to_string(),
-            })?;
-            Ok(bus)
+            .map_err(connect_error)?
         }
-    }
+    };
+    bus.ensure_replicas(replicas).await.map_err(connect_error)?;
+    Ok(bus)
 }
 
 #[cfg(test)]
@@ -111,7 +112,7 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        match rt.block_on(connect_bus("tls://localhost:4222", None)) {
+        match rt.block_on(connect_bus("tls://localhost:4222", None, 1)) {
             Ok(_) => panic!("tls:// without material must be refused"),
             Err(ConnectError::TlsConfig(_)) => {}
             Err(other) => panic!("unexpected error variant: {other}"),

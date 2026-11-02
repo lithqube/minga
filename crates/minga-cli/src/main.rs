@@ -215,6 +215,14 @@ struct NodeArgs {
     /// Can also be set via MINGA_NATS_TOKEN.
     #[arg(long, env = "MINGA_NATS_TOKEN")]
     nats_token: Option<String>,
+    /// Copies kept of the commands, events, dead-letter and KV streams.
+    /// Set 3 (or 5) on a NATS cluster of at least that many servers so
+    /// losing one server loses no bus state; logs stay at one copy. Only
+    /// raises: a node left at 1 never shrinks what another node raised.
+    /// Needs --nats-url; the built-in sidecar is a single server.
+    #[arg(long, env = "MINGA_NATS_REPLICAS", default_value_t = 1,
+          value_parser = clap::value_parser!(u8).range(1..=5))]
+    nats_replicas: u8,
     /// Directory holding the node-local secret store. Secrets are
     /// provisioned there by the operator; values never travel through
     /// Raft or the event bus.
@@ -779,7 +787,8 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
     let bus: Arc<dyn minga_bus::EventBus> = match &args.nats_url {
         Some(url) => {
             _sidecar = None;
-            match bus::connect_bus(url, args.nats_token.as_deref()).await {
+            match bus::connect_bus(url, args.nats_token.as_deref(), args.nats_replicas.into()).await
+            {
                 Ok(b) => b,
                 Err(e) => {
                     eprintln!("error: cannot connect to NATS at {url}: {e}");
@@ -792,6 +801,14 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
                 eprintln!(
                     "error: workers must specify --nats-url (or MINGA_NATS_URL) \
                      to connect to the manager's NATS server"
+                );
+                return ExitCode::FAILURE;
+            }
+            if args.nats_replicas > 1 {
+                eprintln!(
+                    "error: --nats-replicas {} needs a NATS cluster; set --nats-url \
+                     (the built-in sidecar is a single server)",
+                    args.nats_replicas
                 );
                 return ExitCode::FAILURE;
             }
@@ -1515,7 +1532,7 @@ async fn run_agent(cmd: AgentCommand) -> ExitCode {
                 return ExitCode::FAILURE;
             };
 
-            let bus = match bus::connect_bus(&url, None).await {
+            let bus = match bus::connect_bus(&url, None, 1).await {
                 Ok(b) => {
                     let bus: Arc<dyn minga_bus::EventBus> = b;
                     bus
@@ -1586,7 +1603,7 @@ async fn run_logs(task_id: &str, follow: bool, tail: usize, nats_url: Option<&st
         return ExitCode::FAILURE;
     };
 
-    let bus = match bus::connect_bus(url, None).await {
+    let bus = match bus::connect_bus(url, None, 1).await {
         Ok(b) => {
             let bus: Arc<dyn minga_bus::EventBus> = b;
             bus
