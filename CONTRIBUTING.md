@@ -18,6 +18,18 @@ Be direct, be kind, assume good intent. Disagree with ideas, not people. Harassm
   ```
 
 - A C linker (the default toolchain on your platform is fine).
+- **`nats-server`** on `PATH`: the `minga-bus` integration suites start a real server. CI pins v2.10.22.
+- **Linux + containerd** (optional) for the daemon-backed suites:
+
+  ```bash
+  sudo ctr -n minga images pull docker.io/library/redis:8.10.2-alpine
+  sudo ctr -n minga images pull docker.io/library/busybox:latest
+  sudo ctr -n minga images pull docker.io/library/nginx:1.27
+  sudo -E env "PATH=$PATH" MINGA_REQUIRE_CONTAINERD=1 \
+    cargo test -p minga-node --test containerd --test containerd_client
+  ```
+
+  `MINGA_REQUIRE_CONTAINERD=1` makes a missing daemon a failure instead of a silent skip. CI runs this job on pushes to `main` and on pull requests, with the same images preloaded.
 
 ### Clone and build
 
@@ -33,15 +45,19 @@ This is a Cargo workspace. Every crate lives in `crates/`:
 
 | Crate | Purpose |
 | --- | --- |
-| `minga-cli` | The `minga` binary: manager, worker, and CLI entry point |
+| `minga-cli` | The `minga` binary (manager, worker, api, deploy, logs, …) and the NATS sidecar |
 | `minga-compose` | Compose Specification parser and validator |
-| `minga-state` | Cluster state: openraft (Raft) + redb (persistent store) |
-| `minga-scheduler` | Placement: Compose services → tasks on nodes |
-| `minga-api` | Docker Engine API subset (REST) + native gRPC API |
-| `minga-node` | Node supervisor: containerd, task lifecycle, offline operation |
-| `minga-net` | WireGuard overlay, nftables/eBPF, ingress |
-| `minga-sandbox` | Agent sandboxes: wasmtime + Firecracker warm pools |
+| `minga-state` | Cluster state: openraft (Raft) + redb, TCP transport with optional mTLS |
+| `minga-scheduler` | Compose → state translation, placement, IP assignment, reconcile loop |
+| `minga-api` | Docker Engine API v1.41 subset (REST, axum) with bearer-token auth |
+| `minga-node` | Node supervisor: containerd runtime, netns/bridge networking, DNS, secrets, agents |
+| `minga-bus` | `EventBus` trait: in-memory and NATS/JetStream implementations, NATS TLS |
+| `minga-net` | CIDR, IPAM, DNS records, WireGuard key/config generation (not applied yet) |
+| `minga-sandbox` | Agent sandboxes: wasmtime runtime, warm pool, Firecracker stub |
 | `minga-egress` | LLM egress proxy: budgets, caching, secret redaction |
+| `minga-telemetry` | Metrics, health/readiness router, JSON logging |
+
+How the pieces fit, and the known structural limits, are in [docs/architecture.md](docs/architecture.md).
 
 Shared dependency versions go in the root `[workspace.dependencies]` — do not pin versions per-crate unless there is a specific reason.
 
@@ -55,7 +71,7 @@ These are not suggestions. They are the load-bearing decisions of the project. I
 4. **Simplicity over complexity.** One binary, no external dependencies for consensus or storage. Complexity must be earned.
 5. **No silent failures.** Errors propagate. A function that can fail returns a `Result`. Do not swallow errors with `let _ =` or `.ok()` unless you have a comment explaining why the failure is acceptable.
 
-When a design decision is non-obvious, record it as an [ADR](docs/adr/). See the existing ADRs for the format.
+When a design decision is non-obvious, record it as an [ADR](docs/adr/). See the existing ADRs for the format. When the code deviates from an accepted ADR, update that ADR's *Implementation status* section in the same PR.
 
 ## Quality gate
 
@@ -64,7 +80,7 @@ When a design decision is non-obvious, record it as an [ADR](docs/adr/). See the
 ```bash
 cargo fmt --all                              # formatting
 cargo clippy --all-targets -- -D warnings    # lints, zero warnings allowed
-cargo test                                   # all tests pass
+cargo test --workspace                       # all tests pass (needs nats-server)
 ```
 
 Additional expectations:
@@ -92,7 +108,7 @@ Additional expectations:
 
 1. **Open an issue first** for anything beyond a small fix. This avoids wasted work and lets the design be discussed before code is written.
 2. **Keep PRs small.** A PR that touches five crates and refactors unrelated code will not be merged. Split it.
-3. **Fill in the PR template.** Describe what changed, why, and how you tested it.
+3. **Describe the change.** What changed, why, and how you tested it, including anything you couldn't test (Linux-only paths, release workflow).
 4. **Link the issue.** `Closes #123` in the PR description.
 5. **CI must be green.** Formatting, clippy, and tests all pass before review begins.
 

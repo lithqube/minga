@@ -204,9 +204,10 @@ struct NodeArgs {
     /// Reconcile interval in seconds.
     #[arg(long, default_value = "2")]
     interval: u64,
-    /// NATS server URL (e.g. nats://localhost:4222). If not set, uses
-    /// an in-memory bus (single-node development only). Can also be set
-    /// via the MINGA_NATS_URL environment variable.
+    /// NATS server URL (e.g. nats://localhost:4222, or tls://… with the
+    /// MINGA_NATS_TLS_* variables). If not set, a manager spawns its own
+    /// `nats-server` sidecar on 127.0.0.1:4222; workers must set it. Can
+    /// also be set via the MINGA_NATS_URL environment variable.
     #[arg(long, env = "MINGA_NATS_URL")]
     nats_url: Option<String>,
     /// NATS client token. The sidecar config requires the same token;
@@ -527,7 +528,7 @@ async fn run_api(args: ApiArgs) -> ExitCode {
     println!("Try: curl http://{}/_ping", server.addr());
     println!("     DOCKER_HOST=tcp://{} docker service ls", server.addr());
 
-    // Wait forever (until SIGTERM/SIGINT).
+    // Wait forever (until SIGINT).
     tokio::select! {
         _ = &mut reconcile => {},
         _ = tokio::signal::ctrl_c() => {
@@ -1423,7 +1424,7 @@ async fn run_egress(args: EgressArgs) -> ExitCode {
     println!("  proxy:     http://{addr}/v1/chat/completions");
     println!("  workload:  set X-Minga-Workload header to identify the workload");
 
-    // Wait forever (until SIGTERM/SIGINT).
+    // Wait forever (until SIGINT).
     tokio::signal::ctrl_c().await.ok();
     tracing::info!("shutting down egress proxy");
     proxy.shutdown();

@@ -13,6 +13,14 @@
 
 set -euo pipefail
 
+# NOT FUNCTIONAL: kept for reference until a Talos system extension exists.
+# The Minga install step below uses `talosctl upload` / `talosctl run` and a
+# systemd unit. Talos has neither an exec API nor systemd, and the unit also
+# calls `minga node`, which does not exist (the roles are `minga manager`
+# and `minga worker`). See docs/talos-deployment.md.
+echo "error: setup-talos-minga.sh is not functional yet; see docs/talos-deployment.md" >&2
+exit 1
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKDIR="${SCRIPT_DIR}/talos-workdir"
 MINGA_BIN="${SCRIPT_DIR}/bin/minga-linux-amd64"  # or arm64

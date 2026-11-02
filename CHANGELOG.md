@@ -29,6 +29,15 @@
   creates a missing `MINGA_PREFIX`, and installs the licenses under
   `share/minga`.
 
+### Documentation
+- README rewritten against the current CLI. It now has Mermaid diagrams (process architecture, deploy sequence, node networking, topologies), a verified single-host quick start, and an honest multi-node section (external TLS NATS, static Raft membership).
+- New `docs/architecture.md`: where state lives, the deploy round trip, known structural limits and the target design.
+- ADRs gained *Implementation status* sections; ADR 0001 is now Accepted (plan 1).
+- The Talos guide no longer gives install steps that can't work. Talos needs a system extension, which doesn't exist yet. `scripts/setup-talos-minga.sh` now exits with that explanation.
+- `scripts/minga.service` fixed: the old unit called `minga node` and `--log-level`, which don't exist, used `Type=notify`, and silently ran the mock runtime. It now runs either role from `scripts/minga.env.example`, with SIGINT for graceful shutdown.
+- CONTRIBUTING: correct crate table, plus the `nats-server` and containerd test prerequisites.
+- Correction to the `v0.1.0` notes: NATS token auth applies only to plaintext loopback connections. When TLS is configured, the client ignores `--nats-token`, so external TLS connections are certificate-only. A multi-node cluster must point every manager and worker at one external TLS NATS server.
+
 ### Upgrade note
 - Lease renewal uses a new Raft command. Upgrade every node before
   relying on mixed versions: an older node cannot apply it.

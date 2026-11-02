@@ -61,3 +61,22 @@ Operators need Prometheus-scrapable metrics, Kubernetes-compatible health probes
 - `curl /metrics` shows `minga_` metrics
 - `curl /healthz` and `/readyz` return 200 on healthy node
 - Logs are valid JSON with `correlation_id` when bus messages processed
+
+## Implementation status (2026-11-01)
+
+- **Endpoints:** `minga api` serves `/metrics`, `/healthz` and `/readyz`, behind `--api-token` when it's set. `minga manager` and `minga worker` serve them with `--metrics-bind` (`MINGA_METRICS_BIND`).
+- **Readiness:** `/readyz` is ready once a Raft leader is known; on nodes, the bus must also answer. A 503 carries the reason.
+- **Metrics that move:**
+  - `minga_task_starts_total`, `minga_task_stops_total`, `minga_task_restarts_total`
+  - `minga_tasks_total{state="running"}`
+  - `minga_scheduler_reconcile_duration_seconds`
+  - `minga_scheduler_placement_decisions_total{result="placed"}`
+  - `minga_raft_leader`
+  - `minga_bus_publish_latency_seconds{topic}`
+- **Registered but never updated:**
+  - the `no_node` and `constraint_fail` placement results
+  - `minga_raft_replication_lag`
+  - `minga_agent_pool_*`
+  - `minga_containerd_grpc_latency_seconds`
+- **Logging:** JSON on stderr for `manager`, `worker` and `api`. The level comes from `MINGA_LOG_LEVEL`, then `RUST_LOG`, and defaults to `info`.
+- **Not done:** correlation IDs aren't propagated across bus hops.

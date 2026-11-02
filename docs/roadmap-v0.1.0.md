@@ -1,5 +1,7 @@
 # Minga — Roadmap to a First Production Release
 
+> **Historical.** This roadmap was written on 2026-10-27 to plan `v0.1.0`. All seven gates closed on 2026-11-01 (see the [changelog](../CHANGELOG.md)). The blockers and measurements below describe the tree on 2026-10-27, not today. For the current state and what comes next, see [architecture.md](architecture.md).
+
 **Target:** `v0.1.0`, a single-binary release an operator can install on real hardware and run a Compose stack on, with secrets, logs and TLS handled honestly.
 
 **Status of this document:** grounded in a source audit plus one new executable probe (`crates/minga-cli/tests/deploy_path_probe.rs`) run against the current tree on 2026-10-27. Every "absent" below is a verified absence in code, not an inference from documentation. Claims about Talos, hcloud, FIPS, SOC 2, VS-NfD or NATO are deliberately excluded — none are achieved, and no gate below depends on them.

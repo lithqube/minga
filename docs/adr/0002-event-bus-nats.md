@@ -36,7 +36,7 @@ minga.node.{id}.status     JetStream   node status reports
 minga.node.{id}.event      JetStream   node lifecycle events
 minga.task.{id}.status     JetStream   task status reports
 minga.task.{id}.event      JetStream   task lifecycle events
-minga.task.{id}.log        JetStream   container log chunks
+minga.log.{id}             JetStream   container log chunks
 minga.ctl.node.{id}.assign JetStream   task assignment command  [work queue]
 minga.ctl.node.{id}.stop   JetStream   stop/remove command       [work queue]
 minga.ctl.node.{id}.ping   core NATS   synchronous health probe  [req/reply]
@@ -49,7 +49,7 @@ minga.ctl.node.{id}.drain  core NATS   synchronous drain         [req/reply]
 |---|---|---|---|
 | `MINGA_EVENTS` | `minga.node.>`, `minga.task.>`, `minga.egress.>` | Limits | MaxAge 72h |
 | `MINGA_COMMANDS` | `minga.ctl.node.>` | WorkQueue | MaxAge 24h, AckWait 30s |
-| `MINGA_LOGS` | `minga.task.*.log` | Limits | MaxBytes 512 MiB, MaxAge 24h |
+| `MINGA_LOGS` | `minga.log.>` | Limits | MaxBytes 512 MiB, MaxAge 24h |
 
 ## KV buckets
 
@@ -105,3 +105,15 @@ They manage disjoint data and fail independently. Disk caps are pinned explicitl
 | Extend Raft for heartbeats/status | Rejected — violates stated principle, couples liveness to quorum |
 | Redis Streams / RabbitMQ / Kafka | Rejected — wrong scale for edge |
 | Defer bus, ship supervisor with direct gRPC | Rejected as sequencing — the trait makes the bus cheap now |
+
+## Implementation status (2026-11-01)
+
+- **Built:** `MemoryBus` and `NatsBus`, the streams and KV buckets above (logs live under `minga.log.>`, not `minga.task.>`), NATS mTLS (`MINGA_NATS_TLS_*`), and the manager-spawned sidecar. The sidecar listens on loopback only, so a multi-node cluster points every manager and worker at one external TLS NATS server.
+- **Token auth applies only to plaintext loopback connections.** When TLS is configured, the client ignores `--nats-token`/`MINGA_NATS_TOKEN`, so external TLS connections are certificate-only.
+- **Not built:** `SpoolingBus`, so workers have no offline spool.
+- **Deviation: liveness.** Placement reads a lease kept in Raft (`ClusterNode.last_seen_unix`, renewed by the atomic `RenewNodeLease` command), not `MINGA_LEASES`. The bus lease is refreshed but unused. That puts heartbeats through consensus, against this ADR.
+- **Deviation: task state.** The supervisor writes lifecycle transitions (`running`/`stopped`) to the Raft task record so Docker API consumers see them. High-frequency status still goes over the bus.
+- **Deviation: dispatch.** Supervisors also reconcile against their local Raft replica, which needs every node to be a Raft member.
+- **Release:** archives bundle `nats-server` (checksum-pinned) with `SHA256SUMS`, as decided above.
+
+[docs/architecture.md](../architecture.md) describes the plan to remove these deviations (workers leave Raft).
