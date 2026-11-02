@@ -28,6 +28,17 @@
   `SHA256SUMS`; `install.sh` verifies the checksum, installs both binaries,
   creates a missing `MINGA_PREFIX`, and installs the licenses under
   `share/minga`.
+- The release workflow pushes a multi-arch image (`linux/amd64`,
+  `linux/arm64`) to `ghcr.io/lithqube/minga`, built from the same binaries
+  as the archives and tagged `vX.Y.Z`, `X.Y` and `latest`. A manual
+  workflow run validates the pipeline by pushing only the `:edge` tag.
+- `install.sh` is now a small CLI: `--version`/`--prefix` (env equivalents
+  kept), `--with-systemd` (installs the unit and an `/etc/minga/minga.env`
+  template; the archive now carries both files), `--uninstall` (keeps
+  `/etc/minga` and `/var/lib/minga`), and `MINGA_BASE_URL` for mirrors and
+  air-gapped sites.
+- The release workflow refuses a tag that doesn't match the workspace
+  version in `Cargo.toml`.
 
 ### Documentation
 - README rewritten against the current CLI. It now has Mermaid diagrams (process architecture, deploy sequence, node networking, topologies), a verified single-host quick start, and an honest multi-node section (external TLS NATS, static Raft membership).
