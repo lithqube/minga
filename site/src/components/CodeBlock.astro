@@ -9,9 +9,11 @@ interface Props {
   title?: string;
   /** Shown under the code, muted, without a copy button. */
   output?: string;
+  /** Heading over `output`; say where the sample comes from when it was not captured from a run. */
+  outputLabel?: string;
   copy?: boolean;
 }
-const { code, lang = 'bash', title, output, copy = true } = Astro.props;
+const { code, lang = 'bash', title, output, outputLabel = 'Expected output', copy = true } = Astro.props;
 const lines = code.replace(/\n$/, '').split('\n');
 const copyText =
   lang === 'console'
@@ -40,7 +42,7 @@ const consoleHtml = lines
   )}
   {output && (
     <div data-nocopy>
-      <p class="code-title">Expected output</p>
+      <p class="code-title">{outputLabel}</p>
       <pre tabindex="0" aria-label="Expected output" class="out" set:html={esc(output.trim())} />
     </div>
   )}

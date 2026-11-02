@@ -12,7 +12,7 @@ import { site, url } from '../config/site';
 import { asOf, columns, rows } from '../data/comparison';
 import { faq } from '../data/faq';
 import { features } from '../data/features';
-import { assertInReadme, deployOutput, prerequisites, steps } from '../data/quickstart';
+import { assertInReadme, deployOutput, deployOutputLabel, prerequisites, steps } from '../data/quickstart';
 import { featuredArticles } from '../data/writing';
 import { latestRelease, listAdrs, readRepo, readmeLimits, renderRepoMarkdown } from '../lib/repo';
 import { softwareLd } from '../lib/seo';
@@ -55,7 +55,12 @@ ${deployOutput.split('\n').slice(3).join('\n')}`;
       linkText: 'Known limits',
     }}
   >
-    <CodeBlock slot="terminal" lang="console" title="build → preload → deploy" code={terminal} />
+    <CodeBlock
+      slot="terminal"
+      lang="console"
+      title="build → preload → deploy (sample output from the CLI source)"
+      code={terminal}
+    />
     <ArchitectureDiagram
       slot="diagram"
       variant="hero"
@@ -65,27 +70,25 @@ ${deployOutput.split('\n').slice(3).join('\n')}`;
 
   <section class="section" aria-labelledby="problem">
     <div class="wrap">
-      <h2 id="problem">Swarm was built for a datacenter. Your sites aren’t one.</h2>
-      <div class="grid grid-3">
-        <div class="card">
-          <h3>Edge sites</h3>
-          <p>A handful of ARM boards, an uplink that drops, and no room for a heavyweight control plane.</p>
+      <div class="problem">
+        <div>
+          <h2 id="problem">Swarm was built for a datacenter. Your sites aren’t one.</h2>
+          <p class="lede">
+            Kubernetes solves this by adding a control plane your site can’t afford; Swarm assumes registries and a
+            datacenter network. Your stacks are already written as Compose, and the failure that hurts at a remote site
+            is the silent one: a key skipped, a deploy that “succeeded” into an empty cluster. Minga’s rule is that
+            Compose files deploy unchanged, and keys it doesn’t understand fail loudly instead of being skipped.
+          </p>
         </div>
-        <div class="card">
-          <h3>Air-gapped networks</h3>
-          <p>Nothing pulls from a registry, and every dependency has to be vendored and checksummed.</p>
-        </div>
-        <div class="card">
-          <h3>Agent workloads</h3>
-          <p>They need sandboxed execution, token budgets and LLM egress control, not just “run a container”.</p>
-        </div>
+        <dl class="sites">
+          <dt>Edge sites</dt>
+          <dd>A handful of ARM boards, an uplink that drops, and no room for a heavyweight control plane.</dd>
+          <dt>Air-gapped networks</dt>
+          <dd>Nothing pulls from a registry, and every dependency has to be vendored and checksummed.</dd>
+          <dt>Agent workloads</dt>
+          <dd>They need sandboxed execution, token budgets and LLM egress control, not just “run a container”.</dd>
+        </dl>
       </div>
-      <p class="lede">
-        Kubernetes solves this by adding a control plane your site can’t afford; Swarm assumes registries and a
-        datacenter network. Your stacks are already written as Compose, and the failure that hurts at a remote site is
-        the silent one: a key skipped, a deploy that “succeeded” into an empty cluster. Minga’s rule is that Compose
-        files deploy unchanged, and keys it doesn’t understand fail loudly instead of being skipped.
-      </p>
     </div>
   </section>
 
@@ -149,11 +152,20 @@ ${deployOutput.split('\n').slice(3).join('\n')}`;
   <section class="section" aria-labelledby="features">
     <div class="wrap">
       <h2 id="features">What’s in v{version}</h2>
-      <div class="grid grid-4">
-        {features.map((f) => (
-          <FeatureCard {...f} />
-        ))}
+      <div class="grid grid-2">
+        {features
+          .filter((f) => f.lead)
+          .map((f) => (
+            <FeatureCard {...f} />
+          ))}
       </div>
+      <ul class="compact-list">
+        {features
+          .filter((f) => !f.lead)
+          .map((f) => (
+            <FeatureCard {...f} />
+          ))}
+      </ul>
     </div>
   </section>
 
@@ -177,12 +189,13 @@ ${deployOutput.split('\n').slice(3).join('\n')}`;
               code={s.code}
               lang={s.lang ?? 'bash'}
               output={i === steps.length - 1 ? deployOutput : undefined}
+              outputLabel={deployOutputLabel}
             />
           </li>
         ))}
       </ol>
       <p>
-        <a href={url('/docs/quickstart/')}>Full quickstart, deployment topologies and the container image →</a>
+        <a href={url('/docs/quickstart/')}>Full quickstart and deployment topologies</a>
       </p>
     </div>
   </section>
@@ -284,7 +297,7 @@ ${deployOutput.split('\n').slice(3).join('\n')}`;
             <li>Agents have no host capabilities yet; containers have no cross-node network.</li>
           </ul>
           <p>
-            <a href={url('/architecture/')}>Known structural limits and the plan to fix them →</a>
+            <a href={url('/architecture/')}>Known structural limits and the plan to fix them</a>
           </p>
           <h3>Non-goals</h3>
           <ul>
@@ -331,7 +344,7 @@ ${deployOutput.split('\n').slice(3).join('\n')}`;
       </div>
       <p>
         <a href={site.codeOfConductUrl}>Code of Conduct</a> ·{' '}
-        <a href={`${site.repoUrl}/graphs/contributors`}>Contributors</a> ·
+        <a href={`${site.repoUrl}/graphs/contributors`}>Contributors</a> ·{' '}
         <a href={url('/community/')}>Everything about contributing</a>
         {site.social.discord && (
           <>
@@ -369,6 +382,49 @@ ${deployOutput.split('\n').slice(3).join('\n')}`;
 </BaseLayout>
 
 <style>
+  .problem {
+    display: grid;
+    gap: 32px;
+  }
+  @media (min-width: 960px) {
+    .problem {
+      grid-template-columns: 1.2fr 1fr;
+      align-items: start;
+    }
+  }
+  .problem h2 {
+    margin-top: 0;
+  }
+  .sites {
+    margin: 0;
+  }
+  .sites dt {
+    font: 700 var(--step-1) var(--mono);
+    margin-top: 1em;
+  }
+  .sites dt:first-child {
+    margin-top: 0;
+  }
+  .sites dd {
+    margin: 0.3em 0 0;
+  }
+  .compact-list {
+    list-style: none;
+    padding: 0;
+    margin: 32px 0 0;
+    display: grid;
+    gap: 8px 32px;
+  }
+  @media (min-width: 640px) {
+    .compact-list {
+      grid-template-columns: repeat(2, 1fr);
+    }
+  }
+  @media (min-width: 960px) {
+    .compact-list {
+      grid-template-columns: repeat(3, 1fr);
+    }
+  }
   .split {
     display: grid;
     gap: 32px;

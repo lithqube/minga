@@ -17,7 +17,7 @@ const href = (s: string) => (s.startsWith('http') ? s : `${site.repoUrl}/blob/${
 <div class="table-scroll compare" role="region" aria-label="Comparison table, scrolls horizontally" tabindex="0">
   <table>
     <caption class="muted">
-      As of{asOf}. Legend: ● yes, ◐ partly, ○ no. Each cell links to its source.
+      {`As of ${asOf}. Legend: ● yes, ◐ partly, ○ no. Each cell links to its source. Minga cells cite this repository. The Docker Swarm and k3s cells summarize their public documentation and have not yet been checked line by line against the linked pages. `}
       <a href={correctionUrl}>Suggest a correction</a>.
     </caption>
     <thead>

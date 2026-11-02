@@ -813,3 +813,7 @@ A whale with a house where the containers go is a textbook derivative of Moby Do
 | Evidence, not configuration; architecture tests in CI ("It works") | Yes. Every v0.1.0 gate had an executable exit criterion, and each ADR ends with *Implementation status* | RM, docs/README.md | ● |
 
 **On the site:** the ● rows can be claimed. The ◐ and ○ rows go to *When not to use* and the roadmap, never the feature grid. The rows marked "gap" are Minga engineering work, not site work. They're listed here so the copy doesn't over-claim, and as candidates for the roadmap page.
+
+#### Glow budget (antislop audit 001)
+
+Glow appears in three places only: the focus ring, the primary button hover, and the hero background light (the cyan and magenta of the Dev-Ferru covers, kept to the hero as its focal point). Nothing else glows.

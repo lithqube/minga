@@ -26,7 +26,7 @@ const { eyebrow, title, subtitle, primary, secondary, tertiary, prereq, status }
       <p class="lede">{subtitle}</p>
       <div class="actions">
         <a class="btn btn-primary" href={url(primary.href)}>
-          {primary.label} <span aria-hidden="true">&nbsp;→</span>
+          {primary.label}
         </a>
         {secondary && (
           <a class="btn btn-secondary" href={url(secondary.href)}>
@@ -59,6 +59,7 @@ const { eyebrow, title, subtitle, primary, secondary, tertiary, prereq, status }
 <style>
   .hero {
     padding: 48px 0 56px;
+    /* The one glow on the page: the cyan and magenta light of the Dev-Ferru covers, kept to the hero as the focal point (DESIGN.md §12.1). */
     background:
       radial-gradient(60rem 30rem at 85% -10%, color-mix(in srgb, var(--accent-2) 14%, transparent), transparent 60%),
       radial-gradient(50rem 30rem at 0% 0%, color-mix(in srgb, var(--accent) 12%, transparent), transparent 60%);

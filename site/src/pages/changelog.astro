@@ -2,12 +2,8 @@
 import DocsLayout from '../layouts/DocsLayout.astro';
 import { renderRepoFile } from '../lib/repo';
 
+// The "[Unreleased]" pill is added in the markdown pipeline (rehypeUnreleasedPill).
 const doc = await renderRepoFile('CHANGELOG.md');
-// Mark the unreleased section so nobody mistakes it for a tagged release.
-const html = doc.html.replace(
-  /(<h2 id="unreleased">\[Unreleased\])<\/h2>/,
-  '$1 <span class="pill warn">not in a tagged release</span></h2>',
-);
 ---
 
 <DocsLayout
@@ -18,5 +14,5 @@ const html = doc.html.replace(
   headings={doc.headings}
   current="/changelog/"
 >
-  <Fragment set:html={html} />
+  <Fragment set:html={doc.html} />
 </DocsLayout>

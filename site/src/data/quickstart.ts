@@ -72,3 +72,6 @@ export function assertInReadme(readme: string) {
     }
   }
 }
+
+/** Shown over deployOutput everywhere, until it is replaced by output captured from a real run. */
+export const deployOutputLabel = 'Expected output (format taken from the CLI source, not captured from a run)';

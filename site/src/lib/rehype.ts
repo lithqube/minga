@@ -44,6 +44,26 @@ export function rehypeRepoLinks() {
   };
 }
 
+const textOf = (n: Node): string => (n.type === 'text' ? (n.value ?? '') : (n.children ?? []).map(textOf).join(''));
+
+/** Marks a changelog's "## [Unreleased]" heading so nobody mistakes it for a tagged release. */
+export function rehypeUnreleasedPill() {
+  return (tree: Node) =>
+    walk(tree, (n) => {
+      if (n.tagName !== 'h2' || textOf(n).trim() !== '[Unreleased]') return;
+      n.properties = { ...n.properties, id: 'unreleased' }; // keep the anchor stable despite the added text
+      n.children?.push(
+        { type: 'text', value: ' ' },
+        {
+          type: 'element',
+          tagName: 'span',
+          properties: { className: ['pill', 'warn'] },
+          children: [{ type: 'text', value: 'not in a tagged release' }],
+        },
+      );
+    });
+}
+
 /** Code blocks get a keyboard-scrollable, labelled <pre> (WCAG 2.1.1); task-list checkboxes get a label. */
 export function rehypeA11y() {
   return (tree: Node) =>

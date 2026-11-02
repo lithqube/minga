@@ -6,10 +6,17 @@ import { pathToFileURL } from 'node:url';
 import { unified } from '@astrojs/markdown-remark';
 import type { MarkdownHeading } from '@astrojs/markdown-remark';
 import { REPO_ROOT } from './paths';
-import { mermaidPlugin, rehypeA11y, rehypeRepoLinks, shikiConfig, syntaxHighlight } from './rehype';
+import {
+  mermaidPlugin,
+  rehypeA11y,
+  rehypeRepoLinks,
+  rehypeUnreleasedPill,
+  shikiConfig,
+  syntaxHighlight,
+} from './rehype';
 
 const renderer = await unified({
-  rehypePlugins: [rehypeRepoLinks, mermaidPlugin as never, rehypeA11y],
+  rehypePlugins: [rehypeRepoLinks, rehypeUnreleasedPill, mermaidPlugin as never, rehypeA11y],
 }).createRenderer({ shikiConfig, syntaxHighlight: syntaxHighlight as never });
 
 export function readRepo(rel: string): string {

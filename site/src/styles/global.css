@@ -123,6 +123,25 @@ a {
 a:hover {
   text-decoration-thickness: 2px;
 }
+a:active {
+  color: var(--accent-2);
+}
+/* One place for the pointer cursor (R-39), instead of per component. */
+a[href],
+button:not(:disabled),
+summary,
+label[for],
+[role='button'] {
+  cursor: pointer;
+}
+button:disabled {
+  cursor: not-allowed;
+}
+/* Disclosure toggles are tap targets too: 44px minimum. */
+summary {
+  min-height: 44px;
+  padding: 10px 0;
+}
 :focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 2px;
@@ -217,7 +236,7 @@ pre .ok {
 }
 /* Room for the copy button so it never covers the first line. */
 .has-copy > pre {
-  padding-top: 40px;
+  padding-top: 56px;
 }
 .code-title {
   font: var(--step--1) var(--mono);
@@ -228,17 +247,20 @@ pre .ok {
   position: absolute;
   top: 6px;
   right: 6px;
-  min-height: 32px;
-  padding: 4px 10px;
+  min-height: 44px;
+  min-width: 44px;
+  padding: 4px 12px;
   font: var(--step--1) var(--mono);
   color: var(--surface-text);
   background: #1b2440;
   border: 1px solid #2c3a5c;
   border-radius: var(--radius);
-  cursor: pointer;
 }
 .copy:hover {
   border-color: #22d3ee;
+}
+.copy:active {
+  background: #2c3a5c;
 }
 
 /* Mermaid and authored diagrams */
@@ -258,6 +280,8 @@ pre.mermaid,
 
 /* Tables */
 .table-scroll {
+  /* Positioned so visually hidden labels inside cells stay in the scroll box, not the page. */
+  position: relative;
   overflow-x: auto;
   margin: 0 0 1em;
 }
@@ -324,6 +348,12 @@ thead th {
 }
 .btn-secondary:hover {
   border-color: var(--accent);
+}
+.btn-primary:active {
+  background: color-mix(in srgb, var(--accent) 80%, var(--bg));
+}
+.btn-secondary:active {
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
 }
 .actions {
   display: flex;

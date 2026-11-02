@@ -38,10 +38,12 @@
     background: transparent;
     border: 1px solid var(--border);
     border-radius: var(--radius);
-    cursor: pointer;
     white-space: nowrap;
   }
   .theme-toggle:hover {
     border-color: var(--accent);
+  }
+  .theme-toggle:active {
+    background: color-mix(in srgb, var(--accent) 12%, transparent);
   }
 </style>

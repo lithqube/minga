@@ -3,7 +3,7 @@ import Callout from '../../components/Callout.astro';
 import CodeBlock from '../../components/CodeBlock.astro';
 import DocsLayout from '../../layouts/DocsLayout.astro';
 import { url } from '../../config/site';
-import { deployOutput, steps } from '../../data/quickstart';
+import { deployOutput, deployOutputLabel, steps } from '../../data/quickstart';
 import { readRepo } from '../../lib/repo';
 
 // Fixtures and snippets are read from the repo, never retyped.
@@ -40,7 +40,11 @@ const headings = [
 
   <h2 id="minimal-web">Minimal web service</h2>
   <CodeBlock code={compose} lang="yaml" title="compose.yaml" />
-  <CodeBlock code="MINGA_API_TOKEN=change-me minga deploy -c compose.yaml shop" output={deployOutput} />
+  <CodeBlock
+    code="MINGA_API_TOKEN=change-me minga deploy -c compose.yaml shop"
+    output={deployOutput}
+    outputLabel={deployOutputLabel}
+  />
   <p class="muted">
     The service is named <code>shop.web</code> and its network <code>shop_default</code>: stack name, then the Compose
     name.
