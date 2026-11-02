@@ -38,7 +38,7 @@ export const features: Feature[] = [
   },
   {
     title: 'One binary, checksum-verified',
-    body: 'Release archives bundle minga with a checksum-pinned nats-server and its license, and install.sh verifies SHA256SUMS.',
+    body: 'Release archives bundle minga with a checksum-pinned nats-server and ctr plus licenses, install.sh verifies SHA256SUMS and can install the systemd unit, and the same binaries ship as a multi-arch ghcr.io/lithqube/minga image (Talos runs it as a ContainerConfig).',
     caveat: 'No release is tagged yet: build from source for now.',
     href: '/docs/quickstart/',
     linkLabel: 'Quickstart',

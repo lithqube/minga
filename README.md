@@ -171,6 +171,7 @@ You need Linux, root (the supervisor creates netns, bridges and iptables rules),
 
 ```bash
 # Installs minga + the checksum-pinned nats-server and verifies SHA256SUMS.
+# (Works once the first release is tagged; until then use the source build below.)
 curl -fsSL https://github.com/lithqube/minga/releases/latest/download/install.sh | sh
 # Same, plus the systemd unit and an /etc/minga/minga.env template:
 #   curl -fsSL .../install.sh | sh -s -- --with-systemd
