@@ -1,0 +1,77 @@
+name: Site
+
+# Builds the GitHub Pages site in site/ and deploys it from main.
+# The site renders README.md, CHANGELOG.md, CONTRIBUTING.md and docs/ at build time,
+# so changes to those files redeploy it too.
+on:
+  push:
+    branches: [main]
+    paths:
+      - site/**
+      - docs/**
+      - README.md
+      - CHANGELOG.md
+      - CONTRIBUTING.md
+      - crates/minga-compose/tests/fixtures/**
+      - .github/workflows/pages.yml
+  pull_request:
+    paths:
+      - site/**
+      - docs/**
+      - README.md
+      - CHANGELOG.md
+      - CONTRIBUTING.md
+      - crates/minga-compose/tests/fixtures/**
+      - .github/workflows/pages.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pages-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: lint and build
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: site
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: site/package-lock.json
+
+      - run: npm ci
+
+      # Mermaid diagrams are rendered to inline SVG at build time with headless Chromium.
+      - run: npx playwright install --with-deps chromium
+
+      - run: npm run lint
+      - run: npm run build
+
+      - uses: actions/upload-pages-artifact@v3
+        if: github.event_name != 'pull_request'
+        with:
+          path: site/dist
+
+  deploy:
+    name: deploy to GitHub Pages
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

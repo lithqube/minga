@@ -1,0 +1,79 @@
+---
+// `lead`: a card with an icon for the claims an evaluator checks first. Default: a compact list item.
+import { url } from '../config/site';
+import type { Feature } from '../data/features';
+
+type Props = Feature;
+const { title, body, caveat, href, linkLabel, source, lead, icon } = Astro.props;
+const paths = {
+  api: 'M8 6l-5 6 5 6m8-12 5 6-5 6M14 4l-4 16',
+  loud: 'M12 4v10m0 4v2M4 20h16L12 4z',
+};
+---
+
+{lead ? (
+  <article class="lead card">
+    {icon && (
+      <svg viewBox="0 0 24 24" width="28" height="28" aria-hidden="true" focusable="false">
+        <path
+          d={paths[icon]}
+          fill="none"
+          stroke="currentColor"
+          stroke-width="1.6"
+          stroke-linecap="round"
+          stroke-linejoin="round"
+        />
+      </svg>
+    )}
+    <h3>{title}</h3>
+    <p>{body}</p>
+    {caveat && <p class="caveat">Limit: {caveat}</p>}
+    <a href={url(href)} title={`Source: ${source}`}>
+      {linkLabel}
+    </a>
+  </article>
+) : (
+  <li class="compact">
+    <h3>
+      <a href={url(href)} title={`Source: ${source}`}>
+        {title}
+      </a>
+    </h3>
+    <p>{body}</p>
+    {caveat && <p class="caveat">Limit: {caveat}</p>}
+  </li>
+)}
+
+<style>
+  .lead {
+    padding: 24px;
+  }
+  .lead h3 {
+    font-size: var(--step-2);
+  }
+  .lead p {
+    font-size: 1.05rem;
+  }
+  svg {
+    color: var(--accent);
+    margin-bottom: 8px;
+  }
+  .lead:hover {
+    border-color: var(--accent);
+  }
+  .compact {
+    border-top: 1px solid var(--border);
+    padding: 12px 0 4px;
+  }
+  .compact h3 {
+    font-size: var(--step-1);
+    margin: 0 0 0.3em;
+  }
+  .compact p {
+    margin: 0 0 0.4em;
+  }
+  .caveat {
+    color: var(--muted);
+    font-size: var(--step--1);
+  }
+</style>

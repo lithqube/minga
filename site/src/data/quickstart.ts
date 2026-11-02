@@ -1,0 +1,77 @@
+// The landing-page quickstart. Commands must appear verbatim in README.md (checked at build),
+// so the site can never drift from the verified path.
+export interface Step {
+  title: string;
+  code: string;
+  lang?: string;
+  note?: string;
+  /** New content not in the README (e.g. the sample compose file). Skips the drift check. */
+  siteOnly?: boolean;
+}
+
+export const prerequisites = [
+  'Linux with root (the supervisor creates netns, bridges and iptables rules)',
+  'A Rust 1.80+ toolchain and nats-server v2.10.22 on PATH (no release is published yet)',
+  'containerd running',
+  'iproute2, iptables and procps (any standard server install)',
+  'Free loopback ports 7001, 7002, 2375 and 9100',
+];
+
+export const steps: Step[] = [
+  {
+    title: 'Build and install minga from source',
+    note: 'Once a release is tagged, install.sh installs minga and a checksum-pinned nats-server and verifies SHA256SUMS.',
+    code: `cargo build --release -p minga-cli
+sudo install -m 0755 target/release/minga /usr/local/bin/minga`,
+  },
+  {
+    title: 'Preload the images your stack uses (there is no registry pull yet)',
+    code: 'sudo ctr -n minga images pull docker.io/library/nginx:1.27',
+  },
+  {
+    title: 'Write a minimal compose.yaml',
+    lang: 'yaml',
+    siteOnly: true,
+    code: `services:
+  web:
+    image: docker.io/library/nginx:1.27
+    ports:
+      - "8080:80"`,
+  },
+  {
+    title: 'Terminal 1: start the manager',
+    code: `sudo minga manager --node-id 1 --bind 127.0.0.1:7001 --peer 2=127.0.0.1:7002 \\
+  --data-dir /var/lib/minga --runtime containerd --metrics-bind 127.0.0.1:9100`,
+  },
+  {
+    title: 'Terminal 2: start the Docker Engine API',
+    note: 'Today minga api is its own Raft voter, so one host runs two processes that peer with each other.',
+    code: `sudo MINGA_API_TOKEN=change-me minga api --node-id 2 --bind 127.0.0.1:7002 \\
+  --peer 1=127.0.0.1:7001 --data-dir /var/lib/minga-api --api-bind 127.0.0.1:2375`,
+  },
+  {
+    title: 'Deploy the stack and check readiness',
+    code: `MINGA_API_TOKEN=change-me minga deploy -c compose.yaml shop
+curl -s 127.0.0.1:9100/readyz`,
+  },
+];
+
+/** Output format taken from crates/minga-cli/src/deploy.rs; re-capture from a real run when it changes. */
+export const deployOutput = `network shop_default: created
+service shop.web: created
+
+deployment of stack \`shop\`:
+  [ok ] shop.web: created — 1/1 task(s) placed`;
+
+export function assertInReadme(readme: string) {
+  for (const s of steps.filter((s) => !s.siteOnly)) {
+    for (const line of s.code.split('\n')) {
+      if (!readme.includes(line.trim())) {
+        throw new Error(`[site] quickstart command is not in README.md, so the site drifted: ${line.trim()}`);
+      }
+    }
+  }
+}
+
+/** Shown over deployOutput everywhere, until it is replaced by output captured from a real run. */
+export const deployOutputLabel = 'Expected output (format taken from the CLI source, not captured from a run)';

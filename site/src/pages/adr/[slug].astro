@@ -1,0 +1,70 @@
+---
+import Callout from '../../components/Callout.astro';
+import DocsLayout from '../../layouts/DocsLayout.astro';
+import { url } from '../../config/site';
+import { listAdrs, renderRepoFile, type Adr } from '../../lib/repo';
+
+export function getStaticPaths() {
+  const adrs = listAdrs();
+  return adrs.map((adr, i) => ({ params: { slug: adr.slug }, props: { adr, prev: adrs[i - 1], next: adrs[i + 1] } }));
+}
+const { adr, prev, next } = Astro.props as { adr: Adr; prev?: Adr; next?: Adr };
+const doc = await renderRepoFile(adr.rel);
+const implSlug = doc.headings.find((h) => /^Implementation status/.test(h.text))?.slug;
+---
+
+<DocsLayout
+  title={doc.title}
+  description={`ADR ${adr.number} (${adr.status}): ${adr.title}. The decision, its context, and how the code implements it today.`}
+  crumbs={[
+    { name: 'ADRs', path: '/adr/' },
+    { name: adr.number, path: `/adr/${adr.slug}/` },
+  ]}
+  sources={[adr.rel]}
+  headings={doc.headings}
+  current="/adr/"
+>
+  <p class="meta">
+    <span class={`pill ${/accepted/i.test(adr.status) ? 'ok' : ''}`}>Status: {adr.status}</span>
+    {adr.date && <span class="mono muted"> {adr.date}</span>}
+  </p>
+  {implSlug && (
+    <Callout>
+      {adr.deviations > 0
+        ? `the code deviates from this decision in ${adr.deviations} place${adr.deviations > 1 ? 's' : ''}. `
+        : 'what shipped is recorded at the end. '}
+      <a href={`#${implSlug}`}>Jump to Implementation status</a>
+    </Callout>
+  )}
+  <Fragment set:html={doc.html} />
+  <nav class="adr-pager" aria-label="Other decision records">
+    {prev ? (
+      <a href={url(`/adr/${prev.slug}/`)}>
+        ← ADR {prev.number}: {prev.title}
+      </a>
+    ) : (
+      <span />
+    )}
+    {next && (
+      <a href={url(`/adr/${next.slug}/`)}>
+        ADR {next.number}: {next.title} →
+      </a>
+    )}
+  </nav>
+</DocsLayout>
+
+<style>
+  .meta {
+    margin-top: -0.5em;
+  }
+  .adr-pager {
+    display: flex;
+    justify-content: space-between;
+    gap: 16px;
+    margin-top: 32px;
+    font-size: 0.95rem;
+  }
+  :global(h2[id^='implementation-status']) {
+    color: var(--accent);
+  }
+</style>

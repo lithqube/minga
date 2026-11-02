@@ -1,0 +1,495 @@
+---
+import BaseLayout from '../layouts/BaseLayout.astro';
+import ArchitectureDiagram from '../components/ArchitectureDiagram.astro';
+import CodeBlock from '../components/CodeBlock.astro';
+import ComparisonTable from '../components/ComparisonTable.astro';
+import CTA from '../components/CTA.astro';
+import FAQ from '../components/FAQ.astro';
+import FeatureCard from '../components/FeatureCard.astro';
+import Hero from '../components/Hero.astro';
+import SocialProof from '../components/SocialProof.astro';
+import { site, url } from '../config/site';
+import { asOf, columns, rows } from '../data/comparison';
+import { faq } from '../data/faq';
+import { features } from '../data/features';
+import { assertInReadme, deployOutput, deployOutputLabel, prerequisites, steps } from '../data/quickstart';
+import { featuredArticles } from '../data/writing';
+import { latestRelease, listAdrs, readRepo, readmeLimits, renderRepoMarkdown } from '../lib/repo';
+import { softwareLd } from '../lib/seo';
+
+const { version } = latestRelease();
+assertInReadme(readRepo('README.md'));
+const limits = readmeLimits();
+const limitsHtml = (await renderRepoMarkdown(limits.items.map((i) => `- ${i}`).join('\n'), 'README.md')).html;
+const limitsNote = (await renderRepoMarkdown(limits.note, 'README.md')).html;
+const adrs = listAdrs();
+const crate = (name: string) => `${site.repoUrl}/tree/${site.repoBranch}/crates/${name}`;
+
+const terminal = `$ cargo build --release -p minga-cli
+$ sudo install -m 0755 target/release/minga /usr/local/bin/minga
+$ sudo ctr -n minga images pull docker.io/library/nginx:1.27
+$ minga validate -c compose.yaml
+# with minga manager and minga api running (see the quickstart):
+$ MINGA_API_TOKEN=change-me minga deploy -c compose.yaml shop
+
+${deployOutput.split('\n').slice(3).join('\n')}`;
+---
+
+<BaseLayout
+  fullTitle={`${site.name}: ${site.tagline}`}
+  title={site.name}
+  description={`${site.description} Verified on one Linux host; known limits listed up front.`}
+  jsonLd={[softwareLd(version)]}
+>
+  <Hero
+    eyebrow={`v${version}${site.releasePublished ? '' : ' (not tagged yet)'} · ${site.license} · Linux amd64 / arm64`}
+    title={site.tagline}
+    subtitle={site.pitch}
+    primary={site.cta.primary}
+    secondary={site.cta.secondary}
+    tertiary={site.social.discord ? { label: 'Join Discord', href: site.social.discord } : null}
+    prereq="Needs: Linux · root · containerd · Rust toolchain · images preloaded with ctr"
+    status={{
+      text: `Verified on one Linux host (containerd 2.2.1).${site.releasePublished ? '' : ' No release published yet, so you build from source.'} No image pull and no cross-node networking yet.`,
+      href: '#when-not',
+      linkText: 'Known limits',
+    }}
+  >
+    <CodeBlock
+      slot="terminal"
+      lang="console"
+      title="build → preload → deploy (sample output from the CLI source)"
+      code={terminal}
+    />
+    <ArchitectureDiagram
+      slot="diagram"
+      variant="hero"
+      caption="A deploy: desired state goes through Raft; commands, status and logs go through JetStream."
+    />
+  </Hero>
+
+  <section class="section" aria-labelledby="problem">
+    <div class="wrap">
+      <div class="problem">
+        <div>
+          <h2 id="problem">Swarm was built for a datacenter. Your sites aren’t one.</h2>
+          <p class="lede">
+            Kubernetes solves this by adding a control plane your site can’t afford; Swarm assumes registries and a
+            datacenter network. Your stacks are already written as Compose, and the failure that hurts at a remote site
+            is the silent one: a key skipped, a deploy that “succeeded” into an empty cluster. Minga’s rule is that
+            Compose files deploy unchanged, and keys it doesn’t understand fail loudly instead of being skipped.
+          </p>
+        </div>
+        <dl class="sites">
+          <dt>Edge sites</dt>
+          <dd>A handful of ARM boards, an uplink that drops, and no room for a heavyweight control plane.</dd>
+          <dt>Air-gapped networks</dt>
+          <dd>Nothing pulls from a registry, and every dependency has to be vendored and checksummed.</dd>
+          <dt>Agent workloads</dt>
+          <dd>They need sandboxed execution, token budgets and LLM egress control, not just “run a container”.</dd>
+        </dl>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" aria-labelledby="solution">
+    <div class="wrap">
+      <h2 id="solution">One binary that reads your compose.yaml</h2>
+      <p class="lede">
+        Every role (manager, worker, Docker API) is the same <code>minga</code> binary; the only thing next to it is the
+        checksum-pinned <code>nats-server</code> it supervises. Desired state and placement live in embedded Raft
+        (openraft + redb). Commands, task status and logs move over NATS JetStream.
+      </p>
+      <div class="split">
+        <ul class="benefits">
+          <li>
+            <strong>No Docker daemon, no Kubernetes, no etcd.</strong> containerd plus one binary.
+          </li>
+          <li>
+            <strong>Your Docker tooling keeps working.</strong> <code>docker stack deploy</code>,{' '}
+            <code>docker service ls</code> and the Traefik v3 swarm provider run against <code>minga api</code>.
+          </li>
+          <li>
+            <strong>Failures are loud.</strong> Unknown Compose keys are rejected, an unplaceable deploy returns HTTP
+            409, and
+            <code>/readyz</code> says why it is not ready.
+          </li>
+          <li>
+            <strong>The air-gap path has no network step.</strong> Copy the archive and image tarballs, import, start.
+          </li>
+          <li>
+            <strong>Agent workloads in the same file (experimental).</strong> <code>x-minga-agent</code> services run as
+            WASM under wasmtime with fuel and timeout limits.
+          </li>
+        </ul>
+        <div>
+          <h3>How it works</h3>
+          <ol class="steps">
+            <li>
+              <code>minga deploy</code> posts networks, secrets and services to <code>minga api</code>, a Docker Engine
+              API v1.41 subset.
+            </li>
+            <li>
+              The API checks the service is placeable (409 if not) and writes desired state to Raft; writes forward to
+              the leader.
+            </li>
+            <li>
+              The leader’s scheduler places tasks with deterministic IPs and sends an Assign command over JetStream.
+            </li>
+            <li>
+              The node supervisor creates a netns, veth and IP, stages secrets, and starts the container through
+              containerd.
+            </li>
+            <li>
+              Status and log chunks flow back over JetStream; <code>minga logs -f</code> reads the retained backlog.
+            </li>
+          </ol>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" aria-labelledby="features">
+    <div class="wrap">
+      <h2 id="features">What’s in v{version}</h2>
+      <div class="grid grid-2">
+        {features
+          .filter((f) => f.lead)
+          .map((f) => (
+            <FeatureCard {...f} />
+          ))}
+      </div>
+      <ul class="compact-list">
+        {features
+          .filter((f) => !f.lead)
+          .map((f) => (
+            <FeatureCard {...f} />
+          ))}
+      </ul>
+    </div>
+  </section>
+
+  <section class="section" aria-labelledby="quickstart">
+    <div class="wrap">
+      <h2 id="quickstart">Quickstart: one Linux host</h2>
+      <h3 class="small-h">Prerequisites</h3>
+      <ul>
+        {prerequisites.map((p) => (
+          <li>{p}</li>
+        ))}
+      </ul>
+      <ol class="qs">
+        {steps.map((s, i) => (
+          <li>
+            <h3 class="small-h">
+              <span class="n mono">{i + 1}</span> {s.title}
+            </h3>
+            {s.note && <p class="muted">{s.note}</p>}
+            <CodeBlock
+              code={s.code}
+              lang={s.lang ?? 'bash'}
+              output={i === steps.length - 1 ? deployOutput : undefined}
+              outputLabel={deployOutputLabel}
+            />
+          </li>
+        ))}
+      </ol>
+      <p>
+        <a href={url('/docs/quickstart/')}>Full quickstart and deployment topologies</a>
+      </p>
+    </div>
+  </section>
+
+  <section class="section" aria-labelledby="compare">
+    <div class="wrap">
+      <h2 id="compare">How it compares</h2>
+      <p class="lede">
+        Swarm and k3s are mature and run far larger fleets today. Minga’s case is narrower: Compose-native, one binary,
+        no registry, at the edge.
+      </p>
+      <ComparisonTable
+        columns={columns}
+        rows={rows}
+        asOf={asOf}
+        correctionUrl={`${site.issuesUrl}/new?title=Comparison+correction`}
+      />
+    </div>
+  </section>
+
+  <section class="section" aria-labelledby="fit">
+    <div class="wrap fit">
+      <div class="not" id="when-not">
+        <h2 id="fit">When not to use Minga (yet)</h2>
+        <p class="muted">From the README’s “Not in v{version}” list:</p>
+        <div class="limits" set:html={limitsHtml} />
+        <ul class="limits">
+          <li>
+            You have many or flaky workers: every node is a Raft voter in v{version}, so quorum depends on workers.
+          </li>
+          <li>Agents need network, WASI, or enforced memory and token limits.</li>
+        </ul>
+        <div class="muted" set:html={limitsNote} />
+      </div>
+      <div class="use">
+        <h2>When to use it</h2>
+        <ul class="fits">
+          <li>
+            A Compose stack on one Linux host at an edge or on-prem site, with the Docker API surface (CLI, Traefik) and
+            no dockerd.
+          </li>
+          <li>An air-gapped site where you can ship images as tarballs.</li>
+          <li>
+            You want an orchestrator whose limits are written down: each ADR ends with an Implementation status section.
+          </li>
+          <li>You want to experiment with sandboxed WASM agent workloads next to containers.</li>
+          <li>You want to contribute to a Rust orchestrator early.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" aria-labelledby="architecture">
+    <div class="wrap">
+      <h2 id="architecture">Architecture, for the people who will run it</h2>
+      <ArchitectureDiagram
+        variant="process"
+        caption="Every role is the same binary. Full diagrams on the architecture page."
+      />
+      <div class="grid grid-2 arch">
+        <div>
+          <h3>Key components</h3>
+          <ul>
+            <li>
+              <a href={crate('minga-compose')}>minga-compose</a>: Compose parsing that fails loudly
+            </li>
+            <li>
+              <a href={crate('minga-state')}>minga-state</a>: Raft state machine (openraft + redb)
+            </li>
+            <li>
+              <a href={crate('minga-scheduler')}>minga-scheduler</a>: placement and reconcile
+            </li>
+            <li>
+              <a href={crate('minga-api')}>minga-api</a>: Docker Engine API subset
+            </li>
+            <li>
+              <a href={crate('minga-node')}>minga-node</a>: supervisor, containerd, networking
+            </li>
+            <li>
+              <a href={crate('minga-bus')}>minga-bus</a>: NATS JetStream with TLS
+            </li>
+          </ul>
+          <h3>Decision records</h3>
+          <ul>
+            {adrs.map((a) => (
+              <li>
+                <a href={url(`/adr/${a.slug}/`)}>
+                  ADR {a.number}: {a.title}
+                </a>
+              </li>
+            ))}
+          </ul>
+        </div>
+        <div>
+          <h3>Trade-offs today</h3>
+          <ul>
+            <li>Every node is a Raft voter, so a worker can win an election and pause placement.</li>
+            <li>Node liveness goes through Raft leases, not JetStream.</li>
+            <li>Agents have no host capabilities yet; containers have no cross-node network.</li>
+          </ul>
+          <p>
+            <a href={url('/architecture/')}>Known structural limits and the plan to fix them</a>
+          </p>
+          <h3>Non-goals</h3>
+          <ul>
+            <li>No Docker daemon, no kubelet, no external etcd or storage service.</li>
+            <li>No mixed-language FFI: Go runs only as a separate process.</li>
+            <li>No silently skipped Compose keys.</li>
+          </ul>
+          {site.newsletter && (
+            <>
+              <h3>Deeper writing</h3>
+              <ul>
+                {featuredArticles.map((a) => (
+                  <li>
+                    <a href={a.url}>{a.title}</a>
+                  </li>
+                ))}
+              </ul>
+            </>
+          )}
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <SocialProof />
+
+  <section class="section" aria-labelledby="community">
+    <div class="wrap">
+      <h2 id="community">Build it with us</h2>
+      <p class="lede">
+        A <span lang="es">minga</span> is a community moving a house together. Contributions of code, docs, bug reports
+        and field reports from real sites are all welcome.
+      </p>
+      <div class="actions">
+        <a class="btn btn-primary" href={site.contributingUrl}>
+          Read the contribution guide
+        </a>
+        <a class="btn btn-secondary" href={site.goodFirstIssueUrl}>
+          Good first issues
+        </a>
+        <a class="btn btn-secondary" href={site.discussionsUrl ?? site.issuesUrl}>
+          {site.discussionsUrl ? 'GitHub Discussions' : 'Ask in an issue'}
+        </a>
+      </div>
+      <p>
+        <a href={site.codeOfConductUrl}>Code of Conduct</a> ·{' '}
+        <a href={`${site.repoUrl}/graphs/contributors`}>Contributors</a> ·{' '}
+        <a href={url('/community/')}>Everything about contributing</a>
+        {site.social.discord && (
+          <>
+            {' '}
+            · <a href={site.social.discord}>Discord</a>
+          </>
+        )}
+        {site.social.mailingList && (
+          <>
+            {' '}
+            · <a href={site.social.mailingList}>Mailing list</a>
+          </>
+        )}
+      </p>
+    </div>
+  </section>
+
+  <section class="section" aria-labelledby="faq">
+    <div class="wrap">
+      <h2 id="faq">Questions people ask first</h2>
+      <FAQ items={faq} />
+    </div>
+  </section>
+
+  <CTA
+    title="Try it on one host"
+    text="One binary, one compose.yaml, and a written list of what doesn’t work yet."
+    actions={[
+      { label: 'Try it now', href: '/docs/quickstart/', variant: 'primary' },
+      { label: 'Read the docs', href: '/docs/' },
+      { label: 'Star on GitHub', href: site.repoUrl },
+      { label: 'Join the community', href: '/community/' },
+    ]}
+  />
+</BaseLayout>
+
+<style>
+  .problem {
+    display: grid;
+    gap: 32px;
+  }
+  @media (min-width: 960px) {
+    .problem {
+      grid-template-columns: 1.2fr 1fr;
+      align-items: start;
+    }
+  }
+  .problem h2 {
+    margin-top: 0;
+  }
+  .sites {
+    margin: 0;
+  }
+  .sites dt {
+    font: 700 var(--step-1) var(--mono);
+    margin-top: 1em;
+  }
+  .sites dt:first-child {
+    margin-top: 0;
+  }
+  .sites dd {
+    margin: 0.3em 0 0;
+  }
+  .compact-list {
+    list-style: none;
+    padding: 0;
+    margin: 32px 0 0;
+    display: grid;
+    gap: 8px 32px;
+  }
+  @media (min-width: 640px) {
+    .compact-list {
+      grid-template-columns: repeat(2, 1fr);
+    }
+  }
+  @media (min-width: 960px) {
+    .compact-list {
+      grid-template-columns: repeat(3, 1fr);
+    }
+  }
+  .split {
+    display: grid;
+    gap: 32px;
+  }
+  @media (min-width: 960px) {
+    .split {
+      grid-template-columns: 1fr 1fr;
+    }
+  }
+  .benefits {
+    padding-left: 1.2em;
+  }
+  .benefits li,
+  .steps li,
+  .fits li {
+    margin-bottom: 0.6em;
+  }
+  .small-h {
+    font-size: 1.05rem;
+    margin: 1.2em 0 0.5em;
+  }
+  .qs {
+    list-style: none;
+    padding: 0;
+    max-width: 900px;
+  }
+  .n {
+    display: inline-grid;
+    place-items: center;
+    width: 1.6em;
+    height: 1.6em;
+    border: 1px solid var(--accent);
+    color: var(--accent);
+    border-radius: 50%;
+    font-size: 0.85rem;
+    margin-right: 6px;
+  }
+  .fit {
+    display: grid;
+    gap: 32px;
+  }
+  @media (min-width: 960px) {
+    .fit {
+      grid-template-columns: 1fr 1fr;
+    }
+    .use {
+      order: -1;
+    }
+  }
+  .fit h2 {
+    margin-top: 0;
+  }
+  .not {
+    border-left: 3px solid var(--warn);
+    padding-left: 16px;
+  }
+  .not :global(ul),
+  .limits {
+    padding-left: 1.2em;
+    margin-bottom: 0.6em;
+  }
+  .not :global(li) {
+    margin-bottom: 0.5em;
+  }
+  .arch h3 {
+    margin-top: 1.2em;
+  }
+</style>
