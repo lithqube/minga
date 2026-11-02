@@ -1,0 +1,26 @@
+---
+import DocsLayout from '../layouts/DocsLayout.astro';
+import { readmeSection, renderRepoFile, renderRepoMarkdown } from '../lib/repo';
+
+const overview = await renderRepoMarkdown(readmeSection('Architecture').replace(/^## .+\n/, ''), 'README.md');
+const notes = await renderRepoFile('docs/architecture.md');
+---
+
+<DocsLayout
+  title="Architecture"
+  description="How Minga's processes fit together, how a deploy becomes a running container, known structural limits, and the plan."
+  crumbs={[{ name: 'Architecture', path: '/architecture/' }]}
+  sources={['README.md', 'docs/architecture.md']}
+  headings={[
+    { depth: 2, slug: 'overview', text: 'How the pieces fit' },
+    ...overview.headings,
+    { depth: 2, slug: 'notes', text: notes.title },
+    ...notes.headings,
+  ]}
+  current="/architecture/"
+>
+  <h2 id="overview">How the pieces fit</h2>
+  <Fragment set:html={overview.html} />
+  <h2 id="notes">{notes.title}</h2>
+  <Fragment set:html={notes.html} />
+</DocsLayout>

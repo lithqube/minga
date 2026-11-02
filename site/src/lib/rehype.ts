@@ -1,0 +1,101 @@
+// Rehype plugins shared by astro.config (blog posts) and src/lib/markdown.ts (repo docs).
+import path from 'node:path';
+import rehypeMermaid from 'rehype-mermaid';
+import { site, url } from '../config/site';
+import { githubUrl, routeFor } from './routes';
+import { REPO_ROOT } from './paths';
+
+type Node = {
+  type: string;
+  tagName?: string;
+  properties?: Record<string, unknown>;
+  children?: Node[];
+  value?: string;
+};
+
+function walk(node: Node, fn: (n: Node) => void) {
+  fn(node);
+  node.children?.forEach((c) => walk(c, fn));
+}
+
+/**
+ * Rewrites relative links in repo markdown: files with a site route go there,
+ * everything else goes to the file on GitHub. Relative images load from GitHub raw.
+ */
+export function rehypeRepoLinks() {
+  return (tree: Node, file: { path?: string }) => {
+    if (!file.path) return;
+    const sourceDir = path.dirname(path.relative(REPO_ROOT, file.path));
+    if (sourceDir.startsWith('..')) return; // not a repo doc (e.g. a blog post)
+    walk(tree, (n) => {
+      if (n.type !== 'element' || !n.properties) return;
+      const attr = n.tagName === 'a' ? 'href' : n.tagName === 'img' ? 'src' : null;
+      const value = attr && n.properties[attr];
+      if (typeof value !== 'string' || /^([a-z]+:|#|\/\/)/i.test(value)) return;
+      const [target, anchor = ''] = value.split('#');
+      const repoPath = path.posix.normalize(path.posix.join(sourceDir, target));
+      if (n.tagName === 'img') {
+        n.properties.src = `${site.repoUrl}/raw/${site.repoBranch}/${repoPath}`;
+        return;
+      }
+      const route = routeFor(repoPath, anchor);
+      n.properties.href = route ? url(route) : githubUrl(repoPath, anchor);
+    });
+  };
+}
+
+/** Code blocks get a keyboard-scrollable, labelled <pre> (WCAG 2.1.1); task-list checkboxes get a label. */
+export function rehypeA11y() {
+  return (tree: Node) =>
+    walk(tree, (n) => {
+      if (!n.properties) return;
+      if (n.tagName === 'pre') {
+        n.properties.tabIndex = 0;
+        const lang = n.properties.dataLanguage;
+        n.properties.ariaLabel = typeof lang === 'string' && lang !== 'plaintext' ? `${lang} code` : 'Code';
+      } else if (n.tagName === 'input' && n.properties.type === 'checkbox') {
+        n.properties.ariaLabel = n.properties.checked ? 'Done' : 'Not done';
+      }
+    });
+}
+
+/** Pre-rendered Mermaid: inline SVG at build time; on failure the source block stays (no client JS). */
+export const mermaidPlugin = [
+  rehypeMermaid,
+  {
+    strategy: 'inline-svg',
+    mermaidConfig: {
+      theme: 'base',
+      themeVariables: {
+        darkMode: true,
+        background: '#121829',
+        mainBkg: '#16213a',
+        primaryColor: '#16213a',
+        primaryTextColor: '#e5e9f0',
+        primaryBorderColor: '#22d3ee',
+        secondaryColor: '#1b1530',
+        tertiaryColor: '#0f1626',
+        lineColor: '#94a3b8',
+        textColor: '#e5e9f0',
+        clusterBkg: '#0f1626',
+        clusterBorder: '#1f2a44',
+        edgeLabelBackground: '#121829',
+        actorBkg: '#16213a',
+        actorBorder: '#22d3ee',
+        actorTextColor: '#e5e9f0',
+        signalColor: '#94a3b8',
+        signalTextColor: '#e5e9f0',
+        noteBkgColor: '#1b1530',
+        noteTextColor: '#e5e9f0',
+        fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
+      },
+    },
+    errorFallback: (element: Node) => {
+      console.warn('[mermaid] render failed; keeping the diagram source');
+      return element;
+    },
+  },
+] as const;
+
+export const shikiConfig = { theme: 'github-dark-default' } as const;
+export const syntaxHighlight = { type: 'shiki', excludeLangs: ['mermaid'] } as const;

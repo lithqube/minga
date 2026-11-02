@@ -1,0 +1,13 @@
+---
+interface Props {
+  kind?: 'info' | 'limit' | 'unvalidated';
+}
+const { kind = 'info' } = Astro.props;
+const label = { info: 'Note:', limit: 'Limit:', unvalidated: 'Not validated:' }[kind];
+---
+
+<aside class={`callout ${kind}`}>
+  <p>
+    <span class="label">{label}</span> <slot />
+  </p>
+</aside>

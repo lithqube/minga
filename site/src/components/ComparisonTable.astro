@@ -1,0 +1,93 @@
+---
+import { site } from '../config/site';
+import type { Mark, Row } from '../data/comparison';
+
+interface Props {
+  columns: readonly string[];
+  rows: Row[];
+  asOf: string;
+  correctionUrl: string;
+}
+const { columns, rows, asOf, correctionUrl } = Astro.props;
+const glyph: Record<Mark, string> = { yes: '●', partial: '◐', no: '○', na: '' };
+const word: Record<Mark, string> = { yes: 'Yes', partial: 'Partly', no: 'No', na: '' };
+const href = (s: string) => (s.startsWith('http') ? s : `${site.repoUrl}/blob/${site.repoBranch}/${s}`);
+---
+
+<div class="table-scroll compare" role="region" aria-label="Comparison table, scrolls horizontally" tabindex="0">
+  <table>
+    <caption class="muted">
+      As of{asOf}. Legend: ● yes, ◐ partly, ○ no. Each cell links to its source.
+      <a href={correctionUrl}>Suggest a correction</a>.
+    </caption>
+    <thead>
+      <tr>
+        <th scope="col">Capability</th>
+        {columns.map((c) => (
+          <th scope="col">{c}</th>
+        ))}
+      </tr>
+    </thead>
+    <tbody>
+      {rows.map((r) => (
+        <tr>
+          <th scope="row">{r.capability}</th>
+          {r.cells.map((c) => (
+            <td>
+              {c.mark !== 'na' && (
+                <span class={`mark ${c.mark}`}>
+                  <span aria-hidden="true">{glyph[c.mark]}</span> <span class="visually-hidden">{word[c.mark]}:</span>
+                </span>
+              )}
+              <a href={href(c.source)} class="cell-link">
+                {c.text}
+              </a>
+            </td>
+          ))}
+        </tr>
+      ))}
+    </tbody>
+  </table>
+</div>
+
+<style>
+  .compare table {
+    min-width: 760px;
+  }
+  caption {
+    caption-side: bottom;
+    text-align: left;
+    padding-top: 8px;
+    font-size: var(--step--1);
+  }
+  tbody th {
+    font-family: var(--mono);
+    font-size: 0.9rem;
+    position: sticky;
+    left: 0;
+    background: var(--bg);
+  }
+  thead th:nth-child(2),
+  td:nth-child(2) {
+    background: color-mix(in srgb, var(--accent) 6%, transparent);
+  }
+  .mark {
+    font-size: 0.9rem;
+  }
+  .mark.yes {
+    color: var(--ok);
+  }
+  .mark.partial {
+    color: var(--accent-2);
+  }
+  .mark.no {
+    color: var(--warn);
+  }
+  .cell-link {
+    color: var(--text);
+    text-decoration-color: var(--border);
+  }
+  .cell-link:hover {
+    text-decoration-color: var(--accent);
+  }
+</style>

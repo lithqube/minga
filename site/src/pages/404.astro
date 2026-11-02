@@ -1,0 +1,67 @@
+---
+// GitHub Pages serves /minga/404.html for any missing path, so every link here is absolute (url() adds the base).
+import BaseLayout from '../layouts/BaseLayout.astro';
+import { site, url } from '../config/site';
+---
+
+<BaseLayout
+  title="Page not found"
+  description="This page does not exist. Try the quickstart, the docs or the changelog."
+>
+  <div class="wrap nf">
+    <pre
+      aria-hidden="true"
+      data-nocopy
+      set:html={
+        '<span class="prompt">$ </span>minga get page\n<span class="err">error: no such page</span>\n<span class="out">hint: try the docs, or report a broken link</span>'
+      }
+    />
+    <h1>Page not found</h1>
+    <p>The page you asked for doesn’t exist, or it moved.</p>
+    <ul class="actions">
+      <li>
+        <a class="btn btn-primary" href={url('/docs/quickstart/')}>
+          Quickstart
+        </a>
+      </li>
+      <li>
+        <a class="btn btn-secondary" href={url('/docs/')}>
+          Docs
+        </a>
+      </li>
+      <li>
+        <a class="btn btn-secondary" href={url('/adr/')}>
+          Decision records
+        </a>
+      </li>
+      <li>
+        <a class="btn btn-secondary" href={url('/changelog/')}>
+          Changelog
+        </a>
+      </li>
+      <li>
+        <a class="btn btn-secondary" href={url('/')}>
+          Home
+        </a>
+      </li>
+    </ul>
+    <p>
+      Followed a broken link from this site? <a href={`${site.issuesUrl}/new?title=Broken+link`}>Report it on GitHub</a>
+      .
+    </p>
+  </div>
+</BaseLayout>
+
+<style>
+  .nf {
+    padding: 64px 16px 96px;
+    max-width: 760px;
+  }
+  .actions {
+    list-style: none;
+    padding: 0;
+  }
+  .err {
+    color: #fb7185;
+  }
+</style>

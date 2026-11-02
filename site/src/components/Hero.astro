@@ -1,0 +1,110 @@
+---
+import { url } from '../config/site';
+
+interface Link {
+  label: string;
+  href: string;
+}
+interface Props {
+  eyebrow: string;
+  title: string;
+  subtitle: string;
+  primary: Link;
+  secondary?: Link;
+  tertiary?: Link | null;
+  prereq: string;
+  status: { text: string; href: string; linkText: string };
+}
+const { eyebrow, title, subtitle, primary, secondary, tertiary, prereq, status } = Astro.props;
+---
+
+<section class="hero" aria-labelledby="hero-title">
+  <div class="wrap grid-hero">
+    <div class="copy-col">
+      <p class="eyebrow mono">{eyebrow}</p>
+      <h1 id="hero-title">{title}</h1>
+      <p class="lede">{subtitle}</p>
+      <div class="actions">
+        <a class="btn btn-primary" href={url(primary.href)}>
+          {primary.label} <span aria-hidden="true">&nbsp;→</span>
+        </a>
+        {secondary && (
+          <a class="btn btn-secondary" href={url(secondary.href)}>
+            {secondary.label}
+          </a>
+        )}
+        {tertiary && (
+          <a class="btn btn-secondary" href={tertiary.href}>
+            {tertiary.label}
+          </a>
+        )}
+      </div>
+      <p class="prereq mono muted">{prereq}</p>
+      <p class="status">
+        <span class="warn-glyph" aria-hidden="true">
+          ▲
+        </span>
+        {status.text} <a href={status.href}>{status.linkText}</a>
+      </p>
+    </div>
+    <div class="term-col">
+      <slot name="terminal" />
+    </div>
+  </div>
+  <div class="wrap">
+    <slot name="diagram" />
+  </div>
+</section>
+
+<style>
+  .hero {
+    padding: 48px 0 56px;
+    background:
+      radial-gradient(60rem 30rem at 85% -10%, color-mix(in srgb, var(--accent-2) 14%, transparent), transparent 60%),
+      radial-gradient(50rem 30rem at 0% 0%, color-mix(in srgb, var(--accent) 12%, transparent), transparent 60%);
+  }
+  .grid-hero {
+    display: grid;
+    gap: 32px;
+  }
+  @media (min-width: 960px) {
+    .grid-hero {
+      grid-template-columns: 1.05fr 1fr;
+      align-items: center;
+    }
+    .hero {
+      padding: 80px 0 72px;
+    }
+  }
+  .eyebrow {
+    color: var(--muted);
+    font-size: var(--step--1);
+    margin: 0 0 12px;
+  }
+  h1 {
+    font-size: var(--step-5);
+    margin: 0 0 16px;
+  }
+  .actions {
+    margin: 24px 0 12px;
+  }
+  @media (max-width: 639px) {
+    .actions .btn {
+      width: 100%;
+    }
+  }
+  .prereq {
+    font-size: var(--step--1);
+    margin: 0 0 8px;
+  }
+  .status {
+    font-size: 0.95rem;
+    margin: 0;
+  }
+  .warn-glyph {
+    color: var(--warn);
+  }
+  .term-col {
+    min-width: 0;
+  }
+</style>

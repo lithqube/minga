@@ -1,0 +1,276 @@
+---
+import type { MarkdownHeading } from '@astrojs/markdown-remark';
+import BaseLayout from './BaseLayout.astro';
+import { site, url } from '../config/site';
+import { docsNav, docsOrder } from '../data/docsNav';
+import { breadcrumbLd, type Crumb } from '../lib/seo';
+import { githubUrl } from '../lib/routes';
+
+interface Props {
+  title: string;
+  description: string;
+  crumbs: Crumb[];
+  /** Repo-relative markdown files this page renders; shown as "Source" with edit links. */
+  sources?: string[];
+  headings?: MarkdownHeading[];
+  /** Sidebar entry to highlight; defaults to the current path. */
+  current?: string;
+  jsonLd?: object[];
+  type?: 'website' | 'article';
+}
+const { title, description, crumbs, sources = [], headings = [], jsonLd = [], type } = Astro.props;
+const current = Astro.props.current ?? Astro.url.pathname.replace(site.base.replace(/\/$/, ''), '');
+const toc = headings.filter((h) => h.depth === 2 || h.depth === 3);
+const showToc = headings.filter((h) => h.depth === 2).length >= 3;
+const idx = docsOrder.findIndex((i) => i.href === current);
+const prev = idx > 0 ? docsOrder[idx - 1] : null;
+const next = idx >= 0 && idx < docsOrder.length - 1 ? docsOrder[idx + 1] : null;
+---
+
+<BaseLayout title={title} description={description} jsonLd={[breadcrumbLd(crumbs), ...jsonLd]} type={type}>
+  <div class="wrap docs">
+    <details class="docs-nav-mobile">
+      <summary>Docs menu</summary>
+      <nav aria-label="Documentation, mobile">
+        {docsNav.map((g) => (
+          <>
+            <p class="group">{g.group}</p>
+            <ul>
+              {g.items.map((i) => (
+                <li>
+                  <a href={url(i.href)} aria-current={i.href === current ? 'page' : undefined}>
+                    {i.label}
+                  </a>
+                  {i.badge && <span class="pill warn">{i.badge}</span>}
+                </li>
+              ))}
+            </ul>
+          </>
+        ))}
+      </nav>
+    </details>
+    <nav class="docs-nav" aria-label="Documentation">
+      {docsNav.map((g) => (
+        <>
+          <p class="group">{g.group}</p>
+          <ul>
+            {g.items.map((i) => (
+              <li>
+                <a href={url(i.href)} aria-current={i.href === current ? 'page' : undefined}>
+                  {i.label}
+                </a>
+                {i.badge && <span class="pill warn">{i.badge}</span>}
+              </li>
+            ))}
+          </ul>
+        </>
+      ))}
+      <slot name="sidebar" />
+    </nav>
+    <article class="content">
+      <nav aria-label="Breadcrumb" class="crumbs mono">
+        <ol>
+          <li>
+            <a href={url('/')}>Home</a>
+          </li>
+          {crumbs.map((c, i) =>
+            i === crumbs.length - 1 ? (
+              <li aria-current="page">{c.name}</li>
+            ) : (
+              <li>
+                <a href={url(c.path)}>{c.name}</a>
+              </li>
+            ),
+          )}
+        </ol>
+      </nav>
+      <h1>{title}</h1>
+      {sources.length > 0 && (
+        <p class="source muted">
+          Source:{' '}
+          {sources.map((s, i) => (
+            <>
+              {i > 0 && ', '}
+              <a href={githubUrl(s)}>{s}</a>
+            </>
+          ))}{' '}
+          · <a href={`${site.repoUrl}/edit/${site.repoBranch}/${sources[0]}`}>Edit on GitHub</a>
+        </p>
+      )}
+      {showToc && (
+        <details class="toc-mobile">
+          <summary>On this page</summary>
+          <ul>
+            {toc.map((h) => (
+              <li class={`d${h.depth}`}>
+                <a href={`#${h.slug}`}>{h.text}</a>
+              </li>
+            ))}
+          </ul>
+        </details>
+      )}
+      <div class="prose">
+        <slot />
+      </div>
+      {(prev || next) && (
+        <nav class="pager" aria-label="Previous and next page">
+          {prev ? (
+            <a href={url(prev.href)}>
+              <span aria-hidden="true">←</span> {prev.label}
+            </a>
+          ) : (
+            <span />
+          )}
+          {next && (
+            <a href={url(next.href)}>
+              {next.label} <span aria-hidden="true">→</span>
+            </a>
+          )}
+        </nav>
+      )}
+    </article>
+    {showToc && (
+      <nav class="toc" aria-label="On this page">
+        <p class="group">On this page</p>
+        <ul>
+          {toc.map((h) => (
+            <li class={`d${h.depth}`}>
+              <a href={`#${h.slug}`}>{h.text}</a>
+            </li>
+          ))}
+        </ul>
+      </nav>
+    )}
+  </div>
+</BaseLayout>
+
+<style>
+  .docs {
+    display: grid;
+    gap: 24px;
+    padding-top: 24px;
+    padding-bottom: 64px;
+  }
+  .content {
+    min-width: 0;
+  }
+  .docs-nav,
+  .toc {
+    display: none;
+  }
+  ul {
+    list-style: none;
+    padding: 0;
+    margin: 0 0 16px;
+  }
+  .group {
+    font: var(--step--1) var(--mono);
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--muted);
+    margin: 0 0 4px;
+  }
+  .docs-nav a,
+  .docs-nav-mobile a,
+  .toc a {
+    display: inline-block;
+    padding: 5px 0;
+    color: var(--text);
+    text-decoration: none;
+    font-size: 0.93rem;
+  }
+  .docs-nav a:hover,
+  .toc a:hover,
+  [aria-current='page'] {
+    color: var(--accent) !important;
+    text-decoration: underline !important;
+  }
+  .docs-nav .pill,
+  .docs-nav-mobile .pill {
+    margin-left: 6px;
+    font-size: 0.7rem;
+  }
+  .toc .d3 {
+    padding-left: 12px;
+  }
+  .toc,
+  .docs-nav {
+    position: sticky;
+    top: calc(var(--header-h) + 16px);
+    align-self: start;
+    max-height: calc(100vh - var(--header-h) - 32px);
+    overflow-y: auto;
+  }
+  details > summary {
+    cursor: pointer;
+    min-height: 44px;
+    display: flex;
+    align-items: center;
+    font: var(--step--1) var(--mono);
+  }
+  .docs-nav-mobile {
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 0 12px;
+  }
+  .toc-mobile {
+    border-left: 2px solid var(--border);
+    padding-left: 12px;
+    margin-bottom: 1.5em;
+  }
+  .toc-mobile .d3 {
+    padding-left: 12px;
+  }
+  .crumbs ol {
+    list-style: none;
+    padding: 0;
+    margin: 0 0 12px;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    font-size: var(--step--1);
+    color: var(--muted);
+  }
+  .crumbs li + li::before {
+    content: '›';
+    margin-right: 6px;
+  }
+  .source {
+    font-size: var(--step--1);
+    margin-bottom: 1.5em;
+  }
+  .pager {
+    display: flex;
+    justify-content: space-between;
+    gap: 16px;
+    border-top: 1px solid var(--border);
+    margin-top: 48px;
+    padding-top: 16px;
+    font-family: var(--mono);
+  }
+  .pager a {
+    padding: 10px 0;
+  }
+  @media (min-width: 960px) {
+    .docs {
+      grid-template-columns: 220px minmax(0, 1fr);
+    }
+    .docs-nav {
+      display: block;
+    }
+    .docs-nav-mobile {
+      display: none;
+    }
+  }
+  @media (min-width: 1200px) {
+    .docs {
+      grid-template-columns: 220px minmax(0, 1fr) 200px;
+    }
+    .toc {
+      display: block;
+    }
+    .toc-mobile {
+      display: none;
+    }
+  }
+</style>

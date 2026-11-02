@@ -1,0 +1,22 @@
+---
+// Off unless site.analytics.provider is set: no third-party request otherwise.
+import { site } from '../config/site';
+const { provider, id } = site.analytics;
+---
+
+{provider === 'plausible' && id && <script defer data-domain={id} src="https://plausible.io/js/script.js" />}
+{provider === 'google' && id && (
+  <>
+    <script async src={`https://www.googletagmanager.com/gtag/js?id=${id}`} />
+    <script is:inline define:vars={{ id }}>
+      window.dataLayer = window.dataLayer || [];
+      function gtag() {
+        // gtag.js requires the arguments object, not an array.
+        // eslint-disable-next-line prefer-rest-params
+        dataLayer.push(arguments);
+      }
+      gtag('js', new Date());
+      gtag('config', id);
+    </script>
+  </>
+)}

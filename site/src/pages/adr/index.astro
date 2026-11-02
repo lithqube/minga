@@ -1,0 +1,48 @@
+---
+import DocsLayout from '../../layouts/DocsLayout.astro';
+import { url } from '../../config/site';
+import { listAdrs } from '../../lib/repo';
+
+const adrs = listAdrs();
+---
+
+<DocsLayout
+  title="Architecture decision records"
+  description="Minga's architecture decision records: the language split, the NATS event bus, agent workloads and observability, each with its implementation status."
+  crumbs={[{ name: 'ADRs', path: '/adr/' }]}
+  current="/adr/"
+>
+  <p>
+    Each record ends with an <em>Implementation status</em> section saying what shipped and where the code deviates from
+    the decision. Deviations are counted below so you can see which records the code has drifted from.
+  </p>
+  <div class="table-scroll">
+    <table>
+      <caption class="visually-hidden">Decision records</caption>
+      <thead>
+        <tr>
+          <th scope="col">No.</th>
+          <th scope="col">Title</th>
+          <th scope="col">Status</th>
+          <th scope="col">Date</th>
+          <th scope="col">Deviations</th>
+        </tr>
+      </thead>
+      <tbody>
+        {adrs.map((a) => (
+          <tr>
+            <td class="mono">{a.number}</td>
+            <th scope="row">
+              <a href={url(`/adr/${a.slug}/`)}>{a.title}</a>
+            </th>
+            <td>
+              <span class={`pill ${/accepted/i.test(a.status) ? 'ok' : ''}`}>{a.status}</span>
+            </td>
+            <td class="mono">{a.date}</td>
+            <td class="mono">{a.hasImplementationStatus ? a.deviations : 'n/a'}</td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  </div>
+</DocsLayout>

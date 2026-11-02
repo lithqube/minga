@@ -1,0 +1,73 @@
+---
+import DocsLayout from '../layouts/DocsLayout.astro';
+import { site } from '../config/site';
+import { readRepo, renderRepoMarkdown } from '../lib/repo';
+
+const contributing = await renderRepoMarkdown(readRepo('CONTRIBUTING.md'), 'CONTRIBUTING.md');
+const channels = [
+  site.discussionsUrl && { label: 'GitHub Discussions', href: site.discussionsUrl, note: 'questions and design talk' },
+  {
+    label: 'GitHub Issues',
+    href: site.issuesUrl,
+    note: site.discussionsUrl ? 'bugs and feature requests' : 'bugs, feature requests and questions',
+  },
+  site.social.discord && { label: 'Discord', href: site.social.discord, note: 'chat' },
+  site.social.mailingList && { label: 'Mailing list', href: site.social.mailingList, note: 'release announcements' },
+  site.newsletter && {
+    label: `${site.newsletter.name} newsletter`,
+    href: site.newsletter.url,
+    note: `the maintainer’s ${site.newsletter.series}`,
+  },
+].filter(Boolean) as { label: string; href: string; note: string }[];
+---
+
+<DocsLayout
+  title="Community"
+  description="How to contribute to Minga: good first issues, where to ask questions, the code of conduct, and the full contribution guide."
+  crumbs={[{ name: 'Community', path: '/community/' }]}
+  sources={['CONTRIBUTING.md']}
+  headings={[
+    { depth: 2, slug: 'start', text: 'Start here' },
+    { depth: 2, slug: 'talk', text: 'Where to talk' },
+    { depth: 2, slug: 'contributors', text: 'Contributors' },
+    { depth: 2, slug: 'guide', text: 'Contribution guide' },
+    ...contributing.headings,
+  ]}
+  current="/community/"
+>
+  <p>
+    A <span lang="es">minga</span> is a community moving a whole house together. Field reports from real edge and
+    air-gapped sites are as valuable as code.
+  </p>
+  <h2 id="start">Start here</h2>
+  <ul>
+    <li>
+      <a href={site.goodFirstIssueUrl}>Open issues labelled “good first issue”</a>
+    </li>
+    <li>
+      <a href={site.contributingUrl}>Contribution guide (CONTRIBUTING.md)</a>, also rendered below
+    </li>
+    <li>
+      <a href={site.codeOfConductUrl}>Code of Conduct</a>
+    </li>
+    <li>
+      <a href={site.securityUrl}>Reporting a security issue privately</a>
+    </li>
+  </ul>
+  <h2 id="talk">Where to talk</h2>
+  <ul>
+    {channels.map((c) => (
+      <li>
+        <a href={c.href}>{c.label}</a>: {c.note}
+      </li>
+    ))}
+  </ul>
+  <h2 id="contributors">Contributors</h2>
+  <p>
+    Everyone who has landed a change is listed on the{' '}
+    <a href={`${site.repoUrl}/graphs/contributors`}>GitHub contributors page</a>, and release notes in the{' '}
+    <a href={`${site.base}changelog/`}>changelog</a> credit the work that shipped.
+  </p>
+  <h2 id="guide">Contribution guide</h2>
+  <Fragment set:html={contributing.html} />
+</DocsLayout>

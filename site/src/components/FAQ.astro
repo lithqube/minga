@@ -1,0 +1,56 @@
+---
+import { site } from '../config/site';
+import type { Faq } from '../data/faq';
+
+interface Props {
+  items: Faq[];
+}
+const { items } = Astro.props;
+---
+
+<div class="faq">
+  {items.map((f) => (
+    <details>
+      <summary>
+        <h3>{f.q}</h3>
+      </summary>
+      <div class="answer">
+        <p set:html={f.a} />
+        <p class="src muted">
+          Source:{' '}
+          {f.sources.map((s, i) => (
+            <>
+              {i > 0 && ', '}
+              <a href={`${site.repoUrl}/blob/${site.repoBranch}/${s}`}>{s}</a>
+            </>
+          ))}
+        </p>
+      </div>
+    </details>
+  ))}
+</div>
+
+<style>
+  details {
+    border-bottom: 1px solid var(--border);
+    margin: 0;
+  }
+  summary {
+    cursor: pointer;
+    padding: 14px 0;
+    min-height: 44px;
+    list-style-position: outside;
+  }
+  summary h3 {
+    display: inline;
+    font-size: 1.05rem;
+    margin: 0;
+  }
+  .answer {
+    max-width: 72ch;
+    padding: 0 0 12px;
+  }
+  .src {
+    font-size: var(--step--1);
+  }
+</style>

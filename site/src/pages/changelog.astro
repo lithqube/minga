@@ -1,0 +1,22 @@
+---
+import DocsLayout from '../layouts/DocsLayout.astro';
+import { renderRepoFile } from '../lib/repo';
+
+const doc = await renderRepoFile('CHANGELOG.md');
+// Mark the unreleased section so nobody mistakes it for a tagged release.
+const html = doc.html.replace(
+  /(<h2 id="unreleased">\[Unreleased\])<\/h2>/,
+  '$1 <span class="pill warn">not in a tagged release</span></h2>',
+);
+---
+
+<DocsLayout
+  title="Changelog"
+  description="Release notes for every Minga version, including what changed, what was fixed and the upgrade notes."
+  crumbs={[{ name: 'Changelog', path: '/changelog/' }]}
+  sources={['CHANGELOG.md']}
+  headings={doc.headings}
+  current="/changelog/"
+>
+  <Fragment set:html={html} />
+</DocsLayout>

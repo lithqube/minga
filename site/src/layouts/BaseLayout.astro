@@ -1,0 +1,72 @@
+---
+import '../styles/global.css';
+import { absoluteUrl, site, url } from '../config/site';
+import Analytics from '../components/Analytics.astro';
+import Footer from '../components/Footer.astro';
+import Navbar from '../components/Navbar.astro';
+
+interface Props {
+  title: string;
+  description: string;
+  type?: 'website' | 'article';
+  jsonLd?: object[];
+  /** Override for the HTML title; defaults to "<title> · Minga". */
+  fullTitle?: string;
+}
+const { title, description, type = 'website', jsonLd = [], fullTitle } = Astro.props;
+const docTitle = fullTitle ?? `${title} · ${site.name}`;
+const canonical = new URL(Astro.url.pathname, site.siteUrl).href;
+const ogImage = absoluteUrl(site.ogImage);
+---
+
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{docTitle}</title>
+    <meta name="description" content={description} />
+    <link rel="canonical" href={canonical} />
+    <link rel="icon" href={url('/favicon.svg')} type="image/svg+xml" />
+    <link rel="icon" href={url('/favicon-32.png')} sizes="32x32" type="image/png" />
+    <link rel="sitemap" href={url('/sitemap-index.xml')} />
+    <meta name="theme-color" content="#0b0f1a" />
+    <meta property="og:type" content={type} />
+    <meta property="og:site_name" content={site.name} />
+    <meta property="og:title" content={docTitle} />
+    <meta property="og:description" content={description} />
+    <meta property="og:url" content={canonical} />
+    <meta property="og:image" content={ogImage} />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+    <meta property="og:image:alt" content={`${site.name}: ${site.tagline}`} />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content={docTitle} />
+    <meta name="twitter:description" content={description} />
+    <meta name="twitter:image" content={ogImage} />
+    {jsonLd.map((ld) => (
+      <script type="application/ld+json" set:html={JSON.stringify(ld)} />
+    ))}
+    <script is:inline>
+      // Apply a stored theme before first paint. No stored choice: CSS follows the OS, dark by default.
+      try {
+        const t = localStorage.getItem('theme');
+        if (t === 'light' || t === 'dark') document.documentElement.dataset.theme = t;
+      } catch {
+        /* storage blocked */
+      }
+    </script>
+    <Analytics />
+  </head>
+  <body>
+    <Navbar />
+    <main id="main" tabindex="-1">
+      <slot />
+    </main>
+    <Footer />
+    <div id="live" class="visually-hidden" aria-live="polite"></div>
+    <script>
+      import '../scripts/copy';
+    </script>
+  </body>
+</html>

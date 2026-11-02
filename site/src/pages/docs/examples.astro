@@ -1,0 +1,92 @@
+---
+import Callout from '../../components/Callout.astro';
+import CodeBlock from '../../components/CodeBlock.astro';
+import DocsLayout from '../../layouts/DocsLayout.astro';
+import { url } from '../../config/site';
+import { deployOutput, steps } from '../../data/quickstart';
+import { readRepo } from '../../lib/repo';
+
+// Fixtures and snippets are read from the repo, never retyped.
+const edgeAi = readRepo('crates/minga-compose/tests/fixtures/edge-ai.yaml');
+const validateOut = readRepo('README.md').match(/checks a Compose file offline[\s\S]*?```\n([\s\S]*?)```/)?.[1];
+const agent = readRepo('docs/adr/0003-agent-workloads.md').match(
+  /x-minga-agent` Compose extension[\s\S]*?```yaml\n([\s\S]*?)```/,
+)?.[1];
+if (!validateOut || !agent)
+  throw new Error('[site] examples: validate output or x-minga-agent snippet not found in the repo');
+const compose = steps.find((s) => s.lang === 'yaml')!.code;
+const headings = [
+  { depth: 2, slug: 'minimal-web', text: 'Minimal web service' },
+  { depth: 2, slug: 'docker-cli', text: 'Use the docker CLI' },
+  { depth: 2, slug: 'validate', text: 'Validate an edge site' },
+  { depth: 2, slug: 'agent', text: 'Agent workload' },
+];
+---
+
+<DocsLayout
+  title="Examples"
+  description="Copy-paste Minga examples: a minimal Compose service, the docker CLI against minga api, validating an edge site, and an agent workload."
+  crumbs={[
+    { name: 'Docs', path: '/docs/' },
+    { name: 'Examples', path: '/docs/examples/' },
+  ]}
+  sources={['README.md', 'crates/minga-compose/tests/fixtures/edge-ai.yaml', 'docs/adr/0003-agent-workloads.md']}
+  headings={headings}
+>
+  <p>
+    Every example assumes the single-host setup from the <a href={url('/docs/quickstart/')}>quickstart</a>: a manager
+    and <code>minga api</code> running, and images preloaded with <code>ctr -n minga</code>.
+  </p>
+
+  <h2 id="minimal-web">Minimal web service</h2>
+  <CodeBlock code={compose} lang="yaml" title="compose.yaml" />
+  <CodeBlock code="MINGA_API_TOKEN=change-me minga deploy -c compose.yaml shop" output={deployOutput} />
+  <p class="muted">
+    The service is named <code>shop.web</code> and its network <code>shop_default</code>: stack name, then the Compose
+    name.
+  </p>
+
+  <h2 id="docker-cli">Use the docker CLI</h2>
+  <p>
+    <code>minga api</code> speaks a subset of the Docker Engine API v1.41. With a token set, the docker CLI sends it
+    from <code>~/.docker/config.json</code>:
+  </p>
+  <CodeBlock
+    lang="json"
+    title="~/.docker/config.json"
+    code={`{"HttpHeaders": {"Authorization": "Bearer change-me"}}`}
+  />
+  <CodeBlock
+    code={`docker -H tcp://127.0.0.1:2375 stack deploy -c compose.yaml shop
+docker -H tcp://127.0.0.1:2375 service ls
+docker -H tcp://127.0.0.1:2375 node ls`}
+  />
+  <Callout kind="limit">
+    keep <code>:2375</code> on a private network. The API token is the only thing between the network and container
+    creation.
+  </Callout>
+
+  <h2 id="validate">Validate an edge site</h2>
+  <p>
+    <code>minga validate</code> works offline. This is the repo’s <code>edge-ai.yaml</code> fixture: an inference
+    service on a GPU node, an agent API, a sensor reader and an optional debug UI.
+  </p>
+  <Callout kind="limit">
+    validate only. The fixture uses a <code>file:</code> secret, which deploy rejects (only <code>external</code>{' '}
+    secrets are accepted), and its <code>registry.local</code> images would have to be preloaded. Healthchecks and
+    <code>update_config</code> are carried but not enforced.
+  </Callout>
+  <details>
+    <summary>Show edge-ai.yaml ({edgeAi.split('\n').length} lines)</summary>
+    <CodeBlock code={edgeAi} lang="yaml" title="edge-ai.yaml" />
+  </details>
+  <CodeBlock code="minga validate -c edge-ai.yaml" output={validateOut} />
+
+  <h2 id="agent">Agent workload</h2>
+  <Callout kind="limit">
+    pure compute today: no WASI, network, env or clock in the guest, and <code>memory_limit</code> is not enforced.
+    Nodes need <code>--sandbox-runtime wasmtime</code>; relative <code>module:</code> paths resolve against
+    <code>--module-dir</code> (default <code>/var/lib/minga/modules</code>).
+  </Callout>
+  <CodeBlock code={agent} lang="yaml" title="x-minga-agent (from ADR 0003)" />
+</DocsLayout>

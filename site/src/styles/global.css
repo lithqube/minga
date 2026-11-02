@@ -1,0 +1,442 @@
+/* Tokens: neon-noir palette (DESIGN.md §12.2). Every text pair is >= 4.5:1. */
+:root {
+  color-scheme: dark;
+  --bg: #0b0f1a;
+  --bg-raised: #10172a;
+  --surface: #121829; /* code + diagrams, identical in both themes */
+  --surface-text: #e5e9f0;
+  --surface-muted: #94a3b8;
+  --text: #e5e9f0;
+  --muted: #94a3b8;
+  --accent: #22d3ee;
+  --accent-ink: #0b0f1a;
+  --accent-2: #e879f9;
+  --ok: #4ade80;
+  --warn: #fb7185;
+  --border: #1f2a44;
+  --glow: 0 0 0 1px rgb(34 211 238 / 40%), 0 0 18px rgb(34 211 238 / 25%);
+
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace;
+  --sans: system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  --step--1: 0.833rem;
+  --step-1: 1.2rem;
+  --step-2: 1.44rem;
+  --step-3: 1.728rem;
+  --step-4: 2.074rem;
+  --step-5: clamp(2.074rem, 5vw, 2.986rem);
+  --radius: 2px;
+  --header-h: 56px;
+  --max: 1200px;
+}
+
+:root[data-theme='light'] {
+  color-scheme: light;
+  --bg: #f6f7fb;
+  --bg-raised: #ffffff;
+  --text: #0b0f1a;
+  --muted: #475569;
+  --accent: #0e7490;
+  --accent-ink: #ffffff;
+  --accent-2: #a21caf;
+  --ok: #15803d;
+  --warn: #be123c;
+  --border: #d4d8e3;
+  --glow: none;
+}
+
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme='dark']) {
+    color-scheme: light;
+    --bg: #f6f7fb;
+    --bg-raised: #ffffff;
+    --text: #0b0f1a;
+    --muted: #475569;
+    --accent: #0e7490;
+    --accent-ink: #ffffff;
+    --accent-2: #a21caf;
+    --ok: #15803d;
+    --warn: #be123c;
+    --border: #d4d8e3;
+    --glow: none;
+  }
+}
+
+@media (prefers-contrast: more), (prefers-reduced-motion: reduce) {
+  :root {
+    --glow: none;
+  }
+}
+
+/* Base */
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+html {
+  scroll-padding-top: calc(var(--header-h) + 16px);
+  -webkit-text-size-adjust: 100%;
+}
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 1rem/1.6 var(--sans);
+  overflow-wrap: anywhere;
+}
+h1,
+h2,
+h3,
+h4 {
+  font-family: var(--mono);
+  line-height: 1.2;
+  letter-spacing: -0.01em;
+  margin: 2em 0 0.6em;
+}
+h1 {
+  font-size: var(--step-4);
+  margin-top: 0;
+}
+h2 {
+  font-size: var(--step-3);
+}
+h3 {
+  font-size: var(--step-2);
+}
+h4 {
+  font-size: var(--step-1);
+}
+p,
+ul,
+ol,
+table,
+pre,
+blockquote,
+details {
+  margin: 0 0 1em;
+}
+a {
+  color: var(--accent);
+  text-decoration: underline;
+  text-underline-offset: 0.18em;
+}
+a:hover {
+  text-decoration-thickness: 2px;
+}
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  box-shadow: var(--glow);
+}
+img,
+svg {
+  max-width: 100%;
+  height: auto;
+}
+code {
+  font-family: var(--mono);
+  font-size: 0.92em;
+}
+:not(pre) > code {
+  background: color-mix(in srgb, var(--muted) 14%, transparent);
+  padding: 0.1em 0.3em;
+  border-radius: var(--radius);
+}
+/* Link color on the code tint drops below 4.5:1 in light mode; the underline already marks it. */
+a > code {
+  background: none !important;
+  padding: 0 !important;
+}
+hr {
+  border: 0;
+  border-top: 1px solid var(--border);
+  margin: 2em 0;
+}
+[hidden] {
+  display: none !important;
+}
+.visually-hidden {
+  position: absolute !important;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}
+.muted {
+  color: var(--muted);
+}
+.mono {
+  font-family: var(--mono);
+}
+.wrap {
+  max-width: var(--max);
+  margin: 0 auto;
+  padding: 0 16px;
+}
+.skip {
+  position: absolute;
+  left: 8px;
+  top: -48px;
+  z-index: 100;
+  background: var(--accent);
+  color: var(--accent-ink);
+  padding: 8px 12px;
+}
+.skip:focus {
+  top: 8px;
+}
+
+/* Code: always-dark surface in both themes */
+pre {
+  background: var(--surface) !important;
+  color: var(--surface-text);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 16px;
+  overflow-x: auto;
+  font: 0.9rem/1.55 var(--mono);
+  tab-size: 2;
+}
+pre .prompt {
+  color: var(--surface-muted);
+  user-select: none;
+}
+pre .out {
+  color: var(--surface-muted);
+}
+pre .ok {
+  color: #4ade80;
+}
+.code {
+  position: relative;
+  margin: 0 0 1em;
+}
+.code > pre {
+  margin: 0;
+}
+/* Room for the copy button so it never covers the first line. */
+.has-copy > pre {
+  padding-top: 40px;
+}
+.code-title {
+  font: var(--step--1) var(--mono);
+  color: var(--muted);
+  margin: 0 0 4px;
+}
+.copy {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  min-height: 32px;
+  padding: 4px 10px;
+  font: var(--step--1) var(--mono);
+  color: var(--surface-text);
+  background: #1b2440;
+  border: 1px solid #2c3a5c;
+  border-radius: var(--radius);
+  cursor: pointer;
+}
+.copy:hover {
+  border-color: #22d3ee;
+}
+
+/* Mermaid and authored diagrams */
+.diagram,
+pre.mermaid,
+.prose svg[id^='mermaid'] {
+  background: var(--surface);
+}
+.prose svg[id^='mermaid'] {
+  display: block;
+  margin: 0 auto 1em;
+  padding: 16px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  height: auto;
+}
+
+/* Tables */
+.table-scroll {
+  overflow-x: auto;
+  margin: 0 0 1em;
+}
+table {
+  border-collapse: collapse;
+  width: 100%;
+  font-size: 0.95rem;
+}
+th,
+td {
+  text-align: left;
+  vertical-align: top;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border);
+}
+thead th {
+  font-family: var(--mono);
+  font-size: var(--step--1);
+  color: var(--muted);
+}
+
+/* Prose (rendered markdown) */
+.prose {
+  max-width: 72ch;
+}
+.prose blockquote {
+  margin-left: 0;
+  padding: 4px 16px;
+  border-left: 3px solid var(--accent-2);
+  color: var(--text);
+  background: color-mix(in srgb, var(--accent-2) 6%, transparent);
+}
+.prose table {
+  display: block;
+  overflow-x: auto;
+}
+.prose li > p {
+  margin: 0;
+}
+
+/* Buttons */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 44px;
+  padding: 10px 18px;
+  font: 600 1rem var(--mono);
+  text-decoration: none;
+  border-radius: var(--radius);
+  border: 1px solid var(--accent);
+}
+.btn-primary {
+  background: var(--accent);
+  color: var(--accent-ink);
+}
+.btn-primary:hover {
+  box-shadow: var(--glow);
+  text-decoration: none;
+}
+.btn-secondary {
+  color: var(--text);
+  border-color: var(--border);
+}
+.btn-secondary:hover {
+  border-color: var(--accent);
+}
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+/* Callouts and pills */
+.callout {
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent);
+  background: var(--bg-raised);
+  padding: 12px 16px;
+  margin: 0 0 1.5em;
+  border-radius: var(--radius);
+}
+.callout.limit,
+.callout.unvalidated {
+  border-left-color: var(--warn);
+}
+.callout > :last-child {
+  margin-bottom: 0;
+}
+.label {
+  font-family: var(--mono);
+  font-weight: 700;
+}
+.pill {
+  display: inline-block;
+  font: var(--step--1) var(--mono);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 1px 10px;
+  white-space: nowrap;
+}
+.pill.ok {
+  color: var(--ok);
+  border-color: currentColor;
+}
+.pill.warn {
+  color: var(--warn);
+  border-color: currentColor;
+}
+
+/* Cards */
+.grid {
+  display: grid;
+  gap: 16px;
+  grid-template-columns: 1fr;
+}
+@media (min-width: 640px) {
+  .grid-2,
+  .grid-3,
+  .grid-4 {
+    grid-template-columns: repeat(2, 1fr);
+  }
+}
+@media (min-width: 960px) {
+  .grid-3 {
+    grid-template-columns: repeat(3, 1fr);
+  }
+  .grid-4 {
+    grid-template-columns: repeat(4, 1fr);
+  }
+}
+.card {
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 16px;
+}
+.card h3 {
+  margin: 0 0 0.4em;
+  font-size: var(--step-1);
+}
+.card p:last-child {
+  margin-bottom: 0;
+}
+
+/* Sections */
+.section {
+  padding: 64px 0;
+  border-top: 1px solid var(--border);
+}
+.section > .wrap > h2:first-child,
+.section h2.section-title {
+  margin-top: 0;
+}
+.lede {
+  font-size: 1.1rem;
+  max-width: 70ch;
+}
+@media (min-width: 960px) {
+  .section {
+    padding: 96px 0;
+  }
+}
+
+/* Print: runbooks get printed */
+@media print {
+  .site-header,
+  .copy,
+  .site-footer nav,
+  .toc,
+  .docs-nav {
+    display: none !important;
+  }
+  .prose a[href^='http']::after {
+    content: ' (' attr(href) ')';
+    font-size: 0.8em;
+  }
+  body {
+    background: #fff;
+    color: #000;
+  }
+}
