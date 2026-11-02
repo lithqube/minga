@@ -170,8 +170,12 @@ flowchart TB
 You need Linux, root (the supervisor creates netns, bridges and iptables rules), containerd, and images preloaded into the `minga` namespace.
 
 ```bash
-# Install minga and the bundled nats-server (verifies SHA256SUMS)
-curl -fsSL https://raw.githubusercontent.com/lithqube/minga/main/install.sh | sh
+# No release is published yet: build from source, and install nats-server
+# (v2.10.22, as CI and the release workflow pin) next to the binary.
+cargo build --release -p minga-cli
+sudo install -m 0755 target/release/minga /usr/local/bin/minga
+# Once a release exists, this does both and verifies SHA256SUMS:
+#   curl -fsSL https://raw.githubusercontent.com/lithqube/minga/main/install.sh | sh
 
 # Preload the images your stack uses: there is no registry pull yet
 sudo ctr -n minga images pull docker.io/library/nginx:1.27
@@ -209,6 +213,12 @@ services in startup order:
   debug-ui         registry.local/debug-ui:latest           1 replica(s)  ports 9000->9000/tcp
 ```
 
+**Agent workloads** (`x-minga-agent`) only run on nodes started with `--sandbox-runtime wasmtime`. Without it, the supervisor logs a warning and skips agent tasks. Stage each `.wasm` module on that node: a relative `module:` path resolves against `--module-dir` (default `/var/lib/minga/modules`), and an absolute path is used as is.
+
+```bash
+sudo minga manager … --sandbox-runtime wasmtime --module-dir /var/lib/minga/modules
+```
+
 For systemd, [`scripts/minga.service`](scripts/minga.service) runs either role from an environment file.
 
 ## Deployment topologies
@@ -222,7 +232,7 @@ flowchart TB
 
   subgraph multi["2 · Multi-node cluster (control plane only)"]
     direction LR
-    natsx[("external NATS<br/>tls://, token")]
+    natsx[("external NATS<br/>tls://, mTLS")]
     mA["manager 1"] <-->|Raft mTLS| mB["manager 2"]
     mB <-->|Raft mTLS| mC["manager 3 / api"]
     w1["worker"] <-->|Raft mTLS| mA
@@ -231,7 +241,7 @@ flowchart TB
 ```
 
 1. **Single host.** This is the verified path: containers reach each other by service name, and published ports work. It's the quick start above.
-2. **Multi-node.** Raft (with `--raft-tls-*`) and scheduling across nodes work. Two limits: every node must be listed with `--peer` and started together, and containers on different nodes can't reach each other yet. The manager's NATS sidecar listens only on loopback, so remote workers need an external NATS server reached with a `tls://` URL plus `MINGA_NATS_TLS_CA`, `MINGA_NATS_TLS_CERT`, `MINGA_NATS_TLS_KEY` and `MINGA_NATS_TLS_SERVER_NAME` (and `--nats-token`). Issue Raft certificates with `minga tls init-ca` and `minga tls issue-node`.
+2. **Multi-node.** Raft (with `--raft-tls-*`) and scheduling across nodes work. Three limits: every node must be listed with `--peer` and started together, containers on different nodes can't reach each other yet, and placement pauses if a worker wins the Raft election. The manager's NATS sidecar listens only on loopback, so **every manager and worker** must point at one external NATS server: a `tls://` URL plus `MINGA_NATS_TLS_CA`, `MINGA_NATS_TLS_CERT`, `MINGA_NATS_TLS_KEY` and `MINGA_NATS_TLS_SERVER_NAME`. Those connections are certificate-only, since `--nats-token` is ignored over TLS. A manager left without `--nats-url` spawns its own private sidecar and splits the bus. Issue Raft certificates with `minga tls init-ca` and `minga tls issue-node`.
 3. **Talos Linux / Hetzner Cloud.** Written up in [docs/talos-deployment.md](docs/talos-deployment.md), but **not validated**. Talos has no systemd and no shell, so Minga would have to ship as a Talos system extension, which doesn't exist yet.
 4. **Air-gapped.** Copy the release archive (with `minga`, `nats-server` and the licenses) and image tarballs to the site. Then run `ctr -n minga images import <image>.tar` on each node and start the roles as above. No step needs a network connection.
 

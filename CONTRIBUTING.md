@@ -22,12 +22,14 @@ Be direct, be kind, assume good intent. Disagree with ideas, not people. Harassm
 - **Linux + containerd** (optional) for the daemon-backed suites:
 
   ```bash
+  sudo ctr -n minga images pull docker.io/library/redis:8.10.2-alpine
   sudo ctr -n minga images pull docker.io/library/busybox:latest
+  sudo ctr -n minga images pull docker.io/library/nginx:1.27
   sudo -E env "PATH=$PATH" MINGA_REQUIRE_CONTAINERD=1 \
     cargo test -p minga-node --test containerd --test containerd_client
   ```
 
-  `MINGA_REQUIRE_CONTAINERD=1` makes a missing daemon a failure instead of a silent skip. CI runs this job on every push.
+  `MINGA_REQUIRE_CONTAINERD=1` makes a missing daemon a failure instead of a silent skip. CI runs this job on pushes to `main` and on pull requests, with the same images preloaded.
 
 ### Clone and build
 

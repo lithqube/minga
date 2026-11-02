@@ -21,7 +21,7 @@ flowchart LR
 | Concern | Where it lives | Notes |
 | --- | --- | --- |
 | Desired state (services, networks, secret refs, configs) | Raft | Written through the Docker API (`minga deploy` uses it too). Writes are forwarded to the leader. |
-| Placement (tasks with node and IPs) | Raft | The scheduler runs on whichever process is leader: a manager or `minga api`. |
+| Placement (tasks with node and IPs) | Raft | The scheduler acts only on the leader, and only managers and `minga api` run one. A worker leader means no placement (limit 1). |
 | Task lifecycle (`running`/`stopped`) | Raft | Written by the supervisor so Docker API consumers (Traefik) see live state. |
 | Node membership lease | Raft | `RenewNodeLease` every 10s, 30s TTL. One atomic command, so it can't undo a drain or recreate a removed node. |
 | Assign/stop commands | JetStream work queue | Plus the supervisor's polling fallback against its local Raft replica (below). |
@@ -40,6 +40,7 @@ These are deliberate `v0.1.0` trade-offs, listed so nobody builds on them by acc
    - Quorum depends on the number of workers, so flaky edge workers can stall deploys.
    - No node can join a running cluster.
    - A node started without `--peer` bootstraps its own one-node cluster.
+   - Workers run no scheduler, and schedulers only act when their own process is leader. If a worker wins an election, placement stops until leadership moves to a manager or `minga api`.
 
    The 5,000-node target in ADR 0001 can't be reached this way.
 2. **Liveness goes through Raft.** This breaks the "only desired state through Raft" rule, though the lease is now an atomic command. The lease is the node's wall clock compared with the leader's, so clock skew over 30s misjudges liveness. The bus lease (`refresh_lease`/`is_alive`) is maintained but placement doesn't use it.

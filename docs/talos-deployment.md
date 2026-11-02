@@ -41,11 +41,10 @@ Talos Linux is an immutable, API-driven Linux distribution purpose-built for Kub
 ```bash
 talosctl gen config minga-cluster https://<control-plane-vip>:6443 \
   --output-dir ./talos-config \
-  --config-patch @./talos-patches/containerd.yaml \
-  --config-patch @./talos-patches/wireguard.yaml
+  --config-patch @./talos-patches/containerd.yaml
 ```
 - `<control-plane-vip>`: a stable IP/VIP for the control plane (keepalived, metalLB, or cloud LB)
-- Patches below enable containerd socket access and WireGuard
+- The containerd patch below is the only one Minga needs. To use Talos's own WireGuard (section 3), add `--config-patch @./talos-patches/wireguard.yaml` to this command.
 
 ### 2. Containerd Patch (`talos-patches/containerd.yaml`)
 ```yaml
@@ -63,7 +62,7 @@ machine:
 
 ### 3. WireGuard Patch (`talos-patches/wireguard.yaml`) — optional, not used by Minga yet
 
-> Minga doesn't apply its WireGuard mesh in `v0.1.0`, so this patch doesn't give containers cross-node connectivity. You can skip it.
+> Minga doesn't apply its WireGuard mesh in `v0.1.0`, so this patch doesn't give containers cross-node connectivity. You can skip it; the `gen config` commands in this guide leave it out.
 
 ```yaml
 machine:
@@ -100,18 +99,24 @@ talosctl bootstrap --nodes <cp1-ip> --endpoints <cp1-ip>
 Talos can't install a binary and a systemd unit, so Minga has to be packaged as a Talos system extension with an extension service. Until that exists, this step can't be done. Each node's service must run one role:
 
 ```bash
-# Managers: scheduler + supervisor; spawns its own nats-server on 127.0.0.1:4222
+# Every manager and worker uses the same external TLS NATS server (certificate-only;
+# --nats-token is ignored over TLS). A manager without --nats-url would spawn a
+# private loopback sidecar and split the cluster's bus.
+export MINGA_NATS_TLS_CA=… MINGA_NATS_TLS_CERT=… MINGA_NATS_TLS_KEY=… MINGA_NATS_TLS_SERVER_NAME=…
+
+# Managers: scheduler + supervisor
 minga manager --node-id <n> --bind <node-ip>:7001 --peer <id>=<ip>:7001 [--peer …] \
-  --data-dir /var/lib/minga --runtime containerd \
+  --nats-url tls://<nats-host>:4222 --data-dir /var/lib/minga --runtime containerd \
   --containerd-socket /run/containerd/containerd.sock --metrics-bind <node-ip>:9100
 
-# Workers: supervisor only; need a NATS server they can reach over TLS
-MINGA_NATS_TLS_CA=… MINGA_NATS_TLS_CERT=… MINGA_NATS_TLS_KEY=… MINGA_NATS_TLS_SERVER_NAME=… \
+# Workers: supervisor only
 minga worker --node-id <n> --bind <node-ip>:7001 --peer … --nats-url tls://<nats-host>:4222 \
   --data-dir /var/lib/minga --runtime containerd --metrics-bind <node-ip>:9100
 
-# Docker API: today it is its own Raft voter, so give it an id and list it in every --peer set
-MINGA_API_TOKEN=… minga api --node-id <n> --bind <node-ip>:7002 --peer … --api-bind <private-ip>:2375
+# Docker API: today it is its own Raft voter, so give it an id, list it in every --peer set,
+# and give it its own data directory (it must not share the manager's Raft databases)
+MINGA_API_TOKEN=… minga api --node-id <n> --bind <node-ip>:7002 --peer … \
+  --data-dir /var/lib/minga-api --api-bind <private-ip>:2375
 ```
 
 What the extension service must provide:
@@ -203,8 +208,7 @@ LB_IP=$(hcloud load-balancer describe minga-cp -o json | jq -r '.public_net.ipv4
 ```bash
 talosctl gen config minga-cluster https://${LB_IP}:6443 \
   --output-dir ./talos-config \
-  --config-patch @./talos-patches/containerd.yaml \
-  --config-patch @./talos-patches/wireguard.yaml
+  --config-patch @./talos-patches/containerd.yaml
 # --with-examples=false --with-docs=false  # Avoid 32KB userdata limit
 ```
 
@@ -370,7 +374,7 @@ talosctl bootstrap --nodes $(terraform output -raw controlplane_ips | jq -r '.[0
 | **Containerd socket** | Path `/run/containerd/containerd.sock` (no `unix://` prefix); unverified on Talos |
 | **WireGuard** | Minga's mesh isn't applied yet; containers on different nodes can't reach each other |
 | **Private networking** | Create `hcloud network` + attach servers; Minga overlay uses private IPs |
-| **NATS** | Each manager spawns a loopback-only sidecar automatically; workers on other nodes need an external TLS NATS (`--nats-url tls://…`, `MINGA_NATS_TLS_*`) |
+| **NATS** | A manager without `--nats-url` spawns a loopback-only sidecar. Multi-node: point every manager and worker at one external TLS NATS (`--nats-url tls://…`, `MINGA_NATS_TLS_*`, certificate-only) |
 | **Persistent volumes** | Hetzner CSI driver available if needed; Minga local volumes work on local disk |
 | **Upgrades** | `talosctl upgrade --nodes <ip> --image factory.talos.dev/siderolabs/talos:v1.14.x` — zero-downtime with HA |
 | **Backups** | `hcloud server create-snapshot` before upgrades for instant rollback |
@@ -412,7 +416,7 @@ talosctl bootstrap --nodes $(terraform output -raw controlplane_ips | jq -r '.[0
 | Area | Detail |
 |------|--------|
 | **Containerd socket** | Minga's default is the path `/run/containerd/containerd.sock`, with no `unix://` prefix. Check which containerd instance Talos exposes there before relying on it. |
-| **NATS** | Managers spawn `nats-server` (bundled in the release archive) on 127.0.0.1:4222. For multi-node, run an external TLS NATS server and set `--nats-url tls://…` plus `MINGA_NATS_TLS_CA/CERT/KEY/SERVER_NAME`. |
+| **NATS** | A manager without `--nats-url` spawns `nats-server` (bundled in the release archive) on 127.0.0.1:4222. Multi-node: run one external TLS NATS server and set `--nats-url tls://…` plus `MINGA_NATS_TLS_CA/CERT/KEY/SERVER_NAME` on **every** manager and worker. Over TLS, `--nats-token` is ignored. |
 | **WireGuard** | Not used by Minga yet. |
 | **Raft** | Static membership: every node must be in every `--peer` list and start together. Use `--raft-tls-ca/cert/key` from `minga tls`. |
 | **Persistent data** | `/var/lib/minga` (Raft log, state, secrets, volumes) must persist across Talos upgrades. |
