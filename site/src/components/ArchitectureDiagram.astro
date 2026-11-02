@@ -119,80 +119,82 @@ const processSteps = [
     </>
   )}
   {variant === 'process' && (
-    <svg class="process" viewBox="0 0 720 430" role="img" aria-labelledby="dp-t dp-d">
-      <title id="dp-t">Minga processes and how they talk</title>
-      <desc id="dp-d">{processSteps.join(' ')}</desc>
-      <defs>
-        <marker id="ap" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
-          <path d="M0 0 10 5 0 10z" fill="#22d3ee" />
-        </marker>
-      </defs>
-      <text class="group" x="20" y="24">
-        clients
-      </text>
-      <rect x="20" y="34" width="200" height="44" />
-      <text x="120" y="61">
-        minga deploy
-      </text>
-      <rect x="260" y="34" width="200" height="44" />
-      <text x="360" y="61">
-        docker CLI / Traefik
-      </text>
-      <rect x="500" y="34" width="200" height="44" />
-      <text x="600" y="61">
-        minga logs
-      </text>
+    <div class="process-scroll" role="region" aria-label="Diagram, scrolls horizontally" tabindex="0">
+      <svg class="process" viewBox="0 0 720 430" role="img" aria-labelledby="dp-t dp-d">
+        <title id="dp-t">Minga processes and how they talk</title>
+        <desc id="dp-d">{processSteps.join(' ')}</desc>
+        <defs>
+          <marker id="ap" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+            <path d="M0 0 10 5 0 10z" fill="#22d3ee" />
+          </marker>
+        </defs>
+        <text class="group" x="20" y="24">
+          clients
+        </text>
+        <rect x="20" y="34" width="200" height="44" />
+        <text x="120" y="61">
+          minga deploy
+        </text>
+        <rect x="260" y="34" width="200" height="44" />
+        <text x="360" y="61">
+          docker CLI / Traefik
+        </text>
+        <rect x="500" y="34" width="200" height="44" />
+        <text x="600" y="61">
+          minga logs
+        </text>
 
-      <rect x="20" y="140" width="300" height="64" />
-      <text x="170" y="167">
-        minga api
-      </text>
-      <text class="sub" x="170" y="187">
-        Docker Engine API · own Raft voter
-      </text>
-      <rect x="400" y="140" width="300" height="64" />
-      <text x="550" y="167">
-        minga manager
-      </text>
-      <text class="sub" x="550" y="187">
-        scheduler + supervisor
-      </text>
-      <line x1="320" y1="166" x2="396" y2="166" />
-      <line x1="400" y1="180" x2="324" y2="180" />
-      <text class="label" x="360" y="160">
-        Raft mTLS
-      </text>
+        <rect x="20" y="140" width="300" height="64" />
+        <text x="170" y="167">
+          minga api
+        </text>
+        <text class="sub" x="170" y="187">
+          Docker Engine API · own Raft voter
+        </text>
+        <rect x="400" y="140" width="300" height="64" />
+        <text x="550" y="167">
+          minga manager
+        </text>
+        <text class="sub" x="550" y="187">
+          scheduler + supervisor
+        </text>
+        <line x1="320" y1="166" x2="396" y2="166" />
+        <line x1="400" y1="180" x2="324" y2="180" />
+        <text class="label" x="360" y="160">
+          Raft mTLS
+        </text>
 
-      <rect x="400" y="262" width="300" height="56" class="bus" />
-      <text x="550" y="287">
-        nats-server (JetStream)
-      </text>
-      <text class="sub" x="550" y="305">
-        child process of the manager · TLS
-      </text>
-      <rect x="20" y="262" width="300" height="56" />
-      <text x="170" y="287">
-        minga worker
-      </text>
-      <text class="sub" x="170" y="305">
-        supervisor only
-      </text>
-      <rect x="20" y="368" width="680" height="44" />
-      <text x="360" y="395">
-        containerd on every node (gRPC)
-      </text>
+        <rect x="400" y="262" width="300" height="56" class="bus" />
+        <text x="550" y="287">
+          nats-server (JetStream)
+        </text>
+        <text class="sub" x="550" y="305">
+          child process of the manager · TLS
+        </text>
+        <rect x="20" y="262" width="300" height="56" />
+        <text x="170" y="287">
+          minga worker
+        </text>
+        <text class="sub" x="170" y="305">
+          supervisor only
+        </text>
+        <rect x="20" y="368" width="680" height="44" />
+        <text x="360" y="395">
+          containerd on every node (gRPC)
+        </text>
 
-      <line x1="120" y1="78" x2="120" y2="136" />
-      <line x1="360" y1="78" x2="250" y2="136" />
-      <path d="M600 78 V110 H712 V290 H704" fill="none" />
-      <line x1="550" y1="204" x2="550" y2="258" />
-      <line x1="320" y1="290" x2="396" y2="290" />
-      <line x1="170" y1="318" x2="170" y2="364" />
-      <line x1="440" y1="204" x2="440" y2="364" class="dashed" />
-      <text class="label" x="358" y="282">
-        status · logs
-      </text>
-    </svg>
+        <line x1="120" y1="78" x2="120" y2="136" />
+        <line x1="360" y1="78" x2="250" y2="136" />
+        <path d="M600 78 V110 H712 V290 H704" fill="none" />
+        <line x1="550" y1="204" x2="550" y2="258" />
+        <line x1="320" y1="290" x2="396" y2="290" />
+        <line x1="170" y1="318" x2="170" y2="364" />
+        <line x1="440" y1="204" x2="440" y2="364" class="dashed" />
+        <text class="label" x="358" y="282">
+          status · logs
+        </text>
+      </svg>
+    </div>
   )}
   <figcaption class="muted">
     {caption}
@@ -219,8 +221,13 @@ const processSteps = [
     border-radius: var(--radius);
     padding: 8px;
   }
-  .process {
+  /* Drawn at 720 units: below that width it scrolls instead of shrinking its 12px labels. */
+  .process-scroll {
+    overflow-x: auto;
     max-width: 760px;
+  }
+  .process {
+    min-width: 720px;
   }
   .tall {
     max-width: 340px;

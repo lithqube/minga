@@ -93,15 +93,16 @@ h4 {
   letter-spacing: -0.01em;
   margin: 2em 0 0.6em;
 }
+/* Headings scale with the viewport so long mono titles don't fill a phone screen. */
 h1 {
-  font-size: var(--step-4);
+  font-size: clamp(1.4rem, 0.9rem + 2.4vw, var(--step-4));
   margin-top: 0;
 }
 h2 {
-  font-size: var(--step-3);
+  font-size: clamp(1.3rem, 0.95rem + 1.6vw, var(--step-3));
 }
 h3 {
-  font-size: var(--step-2);
+  font-size: clamp(1.15rem, 0.95rem + 1vw, var(--step-2));
 }
 h4 {
   font-size: var(--step-1);
@@ -200,7 +201,10 @@ hr {
   z-index: 100;
   background: var(--accent);
   color: var(--accent-ink);
-  padding: 8px 12px;
+  display: inline-flex;
+  align-items: center;
+  min-height: 44px;
+  padding: 0 14px;
 }
 .skip:focus {
   top: 8px;
@@ -266,16 +270,20 @@ pre .ok {
 /* Mermaid and authored diagrams */
 .diagram,
 pre.mermaid,
-.prose svg[id^='mermaid'] {
+.diagram-scroll {
   background: var(--surface);
 }
-.prose svg[id^='mermaid'] {
-  display: block;
-  margin: 0 auto 1em;
+/* Diagrams keep a readable size and scroll sideways when the column is narrower (rehypeDiagramScroll). */
+.diagram-scroll {
+  overflow-x: auto;
+  margin: 0 0 1em;
   padding: 16px;
   border: 1px solid var(--border);
   border-radius: var(--radius);
-  height: auto;
+}
+.diagram-scroll > svg {
+  display: block;
+  margin: 0 auto;
 }
 
 /* Tables */
@@ -435,8 +443,13 @@ thead th {
 
 /* Sections */
 .section {
-  padding: 64px 0;
+  padding: 40px 0;
   border-top: 1px solid var(--border);
+}
+@media (min-width: 640px) {
+  .section {
+    padding: 64px 0;
+  }
 }
 .section > .wrap > h2:first-child,
 .section h2.section-title {

@@ -492,4 +492,9 @@ ${deployOutput.split('\n').slice(3).join('\n')}`;
   .arch h3 {
     margin-top: 1.2em;
   }
+  /* Link lists, not prose: each link is a 44px tap target. */
+  .arch li > a {
+    display: inline-block;
+    padding-block: 10px;
+  }
 </style>

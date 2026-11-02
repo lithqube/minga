@@ -79,6 +79,38 @@ export function rehypeA11y() {
     });
 }
 
+/**
+ * Keeps Mermaid labels readable at any width: each diagram renders at no less than 75% of its natural
+ * size (16px labels stay >= 12px) inside a labelled scroll region, instead of shrinking to the column.
+ */
+export function rehypeDiagramScroll() {
+  return (tree: Node) => {
+    const visit = (parent: Node) =>
+      parent.children?.forEach((n, i) => {
+        const id = n.properties?.id;
+        if (n.tagName === 'svg' && typeof id === 'string' && id.startsWith('mermaid')) {
+          const natural = Number(String(n.properties?.style ?? '').match(/max-width:\s*([\d.]+)px/)?.[1]);
+          if (natural) {
+            delete n.properties!.width;
+            n.properties!.style = `width: max(100%, ${Math.round(natural * 0.75)}px); max-width: ${Math.round(natural)}px; height: auto;`;
+          }
+          parent.children![i] = {
+            type: 'element',
+            tagName: 'div',
+            properties: {
+              className: ['diagram-scroll'],
+              role: 'region',
+              ariaLabel: 'Diagram, scrolls horizontally',
+              tabIndex: 0,
+            },
+            children: [n],
+          };
+        } else visit(n);
+      });
+    visit(tree);
+  };
+}
+
 /** Pre-rendered Mermaid: inline SVG at build time; on failure the source block stays (no client JS). */
 export const mermaidPlugin = [
   rehypeMermaid,
