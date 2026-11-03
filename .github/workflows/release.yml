@@ -32,13 +32,13 @@ jobs:
             nats_arch: amd64
             nats_sha256: db0b3ccbe4cbdd3872ae7486ec4f6b0f85824632a0789f4da2e0a8518390483e
             ctr_arch: amd64
-            ctr_sha256: 316d510a0428276d931023f72c09fdff1a6ba81d6cc36f31805fea6a3c88f515
+            ctr_sha256: 50e53500800f4f74d0d8b2e57e939297eab68b0fe11a0957b771d5faa61fae5b
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             nats_arch: arm64
             nats_sha256: b4da77b2b194dc5fcf13a1df0dad59ba7e87ae4423f254c50534015b7c8a2369
             ctr_arch: arm64
-            ctr_sha256: 846d13bc2bf1c01ae2f20d13beb9b3a1e50b52c86e955b4ac7d658f5847f2b0e
+            ctr_sha256: c5f0957064e6ed5a67905ea3f8e451dadd16530334b86baaad678dd357205c30
     runs-on: ${{ matrix.os }}
     # Build against bullseye's glibc 2.31: binaries then run on Debian 11+,
     # Ubuntu 20.04+, Fedora 34+ (glibc is forward-compatible, not backward).
@@ -93,7 +93,7 @@ jobs:
 
       - name: Fetch and verify ctr
         run: |
-          archive="containerd-${CONTAINERD_VERSION#v}-linux-${{ matrix.ctr_arch }}.tar.gz"
+          archive="containerd-static-${CONTAINERD_VERSION#v}-linux-${{ matrix.ctr_arch }}.tar.gz"
           curl -fsSL -o "$archive" "https://github.com/containerd/containerd/releases/download/${CONTAINERD_VERSION}/${archive}"
           echo "${{ matrix.ctr_sha256 }}  ${archive}" | sha256sum -c -
           tar -xzf "$archive" bin/ctr
