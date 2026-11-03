@@ -93,7 +93,7 @@ jobs:
 
       - name: Fetch and verify ctr
         run: |
-          archive="containerd-${CONTAINERD_VERSION}-linux-${{ matrix.ctr_arch }}.tar.gz"
+          archive="containerd-${CONTAINERD_VERSION#v}-linux-${{ matrix.ctr_arch }}.tar.gz"
           curl -fsSL -o "$archive" "https://github.com/containerd/containerd/releases/download/${CONTAINERD_VERSION}/${archive}"
           echo "${{ matrix.ctr_sha256 }}  ${archive}" | sha256sum -c -
           tar -xzf "$archive" bin/ctr
