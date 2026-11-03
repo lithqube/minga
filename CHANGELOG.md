@@ -2,12 +2,12 @@
 
 ## [0.1.0] — 2026-11-03
 
-First production-shaped release: a single binary an operator can install on
-real hardware and run a Compose stack on, with secrets, logs and TLS handled
-honestly. Every claim below was verified by execution, on macOS and on
-OrbStack Ubuntu (containerd 2.2.1), per the evidence in `.planning/STATE.md`.
-No earlier build was tagged or published: this is the first release, and it
-includes everything merged up to the tag.
+First published production-shaped release: a single binary an operator can
+install on real hardware and run a Compose stack on, with secrets, logs and
+TLS handled honestly. The seven initial release gates were verified by
+execution on macOS and OrbStack Ubuntu (containerd 2.2.1), per
+`.planning/STATE.md`. This entry also includes subsequent fixes merged before
+the first tag; no earlier build was tagged or published.
 
 ### Security
 - The LLM egress proxy no longer trusts the self-asserted `X-Minga-Workload`
