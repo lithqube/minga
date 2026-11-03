@@ -32,13 +32,13 @@ jobs:
             nats_arch: amd64
             nats_sha256: db0b3ccbe4cbdd3872ae7486ec4f6b0f85824632a0789f4da2e0a8518390483e
             ctr_arch: amd64
-            ctr_sha256: 316d510a0428276d931023f72c09fdff1a6ba81d6cc36f31805fea6a3c88f515
+            ctr_sha256: 50e53500800f4f74d0d8b2e57e939297eab68b0fe11a0957b771d5faa61fae5b
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             nats_arch: arm64
             nats_sha256: b4da77b2b194dc5fcf13a1df0dad59ba7e87ae4423f254c50534015b7c8a2369
             ctr_arch: arm64
-            ctr_sha256: 846d13bc2bf1c01ae2f20d13beb9b3a1e50b52c86e955b4ac7d658f5847f2b0e
+            ctr_sha256: c5f0957064e6ed5a67905ea3f8e451dadd16530334b86baaad678dd357205c30
     runs-on: ${{ matrix.os }}
     # Build against bullseye's glibc 2.31: binaries then run on Debian 11+,
     # Ubuntu 20.04+, Fedora 34+ (glibc is forward-compatible, not backward).
@@ -54,13 +54,18 @@ jobs:
           apt-get update
           apt-get install -y --no-install-recommends git curl ca-certificates build-essential pkg-config perl
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         run: |
           curl -fsSL https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          # GITHUB_PATH only reaches later steps; this step needs the
+          # toolchain on PATH right now (rustup lands in $HOME/.cargo/bin).
+          export PATH="$HOME/.cargo/bin:$PATH"
           rustup target add ${{ matrix.target }}
+          rustc --version
+          cargo --version
 
       - name: Tag must match the workspace version
         if: github.event_name == 'push'
@@ -82,18 +87,25 @@ jobs:
           archive="nats-server-${NATS_VERSION}-linux-${{ matrix.nats_arch }}.tar.gz"
           curl -fsSL -o "$archive" "https://github.com/nats-io/nats-server/releases/download/${NATS_VERSION}/${archive}"
           echo "${{ matrix.nats_sha256 }}  ${archive}" | sha256sum -c -
-          tar -xzf "$archive" --strip-components=1 --wildcards '*/nats-server' '*/LICENSE'
-          mv LICENSE NATS-LICENSE
+          mkdir -p nats-dist
+          # Keep NATS's LICENSE out of the repository root; otherwise tar
+          # overwrites Minga's MIT LICENSE before it is moved to NATS-LICENSE.
+          tar -C nats-dist -xzf "$archive" --strip-components=1 --wildcards '*/nats-server' '*/LICENSE'
+          mv nats-dist/nats-server ./nats-server
+          mv nats-dist/LICENSE NATS-LICENSE
+          rmdir nats-dist
           ./nats-server --version
 
       - name: Fetch and verify ctr
         run: |
-          archive="containerd-${CONTAINERD_VERSION}-linux-${{ matrix.ctr_arch }}.tar.gz"
+          archive="containerd-static-${CONTAINERD_VERSION#v}-linux-${{ matrix.ctr_arch }}.tar.gz"
           curl -fsSL -o "$archive" "https://github.com/containerd/containerd/releases/download/${CONTAINERD_VERSION}/${archive}"
           echo "${{ matrix.ctr_sha256 }}  ${archive}" | sha256sum -c -
           tar -xzf "$archive" bin/ctr
           mv bin/ctr ctr && rmdir bin
-          ./ctr version
+          # `ctr version` contacts a containerd daemon; this build container
+          # has none. Exercise the CLI without requiring a runtime socket.
+          ./ctr --help >/dev/null
 
       - name: Package
         run: |
@@ -106,7 +118,7 @@ jobs:
             minga nats-server ctr NATS-LICENSE install.sh README.md LICENSE CHANGELOG.md \
             minga.service minga.env.example
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: minga-${{ matrix.target }}
           path: minga-${{ matrix.target }}.tar.gz
@@ -116,9 +128,9 @@ jobs:
     needs: build
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: artifacts
           merge-multiple: true
@@ -133,17 +145,17 @@ jobs:
           tar -xzf artifacts/minga-aarch64-unknown-linux-gnu.tar.gz -C dist/linux-arm64
           cp LICENSE dist/
 
-      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-qemu-action@v4
 
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v4
 
-      - uses: docker/login-action@v3
+      - uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: docker/metadata-action@v5
+      - uses: docker/metadata-action@v6
         id: meta
         with:
           images: ghcr.io/${{ github.repository }}
@@ -154,7 +166,7 @@ jobs:
             type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/') }}
             type=raw,value=edge,enable=${{ github.event_name == 'workflow_dispatch' }}
 
-      - uses: docker/build-push-action@v6
+      - uses: docker/build-push-action@v7
         with:
           context: dist
           file: ./Dockerfile
@@ -169,9 +181,9 @@ jobs:
     if: github.event_name == 'push'
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
@@ -180,7 +192,7 @@ jobs:
         run: cd dist && sha256sum minga-*.tar.gz > SHA256SUMS && cat SHA256SUMS
 
       - name: Upload release assets
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           generate_release_notes: true
           files: |

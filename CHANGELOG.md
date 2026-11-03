@@ -1,6 +1,13 @@
 # Changelog
 
-## [Unreleased]
+## [0.1.0] — 2026-11-03
+
+First published production-shaped release: a single binary an operator can
+install on real hardware and run a Compose stack on, with secrets, logs and
+TLS handled honestly. The seven initial release gates were verified by
+execution on macOS and OrbStack Ubuntu (containerd 2.2.1), per
+`.planning/STATE.md`. This entry also includes subsequent fixes merged before
+the first tag; no earlier build was tagged or published.
 
 ### Security
 - The LLM egress proxy no longer trusts the self-asserted `X-Minga-Workload`
@@ -107,21 +114,8 @@
 - README rewritten against the current CLI. It now has Mermaid diagrams (process architecture, deploy sequence, node networking, topologies), a verified single-host quick start, and an honest multi-node section (external TLS NATS, static Raft membership).
 - New `docs/architecture.md`: where state lives, the deploy round trip, known structural limits and the target design.
 - ADRs gained *Implementation status* sections; ADR 0001 is now Accepted (plan 1).
-- The Talos guide no longer gives install steps that can't work. Talos needs a system extension, which doesn't exist yet. `scripts/setup-talos-minga.sh` now exits with that explanation.
 - `scripts/minga.service` fixed: the old unit called `minga node` and `--log-level`, which don't exist, used `Type=notify`, and silently ran the mock runtime. It now runs either role from `scripts/minga.env.example`, with SIGINT for graceful shutdown.
 - CONTRIBUTING: correct crate table, plus the `nats-server` and containerd test prerequisites.
-- Correction to the `v0.1.0` notes: NATS token auth applies only to plaintext loopback connections. When TLS is configured, the client ignores `--nats-token`, so external TLS connections are certificate-only. A multi-node cluster must point every manager and worker at one external TLS NATS server.
-
-### Upgrade note
-- Lease renewal uses a new Raft command. Upgrade every node before
-  relying on mixed versions: an older node cannot apply it.
-
-## [0.1.0] — 2026-11-01
-
-First production-shaped release: a single binary an operator can install on
-real hardware and run a Compose stack on, with secrets, logs and TLS handled
-honestly. Every claim below was verified by execution, on macOS and on
-OrbStack Ubuntu (containerd 2.2.1), per the evidence in `.planning/STATE.md`.
 
 ### Cluster lifecycle
 - Nodes self-register with a membership lease (10s renewal, 30s TTL);
