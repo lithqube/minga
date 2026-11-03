@@ -98,7 +98,9 @@ jobs:
           echo "${{ matrix.ctr_sha256 }}  ${archive}" | sha256sum -c -
           tar -xzf "$archive" bin/ctr
           mv bin/ctr ctr && rmdir bin
-          ./ctr version
+          # `ctr version` contacts a containerd daemon; this build container
+          # has none. Exercise the CLI without requiring a runtime socket.
+          ./ctr --help >/dev/null
 
       - name: Package
         run: |
