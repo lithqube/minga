@@ -24,7 +24,7 @@ Named after the [minga](https://en.wikipedia.org/wiki/Minga) of Chiloé, where a
 >
 > Details: [changelog](CHANGELOG.md), [roadmap](docs/roadmap-v0.1.0.md), [architecture notes](docs/architecture.md).
 >
-> The Talos guide has **not been validated on a Talos host**. FIPS, SOC 2, VS-NfD and NATO are **not assessed**, which is not the same as "not applicable".
+> The Talos install is validated on a single docker-provisioned Talos v1.14 node, not on bare metal. FIPS, SOC 2, VS-NfD and NATO are **not assessed**, which is not the same as "not applicable".
 
 ## Why Minga
 
@@ -171,7 +171,6 @@ You need Linux, root (the supervisor creates netns, bridges and iptables rules),
 
 ```bash
 # Installs minga + the checksum-pinned nats-server and verifies SHA256SUMS.
-# (Works once the first release is tagged; until then use the source build below.)
 curl -fsSL https://github.com/lithqube/minga/releases/latest/download/install.sh | sh
 # Same, plus the systemd unit and an /etc/minga/minga.env template:
 #   curl -fsSL .../install.sh | sh -s -- --with-systemd
@@ -312,12 +311,11 @@ Requirements: Rust 1.80+ with `rustfmt` and `clippy`, and `nats-server` for the 
 
 Next, in order (rationale in [docs/architecture.md](docs/architecture.md)):
 
-1. Tag `v0.1.0` with the Phase 0 fixes (see [Unreleased](CHANGELOG.md)).
-2. Image pull (content transfer + unpack).
-3. Managers-only Raft: workers become pure JetStream clients, liveness moves to `MINGA_LEASES`, and nodes can join a running cluster.
-4. A multi-node WireGuard mesh on top of the per-node data plane.
-5. Spec-update reprovisioning and healthcheck enforcement.
-6. Host capabilities for agent sandboxes: WASI, egress-only networking, host-injected workload identity, memory limits.
+1. Image pull (content transfer + unpack).
+2. Managers-only Raft: workers become pure JetStream clients, liveness moves to `MINGA_LEASES`, and nodes can join a running cluster.
+3. A multi-node WireGuard mesh on top of the per-node data plane.
+4. Spec-update reprovisioning and healthcheck enforcement.
+5. Host capabilities for agent sandboxes: WASI, egress-only networking, host-injected workload identity, memory limits.
 
 ## Documentation
 

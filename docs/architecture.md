@@ -1,6 +1,6 @@
 # Architecture notes
 
-How Minga fits together **as of `v0.1.0` plus the Phase 0 fixes**, the structural limits that come with it, and the plan to remove them. Settled decisions live in the [ADRs](adr/); this page describes the code as it is.
+How Minga fits together **as of `v0.1.0`**, the structural limits that come with it, and the plan to remove them. Settled decisions live in the [ADRs](adr/); this page describes the code as it is.
 
 ## Processes and state
 
@@ -74,9 +74,8 @@ This should be recorded as an ADR (Workers leave Raft) before any code moves. Th
 
 ## Order of work
 
-1. Tag `v0.1.0` with the Phase 0 fixes.
-2. Image pull.
-3. Managers-only Raft and worker join (limits 1–3).
-4. WireGuard mesh (limit 5).
-5. Spec-update reprovisioning and healthcheck enforcement.
-6. Sandbox host capabilities: WASI with explicit grants, outbound HTTP only to the local egress proxy, host-injected workload identity, enforced memory limits (limit 4).
+1. Image pull.
+2. Managers-only Raft and worker join (limits 1–3).
+3. WireGuard mesh (limit 5).
+4. Spec-update reprovisioning and healthcheck enforcement.
+5. Sandbox host capabilities: WASI with explicit grants, outbound HTTP only to the local egress proxy, host-injected workload identity, enforced memory limits (limit 4).
