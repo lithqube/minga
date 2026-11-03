@@ -60,7 +60,12 @@ jobs:
         run: |
           curl -fsSL https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          # GITHUB_PATH only reaches later steps; this step needs the
+          # toolchain on PATH right now (rustup lands in $HOME/.cargo/bin).
+          export PATH="$HOME/.cargo/bin:$PATH"
           rustup target add ${{ matrix.target }}
+          rustc --version
+          cargo --version
 
       - name: Tag must match the workspace version
         if: github.event_name == 'push'
