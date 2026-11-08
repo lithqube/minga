@@ -33,6 +33,7 @@ fn node(id: u64, cpus: f64, mem: u64, gpus: u32, labels: &[(&str, &str)]) -> Clu
         wg_endpoint: None,
         overlay_ip: None,
         last_seen_unix: None,
+        role: Default::default(),
     }
 }
 
@@ -112,11 +113,11 @@ services:
         })
         .collect();
     assert_eq!(creates.len(), 5);
-    assert!(creates.contains(&"plant-7.web.1"));
-    assert!(creates.contains(&"plant-7.web.2"));
-    assert!(creates.contains(&"plant-7.api.1"));
-    assert!(creates.contains(&"plant-7.api.2"));
-    assert!(creates.contains(&"plant-7.api.3"));
+    assert!(creates.iter().any(|id| id.starts_with("plant-7.web.1.")));
+    assert!(creates.iter().any(|id| id.starts_with("plant-7.web.2.")));
+    assert!(creates.iter().any(|id| id.starts_with("plant-7.api.1.")));
+    assert!(creates.iter().any(|id| id.starts_with("plant-7.api.2.")));
+    assert!(creates.iter().any(|id| id.starts_with("plant-7.api.3.")));
 
     // Re-running reconcile with the placed tasks should be a no-op.
     let tasks: Vec<_> = actions

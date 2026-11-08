@@ -6,6 +6,16 @@ use sha2::{Digest, Sha256};
 use super::client::ContainerdClient;
 use super::proto::Image;
 
+/// Parses a numeric `uid[:gid]`; a missing gid is 0. Names would need the
+/// image's `/etc/passwd`, so they fail loudly instead.
+pub fn parse_user(user: &str) -> Result<(u32, u32), &'static str> {
+    let (uid, gid) = user.split_once(':').unwrap_or((user, "0"));
+    Ok((
+        uid.parse().map_err(|_| "named users are not supported")?,
+        gid.parse().map_err(|_| "named groups are not supported")?,
+    ))
+}
+
 const OCI_MANIFEST: &str = "application/vnd.oci.image.manifest.v1+json";
 const DOCKER_MANIFEST: &str = "application/vnd.docker.distribution.manifest.v2+json";
 const OCI_INDEX: &str = "application/vnd.oci.image.index.v1+json";
@@ -211,13 +221,7 @@ impl ImageConfiguration {
         let (uid, gid) = if user.is_empty() {
             (0, 0)
         } else {
-            let (uid, gid) = user.split_once(':').unwrap_or((user, "0"));
-            (
-                uid.parse()
-                    .map_err(|_| "named image users are not supported")?,
-                gid.parse()
-                    .map_err(|_| "named image groups are not supported")?,
-            )
+            parse_user(user)?
         };
         if value["rootfs"]["type"] != "layers" {
             return Err("image rootfs is not layered".into());
@@ -389,6 +393,14 @@ mod tests {
         assert!(ImageConfiguration::parse(&json, "arm64").is_err());
         json["config"]["User"] = serde_json::json!("0");
         assert!(ImageConfiguration::parse(&json, "arm64").is_err());
+    }
+
+    #[test]
+    fn parses_numeric_users_and_refuses_names() {
+        assert_eq!(parse_user("0"), Ok((0, 0)));
+        assert_eq!(parse_user("1000:1001"), Ok((1000, 1001)));
+        assert!(parse_user("app").is_err());
+        assert!(parse_user("1000:app").is_err());
     }
 
     #[test]

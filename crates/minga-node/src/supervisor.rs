@@ -1302,6 +1302,8 @@ mod tests {
             labels: HashMap::new(),
             healthcheck: None,
             mounts: vec![],
+            user: None,
+            update: Default::default(),
         }];
 
         let mut t1 = make_task("shop.web.1", 1);

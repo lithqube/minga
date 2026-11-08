@@ -81,6 +81,7 @@ fn sample_node(id: u64, addr: &str) -> ClusterNode {
         wg_endpoint: None,
         overlay_ip: None,
         last_seen_unix: None,
+        role: Default::default(),
     }
 }
 

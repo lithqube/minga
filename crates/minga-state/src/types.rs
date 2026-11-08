@@ -53,6 +53,42 @@ pub struct ClusterNode {
     /// lease: it is considered live regardless of age.
     #[serde(default)]
     pub last_seen_unix: Option<u64>,
+    /// Manager or worker; matched by `node.role` placement constraints.
+    #[serde(default)]
+    pub role: NodeRole,
+}
+
+/// The role a node was started with.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NodeRole {
+    Manager,
+    #[default]
+    Worker,
+}
+
+/// Whether a replacement task starts before or after the one it replaces.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum UpdateOrder {
+    #[default]
+    StopFirst,
+    StartFirst,
+}
+
+/// How a service's tasks are replaced when its spec changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpdatePolicy {
+    /// Tasks replaced at a time; 0 means all at once.
+    pub parallelism: u32,
+    pub order: UpdateOrder,
+}
+
+impl Default for UpdatePolicy {
+    fn default() -> Self {
+        Self {
+            parallelism: 1,
+            order: UpdateOrder::StopFirst,
+        }
+    }
 }
 
 /// How often a self-registered node renews its lease, in seconds.
@@ -165,6 +201,12 @@ pub struct Service {
     /// Volume and bind mounts.
     #[serde(default)]
     pub mounts: Vec<ServiceMount>,
+    /// Numeric `uid[:gid]` to run as. `None` keeps the image's user.
+    #[serde(default)]
+    pub user: Option<String>,
+    /// How tasks are replaced when the spec changes.
+    #[serde(default)]
+    pub update: UpdatePolicy,
 }
 
 /// A container healthcheck (Compose/Docker shape).
@@ -273,6 +315,9 @@ pub struct TaskSpec {
     /// Volume and bind mounts to apply in the OCI spec.
     #[serde(default)]
     pub mounts: Vec<ServiceMount>,
+    /// Numeric `uid[:gid]` to run as. `None` keeps the image's user.
+    #[serde(default)]
+    pub user: Option<String>,
 }
 
 /// Restart policy for a task.
@@ -470,6 +515,8 @@ mod tests {
             labels: HashMap::new(),
             healthcheck: None,
             mounts: vec![],
+            user: None,
+            update: Default::default(),
         };
         let bytes = bincode::serde::encode_to_vec(&svc, bincode::config::standard()).unwrap();
         let (back, _): (Service, _) =

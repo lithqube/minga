@@ -12,9 +12,11 @@
 
 use std::collections::{HashMap, HashSet};
 
-use minga_state::types::{ClusterNode, Network, NodeId, Service, Task, TaskId};
+use minga_state::types::{
+    ClusterNode, Network, NodeId, Service, Task, TaskId, TaskState, UpdateOrder,
+};
 
-use crate::placement::place_service;
+use crate::placement::{place_service, slot_of};
 
 /// An action the reconcile loop should take to converge the cluster.
 #[derive(Debug, Clone, PartialEq)]
@@ -24,6 +26,17 @@ pub enum ReconcileAction {
     /// Remove a task from the state store. Carries the node_id so the
     /// scheduler can publish a stop command to the right node via the bus.
     RemoveTask { task_id: TaskId, node_id: NodeId },
+}
+
+fn is_live(task: &Task) -> bool {
+    !matches!(task.state, TaskState::Stopped | TaskState::Failed)
+}
+
+fn remove_action(task: &Task) -> ReconcileAction {
+    ReconcileAction::RemoveTask {
+        task_id: task.id.clone(),
+        node_id: task.node_id,
+    }
 }
 
 /// Computes the actions needed to make the cluster's tasks match the
@@ -63,23 +76,77 @@ pub fn plan(
             .get(service.id.as_str())
             .map(|v| v.as_slice())
             .unwrap_or(&[]);
-        let existing_ids: HashSet<&str> = existing.iter().map(|t| t.id.as_str()).collect();
+        let existing_by_id: HashMap<&str, &Task> =
+            existing.iter().map(|t| (t.id.as_str(), *t)).collect();
+        let desired_slots: HashSet<&str> = desired.iter().map(|t| slot_of(&t.id)).collect();
 
-        // Create tasks that are desired but don't exist yet.
-        for task in &desired {
-            if !existing_ids.contains(task.id.as_str()) {
-                actions.push(ReconcileAction::CreateTask(Box::new(task.clone())));
+        // Stale tasks either hand their slot to a newer revision, or have
+        // no successor (a scale-down, or a node became ineligible).
+        let mut outgoing: HashMap<&str, Vec<&Task>> = HashMap::new();
+        for task in existing {
+            if desired_ids.contains(task.id.as_str()) {
+                continue;
+            }
+            if desired_slots.contains(slot_of(&task.id)) {
+                outgoing.entry(slot_of(&task.id)).or_default().push(task);
+            } else {
+                actions.push(remove_action(task));
             }
         }
 
-        // Remove tasks that exist but are no longer desired (e.g. after
-        // a scale-down, or when a node became ineligible).
-        for task in existing {
-            if !desired_ids.contains(task.id.as_str()) {
-                actions.push(ReconcileAction::RemoveTask {
-                    task_id: task.id.clone(),
-                    node_id: task.node_id,
-                });
+        // A published port can't be held by two tasks at once.
+        let order = if service.ports.iter().any(|p| p.published.is_some()) {
+            UpdateOrder::StopFirst
+        } else {
+            service.update.order
+        };
+
+        // Tasks starting now, or still starting, use up the update budget.
+        let busy = desired
+            .iter()
+            .filter(|t| match existing_by_id.get(t.id.as_str()) {
+                Some(current) => current.state != TaskState::Running,
+                None => !outgoing
+                    .get(slot_of(&t.id))
+                    .is_some_and(|old| old.iter().any(|o| is_live(o))),
+            })
+            .count();
+        let mut budget = match service.update.parallelism {
+            0 => usize::MAX,
+            n => (n as usize).saturating_sub(busy),
+        };
+
+        for task in &desired {
+            let old = outgoing
+                .get(slot_of(&task.id))
+                .map_or(&[][..], Vec::as_slice);
+
+            if let Some(current) = existing_by_id.get(task.id.as_str()) {
+                // shortcut: Running means the process started, not that it
+                // is healthy; gate on the healthcheck once it is enforced.
+                // Until then a new task that fails leaves the old one up.
+                if current.state == TaskState::Running {
+                    actions.extend(old.iter().map(|o| remove_action(o)));
+                }
+                continue;
+            }
+
+            let (live, dead): (Vec<&Task>, Vec<&Task>) = old.iter().partition(|o| is_live(o));
+            actions.extend(dead.iter().map(|o| remove_action(o)));
+            if live.is_empty() {
+                actions.push(ReconcileAction::CreateTask(Box::new(task.clone())));
+            } else if budget > 0 {
+                budget -= 1;
+                match order {
+                    UpdateOrder::StartFirst => {
+                        actions.push(ReconcileAction::CreateTask(Box::new(task.clone())));
+                    }
+                    // The replacement is created on a later pass, once the
+                    // old task is gone.
+                    UpdateOrder::StopFirst => {
+                        actions.extend(live.iter().map(|o| remove_action(o)));
+                    }
+                }
             }
         }
     }
@@ -101,7 +168,7 @@ pub fn plan(
 mod tests {
     use super::*;
     use minga_state::types::{
-        NodeStatus, PortMapping, ResourceSpec, ServiceMode, TaskSpec, TaskState,
+        NodeStatus, PortMapping, ResourceSpec, ServiceMode, TaskSpec, UpdatePolicy,
     };
     use std::collections::HashMap;
 
@@ -120,6 +187,7 @@ mod tests {
             wg_endpoint: None,
             overlay_ip: None,
             last_seen_unix: None,
+            role: Default::default(),
         }
     }
 
@@ -147,12 +215,20 @@ mod tests {
             labels: HashMap::new(),
             healthcheck: None,
             mounts: vec![],
+            user: None,
+            update: Default::default(),
         }
+    }
+
+    /// The revision placement gives every `svc()` task.
+    fn rev() -> String {
+        let placed = place_service(&svc("web", 1), &[node(1)], &[], &[], 0);
+        placed[0].id.rsplit_once('.').unwrap().1.to_string()
     }
 
     fn task(id: &str, service_id: &str, node_id: u64) -> Task {
         Task {
-            id: id.to_string(),
+            id: format!("{id}.{}", rev()),
             service_id: service_id.to_string(),
             node_id,
             state: TaskState::Running,
@@ -170,10 +246,131 @@ mod tests {
         actions
             .iter()
             .map(|a| match a {
-                ReconcileAction::CreateTask(t) => format!("+{}", t.id),
-                ReconcileAction::RemoveTask { task_id, .. } => format!("-{task_id}"),
+                ReconcileAction::CreateTask(t) => format!("+{}", slot_of(&t.id)),
+                ReconcileAction::RemoveTask { task_id, .. } => {
+                    format!("-{}", slot_of(task_id))
+                }
             })
             .collect()
+    }
+
+    fn updated(order: UpdateOrder, parallelism: u32, replicas: u32) -> Service {
+        Service {
+            image: "nginx:2".to_string(),
+            update: UpdatePolicy { parallelism, order },
+            ..svc("web", replicas)
+        }
+    }
+
+    fn running(service: &Service, nodes: &[ClusterNode]) -> Vec<Task> {
+        let mut tasks = place_service(service, nodes, &[], &[], 0);
+        tasks.iter_mut().for_each(|t| t.state = TaskState::Running);
+        tasks
+    }
+
+    /// Applies actions the way the scheduler does.
+    fn apply(tasks: &mut Vec<Task>, actions: Vec<ReconcileAction>) {
+        for action in actions {
+            match action {
+                ReconcileAction::CreateTask(t) => tasks.push(*t),
+                ReconcileAction::RemoveTask { task_id, .. } => tasks.retain(|t| t.id != task_id),
+            }
+        }
+    }
+
+    fn mark_new_running(tasks: &mut [Task]) {
+        for t in tasks.iter_mut().filter(|t| t.spec.image == "nginx:2") {
+            t.state = TaskState::Running;
+        }
+    }
+
+    #[test]
+    fn stop_first_update_removes_then_creates() {
+        let nodes = vec![node(1)];
+        let mut tasks = running(&svc("web", 1), &nodes);
+        let services = vec![updated(UpdateOrder::StopFirst, 1, 1)];
+
+        let actions = plan(&services, &tasks, &nodes, &[], 0);
+        assert_eq!(task_ids(&actions), vec!["-web.1"]);
+        apply(&mut tasks, actions);
+
+        let actions = plan(&services, &tasks, &nodes, &[], 0);
+        assert_eq!(task_ids(&actions), vec!["+web.1"]);
+        apply(&mut tasks, actions);
+        assert!(plan(&services, &tasks, &nodes, &[], 0).is_empty());
+    }
+
+    #[test]
+    fn start_first_update_keeps_old_until_new_runs() {
+        let nodes = vec![node(1)];
+        let mut tasks = running(&svc("web", 1), &nodes);
+        let services = vec![updated(UpdateOrder::StartFirst, 1, 1)];
+
+        let actions = plan(&services, &tasks, &nodes, &[], 0);
+        assert_eq!(task_ids(&actions), vec!["+web.1"]);
+        apply(&mut tasks, actions);
+        assert_eq!(tasks.len(), 2);
+
+        // Still starting: nothing moves.
+        assert!(plan(&services, &tasks, &nodes, &[], 0).is_empty());
+
+        mark_new_running(&mut tasks);
+        let actions = plan(&services, &tasks, &nodes, &[], 0);
+        assert_eq!(task_ids(&actions), vec!["-web.1"]);
+        apply(&mut tasks, actions);
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].spec.image, "nginx:2");
+    }
+
+    #[test]
+    fn start_first_leaves_old_running_when_new_fails() {
+        let nodes = vec![node(1)];
+        let mut tasks = running(&svc("web", 1), &nodes);
+        let services = vec![updated(UpdateOrder::StartFirst, 1, 1)];
+
+        let actions = plan(&services, &tasks, &nodes, &[], 0);
+        apply(&mut tasks, actions);
+        for t in tasks.iter_mut().filter(|t| t.spec.image == "nginx:2") {
+            t.state = TaskState::Failed;
+        }
+        assert!(plan(&services, &tasks, &nodes, &[], 0).is_empty());
+    }
+
+    #[test]
+    fn parallelism_limits_tasks_replaced_at_once() {
+        let nodes = vec![node(1)];
+        let mut tasks = running(&svc("web", 2), &nodes);
+        let services = vec![updated(UpdateOrder::StartFirst, 1, 2)];
+
+        let actions = plan(&services, &tasks, &nodes, &[], 0);
+        assert_eq!(task_ids(&actions), vec!["+web.1"]);
+        apply(&mut tasks, actions);
+
+        mark_new_running(&mut tasks);
+        let actions = plan(&services, &tasks, &nodes, &[], 0);
+        assert_eq!(task_ids(&actions), vec!["-web.1", "+web.2"]);
+    }
+
+    #[test]
+    fn published_port_forces_stop_first() {
+        let nodes = vec![node(1)];
+        let published = vec![PortMapping {
+            target: 80,
+            published: Some(80),
+            protocol: "tcp".to_string(),
+        }];
+        let old = Service {
+            ports: published.clone(),
+            ..svc("web", 1)
+        };
+        let tasks = running(&old, &nodes);
+        let services = vec![Service {
+            ports: published,
+            ..updated(UpdateOrder::StartFirst, 1, 1)
+        }];
+
+        let actions = plan(&services, &tasks, &nodes, &[], 0);
+        assert_eq!(task_ids(&actions), vec!["-web.1"]);
     }
 
     #[test]

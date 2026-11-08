@@ -77,5 +77,5 @@ This should be recorded as an ADR (Workers leave Raft) before any code moves. Th
 1. Image pull.
 2. Managers-only Raft and worker join (limits 1–3).
 3. WireGuard mesh (limit 5).
-4. Spec-update reprovisioning and healthcheck enforcement.
+4. Healthcheck enforcement and automatic rollback.
 5. Sandbox host capabilities: WASI with explicit grants, outbound HTTP only to the local egress proxy, host-injected workload identity, enforced memory limits (limit 4).

@@ -504,10 +504,11 @@ pub fn spec_to_any_with_image(
     let mut oci = spec_from_task_with_secrets(container_id, spec, secret_mounts, network);
     oci.process.args = args;
     oci.process.cwd = image.cwd.clone();
-    oci.process.user = OciUser {
-        uid: image.uid,
-        gid: image.gid,
+    let (uid, gid) = match &spec.user {
+        Some(user) => super::image::parse_user(user)?,
+        None => (image.uid, image.gid),
     };
+    oci.process.user = OciUser { uid, gid };
     let mut env = image.env.clone();
     let mut overrides: Vec<_> = spec.env.iter().collect();
     overrides.sort_by_key(|(key, _)| *key);

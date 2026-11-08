@@ -16,7 +16,8 @@ use chrono::Utc;
 use minga_state::types::{
     AgentSpec, ClusterNode, Config as MingaConfig, Network, NetworkId, NodeId,
     NodeStatus as MingaNodeStatus, PortMapping, ResourceSpec, RestartCondition, RestartPolicy,
-    Secret as MingaSecret, SecretRef, Service, ServiceMode, Task, TaskState,
+    Secret as MingaSecret, SecretRef, Service, ServiceMode, Task, TaskState, UpdateOrder,
+    UpdatePolicy,
 };
 
 use crate::models;
@@ -85,6 +86,23 @@ pub fn service_spec_to_state(spec: &models::ServiceSpec) -> Result<Service, Stri
                 .MaxAttempts
                 .filter(|&n| n > 0)
                 .map(|n| u32::try_from(n).unwrap_or(u32::MAX)),
+        },
+    };
+
+    // Docker semantics: an absent or zero Parallelism means all at once.
+    let update = match &spec.UpdateConfig {
+        None => UpdatePolicy::default(),
+        Some(u) => UpdatePolicy {
+            parallelism: u
+                .Parallelism
+                .map_or(0, |n| u32::try_from(n).unwrap_or(u32::MAX)),
+            order: match u.Order.as_deref() {
+                None | Some("stop-first") => UpdateOrder::StopFirst,
+                Some("start-first") => UpdateOrder::StartFirst,
+                Some(other) => {
+                    return Err(format!("service '{name}': unknown update order {other:?}"))
+                }
+            },
         },
     };
 
@@ -267,6 +285,8 @@ pub fn service_spec_to_state(spec: &models::ServiceSpec) -> Result<Service, Stri
             .collect(),
         healthcheck,
         mounts,
+        user: container.User.clone(),
+        update,
     })
 }
 
@@ -401,6 +421,7 @@ pub fn service_to_docker(svc: &Service) -> models::Service {
         Command: svc.command.clone(),
         Args: svc.entrypoint.clone(),
         Mounts: mounts,
+        User: svc.user.clone(),
         Healthcheck: healthcheck,
         Secrets: secrets,
         ..Default::default()
@@ -503,7 +524,17 @@ pub fn service_to_docker(svc: &Service) -> models::Service {
                 Platforms: vec![],
             },
             Mode: Some(mode),
-            UpdateConfig: None,
+            UpdateConfig: Some(models::UpdateConfig {
+                Parallelism: Some(u64::from(svc.update.parallelism)),
+                Order: Some(
+                    match svc.update.order {
+                        UpdateOrder::StopFirst => "stop-first",
+                        UpdateOrder::StartFirst => "start-first",
+                    }
+                    .to_string(),
+                ),
+                ..Default::default()
+            }),
             RollbackConfig: None,
             Networks: networks,
             EndpointSpec: endpoint_spec,
@@ -596,10 +627,11 @@ pub fn task_to_docker(task: &Task, networks: &[Network]) -> models::Task {
         TaskState::Failed => ("failed", "shutdown"),
     };
 
+    // Task IDs are `{service}.{slot}.{revision}`.
     let slot = task
         .id
         .rsplit('.')
-        .next()
+        .nth(1)
         .and_then(|s| s.parse::<i32>().ok());
 
     let container_spec = models::ContainerSpec {
@@ -1094,6 +1126,38 @@ mod tests {
     }
 
     #[test]
+    fn user_and_update_policy_survive_the_docker_api_round_trip() {
+        let svc = Service {
+            id: "web".to_string(),
+            name: "web".to_string(),
+            image: "nginx".to_string(),
+            replicas: 1,
+            mode: ServiceMode::Replicated,
+            constraints: vec![],
+            env: HashMap::new(),
+            ports: vec![],
+            networks: vec![],
+            resources: ResourceSpec::default(),
+            agent: None,
+            restart_policy: Default::default(),
+            secrets: vec![],
+            command: vec![],
+            entrypoint: vec![],
+            labels: HashMap::new(),
+            healthcheck: None,
+            mounts: vec![],
+            user: Some("0".to_string()),
+            update: UpdatePolicy {
+                parallelism: 2,
+                order: UpdateOrder::StartFirst,
+            },
+        };
+        let back = service_spec_to_state(&service_to_docker(&svc).Spec).unwrap();
+        assert_eq!(back.user, svc.user);
+        assert_eq!(back.update, svc.update);
+    }
+
+    #[test]
     fn service_to_docker_env_excludes_minga_stack() {
         let svc = Service {
             id: "test".to_string(),
@@ -1119,6 +1183,8 @@ mod tests {
             labels: HashMap::new(),
             healthcheck: None,
             mounts: vec![],
+            user: None,
+            update: Default::default(),
         };
         let docker = service_to_docker(&svc);
         let env = &docker.Spec.TaskTemplate.ContainerSpec.as_ref().unwrap().Env;
@@ -1142,6 +1208,7 @@ mod tests {
             wg_endpoint: None,
             overlay_ip: None,
             last_seen_unix: None,
+            role: Default::default(),
         };
         let docker = node_to_docker(&node, true);
         assert_eq!(docker.ID, "1");
@@ -1163,6 +1230,7 @@ mod tests {
             wg_endpoint: None,
             overlay_ip: None,
             last_seen_unix: None,
+            role: Default::default(),
         };
         let docker = node_to_docker(&node, false);
         assert_eq!(docker.Spec.Role, "worker");
@@ -1181,6 +1249,7 @@ mod tests {
             wg_endpoint: None,
             overlay_ip: None,
             last_seen_unix: None,
+            role: Default::default(),
         };
         let docker = node_to_docker(&node, false);
         assert_eq!(docker.Status.State, "down");
@@ -1189,7 +1258,7 @@ mod tests {
     #[test]
     fn task_to_docker_running() {
         let task = Task {
-            id: "svc1.1".to_string(),
+            id: "svc1.1.abcd1234".to_string(),
             service_id: "svc1".to_string(),
             node_id: 1,
             state: TaskState::Running,
@@ -1202,7 +1271,7 @@ mod tests {
             },
         };
         let docker = task_to_docker(&task, &[]);
-        assert_eq!(docker.ID, "svc1.1");
+        assert_eq!(docker.ID, "svc1.1.abcd1234");
         assert_eq!(docker.ServiceID, "svc1");
         assert_eq!(docker.NodeID, "1");
         assert_eq!(docker.Status.State, "running");
@@ -1213,7 +1282,7 @@ mod tests {
     #[test]
     fn task_to_docker_pending() {
         let task = Task {
-            id: "svc1.1".to_string(),
+            id: "svc1.1.abcd1234".to_string(),
             service_id: "svc1".to_string(),
             node_id: 1,
             state: TaskState::Pending,
@@ -1233,7 +1302,7 @@ mod tests {
     #[test]
     fn task_to_docker_failed() {
         let task = Task {
-            id: "svc1.2".to_string(),
+            id: "svc1.2.abcd1234".to_string(),
             service_id: "svc1".to_string(),
             node_id: 2,
             state: TaskState::Failed,

@@ -67,6 +67,21 @@ async fn run_tolerated(program: &str, args: &[&str]) {
         .await;
 }
 
+/// Inserts an iptables rule unless it is already present.
+async fn ensure_rule(table: &str, chain: &str, rule: &[&str]) -> Result<(), NetError> {
+    let exists = tokio::process::Command::new("iptables")
+        .args(["-t", table, "-C", chain])
+        .args(rule)
+        .output()
+        .await
+        .is_ok_and(|o| o.status.success());
+    if exists {
+        return Ok(());
+    }
+    let args = [&["-t", table, "-I", chain], rule].concat();
+    run("iptables", &args).await
+}
+
 /// A short deterministic hash for interface names (IFNAMSIZ is 16 bytes).
 fn short_hash(s: &str) -> String {
     use std::hash::{Hash, Hasher};
@@ -175,6 +190,34 @@ impl NetworkSetup {
         // Forwarding between bridges and the outside world. Set once;
         // failures surface on the first container start.
         run_tolerated("sysctl", &["-w", "net.ipv4.ip_forward=1"]).await;
+
+        // Task IPs are private to this host: without SNAT, replies from
+        // anything off this bridge have no route back.
+        let cidr = subnet.to_string();
+        ensure_rule(
+            "nat",
+            "POSTROUTING",
+            &["-s", &cidr, "!", "-o", &br, "-j", "MASQUERADE"],
+        )
+        .await?;
+        // Hosts that default FORWARD to DROP (or load br_netfilter) still
+        // pass task traffic and published ports.
+        ensure_rule("filter", "FORWARD", &["-i", &br, "-j", "ACCEPT"]).await?;
+        ensure_rule(
+            "filter",
+            "FORWARD",
+            &[
+                "-o",
+                &br,
+                "-m",
+                "conntrack",
+                "--ctstate",
+                "RELATED,ESTABLISHED,DNAT",
+                "-j",
+                "ACCEPT",
+            ],
+        )
+        .await?;
         Ok(())
     }
 

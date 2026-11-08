@@ -43,6 +43,7 @@ fn identity(id: u64) -> NodeIdentity {
             memory_bytes: 32 * 1024 * 1024 * 1024,
             gpus: 0,
         },
+        role: Default::default(),
     }
 }
 

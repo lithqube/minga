@@ -1,5 +1,25 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+- Rolling updates. A changed service spec now replaces its running tasks,
+  honoring `update_config.order` and `parallelism`. Task IDs carry a spec
+  revision (`{service}.{slot}.{revision}`). A `start-first` replacement that
+  fails to start leaves the old task running. A service with a published
+  port is always `stop-first`. `delay`, `monitor`, `failure_action` and
+  rollback are not implemented, and until healthchecks are enforced
+  `Running` means the process started, not that it is healthy.
+- `node.role` placement constraints.
+- Compose `user` (numeric `uid[:gid]`) reaches the container.
+- `minga secret put` provisions the node-local store from stdin;
+  `talos/provision-secret.yaml` runs it on Talos.
+
+### Fixed
+- Containers could not reach anything off their bridge: there was no SNAT.
+  Each network now gets a `MASQUERADE` rule and `FORWARD` accepts.
+- A service whose own tasks filled a node was evicted by its own placement.
+
 ## [0.1.0] — 2026-11-03
 
 First published production-shaped release: a single binary an operator can

@@ -7,12 +7,16 @@
 //! service's placement constraints, and it has enough remaining CPU, memory
 //! and GPUs.
 //!
-//! Task IDs are deterministic: `{service_id}.{slot}` for replicated
-//! services (slot = 1..=replicas) and `{service_id}.{node_id}` for global
-//! services. This makes reconciliation idempotent — re-running placement
-//! produces the same IDs, so the diff in [`crate::reconcile`] is clean.
+//! Task IDs are deterministic: `{service_id}.{slot}.{revision}` for
+//! replicated services (slot = 1..=replicas) and
+//! `{service_id}.{node_id}.{revision}` for global services, where the
+//! revision is a hash of the task spec. Re-running placement produces the
+//! same IDs, so the diff in [`crate::reconcile`] is clean; changing a
+//! service produces new IDs, which is what starts a rollout.
 
 use std::collections::HashMap;
+
+use sha2::{Digest, Sha256};
 
 use minga_state::types::{
     ClusterNode, Network, NetworkId, NodeId, NodeStatus, ResourceSpec, Service, ServiceMode, Task,
@@ -131,7 +135,11 @@ pub fn place_service(
     // Sum resources consumed by existing tasks (skip terminal states).
     let mut used: HashMap<NodeId, ResourceSpec> = HashMap::new();
     for task in existing_tasks {
-        if matches!(task.state, TaskState::Stopped | TaskState::Failed) {
+        // A service's own tasks are what this placement keeps or replaces;
+        // counting them would evict it from a nearly full node.
+        if task.service_id == service.id
+            || matches!(task.state, TaskState::Stopped | TaskState::Failed)
+        {
             continue;
         }
         let entry = used.entry(task.node_id).or_default();
@@ -206,7 +214,9 @@ pub fn place_service(
         labels: service.labels.clone(),
         healthcheck: service.healthcheck.clone(),
         mounts: service.mounts.clone(),
+        user: service.user.clone(),
     };
+    let revision = spec_revision(&spec);
 
     let mut tasks = Vec::new();
 
@@ -221,7 +231,7 @@ pub fn place_service(
                     );
                     continue;
                 }
-                let task_id = format!("{}.{}", service.id, node.id);
+                let task_id = format!("{}.{}.{revision}", service.id, node.id);
                 let mut spec = spec.clone();
                 spec.ips = allocate_ips(&task_id, &mut ipams);
                 tasks.push(Task {
@@ -244,7 +254,7 @@ pub fn place_service(
                     let idx = (start + i) % candidates.len();
                     let (node, avail) = &mut candidates[idx];
                     if fits(avail, &service.resources) {
-                        let task_id = format!("{}.{}", service.id, slot);
+                        let task_id = format!("{}.{}.{revision}", service.id, slot);
                         let mut spec = spec.clone();
                         spec.ips = allocate_ips(&task_id, &mut ipams);
                         tasks.push(Task {
@@ -271,6 +281,19 @@ pub fn place_service(
     }
 
     tasks
+}
+
+/// Short content hash of a task spec, taken before IPs are assigned. It
+/// goes through `serde_json::Value` because that sorts map keys, and
+/// `HashMap` order differs between instances.
+fn spec_revision(spec: &TaskSpec) -> String {
+    let canonical = serde_json::to_value(spec).expect("task spec serializes");
+    format!("{:x}", Sha256::digest(canonical.to_string()))[..8].to_string()
+}
+
+/// The slot a task fills: its ID without the revision suffix.
+pub fn slot_of(task_id: &str) -> &str {
+    task_id.rsplit_once('.').map_or(task_id, |(slot, _)| slot)
 }
 
 /// Allocates an IP for `task_id` on each IPAM-tracked network. A network
@@ -332,6 +355,7 @@ mod tests {
             wg_endpoint: None,
             overlay_ip: None,
             last_seen_unix: None,
+            role: Default::default(),
         }
     }
 
@@ -359,6 +383,8 @@ mod tests {
             labels: HashMap::new(),
             healthcheck: None,
             mounts: vec![],
+            user: None,
+            update: Default::default(),
         }
     }
 
@@ -375,8 +401,8 @@ mod tests {
         // Round-robin: slot 1 → node 1, slot 2 → node 2
         assert_eq!(tasks[0].node_id, 1);
         assert_eq!(tasks[1].node_id, 2);
-        assert_eq!(tasks[0].id, "web.1");
-        assert_eq!(tasks[1].id, "web.2");
+        assert_eq!(slot_of(&tasks[0].id), "web.1");
+        assert_eq!(slot_of(&tasks[1].id), "web.2");
         assert!(tasks.iter().all(|t| t.state == TaskState::Pending));
     }
 
@@ -403,8 +429,8 @@ mod tests {
         assert_eq!(tasks.len(), 3);
         let node_ids: Vec<u64> = tasks.iter().map(|t| t.node_id).collect();
         assert_eq!(node_ids, vec![1, 2, 3]);
-        assert_eq!(tasks[0].id, "agent.1");
-        assert_eq!(tasks[1].id, "agent.2");
+        assert_eq!(slot_of(&tasks[0].id), "agent.1");
+        assert_eq!(slot_of(&tasks[1].id), "agent.2");
     }
 
     #[test]
@@ -546,6 +572,39 @@ mod tests {
         });
         assert_eq!(counts.get(&1), Some(&2));
         assert_eq!(counts.get(&2), Some(&1));
+    }
+
+    #[test]
+    fn revision_ignores_map_order_and_tracks_the_spec() {
+        let nodes = vec![node(1, 4.0, 1 << 30, 0, &[])];
+        let env = |rev: bool| -> HashMap<String, String> {
+            let mut keys: Vec<u32> = (0..64).collect();
+            if rev {
+                keys.reverse();
+            }
+            keys.iter().map(|k| (format!("K{k}"), "v".into())).collect()
+        };
+        let mut a = svc("web", 1, ServiceMode::Replicated);
+        a.env = env(false);
+        let mut b = a.clone();
+        b.env = env(true);
+        let mut c = a.clone();
+        c.env.insert("K0".to_string(), "changed".to_string());
+
+        let id = |s: &Service| place_service(s, &nodes, &[], &[], 0)[0].id.clone();
+        assert_eq!(id(&a), id(&b));
+        assert_ne!(id(&a), id(&c));
+        assert_eq!(slot_of(&id(&a)), slot_of(&id(&c)));
+    }
+
+    #[test]
+    fn own_tasks_do_not_evict_the_service_from_a_full_node() {
+        let nodes = vec![node(1, 1.0, 1 << 30, 0, &[])];
+        let mut service = svc("web", 1, ServiceMode::Replicated);
+        service.resources.cpus = 1.0;
+        let mut existing = place_service(&service, &nodes, &[], &[], 0);
+        existing[0].state = TaskState::Running;
+        assert_eq!(place_service(&service, &nodes, &existing, &[], 0).len(), 1);
     }
 
     #[test]

@@ -208,6 +208,7 @@ pub async fn create_node(
         // Operator-registered nodes carry no lease: they stay eligible
         // until explicitly removed or drained.
         last_seen_unix: None,
+        role: Default::default(),
     };
     app.store.upsert_node(node.clone()).await?;
     tracing::info!(node = id, address = %node.address, "node registered via API");
@@ -827,6 +828,7 @@ mod tests {
                 wg_endpoint: None,
                 overlay_ip: None,
                 last_seen_unix: None,
+                role: Default::default(),
             })
             .await
             .unwrap();

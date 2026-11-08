@@ -174,6 +174,28 @@ impl SecretStore {
         &self.root
     }
 
+    /// Provisions or rotates a secret's value, in the shape [`Self::resolve`]
+    /// accepts: owner-only, one link. The rename makes rotation atomic.
+    #[cfg(unix)]
+    pub fn put(&self, secret_id: &str, value: &[u8]) -> std::io::Result<PathBuf> {
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+        std::fs::create_dir_all(&self.root)?;
+        std::fs::set_permissions(&self.root, std::fs::Permissions::from_mode(0o700))?;
+        let path = self.root.join(Self::file_name_for(secret_id));
+        let tmp = path.with_extension(format!("tmp{}", std::process::id()));
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        file.write_all(value)?;
+        file.sync_all()?;
+        std::fs::rename(&tmp, &path)?;
+        Ok(path)
+    }
+
     /// Derive the on-disk file name for a secret ID.
     ///
     /// SHA-256 gives a stable, fixed-shape name without user-controlled path
@@ -390,6 +412,16 @@ mod tests {
         assert!(!evil.contains('/'));
         assert!(!evil.contains(".."));
         assert_ne!(evil, a);
+    }
+
+    #[test]
+    fn put_writes_a_value_resolve_accepts_and_rotates_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SecretStore::new(dir.path().join("store"));
+        store.put("stack_key", b"one").unwrap();
+        assert_eq!(store.read_value("stack_key").unwrap(), "one");
+        store.put("stack_key", b"two").unwrap();
+        assert_eq!(store.read_value("stack_key").unwrap(), "two");
     }
 
     #[test]

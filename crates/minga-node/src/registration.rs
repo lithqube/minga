@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use minga_state::types::{
-    unix_now, ClusterNode, NodeId, NodeStatus, ResourceSpec, NODE_LEASE_TTL_SECS,
+    unix_now, ClusterNode, NodeId, NodeRole, NodeStatus, ResourceSpec, NODE_LEASE_TTL_SECS,
     NODE_RENEW_INTERVAL_SECS,
 };
 use minga_state::{StateError, StateStore};
@@ -30,6 +30,7 @@ pub struct NodeIdentity {
     pub labels: HashMap<String, String>,
     /// Compute capacity, e.g. from [`host_capacity`].
     pub capacity: ResourceSpec,
+    pub role: NodeRole,
 }
 
 impl NodeIdentity {
@@ -44,6 +45,7 @@ impl NodeIdentity {
             wg_endpoint: None,
             overlay_ip: None,
             last_seen_unix: Some(unix_now()),
+            role: self.role,
         }
     }
 }
@@ -168,6 +170,7 @@ mod tests {
                 memory_bytes: 1 << 30,
                 gpus: 0,
             },
+            role: Default::default(),
         }
     }
 
