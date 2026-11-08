@@ -181,19 +181,28 @@ impl SecretStore {
         use std::io::Write;
         use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
-        std::fs::create_dir_all(&self.root)?;
-        std::fs::set_permissions(&self.root, std::fs::Permissions::from_mode(0o700))?;
+        if !self.root.exists() {
+            std::fs::create_dir_all(&self.root)?;
+            std::fs::set_permissions(&self.root, std::fs::Permissions::from_mode(0o700))?;
+        }
         let path = self.root.join(Self::file_name_for(secret_id));
         let tmp = path.with_extension(format!("tmp{}", std::process::id()));
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&tmp)?;
-        file.write_all(value)?;
-        file.sync_all()?;
-        std::fs::rename(&tmp, &path)?;
-        Ok(path)
+        // A crash can leave this behind, and PIDs repeat inside containers.
+        let _ = std::fs::remove_file(&tmp);
+        let written = (|| -> std::io::Result<()> {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&tmp)?;
+            file.write_all(value)?;
+            file.sync_all()?;
+            std::fs::rename(&tmp, &path)
+        })();
+        if written.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        written.map(|()| path)
     }
 
     /// Derive the on-disk file name for a secret ID.
@@ -422,6 +431,25 @@ mod tests {
         assert_eq!(store.read_value("stack_key").unwrap(), "one");
         store.put("stack_key", b"two").unwrap();
         assert_eq!(store.read_value("stack_key").unwrap(), "two");
+    }
+
+    #[test]
+    fn put_survives_a_stale_temp_file_and_leaves_an_existing_root_alone() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = SecretStore::new(dir.path());
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o750)).unwrap();
+        let path = dir.path().join(SecretStore::file_name_for("stack_key"));
+        let stale = path.with_extension(format!("tmp{}", std::process::id()));
+        std::fs::write(&stale, "old").unwrap();
+
+        store.put("stack_key", b"new").unwrap();
+
+        assert_eq!(store.read_value("stack_key").unwrap(), "new");
+        assert!(!stale.exists());
+        let mode = std::fs::metadata(dir.path()).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o750);
     }
 
     #[test]

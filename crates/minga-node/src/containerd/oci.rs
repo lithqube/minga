@@ -505,7 +505,7 @@ pub fn spec_to_any_with_image(
     oci.process.args = args;
     oci.process.cwd = image.cwd.clone();
     let (uid, gid) = match &spec.user {
-        Some(user) => super::image::parse_user(user)?,
+        Some(user) => minga_state::types::parse_user(user)?,
         None => (image.uid, image.gid),
     };
     oci.process.user = OciUser { uid, gid };

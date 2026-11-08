@@ -20,7 +20,7 @@ Named after the [minga](https://en.wikipedia.org/wiki/Minga) of Chiloé, where a
 > - Image pull: preload images into the `minga` containerd namespace instead.
 > - Container networking across nodes: there's no WireGuard mesh yet.
 > - Joining a node to a running cluster: Raft membership is fixed at bootstrap.
-> - Healthcheck enforcement, automatic rollback, and host-local port hairpinning.
+> - Healthcheck enforcement, spec-update reprovisioning, automatic rollback, and host-local port hairpinning. Rolling updates are in [Unreleased](CHANGELOG.md).
 >
 > Details: [changelog](CHANGELOG.md), [roadmap](docs/roadmap-v0.1.0.md), [architecture notes](docs/architecture.md).
 >

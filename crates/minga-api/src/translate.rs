@@ -89,6 +89,14 @@ pub fn service_spec_to_state(spec: &models::ServiceSpec) -> Result<Service, Stri
         },
     };
 
+    // Caught here: on the node it fails every start, and a stop-first
+    // update would already have removed the old task.
+    let user = container.User.clone().filter(|u| !u.is_empty());
+    if let Some(user) = &user {
+        minga_state::types::parse_user(user)
+            .map_err(|e| format!("service '{name}': invalid user {user:?}: {e}"))?;
+    }
+
     // Docker semantics: an absent or zero Parallelism means all at once.
     let update = match &spec.UpdateConfig {
         None => UpdatePolicy::default(),
@@ -285,7 +293,7 @@ pub fn service_spec_to_state(spec: &models::ServiceSpec) -> Result<Service, Stri
             .collect(),
         healthcheck,
         mounts,
-        user: container.User.clone(),
+        user,
         update,
     })
 }
@@ -1155,6 +1163,12 @@ mod tests {
         let back = service_spec_to_state(&service_to_docker(&svc).Spec).unwrap();
         assert_eq!(back.user, svc.user);
         assert_eq!(back.update, svc.update);
+
+        let named = Service {
+            user: Some("nginx".to_string()),
+            ..svc
+        };
+        assert!(service_spec_to_state(&service_to_docker(&named).Spec).is_err());
     }
 
     #[test]

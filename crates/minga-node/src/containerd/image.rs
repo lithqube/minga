@@ -1,20 +1,11 @@
 //! Preloaded OCI image metadata resolution for containerd tasks.
 
+use minga_state::types::parse_user;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use super::client::ContainerdClient;
 use super::proto::Image;
-
-/// Parses a numeric `uid[:gid]`; a missing gid is 0. Names would need the
-/// image's `/etc/passwd`, so they fail loudly instead.
-pub fn parse_user(user: &str) -> Result<(u32, u32), &'static str> {
-    let (uid, gid) = user.split_once(':').unwrap_or((user, "0"));
-    Ok((
-        uid.parse().map_err(|_| "named users are not supported")?,
-        gid.parse().map_err(|_| "named groups are not supported")?,
-    ))
-}
 
 const OCI_MANIFEST: &str = "application/vnd.oci.image.manifest.v1+json";
 const DOCKER_MANIFEST: &str = "application/vnd.docker.distribution.manifest.v2+json";

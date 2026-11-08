@@ -244,6 +244,14 @@ fn translate_service(
     // Build the agent spec from the extension, if present.
     let agent = agent_ext.map(agent_extension_to_spec);
 
+    // Caught here: on the node it fails every start, and a stop-first
+    // update would already have removed the old task.
+    if let Some(user) = &svc.user {
+        minga_state::types::parse_user(user).map_err(|e| {
+            TranslateError::Service(name.to_string(), format!("invalid user {user:?}: {e}"))
+        })?;
+    }
+
     let update = match &deploy.update_config {
         None => UpdatePolicy::default(),
         Some(u) => UpdatePolicy {
@@ -718,6 +726,13 @@ mod tests {
         assert_eq!(service.user.as_deref(), Some("0"));
         assert_eq!(service.update.parallelism, 2);
         assert_eq!(service.update.order, UpdateOrder::StartFirst);
+    }
+
+    #[test]
+    fn translate_rejects_a_named_user() {
+        let svc = make_compose_service("image: nginx\nuser: nginx\n");
+        let err = translate_service("web", &svc, "test", &empty_project()).unwrap_err();
+        assert!(err.to_string().contains("invalid user"));
     }
 
     #[test]

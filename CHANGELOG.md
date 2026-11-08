@@ -20,6 +20,11 @@
   Each network now gets a `MASQUERADE` rule and `FORWARD` accepts.
 - A service whose own tasks filled a node was evicted by its own placement.
 
+### Upgrading
+- The cluster state and Raft log are bincode-encoded and their record layouts
+  changed, so state from an earlier build does not decode. Clear `--data-dir`
+  and redeploy. No tagged release has shipped the old layout.
+
 ## [0.1.0] — 2026-11-03
 
 First published production-shaped release: a single binary an operator can

@@ -70,7 +70,7 @@ async fn run_tolerated(program: &str, args: &[&str]) {
 /// Inserts an iptables rule unless it is already present.
 async fn ensure_rule(table: &str, chain: &str, rule: &[&str]) -> Result<(), NetError> {
     let exists = tokio::process::Command::new("iptables")
-        .args(["-t", table, "-C", chain])
+        .args(["-w", "5", "-t", table, "-C", chain])
         .args(rule)
         .output()
         .await
@@ -78,7 +78,7 @@ async fn ensure_rule(table: &str, chain: &str, rule: &[&str]) -> Result<(), NetE
     if exists {
         return Ok(());
     }
-    let args = [&["-t", table, "-I", chain], rule].concat();
+    let args = [&["-w", "5", "-t", table, "-I", chain], rule].concat();
     run("iptables", &args).await
 }
 
@@ -340,6 +340,8 @@ impl NetworkSetup {
             run(
                 "iptables",
                 &[
+                    "-w",
+                    "5",
                     "-t",
                     "nat",
                     "-A",
@@ -359,6 +361,8 @@ impl NetworkSetup {
             run(
                 "iptables",
                 &[
+                    "-w",
+                    "5",
                     "-t",
                     "nat",
                     "-A",
@@ -419,6 +423,8 @@ impl NetworkSetup {
                         run_tolerated(
                             "iptables",
                             &[
+                                "-w",
+                                "5",
                                 "-t",
                                 "nat",
                                 "-D",
@@ -437,6 +443,8 @@ impl NetworkSetup {
                         run_tolerated(
                             "iptables",
                             &[
+                                "-w",
+                                "5",
                                 "-t",
                                 "nat",
                                 "-D",
