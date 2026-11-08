@@ -157,6 +157,7 @@ impl Scheduler {
                     };
                     tracing::warn!(service = %service_id, "rollout failed, rolling back");
                     let mut rolled_back = *previous;
+                    rolled_back.rollback = current.rollback;
                     if let Some(rollback_policy) = &current.rollback {
                         rolled_back.update = *rollback_policy;
                     }

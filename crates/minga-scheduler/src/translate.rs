@@ -254,40 +254,7 @@ fn translate_service(
 
     let update = match &deploy.update_config {
         None => UpdatePolicy::default(),
-        Some(u) => UpdatePolicy {
-            parallelism: u.parallelism.unwrap_or(1),
-            order: match u.order.as_deref() {
-                None | Some("stop-first") => UpdateOrder::StopFirst,
-                Some("start-first") => UpdateOrder::StartFirst,
-                Some(other) => {
-                    return Err(TranslateError::Service(
-                        name.to_string(),
-                        format!("unknown update_config.order {other:?}"),
-                    ))
-                }
-            },
-            delay_secs: u
-                .delay
-                .as_deref()
-                .and_then(parse_duration_secs)
-                .unwrap_or(0),
-            monitor_secs: u
-                .monitor
-                .as_deref()
-                .and_then(parse_duration_secs)
-                .unwrap_or(UpdatePolicy::default().monitor_secs),
-            failure_action: match u.failure_action.as_deref() {
-                None | Some("pause") => FailureAction::Pause,
-                Some("continue") => FailureAction::Continue,
-                Some("rollback") => FailureAction::Rollback,
-                Some(other) => {
-                    return Err(TranslateError::Service(
-                        name.to_string(),
-                        format!("unknown update_config.failure_action {other:?}"),
-                    ))
-                }
-            },
-        },
+        Some(u) => compose_update_config_to_policy(u, name, "update_config")?,
     };
 
     // Translate restart policy from Compose deploy.restart_policy.
@@ -314,29 +281,52 @@ fn translate_service(
         mounts,
         user: svc.user.clone(),
         update,
-        rollback: deploy.rollback_config.as_ref().map(|r| UpdatePolicy {
-            parallelism: r.parallelism.unwrap_or(1),
-            order: match r.order.as_deref() {
-                Some("start-first") => UpdateOrder::StartFirst,
-                _ => UpdateOrder::StopFirst,
-            },
-            delay_secs: r
-                .delay
-                .as_deref()
-                .and_then(parse_duration_secs)
-                .unwrap_or(0),
-            monitor_secs: r
-                .monitor
-                .as_deref()
-                .and_then(parse_duration_secs)
-                .unwrap_or(UpdatePolicy::default().monitor_secs),
-            failure_action: match r.failure_action.as_deref() {
-                Some("continue") => FailureAction::Continue,
-                Some("rollback") => FailureAction::Rollback,
-                _ => FailureAction::Pause,
-            },
-        }),
+        rollback: match &deploy.rollback_config {
+            None => None,
+            Some(r) => Some(compose_update_config_to_policy(r, name, "rollback_config")?),
+        },
         previous: None,
+    })
+}
+
+fn compose_update_config_to_policy(
+    u: &minga_compose::UpdateConfig,
+    service_name: &str,
+    kind: &str,
+) -> Result<UpdatePolicy, TranslateError> {
+    Ok(UpdatePolicy {
+        parallelism: u.parallelism.unwrap_or(1),
+        order: match u.order.as_deref() {
+            None | Some("stop-first") => UpdateOrder::StopFirst,
+            Some("start-first") => UpdateOrder::StartFirst,
+            Some(other) => {
+                return Err(TranslateError::Service(
+                    service_name.to_string(),
+                    format!("unknown {kind}.order {other:?}"),
+                ))
+            }
+        },
+        delay_secs: u
+            .delay
+            .as_deref()
+            .and_then(parse_duration_secs)
+            .unwrap_or(0),
+        monitor_secs: u
+            .monitor
+            .as_deref()
+            .and_then(parse_duration_secs)
+            .unwrap_or(UpdatePolicy::default().monitor_secs),
+        failure_action: match u.failure_action.as_deref() {
+            None | Some("pause") => FailureAction::Pause,
+            Some("continue") => FailureAction::Continue,
+            Some("rollback") => FailureAction::Rollback,
+            Some(other) => {
+                return Err(TranslateError::Service(
+                    service_name.to_string(),
+                    format!("unknown {kind}.failure_action {other:?}"),
+                ))
+            }
+        },
     })
 }
 

@@ -477,13 +477,18 @@ impl ContainerdRuntime {
     async fn pull_image(&self, image_ref: &str) -> Result<(), RuntimeError> {
         tracing::info!(image = %image_ref, "pulling image via ctr");
 
-        let pull = tokio::process::Command::new("ctr")
-            .args(["-n", "minga", "images", "pull", image_ref])
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .output()
-            .await
-            .map_err(|e| RuntimeError::Start(format!("spawn ctr pull: {e}")))?;
+        let pull = tokio::time::timeout(
+            Duration::from_secs(300),
+            tokio::process::Command::new("ctr")
+                .args(["-n", "minga", "images", "pull", image_ref])
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        .map_err(|_| RuntimeError::Start(format!("ctr pull {image_ref} timed out after 300s")))?
+        .map_err(|e| RuntimeError::Start(format!("spawn ctr pull: {e}")))?;
 
         if !pull.status.success() {
             let stderr = String::from_utf8_lossy(&pull.stderr);
@@ -493,13 +498,18 @@ impl ContainerdRuntime {
             )));
         }
 
-        let unpack = tokio::process::Command::new("ctr")
-            .args(["-n", "minga", "images", "unpack", image_ref])
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .output()
-            .await
-            .map_err(|e| RuntimeError::Start(format!("spawn ctr unpack: {e}")))?;
+        let unpack = tokio::time::timeout(
+            Duration::from_secs(120),
+            tokio::process::Command::new("ctr")
+                .args(["-n", "minga", "images", "unpack", image_ref])
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        .map_err(|_| RuntimeError::Start(format!("ctr unpack {image_ref} timed out after 120s")))?
+        .map_err(|e| RuntimeError::Start(format!("spawn ctr unpack: {e}")))?;
 
         if !unpack.status.success() {
             let stderr = String::from_utf8_lossy(&unpack.stderr);
