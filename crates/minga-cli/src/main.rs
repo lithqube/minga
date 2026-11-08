@@ -92,6 +92,11 @@ enum Command {
         #[arg(long, env = "MINGA_NATS_URL")]
         nats_url: Option<String>,
     },
+    /// Container image management.
+    Image {
+        #[command(subcommand)]
+        cmd: ImageCommand,
+    },
 }
 
 #[derive(Subcommand)]
@@ -101,6 +106,15 @@ enum AgentCommand {
         /// NATS server URL (e.g. nats://localhost:4222).
         #[arg(long, env = "MINGA_NATS_URL")]
         nats_url: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum ImageCommand {
+    /// Pull an image from a registry into the Minga containerd namespace.
+    Pull {
+        /// Fully qualified image reference (e.g. ghcr.io/org/app:latest).
+        image_ref: String,
     },
 }
 
@@ -516,6 +530,7 @@ async fn main() -> ExitCode {
         } => {
             return run_logs(&task_id, follow, tail, nats_url.as_deref()).await;
         }
+        Command::Image { cmd } => return run_image(cmd).await,
     }
     ExitCode::SUCCESS
 }
@@ -1717,5 +1732,52 @@ fn print_log_entry(entry: &minga_bus::LogEntry) {
     } else {
         print!("{data}");
         let _ = std::io::stdout().flush();
+    }
+}
+
+async fn run_image(cmd: ImageCommand) -> ExitCode {
+    match cmd {
+        ImageCommand::Pull { image_ref } => {
+            eprintln!("pulling {image_ref} into containerd namespace minga …");
+
+            let pull = tokio::process::Command::new("ctr")
+                .args(["-n", "minga", "images", "pull", &image_ref])
+                .status()
+                .await;
+
+            match pull {
+                Ok(status) if status.success() => {}
+                Ok(status) => {
+                    eprintln!("error: ctr pull exited with {status}");
+                    return ExitCode::FAILURE;
+                }
+                Err(e) => {
+                    eprintln!("error: cannot run ctr: {e}");
+                    return ExitCode::FAILURE;
+                }
+            }
+
+            eprintln!("unpacking {image_ref} …");
+
+            let unpack = tokio::process::Command::new("ctr")
+                .args(["-n", "minga", "images", "unpack", &image_ref])
+                .status()
+                .await;
+
+            match unpack {
+                Ok(status) if status.success() => {
+                    eprintln!("done");
+                    ExitCode::SUCCESS
+                }
+                Ok(status) => {
+                    eprintln!("error: ctr unpack exited with {status}");
+                    ExitCode::FAILURE
+                }
+                Err(e) => {
+                    eprintln!("error: cannot run ctr: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
     }
 }

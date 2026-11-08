@@ -30,6 +30,42 @@ pub const AGENT_LABEL: &str = "minga.agent";
 // Inbound: Docker → Minga
 // ---------------------------------------------------------------------------
 
+/// Docker semantics: absent or zero Parallelism means all at once.
+fn docker_update_config_to_policy(
+    u: &models::UpdateConfig,
+    service_name: &str,
+    kind: &str,
+) -> Result<UpdatePolicy, String> {
+    Ok(UpdatePolicy {
+        parallelism: u
+            .Parallelism
+            .map_or(0, |n| u32::try_from(n).unwrap_or(u32::MAX)),
+        order: match u.Order.as_deref() {
+            None | Some("stop-first") => UpdateOrder::StopFirst,
+            Some("start-first") => UpdateOrder::StartFirst,
+            Some(other) => {
+                return Err(format!(
+                    "service '{service_name}': unknown {kind} order {other:?}"
+                ))
+            }
+        },
+        delay_secs: u.Delay.map_or(0, |n| n.div_ceil(1_000_000_000)),
+        monitor_secs: u.Monitor.map_or(UpdatePolicy::default().monitor_secs, |n| {
+            n.div_ceil(1_000_000_000)
+        }),
+        failure_action: match u.FailureAction.as_deref() {
+            None | Some("pause") => FailureAction::Pause,
+            Some("continue") => FailureAction::Continue,
+            Some("rollback") => FailureAction::Rollback,
+            Some(other) => {
+                return Err(format!(
+                    "service '{service_name}': unknown {kind} failure action {other:?}"
+                ))
+            }
+        },
+    })
+}
+
 /// Translates a Docker `ServiceSpec` into a Minga `Service`.
 ///
 /// The Docker service `Name` (e.g. `mystack_web`) becomes the Minga
@@ -97,35 +133,14 @@ pub fn service_spec_to_state(spec: &models::ServiceSpec) -> Result<Service, Stri
             .map_err(|e| format!("service '{name}': invalid user {user:?}: {e}"))?;
     }
 
-    // Docker semantics: an absent or zero Parallelism means all at once.
     let update = match &spec.UpdateConfig {
         None => UpdatePolicy::default(),
-        Some(u) => UpdatePolicy {
-            parallelism: u
-                .Parallelism
-                .map_or(0, |n| u32::try_from(n).unwrap_or(u32::MAX)),
-            order: match u.Order.as_deref() {
-                None | Some("stop-first") => UpdateOrder::StopFirst,
-                Some("start-first") => UpdateOrder::StartFirst,
-                Some(other) => {
-                    return Err(format!("service '{name}': unknown update order {other:?}"))
-                }
-            },
-            delay_secs: u.Delay.map_or(0, |n| n.div_ceil(1_000_000_000)),
-            monitor_secs: u.Monitor.map_or(UpdatePolicy::default().monitor_secs, |n| {
-                n.div_ceil(1_000_000_000)
-            }),
-            failure_action: match u.FailureAction.as_deref() {
-                None | Some("pause") => FailureAction::Pause,
-                Some("continue") => FailureAction::Continue,
-                Some("rollback") => FailureAction::Rollback,
-                Some(other) => {
-                    return Err(format!(
-                        "service '{name}': unknown failure action {other:?}"
-                    ))
-                }
-            },
-        },
+        Some(u) => docker_update_config_to_policy(u, &name, "update")?,
+    };
+
+    let rollback = match &spec.RollbackConfig {
+        None => None,
+        Some(r) => Some(docker_update_config_to_policy(r, &name, "rollback")?),
     };
 
     // Parse env list ("KEY=VAL") into a map.
@@ -309,6 +324,7 @@ pub fn service_spec_to_state(spec: &models::ServiceSpec) -> Result<Service, Stri
         mounts,
         user,
         update,
+        rollback,
         previous: None,
     })
 }
@@ -568,7 +584,27 @@ pub fn service_to_docker(svc: &Service) -> models::Service {
                 ),
                 ..Default::default()
             }),
-            RollbackConfig: None,
+            RollbackConfig: svc.rollback.map(|r| models::UpdateConfig {
+                Parallelism: Some(r.parallelism as u64),
+                Delay: Some(r.delay_secs * 1_000_000_000),
+                Monitor: Some(r.monitor_secs * 1_000_000_000),
+                FailureAction: Some(
+                    match r.failure_action {
+                        FailureAction::Pause => "pause",
+                        FailureAction::Continue => "continue",
+                        FailureAction::Rollback => "rollback",
+                    }
+                    .to_string(),
+                ),
+                Order: Some(
+                    match r.order {
+                        UpdateOrder::StopFirst => "stop-first",
+                        UpdateOrder::StartFirst => "start-first",
+                    }
+                    .to_string(),
+                ),
+                ..Default::default()
+            }),
             Networks: networks,
             EndpointSpec: endpoint_spec,
         },
@@ -1185,6 +1221,7 @@ mod tests {
                 order: UpdateOrder::StartFirst,
                 ..Default::default()
             },
+            rollback: None,
             previous: None,
         };
         let back = service_spec_to_state(&service_to_docker(&svc).Spec).unwrap();
@@ -1226,6 +1263,7 @@ mod tests {
             mounts: vec![],
             user: None,
             update: Default::default(),
+            rollback: None,
             previous: None,
         };
         let docker = service_to_docker(&svc);

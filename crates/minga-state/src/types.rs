@@ -237,6 +237,9 @@ pub struct Service {
     /// How tasks are replaced when the spec changes.
     #[serde(default)]
     pub update: UpdatePolicy,
+    /// How tasks are replaced when rolling back to `previous`.
+    #[serde(default)]
+    pub rollback: Option<UpdatePolicy>,
     /// The spec this one replaced, kept until the rollout settles.
     #[serde(default)]
     pub previous: Option<Box<Service>>,
@@ -556,6 +559,7 @@ mod tests {
             mounts: vec![],
             user: None,
             update: Default::default(),
+            rollback: None,
             previous: None,
         };
         let bytes = bincode::serde::encode_to_vec(&svc, bincode::config::standard()).unwrap();
