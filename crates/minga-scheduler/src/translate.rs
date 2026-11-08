@@ -314,6 +314,28 @@ fn translate_service(
         mounts,
         user: svc.user.clone(),
         update,
+        rollback: deploy.rollback_config.as_ref().map(|r| UpdatePolicy {
+            parallelism: r.parallelism.unwrap_or(1),
+            order: match r.order.as_deref() {
+                Some("start-first") => UpdateOrder::StartFirst,
+                _ => UpdateOrder::StopFirst,
+            },
+            delay_secs: r
+                .delay
+                .as_deref()
+                .and_then(parse_duration_secs)
+                .unwrap_or(0),
+            monitor_secs: r
+                .monitor
+                .as_deref()
+                .and_then(parse_duration_secs)
+                .unwrap_or(UpdatePolicy::default().monitor_secs),
+            failure_action: match r.failure_action.as_deref() {
+                Some("continue") => FailureAction::Continue,
+                Some("rollback") => FailureAction::Rollback,
+                _ => FailureAction::Pause,
+            },
+        }),
         previous: None,
     })
 }

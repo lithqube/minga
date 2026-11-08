@@ -149,15 +149,18 @@ impl Scheduler {
                     }
                 }
                 ReconcileAction::RollbackService(service_id) => {
-                    let Some(previous) = services
-                        .iter()
-                        .find(|s| &s.id == service_id)
-                        .and_then(|s| s.previous.clone())
-                    else {
+                    let Some(current) = services.iter().find(|s| &s.id == service_id) else {
+                        continue;
+                    };
+                    let Some(previous) = current.previous.clone() else {
                         continue;
                     };
                     tracing::warn!(service = %service_id, "rollout failed, rolling back");
-                    self.state.upsert_service(*previous).await?;
+                    let mut rolled_back = *previous;
+                    if let Some(rollback_policy) = &current.rollback {
+                        rolled_back.update = *rollback_policy;
+                    }
+                    self.state.upsert_service(rolled_back).await?;
                 }
                 ReconcileAction::SettleService(service_id) => {
                     let Some(service) = services.iter().find(|s| &s.id == service_id) else {

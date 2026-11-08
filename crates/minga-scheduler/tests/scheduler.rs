@@ -53,6 +53,7 @@ fn make_service(id: &str, replicas: u32) -> Service {
         mounts: vec![],
         user: None,
         update: Default::default(),
+        rollback: None,
         previous: None,
     }
 }

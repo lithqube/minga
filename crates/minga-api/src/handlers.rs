@@ -443,6 +443,7 @@ pub async fn update_service(
     let comparable = |s: &minga_state::types::Service| minga_state::types::Service {
         previous: None,
         update: Default::default(),
+        rollback: None,
         ..s.clone()
     };
     svc.previous = if comparable(&svc) == comparable(existing) {

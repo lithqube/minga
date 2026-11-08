@@ -128,6 +128,25 @@ pub fn service_spec_to_state(spec: &models::ServiceSpec) -> Result<Service, Stri
         },
     };
 
+    let rollback = spec.RollbackConfig.as_ref().map(|r| UpdatePolicy {
+        parallelism: r
+            .Parallelism
+            .map_or(1, |n| u32::try_from(n).unwrap_or(u32::MAX)),
+        order: match r.Order.as_deref() {
+            Some("start-first") => UpdateOrder::StartFirst,
+            _ => UpdateOrder::StopFirst,
+        },
+        delay_secs: r.Delay.map_or(0, |n| n.div_ceil(1_000_000_000)),
+        monitor_secs: r.Monitor.map_or(UpdatePolicy::default().monitor_secs, |n| {
+            n.div_ceil(1_000_000_000)
+        }),
+        failure_action: match r.FailureAction.as_deref() {
+            Some("continue") => FailureAction::Continue,
+            Some("rollback") => FailureAction::Rollback,
+            _ => FailureAction::Pause,
+        },
+    });
+
     // Parse env list ("KEY=VAL") into a map.
     let mut env: HashMap<String, String> = HashMap::new();
     for e in &container.Env {
@@ -309,6 +328,7 @@ pub fn service_spec_to_state(spec: &models::ServiceSpec) -> Result<Service, Stri
         mounts,
         user,
         update,
+        rollback,
         previous: None,
     })
 }
@@ -568,7 +588,26 @@ pub fn service_to_docker(svc: &Service) -> models::Service {
                 ),
                 ..Default::default()
             }),
-            RollbackConfig: None,
+            RollbackConfig: svc.rollback.map(|r| models::UpdateConfig {
+                Parallelism: Some(r.parallelism as u64),
+                Delay: Some(r.delay_secs * 1_000_000_000),
+                FailureAction: Some(
+                    match r.failure_action {
+                        FailureAction::Pause => "pause",
+                        FailureAction::Continue => "continue",
+                        FailureAction::Rollback => "rollback",
+                    }
+                    .to_string(),
+                ),
+                Order: Some(
+                    match r.order {
+                        UpdateOrder::StopFirst => "stop-first",
+                        UpdateOrder::StartFirst => "start-first",
+                    }
+                    .to_string(),
+                ),
+                ..Default::default()
+            }),
             Networks: networks,
             EndpointSpec: endpoint_spec,
         },
@@ -1185,6 +1224,7 @@ mod tests {
                 order: UpdateOrder::StartFirst,
                 ..Default::default()
             },
+            rollback: None,
             previous: None,
         };
         let back = service_spec_to_state(&service_to_docker(&svc).Spec).unwrap();
@@ -1226,6 +1266,7 @@ mod tests {
             mounts: vec![],
             user: None,
             update: Default::default(),
+            rollback: None,
             previous: None,
         };
         let docker = service_to_docker(&svc);

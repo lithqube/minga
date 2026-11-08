@@ -389,6 +389,7 @@ mod tests {
             mounts: vec![],
             user: None,
             update: Default::default(),
+            rollback: None,
             previous: None,
         }
     }
