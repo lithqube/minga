@@ -115,6 +115,8 @@ mod tests {
                     .collect(),
                 ..Default::default()
             },
+            restarts: 0,
+            running_since_unix: None,
         }
     }
 

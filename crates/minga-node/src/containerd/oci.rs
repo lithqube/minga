@@ -457,6 +457,26 @@ pub fn spec_to_any(container_id: &str, spec: &TaskSpec) -> Result<prost_types::A
     })
 }
 
+/// The process spec for running `args` inside a container: same user, env
+/// and working directory as the container's own process.
+pub fn exec_process_any(
+    container_spec: &prost_types::Any,
+    args: &[String],
+) -> Result<prost_types::Any, String> {
+    let spec: serde_json::Value = serde_json::from_slice(&container_spec.value)
+        .map_err(|e| format!("invalid container spec: {e}"))?;
+    let mut process = spec["process"].clone();
+    if !process.is_object() {
+        return Err("container spec has no process".to_string());
+    }
+    process["args"] = serde_json::json!(args);
+    process["terminal"] = serde_json::json!(false);
+    Ok(prost_types::Any {
+        type_url: "types.containerd.io/opencontainers/runtime-spec/1/Process".to_string(),
+        value: serde_json::to_vec(&process).map_err(|e| e.to_string())?,
+    })
+}
+
 /// Serialize an OCI spec that includes secret mounts.
 pub fn spec_to_any_with_secrets(
     container_id: &str,

@@ -438,6 +438,22 @@ pub async fn update_service(
     svc.id = existing.id.clone();
     svc.name = existing.name.clone();
 
+    // A redeploy of the same spec is not a rollout, so it keeps whatever
+    // rollback target is already there.
+    let comparable = |s: &minga_state::types::Service| minga_state::types::Service {
+        previous: None,
+        update: Default::default(),
+        ..s.clone()
+    };
+    svc.previous = if comparable(&svc) == comparable(existing) {
+        existing.previous.clone()
+    } else {
+        Some(Box::new(minga_state::types::Service {
+            previous: None,
+            ..existing.clone()
+        }))
+    };
+
     ensure_placeable(&app, &svc, Some(&svc.id)).await?;
 
     app.store.upsert_service(svc.clone()).await?;
@@ -869,6 +885,8 @@ mod tests {
                     },
                     ..Default::default()
                 },
+                restarts: 0,
+                running_since_unix: None,
             })
             .await
             .unwrap();

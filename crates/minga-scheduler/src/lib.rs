@@ -44,6 +44,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use minga_bus::{Command, EventBus};
+use minga_state::types::Service;
 use minga_state::{StateError, StateStore};
 use thiserror::Error;
 
@@ -146,6 +147,29 @@ impl Scheduler {
                             );
                         }
                     }
+                }
+                ReconcileAction::RollbackService(service_id) => {
+                    let Some(previous) = services
+                        .iter()
+                        .find(|s| &s.id == service_id)
+                        .and_then(|s| s.previous.clone())
+                    else {
+                        continue;
+                    };
+                    tracing::warn!(service = %service_id, "rollout failed, rolling back");
+                    self.state.upsert_service(*previous).await?;
+                }
+                ReconcileAction::SettleService(service_id) => {
+                    let Some(service) = services.iter().find(|s| &s.id == service_id) else {
+                        continue;
+                    };
+                    tracing::info!(service = %service_id, "rollout settled");
+                    self.state
+                        .upsert_service(Service {
+                            previous: None,
+                            ..service.clone()
+                        })
+                        .await?;
                 }
                 ReconcileAction::RemoveTask { task_id, node_id } => {
                     tracing::info!(task = %task_id, "removing task");

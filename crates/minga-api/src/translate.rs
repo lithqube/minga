@@ -14,7 +14,7 @@ use std::collections::HashMap;
 
 use chrono::Utc;
 use minga_state::types::{
-    AgentSpec, ClusterNode, Config as MingaConfig, Network, NetworkId, NodeId,
+    AgentSpec, ClusterNode, Config as MingaConfig, FailureAction, Network, NetworkId, NodeId,
     NodeStatus as MingaNodeStatus, PortMapping, ResourceSpec, RestartCondition, RestartPolicy,
     Secret as MingaSecret, SecretRef, Service, ServiceMode, Task, TaskState, UpdateOrder,
     UpdatePolicy,
@@ -109,6 +109,20 @@ pub fn service_spec_to_state(spec: &models::ServiceSpec) -> Result<Service, Stri
                 Some("start-first") => UpdateOrder::StartFirst,
                 Some(other) => {
                     return Err(format!("service '{name}': unknown update order {other:?}"))
+                }
+            },
+            delay_secs: u.Delay.map_or(0, |n| n.div_ceil(1_000_000_000)),
+            monitor_secs: u.Monitor.map_or(UpdatePolicy::default().monitor_secs, |n| {
+                n.div_ceil(1_000_000_000)
+            }),
+            failure_action: match u.FailureAction.as_deref() {
+                None | Some("pause") => FailureAction::Pause,
+                Some("continue") => FailureAction::Continue,
+                Some("rollback") => FailureAction::Rollback,
+                Some(other) => {
+                    return Err(format!(
+                        "service '{name}': unknown failure action {other:?}"
+                    ))
                 }
             },
         },
@@ -295,6 +309,7 @@ pub fn service_spec_to_state(spec: &models::ServiceSpec) -> Result<Service, Stri
         mounts,
         user,
         update,
+        previous: None,
     })
 }
 
@@ -534,6 +549,16 @@ pub fn service_to_docker(svc: &Service) -> models::Service {
             Mode: Some(mode),
             UpdateConfig: Some(models::UpdateConfig {
                 Parallelism: Some(u64::from(svc.update.parallelism)),
+                Delay: Some(svc.update.delay_secs * 1_000_000_000),
+                Monitor: Some(svc.update.monitor_secs * 1_000_000_000),
+                FailureAction: Some(
+                    match svc.update.failure_action {
+                        FailureAction::Pause => "pause",
+                        FailureAction::Continue => "continue",
+                        FailureAction::Rollback => "rollback",
+                    }
+                    .to_string(),
+                ),
                 Order: Some(
                     match svc.update.order {
                         UpdateOrder::StopFirst => "stop-first",
@@ -1158,7 +1183,9 @@ mod tests {
             update: UpdatePolicy {
                 parallelism: 2,
                 order: UpdateOrder::StartFirst,
+                ..Default::default()
             },
+            previous: None,
         };
         let back = service_spec_to_state(&service_to_docker(&svc).Spec).unwrap();
         assert_eq!(back.user, svc.user);
@@ -1199,6 +1226,7 @@ mod tests {
             mounts: vec![],
             user: None,
             update: Default::default(),
+            previous: None,
         };
         let docker = service_to_docker(&svc);
         let env = &docker.Spec.TaskTemplate.ContainerSpec.as_ref().unwrap().Env;
@@ -1283,6 +1311,8 @@ mod tests {
                 resources: ResourceSpec::default(),
                 ..Default::default()
             },
+            restarts: 0,
+            running_since_unix: None,
         };
         let docker = task_to_docker(&task, &[]);
         assert_eq!(docker.ID, "svc1.1.abcd1234");
@@ -1307,6 +1337,8 @@ mod tests {
                 resources: ResourceSpec::default(),
                 ..Default::default()
             },
+            restarts: 0,
+            running_since_unix: None,
         };
         let docker = task_to_docker(&task, &[]);
         assert_eq!(docker.Status.State, "pending");
@@ -1327,6 +1359,8 @@ mod tests {
                 resources: ResourceSpec::default(),
                 ..Default::default()
             },
+            restarts: 0,
+            running_since_unix: None,
         };
         let docker = task_to_docker(&task, &[]);
         assert_eq!(docker.Status.State, "failed");

@@ -95,6 +95,7 @@ fn sample_service(id: &str) -> Service {
         mounts: vec![],
         user: None,
         update: Default::default(),
+        previous: None,
     }
 }
 

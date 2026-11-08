@@ -90,6 +90,23 @@ pub struct UpdatePolicy {
     /// Tasks replaced at a time; 0 means all at once.
     pub parallelism: u32,
     pub order: UpdateOrder,
+    /// Seconds a replaced batch must stay up before the next one starts.
+    #[serde(default)]
+    pub delay_secs: u64,
+    /// Seconds a replacement must stay up before the rollout counts as done.
+    #[serde(default)]
+    pub monitor_secs: u64,
+    #[serde(default)]
+    pub failure_action: FailureAction,
+}
+
+/// What a rollout does when a replacement fails.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FailureAction {
+    #[default]
+    Pause,
+    Continue,
+    Rollback,
 }
 
 impl Default for UpdatePolicy {
@@ -97,6 +114,9 @@ impl Default for UpdatePolicy {
         Self {
             parallelism: 1,
             order: UpdateOrder::StopFirst,
+            delay_secs: 0,
+            monitor_secs: 5,
+            failure_action: FailureAction::Pause,
         }
     }
 }
@@ -217,6 +237,9 @@ pub struct Service {
     /// How tasks are replaced when the spec changes.
     #[serde(default)]
     pub update: UpdatePolicy,
+    /// The spec this one replaced, kept until the rollout settles.
+    #[serde(default)]
+    pub previous: Option<Box<Service>>,
 }
 
 /// A container healthcheck (Compose/Docker shape).
@@ -276,6 +299,12 @@ pub struct Task {
     pub node_id: NodeId,
     pub state: TaskState,
     pub spec: TaskSpec,
+    /// When the task last became `Running`.
+    #[serde(default)]
+    pub running_since_unix: Option<u64>,
+    /// Times the container exited or failed to start and was retried.
+    #[serde(default)]
+    pub restarts: u32,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -527,6 +556,7 @@ mod tests {
             mounts: vec![],
             user: None,
             update: Default::default(),
+            previous: None,
         };
         let bytes = bincode::serde::encode_to_vec(&svc, bincode::config::standard()).unwrap();
         let (back, _): (Service, _) =

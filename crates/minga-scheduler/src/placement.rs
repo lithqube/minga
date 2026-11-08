@@ -240,6 +240,8 @@ pub fn place_service(
                     node_id: node.id,
                     state: TaskState::Pending,
                     spec,
+                    restarts: 0,
+                    running_since_unix: None,
                 });
                 consume(avail, &service.resources);
             }
@@ -263,6 +265,8 @@ pub fn place_service(
                             node_id: node.id,
                             state: TaskState::Pending,
                             spec,
+                            restarts: 0,
+                            running_since_unix: None,
                         });
                         consume(avail, &service.resources);
                         placed = true;
@@ -385,6 +389,7 @@ mod tests {
             mounts: vec![],
             user: None,
             update: Default::default(),
+            previous: None,
         }
     }
 
@@ -500,6 +505,8 @@ mod tests {
                 },
                 ..Default::default()
             },
+            restarts: 0,
+            running_since_unix: None,
         }];
         let tasks = place_service(&service, &nodes, &existing, &[], 0);
         assert_eq!(tasks.len(), 2);
@@ -532,6 +539,8 @@ mod tests {
                 },
                 ..Default::default()
             },
+            restarts: 0,
+            running_since_unix: None,
         }];
         let tasks = place_service(&service, &nodes, &existing, &[], 0);
         assert_eq!(tasks.len(), 1);

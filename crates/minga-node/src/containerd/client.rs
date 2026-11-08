@@ -221,6 +221,87 @@ impl ContainerdClient {
         Ok(response.exit_status)
     }
 
+    /// Create a process inside a running task, with no stdio.
+    pub async fn exec_process(
+        &mut self,
+        container_id: &str,
+        exec_id: &str,
+        spec: prost_types::Any,
+    ) -> Result<(), ClientError> {
+        let request = ExecProcessRequest {
+            container_id: container_id.to_string(),
+            stdin: String::new(),
+            stdout: String::new(),
+            stderr: String::new(),
+            terminal: false,
+            spec: Some(spec),
+            exec_id: exec_id.to_string(),
+        };
+        let _: ExecProcessResponse = self.unary(request, paths::TASK_EXEC).await?;
+        Ok(())
+    }
+
+    /// Start a process created with [`Self::exec_process`].
+    pub async fn start_process(
+        &mut self,
+        container_id: &str,
+        exec_id: &str,
+    ) -> Result<(), ClientError> {
+        let request = StartRequest {
+            container_id: container_id.to_string(),
+            exec_id: exec_id.to_string(),
+        };
+        let _: StartResponse = self.unary(request, paths::TASK_START).await?;
+        Ok(())
+    }
+
+    /// Read an exec process's status.
+    pub async fn get_process(
+        &mut self,
+        container_id: &str,
+        exec_id: &str,
+    ) -> Result<Process, ClientError> {
+        let request = GetTaskRequest {
+            container_id: container_id.to_string(),
+            exec_id: exec_id.to_string(),
+        };
+        let response: GetTaskResponse = self.unary(request, paths::TASK_GET).await?;
+        response
+            .process
+            .ok_or_else(|| ClientError::TaskNotFound(container_id.to_string()))
+    }
+
+    /// Kill an exec process.
+    pub async fn kill_process(
+        &mut self,
+        container_id: &str,
+        exec_id: &str,
+        signal: u32,
+    ) -> Result<(), ClientError> {
+        let request = KillRequest {
+            container_id: container_id.to_string(),
+            exec_id: exec_id.to_string(),
+            signal,
+            all: false,
+        };
+        let _: KillResponse = self.unary(request, paths::TASK_KILL).await?;
+        Ok(())
+    }
+
+    /// Remove a finished exec process.
+    pub async fn delete_process(
+        &mut self,
+        container_id: &str,
+        exec_id: &str,
+    ) -> Result<(), ClientError> {
+        let request = DeleteProcessRequest {
+            container_id: container_id.to_string(),
+            exec_id: exec_id.to_string(),
+        };
+        let _: DeleteTaskResponse = self.unary(request, paths::TASK_DELETE_PROCESS).await?;
+        Ok(())
+    }
+
     // --- ImageService -------------------------------------------------------
 
     /// Check if an image exists. Returns `Ok(Some(image))` if found,

@@ -13,7 +13,8 @@
 use std::collections::{HashMap, HashSet};
 
 use minga_state::types::{
-    ClusterNode, Network, NodeId, Service, Task, TaskId, TaskState, UpdateOrder,
+    ClusterNode, FailureAction, Network, NodeId, Service, ServiceId, Task, TaskId, TaskState,
+    UpdateOrder,
 };
 
 use crate::placement::{place_service, slot_of};
@@ -26,10 +27,24 @@ pub enum ReconcileAction {
     /// Remove a task from the state store. Carries the node_id so the
     /// scheduler can publish a stop command to the right node via the bus.
     RemoveTask { task_id: TaskId, node_id: NodeId },
+    /// A rollout failed: put the service's previous spec back.
+    RollbackService(ServiceId),
+    /// A rollout finished its monitor window: forget the previous spec.
+    SettleService(ServiceId),
 }
 
 fn is_live(task: &Task) -> bool {
     !matches!(task.state, TaskState::Stopped | TaskState::Failed)
+}
+
+fn has_failed(task: &Task) -> bool {
+    task.state == TaskState::Failed || task.restarts > 0
+}
+
+/// Whether a task has been up for at least `secs`.
+fn has_run_for(task: &Task, secs: u64, now_unix: u64) -> bool {
+    task.running_since_unix
+        .map_or(true, |since| since + secs <= now_unix)
 }
 
 fn remove_action(task: &Task) -> ReconcileAction {
@@ -94,6 +109,20 @@ pub fn plan(
             }
         }
 
+        let update = service.update;
+        let current = |t: &Task| existing_by_id.get(t.id.as_str()).copied();
+
+        // A rollout keeps the previous spec until it settles; a failure of
+        // the new revision before then follows `failure_action`.
+        let in_rollout = service.previous.is_some();
+        if in_rollout
+            && update.failure_action == FailureAction::Rollback
+            && desired.iter().any(|t| current(t).is_some_and(has_failed))
+        {
+            actions.push(ReconcileAction::RollbackService(service.id.clone()));
+            continue;
+        }
+
         // A published port can't be held by two tasks at once.
         let order = if service.ports.iter().any(|p| p.published.is_some()) {
             UpdateOrder::StopFirst
@@ -104,8 +133,12 @@ pub fn plan(
         // Tasks starting now, or still starting, use up the update budget.
         let busy = desired
             .iter()
-            .filter(|t| match existing_by_id.get(t.id.as_str()) {
-                Some(current) => current.state != TaskState::Running,
+            .filter(|t| match current(t) {
+                Some(task) if has_failed(task) => update.failure_action != FailureAction::Continue,
+                Some(task) => {
+                    task.state != TaskState::Running
+                        || !has_run_for(task, update.delay_secs, now_unix)
+                }
                 None => !outgoing
                     .get(slot_of(&t.id))
                     .is_some_and(|old| old.iter().any(|o| is_live(o))),
@@ -121,11 +154,10 @@ pub fn plan(
                 .get(slot_of(&task.id))
                 .map_or(&[][..], Vec::as_slice);
 
-            if let Some(current) = existing_by_id.get(task.id.as_str()) {
-                // shortcut: Running means the process started, not that it
-                // is healthy; gate on the healthcheck once it is enforced.
-                // Until then a new task that fails leaves the old one up.
-                if current.state == TaskState::Running {
+            if let Some(new) = current(task) {
+                // With a healthcheck, Running means the first probe passed.
+                // A new task that fails leaves the old one up.
+                if new.state == TaskState::Running && !has_failed(new) {
                     actions.extend(old.iter().map(|o| remove_action(o)));
                 }
                 continue;
@@ -148,6 +180,17 @@ pub fn plan(
                     }
                 }
             }
+        }
+
+        let settled = desired.iter().all(|t| {
+            current(t).is_some_and(|task| {
+                task.state == TaskState::Running
+                    && !has_failed(task)
+                    && has_run_for(task, update.monitor_secs, now_unix)
+            })
+        });
+        if in_rollout && outgoing.is_empty() && settled {
+            actions.push(ReconcileAction::SettleService(service.id.clone()));
         }
     }
 
@@ -217,6 +260,7 @@ mod tests {
             mounts: vec![],
             user: None,
             update: Default::default(),
+            previous: None,
         }
     }
 
@@ -239,6 +283,8 @@ mod tests {
                 resources: ResourceSpec::default(),
                 ..Default::default()
             },
+            restarts: 0,
+            running_since_unix: None,
         }
     }
 
@@ -250,6 +296,8 @@ mod tests {
                 ReconcileAction::RemoveTask { task_id, .. } => {
                     format!("-{}", slot_of(task_id))
                 }
+                ReconcileAction::RollbackService(id) => format!("rollback {id}"),
+                ReconcileAction::SettleService(id) => format!("settle {id}"),
             })
             .collect()
     }
@@ -257,7 +305,11 @@ mod tests {
     fn updated(order: UpdateOrder, parallelism: u32, replicas: u32) -> Service {
         Service {
             image: "nginx:2".to_string(),
-            update: UpdatePolicy { parallelism, order },
+            update: UpdatePolicy {
+                parallelism,
+                order,
+                ..Default::default()
+            },
             ..svc("web", replicas)
         }
     }
@@ -274,6 +326,7 @@ mod tests {
             match action {
                 ReconcileAction::CreateTask(t) => tasks.push(*t),
                 ReconcileAction::RemoveTask { task_id, .. } => tasks.retain(|t| t.id != task_id),
+                _ => {}
             }
         }
     }
@@ -334,6 +387,74 @@ mod tests {
             t.state = TaskState::Failed;
         }
         assert!(plan(&services, &tasks, &nodes, &[], 0).is_empty());
+    }
+
+    /// A service mid-rollout from `svc("web", 1)` to `nginx:2`.
+    fn rolling(failure_action: FailureAction, monitor_secs: u64) -> Service {
+        let mut service = updated(UpdateOrder::StartFirst, 1, 1);
+        service.update.failure_action = failure_action;
+        service.update.monitor_secs = monitor_secs;
+        service.previous = Some(Box::new(svc("web", 1)));
+        service
+    }
+
+    #[test]
+    fn a_restart_during_the_rollout_triggers_rollback() {
+        let nodes = vec![node(1)];
+        let service = rolling(FailureAction::Rollback, 30);
+        let mut tasks = running(&svc("web", 1), &nodes);
+        let services = vec![service];
+        let actions = plan(&services, &tasks, &nodes, &[], 0);
+        apply(&mut tasks, actions);
+        for t in tasks.iter_mut().filter(|t| t.spec.image == "nginx:2") {
+            t.restarts = 1;
+        }
+        let actions = plan(&services, &tasks, &nodes, &[], 0);
+        assert_eq!(task_ids(&actions), vec!["rollback web"]);
+    }
+
+    #[test]
+    fn pause_holds_the_rollout_and_keeps_the_old_task() {
+        let nodes = vec![node(1)];
+        let services = vec![rolling(FailureAction::Pause, 30)];
+        let mut tasks = running(&svc("web", 1), &nodes);
+        let actions = plan(&services, &tasks, &nodes, &[], 0);
+        apply(&mut tasks, actions);
+        for t in tasks.iter_mut().filter(|t| t.spec.image == "nginx:2") {
+            t.state = TaskState::Running;
+            t.restarts = 1;
+        }
+        assert!(plan(&services, &tasks, &nodes, &[], 0).is_empty());
+    }
+
+    #[test]
+    fn rollout_settles_only_after_the_monitor_window() {
+        let nodes = vec![node(1)];
+        let services = vec![rolling(FailureAction::Rollback, 30)];
+        let mut tasks = running(&services[0], &nodes);
+        tasks[0].running_since_unix = Some(1000);
+        assert!(plan(&services, &tasks, &nodes, &[], 1029).is_empty());
+        let actions = plan(&services, &tasks, &nodes, &[], 1030);
+        assert_eq!(task_ids(&actions), vec!["settle web"]);
+    }
+
+    #[test]
+    fn delay_spaces_out_batches() {
+        let nodes = vec![node(1)];
+        let mut service = updated(UpdateOrder::StartFirst, 1, 2);
+        service.update.delay_secs = 10;
+        let services = vec![service];
+        let mut tasks = running(&svc("web", 2), &nodes);
+        let actions = plan(&services, &tasks, &nodes, &[], 1000);
+        apply(&mut tasks, actions);
+        for t in tasks.iter_mut().filter(|t| t.spec.image == "nginx:2") {
+            t.state = TaskState::Running;
+            t.running_since_unix = Some(1000);
+        }
+        let held = plan(&services, &tasks, &nodes, &[], 1009);
+        assert_eq!(task_ids(&held), vec!["-web.1"]);
+        let next = plan(&services, &tasks, &nodes, &[], 1010);
+        assert_eq!(task_ids(&next), vec!["-web.1", "+web.2"]);
     }
 
     #[test]
