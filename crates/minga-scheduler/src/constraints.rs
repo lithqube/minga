@@ -5,7 +5,7 @@
 //! a [`ClusterNode`]. Unknown fields fail loudly — a constraint we cannot
 //! evaluate must never silently pass.
 
-use minga_state::types::ClusterNode;
+use minga_state::types::{ClusterNode, NodeRole};
 use thiserror::Error;
 
 #[derive(Debug, Error, PartialEq)]
@@ -33,7 +33,7 @@ pub struct Constraint {
 
 /// Parses a constraint string like `node.labels.gpu == true`.
 ///
-/// Phase 0 supports `node.id` and `node.labels.<key>`. Anything else is
+/// Supported fields: `node.id`, `node.role`, `node.labels.<key>`. Anything else is
 /// an error — we fail loudly rather than silently ignoring a constraint
 /// the user thinks is being enforced.
 pub fn parse_constraint(s: &str) -> Result<Constraint, ConstraintError> {
@@ -50,7 +50,7 @@ pub fn parse_constraint(s: &str) -> Result<Constraint, ConstraintError> {
         return Err(ConstraintError::Syntax(s.to_string()));
     }
 
-    if field != "node.id" && !field.starts_with("node.labels.") {
+    if field != "node.id" && field != "node.role" && !field.starts_with("node.labels.") {
         return Err(ConstraintError::UnsupportedField(
             s.to_string(),
             field.to_string(),
@@ -97,6 +97,15 @@ fn resolve_field(field: &str, node: &ClusterNode) -> Option<String> {
     if field == "node.id" {
         return Some(node.id.to_string());
     }
+    if field == "node.role" {
+        return Some(
+            match node.role {
+                NodeRole::Manager => "manager",
+                NodeRole::Worker => "worker",
+            }
+            .to_string(),
+        );
+    }
     if let Some(key) = field.strip_prefix("node.labels.") {
         return node.labels.get(key).cloned();
     }
@@ -123,6 +132,7 @@ mod tests {
             wg_endpoint: None,
             overlay_ip: None,
             last_seen_unix: None,
+            role: Default::default(),
         }
     }
 
@@ -198,6 +208,15 @@ mod tests {
         assert!(evaluate(&c, &n));
         let c = parse_constraint("node.id != 3").unwrap();
         assert!(!evaluate(&c, &n));
+    }
+
+    #[test]
+    fn match_node_role() {
+        let mut n = node(1, &[]);
+        assert!(matches_str("node.role == worker", &n));
+        n.role = NodeRole::Manager;
+        assert!(matches_str("node.role == manager", &n));
+        assert!(!matches_str("node.role == worker", &n));
     }
 
     #[test]

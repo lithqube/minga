@@ -100,6 +100,19 @@ pub trait Runtime: Send + Sync {
     /// of lines returned (0 = all available). Returns an empty vec if the
     /// container is not found or has no logs.
     async fn logs(&self, container_id: &str, tail: usize) -> Vec<ContainerLog>;
+
+    /// Runs a command inside a running container and returns its exit
+    /// code. Used for healthchecks.
+    async fn exec(
+        &self,
+        container_id: &str,
+        args: &[String],
+        timeout: std::time::Duration,
+    ) -> Result<i32, RuntimeError>;
+
+    /// Force-kills a container's process. The container stays around, so
+    /// the restart policy sees an ordinary exit.
+    async fn kill(&self, container_id: &str) -> Result<(), RuntimeError>;
 }
 
 // --- MockRuntime ---------------------------------------------------------------
@@ -119,6 +132,8 @@ pub struct MockRuntime {
     pub failed_containers: Mutex<HashSet<String>>,
     /// Exit codes for containers marked as failed. Defaults to 1.
     pub exit_codes: Mutex<HashMap<String, i32>>,
+    /// What `exec()` returns per container. Defaults to 0 (healthy).
+    pub exec_codes: Mutex<HashMap<String, i32>>,
 }
 
 #[derive(Debug, Clone)]
@@ -251,6 +266,24 @@ impl Runtime for MockRuntime {
             ContainerStatus::Stopped => Some(0),
         };
         Some(ContainerState { status, exit_code })
+    }
+
+    async fn exec(
+        &self,
+        container_id: &str,
+        _args: &[String],
+        _timeout: std::time::Duration,
+    ) -> Result<i32, RuntimeError> {
+        if !self.containers.lock().unwrap().contains_key(container_id) {
+            return Err(RuntimeError::NotFound(container_id.to_string()));
+        }
+        let codes = self.exec_codes.lock().unwrap();
+        Ok(codes.get(container_id).copied().unwrap_or(0))
+    }
+
+    async fn kill(&self, container_id: &str) -> Result<(), RuntimeError> {
+        self.mark_failed_with_code(container_id, 137);
+        Ok(())
     }
 
     async fn logs(&self, container_id: &str, tail: usize) -> Vec<ContainerLog> {

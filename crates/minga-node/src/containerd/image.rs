@@ -1,5 +1,6 @@
 //! Preloaded OCI image metadata resolution for containerd tasks.
 
+use minga_state::types::parse_user;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
@@ -211,13 +212,7 @@ impl ImageConfiguration {
         let (uid, gid) = if user.is_empty() {
             (0, 0)
         } else {
-            let (uid, gid) = user.split_once(':').unwrap_or((user, "0"));
-            (
-                uid.parse()
-                    .map_err(|_| "named image users are not supported")?,
-                gid.parse()
-                    .map_err(|_| "named image groups are not supported")?,
-            )
+            parse_user(user)?
         };
         if value["rootfs"]["type"] != "layers" {
             return Err("image rootfs is not layered".into());
@@ -389,6 +384,14 @@ mod tests {
         assert!(ImageConfiguration::parse(&json, "arm64").is_err());
         json["config"]["User"] = serde_json::json!("0");
         assert!(ImageConfiguration::parse(&json, "arm64").is_err());
+    }
+
+    #[test]
+    fn parses_numeric_users_and_refuses_names() {
+        assert_eq!(parse_user("0"), Ok((0, 0)));
+        assert_eq!(parse_user("1000:1001"), Ok((1000, 1001)));
+        assert!(parse_user("app").is_err());
+        assert!(parse_user("1000:app").is_err());
     }
 
     #[test]

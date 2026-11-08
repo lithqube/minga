@@ -41,6 +41,7 @@ fn sample_node(id: u64) -> ClusterNode {
         wg_endpoint: None,
         overlay_ip: None,
         last_seen_unix: None,
+        role: Default::default(),
     }
 }
 
@@ -72,6 +73,9 @@ fn sample_service(id: &str) -> Service {
         labels: HashMap::new(),
         healthcheck: None,
         mounts: vec![],
+        user: None,
+        update: Default::default(),
+        previous: None,
     }
 }
 
@@ -88,6 +92,8 @@ fn sample_task(id: &str, service_id: &str, node_id: u64) -> Task {
             resources: ResourceSpec::default(),
             ..Default::default()
         },
+        restarts: 0,
+        running_since_unix: None,
     }
 }
 

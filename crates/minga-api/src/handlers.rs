@@ -208,6 +208,7 @@ pub async fn create_node(
         // Operator-registered nodes carry no lease: they stay eligible
         // until explicitly removed or drained.
         last_seen_unix: None,
+        role: Default::default(),
     };
     app.store.upsert_node(node.clone()).await?;
     tracing::info!(node = id, address = %node.address, "node registered via API");
@@ -436,6 +437,22 @@ pub async fn update_service(
     }
     svc.id = existing.id.clone();
     svc.name = existing.name.clone();
+
+    // A redeploy of the same spec is not a rollout, so it keeps whatever
+    // rollback target is already there.
+    let comparable = |s: &minga_state::types::Service| minga_state::types::Service {
+        previous: None,
+        update: Default::default(),
+        ..s.clone()
+    };
+    svc.previous = if comparable(&svc) == comparable(existing) {
+        existing.previous.clone()
+    } else {
+        Some(Box::new(minga_state::types::Service {
+            previous: None,
+            ..existing.clone()
+        }))
+    };
 
     ensure_placeable(&app, &svc, Some(&svc.id)).await?;
 
@@ -827,6 +844,7 @@ mod tests {
                 wg_endpoint: None,
                 overlay_ip: None,
                 last_seen_unix: None,
+                role: Default::default(),
             })
             .await
             .unwrap();
@@ -867,6 +885,8 @@ mod tests {
                     },
                     ..Default::default()
                 },
+                restarts: 0,
+                running_since_unix: None,
             })
             .await
             .unwrap();

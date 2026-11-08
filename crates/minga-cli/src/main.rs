@@ -59,6 +59,11 @@ enum Command {
         #[command(subcommand)]
         cmd: TlsCommand,
     },
+    /// Node-local secret store.
+    Secret {
+        #[command(subcommand)]
+        cmd: SecretCommand,
+    },
     /// Run the Docker Engine API server (Swarm-compatible REST API).
     Api(ApiArgs),
     /// Agent sandbox management.
@@ -498,6 +503,7 @@ async fn main() -> ExitCode {
         Command::Net { cmd } => return run_net(cmd),
         Command::Wg { cmd } => return run_wg(cmd),
         Command::Tls { cmd } => return run_tls(cmd),
+        Command::Secret { cmd } => return run_secret(cmd),
         Command::Api(args) => return run_api(args).await,
         Command::Sandbox { cmd } => return run_sandbox(cmd).await,
         Command::Egress(args) => return run_egress(args).await,
@@ -587,6 +593,44 @@ async fn run_api(args: ApiArgs) -> ExitCode {
 }
 
 /// Cluster PKI operations: CA creation and node certificate issuance.
+#[derive(Subcommand)]
+enum SecretCommand {
+    /// Provision or rotate a secret on this node. The value is read from
+    /// stdin so it never reaches argv or shell history.
+    Put {
+        /// Secret ID: `<stack>_<compose secret key>`.
+        id: String,
+        /// Directory holding the node-local secret store.
+        #[arg(long, default_value = "/var/lib/minga/secrets")]
+        secret_store: String,
+    },
+}
+
+fn run_secret(cmd: SecretCommand) -> ExitCode {
+    use std::io::Read;
+
+    let SecretCommand::Put { id, secret_store } = cmd;
+    let mut value = Vec::new();
+    if let Err(e) = std::io::stdin().read_to_end(&mut value) {
+        eprintln!("error: cannot read the secret value from stdin: {e}");
+        return ExitCode::FAILURE;
+    }
+    if value.is_empty() {
+        eprintln!("error: no secret value on stdin");
+        return ExitCode::FAILURE;
+    }
+    match minga_node::secrets::SecretStore::new(&secret_store).put(&id, &value) {
+        Ok(_) => {
+            println!("secret `{id}` provisioned in {secret_store}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("error: cannot write secret `{id}`: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 fn run_tls(cmd: TlsCommand) -> ExitCode {
     match cmd {
         TlsCommand::InitCa { dir } => {
@@ -770,6 +814,11 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
         address: args.bind.clone(),
         labels,
         capacity: minga_node::host_capacity(),
+        role: if is_manager {
+            minga_state::types::NodeRole::Manager
+        } else {
+            minga_state::types::NodeRole::Worker
+        },
     };
     let membership = match minga_node::NodeMembership::start(state.clone(), identity).await {
         Ok(m) => m,

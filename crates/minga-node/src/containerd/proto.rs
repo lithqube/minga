@@ -256,6 +256,37 @@ pub struct KillRequest {
 #[derive(Clone, PartialEq, Message)]
 pub struct KillResponse {}
 
+/// `containerd.services.tasks.v1.ExecProcessRequest`
+#[derive(Clone, PartialEq, Message)]
+pub struct ExecProcessRequest {
+    #[prost(string, tag = "1")]
+    pub container_id: String,
+    #[prost(string, tag = "2")]
+    pub stdin: String,
+    #[prost(string, tag = "3")]
+    pub stdout: String,
+    #[prost(string, tag = "4")]
+    pub stderr: String,
+    #[prost(bool, tag = "5")]
+    pub terminal: bool,
+    #[prost(message, optional, tag = "6")]
+    pub spec: Option<prost_types::Any>,
+    #[prost(string, tag = "7")]
+    pub exec_id: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct ExecProcessResponse {}
+
+/// `containerd.services.tasks.v1.DeleteProcessRequest`
+#[derive(Clone, PartialEq, Message)]
+pub struct DeleteProcessRequest {
+    #[prost(string, tag = "1")]
+    pub container_id: String,
+    #[prost(string, tag = "2")]
+    pub exec_id: String,
+}
+
 /// `containerd.services.tasks.v1.DeleteTaskRequest`
 ///
 /// containerd v1.7: `container_id=1` (no exec_id).
@@ -456,6 +487,8 @@ pub mod paths {
     pub const TASK_CREATE: &str = "/containerd.services.tasks.v1.Tasks/Create";
     pub const TASK_START: &str = "/containerd.services.tasks.v1.Tasks/Start";
     pub const TASK_KILL: &str = "/containerd.services.tasks.v1.Tasks/Kill";
+    pub const TASK_EXEC: &str = "/containerd.services.tasks.v1.Tasks/Exec";
+    pub const TASK_DELETE_PROCESS: &str = "/containerd.services.tasks.v1.Tasks/DeleteProcess";
     pub const TASK_DELETE: &str = "/containerd.services.tasks.v1.Tasks/Delete";
     pub const TASK_GET: &str = "/containerd.services.tasks.v1.Tasks/Get";
     pub const TASK_LIST: &str = "/containerd.services.tasks.v1.Tasks/List";

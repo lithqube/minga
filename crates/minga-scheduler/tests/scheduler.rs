@@ -27,6 +27,7 @@ fn make_node(id: u64, cpus: f64, mem: u64) -> ClusterNode {
         wg_endpoint: None,
         overlay_ip: None,
         last_seen_unix: None,
+        role: Default::default(),
     }
 }
 
@@ -50,6 +51,9 @@ fn make_service(id: &str, replicas: u32) -> Service {
         labels: HashMap::new(),
         healthcheck: None,
         mounts: vec![],
+        user: None,
+        update: Default::default(),
+        previous: None,
     }
 }
 
@@ -83,8 +87,8 @@ async fn reconcile_creates_tasks_for_service() {
     let tasks = store.list_tasks().await.unwrap();
     assert_eq!(tasks.len(), 2);
     let ids: Vec<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
-    assert!(ids.contains(&"app.web.1"));
-    assert!(ids.contains(&"app.web.2"));
+    assert!(ids.iter().any(|id| id.starts_with("app.web.1.")));
+    assert!(ids.iter().any(|id| id.starts_with("app.web.2.")));
 
     // Tasks should be spread across both nodes.
     let node_ids: Vec<u64> = tasks.iter().map(|t| t.node_id).collect();
@@ -211,7 +215,7 @@ async fn reconcile_handles_scale_down() {
 
     let tasks = store.list_tasks().await.unwrap();
     assert_eq!(tasks.len(), 1);
-    assert_eq!(tasks[0].id, "app.web.1");
+    assert!(tasks[0].id.starts_with("app.web.1."));
 
     drop(scheduler);
     Arc::try_unwrap(store)

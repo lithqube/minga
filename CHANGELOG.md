@@ -1,5 +1,37 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+- Rolling updates. A changed service spec now replaces its running tasks,
+  honoring `update_config` (`order`, `parallelism`, `delay`, `monitor`,
+  `failure_action`). Task IDs carry a spec revision
+  (`{service}.{slot}.{revision}`). A service with a published port is always
+  `stop-first`. `failure_action: rollback` restores the previous spec when a
+  replacement restarts or fails before the monitor window ends, using the
+  restored spec's own `update_config`; `rollback_config` is not read.
+- Healthcheck enforcement. A task with a healthcheck stays `Starting`, out of
+  DNS, until its first probe passes, and is killed after `retries` straight
+  failures so the restart policy takes over.
+- `node.role` placement constraints.
+- Compose `user` (numeric `uid[:gid]`) reaches the container.
+- `minga secret put` provisions the node-local store from stdin;
+  `talos/provision-secret.yaml` runs it on Talos.
+
+### Fixed
+- Containers could not reach anything off their bridge: there was no SNAT.
+  Each network now gets a `MASQUERADE` rule and `FORWARD` accepts.
+- A service whose own tasks filled a node was evicted by its own placement.
+- The restart policy was bypassed: any task not tracked as running was
+  restarted on the next pass, ignoring backoff, `max_attempts` and
+  `condition: none`. A crashed task also stayed `Running`. Tasks now end
+  `Failed` or `Stopped`, and show `Starting` while being retried.
+
+### Upgrading
+- The cluster state and Raft log are bincode-encoded and their record layouts
+  changed, so state from an earlier build does not decode. Clear `--data-dir`
+  and redeploy. No tagged release has shipped the old layout.
+
 ## [0.1.0] — 2026-11-03
 
 First published production-shaped release: a single binary an operator can

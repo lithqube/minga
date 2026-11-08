@@ -34,6 +34,8 @@ args:
   # resolved by runc on the host. A UserVolume mounts at /var/mnt/<name>
   # on the host, so use that identical path inside.
   - --data-dir=/var/mnt/minga-state
+  # Staged secrets are bind-mounted by runc on the host: same path rule.
+  - --secret-store=/var/mnt/minga-state/secrets
   - --runtime=containerd
   - --containerd-socket=/run/containerd/containerd.sock
   - --metrics-bind=0.0.0.0:9100

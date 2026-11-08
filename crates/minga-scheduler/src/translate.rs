@@ -14,7 +14,8 @@ use std::collections::HashMap;
 
 use minga_compose::{AgentExtension, DeployMode, DeviceCount, Project, DEFAULT_NETWORK};
 use minga_state::types::{
-    AgentSpec, Config as StateConfig, Network, ResourceSpec, Secret, Service, ServiceMode, Volume,
+    AgentSpec, Config as StateConfig, FailureAction, Network, ResourceSpec, Secret, Service,
+    ServiceMode, UpdateOrder, UpdatePolicy, Volume,
 };
 use thiserror::Error;
 
@@ -243,6 +244,52 @@ fn translate_service(
     // Build the agent spec from the extension, if present.
     let agent = agent_ext.map(agent_extension_to_spec);
 
+    // Caught here: on the node it fails every start, and a stop-first
+    // update would already have removed the old task.
+    if let Some(user) = &svc.user {
+        minga_state::types::parse_user(user).map_err(|e| {
+            TranslateError::Service(name.to_string(), format!("invalid user {user:?}: {e}"))
+        })?;
+    }
+
+    let update = match &deploy.update_config {
+        None => UpdatePolicy::default(),
+        Some(u) => UpdatePolicy {
+            parallelism: u.parallelism.unwrap_or(1),
+            order: match u.order.as_deref() {
+                None | Some("stop-first") => UpdateOrder::StopFirst,
+                Some("start-first") => UpdateOrder::StartFirst,
+                Some(other) => {
+                    return Err(TranslateError::Service(
+                        name.to_string(),
+                        format!("unknown update_config.order {other:?}"),
+                    ))
+                }
+            },
+            delay_secs: u
+                .delay
+                .as_deref()
+                .and_then(parse_duration_secs)
+                .unwrap_or(0),
+            monitor_secs: u
+                .monitor
+                .as_deref()
+                .and_then(parse_duration_secs)
+                .unwrap_or(UpdatePolicy::default().monitor_secs),
+            failure_action: match u.failure_action.as_deref() {
+                None | Some("pause") => FailureAction::Pause,
+                Some("continue") => FailureAction::Continue,
+                Some("rollback") => FailureAction::Rollback,
+                Some(other) => {
+                    return Err(TranslateError::Service(
+                        name.to_string(),
+                        format!("unknown update_config.failure_action {other:?}"),
+                    ))
+                }
+            },
+        },
+    };
+
     // Translate restart policy from Compose deploy.restart_policy.
     let restart_policy = translate_restart_policy(&deploy.restart_policy, &svc.restart);
 
@@ -265,6 +312,9 @@ fn translate_service(
         labels,
         healthcheck,
         mounts,
+        user: svc.user.clone(),
+        update,
+        previous: None,
     })
 }
 
@@ -680,6 +730,37 @@ mod tests {
         );
         let result = translate_service("agent", &svc, "test", &empty_project());
         assert!(result.is_ok(), "agent service without image should succeed");
+    }
+
+    #[test]
+    fn translate_user_and_update_config() {
+        let svc = make_compose_service(
+            r#"
+            image: nginx
+            user: "0"
+            deploy:
+              update_config:
+                parallelism: 2
+                order: start-first
+                delay: 10s
+                monitor: 1m
+                failure_action: rollback
+            "#,
+        );
+        let service = translate_service("web", &svc, "test", &empty_project()).unwrap();
+        assert_eq!(service.user.as_deref(), Some("0"));
+        assert_eq!(service.update.parallelism, 2);
+        assert_eq!(service.update.order, UpdateOrder::StartFirst);
+        assert_eq!(service.update.delay_secs, 10);
+        assert_eq!(service.update.monitor_secs, 60);
+        assert_eq!(service.update.failure_action, FailureAction::Rollback);
+    }
+
+    #[test]
+    fn translate_rejects_a_named_user() {
+        let svc = make_compose_service("image: nginx\nuser: nginx\n");
+        let err = translate_service("web", &svc, "test", &empty_project()).unwrap_err();
+        assert!(err.to_string().contains("invalid user"));
     }
 
     #[test]

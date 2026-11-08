@@ -46,13 +46,14 @@ use minga_bus::{
     subjects, Command, EventBus, LogEntry, LogStream, TaskActualState, TaskStatusReport,
 };
 use minga_state::types::{
-    NodeId, RestartCondition, Task, TaskId, TaskSpec, TaskState, WorkloadKind,
+    unix_now, NodeId, RestartCondition, Task, TaskId, TaskSpec, TaskState, WorkloadKind,
 };
 use minga_state::{StateError, StateStore};
 use thiserror::Error;
 use tokio::sync::Mutex;
 
 use crate::agent::{AgentError, AgentExecutor, AgentStatus};
+use crate::health::{self, Health};
 use crate::runtime::{Runtime, RuntimeError};
 
 #[derive(Debug, Error)]
@@ -138,7 +139,7 @@ fn build_dns_store(
 
     let mut store = minga_net::DnsStore::new();
     for task in tasks {
-        if matches!(task.state, TaskState::Stopped | TaskState::Failed) {
+        if task.state != TaskState::Running {
             continue;
         }
         let Some(svc) = services.iter().find(|s| s.id == task.service_id) else {
@@ -189,6 +190,7 @@ pub struct Supervisor {
     bus_assigned: BusAssignedTasks,
     log_offsets: LogOffsets,
     restart_states: RestartStates,
+    health: Arc<Mutex<HashMap<TaskId, Health>>>,
     #[cfg(target_os = "linux")]
     networking: Option<SupervisorNetworking>,
 }
@@ -206,6 +208,7 @@ impl Supervisor {
             bus_assigned: Arc::new(Mutex::new(HashSet::new())),
             log_offsets: Arc::new(Mutex::new(HashMap::new())),
             restart_states: Arc::new(Mutex::new(HashMap::new())),
+            health: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(target_os = "linux")]
             networking: None,
         }
@@ -230,6 +233,7 @@ impl Supervisor {
             bus_assigned: Arc::new(Mutex::new(HashSet::new())),
             log_offsets: Arc::new(Mutex::new(HashMap::new())),
             restart_states: Arc::new(Mutex::new(HashMap::new())),
+            health: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(target_os = "linux")]
             networking: None,
         }
@@ -254,6 +258,7 @@ impl Supervisor {
             bus_assigned: Arc::new(Mutex::new(HashSet::new())),
             log_offsets: Arc::new(Mutex::new(HashMap::new())),
             restart_states: Arc::new(Mutex::new(HashMap::new())),
+            health: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(target_os = "linux")]
             networking: None,
         }
@@ -296,6 +301,8 @@ impl Supervisor {
 
         // --- Raft fallback: reconcile with desired state ----------------------
         actions += self.raft_reconcile().await?;
+
+        self.check_health().await;
 
         // --- Restart policy: check failed containers, restart if needed -------
         actions += self.check_restarts().await;
@@ -539,6 +546,7 @@ impl Supervisor {
             // Remove the terminated container from tracking and clean it up.
             self.running.lock().await.remove(&task_id);
             self.log_offsets.lock().await.remove(&task_id);
+            self.health.lock().await.remove(&task_id);
 
             // Capture the exit code BEFORE stopping: `stop()` deletes the
             // task, which would discard the exit status we need to decide
@@ -573,6 +581,12 @@ impl Supervisor {
             let policy = &spec.restart_policy;
             if policy.condition == RestartCondition::None {
                 tracing::info!(task = %task_id, "task terminated, restart policy is `none`");
+                let end = if exit_code == Some(0) {
+                    TaskState::Stopped
+                } else {
+                    TaskState::Failed
+                };
+                self.mark_task_state(&task_id, end).await;
                 continue;
             }
 
@@ -590,8 +604,11 @@ impl Supervisor {
                     exit_code = ?exit_code,
                     "task exited cleanly, restart policy does not apply"
                 );
+                self.mark_task_state(&task_id, TaskState::Stopped).await;
                 continue;
             }
+
+            self.record_restart(&task_id).await;
 
             // Determine if we should restart, and compute backoff.
             let (attempt, new_spec) = {
@@ -613,6 +630,8 @@ impl Supervisor {
                             "task failed, max restart attempts reached"
                         );
                         states.remove(&task_id);
+                        drop(states);
+                        self.mark_task_state(&task_id, TaskState::Failed).await;
                         continue;
                     }
                 }
@@ -643,6 +662,7 @@ impl Supervisor {
                             .lock()
                             .await
                             .insert(task_id.clone(), new_container_id);
+                        self.container_started(&task_id, &new_spec).await;
                         actions += 1;
                     }
                     Err(e) => {
@@ -823,6 +843,7 @@ impl Supervisor {
         match self.state.get_task(task_id).await {
             Ok(Some(mut task)) => {
                 if task.state != state {
+                    task.running_since_unix = (state == TaskState::Running).then(unix_now);
                     task.state = state;
                     if let Err(e) = self.state.upsert_task(task).await {
                         tracing::warn!(task = %task_id, error = %e, "failed to record task state");
@@ -833,6 +854,78 @@ impl Supervisor {
             Ok(None) => {}
             Err(e) => {
                 tracing::warn!(task = %task_id, error = %e, "failed to read task for state mark")
+            }
+        }
+    }
+
+    /// Records a container that just started. With a healthcheck, the task
+    /// stays `Starting` until its first probe passes.
+    async fn container_started(&self, task_id: &TaskId, spec: &TaskSpec) {
+        match spec.healthcheck.as_ref().filter(|c| health::is_enforced(c)) {
+            Some(check) => {
+                let health = Health::new(check, std::time::Instant::now());
+                self.health.lock().await.insert(task_id.clone(), health);
+                self.mark_task_state(task_id, TaskState::Starting).await;
+            }
+            None => self.mark_task_state(task_id, TaskState::Running).await,
+        }
+    }
+
+    /// Records that a task's container exited or failed to start and will
+    /// be retried. A rollout treats this as a failure of the new revision.
+    async fn record_restart(&self, task_id: &TaskId) {
+        if let Ok(Some(mut task)) = self.state.get_task(task_id).await {
+            task.state = TaskState::Starting;
+            task.running_since_unix = None;
+            task.restarts += 1;
+            if let Err(e) = self.state.upsert_task(task).await {
+                tracing::warn!(task = %task_id, error = %e, "failed to record task restart");
+            }
+        }
+    }
+
+    /// Starts due probes and acts on finished ones. Probes run in their
+    /// own tasks: one can take as long as its timeout.
+    async fn check_health(&self) {
+        let running = self.running.lock().await.clone();
+        let now = std::time::Instant::now();
+        let mut healthy = Vec::new();
+        let mut unhealthy = Vec::new();
+        {
+            let mut states = self.health.lock().await;
+            states.retain(|task_id, _| running.contains_key(task_id));
+            for (task_id, state) in states.iter_mut() {
+                if state.take_newly_healthy() {
+                    healthy.push(task_id.clone());
+                }
+                if state.is_unhealthy() {
+                    unhealthy.push(task_id.clone());
+                } else if state.begin_probe(now) {
+                    let runtime = self.runtime.clone();
+                    let health = self.health.clone();
+                    let task_id = task_id.clone();
+                    let container_id = running[&task_id].clone();
+                    let (args, timeout) = (state.args.clone(), state.timeout);
+                    tokio::spawn(async move {
+                        let result = runtime.exec(&container_id, &args, timeout).await;
+                        if let Some(state) = health.lock().await.get_mut(&task_id) {
+                            state.record(matches!(result, Ok(0)), std::time::Instant::now());
+                        }
+                    });
+                }
+            }
+            for task_id in &unhealthy {
+                states.remove(task_id);
+            }
+        }
+
+        for task_id in healthy {
+            self.mark_task_state(&task_id, TaskState::Running).await;
+        }
+        for task_id in unhealthy {
+            tracing::warn!(task = %task_id, "healthcheck failed, killing container");
+            if let Err(e) = self.runtime.kill(&running[&task_id]).await {
+                tracing::error!(task = %task_id, error = %e, "failed to kill unhealthy container");
             }
         }
     }
@@ -881,7 +974,7 @@ impl Supervisor {
                                 .lock()
                                 .await
                                 .insert(task_id.clone(), container_id);
-                            self.mark_task_state(&task_id, TaskState::Running).await;
+                            self.container_started(&task_id, &spec).await;
                             self.bus_assigned.lock().await.insert(task_id);
                             1
                         }
@@ -1068,6 +1161,16 @@ impl Supervisor {
             .filter(|t| t.node_id == self.node_id)
             .collect();
 
+        let backing_off: HashSet<TaskId> = {
+            let now = std::time::Instant::now();
+            let states = self.restart_states.lock().await;
+            states
+                .iter()
+                .filter(|(_, s)| now < s.next_retry)
+                .map(|(id, _)| id.clone())
+                .collect()
+        };
+
         let mut running = self.running.lock().await;
         let mut running_agents = self.running_agents.lock().await;
         let mut actions = 0;
@@ -1077,6 +1180,13 @@ impl Supervisor {
             let already_container = running.contains_key(&task.id);
             let already_agent = running_agents.contains(&task.id);
             if already_container || already_agent {
+                continue;
+            }
+            // Not running on purpose: finished, out of restart attempts, or
+            // waiting out the restart backoff.
+            if backing_off.contains(&task.id)
+                || matches!(task.state, TaskState::Stopped | TaskState::Failed)
+            {
                 continue;
             }
 
@@ -1092,7 +1202,7 @@ impl Supervisor {
                         );
                         running.insert(task.id.clone(), container_id);
                         actions += 1;
-                        self.mark_task_state(&task.id, TaskState::Running).await;
+                        self.container_started(&task.id, &task.spec).await;
                     }
                     Err(e) => {
                         tracing::error!(
@@ -1100,6 +1210,11 @@ impl Supervisor {
                             error = %e,
                             "failed to start container (raft reconcile)"
                         );
+                        // Once is enough for a rollout to see it; this
+                        // path retries every pass.
+                        if task.restarts == 0 {
+                            self.record_restart(&task.id).await;
+                        }
                     }
                 },
                 WorkloadKind::Agent(agent_spec) => {
@@ -1266,6 +1381,8 @@ mod tests {
                 resources: ResourceSpec::default(),
                 ..Default::default()
             },
+            restarts: 0,
+            running_since_unix: None,
         }
     }
 
@@ -1302,6 +1419,9 @@ mod tests {
             labels: HashMap::new(),
             healthcheck: None,
             mounts: vec![],
+            user: None,
+            update: Default::default(),
+            previous: None,
         }];
 
         let mut t1 = make_task("shop.web.1", 1);
@@ -1398,6 +1518,90 @@ mod tests {
     }
 
     // --- Existing Raft-based tests -------------------------------------------
+
+    fn with_healthcheck(mut task: Task) -> Task {
+        task.spec.restart_policy = minga_state::types::RestartPolicy {
+            condition: RestartCondition::Any,
+            delay_secs: 0,
+            max_attempts: None,
+        };
+        task.spec.healthcheck = Some(minga_state::types::Healthcheck {
+            test: vec!["CMD".to_string(), "true".to_string()],
+            interval_secs: Some(0),
+            timeout_secs: Some(1),
+            start_period_secs: Some(0),
+            retries: Some(1),
+        });
+        task
+    }
+
+    /// Runs supervisor passes until `done` holds for the task.
+    async fn pass_until(
+        sup: &Supervisor,
+        store: &StateStore,
+        id: &str,
+        done: impl Fn(&Task) -> bool,
+    ) -> Task {
+        for _ in 0..100 {
+            sup.reconcile_once().await.unwrap();
+            let task = store.get_task(&id.to_string()).await.unwrap().unwrap();
+            if done(&task) {
+                return task;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("task {id} never reached the expected state");
+    }
+
+    #[tokio::test]
+    async fn healthcheck_gates_running_then_an_unhealthy_task_restarts() {
+        let (sup, rt, store) = setup(1).await;
+        store
+            .upsert_task(with_healthcheck(make_task("t1", 1)))
+            .await
+            .unwrap();
+
+        let task = pass_until(&sup, &store, "t1", |t| t.state == TaskState::Running).await;
+        assert!(task.running_since_unix.is_some());
+        assert_eq!(task.restarts, 0);
+
+        let container = rt.list().await[0].id.clone();
+        rt.exec_codes.lock().unwrap().insert(container, 1);
+        let task = pass_until(&sup, &store, "t1", |t| t.restarts > 0).await;
+        assert_eq!(task.restarts, 1);
+    }
+
+    #[tokio::test]
+    async fn a_task_that_never_passes_stays_starting() {
+        let (sup, rt, store) = setup(1).await;
+        let mut task = with_healthcheck(make_task("t1", 1));
+        task.spec.healthcheck.as_mut().unwrap().start_period_secs = Some(3600);
+        store.upsert_task(task).await.unwrap();
+
+        sup.reconcile_once().await.unwrap();
+        let container = rt.list().await[0].id.clone();
+        rt.exec_codes.lock().unwrap().insert(container, 1);
+        for _ in 0..5 {
+            sup.reconcile_once().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let task = store.get_task(&"t1".to_string()).await.unwrap().unwrap();
+        assert_eq!(task.state, TaskState::Starting);
+    }
+
+    #[tokio::test]
+    async fn exhausted_or_finished_tasks_are_not_started_again() {
+        let (sup, rt, store) = setup(1).await;
+        let mut failed = make_task("t1", 1);
+        failed.state = TaskState::Failed;
+        let mut stopped = make_task("t2", 1);
+        stopped.state = TaskState::Stopped;
+        store.upsert_task(failed).await.unwrap();
+        store.upsert_task(stopped).await.unwrap();
+
+        sup.reconcile_once().await.unwrap();
+        assert_eq!(rt.container_count(), 0);
+    }
 
     #[tokio::test]
     async fn starts_container_for_assigned_task() {
@@ -1644,6 +1848,8 @@ mod tests {
                 }),
                 ..Default::default()
             },
+            restarts: 0,
+            running_since_unix: None,
         }
     }
 
@@ -2011,6 +2217,8 @@ mod tests {
             node_id: 1,
             state: TaskState::Pending,
             spec,
+            restarts: 0,
+            running_since_unix: None,
         };
         store.upsert_task(task).await.unwrap();
 
@@ -2045,6 +2253,8 @@ mod tests {
             node_id: 1,
             state: TaskState::Pending,
             spec,
+            restarts: 0,
+            running_since_unix: None,
         };
         store.upsert_task(task).await.unwrap();
 
@@ -2083,6 +2293,8 @@ mod tests {
             node_id: 1,
             state: TaskState::Pending,
             spec,
+            restarts: 0,
+            running_since_unix: None,
         };
         store.upsert_task(task).await.unwrap();
 

@@ -39,6 +39,9 @@ use crate::runtime::{
 };
 use crate::secrets::SecretStore;
 
+/// Exec processes are told apart by this counter within a container.
+static NEXT_EXEC_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Grace period after SIGTERM before sending SIGKILL.
 const GRACE_PERIOD: Duration = Duration::from_secs(10);
 
@@ -938,6 +941,84 @@ impl Runtime for ContainerdRuntime {
             }
             Err(_) => None,
         }
+    }
+
+    async fn exec(
+        &self,
+        container_id: &str,
+        args: &[String],
+        timeout: Duration,
+    ) -> Result<i32, RuntimeError> {
+        let err = |e: ClientError| RuntimeError::Other(format!("exec in {container_id}: {e}"));
+        let exec_id = format!(
+            "probe-{}",
+            NEXT_EXEC_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        {
+            let mut client = self.client.lock().await;
+            let container = client.get_container(container_id).await.map_err(err)?;
+            let spec = container
+                .spec
+                .ok_or_else(|| RuntimeError::Other("container has no spec".to_string()))?;
+            let process = oci::exec_process_any(&spec, args).map_err(RuntimeError::Other)?;
+            client
+                .exec_process(container_id, &exec_id, process)
+                .await
+                .map_err(err)?;
+            client
+                .start_process(container_id, &exec_id)
+                .await
+                .map_err(err)?;
+        }
+
+        // Poll with the lock released: a probe can run for as long as its
+        // timeout, and every other runtime call shares this client.
+        let deadline = std::time::Instant::now() + timeout;
+        let outcome = loop {
+            let process = {
+                let mut client = self.client.lock().await;
+                client.get_process(container_id, &exec_id).await
+            };
+            match process {
+                Ok(p) if p.status == ProcessStatus::Stopped as i32 => {
+                    break Ok(p.exit_status as i32)
+                }
+                Ok(_) => {}
+                Err(e) => break Err(err(e)),
+            }
+            if std::time::Instant::now() >= deadline {
+                break Err(RuntimeError::Other(format!(
+                    "exec in {container_id} timed out"
+                )));
+            }
+            tokio::time::sleep(KILL_CHECK_INTERVAL).await;
+        };
+
+        if outcome.is_err() {
+            let _ = self
+                .client
+                .lock()
+                .await
+                .kill_process(container_id, &exec_id, 9)
+                .await;
+            tokio::time::sleep(KILL_CHECK_INTERVAL).await;
+        }
+        let _ = self
+            .client
+            .lock()
+            .await
+            .delete_process(container_id, &exec_id)
+            .await;
+        outcome
+    }
+
+    async fn kill(&self, container_id: &str) -> Result<(), RuntimeError> {
+        self.client
+            .lock()
+            .await
+            .kill_task(container_id, 9)
+            .await
+            .map_err(|e| RuntimeError::Other(format!("kill {container_id}: {e}")))
     }
 
     async fn logs(&self, container_id: &str, tail: usize) -> Vec<ContainerLog> {

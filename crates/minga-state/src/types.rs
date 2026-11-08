@@ -53,6 +53,72 @@ pub struct ClusterNode {
     /// lease: it is considered live regardless of age.
     #[serde(default)]
     pub last_seen_unix: Option<u64>,
+    /// Manager or worker; matched by `node.role` placement constraints.
+    #[serde(default)]
+    pub role: NodeRole,
+}
+
+/// Parses a numeric `uid[:gid]`; a missing gid is 0. Names would need the
+/// image's `/etc/passwd`, so they fail loudly instead.
+pub fn parse_user(user: &str) -> Result<(u32, u32), &'static str> {
+    let (uid, gid) = user.split_once(':').unwrap_or((user, "0"));
+    Ok((
+        uid.parse().map_err(|_| "named users are not supported")?,
+        gid.parse().map_err(|_| "named groups are not supported")?,
+    ))
+}
+
+/// The role a node was started with.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NodeRole {
+    Manager,
+    #[default]
+    Worker,
+}
+
+/// Whether a replacement task starts before or after the one it replaces.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum UpdateOrder {
+    #[default]
+    StopFirst,
+    StartFirst,
+}
+
+/// How a service's tasks are replaced when its spec changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpdatePolicy {
+    /// Tasks replaced at a time; 0 means all at once.
+    pub parallelism: u32,
+    pub order: UpdateOrder,
+    /// Seconds a replaced batch must stay up before the next one starts.
+    #[serde(default)]
+    pub delay_secs: u64,
+    /// Seconds a replacement must stay up before the rollout counts as done.
+    #[serde(default)]
+    pub monitor_secs: u64,
+    #[serde(default)]
+    pub failure_action: FailureAction,
+}
+
+/// What a rollout does when a replacement fails.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FailureAction {
+    #[default]
+    Pause,
+    Continue,
+    Rollback,
+}
+
+impl Default for UpdatePolicy {
+    fn default() -> Self {
+        Self {
+            parallelism: 1,
+            order: UpdateOrder::StopFirst,
+            delay_secs: 0,
+            monitor_secs: 5,
+            failure_action: FailureAction::Pause,
+        }
+    }
 }
 
 /// How often a self-registered node renews its lease, in seconds.
@@ -165,6 +231,15 @@ pub struct Service {
     /// Volume and bind mounts.
     #[serde(default)]
     pub mounts: Vec<ServiceMount>,
+    /// Numeric `uid[:gid]` to run as. `None` keeps the image's user.
+    #[serde(default)]
+    pub user: Option<String>,
+    /// How tasks are replaced when the spec changes.
+    #[serde(default)]
+    pub update: UpdatePolicy,
+    /// The spec this one replaced, kept until the rollout settles.
+    #[serde(default)]
+    pub previous: Option<Box<Service>>,
 }
 
 /// A container healthcheck (Compose/Docker shape).
@@ -224,6 +299,12 @@ pub struct Task {
     pub node_id: NodeId,
     pub state: TaskState,
     pub spec: TaskSpec,
+    /// When the task last became `Running`.
+    #[serde(default)]
+    pub running_since_unix: Option<u64>,
+    /// Times the container exited or failed to start and was retried.
+    #[serde(default)]
+    pub restarts: u32,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -273,6 +354,9 @@ pub struct TaskSpec {
     /// Volume and bind mounts to apply in the OCI spec.
     #[serde(default)]
     pub mounts: Vec<ServiceMount>,
+    /// Numeric `uid[:gid]` to run as. `None` keeps the image's user.
+    #[serde(default)]
+    pub user: Option<String>,
 }
 
 /// Restart policy for a task.
@@ -470,6 +554,9 @@ mod tests {
             labels: HashMap::new(),
             healthcheck: None,
             mounts: vec![],
+            user: None,
+            update: Default::default(),
+            previous: None,
         };
         let bytes = bincode::serde::encode_to_vec(&svc, bincode::config::standard()).unwrap();
         let (back, _): (Service, _) =

@@ -104,6 +104,15 @@ kubectl -n kube-system logs job/minga-preload-images
 Air-gapped: put image tarballs on a `UserVolume` and switch the Job's args to
 `["-n", "minga", "images", "import", "/images/<name>.tar"]` with the volume mounted.
 
+### Provision secrets
+
+Minga takes no secret values over its API: a `secrets:` entry with
+`external: true` reads a file from the node's store, and a task whose secret
+is missing fails to start. Talos has no shell, so
+[`talos/provision-secret.yaml`](../talos/provision-secret.yaml) writes the file
+with `minga secret put`. The secret ID is `<stack>_<compose secret key>`; the
+file's header has the commands. **Not yet run on Talos.**
+
 ### Deploy
 
 ```bash
