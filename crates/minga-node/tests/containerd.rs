@@ -59,7 +59,7 @@ async fn containerd_start_list_status_stop() {
         }
     };
 
-    // The image must be preloaded and unpacked in the `minga` namespace.
+    // The image must be available (or pullable) in the `minga` namespace.
     //
     // Redis is used because its default command is a long-running server:
     // BusyBox's default command is `sh`, which exits immediately when stdin
@@ -99,7 +99,7 @@ async fn containerd_start_list_status_stop() {
 }
 
 #[tokio::test]
-async fn missing_image_fails_with_preload_instruction() {
+async fn missing_image_fails_after_pull_attempt() {
     let socket = socket_path();
     if !containerd_available_at(&socket) {
         eprintln!("SKIP: containerd not available at {socket}");
@@ -121,9 +121,10 @@ async fn missing_image_fails_with_preload_instruction() {
         .start(&"minga-missing-image-probe".to_string(), &spec)
         .await
         .expect_err("missing image must fail closed");
+    let msg = err.to_string();
     assert!(
-        err.to_string().contains("preload") || err.to_string().contains("pre-provision"),
-        "missing image should explain the provisioning requirement: {err}"
+        msg.contains("ctr pull") || msg.contains("still missing"),
+        "should report pull failure or missing image: {msg}"
     );
 }
 
