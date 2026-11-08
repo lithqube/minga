@@ -7,7 +7,7 @@
 //!
 //! ```text
 //! start(task_id, spec):
-//!   1. Require an image preloaded and unpacked in namespace `minga`
+//!   1. Ensure image in namespace `minga`, pulling from registry if absent
 //!   2. Read and authenticate OCI metadata; derive process and parent snapshot
 //!   3. Prepare a writable snapshot and generate the OCI spec
 //!   4. Create container and task with the snapshot's rootfs mounts
@@ -451,20 +451,66 @@ impl ContainerdRuntime {
         self
     }
 
-    /// Require an image already available in Minga's containerd namespace.
-    ///
-    /// The Images service has no Pull RPC. Image retrieval and unpacking
-    /// must be performed by an explicit provisioning step until Minga has a
-    /// supported registry/transfer implementation.
+    /// Ensure the image is available in the Minga containerd namespace,
+    /// pulling from the registry if needed.
     async fn ensure_image(&self, image_ref: &str) -> Result<Image, RuntimeError> {
         let mut client = self.client.lock().await;
         match client.get_image(image_ref).await {
             Ok(Some(image)) => Ok(image),
-            Ok(None) => Err(RuntimeError::Start(format!(
-                "image {image_ref} is not preloaded in the minga containerd namespace; preload and unpack it before starting this task"
-            ))),
+            Ok(None) => {
+                drop(client);
+                self.pull_image(image_ref).await?;
+                let mut client = self.client.lock().await;
+                client
+                    .get_image(image_ref)
+                    .await
+                    .map_err(|e| RuntimeError::Start(format!("check image after pull: {e}")))?
+                    .ok_or_else(|| {
+                        RuntimeError::Start(format!("image {image_ref} still missing after pull"))
+                    })
+            }
             Err(e) => Err(RuntimeError::Start(format!("check image {image_ref}: {e}"))),
         }
+    }
+
+    /// Pull and unpack an image via `ctr` into the `minga` namespace.
+    async fn pull_image(&self, image_ref: &str) -> Result<(), RuntimeError> {
+        tracing::info!(image = %image_ref, "pulling image via ctr");
+
+        let pull = tokio::process::Command::new("ctr")
+            .args(["-n", "minga", "images", "pull", image_ref])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .await
+            .map_err(|e| RuntimeError::Start(format!("spawn ctr pull: {e}")))?;
+
+        if !pull.status.success() {
+            let stderr = String::from_utf8_lossy(&pull.stderr);
+            return Err(RuntimeError::Start(format!(
+                "ctr pull {image_ref} failed ({}): {stderr}",
+                pull.status
+            )));
+        }
+
+        let unpack = tokio::process::Command::new("ctr")
+            .args(["-n", "minga", "images", "unpack", image_ref])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .await
+            .map_err(|e| RuntimeError::Start(format!("spawn ctr unpack: {e}")))?;
+
+        if !unpack.status.success() {
+            let stderr = String::from_utf8_lossy(&unpack.stderr);
+            return Err(RuntimeError::Start(format!(
+                "ctr unpack {image_ref} failed ({}): {stderr}",
+                unpack.status
+            )));
+        }
+
+        tracing::info!(image = %image_ref, "image pulled and unpacked");
+        Ok(())
     }
 
     /// Clear leftovers from a previous attempt at the same task ID.
