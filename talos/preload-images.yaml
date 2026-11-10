@@ -1,7 +1,7 @@
 # Preload workload images into the `minga` containerd namespace on Talos.
 #
-# Minga has no registry pull yet; tasks run only images already unpacked in
-# the `minga` namespace. Talos has no `ctr` on the host, so this Job runs
+# A task pulls a missing image itself (anonymous access only); preload for
+# private registries and air-gapped nodes. Talos has no `ctr` on the host, so this Job runs
 # the ctr bundled in the Minga image against the host containerd socket.
 # It uses the Kubernetes that every bootstrapped Talos cluster already has.
 #

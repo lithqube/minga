@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+## [1.0.1-rc.1] — 2026-11-10
+
+Release candidate. Everything in the 0.1.0 entry below plus the changes
+here. `0.1.0` was never tagged, so this is the first tagged build; the
+version jumps from `0.1.0` to `1.0.1-rc.1` by maintainer decision. See
+[docs/release-1.0.1-rc.1.md](docs/release-1.0.1-rc.1.md) for what was and
+was not verified.
+
 ### Added
 - Rolling updates. A changed service spec now replaces its running tasks,
   honoring `update_config` (`order`, `parallelism`, `delay`, `monitor`,
@@ -9,16 +17,29 @@
   (`{service}.{slot}.{revision}`). A service with a published port is always
   `stop-first`. `failure_action: rollback` restores the previous spec when a
   replacement restarts or fails before the monitor window ends, using the
-  restored spec's own `update_config`; `rollback_config` is not read.
+  restored spec's own `update_config`, or its `rollback_config` when the
+  service sets one (parsed from Compose `deploy.rollback_config` and the Docker
+  API, and kept across a rollback).
 - Healthcheck enforcement. A task with a healthcheck stays `Starting`, out of
   DNS, until its first probe passes, and is killed after `retries` straight
   failures so the restart policy takes over.
+- Image pull. A task whose image is missing from the `minga` containerd
+  namespace pulls and unpacks it with `ctr` (300s pull and 120s unpack
+  timeouts) instead of failing. `minga image pull <ref>` does the same by
+  hand.
+- `update_config` and `rollback_config` reject unknown values the same way on
+  the Compose and Docker API paths.
 - `node.role` placement constraints.
 - Compose `user` (numeric `uid[:gid]`) reaches the container.
 - `minga secret put` provisions the node-local store from stdin;
   `talos/provision-secret.yaml` runs it on Talos.
 
 ### Fixed
+- `minga secret put` removes a stale temp file, cleans up after a failed
+  write and leaves the mode of an existing store directory alone. A
+  non-numeric Compose `user` is rejected when the service is translated
+  instead of failing every start after a stop-first update removed the old
+  task. `iptables` calls on the task setup path wait for the xtables lock.
 - Containers could not reach anything off their bridge: there was no SNAT.
   Each network now gets a `MASQUERADE` rule and `FORWARD` accepts.
 - A service whose own tasks filled a node was evicted by its own placement.
@@ -26,6 +47,13 @@
   restarted on the next pass, ignoring backoff, `max_attempts` and
   `condition: none`. A crashed task also stayed `Running`. Tasks now end
   `Failed` or `Stopped`, and show `Starting` while being retried.
+
+### Known limits
+- Image pull runs `ctr` as a subprocess: anonymous registry access only, and
+  it ignores `--containerd-socket` (it uses `ctr`'s default socket). Preload
+  images from private registries. Not exercised against a real registry or
+  on Talos for this candidate.
+- A named image `USER` (anything but numeric `uid[:gid]`) is still refused.
 
 ### Upgrading
 - The cluster state and Raft log are bincode-encoded and their record layouts
