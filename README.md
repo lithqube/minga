@@ -2,27 +2,28 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.80%2B-orange.svg)](https://www.rust-lang.org)
-[![Status](https://img.shields.io/badge/status-v0.1.0-blue.svg)](CHANGELOG.md)
+[![Status](https://img.shields.io/badge/status-v1.0.1--rc.1-blue.svg)](CHANGELOG.md)
 
 A single-binary container and agent orchestrator for **edge, on-prem and air-gapped sites**, written in Rust. It runs Compose files natively, speaks enough of the Docker Swarm API to replace it, and treats AI-agent workloads as first-class objects (WASM sandboxes and an LLM egress proxy today).
 
 Named after the [minga](https://en.wikipedia.org/wiki/Minga) of Chiloé, where a community moves a whole house together.
 
-> **Status: `v0.1.0`.** What works, verified by execution on macOS and on Linux (OrbStack Ubuntu, containerd 2.2.1):
+> **Status: `v1.0.1-rc.1` (release candidate).** What works, verified by execution on macOS and on Linux (OrbStack Ubuntu, containerd 2.2.1):
 >
 > - **Compose and deploy:** Compose parsing that fails loudly on unknown keys, and `minga deploy` through the Swarm-compatible Docker Engine API (v1.41, optional bearer token).
 > - **Control plane:** Raft consensus with mTLS and write forwarding, a scheduler, and self-registering nodes with membership leases.
 > - **Runtime and networking:** a node supervisor driving a **real containerd runtime**, per-task netns/bridge networking with IPAM and embedded DNS, and real container logs.
 > - **Platform:** NATS/JetStream with TLS, WASM sandboxes, an LLM egress proxy, and Prometheus metrics with health endpoints.
+> - **Updates:** rolling updates honoring `update_config`, enforced healthchecks, automatic rollback, and registry image pull through `ctr`.
 >
-> **Not in `v0.1.0`:**
+> **Not in `v1.0.1`:**
 >
-> - Image pull: preload images into the `minga` containerd namespace instead.
 > - Container networking across nodes: there's no WireGuard mesh yet.
 > - Joining a node to a running cluster: Raft membership is fixed at bootstrap.
-> - Healthcheck enforcement, spec-update reprovisioning, automatic rollback, and host-local port hairpinning. Rolling updates, healthchecks and rollback are in [Unreleased](CHANGELOG.md).
+> - Private-registry credentials for image pull, and host-local port hairpinning.
+> - Verification on a real registry or on Talos for this candidate: see [the release notes](docs/release-1.0.1-rc.1.md).
 >
-> Details: [changelog](CHANGELOG.md), [roadmap](docs/roadmap-v0.1.0.md), [architecture notes](docs/architecture.md).
+> Details: [changelog](CHANGELOG.md), [release notes](docs/release-1.0.1-rc.1.md), [roadmap](docs/roadmap-v0.1.0.md), [architecture notes](docs/architecture.md).
 >
 > The Talos install is validated on a single docker-provisioned Talos v1.14 node, not on bare metal. FIPS, SOC 2, VS-NfD and NATO are **not assessed**, which is not the same as "not applicable".
 
@@ -45,7 +46,7 @@ Minga ships as **one binary** (plus the `nats-server` it supervises). There's no
 - **Secrets and logs.** Secrets are external references staged per task and content-addressed, so rotation never changes a running task's files. `minga logs [-f]` shows separated stdout/stderr from a JetStream-retained backlog.
 - **Agent workloads.** `x-minga-agent` Compose services run as WASM modules under wasmtime with fuel and timeout limits. An LLM egress proxy enforces per-workload token budgets, caches responses and redacts secrets. Today the WASM guest gets no host I/O: no WASI, no network, so it can't reach the proxy yet. Memory limits aren't enforced, and Firecracker is a stub.
 - **Observability.** `/metrics`, `/healthz` and `/readyz` on `minga api`, and on manager and worker nodes via `--metrics-bind`. JSON logs on stderr for long-running roles.
-- **Air-gap friendly.** Release archives bundle a checksum-pinned `nats-server`, and `install.sh` verifies `SHA256SUMS`. Images are preloaded with `ctr` because there's no registry pull.
+- **Air-gap friendly.** Release archives bundle a checksum-pinned `nats-server`, and `install.sh` verifies `SHA256SUMS`. A task pulls a missing image with the bundled `ctr` (anonymous pulls only), and air-gapped sites can preload images with `ctr` instead.
 
 ## Architecture
 
@@ -91,7 +92,7 @@ flowchart LR
   supB --> ctrB["containerd + netns/bridge"]
 ```
 
-> In `v0.1.0` **every `minga` process is a Raft voter**, including workers and `minga api`, and membership is fixed when the cluster first starts. Only desired state should go through Raft. Node lease renewals still do, as one atomic command every 10s. [docs/architecture.md](docs/architecture.md) explains why this matters for cluster size and quorum, and what replaces it.
+> In `v1.0.1-rc.1` **every `minga` process is a Raft voter**, including workers and `minga api`, and membership is fixed when the cluster first starts. Only desired state should go through Raft. Node lease renewals still do, as one atomic command every 10s. [docs/architecture.md](docs/architecture.md) explains why this matters for cluster size and quorum, and what replaces it.
 
 ### How a deploy becomes a running container
 
@@ -167,7 +168,7 @@ flowchart TB
 
 ## Quick start: one Linux host
 
-You need Linux, root (the supervisor creates netns, bridges and iptables rules), `iproute2` + `iptables` + `procps` (present in any standard server install; the container image bundles them), containerd, and images preloaded into the `minga` namespace.
+You need Linux, root (the supervisor creates netns, bridges and iptables rules), `iproute2` + `iptables` + `procps` (present in any standard server install; the container image bundles them), and containerd. A task pulls a missing image into the `minga` namespace with `ctr` (on PATH, default containerd socket, anonymous registry access).
 
 ```bash
 # Installs minga + the checksum-pinned nats-server and verifies SHA256SUMS.
@@ -180,7 +181,7 @@ curl -fsSL https://github.com/lithqube/minga/releases/latest/download/install.sh
 cargo build --release -p minga-cli
 sudo install -m 0755 target/release/minga /usr/local/bin/minga
 
-# Preload the images your stack uses: there is no registry pull yet
+# Optional: preload images (air-gapped sites, private registries); otherwise a task pulls what it needs
 sudo ctr -n minga images pull docker.io/library/nginx:1.27
 ```
 
@@ -311,15 +312,15 @@ Requirements: Rust 1.80+ with `rustfmt` and `clippy`, and `nats-server` for the 
 
 Next, in order (rationale in [docs/architecture.md](docs/architecture.md)):
 
-1. Image pull (content transfer + unpack).
-2. Managers-only Raft: workers become pure JetStream clients, liveness moves to `MINGA_LEASES`, and nodes can join a running cluster.
-3. A multi-node WireGuard mesh on top of the per-node data plane.
-4. Spec-update reprovisioning and healthcheck enforcement.
-5. Host capabilities for agent sandboxes: WASI, egress-only networking, host-injected workload identity, memory limits.
+1. Managers-only Raft: workers become pure JetStream clients, liveness moves to `MINGA_LEASES`, and nodes can join a running cluster.
+2. A multi-node WireGuard mesh on top of the per-node data plane.
+3. Registry credentials for image pull (an in-process pull that honors `--containerd-socket`).
+4. Host capabilities for agent sandboxes: WASI, egress-only networking, host-injected workload identity, memory limits.
 
 ## Documentation
 
 - [Architecture notes](docs/architecture.md): how the pieces fit today, known structural limits, and the plan
+- [Release notes: v1.0.1-rc.1](docs/release-1.0.1-rc.1.md)
 - [Roadmap to v0.1.0](docs/roadmap-v0.1.0.md): the seven release gates and their evidence
 - [ADR 0001: Language split](docs/adr/0001-language-split.md)
 - [ADR 0002: Event bus](docs/adr/0002-event-bus-nats.md): NATS/JetStream behind `minga-bus`

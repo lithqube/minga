@@ -1,6 +1,6 @@
 # Architecture notes
 
-How Minga fits together **as of `v0.1.0`**, the structural limits that come with it, and the plan to remove them. Settled decisions live in the [ADRs](adr/); this page describes the code as it is.
+How Minga fits together **as of `v1.0.1-rc.1`**, the structural limits that come with it, and the plan to remove them. Settled decisions live in the [ADRs](adr/); this page describes the code as it is.
 
 ## Processes and state
 
@@ -34,7 +34,7 @@ flowchart LR
 
 ## Known structural limits
 
-These are deliberate `v0.1.0` trade-offs, listed so nobody builds on them by accident.
+These are deliberate `v1.0.1-rc.1` trade-offs, listed so nobody builds on them by accident.
 
 1. **Every node is a Raft voter.** Workers and `minga api` open a full `StateStore`, and membership is the `--peer` list at first start. Consequences:
    - Quorum depends on the number of workers, so flaky edge workers can stall deploys.
@@ -74,8 +74,7 @@ This should be recorded as an ADR (Workers leave Raft) before any code moves. Th
 
 ## Order of work
 
-1. Image pull.
-2. Managers-only Raft and worker join (limits 1–3).
-3. WireGuard mesh (limit 5).
-4. Rolling updates that honour `rollback_config` separately from `update_config`.
-5. Sandbox host capabilities: WASI with explicit grants, outbound HTTP only to the local egress proxy, host-injected workload identity, enforced memory limits (limit 4).
+1. Managers-only Raft and worker join (limits 1–3).
+2. WireGuard mesh (limit 5).
+3. In-process image pull with registry credentials, honoring `--containerd-socket`.
+4. Sandbox host capabilities: WASI with explicit grants, outbound HTTP only to the local egress proxy, host-injected workload identity, enforced memory limits (limit 4).

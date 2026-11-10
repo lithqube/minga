@@ -89,8 +89,10 @@ ports (`7001`/`7002`) and `:9100` to your management network.
 
 ### Preload workload images
 
-Minga has no registry pull: tasks run only images already unpacked in the
-`minga` containerd namespace. Talos has no `ctr` on the host, so preload via the
+A task pulls a missing image itself with the bundled `ctr` (anonymous access,
+default containerd socket; this path is not validated on Talos). Preloading is
+still the route for private registries and air-gapped nodes. Talos has no `ctr`
+on the host, so preload via the
 Kubernetes every Talos cluster already has — the Job uses the `ctr` bundled in
 the Minga image:
 
@@ -316,7 +318,7 @@ Notes:
 ## Known limits (unchanged by this guide)
 
 - No cross-node container mesh (WireGuard) yet; published ports are host-local.
-- No registry pull: every workload image must be preloaded in the `minga` namespace.
+- Image pull is a `ctr` subprocess: anonymous registry access only, and it ignores `--containerd-socket`. Preload images from private registries.
 - Placement pauses if a worker wins the Raft election.
 - Talos compliance certifications (FIPS, SOC 2, VS-NfD, NATO) are **not assessed** — which is not the same as not applicable.
 
@@ -327,7 +329,7 @@ Notes:
 | `failed to start container: network setup: ip … No such file or directory` | The image lacks `iproute2`/`iptables`/`procps` — the release image bundles them; a custom-built image must too |
 | `failed to fulfil mount request: open /var/… no such file or directory` | Path identity broken: `--data-dir` (or a Compose bind source) differs between container and host. Use the `/var/mnt/<volume>` layout from the examples |
 | `namespace path: lstat /var/run/netns/…: no such file or directory` | `/run/netns` not mounted into the manager container with `rshared` — runc on the host can't see the handle |
-| `image <ref> is not preloaded in the minga containerd namespace` | Preload it (`talos/preload-images.yaml`). Minga normalizes short refs to `docker.io/library/…`; the preload stores exactly that |
+| `ctr pull <ref> failed` | The auto-pull could not reach the registry or needs credentials. Preload it (`talos/preload-images.yaml`). Minga normalizes short refs to `docker.io/library/…`; the preload stores exactly that |
 | Container stuck `pulling` in `containerimagestatus` | Node can't reach the registry. For a private/mirror registry configure `machine.registries.mirrors` (and `tls.insecureSkipVerify` only if you must) |
 | `cannot connect to containerd` | Pass a filesystem path to `--containerd-socket`, not a `unix://` URL; the mount in the document must match |
 | `/readyz` returns 503 | The body says why: `raft not ready` (no leader; check that every `--peer` is up) or `bus not connected` (check `--nats-url`, TLS env) |
