@@ -1,6 +1,5 @@
 //! Preloaded OCI image metadata resolution for containerd tasks.
 
-use minga_state::types::parse_user;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
@@ -157,8 +156,9 @@ pub struct ImageConfiguration {
     pub cmd: Vec<String>,
     pub env: Vec<String>,
     pub cwd: String,
-    pub uid: u32,
-    pub gid: u32,
+    /// Image `User`, unparsed: a task's own `user` may replace a name that
+    /// could not be resolved. See `oci::task_user`.
+    pub user: String,
     pub parent_snapshot: String,
 }
 
@@ -209,11 +209,6 @@ impl ImageConfiguration {
             return Err("image working directory must be absolute".into());
         }
         let user = config["User"].as_str().unwrap_or_default();
-        let (uid, gid) = if user.is_empty() {
-            (0, 0)
-        } else {
-            parse_user(user)?
-        };
         if value["rootfs"]["type"] != "layers" {
             return Err("image rootfs is not layered".into());
         }
@@ -232,8 +227,7 @@ impl ImageConfiguration {
             cmd,
             env,
             cwd: cwd.to_string(),
-            uid,
-            gid,
+            user: user.to_string(),
             parent_snapshot: chain_id(&diff_ids)?,
         })
     }
@@ -370,24 +364,26 @@ mod tests {
         assert_eq!(config.args(), vec!["/bin/sh", "-c", "echo ok"]);
         assert_eq!(config.env, vec!["A=1", "B=2"]);
         assert_eq!(config.cwd, "/app");
-        assert_eq!((config.uid, config.gid), (1000, 1001));
+        assert_eq!(config.user, "1000:1001");
         assert_eq!(config.parent_snapshot, format!("sha256:{}", "c".repeat(64)));
     }
 
     #[test]
-    fn rejects_empty_command_and_named_user() {
+    fn rejects_empty_command_but_keeps_a_named_user_for_the_task_to_replace() {
         let mut json = serde_json::json!({
             "os": "linux", "architecture": "arm64",
-            "config": {"User": "app"},
+            "config": {"User": "0"},
             "rootfs": {"type": "layers", "diff_ids": [format!("sha256:{}", "c".repeat(64))]}
         });
         assert!(ImageConfiguration::parse(&json, "arm64").is_err());
-        json["config"]["User"] = serde_json::json!("0");
-        assert!(ImageConfiguration::parse(&json, "arm64").is_err());
+        json["config"] = serde_json::json!({"Cmd": ["run"], "User": "nodejs"});
+        let config = ImageConfiguration::parse(&json, "arm64").unwrap();
+        assert_eq!(config.user, "nodejs");
     }
 
     #[test]
     fn parses_numeric_users_and_refuses_names() {
+        use minga_state::types::parse_user;
         assert_eq!(parse_user("0"), Ok((0, 0)));
         assert_eq!(parse_user("1000:1001"), Ok((1000, 1001)));
         assert!(parse_user("app").is_err());

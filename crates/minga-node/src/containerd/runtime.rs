@@ -86,6 +86,16 @@ impl LogRing {
     }
 }
 
+/// A non-root process cannot read a root-owned 0400 file. Each staged copy
+/// belongs to one task, so this exposes it to that task only.
+fn chown_secrets(mounts: &[oci::SecretMount], uid: u32, gid: u32) -> Result<(), RuntimeError> {
+    for mount in mounts {
+        std::os::unix::fs::chown(&mount.source, Some(uid), Some(gid))
+            .map_err(|e| RuntimeError::Start(format!("secret ownership: {e}")))?;
+    }
+    Ok(())
+}
+
 /// Creates a FIFO at `path` (0600).
 fn make_fifo(path: &std::path::Path) -> Result<(), std::io::Error> {
     let raw = std::ffi::CString::new(path.display().to_string().as_bytes().to_vec())
@@ -664,6 +674,8 @@ impl Runtime for ContainerdRuntime {
         let config = image::load_image(&mut client, &image, &self.snapshotter)
             .await
             .map_err(RuntimeError::Start)?;
+        let (uid, gid) = oci::task_user(spec, &config).map_err(RuntimeError::Start)?;
+        chown_secrets(&secret_mounts, uid, gid)?;
 
         let snapshot_key = format!("minga-{container_id}");
 
@@ -1094,6 +1106,42 @@ impl Runtime for ContainerdRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn secrets_go_to_the_task_user_at_0400_and_a_failed_chown_stops_the_task() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::secrets::SecretStore::new(dir.path());
+        store.put("value", b"value").unwrap();
+        let refs = [minga_state::types::SecretRef::new(
+            "value",
+            "/run/secrets/value",
+        )];
+        let source = store.stage_all("task", &refs).unwrap()[0]
+            .staged_path
+            .clone();
+        let mounts = [oci::SecretMount {
+            source: source.clone(),
+            target: "/run/secrets/value".into(),
+        }];
+
+        // Without root the only chown allowed is to ourselves, so a real
+        // change of owner is proven only when this runs as root (CI on Linux).
+        let root = unsafe { libc::geteuid() } == 0;
+        let (uid, gid) = if root {
+            (1001, 65533)
+        } else {
+            unsafe { (libc::geteuid(), libc::getegid()) }
+        };
+        chown_secrets(&mounts, uid, gid).unwrap();
+        let meta = std::fs::metadata(&source).unwrap();
+        assert_eq!((meta.uid(), meta.gid()), (uid, gid));
+        assert_eq!(meta.mode() & 0o7777, 0o400);
+
+        if !root {
+            assert!(chown_secrets(&mounts, 0, 0).is_err());
+        }
+    }
 
     #[test]
     fn default_constants() {
