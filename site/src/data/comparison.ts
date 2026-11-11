@@ -12,7 +12,7 @@ export interface Row {
 }
 
 export const asOf = '2026-11';
-export const columns = ['Minga v0.1.0', 'Docker Swarm mode', 'k3s'] as const;
+export const columns = ['Minga v1.0.1', 'Docker Swarm mode', 'k3s'] as const;
 
 const swarmDocs = 'https://docs.docker.com/engine/swarm/';
 const k3sDocs = 'https://docs.k3s.io/';
@@ -65,7 +65,7 @@ export const rows: Row[] = [
   {
     capability: 'Image pull from a registry',
     cells: [
-      { mark: 'no', text: 'Not yet; preload images with ctr', source: 'README.md' },
+      { mark: 'partial', text: 'Anonymous-registry pulls; no private-registry credentials', source: 'CHANGELOG.md' },
       { mark: 'yes', text: 'Yes', source: swarmDocs },
       { mark: 'yes', text: 'Yes', source: k3sDocs },
     ],
@@ -93,7 +93,7 @@ export const rows: Row[] = [
   {
     capability: 'Healthchecks, rolling update, rollback',
     cells: [
-      { mark: 'no', text: 'Healthcheck carried, not enforced; no rollback', source: 'README.md' },
+      { mark: 'yes', text: 'Healthchecks enforced; rolling updates and rollback supported', source: 'CHANGELOG.md' },
       { mark: 'yes', text: 'Yes', source: 'https://docs.docker.com/engine/swarm/swarm-tutorial/rolling-update/' },
       { mark: 'yes', text: 'Probes, rollouts and rollback', source: k3sDocs },
     ],
@@ -115,7 +115,7 @@ export const rows: Row[] = [
     cells: [
       {
         mark: 'partial',
-        text: 'Release archive with checksum-pinned nats-server and SHA256SUMS (no release tagged yet); images as tarballs',
+        text: 'Published release archives with checksum-pinned nats-server and SHA256SUMS; images can be preloaded as tarballs',
         source: 'README.md',
       },
       { mark: 'partial', text: 'Offline packages plus docker load', source: swarmDocs },
@@ -141,7 +141,7 @@ export const rows: Row[] = [
   {
     capability: 'Maturity',
     cells: [
-      { mark: 'partial', text: 'v0.1.0, released 2026-11-01', source: 'CHANGELOG.md' },
+      { mark: 'partial', text: 'v1.0.1, released 2026-11-11', source: 'CHANGELOG.md' },
       { mark: 'yes', text: 'In Docker Engine since 2016', source: swarmDocs },
       { mark: 'yes', text: 'CNCF project, certified Kubernetes distribution', source: k3sDocs },
     ],

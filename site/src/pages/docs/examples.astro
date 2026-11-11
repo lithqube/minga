@@ -76,9 +76,8 @@ docker -H tcp://127.0.0.1:2375 node ls`}
     service on a GPU node, an agent API, a sensor reader and an optional debug UI.
   </p>
   <Callout kind="limit">
-    validate only. The fixture uses a <code>file:</code> secret, which deploy rejects (only <code>external</code>{' '}
-    secrets are accepted), and its <code>registry.local</code> images would have to be preloaded. Healthchecks and
-    <code>update_config</code> are carried but not enforced.
+    the <code>registry.local</code> images can be pulled anonymously if reachable, or preloaded for
+    air-gapped/authenticated registries. Healthchecks and <code>update_config</code> are enforced.
   </Callout>
   <details>
     <summary>Show edge-ai.yaml ({edgeAi.split('\n').length} lines)</summary>
