@@ -1327,15 +1327,10 @@ impl Supervisor {
     /// Runs the supervisor loop forever, sleeping `interval` between passes.
     pub async fn run(self, interval: Duration) -> ! {
         tracing::info!(node = self.node_id, ?interval, "supervisor loop starting");
-        // Startup reconciliation: kill and delete any STOPPED containerd tasks
-        // left over from a previous run. Without this, Minga fails with
-        // AlreadyExists when trying to create new tasks with the same ID.
-        for info in self.runtime.list().await {
-            if matches!(info.status, crate::runtime::ContainerStatus::Stopped) {
-                tracing::info!(task = %info.id, "startup: removing stale stopped task");
-                let _ = self.runtime.stop(&info.id).await;
-            }
-        }
+        // Startup reconciliation: kill and delete any STOPPED or orphan tasks
+        // left over from a previous run. Uses list_tasks (not list_containers)
+        // so it also catches tasks whose container entry is already gone.
+        self.runtime.purge_stopped_tasks().await;
         loop {
             match self.reconcile_once().await {
                 Ok(0) => {

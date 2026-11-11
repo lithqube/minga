@@ -1010,6 +1010,33 @@ impl Runtime for ContainerdRuntime {
         infos
     }
 
+    /// Kill and delete every task in the minga namespace that is in a stopped
+    /// state. Called once on supervisor startup to clear orphan tasks left by
+    /// a previous run, so subsequent `create_task` calls don't fail with
+    /// AlreadyExists.
+    async fn purge_stopped_tasks(&self) {
+        let tasks = {
+            let mut client = self.client.lock().await;
+            match client.list_tasks().await {
+                Ok(ts) => ts,
+                Err(e) => {
+                    tracing::warn!(error = %e, "startup: failed to list tasks for cleanup");
+                    return;
+                }
+            }
+        };
+        for task in tasks {
+            let ps = ProcessStatus::try_from(task.status).unwrap_or(ProcessStatus::Unknown);
+            if matches!(ps, ProcessStatus::Stopped | ProcessStatus::Unknown) {
+                tracing::info!(task = %task.id, "startup: removing stale stopped/unknown task");
+                let mut client = self.client.lock().await;
+                let _ = client.kill_task(&task.id, 9).await;
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                let _ = client.delete_task(&task.id).await;
+            }
+        }
+    }
+
     async fn status(&self, container_id: &str) -> Option<ContainerStatus> {
         self.state(container_id).await.map(|s| s.status)
     }

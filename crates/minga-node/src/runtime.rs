@@ -87,6 +87,10 @@ pub trait Runtime: Send + Sync {
     /// Lists all containers known to this runtime.
     async fn list(&self) -> Vec<ContainerInfo>;
 
+    /// Kill and delete all stopped/orphan tasks in the runtime namespace.
+    /// Called once on supervisor startup to prevent AlreadyExists errors.
+    async fn purge_stopped_tasks(&self);
+
     /// Returns the status of a container, or `None` if not found.
     async fn status(&self, container_id: &str) -> Option<ContainerStatus>;
 
@@ -311,6 +315,10 @@ impl Runtime for MockRuntime {
         } else {
             lines
         }
+    }
+
+    async fn purge_stopped_tasks(&self) {
+        // No-op in the mock: tests manage container state directly.
     }
 }
 
