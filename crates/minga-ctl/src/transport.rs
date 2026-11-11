@@ -5,27 +5,31 @@
 //! returns. This module also holds the validation and quoting rules for
 //! everything sent to a remote shell (plan item 8), and [`remote_exec`].
 //!
-//! The tunnel forwards to a Unix socket in a private 0700 directory, not to a
-//! local TCP port. A released TCP port can be bound by another local user
-//! before `ssh` binds it (the port is visible in `ps`), and the token would go
-//! to them. minga-ctl instead keeps its own `127.0.0.1:0` listener for the
-//! whole command and relays each connection to the socket.
+//! The tunnel forwards to Unix sockets in a fresh 0700 directory, and the
+//! [`ApiClient`] connects to those sockets directly. There is no local TCP
+//! port: a free port handed to `ssh` is released first and can be bound by
+//! another local user who reads it from `ps`, and the token would go to them.
+//! Other local users cannot reach the sockets either.
 
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{TcpListener, UnixStream};
+use tokio::net::UnixStream;
 use tokio::process::{Child, ChildStderr, Command};
-use tokio::task::JoinHandle;
 
 use crate::api::ApiClient;
 use crate::config::{self, Resolved, TokenSource};
 use crate::error::CtlError;
 
-/// How long to wait for the tunnel to accept a connection.
+/// How long to wait for the tunnel when ssh has no terminal to prompt on.
 const TUNNEL_WAIT: Duration = Duration::from_secs(10);
+
+/// Longest socket path used. `sun_path` is 104 bytes on macOS and 108 on
+/// Linux, the terminating NUL included.
+const SOCKET_PATH_MAX: usize = 100;
 
 /// A live connection for one command.
 pub struct Connection {
@@ -74,6 +78,10 @@ pub async fn connect(resolved: &Resolved, debug: bool) -> Result<Connection, Ctl
 }
 
 /// The SSH transport: read the token if it lives on the node, then tunnel.
+///
+/// The token read runs first and has no time limit, so a first-use host-key
+/// or passphrase prompt can be answered there; with a `ControlMaster` in the
+/// operator's ssh config the tunnel then reuses that connection.
 async fn connect_ssh(
     resolved: &Resolved,
     target: &str,
@@ -92,9 +100,18 @@ async fn connect_ssh(
         _ => resolved.token.clone(),
     };
     let tunnel = Tunnel::open(target, &api_dest, metrics_dest.as_deref(), debug).await?;
-    // The tunnel is plain HTTP to minga-ctl's own loopback listener.
-    let api = ApiClient::new(&tunnel.api, token, None, &resolved.name, debug)?;
-    let metrics = tunnel.metrics.clone().unwrap_or_else(|| tunnel.api.clone());
+    // URLs name the API as seen from the target; every connection goes to
+    // the tunnel's socket.
+    let root = resolved.endpoint.trim_end_matches('/').to_string();
+    let mut api = ApiClient::over_socket(&tunnel.api_sock, &root, token, &resolved.name, debug)?;
+    let metrics = match (&resolved.context.metrics_endpoint, &tunnel.metrics_sock) {
+        (Some(url), Some(sock)) => {
+            let metrics = url.trim_end_matches('/').to_string();
+            api = api.route_text(&metrics, sock)?;
+            metrics
+        }
+        _ => root,
+    };
     Ok(Connection {
         api,
         metrics,
@@ -102,20 +119,27 @@ async fn connect_ssh(
     })
 }
 
-/// An `ssh -N` child forwarding to the API (and metrics) on the target.
+/// What the signal thread kills and removes if minga-ctl is told to stop:
+/// the ssh pid once it is known, and the socket directory.
+type Cleanup = Arc<Mutex<Option<(Option<u32>, PathBuf)>>>;
+
+/// An `ssh -N` child forwarding Unix sockets to the API (and metrics) on
+/// the target.
 pub struct Tunnel {
-    /// `http://127.0.0.1:<port>` for the API.
-    pub api: String,
-    /// `http://127.0.0.1:<port>` for metrics, when `metrics_endpoint` is set.
-    pub metrics: Option<String>,
+    /// Socket forwarded to the API on the target.
+    pub api_sock: PathBuf,
+    /// Socket forwarded to metrics, when `metrics_endpoint` is set.
+    pub metrics_sock: Option<PathBuf>,
     child: Child,
     dir: PathBuf,
-    relays: Vec<JoinHandle<()>>,
+    cleanup: Cleanup,
 }
 
 impl Tunnel {
-    /// Starts `ssh` and waits until the forward accepts a connection
-    /// ([`TUNNEL_WAIT`]) or `ssh` fails.
+    /// Starts `ssh` and waits until every forward accepts a connection, or
+    /// `ssh` fails. Without a terminal ssh cannot prompt, so the wait is
+    /// limited to [`TUNNEL_WAIT`]; with one the operator may be answering a
+    /// prompt and can interrupt instead.
     pub async fn open(
         target: &str,
         api_dest: &str,
@@ -127,8 +151,9 @@ impl Tunnel {
             target: target.to_string(),
             detail,
         };
-        let dir =
-            private_dir().map_err(|e| fail(format!("cannot create a socket directory: {e}")))?;
+        let cleanup = signal_guard().map_err(|e| fail(format!("cannot watch for signals: {e}")))?;
+        let dir = private_dir().map_err(fail)?;
+        *lock(&cleanup) = Some((None, dir.clone()));
         let api_sock = dir.join("api.sock");
         let metrics_sock = metrics_dest.map(|_| dir.join("metrics.sock"));
         let args = tunnel_args(
@@ -143,24 +168,28 @@ impl Tunnel {
         let mut child = match cmd.spawn() {
             Ok(child) => child,
             Err(e) => {
+                lock(&cleanup).take();
                 let _ = std::fs::remove_dir_all(&dir);
                 return Err(fail(format!("cannot run ssh: {e}")));
             }
         };
+        if let Some(pending) = lock(&cleanup).as_mut() {
+            pending.0 = child.id();
+        }
         let stderr = child.stderr.take().expect("stderr is piped");
         let mut tunnel = Tunnel {
-            api: String::new(),
-            metrics: None,
+            api_sock,
+            metrics_sock,
             child,
             dir,
-            relays: Vec::new(),
+            cleanup,
         };
         let mut reader = Some(tokio::spawn(drain_stderr(stderr, debug)));
 
-        let socks: Vec<&Path> = std::iter::once(api_sock.as_path())
-            .chain(metrics_sock.as_deref())
+        let socks: Vec<PathBuf> = std::iter::once(tunnel.api_sock.clone())
+            .chain(tunnel.metrics_sock.clone())
             .collect();
-        let deadline = Instant::now() + TUNNEL_WAIT;
+        let deadline = (!has_terminal()).then(|| Instant::now() + TUNNEL_WAIT);
         loop {
             // A ControlMaster can hold the forward after this client exits,
             // so a socket that answers wins over the exit status.
@@ -184,7 +213,7 @@ impl Tunnel {
                     format!("ssh exited with {status} before the tunnel opened")
                 })));
             }
-            if Instant::now() >= deadline {
+            if deadline.is_some_and(|d| Instant::now() >= d) {
                 return Err(fail(format!(
                     "the tunnel did not open within {} s",
                     TUNNEL_WAIT.as_secs()
@@ -192,48 +221,68 @@ impl Tunnel {
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-
-        tunnel.api = tunnel.relay(api_sock).await?;
-        if let Some(sock) = metrics_sock {
-            tunnel.metrics = Some(tunnel.relay(sock).await?);
-        }
         Ok(tunnel)
-    }
-
-    /// Listens on `127.0.0.1:0` and relays each connection to `sock`.
-    async fn relay(&mut self, sock: PathBuf) -> Result<String, CtlError> {
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .and_then(|l| Ok((l.local_addr()?, l)))
-            .map_err(|e| CtlError::Unreachable {
-                endpoint: "127.0.0.1:0".to_string(),
-                detail: e.to_string(),
-            })?;
-        let (addr, listener) = listener;
-        self.relays.push(tokio::spawn(async move {
-            while let Ok((mut tcp, _)) = listener.accept().await {
-                let sock = sock.clone();
-                tokio::spawn(async move {
-                    // A failed relay closes the connection; the client
-                    // reports it as an unreachable API.
-                    if let Ok(mut unix) = UnixStream::connect(&sock).await {
-                        let _ = tokio::io::copy_bidirectional(&mut tcp, &mut unix).await;
-                    }
-                });
-            }
-        }));
-        Ok(format!("http://{addr}"))
     }
 }
 
 impl Drop for Tunnel {
     fn drop(&mut self) {
-        for relay in &self.relays {
-            relay.abort();
-        }
+        // Held while killing, so the signal thread never acts on a pid that
+        // has been reaped and reused.
+        let mut pending = lock(&self.cleanup);
+        pending.take();
         let _ = self.child.start_kill();
         let _ = std::fs::remove_dir_all(&self.dir);
     }
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Starts a thread that, on SIGINT, SIGTERM or SIGHUP, kills the tunnel's
+/// ssh, removes its socket directory and exits with 128 + the signal number.
+///
+/// `Drop` and `kill_on_drop` run only on a normal return, so without this a
+/// signal would leave `ssh -N` and the directory behind. The thread has its
+/// own runtime, so it also acts while the command blocks (a confirmation
+/// prompt, for example). On Linux `ssh_command` also sets `PR_SET_PDEATHSIG`,
+/// which covers SIGKILL; elsewhere a SIGKILL still orphans the tunnel.
+fn signal_guard() -> std::io::Result<Cleanup> {
+    use tokio::signal::unix::{signal, SignalKind};
+    let cleanup: Cleanup = Arc::default();
+    let shared = Arc::clone(&cleanup);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    // Registered here, before ssh starts, so no signal falls through to the
+    // default action.
+    let (mut int, mut term, mut hup) = {
+        let _entered = runtime.enter();
+        (
+            signal(SignalKind::interrupt())?,
+            signal(SignalKind::terminate())?,
+            signal(SignalKind::hangup())?,
+        )
+    };
+    std::thread::spawn(move || {
+        let signo = runtime.block_on(async {
+            tokio::select! {
+                _ = int.recv() => libc::SIGINT,
+                _ = term.recv() => libc::SIGTERM,
+                _ = hup.recv() => libc::SIGHUP,
+            }
+        });
+        if let Some((pid, dir)) = lock(&shared).take() {
+            if let Some(pid) = pid.and_then(|p| libc::pid_t::try_from(p).ok()) {
+                // SAFETY: kill(2) on the pid of our own unreaped child.
+                unsafe { libc::kill(pid, libc::SIGTERM) };
+            }
+            let _ = std::fs::remove_dir_all(dir);
+        }
+        std::process::exit(128 + signo);
+    });
+    Ok(cleanup)
 }
 
 /// What a remote command returned. An ssh failure is an error instead.
@@ -244,6 +293,17 @@ pub struct RemoteOutput {
     pub stderr: Vec<u8>,
 }
 
+/// One argument of a remote command.
+#[derive(Debug, Clone, Copy)]
+pub enum RemoteArg<'a> {
+    /// Text the code itself chooses, such as a program name or a flag. It
+    /// may start with `-`.
+    Fixed(&'static str),
+    /// A value from config, flags or the server. It may not start with `-`,
+    /// so it can never be read as an option.
+    Value(&'a str),
+}
+
 /// Runs `argv` on `target` over ssh and returns its status and output.
 ///
 /// Validate each value with the `validate_*` function for its kind first;
@@ -252,9 +312,14 @@ pub struct RemoteOutput {
 /// in process listings and the `--debug` trace. Exit status 255 is ssh's own
 /// failure and becomes [`CtlError::Ssh`]; any other status is the caller's
 /// to judge.
+///
+/// There is no time limit: ssh may be waiting on a host-key, passphrase or
+/// MFA prompt, and remote commands such as an image pull can take minutes.
+/// A caller that needs one wraps the call in `tokio::time::timeout`; the
+/// child is killed when the future is dropped.
 pub async fn remote_exec(
     target: &str,
-    argv: &[&str],
+    argv: &[RemoteArg<'_>],
     stdin: Option<&[u8]>,
     debug: bool,
 ) -> Result<RemoteOutput, CtlError> {
@@ -304,7 +369,8 @@ pub async fn remote_exec(
 /// Reads the API token from `path` on `target`; in memory only.
 async fn read_remote_token(target: &str, path: &str, debug: bool) -> Result<String, CtlError> {
     validate_remote_path(path)?;
-    let out = remote_exec(target, &["cat", path], None, debug).await?;
+    let argv = [RemoteArg::Fixed("cat"), RemoteArg::Value(path)];
+    let out = remote_exec(target, &argv, None, debug).await?;
     if !out.status.success() {
         return Err(ssh_error(target, &out.stderr, out.status));
     }
@@ -341,22 +407,29 @@ pub fn tunnel_args(
 }
 
 /// The ssh arguments that run `argv` on `target`, each argument quoted.
-pub fn exec_args(target: &str, argv: &[&str]) -> Result<Vec<String>, CtlError> {
+///
+/// `-T` keeps a `RequestTTY force` in the operator's ssh config from adding
+/// a terminal, whose output processing would change the command's stdout.
+pub fn exec_args(target: &str, argv: &[RemoteArg<'_>]) -> Result<Vec<String>, CtlError> {
     validate_target(target)?;
     if argv.is_empty() {
         return Err(CtlError::Usage(
             "a remote command needs a program to run".to_string(),
         ));
     }
-    let mut args = vec!["--".to_string(), target.to_string()];
+    let mut args = vec!["-T".to_string(), "--".to_string(), target.to_string()];
     for arg in argv {
-        if !remote_arg_ok(arg) {
+        let (text, ok) = match *arg {
+            RemoteArg::Fixed(text) => (text, remote_arg_ok(text)),
+            RemoteArg::Value(text) => (text, remote_arg_ok(text) && !text.starts_with('-')),
+        };
+        if !ok {
             return Err(CtlError::Usage(format!(
                 "refusing to send `{}` to a remote shell",
-                arg.escape_debug()
+                text.escape_debug()
             )));
         }
-        args.push(quote(arg));
+        args.push(quote(text));
     }
     Ok(args)
 }
@@ -392,18 +465,20 @@ pub fn validate_image(value: &str) -> Result<(), CtlError> {
 
 /// A path on the remote node: `^/[A-Za-z0-9._/-]+$`.
 pub fn validate_remote_path(value: &str) -> Result<(), CtlError> {
-    let ok = value.len() > 1
-        && value.starts_with('/')
-        && value
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || "._/-".contains(c));
-    if ok {
+    if value.len() > 1 && value.starts_with('/') && path_chars_ok(value) {
         return Ok(());
     }
     Err(CtlError::Usage(format!(
         "invalid remote path `{}`: it must be absolute and use only letters, digits and `._/-`",
         value.escape_debug()
     )))
+}
+
+/// Letters, digits and `._/-` only.
+fn path_chars_ok(value: &str) -> bool {
+    value
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || "._/-".contains(c))
 }
 
 /// Checks a value that starts with an ASCII letter or digit and continues
@@ -486,25 +561,68 @@ fn ssh_command(args: &[String], debug: bool) -> Command {
     }
     let mut cmd = Command::new("ssh");
     cmd.args(args).kill_on_drop(true);
+    #[cfg(target_os = "linux")]
+    // SAFETY: prctl is async-signal-safe and touches only the child.
+    unsafe {
+        cmd.pre_exec(|| {
+            // ssh gets SIGTERM when minga-ctl dies, even by SIGKILL.
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
     cmd
 }
 
+/// True when ssh can prompt: it reads passphrases and MFA codes from
+/// `/dev/tty`, not stdin.
+fn has_terminal() -> bool {
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/tty")
+        .is_ok()
+}
+
 /// A new directory only this user can enter, for the tunnel's sockets.
-fn private_dir() -> std::io::Result<PathBuf> {
+/// `$TMPDIR` is used unless its socket paths would be too long or unsafe
+/// inside `-L path:host:port`; then `/tmp`.
+fn private_dir() -> Result<PathBuf, String> {
     use std::os::unix::fs::DirBuilderExt;
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.subsec_nanos())
         .unwrap_or(0);
-    let dir = std::env::temp_dir().join(format!("minga-ctl-{}-{nanos:x}", std::process::id()));
-    // `create`, not `create_all`: fails if the path already exists, so a
-    // directory or symlink planted there is never used.
-    std::fs::DirBuilder::new().mode(0o700).create(&dir)?;
-    Ok(dir)
+    let name = format!("minga-ctl-{}-{nanos:x}", std::process::id());
+    for base in [std::env::temp_dir(), PathBuf::from("/tmp")] {
+        let dir = base.join(&name);
+        if !socket_dir_ok(&dir) {
+            continue;
+        }
+        // `create`, not `create_all`: fails if the path already exists, so a
+        // directory or symlink planted there is never used.
+        return match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
+            Ok(()) => Ok(dir),
+            Err(e) => Err(format!("cannot create {}: {e}", dir.display())),
+        };
+    }
+    Err(
+        "no temporary directory gives a socket path ssh can use; set TMPDIR to a short path"
+            .to_string(),
+    )
+}
+
+/// Whether the longest socket path in `dir` fits `sun_path` and holds no
+/// `:` or other character `-L` or a shell could misread.
+fn socket_dir_ok(dir: &Path) -> bool {
+    dir.join("metrics.sock")
+        .to_str()
+        .is_some_and(|p| p.len() <= SOCKET_PATH_MAX && path_chars_ok(p))
 }
 
 /// True when every socket accepts a connection.
-async fn all_connect(socks: &[&Path]) -> bool {
+async fn all_connect(socks: &[PathBuf]) -> bool {
     for sock in socks {
         if UnixStream::connect(sock).await.is_err() {
             return false;
@@ -604,7 +722,14 @@ mod tests {
     #[test]
     fn no_argv_sets_batch_mode_or_host_key_checking() {
         let tunnel = tunnel_args("mgr1", (Path::new("/d/a"), "127.0.0.1:2375"), None);
-        let exec = exec_args("mgr1", &["cat", "/etc/minga/api-token"]).unwrap();
+        let exec = exec_args(
+            "mgr1",
+            &[
+                RemoteArg::Fixed("cat"),
+                RemoteArg::Value("/etc/minga/api-token"),
+            ],
+        )
+        .unwrap();
         for arg in tunnel.iter().chain(&exec) {
             assert!(!arg.contains("BatchMode"), "{arg}");
             assert!(!arg.contains("StrictHostKeyChecking"), "{arg}");
@@ -613,10 +738,17 @@ mod tests {
 
     #[test]
     fn the_exec_argv_puts_the_target_after_dashes_and_quotes_arguments() {
-        let args = exec_args("alice@mgr1", &["cat", "/etc/minga/api-token"]).unwrap();
+        let args = exec_args(
+            "alice@mgr1",
+            &[
+                RemoteArg::Fixed("cat"),
+                RemoteArg::Value("/etc/minga/api-token"),
+            ],
+        )
+        .unwrap();
         assert_eq!(
             args,
-            ["--", "alice@mgr1", "'cat'", "'/etc/minga/api-token'"]
+            ["-T", "--", "alice@mgr1", "'cat'", "'/etc/minga/api-token'"]
         );
     }
 
@@ -625,9 +757,30 @@ mod tests {
         for arg in [
             "a b", "x;rm", "$(id)", "`id`", "a'b", "a\\b", "!1", "", "a\nb",
         ] {
-            assert!(exec_args("mgr1", &["echo", arg]).is_err(), "{arg:?}");
+            let argv = [RemoteArg::Fixed("echo"), RemoteArg::Value(arg)];
+            assert!(exec_args("mgr1", &argv).is_err(), "{arg:?}");
         }
         assert!(exec_args("mgr1", &[]).is_err());
+        assert!(exec_args("mgr1", &[RemoteArg::Fixed("a b")]).is_err());
+    }
+
+    #[test]
+    fn only_fixed_arguments_may_start_with_a_dash() {
+        let value = [RemoteArg::Fixed("ls"), RemoteArg::Value("-la")];
+        assert!(exec_args("mgr1", &value).is_err());
+        let flag = [RemoteArg::Fixed("ls"), RemoteArg::Fixed("-la")];
+        assert_eq!(exec_args("mgr1", &flag).unwrap()[4], "'-la'");
+    }
+
+    #[test]
+    fn a_socket_directory_must_fit_sun_path_and_parse_in_a_forward() {
+        assert!(socket_dir_ok(Path::new("/tmp/minga-ctl-1-ab")));
+        assert!(socket_dir_ok(Path::new(
+            "/var/folders/9x/abcdefghijklmnopqrstuvwxyz0000gn/T/minga-ctl-99999-3b9aca00"
+        )));
+        assert!(!socket_dir_ok(&Path::new("/tmp").join("x".repeat(90))));
+        assert!(!socket_dir_ok(Path::new("/tmp/a:b/minga-ctl-1-ab")));
+        assert!(!socket_dir_ok(Path::new("/tmp/a b/minga-ctl-1-ab")));
     }
 
     #[test]
