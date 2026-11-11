@@ -50,10 +50,7 @@ async fn a_failed_revision_save_removes_the_old_revision() {
     let tmp = path.with_file_name(format!("shop.api.json.tmp.{}", std::process::id()));
     std::fs::create_dir(&tmp).unwrap();
 
-    let conn = Connection {
-        api,
-        metrics: cluster.url.clone(),
-    };
+    let conn = Connection::direct(api, cluster.url.clone());
     let scale = ServiceCommand::Scale {
         service: "shop.api".to_string(),
         replicas: 2,

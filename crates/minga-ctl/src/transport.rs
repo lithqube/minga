@@ -42,6 +42,17 @@ pub struct Connection {
     _tunnel: Option<Tunnel>,
 }
 
+impl Connection {
+    /// A connection without a tunnel, for a client the caller built.
+    pub fn direct(api: ApiClient, metrics: String) -> Connection {
+        Connection {
+            api,
+            metrics,
+            _tunnel: None,
+        }
+    }
+}
+
 /// Connects to the resolved context's cluster.
 pub async fn connect(resolved: &Resolved, debug: bool) -> Result<Connection, CtlError> {
     if let Some(target) = &resolved.context.ssh {
@@ -70,11 +81,7 @@ pub async fn connect(resolved: &Resolved, debug: bool) -> Result<Connection, Ctl
         &resolved.name,
         debug,
     )?;
-    Ok(Connection {
-        api,
-        metrics,
-        _tunnel: None,
-    })
+    Ok(Connection::direct(api, metrics))
 }
 
 /// The SSH transport: read the token if it lives on the node, then tunnel.
@@ -496,7 +503,8 @@ fn check(kind: &str, value: &str, extra: &str) -> Result<(), CtlError> {
     )))
 }
 
-/// The `host:port` an `http://` URL names, as seen from the SSH target.
+/// The `host:port` an `http://` URL names, as seen from the SSH target. The
+/// host must be the target's loopback interface.
 pub fn forward_dest(url: &str) -> Result<String, CtlError> {
     let bad = |why: &str| CtlError::Config(format!("with ssh, `{url}` {why}"));
     let rest = url
@@ -523,21 +531,18 @@ pub fn forward_dest(url: &str) -> Result<String, CtlError> {
             None => (authority, None, false),
         },
     };
-    let host_ok = if v6 {
-        !host.is_empty()
-            && host
-                .chars()
-                .all(|c| c.is_ascii_hexdigit() || ":.".contains(c))
+    // ssh opens the connection to this host from the target, in plain HTTP;
+    // only the target's own loopback keeps the token inside the tunnel.
+    let loopback = if v6 {
+        host == "::1"
     } else {
-        host.chars()
-            .next()
-            .is_some_and(|c| c.is_ascii_alphanumeric())
-            && host
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || ".-".contains(c))
+        host == "127.0.0.1" || host.eq_ignore_ascii_case("localhost")
     };
-    if !host_ok {
-        return Err(bad(shape));
+    if !loopback {
+        return Err(bad(
+            "must name the SSH target's loopback (127.0.0.1, localhost or [::1]); \
+             the hop from the target to any other host is plain HTTP outside the tunnel",
+        ));
     }
     let port = match port {
         None => 80,
@@ -548,9 +553,9 @@ pub fn forward_dest(url: &str) -> Result<String, CtlError> {
             .ok_or_else(|| bad(shape))?,
     };
     Ok(if v6 {
-        format!("[{host}]:{port}")
+        format!("[::1]:{port}")
     } else {
-        format!("{host}:{port}")
+        format!("{}:{port}", host.to_ascii_lowercase())
     })
 }
 
@@ -847,7 +852,7 @@ mod tests {
             "localhost:9100"
         );
         assert_eq!(forward_dest("http://[::1]:2375").unwrap(), "[::1]:2375");
-        assert_eq!(forward_dest("http://10.0.0.5").unwrap(), "10.0.0.5:80");
+        assert_eq!(forward_dest("http://LOCALHOST").unwrap(), "localhost:80");
         for bad in [
             "https://127.0.0.1:2375",
             "http://127.0.0.1:2375/v1.41",
@@ -860,6 +865,24 @@ mod tests {
             "tcp://127.0.0.1:2375",
         ] {
             assert!(forward_dest(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_forward_destination_must_be_the_targets_loopback() {
+        for remote in [
+            "http://10.0.0.5:2375",
+            "http://mgr2.example.net:2375",
+            "http://127.0.0.2:2375",
+            "http://[fe80::1]:2375",
+            "http://0.0.0.0:2375",
+        ] {
+            let err = forward_dest(remote).unwrap_err().to_string();
+            assert!(
+                err.contains("must name the SSH target's loopback"),
+                "{remote}: {err}"
+            );
+            assert_eq!(forward_dest(remote).unwrap_err().exit_code(), 1);
         }
     }
 

@@ -91,8 +91,13 @@ phase 1 takes the API off the network instead.
        [-L <dir>/metrics.sock:127.0.0.1:9100] -- <target>
    ```
 
+   With `ssh`, `api_endpoint` and `metrics_endpoint` must be `http://` to
+   the target's own loopback (`127.0.0.1`, `localhost` or `[::1]`):
+   ssh makes the hop from the target to the destination in plain HTTP, so
+   any other host would see the token. `context add` checks this too.
+
    The HTTP client connects to the sockets directly; there is no local TCP
-   port. A free TCP port handed to `ssh` would be released first, and
+   port. System proxies (`HTTP_PROXY` and friends) are never used. A free TCP port handed to `ssh` would be released first, and
    another local user who reads the port from `ps` could bind it before
    `ssh` does and receive the token. Other local users cannot reach the
    sockets either, so a node that runs the API without a token is not

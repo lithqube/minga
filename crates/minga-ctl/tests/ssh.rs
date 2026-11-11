@@ -328,3 +328,53 @@ fn a_target_starting_with_a_dash_is_refused_at_add_time() {
     );
     assert!(!ok && err.contains("invalid remote path"), "{err}");
 }
+
+#[test]
+fn context_add_applies_the_tunnel_destination_rules() {
+    let stub = Stub::new();
+    let add = |extra: &[&str]| {
+        let mut args = vec!["context", "add", "bad", "--ssh", "mgr1"];
+        args.extend_from_slice(extra);
+        stub.ctl(&args, &[])
+    };
+    for (extra, expected) in [
+        (
+            &["--endpoint", "https://127.0.0.1:2375"][..],
+            "must be an http:// URL",
+        ),
+        (
+            &["--endpoint", "http://10.0.0.5:2375"][..],
+            "must name the SSH target's loopback",
+        ),
+        (
+            &["--metrics-endpoint", "http://10.0.0.5:9100"][..],
+            "must name the SSH target's loopback",
+        ),
+    ] {
+        let (ok, _, err) = add(extra);
+        assert!(!ok, "{extra:?} was accepted");
+        assert!(err.contains(expected), "{extra:?}: {err}");
+    }
+    let (ok, _, err) = add(&["--metrics-endpoint", "http://127.0.0.1:9100"]);
+    assert!(ok, "{err}");
+    let list =
+        std::fs::read_to_string(stub.path("config").join("minga-ctl").join("config.yaml")).unwrap();
+    assert!(!list.contains("10.0.0.5"), "{list}");
+}
+
+#[test]
+fn a_remote_token_file_without_ssh_is_refused_at_add_time() {
+    let stub = Stub::new();
+    let (ok, _, err) = stub.ctl(
+        &[
+            "context",
+            "add",
+            "local",
+            "--remote-token-file",
+            "/etc/minga/api-token",
+        ],
+        &[],
+    );
+    assert!(!ok);
+    assert!(err.contains("--remote-token-file needs --ssh"), "{err}");
+}

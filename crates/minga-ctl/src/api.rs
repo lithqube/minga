@@ -31,11 +31,13 @@ pub struct ApiClient {
     text_route: Option<(String, reqwest::Client)>,
 }
 
-/// Builder settings every client shares.
+/// Builder settings every client shares. System proxies are off: the token
+/// must go only to the API or the tunnel, never to `HTTP_PROXY`.
 fn builder() -> reqwest::ClientBuilder {
     reqwest::Client::builder()
         .timeout(Duration::from_secs(15))
         .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
 }
 
 /// The outcome of a request that may name something that does not exist.
