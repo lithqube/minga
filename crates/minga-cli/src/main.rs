@@ -497,7 +497,13 @@ async fn main() -> ExitCode {
             };
             let project_dir = std::path::Path::new(&compose.compose_file)
                 .parent()
-                .and_then(|p| if p.as_os_str().is_empty() { None } else { Some(p) })
+                .and_then(|p| {
+                    if p.as_os_str().is_empty() {
+                        None
+                    } else {
+                        Some(p)
+                    }
+                })
                 .map(|p| p.canonicalize().unwrap_or_else(|_| p.to_path_buf()));
             let translated = match minga_scheduler::translate_project(
                 &loaded.project,

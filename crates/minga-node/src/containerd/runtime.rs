@@ -449,9 +449,14 @@ impl ContainerdRuntime {
                     m.source = dir.display().to_string();
                 }
                 minga_state::types::MountKind::Bind => {
-                    tokio::fs::create_dir_all(&m.source).await.map_err(|e| {
-                        RuntimeError::Start(format!("create bind source {}: {e}", m.source))
-                    })?;
+                    // Skip mkdir if the source already exists (file bind mounts).
+                    // Only create a directory when the path is absent entirely.
+                    let path = std::path::Path::new(&m.source);
+                    if !path.exists() {
+                        tokio::fs::create_dir_all(path).await.map_err(|e| {
+                            RuntimeError::Start(format!("create bind source {}: {e}", m.source))
+                        })?;
+                    }
                 }
             }
         }
@@ -523,8 +528,11 @@ impl ContainerdRuntime {
             let auth_b64 = v["auths"][registry_host]["auth"].as_str()?;
             use base64::Engine as _;
             let decoded = String::from_utf8(
-                base64::engine::general_purpose::STANDARD.decode(auth_b64).ok()?
-            ).ok()?;
+                base64::engine::general_purpose::STANDARD
+                    .decode(auth_b64)
+                    .ok()?,
+            )
+            .ok()?;
             Some(decoded) // "username:token"
         })();
 

@@ -61,7 +61,8 @@ services:
           memory: 512M
 "#;
     let project = load(yaml);
-    let translated = translate_project(&project, "plant-7", None).expect("translation should succeed");
+    let translated =
+        translate_project(&project, "plant-7", None).expect("translation should succeed");
 
     // Verify translation.
     assert_eq!(translated.services.len(), 2);
@@ -276,7 +277,8 @@ secrets:
     file: ./secrets/db_password.txt
 "#;
     let project = load(yaml);
-    let err = translate_project(&project, "data", None).expect_err("a file: secret must be refused");
+    let err =
+        translate_project(&project, "data", None).expect_err("a file: secret must be refused");
     let message = err.to_string();
     assert!(
         message.contains("file:") && message.contains("not supported"),

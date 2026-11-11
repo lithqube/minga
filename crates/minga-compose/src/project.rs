@@ -278,7 +278,10 @@ impl Project {
                     }
                     if let Some((k, v)) = line.split_once('=') {
                         // Only insert if the key is not already set by `environment`.
-                        svc.environment.0.entry(k.trim().to_string()).or_insert(Some(v.to_string()));
+                        svc.environment
+                            .0
+                            .entry(k.trim().to_string())
+                            .or_insert(Some(v.to_string()));
                     }
                 }
             }
