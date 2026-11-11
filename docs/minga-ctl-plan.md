@@ -122,11 +122,24 @@ supports the sshd logs but is not independent evidence.
 
 **Revoking an operator.** The API token is shared, and anyone who can read the
 token file can keep a copy; minga-ctl not storing it is a habit of the tool,
-not a guarantee. Removing an operator from the unix group stops further reads
-of the file and nothing else: with SSH access and a retained token they can
-still forward the API port and use it. Revocation is therefore two steps:
-remove the SSH account (or its port forwarding), and rotate the token on the
-node. Phase 2 replaces the shared token with per-operator certificates.
+not a guarantee. Half measures do not revoke access:
+
+- Removing the operator from the unix group does not affect sessions that are
+  already open, and a copied token keeps working.
+- Disabling port forwarding does not help while they have a shell: the
+  loopback API can be called from the node itself.
+- Rotating the token does not help while they can still read the token file.
+
+Revocation is these steps, in this order, on every node:
+
+1. Remove or lock the operator's SSH account and remove them from the
+   operators group.
+2. End their open sessions.
+3. Rotate the API token: write a new token file and restart `minga api` with
+   it. The token is read at start-up only.
+
+Until step 3 is done, treat the old token as known to them. Phase 2 replaces
+the shared token with per-operator certificates.
 
 ### 2.3 Phase 2: mutual TLS, roles, audit and revisions on the server
 
@@ -168,11 +181,11 @@ and produce evidence; it cannot provide compliance by itself.
 | Criterion | Phase 1 supports it with | Phase 2 adds | Stays with the organisation |
 |---|---|---|---|
 | CC6.1 logical access | API reachable only on node loopback through SSH; no credentials stored on workstations | Client certificate per operator | SSH key issuance, MFA, device security |
-| CC6.2, CC6.3 provisioning and least privilege | Access is an SSH account on a node. Group membership only controls who can read the token file. Revoking an operator means removing the SSH account (or its port forwarding) and rotating the shared token. No roles. | `viewer`, `deployer`, `admin`; short-lived certificates | Joiner and leaver process, access reviews |
+| CC6.2, CC6.3 provisioning and least privilege | Access is an SSH account on a node plus read access to the token file through a unix group. Revoking an operator means removing the account, ending its sessions and rotating the shared token, in that order (section 2.2). No roles. | `viewer`, `deployer`, `admin`; short-lived certificates | Joiner and leaver process, access reviews |
 | CC6.6 boundary protection | API and metrics on loopback; client refuses plain HTTP off-host | TLS listener | Firewalls, bastion hosts |
 | CC6.7 data in transit | All remote traffic inside SSH; secret values on stdin only | TLS on the API | Key management |
 | CC7.2 monitoring | sshd logs (who, when, from where) plus the client audit log (what) | Server audit line per change, tied to the certificate identity | Log shipping, retention, alerting |
-| CC8.1 change management | Deploys from a compose file; revision saved before each change; rollback; audit line per change | Server-side revisions | Review and approval, CI gates |
+| CC8.1 change management | Deploys from a compose file; previous revision saved with each accepted change; rollback; audit line per change | Server-side revisions | Review and approval, CI gates |
 
 ## 3. Crate layout
 
@@ -685,6 +698,12 @@ and `rollback` reads again after its confirmation prompt. That narrows the
 window; it does not close it. Closing it needs the server to check `version`
 (section 2.3).
 
+Operating rule until then: only one change at a time may be in flight for a
+given service, across every client that can write to the API (minga-ctl,
+`minga deploy`, CI jobs, Docker-compatible tools). minga-ctl cannot enforce
+this; the team has to, for example by sending every change to a service
+through one CI pipeline that does not run jobs for the same stack in parallel.
+
 ```
 $ minga-ctl service update myapp.web --image ghcr.io/acme/web:1.4.3
 myapp.web updated: image ghcr.io/acme/web:1.4.2 -> ghcr.io/acme/web:1.4.3
@@ -1095,9 +1114,12 @@ Before each commit: `cargo fmt --all`, `cargo clippy --all-targets -- -D warning
   ID to the name), fails the prefix check, and cannot be removed with
   minga-ctl.
 - Two operators changing the same service at the same time can overwrite each
-  other without warning, because the server ignores `version` (section 5.3).
+  other without warning, because the server ignores `version`. Until the
+  server rejects stale updates, changes to a service must be made one at a
+  time across all clients (section 5.3).
 - The API token is shared. Removing one operator's access means removing
-  their SSH account and rotating the token (section 2.2).
+  their SSH account, ending their sessions and rotating the token
+  (section 2.2).
 - If minga-ctl stops between the API accepting an update and the revision
   file being written, that change has no saved revision.
 - `registry` commands do nothing useful until Minga stores registry
