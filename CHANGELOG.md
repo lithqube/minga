@@ -2,13 +2,13 @@
 
 ## [Unreleased]
 
-## [1.0.1-rc.1] — 2026-11-10
+## [1.0.1] — 2026-11-11
 
-Release candidate. Everything in the 0.1.0 entry below plus the changes
-here. `0.1.0` was never tagged, so this is the first tagged build; the
-version jumps from `0.1.0` to `1.0.1-rc.1` by maintainer decision. See
-[docs/release-1.0.1-rc.1.md](docs/release-1.0.1-rc.1.md) for what was and
-was not verified.
+Release contents prepared for `1.0.1`. Includes the `0.1.0` entry below
+plus the changes here. `0.1.0` was never tagged; this release is numbered
+`1.0.1` by maintainer decision. Publishing requires the `v1.0.1` tag. See
+[docs/release-1.0.1.md](docs/release-1.0.1.md) for verification status and
+installation details.
 
 ### Added
 - Rolling updates. A changed service spec now replaces its running tasks,

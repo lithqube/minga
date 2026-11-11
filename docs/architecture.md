@@ -1,6 +1,6 @@
 # Architecture notes
 
-How Minga fits together **as of `v1.0.1-rc.1`**, the structural limits that come with it, and the plan to remove them. Settled decisions live in the [ADRs](adr/); this page describes the code as it is.
+How Minga fits together **as of `v1.0.1`**, the structural limits that come with it, and the plan to remove them. Settled decisions live in the [ADRs](adr/); this page describes the code as it is.
 
 ## Processes and state
 
@@ -34,7 +34,7 @@ flowchart LR
 
 ## Known structural limits
 
-These are deliberate `v1.0.1-rc.1` trade-offs, listed so nobody builds on them by accident.
+These are deliberate `v1.0.1` trade-offs, listed so nobody builds on them by accident.
 
 1. **Every node is a Raft voter.** Workers and `minga api` open a full `StateStore`, and membership is the `--peer` list at first start. Consequences:
    - Quorum depends on the number of workers, so flaky edge workers can stall deploys.
