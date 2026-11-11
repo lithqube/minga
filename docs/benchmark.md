@@ -189,3 +189,68 @@ For multi-node production use cases, Docker Swarm currently has an availability
 advantage. Minga's multi-node mesh (WireGuard) is in progress; once available,
 re-running this benchmark on equivalent multi-node topologies would give a
 definitive comparison.
+
+---
+
+## Expert assessment — production readiness (v1.0.1)
+
+_Assessed after deploying a real 8-service stack (Traefik, BFF, NATS, auth server,
+Postgres, secrets agent, AI service, workers) on a fresh Ubuntu 24.04 node._
+
+### What it gets right
+
+**The core architecture is sound.** A single binary that reads Compose files natively,
+runs containerd directly, and requires neither Docker daemon nor Kubernetes fills a
+genuine gap. Swarm is deprecated; k3s idles at ~300 MB; plain Docker Compose has no
+rolling updates. Minga targets the right niche.
+
+**The Raft + NATS design is clean.** Externalising desired state to `openraft + redb`
+and routing events through a NATS sidecar is the correct split — it explains the memory
+advantage and scales better than Swarm's approach of embedding everything in `dockerd`.
+
+**Compose fidelity is taken seriously.** Failing loudly on unknown keys is a better
+contract than silently ignoring them (as `docker compose` does for `x-` extensions
+and deprecated fields).
+
+### Production blockers found in v1.0.1
+
+| Issue                                          | Severity                                            | Status          |
+| ---------------------------------------------- | --------------------------------------------------- | --------------- |
+| `env_file` not supported                       | High — used in nearly every real stack              | Fixed in v1.0.2 |
+| Named `user:` rejected                         | High — ZITADEL, Python services use named users     | Fixed in v1.0.2 |
+| `ctr images unpack` removed in containerd v2.2 | High — silent deploy failure on Ubuntu 24.04        | Fixed in v1.0.2 |
+| Orphan tasks persist across restarts           | High — requires manual containerd cleanup           | Fixed in v1.0.2 |
+| `extra_hosts` not supported                    | Medium                                              | Fixed in v1.0.2 |
+| `command: >` folded scalar not argv-split      | Medium — breaks multi-line commands                 | Open            |
+| `~/.docker/config.json` not read by `ctr`      | Medium — private registries require manual pre-pull | Fixed in v1.0.2 |
+| Relative bind mounts not resolved              | Medium                                              | Fixed in v1.0.2 |
+
+8 blockers in a single day of deployment. For a project billing itself as
+"Compose-native," the gap between claimed and actual Compose compatibility was the
+primary credibility risk. 6 of the 8 are fixed in v1.0.2.
+
+### Where it fits well
+
+| Good fit                                                   | Not yet ready                                            |
+| ---------------------------------------------------------- | -------------------------------------------------------- |
+| Edge/IoT nodes (Swarm/k3s too heavy)                       | Multi-node HA production (no cross-node networking)      |
+| Air-gapped environments (single binary + bundled deps)     | Orgs with private registries and existing Docker tooling |
+| Teams wanting Compose + rolling updates without Kubernetes | Services with complex `command: >` multi-line args       |
+| Self-hosted, low-traffic, single-node stacks               | —                                                        |
+
+### Rating
+
+| Dimension                                  | Score                            |
+| ------------------------------------------ | -------------------------------- |
+| Architecture and design                    | 8/10                             |
+| Compose compatibility (v1.0.1)             | 4/10                             |
+| Compose compatibility (v1.0.2 fixes)       | 7/10                             |
+| Production readiness (v1.0.1, single-node) | 5/10                             |
+| Production readiness (v1.0.2, single-node) | 7/10                             |
+| Multi-node production readiness            | 3/10 (blocked on WireGuard mesh) |
+| Documentation                              | 6/10                             |
+
+**Summary:** Technically sound architecture, v1.0.1 needed hardening before real
+workloads. With v1.0.2 fixes merged, it becomes a viable choice for single-node edge
+deployments. The 60–73% memory advantage over Docker/Swarm is real. Recommend
+tracking the WireGuard mesh milestone before adopting for multi-node production.
