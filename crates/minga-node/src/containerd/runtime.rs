@@ -500,13 +500,47 @@ impl ContainerdRuntime {
     }
 
     /// Pull and unpack an image via `ctr` into the `minga` namespace.
+    ///
+    /// Credentials are read from `~/.docker/config.json` when present and the
+    /// image's registry has an entry there. This lets pre-pulled images stay
+    /// usable across restarts without a separate `docker login` step.
     async fn pull_image(&self, image_ref: &str) -> Result<(), RuntimeError> {
         tracing::info!(image = %image_ref, "pulling image via ctr");
+
+        // Extract registry host: first path component if it contains '.' or ':'.
+        let registry_host = image_ref
+            .split('/')
+            .next()
+            .filter(|h| h.contains('.') || h.contains(':'))
+            .unwrap_or("docker.io");
+
+        // shortcut: ~/.docker/config.json auth lookup; falls back to anonymous pull.
+        let user_arg: Option<String> = (|| {
+            let home = std::env::var("HOME").ok()?;
+            let path = std::path::Path::new(&home).join(".docker/config.json");
+            let bytes = std::fs::read(&path).ok()?;
+            let v: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+            let auth_b64 = v["auths"][registry_host]["auth"].as_str()?;
+            use base64::Engine as _;
+            let decoded = String::from_utf8(
+                base64::engine::general_purpose::STANDARD.decode(auth_b64).ok()?
+            ).ok()?;
+            Some(decoded) // "username:token"
+        })();
+
+        let mut pull_args = vec!["-n", "minga", "images", "pull"];
+        let user_owned;
+        if let Some(ref creds) = user_arg {
+            pull_args.push("--user");
+            user_owned = creds.as_str();
+            pull_args.push(user_owned);
+        }
+        pull_args.push(image_ref);
 
         let pull = tokio::time::timeout(
             Duration::from_secs(300),
             tokio::process::Command::new("ctr")
-                .args(["-n", "minga", "images", "pull", image_ref])
+                .args(&pull_args)
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
                 .kill_on_drop(true)

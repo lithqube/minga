@@ -262,6 +262,7 @@ mod tests {
             update: Default::default(),
             rollback: None,
             previous: None,
+            extra_hosts: vec![],
         }
     }
 

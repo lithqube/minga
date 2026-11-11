@@ -567,6 +567,7 @@ mod tests {
             update: Default::default(),
             rollback: None,
             previous: None,
+            extra_hosts: vec![],
         };
         let bytes = bincode::serde::encode_to_vec(&svc, bincode::config::standard()).unwrap();
         let (back, _): (Service, _) =

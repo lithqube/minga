@@ -495,7 +495,15 @@ async fn main() -> ExitCode {
             let Some(loaded) = load(&compose) else {
                 return ExitCode::FAILURE;
             };
-            let translated = match minga_scheduler::translate_project(&loaded.project, &stack) {
+            let project_dir = std::path::Path::new(&compose.compose_file)
+                .parent()
+                .and_then(|p| if p.as_os_str().is_empty() { None } else { Some(p) })
+                .map(|p| p.canonicalize().unwrap_or_else(|_| p.to_path_buf()));
+            let translated = match minga_scheduler::translate_project(
+                &loaded.project,
+                &stack,
+                project_dir.as_deref(),
+            ) {
                 Ok(t) => t,
                 Err(e) => {
                     eprintln!("error: {e}");
