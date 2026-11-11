@@ -1327,6 +1327,10 @@ impl Supervisor {
     /// Runs the supervisor loop forever, sleeping `interval` between passes.
     pub async fn run(self, interval: Duration) -> ! {
         tracing::info!(node = self.node_id, ?interval, "supervisor loop starting");
+        // Startup reconciliation: kill and delete any STOPPED or orphan tasks
+        // left over from a previous run. Uses list_tasks (not list_containers)
+        // so it also catches tasks whose container entry is already gone.
+        self.runtime.purge_stopped_tasks().await;
         loop {
             match self.reconcile_once().await {
                 Ok(0) => {

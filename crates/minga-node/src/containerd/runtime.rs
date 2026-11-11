@@ -566,27 +566,8 @@ impl ContainerdRuntime {
             )));
         }
 
-        let unpack = tokio::time::timeout(
-            Duration::from_secs(120),
-            tokio::process::Command::new("ctr")
-                .args(["-n", "minga", "images", "unpack", image_ref])
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
-                .kill_on_drop(true)
-                .output(),
-        )
-        .await
-        .map_err(|_| RuntimeError::Start(format!("ctr unpack {image_ref} timed out after 120s")))?
-        .map_err(|e| RuntimeError::Start(format!("spawn ctr unpack: {e}")))?;
-
-        if !unpack.status.success() {
-            let stderr = String::from_utf8_lossy(&unpack.stderr);
-            return Err(RuntimeError::Start(format!(
-                "ctr unpack {image_ref} failed ({}): {stderr}",
-                unpack.status
-            )));
-        }
-
+        // `ctr images pull` on containerd v2 unpacks automatically; a separate
+        // `ctr images unpack` step is not available in containerd v2.2+.
         tracing::info!(image = %image_ref, "image pulled and unpacked");
         Ok(())
     }
@@ -608,6 +589,10 @@ impl ContainerdRuntime {
                 errors.push(format!("kill stale task: {error}"));
             }
         }
+        // Brief pause after SIGKILL so containerd v2 marks the task stopped
+        // before we attempt delete — without this, delete may return
+        // "cannot delete a running process" on containerd 2.2+.
+        tokio::time::sleep(Duration::from_millis(500)).await;
         if let Err(error) = client.delete_task(container_id).await {
             if !is_missing(&error) {
                 errors.push(format!("delete stale task: {error}"));
@@ -1023,6 +1008,33 @@ impl Runtime for ContainerdRuntime {
             });
         }
         infos
+    }
+
+    /// Kill and delete every task in the minga namespace that is in a stopped
+    /// state. Called once on supervisor startup to clear orphan tasks left by
+    /// a previous run, so subsequent `create_task` calls don't fail with
+    /// AlreadyExists.
+    async fn purge_stopped_tasks(&self) {
+        let tasks = {
+            let mut client = self.client.lock().await;
+            match client.list_tasks().await {
+                Ok(ts) => ts,
+                Err(e) => {
+                    tracing::warn!(error = %e, "startup: failed to list tasks for cleanup");
+                    return;
+                }
+            }
+        };
+        for task in tasks {
+            let ps = ProcessStatus::try_from(task.status).unwrap_or(ProcessStatus::Unknown);
+            if matches!(ps, ProcessStatus::Stopped | ProcessStatus::Unknown) {
+                tracing::info!(task = %task.id, "startup: removing stale stopped/unknown task");
+                let mut client = self.client.lock().await;
+                let _ = client.kill_task(&task.id, 9).await;
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                let _ = client.delete_task(&task.id).await;
+            }
+        }
     }
 
     async fn status(&self, container_id: &str) -> Option<ContainerStatus> {
