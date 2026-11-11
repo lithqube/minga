@@ -10,6 +10,7 @@ use serde_json::json;
 use crate::api::{self, ApiClient};
 use crate::error::CtlError;
 use crate::output::{self, Format, Rows};
+use crate::transport::Connection;
 use crate::view;
 
 /// Stack commands.
@@ -27,10 +28,11 @@ pub enum StackCommand {
 /// Runs a stack command.
 pub async fn run(
     cmd: &StackCommand,
-    client: &ApiClient,
+    conn: &Connection,
     format: Format,
     quiet: bool,
 ) -> Result<(), CtlError> {
+    let client = &conn.api;
     match cmd {
         StackCommand::Ls => ls(client, format, quiet).await,
         StackCommand::Ps { stack } => ps(client, stack, format, quiet).await,

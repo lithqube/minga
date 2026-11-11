@@ -3,9 +3,10 @@
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use minga_ctl::api::{self, ApiClient};
+use minga_ctl::api;
 use minga_ctl::error::CtlError;
 use minga_ctl::output::Format;
+use minga_ctl::transport::{self, Connection};
 use minga_ctl::{cmd, config};
 
 /// Companion CLI for Minga: contexts, stack and service operations, health,
@@ -78,26 +79,27 @@ fn run(cli: &Cli) -> Result<(), CtlError> {
     let (format, quiet) = (cli.format(), cli.quiet);
     match &cli.command {
         Command::Context(cmd) => cmd::context::run(cmd, format, quiet),
-        Command::Stack(cmd) => {
-            let client = api_client(cli)?;
-            api::block_on(cmd::stack::run(cmd, &client, format, quiet))
-        }
-        Command::Service(cmd) => {
-            let client = api_client(cli)?;
-            api::block_on(cmd::service::run(cmd, &client, format, quiet))
-        }
-        Command::Secret(cmd) => {
-            let client = api_client(cli)?;
-            api::block_on(cmd::secret::run(cmd, &client, format, quiet))
-        }
+        Command::Stack(cmd) => api::block_on(async {
+            let conn = connect(cli).await?;
+            cmd::stack::run(cmd, &conn, format, quiet).await
+        }),
+        Command::Service(cmd) => api::block_on(async {
+            let conn = connect(cli).await?;
+            cmd::service::run(cmd, &conn, format, quiet).await
+        }),
+        Command::Secret(cmd) => api::block_on(async {
+            let conn = connect(cli).await?;
+            cmd::secret::run(cmd, &conn, format, quiet).await
+        }),
     }
 }
 
-/// The API client for the selected context.
-fn api_client(cli: &Cli) -> Result<ApiClient, CtlError> {
+/// Connects to the selected context. The connection (and, once step 3 lands,
+/// its SSH tunnel) lives until the command returns.
+async fn connect(cli: &Cli) -> Result<Connection, CtlError> {
     let config = config::load()?;
     let resolved = config::resolve(&config, cli.context.as_deref())?;
-    ApiClient::direct(&resolved, cli.debug)
+    transport::connect(&resolved, cli.debug).await
 }
 
 #[cfg(test)]
