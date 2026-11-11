@@ -8,14 +8,20 @@ management. It is a separate binary from `minga` and works for any site that
 runs Minga.
 
 This plan is security-first. Phase 1 needs no change to Minga and is specified
-fully enough to implement, with one exception: registry login (section 5.8)
-needs a small change on the node side of Minga first. Phase 2 is server work
-and is outlined; it needs its own ADR before it starts.
+fully enough to implement. One command group, registry login (section 5.8),
+relies on Minga 1.0.2. Phase 2 is server work and is outlined; it needs its
+own ADR before it starts.
+
+Two open pull requests shaped this version of the plan: PR #16 (Compose
+compatibility fixes for 1.0.2, including registry credentials) and PR #17
+(the Hetzner ARM64 staging guide). Where the plan depends on them it says so.
 
 ## 1. What the code allows today
 
 The design follows what Minga serves, not what the Docker Engine API has in
 general. All routes are registered in `crates/minga-api/src/server.rs:91-136`.
+File and line references are for `main` at v1.0.1 (`bf600b7`); PR #16 moves
+several of them.
 
 | Finding | Where | Effect on minga-ctl |
 |---|---|---|
@@ -33,7 +39,9 @@ general. All routes are registered in `crates/minga-api/src/server.rs:91-136`.
 | `minga logs` reads NATS JetStream. Plain NATS is allowed only to loopback. | `main.rs:1670-1719`, `minga-cli/src/bus.rs:68-83` | Logs run on the node. |
 | `minga image pull` runs `ctr` on the machine it is called on. There is no `image ls` or `image rm`. | `main.rs:1740-1770` | Image commands run on the node. |
 | `minga secret put` reads stdin and writes a file in the local secret store. The API stores secret metadata only and rejects a non-empty `Data`. | `main.rs:624-647`, `handlers.rs:673` | Secret values never use the API. |
-| Image pulls are anonymous. `minga image pull` and the automatic pull before a task starts both run `ctr -n minga images pull <ref>` with no credentials. | `main.rs:1744`, `minga-node/src/containerd/runtime.rs:483` | Registry login needs a Minga change (section 5.8). |
+| Image pulls are anonymous in 1.0.1. `minga image pull` and the automatic pull before a task starts both run `ctr -n minga images pull <ref>` with no credentials. PR #16 makes the automatic pull read `$HOME/.docker/config.json`; `minga image pull` stays anonymous. | `main.rs:1744`, `minga-node/src/containerd/runtime.rs:483` | Registry login maintains that file and needs 1.0.2 (section 5.8). |
+| `minga deploy` translates the compose file on the machine it runs on. With PR #16 that includes reading `env_file` files, joining relative bind-mount sources to the compose file's directory, and turning `extra_hosts: host-gateway` into that machine's default-route address. | `minga-cli/src/main.rs`, `translate_project` in `minga-scheduler/src/translate.rs` | A deploy from a workstation resolves these on the workstation (section 5.2). |
+| Things inside the cluster read the API too. The staging guide in PR #17 runs Traefik as a container whose Swarm provider reads `http://<gateway>:2375`, with the API on `0.0.0.0:2375` behind a host firewall. | `docs/hetzner-arm-staging.md` (PR #17) | The API cannot always be bound to loopback (section 2.2). |
 
 Two things the original brief asked for do not exist and are not faked: image
 pull latency and update count metrics.
@@ -51,8 +59,18 @@ phase 1 takes the API off the network instead.
 
 **Node setup** (documented requirement, not enforced by minga-ctl):
 
-- `minga api --api-bind 127.0.0.1:2375 --api-token …` (the default bind is
-  `0.0.0.0:2375`; change it).
+- The API must not be reachable from outside the node, and always runs with
+  `--api-token`. `--api-bind` takes one address, so there are two cases:
+  - Nothing inside the cluster reads the API: `--api-bind 127.0.0.1:2375`.
+    The default is `0.0.0.0:2375`; change it.
+  - A container reads the API, for example Traefik's Swarm provider (PR #17):
+    the API has to listen on an address containers can reach. Keep
+    `0.0.0.0:2375` and have the host firewall drop port 2375 on every
+    external interface. The guide in PR #17 does this with `ufw`, leaving
+    only 22, 80 and 443 open.
+
+  Either way minga-ctl reaches the API through the SSH tunnel to the node's
+  loopback address.
 - `--metrics-bind 127.0.0.1:9100` on the manager.
 - Operators have their own SSH accounts and are members of one unix group, for
   example `minga-operators`.
@@ -120,6 +138,17 @@ call to a person, there are no roles, and every operator needs an SSH account
 on a node. The local audit log is written by the operator's own machine, so it
 supports the sshd logs but is not independent evidence.
 
+**Readers inside the cluster.** When containers can reach port 2375, the token
+is the only thing between any container on that node and the whole cluster:
+the API lets its caller read every spec and change every service. A reader
+such as Traefik therefore has to send the token. Whether Traefik's Swarm
+provider can send a bearer token has not been checked for this plan. If it
+cannot, the choices in phase 1 are to run the API without a token, which
+gives every container full control and is acceptable for a throwaway staging
+node at most, or to keep the token and not use the Swarm provider. Phase 2
+fixes this properly: Traefik's Swarm provider has TLS client-certificate
+options, so it can be given a `viewer` certificate.
+
 **Revoking an operator.** The API token is shared, and anyone who can read the
 token file can keep a copy; minga-ctl not storing it is a habit of the tool,
 not a guarantee. Half measures do not revoke access:
@@ -180,9 +209,9 @@ and produce evidence; it cannot provide compliance by itself.
 
 | Criterion | Phase 1 supports it with | Phase 2 adds | Stays with the organisation |
 |---|---|---|---|
-| CC6.1 logical access | API reachable only on node loopback through SSH; no credentials stored on workstations | Client certificate per operator | SSH key issuance, MFA, device security |
+| CC6.1 logical access | Operators reach the API only through SSH to a node; minga-ctl stores no credentials on workstations | Client certificate per operator | SSH key issuance, MFA, device security |
 | CC6.2, CC6.3 provisioning and least privilege | Access is an SSH account on a node plus read access to the token file through a unix group. Revoking an operator means removing the account, ending its sessions and rotating the shared token, in that order (section 2.2). No roles. | `viewer`, `deployer`, `admin`; short-lived certificates | Joiner and leaver process, access reviews |
-| CC6.6 boundary protection | API and metrics on loopback; client refuses plain HTTP off-host | TLS listener | Firewalls, bastion hosts |
+| CC6.6 boundary protection | API not reachable from outside the node (loopback, or firewalled when containers must read it); metrics on loopback; client refuses plain HTTP off-host. Containers that can reach the API are held back only by the token. | TLS listener; read-only certificate for in-cluster readers | Firewalls, bastion hosts |
 | CC6.7 data in transit | All remote traffic inside SSH; secret values on stdin only | TLS on the API | Key management |
 | CC7.2 monitoring | sshd logs (who, when, from where) plus the client audit log (what) | Server audit line per change, tied to the certificate identity | Log shipping, retention, alerting |
 | CC8.1 change management | Deploys from a compose file; previous revision saved with each accepted change; rollback; audit line per change | Server-side revisions | Review and approval, CI gates |
@@ -286,9 +315,12 @@ pub struct Context {
     /// NATS URL for logs, as seen from where `minga logs` runs.
     /// Default: nats://127.0.0.1:4222
     pub nats_url: Option<String>,
-    /// SSH targets for node-local commands (image, secret put).
+    /// SSH targets for node-local commands (image, secret put, registry).
     #[serde(default)]
     pub nodes: Vec<String>,
+    /// Docker credential file on the node that Minga reads when pulling.
+    /// Default: /root/.docker/config.json
+    pub registry_auth_file: Option<String>,
 }
 
 // What a command runs against, after flags, env and config are merged.
@@ -424,7 +456,9 @@ for 400, 415 and 422 request rejections) are shown as the message.
 | Unknown config key | ``error: ~/.config/minga-ctl/config.yaml: unknown field `api_token` `` then ``hint: tokens are not stored in the config; use remote_token_file or token_command`` | 1 |
 | No terminal for a prompt | ``error: `stack rm` needs confirmation; pass --yes to run without a terminal`` | 1 |
 | No registry credential given | ``error: no credential on stdin for ghcr.io`` then ``hint: run in a terminal to be prompted, or pipe the token to stdin`` | 1 |
-| Node's Minga too old | ``error: `minga` on alice@mgr1.example.net has no `registry` command`` then ``hint: registry login needs a newer Minga on the node (see docs/minga-ctl-plan.md, section 5.8)`` | 2 |
+| Registry file not usable | ``error: cannot read /root/.docker/config.json on alice@mgr1.example.net: Permission denied`` then ``hint: the SSH user needs read and write access to the file; minga-ctl does not use sudo`` | 2 |
+| Registry file not JSON | ``error: /root/.docker/config.json on alice@mgr1.example.net is not valid JSON; left unchanged`` | 2 |
+| Deploy needs the node | ``error: compose.yaml uses host-gateway (service `traefik`), which would resolve on this machine, not on the node`` then ``hint: use an explicit address, or run minga-ctl on the node with a local context`` | 1 |
 
 ### 4.5 State files
 
@@ -462,7 +496,8 @@ Local file only. No API call.
 minga-ctl context add <name> [--ssh <target>] [--endpoint <url>]
                              [--remote-token-file <path>] [--token-command <cmd>]
                              [--tls-cert <path>] [--metrics-endpoint <url>]
-                             [--nats-url <url>] [--node <target>]... [--use]
+                             [--nats-url <url>] [--node <target>]...
+                             [--registry-auth-file <path>] [--use]
 minga-ctl context use <name>
 minga-ctl context list
 minga-ctl context delete <name>
@@ -502,6 +537,8 @@ minga-ctl stack rm <stack> [--with <id>]... [--yes]
 
 **`deploy`** (`-c` default `compose.yaml`, `--wait` default `30`)
 
+0. In a context with an SSH target, check the compose file before anything
+   else (see "Where the compose file is resolved" below).
 1. `GET /v1.41/services?filters={"label":["com.docker.stack.namespace=<stack>"]}`
    and keep each existing service's `Spec` in memory.
 2. Run `minga deploy -c <file> [-p …] --wait <secs> --api-url <endpoint> <stack>`
@@ -520,6 +557,28 @@ $ minga-ctl stack deploy -c compose.yaml myapp
 <output of minga deploy>
 saved revision for myapp.web (myapp.worker unchanged)
 ```
+
+**Where the compose file is resolved.** `minga deploy` translates the compose
+file on the machine it runs on, and minga-ctl runs it on the operator's
+machine. With Minga 1.0.2 (PR #16) three things are resolved there:
+
+| In the compose file | Resolved on the operator's machine as | In a context with an SSH target |
+|---|---|---|
+| `env_file` | The files are read and their values go into the service spec | Allowed. It is what a deploy from a workstation should do. The values end up in the spec and in the revision file. |
+| A bind mount with a relative source (`./conf:/etc/app`) | An absolute path under the compose file's directory | Refused: that path is on the workstation, not on the node. |
+| `extra_hosts: ["name:host-gateway"]` | That machine's default-route address, or `172.17.0.1` when it is not Linux | Refused: the address has nothing to do with the node. |
+
+The check in step 0 reads the compose file as YAML and looks, per service, for
+`extra_hosts` entries whose address is `host-gateway` and for volume entries
+whose source starts with `./`, `../` or `~`. If it finds one it exits 1 with
+the "Deploy needs the node" error from section 4.4 and deploys nothing. It is
+a guard on the plain file: it does not follow `extends`, `include` or
+variable interpolation. In a context without an SSH target nothing is
+refused, because the operator's machine is the node.
+
+To deploy a stack that needs either feature, use absolute paths and explicit
+addresses, or copy the compose file to the node and run minga-ctl there with
+a local context.
 
 **`ls`**: `GET /v1.41/services`, grouped by the label
 `com.docker.stack.namespace` in `Spec.Labels`. Services without the label are
@@ -756,8 +815,10 @@ target is reported, the rest still run, and the exit code is 2.
 
 `minga` has no `image ls` or `image rm`, so those call `ctr` directly. The SSH
 user needs access to the containerd socket; minga-ctl does not call `sudo`.
-Pulls are anonymous unless the node holds a credential for the image's
-registry (section 5.8).
+`minga image pull` is anonymous, in 1.0.1 and with PR #16, so
+`minga-ctl image pull` cannot fetch a private image. Private images are
+pulled by the task that needs them, using the node's registry credentials
+(section 5.8).
 
 ```
 $ minga-ctl image ls
@@ -892,16 +953,19 @@ myapp_db_password   myapp_db_password   2026-11-10T09:12:44Z
 
 ### 5.8 `registry`
 
-Logs nodes in to private container registries, so that both
-`minga-ctl image pull` and the automatic pull before a task starts can fetch
-private images. Node-local, like `secret put`: the credential goes to each
-node over SSH on stdin, never through the API, and is never stored on the
-workstation.
+Logs nodes in to private container registries, so that the automatic pull
+before a task starts can fetch private images. Node-local, like `secret put`:
+the credential goes to each node over SSH on stdin, never through the API,
+and is never stored on the workstation.
+
+It needs Minga 1.0.2 or later on the nodes. That release (PR #16, open when
+this was written) makes the automatic pull read Docker's credential file on
+the node. minga-ctl maintains that file, so `login`, `logout` and `list` need
+no further Minga change.
 
 ```
 minga-ctl registry login <registry> [--username <user>] [--key-file <path>]
-                                    [--password-stdin] [--verify <image ref>]
-                                    [--ssh <target>]...
+                                    [--password-stdin] [--ssh <target>]...
 minga-ctl registry logout <registry> [--ssh <target>]... [--yes]
 minga-ctl registry list [--ssh <target>]...
 ```
@@ -909,11 +973,23 @@ minga-ctl registry list [--ssh <target>]...
 Targets are chosen as in section 5.4. A credential must be on every node that
 can run the service; `list` shows which nodes have it.
 
+**The credential file.** Minga reads `$HOME/.docker/config.json`, where
+`$HOME` is that of the user the Minga manager or worker runs as, and looks up
+`auths.<host>.auth`: the base64 of `<user>:<secret>`.
+
+- The context field `registry_auth_file` is the path on the node. Default:
+  `/root/.docker/config.json`.
+- It has to be the file Minga reads. If the Minga service runs as another
+  user, or has no `HOME` in its environment, set the path or the service
+  environment to match; otherwise Minga finds no file and pulls anonymously.
+- The SSH user must be able to read and write the file. minga-ctl does not
+  call `sudo`.
+
 **Registry names.** `<registry>` is a short name or a host. Known registries
 get a hint that says which credential to create and the smallest scope that
 can pull.
 
-| You type | Host stored | Username | Credential the hint asks for |
+| You type | Key written | Username | Credential the hint asks for |
 |---|---|---|---|
 | `dockerhub`, `docker.io` | `docker.io` | Docker ID | Access token with the Read-only permission |
 | `ghcr`, `github`, `ghcr.io` | `ghcr.io` | GitHub user name | Personal access token (classic) with only `read:packages` |
@@ -934,25 +1010,37 @@ A host must match `^[A-Za-z0-9][A-Za-z0-9.-]*(:[0-9]+)?$` and a username
    - a prompt without echo, when stdin is a terminal.
 
    There is no `--password` flag. An empty credential is exit 1.
-4. On each target run `minga registry login <host> --username <user>` with the
-   credential on its stdin. Each target is reported separately; a failure on
-   any target gives exit 2.
-5. With `--verify <image ref>`, run `minga image pull <ref>` on each target
-   and report the result. The reference's host must be the registry just
-   logged in to, else exit 1 before anything is stored.
+4. `GET /v1.41/version`. If Minga is older than 1.0.2, print a warning and
+   continue:
+   ``warning: Minga 1.0.1 in context `prod` pulls anonymously; the credential is stored but unused until the nodes run 1.0.2 or later``.
+5. On each target:
+   - Read the file: `if [ -e '<file>' ]; then cat '<file>'; fi`. A missing
+     file counts as `{}`. A file that cannot be read or is not JSON stops
+     that target with an error, and the file is left as it is.
+   - Set `auths.<host>.auth` to the base64 of `<user>:<credential>`. Every
+     other key in the file is kept.
+   - Write it back with the new content on stdin:
+     `umask 077; mkdir -p '<dir>' && cat > '<file>.minga-ctl.tmp' && mv '<file>.minga-ctl.tmp' '<file>'`.
+
+   In a context with no SSH target the same is done on the local filesystem.
+   A failure on any target gives exit 2; the other targets still run.
 6. Append the audit line: host, username and targets. Never the credential.
+
+The existing file, which can hold credentials for other registries, passes
+through minga-ctl's memory during step 5. It is not written to the
+workstation.
 
 Running `login` again replaces the stored credential. It takes effect at the
 next pull; nothing is restarted.
 
 ```
-$ minga-ctl registry login ghcr --verify ghcr.io/acme/web:1.4.2
+$ minga-ctl registry login ghcr
 GitHub Container Registry (ghcr.io)
 Create a personal access token (classic) with only the read:packages scope.
 Username: acme-deploy
 Token:
-alice@mgr1.example.net  stored    pull ok
-alice@wrk1.example.net  stored    pull ok
+alice@mgr1.example.net  stored
+alice@wrk1.example.net  stored
 ```
 
 ```
@@ -968,64 +1056,57 @@ $ op read op://infra/dockerhub/pull-token | minga-ctl registry login dockerhub -
 ```
 
 ```json
-[{"node":"alice@mgr1.example.net","registry":"ghcr.io","username":"acme-deploy","stored":true,"verified":true}]
+[{"node":"alice@mgr1.example.net","registry":"ghcr.io","username":"acme-deploy","stored":true}]
 ```
 
-**`logout`**: asks for confirmation, then runs `minga registry logout <host>`
-on each target. A node that has no credential for the host is reported as
-`not logged in` and is not an error.
+**`logout`**: asks for confirmation, then removes `auths.<host>` from the file
+on each target with the same read and write steps. Other entries are kept. A
+node with no entry for the host is reported as `not logged in` and is not an
+error.
 
-**`list`**: runs `minga registry ls` on each target. It shows no secrets.
+**`list`**: reads the file on each target and prints each host with the
+username decoded from its entry. It never prints the secret part.
 
 ```
 $ minga-ctl registry list
-NODE                    REGISTRY                      USERNAME      UPDATED
-alice@mgr1.example.net  ghcr.io                       acme-deploy   2026-11-11T14:02:10Z
-alice@mgr1.example.net  europe-west1-docker.pkg.dev   _json_key     2026-11-11T14:05:41Z
-alice@wrk1.example.net  ghcr.io                       acme-deploy   2026-11-11T14:02:11Z
+NODE                    REGISTRY                      USERNAME
+alice@mgr1.example.net  ghcr.io                       acme-deploy
+alice@mgr1.example.net  europe-west1-docker.pkg.dev   _json_key
+alice@wrk1.example.net  ghcr.io                       acme-deploy
 ```
 
 ```json
-[{"node":"alice@mgr1.example.net","registry":"ghcr.io","username":"acme-deploy","updated":"2026-11-11T14:02:10Z"}]
+[{"node":"alice@mgr1.example.net","registry":"ghcr.io","username":"acme-deploy"}]
 ```
 
 In the example `wrk1` has no Google credential, so a task placed there cannot
 pull from that registry.
 
-**What Minga must add first.** minga-ctl only carries the credential to the
-node. Minga has to store it and use it:
+**Gaps in PR #16 as it stands.** These are for Minga to close, not minga-ctl.
 
-- `minga registry login <host> --username <user> [--registry-auth-dir <dir>]`
-  reads the credential from stdin, the same way `minga secret put` does.
-- `minga registry logout <host>` and `minga registry ls`. `ls` prints one line
-  per registry, `host<TAB>username<TAB>updated_at`, and never the credential.
-- Storage: one file per host in `/var/lib/minga/registry-auth` (directory 0700,
-  files 0600, written to a temporary file and renamed).
-  `SecretStore::put` in `crates/minga-node/src/secrets.rs` already writes
-  files this way and can be pointed at that directory. It is a separate
-  directory from the secret store so a registry credential can never be
-  mounted into a task as a Compose secret. Record:
+- The credential is on a command line. The pull runs
+  `ctr -n minga images pull --user <user>:<secret> <ref>` (`pull_image` in
+  `crates/minga-node/src/containerd/runtime.rs`), so every local user of the
+  node can read it in the process list while a pull runs. This plan's rule is
+  that a credential never appears on a command line (section 2.2, item 9);
+  PR #16 does not meet it yet.
+- Failures are silent. A missing `HOME`, an unreadable or malformed file, or
+  a missing entry all lead to an anonymous pull with no log line. The first
+  sign is a 401 from the registry when a task starts.
+- `minga image pull` does not read the file, so `minga-ctl image pull` of a
+  private image still fails. For the same reason `login` has no verify step:
+  no command pulls on demand with the stored credential. Once
+  `minga image pull` uses the same lookup, `login --verify <image ref>` runs
+  it on each node after storing.
+- Docker Hub uses a different key. PR #16 looks up `docker.io`, which is what
+  minga-ctl writes. `docker login` writes `https://index.docker.io/v1/`, so a
+  file produced by `docker login` on the node is not matched for Docker Hub.
+- `credHelpers` and `credsStore` are not read. minga-ctl writes inline `auth`
+  entries only.
 
-  ```json
-  {"host":"ghcr.io","username":"acme-deploy","secret":"…","updated_at":"2026-11-11T14:02:10Z"}
-  ```
-- Both pull call sites (`crates/minga-cli/src/main.rs:1744` and
-  `crates/minga-node/src/containerd/runtime.rs:483`) look up the host of the
-  image reference and authenticate when a credential is stored.
-  `index.docker.io` and `registry-1.docker.io` are treated as `docker.io`.
-- The credential must not appear in a command line, in another process's
-  environment, or in a log line. `ctr images pull --user <user>:<secret>` puts
-  it on the command line, where every local user of the node can read it while
-  the pull runs, so it is not acceptable as it stands.
-
-**Open point.** How the pull authenticates without exposing the credential is
-not decided here. It belongs to the Minga change and has to be checked against
-the containerd version Minga pins. Candidates: answer `ctr`'s password prompt
-from the parent process, or pull through containerd's gRPC API, which Minga
-already uses to run containers.
-
-Until a node runs a Minga with these commands, `registry` commands fail with
-the "Node's Minga too old" error from section 4.4.
+A node-side `minga registry login` with its own store and a fixed path would
+be a cleaner contract than a file under `$HOME`. It is not needed for this
+plan.
 
 **Limits**
 
@@ -1033,10 +1114,13 @@ the "Node's Minga too old" error from section 4.4.
   minga-ctl does not refresh them. This covers AWS ECR login passwords and
   Google access tokens (`oauth2accesstoken`). Use long-lived, read-only pull
   credentials.
-- There is no import from `~/.docker/config.json`. Personal Docker logins are
-  often read-write, and copying them to production nodes is the wrong default.
-- The credential is stored in clear text on the node, protected by file
-  permissions, as node-local secrets are.
+- minga-ctl does not copy the workstation's own Docker logins to nodes.
+  Personal Docker logins are often read-write, and copying them to production
+  nodes is the wrong default.
+- The file holds credentials as base64, which is an encoding, not encryption.
+  File permissions are the only protection.
+- `login` and `logout` read the file and write it back. Two operators changing
+  the same node's file at the same moment can lose one of the two changes.
 
 ## 6. Tests and build order
 
@@ -1062,11 +1146,16 @@ the "Node's Minga too old" error from section 4.4.
   arguments, environment and stdin, and checks `stack deploy` and
   `secret put`: the token arrives in the environment, the secret value on
   stdin, and neither in the arguments.
-- `tests/wrapped.rs` also checks `registry login`: the credential arrives on
-  the stub's stdin and in neither its arguments nor its environment; `ghcr`
-  resolves to `ghcr.io`; a `-docker.pkg.dev` host sends the username
-  `_json_key`; `--verify` with a reference on another host exits 1 before
-  the stub is called.
+- `registry`, in a local context with `registry_auth_file` in a temporary
+  directory: `login ghcr` creates the file with mode 0600 and
+  `auths."ghcr.io".auth` equal to the base64 of `user:secret`; an existing
+  entry for another host and unknown top-level keys survive; `logout` removes
+  only its host; a `-docker.pkg.dev` host stores the username `_json_key`;
+  a file that is not JSON is left unchanged and gives exit 2; `list` output
+  contains no secret.
+- Required: with an SSH context, `stack deploy` of a compose file that uses
+  `host-gateway` or a relative bind mount exits 1 before `MINGA_BIN` is run;
+  the same file deploys in a local context; `env_file` is allowed in both.
 - Unit tests: token and endpoint precedence; refusal of a config with mode
   0644 and of an unknown key; plain-HTTP refusal for a non-loopback host;
   validation and quoting of remote arguments (including a target starting
@@ -1084,7 +1173,8 @@ the "Node's Minga too old" error from section 4.4.
 4. `state.rs`; `service scale`, `update`, `rollback`; `stack rm`.
 5. Wrapped commands: `stack deploy`, `service logs`, `image`, `secret put`.
 6. `health`, `metrics`.
-7. `registry`, once the Minga change in section 5.8 has landed.
+7. `registry`. It can be built at any time; it is useful once the nodes run
+   Minga 1.0.2.
 
 Before each commit: `cargo fmt --all`, `cargo clippy --all-targets -- -D warnings`,
 `cargo test`.
@@ -1122,8 +1212,15 @@ Before each commit: `cargo fmt --all`, `cargo clippy --all-targets -- -D warning
   (section 2.2).
 - If minga-ctl stops between the API accepting an update and the revision
   file being written, that change has no saved revision.
-- `registry` commands do nothing useful until Minga stores registry
-  credentials and uses them when pulling (section 5.8). How the pull
-  authenticates without exposing the credential is still open.
+- `registry` commands have no effect on nodes that run Minga older than
+  1.0.2. From 1.0.2 the credential is used, but Minga passes it to `ctr` on
+  the command line, where local users of the node can read it during a pull
+  (section 5.8). That is for Minga to fix.
+- When a container has to read the API (Traefik's Swarm provider), the API
+  listens beyond loopback and the token is the only barrier between any
+  container on the node and the cluster (section 2.2).
+- `stack deploy` through an SSH context refuses compose files that use
+  `host-gateway` or relative bind mounts, because Minga resolves them on the
+  machine that runs the deploy (section 5.2).
 - Not included: node commands, events, waiting for rollouts, refresh of
   short-lived registry credentials, client certificates (phase 2).
