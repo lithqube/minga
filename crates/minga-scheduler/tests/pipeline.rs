@@ -61,7 +61,8 @@ services:
           memory: 512M
 "#;
     let project = load(yaml);
-    let translated = translate_project(&project, "plant-7").expect("translation should succeed");
+    let translated =
+        translate_project(&project, "plant-7", None).expect("translation should succeed");
 
     // Verify translation.
     assert_eq!(translated.services.len(), 2);
@@ -156,7 +157,7 @@ networks:
     driver: overlay
 "#;
     let project = load(yaml);
-    let translated = translate_project(&project, "edge").expect("translation should succeed");
+    let translated = translate_project(&project, "edge", None).expect("translation should succeed");
 
     let inference = translated
         .services
@@ -228,7 +229,7 @@ configs:
     file: ./init.sql
 "#;
     let project = load(yaml);
-    let translated = translate_project(&project, "data").expect("translation should succeed");
+    let translated = translate_project(&project, "data", None).expect("translation should succeed");
 
     assert_eq!(translated.volumes.len(), 1);
     assert_eq!(translated.volumes[0].id, "data_pg-data");
@@ -276,7 +277,8 @@ secrets:
     file: ./secrets/db_password.txt
 "#;
     let project = load(yaml);
-    let err = translate_project(&project, "data").expect_err("a file: secret must be refused");
+    let err =
+        translate_project(&project, "data", None).expect_err("a file: secret must be refused");
     let message = err.to_string();
     assert!(
         message.contains("file:") && message.contains("not supported"),
@@ -298,7 +300,7 @@ secrets:
     external: true
 "#;
     let project = load(yaml);
-    let translated = translate_project(&project, "data").unwrap();
+    let translated = translate_project(&project, "data", None).unwrap();
     let db = translated.services.iter().find(|s| s.name == "db").unwrap();
     let nodes = vec![node(1, 8.0, 1 << 34, 0, &[])];
     let tasks = place_service(db, &nodes, &[], &[], 0);
@@ -320,7 +322,7 @@ services:
       replicas: 3
 "#;
     let project = load(yaml);
-    let translated = translate_project(&project, "app").unwrap();
+    let translated = translate_project(&project, "app", None).unwrap();
     let nodes = vec![node(1, 8.0, 1 << 34, 0, &[]), node(2, 8.0, 1 << 34, 0, &[])];
 
     // Initial deploy: 3 tasks created.
@@ -376,7 +378,7 @@ services:
       replicas: 1
 "#;
     let project = load(yaml);
-    let result = translate_project(&project, "batch");
+    let result = translate_project(&project, "batch", None);
     assert!(result.is_err(), "job modes should fail loudly");
     let err = result.unwrap_err().to_string();
     assert!(err.contains("job modes are not supported"));
@@ -393,7 +395,7 @@ services:
       replicas: 1
 "#;
     let project = load(yaml);
-    let translated = translate_project(&project, "test").unwrap();
+    let translated = translate_project(&project, "test", None).unwrap();
     let nodes = vec![node(1, 4.0, 1 << 34, 0, &[])];
     let tasks = place_service(&translated.services[0], &nodes, &[], &[], 0);
     assert_eq!(tasks.len(), 1);
@@ -418,7 +420,7 @@ services:
       NUM: 42
 "#;
     let project = load(yaml);
-    let translated = translate_project(&project, "envtest").unwrap();
+    let translated = translate_project(&project, "envtest", None).unwrap();
 
     let list_svc = translated
         .services
@@ -470,7 +472,7 @@ fn agent_service_full_pipeline() {
         "#,
     );
 
-    let translated = translate_project(&project, "test").unwrap();
+    let translated = translate_project(&project, "test", None).unwrap();
     assert_eq!(translated.services.len(), 1);
 
     let svc = &translated.services[0];
@@ -533,7 +535,7 @@ fn mixed_container_and_agent_pipeline() {
         "#,
     );
 
-    let translated = translate_project(&project, "stack").unwrap();
+    let translated = translate_project(&project, "stack", None).unwrap();
     assert_eq!(translated.services.len(), 2);
 
     let web = translated
@@ -588,7 +590,7 @@ fn agent_service_reconcile_creates_agent_tasks() {
               replicas: 1
         "#,
     );
-    let translated = translate_project(&project, "test").unwrap();
+    let translated = translate_project(&project, "test", None).unwrap();
     let nodes = vec![node(1, 4.0, 1 << 30, 0, &[])];
 
     let actions = plan(&translated.services, &[], &nodes, &[], 0);

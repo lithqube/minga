@@ -86,6 +86,16 @@ impl LogRing {
     }
 }
 
+/// A non-root process cannot read a root-owned 0400 file. Each staged copy
+/// belongs to one task, so this exposes it to that task only.
+fn chown_secrets(mounts: &[oci::SecretMount], uid: u32, gid: u32) -> Result<(), RuntimeError> {
+    for mount in mounts {
+        std::os::unix::fs::chown(&mount.source, Some(uid), Some(gid))
+            .map_err(|e| RuntimeError::Start(format!("secret ownership: {e}")))?;
+    }
+    Ok(())
+}
+
 /// Creates a FIFO at `path` (0600).
 fn make_fifo(path: &std::path::Path) -> Result<(), std::io::Error> {
     let raw = std::ffi::CString::new(path.display().to_string().as_bytes().to_vec())
@@ -360,9 +370,25 @@ impl ContainerdRuntime {
             "containerd: task network prepared"
         );
 
+        // Write a per-task /etc/hosts file if the spec has extra_hosts entries.
+        let hosts_path = if spec.extra_hosts.is_empty() {
+            None
+        } else {
+            let hosts_file = netns.resolv_conf.with_extension("hosts");
+            let mut content = "127.0.0.1\tlocalhost\n::1\tlocalhost\n".to_string();
+            for (host, ip) in &spec.extra_hosts {
+                content.push_str(&format!("{ip}\t{host}\n"));
+            }
+            tokio::fs::write(&hosts_file, &content)
+                .await
+                .map_err(|e| RuntimeError::Start(format!("write hosts: {e}")))?;
+            Some(hosts_file)
+        };
+
         Ok(Some(oci::NetworkSpec {
             netns_path: netns.netns_path.display().to_string(),
             resolv_conf: Some(netns.resolv_conf),
+            hosts_path,
         }))
     }
 
@@ -423,9 +449,14 @@ impl ContainerdRuntime {
                     m.source = dir.display().to_string();
                 }
                 minga_state::types::MountKind::Bind => {
-                    tokio::fs::create_dir_all(&m.source).await.map_err(|e| {
-                        RuntimeError::Start(format!("create bind source {}: {e}", m.source))
-                    })?;
+                    // Skip mkdir if the source already exists (file bind mounts).
+                    // Only create a directory when the path is absent entirely.
+                    let path = std::path::Path::new(&m.source);
+                    if !path.exists() {
+                        tokio::fs::create_dir_all(path).await.map_err(|e| {
+                            RuntimeError::Start(format!("create bind source {}: {e}", m.source))
+                        })?;
+                    }
                 }
             }
         }
@@ -474,13 +505,50 @@ impl ContainerdRuntime {
     }
 
     /// Pull and unpack an image via `ctr` into the `minga` namespace.
+    ///
+    /// Credentials are read from `~/.docker/config.json` when present and the
+    /// image's registry has an entry there. This lets pre-pulled images stay
+    /// usable across restarts without a separate `docker login` step.
     async fn pull_image(&self, image_ref: &str) -> Result<(), RuntimeError> {
         tracing::info!(image = %image_ref, "pulling image via ctr");
+
+        // Extract registry host: first path component if it contains '.' or ':'.
+        let registry_host = image_ref
+            .split('/')
+            .next()
+            .filter(|h| h.contains('.') || h.contains(':'))
+            .unwrap_or("docker.io");
+
+        // shortcut: ~/.docker/config.json auth lookup; falls back to anonymous pull.
+        let user_arg: Option<String> = (|| {
+            let home = std::env::var("HOME").ok()?;
+            let path = std::path::Path::new(&home).join(".docker/config.json");
+            let bytes = std::fs::read(&path).ok()?;
+            let v: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+            let auth_b64 = v["auths"][registry_host]["auth"].as_str()?;
+            use base64::Engine as _;
+            let decoded = String::from_utf8(
+                base64::engine::general_purpose::STANDARD
+                    .decode(auth_b64)
+                    .ok()?,
+            )
+            .ok()?;
+            Some(decoded) // "username:token"
+        })();
+
+        let mut pull_args = vec!["-n", "minga", "images", "pull"];
+        let user_owned;
+        if let Some(ref creds) = user_arg {
+            pull_args.push("--user");
+            user_owned = creds.as_str();
+            pull_args.push(user_owned);
+        }
+        pull_args.push(image_ref);
 
         let pull = tokio::time::timeout(
             Duration::from_secs(300),
             tokio::process::Command::new("ctr")
-                .args(["-n", "minga", "images", "pull", image_ref])
+                .args(&pull_args)
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
                 .kill_on_drop(true)
@@ -664,6 +732,8 @@ impl Runtime for ContainerdRuntime {
         let config = image::load_image(&mut client, &image, &self.snapshotter)
             .await
             .map_err(RuntimeError::Start)?;
+        let (uid, gid) = oci::task_user(spec, &config).map_err(RuntimeError::Start)?;
+        chown_secrets(&secret_mounts, uid, gid)?;
 
         let snapshot_key = format!("minga-{container_id}");
 
@@ -1094,6 +1164,42 @@ impl Runtime for ContainerdRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn secrets_go_to_the_task_user_at_0400_and_a_failed_chown_stops_the_task() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::secrets::SecretStore::new(dir.path());
+        store.put("value", b"value").unwrap();
+        let refs = [minga_state::types::SecretRef::new(
+            "value",
+            "/run/secrets/value",
+        )];
+        let source = store.stage_all("task", &refs).unwrap()[0]
+            .staged_path
+            .clone();
+        let mounts = [oci::SecretMount {
+            source: source.clone(),
+            target: "/run/secrets/value".into(),
+        }];
+
+        // Without root the only chown allowed is to ourselves, so a real
+        // change of owner is proven only when this runs as root (CI on Linux).
+        let root = unsafe { libc::geteuid() } == 0;
+        let (uid, gid) = if root {
+            (1001, 65533)
+        } else {
+            unsafe { (libc::geteuid(), libc::getegid()) }
+        };
+        chown_secrets(&mounts, uid, gid).unwrap();
+        let meta = std::fs::metadata(&source).unwrap();
+        assert_eq!((meta.uid(), meta.gid()), (uid, gid));
+        assert_eq!(meta.mode() & 0o7777, 0o400);
+
+        if !root {
+            assert!(chown_secrets(&mounts, 0, 0).is_err());
+        }
+    }
 
     #[test]
     fn default_constants() {

@@ -234,6 +234,9 @@ pub struct Service {
     /// Numeric `uid[:gid]` to run as. `None` keeps the image's user.
     #[serde(default)]
     pub user: Option<String>,
+    /// Additional `/etc/hosts` entries: `[(hostname, ip)]`.
+    #[serde(default)]
+    pub extra_hosts: Vec<(String, String)>,
     /// How tasks are replaced when the spec changes.
     #[serde(default)]
     pub update: UpdatePolicy,
@@ -360,6 +363,9 @@ pub struct TaskSpec {
     /// Numeric `uid[:gid]` to run as. `None` keeps the image's user.
     #[serde(default)]
     pub user: Option<String>,
+    /// Additional `/etc/hosts` entries: `[(hostname, ip)]`.
+    #[serde(default)]
+    pub extra_hosts: Vec<(String, String)>,
 }
 
 /// Restart policy for a task.
@@ -561,6 +567,7 @@ mod tests {
             update: Default::default(),
             rollback: None,
             previous: None,
+            extra_hosts: vec![],
         };
         let bytes = bincode::serde::encode_to_vec(&svc, bincode::config::standard()).unwrap();
         let (back, _): (Service, _) =

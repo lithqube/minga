@@ -1420,6 +1420,7 @@ mod tests {
             healthcheck: None,
             mounts: vec![],
             user: None,
+            extra_hosts: vec![],
             update: Default::default(),
             rollback: None,
             previous: None,

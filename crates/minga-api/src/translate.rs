@@ -323,6 +323,7 @@ pub fn service_spec_to_state(spec: &models::ServiceSpec) -> Result<Service, Stri
         healthcheck,
         mounts,
         user,
+        extra_hosts: vec![],
         update,
         rollback,
         previous: None,
@@ -1223,6 +1224,7 @@ mod tests {
             },
             rollback: None,
             previous: None,
+            extra_hosts: vec![],
         };
         let back = service_spec_to_state(&service_to_docker(&svc).Spec).unwrap();
         assert_eq!(back.user, svc.user);
@@ -1265,6 +1267,7 @@ mod tests {
             update: Default::default(),
             rollback: None,
             previous: None,
+            extra_hosts: vec![],
         };
         let docker = service_to_docker(&svc);
         let env = &docker.Spec.TaskTemplate.ContainerSpec.as_ref().unwrap().Env;

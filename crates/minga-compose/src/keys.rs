@@ -122,7 +122,9 @@ pub(crate) const MODELLED_SERVICE: &[&str] = &[
     "deploy",
     "devices",
     "entrypoint",
+    "env_file",
     "environment",
+    "extra_hosts",
     "healthcheck",
     "hostname",
     "image",
@@ -155,7 +157,6 @@ fn unsupported_note(key: &str) -> Option<&'static str> {
         "network_mode" => Some("attach the service to a network instead"),
         "include" | "extends" => Some("planned for phase 1; flatten the file for now"),
         "gpus" => Some("use deploy.resources.reservations.devices with capabilities: [gpu]"),
-        "env_file" => Some("planned for phase 1; use `environment` for now"),
         _ => None,
     }
 }

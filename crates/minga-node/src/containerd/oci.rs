@@ -195,6 +195,8 @@ pub struct NetworkSpec {
     pub netns_path: String,
     /// Per-task resolv.conf to bind-mount read-only at /etc/resolv.conf.
     pub resolv_conf: Option<std::path::PathBuf>,
+    /// Per-task hosts file (extra_hosts entries) to bind-mount at /etc/hosts.
+    pub hosts_path: Option<std::path::PathBuf>,
 }
 
 /// Generate an OCI runtime spec from a Minga task spec.
@@ -226,6 +228,19 @@ pub fn spec_from_task_with_secrets(
                 destination: "/etc/resolv.conf".to_string(),
                 mount_type: "bind".to_string(),
                 source: resolv.display().to_string(),
+                options: vec![
+                    "bind".to_string(),
+                    "ro".to_string(),
+                    "nosuid".to_string(),
+                    "nodev".to_string(),
+                ],
+            });
+        }
+        if let Some(hosts) = &net.hosts_path {
+            oci.mounts.push(OciMount {
+                destination: "/etc/hosts".to_string(),
+                mount_type: "bind".to_string(),
+                source: hosts.display().to_string(),
                 options: vec![
                     "bind".to_string(),
                     "ro".to_string(),
@@ -493,6 +508,19 @@ pub fn spec_to_any_with_secrets(
     })
 }
 
+/// The uid and gid a task's process runs as: its own `user`, else the image's.
+/// A name needs the image's `/etc/passwd`, so it fails here, only when nothing
+/// numeric replaced it.
+pub fn task_user(spec: &TaskSpec, image: &ImageConfiguration) -> Result<(u32, u32), String> {
+    let user = match &spec.user {
+        Some(user) => user,
+        None if image.user.is_empty() => return Ok((0, 0)),
+        None => &image.user,
+    };
+    minga_state::types::parse_user(user)
+        .map_err(|e| format!("user `{user}`: {e}; set a numeric `user:` on the service"))
+}
+
 /// Serialize a runnable OCI spec using the selected image's process defaults.
 /// Explicit task environment entries override image values by key.
 pub fn spec_to_any_with_image(
@@ -524,10 +552,7 @@ pub fn spec_to_any_with_image(
     let mut oci = spec_from_task_with_secrets(container_id, spec, secret_mounts, network);
     oci.process.args = args;
     oci.process.cwd = image.cwd.clone();
-    let (uid, gid) = match &spec.user {
-        Some(user) => minga_state::types::parse_user(user)?,
-        None => (image.uid, image.gid),
-    };
+    let (uid, gid) = task_user(spec, image)?;
     oci.process.user = OciUser { uid, gid };
     let mut env = image.env.clone();
     let mut overrides: Vec<_> = spec.env.iter().collect();
@@ -575,8 +600,7 @@ mod tests {
             cmd: vec!["echo ok".into()],
             env: vec!["A=image".into(), "PATH=/bin".into(), "B=keep".into()],
             cwd: "/app".into(),
-            uid: 1000,
-            gid: 1001,
+            user: "1000:1001".into(),
             parent_snapshot: "unused".into(),
         };
         let any = spec_to_any_with_image("c1", &task, &[], &image, None).unwrap();
@@ -833,10 +857,24 @@ mod override_tests {
             cmd: vec!["img-cmd".into()],
             env: vec![],
             cwd: "/".into(),
-            uid: 0,
-            gid: 0,
+            user: String::new(),
             parent_snapshot: "unused".into(),
         }
+    }
+
+    #[test]
+    fn task_user_prefers_the_task_and_refuses_an_unreplaced_name() {
+        let named = ImageConfiguration {
+            user: "nodejs".into(),
+            ..image()
+        };
+        let mut task = TaskSpec::default();
+        let error = task_user(&task, &named).unwrap_err();
+        assert!(error.contains("nodejs"), "{error}");
+        assert_eq!(task_user(&task, &image()), Ok((0, 0)));
+
+        task.user = Some("1001:65533".into());
+        assert_eq!(task_user(&task, &named), Ok((1001, 65533)));
     }
 
     fn args_of(spec: &TaskSpec) -> Vec<String> {

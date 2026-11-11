@@ -41,15 +41,18 @@ pub struct TranslatedStack {
 ///
 /// `stack` is the deploy name (e.g. `plant-7`). It prefixes every entity
 /// ID so multiple stacks can coexist in the same cluster.
+/// `project_dir` is the directory of the Compose file; relative bind mount
+/// sources are resolved against it. Pass `None` only in tests.
 pub fn translate_project(
     project: &Project,
     stack: &str,
+    project_dir: Option<&std::path::Path>,
 ) -> Result<TranslatedStack, TranslateError> {
     let mut out = TranslatedStack::default();
 
     for (name, svc) in &project.services {
         out.services
-            .push(translate_service(name, svc, stack, project)?);
+            .push(translate_service(name, svc, stack, project, project_dir)?);
     }
 
     out.networks = translate_networks(project, stack);
@@ -65,6 +68,7 @@ fn translate_service(
     svc: &minga_compose::Service,
     stack: &str,
     project: &Project,
+    project_dir: Option<&std::path::Path>,
 ) -> Result<Service, TranslateError> {
     // Check for x-minga-agent extension — agent services don't need an image.
     let agent_ext = svc
@@ -219,11 +223,21 @@ fn translate_service(
                 });
             }
             VolumeKind::Bind => {
-                let Some(source) = vol.source.clone() else {
+                let Some(raw_source) = vol.source.clone() else {
                     return Err(TranslateError::Service(
                         name.to_string(),
                         format!("bind mount `{}` has no source path", vol.target),
                     ));
+                };
+                // Resolve relative paths against the compose file's directory.
+                let source = if std::path::Path::new(&raw_source).is_relative() {
+                    if let Some(dir) = project_dir {
+                        dir.join(&raw_source).display().to_string()
+                    } else {
+                        raw_source
+                    }
+                } else {
+                    raw_source
                 };
                 mounts.push(minga_state::types::ServiceMount {
                     kind: minga_state::types::MountKind::Bind,
@@ -260,6 +274,22 @@ fn translate_service(
     // Translate restart policy from Compose deploy.restart_policy.
     let restart_policy = translate_restart_policy(&deploy.restart_policy, &svc.restart);
 
+    // extra_hosts: resolve "host-gateway" to the host's default route IP.
+    let extra_hosts: Vec<(String, String)> = svc
+        .extra_hosts
+        .0
+        .iter()
+        .map(|(host, ip_opt)| {
+            let raw = ip_opt.as_deref().unwrap_or("");
+            let ip = if raw == "host-gateway" {
+                host_gateway_ip()
+            } else {
+                raw.to_string()
+            };
+            (host.clone(), ip)
+        })
+        .collect();
+
     Ok(Service {
         id: format!("{stack}.{name}"),
         name: name.to_string(),
@@ -280,6 +310,7 @@ fn translate_service(
         healthcheck,
         mounts,
         user: svc.user.clone(),
+        extra_hosts,
         update,
         rollback: match &deploy.rollback_config {
             None => None,
@@ -540,6 +571,30 @@ fn config_id(stack: &str, name: &str) -> String {
 
 // --- memory parsing -----------------------------------------------------------
 
+/// Returns the host's default route IP for the `host-gateway` extra_hosts alias.
+/// Reads `/proc/net/route` on Linux; falls back to `172.17.0.1` on other platforms.
+fn host_gateway_ip() -> String {
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(content) = std::fs::read_to_string("/proc/net/route") {
+            for line in content.lines().skip(1) {
+                let cols: Vec<&str> = line.split_whitespace().collect();
+                // Default route: Destination == 00000000
+                if cols.get(1) == Some(&"00000000") {
+                    if let Some(gw_hex) = cols.get(2) {
+                        if let Ok(n) = u32::from_str_radix(gw_hex, 16) {
+                            let b = n.to_le_bytes();
+                            return format!("{}.{}.{}.{}", b[0], b[1], b[2], b[3]);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // shortcut: returns 172.17.0.1 when /proc/net/route is unavailable or not Linux
+    "172.17.0.1".to_string()
+}
+
 /// Parses a Compose memory string into bytes.
 ///
 /// Accepts plain numbers (bytes) and suffixes `b`, `k`/`kb`/`kib`,
@@ -663,7 +718,7 @@ mod tests {
               replicas: 2
             "#,
         );
-        let result = translate_service("my-agent", &svc, "test", &empty_project()).unwrap();
+        let result = translate_service("my-agent", &svc, "test", &empty_project(), None).unwrap();
         assert_eq!(result.id, "test.my-agent");
         assert!(
             result.image.is_empty(),
@@ -692,7 +747,7 @@ mod tests {
               module: ./agent.wasm
             "#,
         );
-        let result = translate_service("agent", &svc, "test", &empty_project()).unwrap();
+        let result = translate_service("agent", &svc, "test", &empty_project(), None).unwrap();
         assert!(result.image.is_empty());
         let agent = result.agent.expect("should have agent spec");
         assert_eq!(agent.module_ref, "./agent.wasm");
@@ -709,7 +764,7 @@ mod tests {
               replicas: 1
             "#,
         );
-        let result = translate_service("web", &svc, "test", &empty_project()).unwrap();
+        let result = translate_service("web", &svc, "test", &empty_project(), None).unwrap();
         assert_eq!(result.image, "nginx:latest");
         assert!(
             result.agent.is_none(),
@@ -725,7 +780,7 @@ mod tests {
             image: None,
             ..Default::default()
         };
-        let result = translate_service("web", &svc, "test", &empty_project());
+        let result = translate_service("web", &svc, "test", &empty_project(), None);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("image"), "error should mention image: {err}");
@@ -740,7 +795,7 @@ mod tests {
               module: ./agent.wasm
             "#,
         );
-        let result = translate_service("agent", &svc, "test", &empty_project());
+        let result = translate_service("agent", &svc, "test", &empty_project(), None);
         assert!(result.is_ok(), "agent service without image should succeed");
     }
 
@@ -759,7 +814,7 @@ mod tests {
                 failure_action: rollback
             "#,
         );
-        let service = translate_service("web", &svc, "test", &empty_project()).unwrap();
+        let service = translate_service("web", &svc, "test", &empty_project(), None).unwrap();
         assert_eq!(service.user.as_deref(), Some("0"));
         assert_eq!(service.update.parallelism, 2);
         assert_eq!(service.update.order, UpdateOrder::StartFirst);
@@ -771,7 +826,7 @@ mod tests {
     #[test]
     fn translate_rejects_a_named_user() {
         let svc = make_compose_service("image: nginx\nuser: nginx\n");
-        let err = translate_service("web", &svc, "test", &empty_project()).unwrap_err();
+        let err = translate_service("web", &svc, "test", &empty_project(), None).unwrap_err();
         assert!(err.to_string().contains("invalid user"));
     }
 
@@ -787,8 +842,8 @@ mod tests {
         );
         let project = empty_project();
 
-        let container = translate_service("web", &container_svc, "stack", &project).unwrap();
-        let agent = translate_service("bot", &agent_svc, "stack", &project).unwrap();
+        let container = translate_service("web", &container_svc, "stack", &project, None).unwrap();
+        let agent = translate_service("bot", &agent_svc, "stack", &project, None).unwrap();
 
         assert_eq!(container.image, "nginx:latest");
         assert!(container.agent.is_none());
@@ -810,7 +865,7 @@ mod tests {
                   memory: 512M
             "#,
         );
-        let result = translate_service("agent", &svc, "test", &empty_project()).unwrap();
+        let result = translate_service("agent", &svc, "test", &empty_project(), None).unwrap();
         assert_eq!(result.resources.cpus, 2.0);
         assert_eq!(result.resources.memory_bytes, 512 * 1024 * 1024);
         assert!(result.agent.is_some());
@@ -828,7 +883,7 @@ mod tests {
                   - node.labels.gpu == true
             "#,
         );
-        let result = translate_service("agent", &svc, "test", &empty_project()).unwrap();
+        let result = translate_service("agent", &svc, "test", &empty_project(), None).unwrap();
         assert_eq!(
             result.constraints,
             vec!["node.labels.gpu == true".to_string()]
@@ -843,7 +898,7 @@ mod tests {
               fuel_limit: "not-a-number"
             "#,
         );
-        let result = translate_service("agent", &svc, "test", &empty_project());
+        let result = translate_service("agent", &svc, "test", &empty_project(), None);
         assert!(result.is_err(), "invalid agent extension should fail");
     }
 
@@ -873,7 +928,7 @@ mod tests {
     #[test]
     fn restart_policy_default_is_none() {
         let svc = make_compose_service("image: nginx:latest");
-        let result = translate_service("web", &svc, "test", &empty_project()).unwrap();
+        let result = translate_service("web", &svc, "test", &empty_project(), None).unwrap();
         assert_eq!(
             result.restart_policy.condition,
             minga_state::types::RestartCondition::None
@@ -892,7 +947,7 @@ mod tests {
                 max_attempts: 3
             "#,
         );
-        let result = translate_service("web", &svc, "test", &empty_project()).unwrap();
+        let result = translate_service("web", &svc, "test", &empty_project(), None).unwrap();
         assert_eq!(
             result.restart_policy.condition,
             minga_state::types::RestartCondition::OnFailure
@@ -909,7 +964,7 @@ mod tests {
             restart: always
             "#,
         );
-        let result = translate_service("web", &svc, "test", &empty_project()).unwrap();
+        let result = translate_service("web", &svc, "test", &empty_project(), None).unwrap();
         assert_eq!(
             result.restart_policy.condition,
             minga_state::types::RestartCondition::Any
@@ -928,7 +983,7 @@ mod tests {
                 delay: 10s
             "#,
         );
-        let result = translate_service("web", &svc, "test", &empty_project()).unwrap();
+        let result = translate_service("web", &svc, "test", &empty_project(), None).unwrap();
         assert_eq!(
             result.restart_policy.condition,
             minga_state::types::RestartCondition::Any
@@ -970,7 +1025,7 @@ volumes:
         let project = minga_compose::load(FIDELITY, &minga_compose::LoadOptions::default())
             .expect("compose should load")
             .project;
-        let stack = translate_project(&project, "shop").unwrap();
+        let stack = translate_project(&project, "shop", None).unwrap();
         let svc = &stack.services[0];
 
         assert_eq!(svc.command, vec!["sleep", "3600"]);

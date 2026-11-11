@@ -215,6 +215,7 @@ pub fn place_service(
         healthcheck: service.healthcheck.clone(),
         mounts: service.mounts.clone(),
         user: service.user.clone(),
+        extra_hosts: service.extra_hosts.clone(),
     };
     let revision = spec_revision(&spec);
 
@@ -391,6 +392,7 @@ mod tests {
             update: Default::default(),
             rollback: None,
             previous: None,
+            extra_hosts: vec![],
         }
     }
 

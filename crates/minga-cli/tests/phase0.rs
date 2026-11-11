@@ -179,7 +179,7 @@ async fn phase0_gate_10_services_3_nodes() {
     assert_eq!(loaded.project.services.len(), 10, "expected 10 services");
 
     let translated =
-        minga_scheduler::translate_project(&loaded.project, "plant-7").expect("translation");
+        minga_scheduler::translate_project(&loaded.project, "plant-7", None).expect("translation");
     assert_eq!(translated.services.len(), 10);
 
     // --- 5. Write services to Raft --------------------------------------------

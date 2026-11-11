@@ -55,6 +55,7 @@ fn make_service(id: &str, replicas: u32) -> Service {
         update: Default::default(),
         rollback: None,
         previous: None,
+        extra_hosts: vec![],
     }
 }
 

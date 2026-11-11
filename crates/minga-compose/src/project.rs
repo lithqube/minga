@@ -2,6 +2,7 @@
 //! startup order computed from `depends_on`.
 
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 
 use indexmap::IndexMap;
 use serde_yaml::Value;
@@ -63,6 +64,7 @@ impl Project {
             extensions: file.extensions,
             order: Vec::new(),
         };
+        project.load_env_files(errors);
         project.check_dependencies(errors, warnings);
         project.check_services(errors);
         project.check_file_objects(errors);
@@ -247,5 +249,42 @@ impl Project {
             order.push(name.to_string());
         }
         order
+    }
+
+    /// Reads each `env_file` entry and merges variables into the service
+    /// environment. Explicit `environment` keys take precedence (env_file
+    /// fills gaps, never overwrites).
+    fn load_env_files(&mut self, errors: &mut Vec<ComposeError>) {
+        for (name, svc) in &mut self.services {
+            let at = format!("services.{name}.env_file");
+            for ef in &svc.env_file {
+                let path = Path::new(&ef.path);
+                let content = match std::fs::read_to_string(path) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        if ef.required {
+                            errors.push(ComposeError::invalid(
+                                &at,
+                                format!("cannot read {:?}: {e}", ef.path),
+                            ));
+                        }
+                        continue;
+                    }
+                };
+                for line in content.lines() {
+                    let line = line.trim();
+                    if line.is_empty() || line.starts_with('#') {
+                        continue;
+                    }
+                    if let Some((k, v)) = line.split_once('=') {
+                        // Only insert if the key is not already set by `environment`.
+                        svc.environment
+                            .0
+                            .entry(k.trim().to_string())
+                            .or_insert(Some(v.to_string()));
+                    }
+                }
+            }
+        }
     }
 }
