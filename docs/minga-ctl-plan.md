@@ -40,8 +40,8 @@ File and line references are for `main` at `b1e49ac`, after PR #18 merged.
 | `minga logs` reads NATS JetStream. Plain NATS is allowed only to loopback. | `run_logs` at `main.rs:1672`, `minga-cli/src/bus.rs:68-83` | Logs run on the node. |
 | `minga image pull` runs `ctr` on the machine it is called on. There is no `image ls` or `image rm`. | `run_image` at `main.rs:1746` | Image commands run on the node. |
 | `minga secret put` reads stdin and writes a file in the local secret store. The API stores secret metadata only and rejects a non-empty `Data`. | `run_secret` at `main.rs:632`, `handlers.rs:673` | Secret values never use the API. |
-| In 1.0.1 image pulls are anonymous: `minga image pull` and the automatic pull before a task starts both run `ctr -n minga images pull <ref>` with no credentials. On `main` the automatic pull reads `$HOME/.docker/config.json`; `minga image pull` is still anonymous. | `main.rs:1752`, `pull_image` at `minga-node/src/containerd/runtime.rs:539` | Registry login maintains that file and needs 1.0.2 (section 5.8). |
-| `minga deploy` translates the compose file on the machine it runs on. On `main` that includes reading `env_file` files, joining relative bind-mount sources to the compose file's directory, and turning `extra_hosts: host-gateway` into that machine's default-route address. | `minga-cli/src/main.rs`, `host_gateway_ip` at `minga-scheduler/src/translate.rs:576` | A deploy from a workstation resolves these on the workstation (section 5.2). |
+| In 1.0.1 image pulls are anonymous: `minga image pull` and the automatic pull before a task starts both run `ctr -n minga images pull <ref>` with no credentials. On `main` both read `$DOCKER_CONFIG/config.json`, else `$HOME/.docker/config.json`. | `run_image` in `minga-cli/src/main.rs`, `pull_with_ctr` and `registry_auth` in `minga-node/src/containerd/runtime.rs` | Registry login maintains that file and needs 1.0.2 (section 5.8). |
+| `minga deploy` translates the compose file on the machine it runs on. On `main` that includes reading `env_file` files and joining relative bind-mount sources to the compose file's directory. (`extra_hosts: host-gateway` stays literal and is resolved by the node.) | `minga-cli/src/main.rs`, `minga-compose/src/project.rs` | A deploy from a workstation resolves these on the workstation (section 5.2). |
 | Things inside the cluster read the API too. The staging guide runs Traefik as a container whose Swarm provider reads `http://<gateway>:2375`, with the API on `0.0.0.0:2375` behind a host firewall. | `docs/hetzner-arm-staging.md` | The API cannot always be bound to loopback (section 2.2). |
 
 Two things the original brief asked for do not exist and are not faked: image
@@ -463,7 +463,7 @@ for 400, 415 and 422 request rejections) are shown as the message.
 | No registry credential given | ``error: no credential on stdin for ghcr.io`` then ``hint: run in a terminal to be prompted, or pipe the token to stdin`` | 1 |
 | Registry file not usable | ``error: cannot read /root/.docker/config.json on alice@mgr1.example.net: Permission denied`` then ``hint: the SSH user needs read and write access to the file; minga-ctl does not use sudo`` | 2 |
 | Registry file not JSON | ``error: /root/.docker/config.json on alice@mgr1.example.net is not valid JSON; left unchanged`` | 2 |
-| Deploy needs the node | ``error: compose.yaml uses host-gateway (service `traefik`), which would resolve on this machine, not on the node`` then ``hint: use an explicit address, or run minga-ctl on the node with a local context`` | 1 |
+| Deploy needs the node | ``error: compose.yaml bind-mounts ./conf (service `traefik`), which would resolve on this machine, not on the node`` then ``hint: use an absolute path on the node, or run minga-ctl on the node with a local context`` | 1 |
 
 ### 4.5 State files
 
@@ -576,11 +576,10 @@ machine. On `main`, and so from 1.0.2, three things are resolved there:
 |---|---|---|
 | `env_file` | The files are read and their values go into the service spec | Allowed. It is what a deploy from a workstation should do. The values end up in the spec and in the revision file. |
 | A bind mount with a relative source (`./conf:/etc/app`) | An absolute path under the compose file's directory | Refused: that path is on the workstation, not on the node. |
-| `extra_hosts: ["name:host-gateway"]` | That machine's default-route address, or `172.17.0.1` when it is not Linux | Refused: the address has nothing to do with the node. |
+| `extra_hosts: ["name:host-gateway"]` | Nothing: it stays literal, and the node writes its own bridge address | Allowed. |
 
 The check in step 0 reads the compose file as YAML and looks, per service, for
-`extra_hosts` entries whose address is `host-gateway` and for volume entries
-whose source starts with `./`, `../` or `~`. If it finds one it exits 1 with
+volume entries whose source starts with `./`, `../` or `~`. If it finds one it exits 1 with
 the "Deploy needs the node" error from section 4.4 and deploys nothing. It is
 a guard on the plain file: it does not follow `extends`, `include` or
 variable interpolation. Nothing is refused only when the context has no SSH
@@ -833,10 +832,8 @@ target is reported, the rest still run, and the exit code is 2.
 
 `minga` has no `image ls` or `image rm`, so those call `ctr` directly. The SSH
 user needs access to the containerd socket; minga-ctl does not call `sudo`.
-`minga image pull` is anonymous, in 1.0.1 and on `main`, so
-`minga-ctl image pull` cannot fetch a private image. Private images are
-pulled by the task that needs them, using the node's registry credentials
-(section 5.8).
+`minga image pull` is anonymous in 1.0.1. On `main` it uses the node's
+registry credentials (section 5.8), the same as a task's automatic pull.
 
 ```
 $ minga-ctl image ls
@@ -999,9 +996,10 @@ can run the service; `list` shows which nodes have it.
 
 - The context field `registry_auth_file` is the path on the node. Default:
   `/root/.docker/config.json`.
-- It has to be the file Minga reads. If the Minga service runs as another
-  user, or has no `HOME` in its environment, set the path or the service
-  environment to match; otherwise Minga finds no file and pulls anonymously.
+- It has to be the file Minga reads: `$DOCKER_CONFIG/config.json` when the
+  service sets `DOCKER_CONFIG`, else `$HOME/.docker/config.json`. Set the
+  path or the service environment to match; otherwise Minga finds no file
+  and pulls anonymously.
 - The SSH user must be able to read and write the file. minga-ctl does not
   call `sudo`.
 
@@ -1126,14 +1124,11 @@ were checked against `main` at `b1e49ac`.
   node can read it in the process list while a pull runs. This plan's rule is
   that a credential never appears on a command line (section 2.2, item 9);
   the merged code does not meet it yet.
-- Failures are silent. A missing `HOME`, an unreadable or malformed file, or
-  a missing entry all lead to an anonymous pull with no log line. The first
-  sign is a 401 from the registry when a task starts.
-- `minga image pull` does not read the file, so `minga-ctl image pull` of a
-  private image still fails. For the same reason `login` has no verify step:
-  no command pulls on demand with the stored credential. Once
-  `minga image pull` uses the same lookup, `login --verify <image ref>` runs
-  it on each node after storing.
+- Failures are quiet. A file with no entry for the registry logs one info
+  line and pulls anonymously. A missing `HOME` or an unreadable or malformed
+  file logs nothing. The first sign is a 401 from the registry.
+- `minga image pull` uses the same lookup, so `login --verify <image ref>`
+  can run it on each node after storing.
 - Docker Hub uses a different key. Minga looks up `docker.io`, which is what
   minga-ctl writes. `docker login` writes `https://index.docker.io/v1/`, so a
   file produced by `docker login` on the node is not matched for Docker Hub.
@@ -1199,8 +1194,9 @@ plan.
 - Required: `stack deploy` with a direct `https://` endpoint refuses the same
   compose files as with an SSH context.
 - Required: with an SSH context, `stack deploy` of a compose file that uses
-  `host-gateway` or a relative bind mount exits 1 before `MINGA_BIN` is run;
-  the same file deploys in a local context; `env_file` is allowed in both.
+  a relative bind mount exits 1 before `MINGA_BIN` is run; the same file
+  deploys in a local context; `env_file` and `host-gateway` are allowed in
+  both.
 - Unit tests: token and endpoint precedence; refusal of a config with mode
   0644 and of an unknown key; plain-HTTP refusal for a non-loopback host;
   validation and quoting of remote arguments (including a target starting
@@ -1264,8 +1260,8 @@ Before each commit: `cargo fmt --all`, `cargo clippy --all-targets -- -D warning
 - When a container has to read the API (Traefik's Swarm provider), the API
   listens beyond loopback and the token is the only barrier between any
   container on the node and the cluster (section 2.2).
-- `stack deploy` refuses compose files that use `host-gateway` or relative
-  bind mounts whenever the node is another machine (an SSH context, or a
+- `stack deploy` refuses compose files that use relative bind mounts
+  whenever the node is another machine (an SSH context, or a
   direct endpoint that is not loopback), because Minga resolves them on the
   machine that runs the deploy (section 5.2).
 - `registry login` overwrites an existing credential file in place to keep

@@ -8,11 +8,13 @@
 //! spec defaults (the runtime fills them in).
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 use minga_state::types::TaskSpec;
 use serde::Serialize;
 
 use super::image::ImageConfiguration;
+use super::proto::Mount;
 
 /// OCI runtime spec version.
 const OCI_VERSION: &str = "1.0.2";
@@ -509,16 +511,105 @@ pub fn spec_to_any_with_secrets(
 }
 
 /// The uid and gid a task's process runs as: its own `user`, else the image's.
-/// A name needs the image's `/etc/passwd`, so it fails here, only when nothing
-/// numeric replaced it.
-pub fn task_user(spec: &TaskSpec, image: &ImageConfiguration) -> Result<(u32, u32), String> {
+/// Names are looked up in the image's `/etc/passwd` and `/etc/group`, read
+/// from `rootfs` (the snapshot's directories, top layer first). A user name
+/// without a group takes that user's primary group, as Docker does.
+pub fn task_user(
+    spec: &TaskSpec,
+    image: &ImageConfiguration,
+    rootfs: &[PathBuf],
+) -> Result<(u32, u32), String> {
     let user = match &spec.user {
         Some(user) => user,
         None if image.user.is_empty() => return Ok((0, 0)),
         None => &image.user,
     };
-    minga_state::types::parse_user(user)
-        .map_err(|e| format!("user `{user}`: {e}; set a numeric `user:` on the service"))
+    if let Ok(ids) = minga_state::types::parse_user(user) {
+        return Ok(ids);
+    }
+    resolve_user(user, rootfs)
+        .map_err(|e| format!("user `{user}`: {e}; or set a numeric `user:` on the service"))
+}
+
+fn resolve_user(user: &str, rootfs: &[PathBuf]) -> Result<(u32, u32), String> {
+    let (name, group) = match user.split_once(':') {
+        Some((name, group)) => (name, Some(group)),
+        None => (user, None),
+    };
+    let (uid, primary_gid) = match name.parse::<u32>() {
+        Ok(uid) => (uid, 0),
+        Err(_) => match lookup(&read_etc(rootfs, "passwd")?, name) {
+            Some((uid, Some(gid))) => (uid, gid),
+            _ => return Err(format!("no user `{name}` in the image's /etc/passwd")),
+        },
+    };
+    let gid = match group {
+        None => primary_gid,
+        Some(group) => match group.parse::<u32>() {
+            Ok(gid) => gid,
+            Err(_) => lookup(&read_etc(rootfs, "group")?, group)
+                .map(|(gid, _)| gid)
+                .ok_or_else(|| format!("no group `{group}` in the image's /etc/group"))?,
+        },
+    };
+    Ok((uid, gid))
+}
+
+/// The id fields of `name`'s line in a passwd (`name:x:uid:gid:…`) or group
+/// (`name:x:gid:members`) file. The second id is `None` for group files.
+fn lookup(file: &str, name: &str) -> Option<(u32, Option<u32>)> {
+    file.lines().find_map(|line| {
+        let mut fields = line.split(':');
+        if fields.next()? != name {
+            return None;
+        }
+        fields.next()?; // password
+        let id = fields.next()?.parse().ok()?;
+        Some((id, fields.next().and_then(|f| f.parse().ok())))
+    })
+}
+
+/// Reads `etc/<file>` from the topmost snapshot directory that has it.
+/// Symlinks are refused: they would resolve against the host, not the image.
+fn read_etc(rootfs: &[PathBuf], file: &str) -> Result<String, String> {
+    for dir in rootfs {
+        let etc = dir.join("etc");
+        let path = etc.join(file);
+        for p in [&etc, &path] {
+            if std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_symlink()) {
+                return Err(format!("the image's /etc/{file} is behind a symlink"));
+            }
+        }
+        match std::fs::symlink_metadata(&path) {
+            Ok(meta) if meta.is_file() => {
+                return std::fs::read_to_string(&path)
+                    .map_err(|e| format!("read the image's /etc/{file}: {e}"));
+            }
+            // An overlay whiteout (or anything else) hides the lower layers.
+            Ok(_) => break,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(format!("read the image's /etc/{file}: {e}")),
+        }
+    }
+    Err(format!("the image has no /etc/{file}"))
+}
+
+/// The directories behind a prepared snapshot's mounts, top layer first:
+/// overlay `upperdir` then each `lowerdir`, or a bind mount's source.
+pub fn rootfs_dirs(mounts: &[Mount]) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    for mount in mounts {
+        if mount.r#type != "overlay" {
+            dirs.push(PathBuf::from(&mount.source));
+            continue;
+        }
+        let option = |key: &str| mount.options.iter().find_map(|o| o.strip_prefix(key));
+        dirs.extend(option("upperdir=").map(PathBuf::from));
+        if let Some(lower) = option("lowerdir=") {
+            dirs.extend(lower.split(':').map(PathBuf::from));
+        }
+    }
+    dirs
 }
 
 /// Serialize a runnable OCI spec using the selected image's process defaults.
@@ -528,6 +619,7 @@ pub fn spec_to_any_with_image(
     spec: &TaskSpec,
     secret_mounts: &[SecretMount],
     image: &ImageConfiguration,
+    (uid, gid): (u32, u32),
     network: Option<&NetworkSpec>,
 ) -> Result<prost_types::Any, String> {
     // Docker override semantics: an explicit task entrypoint replaces the
@@ -552,7 +644,6 @@ pub fn spec_to_any_with_image(
     let mut oci = spec_from_task_with_secrets(container_id, spec, secret_mounts, network);
     oci.process.args = args;
     oci.process.cwd = image.cwd.clone();
-    let (uid, gid) = task_user(spec, image)?;
     oci.process.user = OciUser { uid, gid };
     let mut env = image.env.clone();
     let mut overrides: Vec<_> = spec.env.iter().collect();
@@ -603,7 +694,7 @@ mod tests {
             user: "1000:1001".into(),
             parent_snapshot: "unused".into(),
         };
-        let any = spec_to_any_with_image("c1", &task, &[], &image, None).unwrap();
+        let any = spec_to_any_with_image("c1", &task, &[], &image, (1000, 1001), None).unwrap();
         let json: serde_json::Value = serde_json::from_slice(&any.value).unwrap();
         assert_eq!(
             json["process"]["args"],
@@ -863,22 +954,99 @@ mod override_tests {
     }
 
     #[test]
-    fn task_user_prefers_the_task_and_refuses_an_unreplaced_name() {
+    fn task_user_prefers_the_task_and_refuses_an_unknown_name() {
         let named = ImageConfiguration {
             user: "nodejs".into(),
             ..image()
         };
         let mut task = TaskSpec::default();
-        let error = task_user(&task, &named).unwrap_err();
+        let error = task_user(&task, &named, &[]).unwrap_err();
         assert!(error.contains("nodejs"), "{error}");
-        assert_eq!(task_user(&task, &image()), Ok((0, 0)));
+        assert_eq!(task_user(&task, &image(), &[]), Ok((0, 0)));
 
         task.user = Some("1001:65533".into());
-        assert_eq!(task_user(&task, &named), Ok((1001, 65533)));
+        assert_eq!(task_user(&task, &named, &[]), Ok((1001, 65533)));
+    }
+
+    /// Two snapshot layers: `upper` overrides `/etc/passwd`, `lower` holds
+    /// `/etc/group`.
+    fn layered_rootfs() -> (tempfile::TempDir, Vec<PathBuf>) {
+        let root = tempfile::tempdir().unwrap();
+        let (upper, lower) = (root.path().join("upper"), root.path().join("lower"));
+        for dir in [&upper, &lower] {
+            std::fs::create_dir_all(dir.join("etc")).unwrap();
+        }
+        std::fs::write(
+            upper.join("etc/passwd"),
+            "root:x:0:0:root:/root:/bin/sh\nzitadel:x:1000:1000::/home/zitadel:/sbin/nologin\n",
+        )
+        .unwrap();
+        std::fs::write(lower.join("etc/passwd"), "zitadel:x:1:1::/:/bin/sh\n").unwrap();
+        std::fs::write(lower.join("etc/group"), "root:x:0:\nstaff:x:50:zitadel\n").unwrap();
+        (root, vec![upper, lower])
+    }
+
+    #[test]
+    fn task_user_resolves_names_from_the_top_layer() {
+        let (_root, rootfs) = layered_rootfs();
+        let user = |u: &str| {
+            let task = TaskSpec {
+                user: Some(u.into()),
+                ..Default::default()
+            };
+            task_user(&task, &image(), &rootfs)
+        };
+        assert_eq!(user("zitadel"), Ok((1000, 1000)));
+        assert_eq!(user("zitadel:staff"), Ok((1000, 50)));
+        assert_eq!(user("zitadel:7"), Ok((1000, 7)));
+        assert_eq!(user("1234:staff"), Ok((1234, 50)));
+        assert!(user("nobody").unwrap_err().contains("no user `nobody`"));
+        assert!(user("zitadel:wheel")
+            .unwrap_err()
+            .contains("no group `wheel`"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn task_user_refuses_a_symlinked_passwd() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("etc")).unwrap();
+        std::os::unix::fs::symlink("/etc/passwd", root.path().join("etc/passwd")).unwrap();
+        let task = TaskSpec {
+            user: Some("root".into()),
+            ..Default::default()
+        };
+        let error = task_user(&task, &image(), &[root.path().to_path_buf()]).unwrap_err();
+        assert!(error.contains("symlink"), "{error}");
+    }
+
+    #[test]
+    fn rootfs_dirs_lists_overlay_layers_top_first() {
+        let overlay = Mount {
+            r#type: "overlay".into(),
+            source: "overlay".into(),
+            target: String::new(),
+            options: vec![
+                "workdir=/s/9/work".into(),
+                "upperdir=/s/9/fs".into(),
+                "lowerdir=/s/8/fs:/s/7/fs".into(),
+            ],
+        };
+        let bind = Mount {
+            r#type: "bind".into(),
+            source: "/s/1/fs".into(),
+            target: String::new(),
+            options: vec!["rbind".into(), "ro".into()],
+        };
+        assert_eq!(
+            rootfs_dirs(&[overlay]),
+            ["/s/9/fs", "/s/8/fs", "/s/7/fs"].map(PathBuf::from)
+        );
+        assert_eq!(rootfs_dirs(&[bind]), [PathBuf::from("/s/1/fs")]);
     }
 
     fn args_of(spec: &TaskSpec) -> Vec<String> {
-        let any = spec_to_any_with_image("c1", spec, &[], &image(), None).unwrap();
+        let any = spec_to_any_with_image("c1", spec, &[], &image(), (0, 0), None).unwrap();
         let json: serde_json::Value = serde_json::from_slice(&any.value).unwrap();
         serde_json::from_value(json["process"]["args"].clone()).unwrap()
     }
@@ -935,7 +1103,7 @@ mod override_tests {
             ],
             ..Default::default()
         };
-        let any = spec_to_any_with_image("c1", &spec, &[], &image(), None).unwrap();
+        let any = spec_to_any_with_image("c1", &spec, &[], &image(), (0, 0), None).unwrap();
         let json: serde_json::Value = serde_json::from_slice(&any.value).unwrap();
         let mounts = json["mounts"].as_array().unwrap();
         let data = mounts

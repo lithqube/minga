@@ -58,8 +58,30 @@ pub struct ClusterNode {
     pub role: NodeRole,
 }
 
-/// Parses a numeric `uid[:gid]`; a missing gid is 0. Names would need the
-/// image's `/etc/passwd`, so they fail loudly instead.
+/// Checks a `user` value is `user[:group]`, each part a number or a name of
+/// letters, digits, `.`, `_` or `-`. The node resolves names from the
+/// image's `/etc/passwd` and `/etc/group` when the task starts.
+pub fn validate_user(user: &str) -> Result<(), &'static str> {
+    let valid = |part: &str| {
+        !part.is_empty()
+            && !part.starts_with('-')
+            && part
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    };
+    let (name, group) = match user.split_once(':') {
+        Some((name, group)) => (name, Some(group)),
+        None => (user, None),
+    };
+    if valid(name) && group.map_or(true, valid) {
+        Ok(())
+    } else {
+        Err("expected `user[:group]`, each a number or a name of letters, digits, `.`, `_` or `-`")
+    }
+}
+
+/// Parses a numeric `uid[:gid]`; a missing gid is 0. Names need the image's
+/// `/etc/passwd`, which the node reads (see `validate_user`).
 pub fn parse_user(user: &str) -> Result<(u32, u32), &'static str> {
     let (uid, gid) = user.split_once(':').unwrap_or((user, "0"));
     Ok((

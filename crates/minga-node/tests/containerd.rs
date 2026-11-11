@@ -266,3 +266,73 @@ async fn containerd_logs_capture_stdout_and_stderr() {
         "FIFO must be removed on stop"
     );
 }
+
+/// A named `user:` resolves against the image's own /etc/passwd and
+/// /etc/group (BusyBox: `nobody` is 65534, `nogroup` is 65534).
+#[tokio::test]
+async fn containerd_named_user_resolves_from_the_image() {
+    let socket = socket_path();
+    if !containerd_available_at(&socket) {
+        eprintln!("SKIP: containerd not available at {socket}");
+        return;
+    }
+    let runtime = match ContainerdRuntime::connect(&socket).await {
+        Ok(rt) => rt,
+        Err(e) => {
+            assert!(
+                std::env::var_os("MINGA_REQUIRE_CONTAINERD").is_none(),
+                "required containerd connection failed: {e}"
+            );
+            eprintln!("SKIP: cannot connect to containerd: {e}");
+            return;
+        }
+    };
+    let logs_dir = tempfile::tempdir().unwrap();
+    let runtime = runtime.with_logs_dir(logs_dir.path());
+
+    let task_id = "minga-test-named-user-001".to_string();
+    let spec = TaskSpec {
+        image: "docker.io/library/busybox:latest".to_string(),
+        user: Some("nobody:nogroup".to_string()),
+        command: vec!["sh".into(), "-c".into(), "id; sleep 30".into()],
+        ..Default::default()
+    };
+    runtime
+        .start(&task_id, &spec)
+        .await
+        .expect("a named user from the image's passwd must start");
+
+    let mut out = Vec::new();
+    for _ in 0..20 {
+        out = runtime
+            .logs(&task_id, 0)
+            .await
+            .into_iter()
+            .flat_map(|c| c.data)
+            .collect();
+        if out.windows(9).any(|w| w == b"uid=65534") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    runtime.stop(&task_id).await.expect("stop");
+    let out = String::from_utf8_lossy(&out);
+    assert!(
+        out.contains("uid=65534") && out.contains("gid=65534"),
+        "process must run as nobody:nogroup, got {out:?}"
+    );
+
+    // An unknown name fails the start and rolls its snapshot back.
+    let unknown = TaskSpec {
+        user: Some("no-such-user".to_string()),
+        ..spec
+    };
+    let error = runtime
+        .start(&"minga-test-named-user-002".to_string(), &unknown)
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("no user `no-such-user`"),
+        "{error}"
+    );
+}

@@ -2,6 +2,40 @@
 
 ## [Unreleased]
 
+### Added
+- Compose `env_file` (string or `{path, required}` entries), merged under
+  `environment`, which wins on conflicts.
+- Compose `extra_hosts`, written to a per-task `/etc/hosts`. `host-gateway`
+  is the host's address on the task's bridge, resolved on the node.
+- Named users: `user:` (and an image's `USER`) may be `name[:group]`,
+  resolved from the image's own `/etc/passwd` and `/etc/group` at task
+  start. A name with no group takes the user's primary group.
+- Private registries: image pulls (automatic and `minga image pull`) read
+  inline `auth` entries from `$DOCKER_CONFIG/config.json`, else
+  `~/.docker/config.json`. Docker Hub's `https://index.docker.io/v1/` key
+  matches `docker.io` images.
+- The API accepts its token as the HTTP Basic-auth password (any username)
+  as well as `Authorization: Bearer`, so Traefik's Swarm provider can
+  authenticate.
+- Relative bind-mount sources are joined to the compose file's directory.
+
+### Fixed
+- A string `command` or `entrypoint` (plain or folded `>`) ran as a single
+  argv entry. It is now split with shell quoting, as Compose does; an
+  unterminated quote fails the deploy.
+- Image pull no longer runs `ctr images unpack`, which containerd 2.2
+  removed. `minga image pull` failed outright on Ubuntu 24.04.
+- Stopped or orphaned containerd tasks are purged when the supervisor
+  starts, so a restart no longer needs a manual `ctr tasks delete`.
+- `extra_hosts: host-gateway` resolved to the host's default route, which on
+  most VMs is the upstream router rather than the host.
+
+### Known limits
+- Registry credential helpers (`credsStore`, `credHelpers`) are not read.
+  `ctr` receives credentials on its command line, visible in `ps`.
+- Supplementary groups from the image's `/etc/group` are not applied.
+- `extra_hosts` takes effect only for tasks with node networking.
+
 ## [1.0.1] — 2026-11-11
 
 Release contents prepared for `1.0.1`. Includes the `0.1.0` entry below
