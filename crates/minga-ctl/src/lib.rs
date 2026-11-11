@@ -9,6 +9,7 @@ pub mod cmd;
 pub mod config;
 pub mod error;
 pub mod output;
+pub mod state;
 pub mod transport;
 pub mod view;
 
