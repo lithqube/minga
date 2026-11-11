@@ -12,6 +12,54 @@ No load testing — idle/low-traffic baseline only.
 
 ---
 
+## Visual comparison
+
+### Orchestration layer memory (MB RSS, idle)
+
+```
+Minga (A)          ██████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░  42 MB
+Docker Compose (B) ████████████████░░░░░░░░░░░░░░░░░░░░░░░░  101 MB
+Docker Swarm (C)   ██████████████████████████████████████████████████  311 MB
+                   0        50       100      150      200      250      300+ MB
+```
+
+### Total runtime overhead (orchestrator + containerd, MB RSS)
+
+```
+Minga (A)          ████████████████░░░░░░░░░░░░░░░░░░░░░░░░  102 MB
+Docker Compose (B) ███████████████████████████░░░░░░░░░░░░░  169 MB
+Docker Swarm (C)   ██████████████████████████████████████████████████████████████  377 MB
+                   0        50       100      150      200      250      300      350+ MB
+```
+
+### Port proxy processes (per 10 published ports)
+
+```
+Minga (A)          ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░  0  (iptables DNAT)
+Docker Compose (B) ████████████████████░░░░░░░░░░░░░░░░░░░░  10 (1 docker-proxy per port)
+Docker Swarm (C)   ████████████████████░░░░░░░░░░░░░░░░░░░░  10 (1 docker-proxy per port)
+```
+
+> GitHub-rendered Mermaid chart (same data):
+
+```mermaid
+xychart-beta
+    title "Orchestration layer memory (MB RSS, idle)"
+    x-axis ["Minga (A)", "Docker Compose (B)", "Docker Swarm (C)"]
+    y-axis "MB RSS" 0 --> 400
+    bar [42, 101, 311]
+```
+
+```mermaid
+xychart-beta
+    title "Total runtime overhead — orchestrator + containerd (MB RSS)"
+    x-axis ["Minga (A)", "Docker Compose (B)", "Docker Swarm (C)"]
+    y-axis "MB RSS" 0 --> 400
+    bar [102, 169, 377]
+```
+
+---
+
 ## Environments
 
 |                       | Env A — Minga                       | Env B — Docker Compose              | Env C — Docker Swarm                 |
