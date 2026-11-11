@@ -80,6 +80,18 @@ pub fn save_revision(context: &str, service: &str, spec: &Value) -> Result<(), C
     config::write_private_file(&path, &bytes)
 }
 
+/// Removes the revision of `service` in `context`; a missing file is fine.
+pub fn remove_revision(context: &str, service: &str) -> Result<(), CtlError> {
+    let path = revision_path(context, service)?;
+    match fs::remove_file(&path) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(CtlError::ConfigInvalid {
+            path: display_path(&path),
+            detail: e.to_string(),
+        }),
+        _ => Ok(()),
+    }
+}
+
 /// Appends one line to `audit.jsonl` for a command that changes state, on
 /// success and on failure. `args` must not hold secret or environment values.
 pub fn audit(
@@ -119,7 +131,9 @@ pub fn audit(
         .map_err(|e| CtlError::ConfigInvalid {
             path: display_path(&path),
             detail: e.to_string(),
-        })
+        })?;
+    // `mode` above applies only when the file is created.
+    config::set_mode(&path, 0o600)
 }
 
 fn now() -> String {

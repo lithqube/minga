@@ -92,8 +92,11 @@ impl ServiceCommand {
                 json!({
                     "service": service,
                     "image": image,
-                    "env_add": env_add.iter().map(|e| env_key(e)).collect::<Vec<_>>(),
-                    "env_rm": env_rm,
+                    "env_add": env_add
+                        .iter()
+                        .map(|e| e.split_once('=').map_or(INVALID, |(k, _)| logged_key(k)))
+                        .collect::<Vec<_>>(),
+                    "env_rm": env_rm.iter().map(|k| logged_key(k)).collect::<Vec<_>>(),
                     "replicas": replicas,
                 }),
             )),
@@ -215,9 +218,9 @@ async fn scale(
     format: Format,
     quiet: bool,
 ) -> Result<(), CtlError> {
-    let (old, new) = edit(client, id, |spec| set_replicas(spec, id, replicas)).await?;
+    let (old, _, changed) = edit(client, id, |spec| set_replicas(spec, id, replicas)).await?;
     let from = replicas_of(&old);
-    let text = if old == new {
+    let text = if !changed {
         format!("{id} already has {replicas} replicas; nothing changed")
     } else {
         let from = from.map_or("-".to_string(), |n| n.to_string());
@@ -226,7 +229,7 @@ async fn scale(
     let value = json!({
         "service": id,
         "replicas": { "from": from, "to": replicas },
-        "changed": old != new,
+        "changed": changed,
     });
     report(format, quiet, &text, value)
 }
@@ -247,24 +250,26 @@ async fn update(
     format: Format,
     quiet: bool,
 ) -> Result<(), CtlError> {
-    // Check every flag before the first request.
-    for entry in change.env_add {
-        if !entry.contains('=') || env_key(entry).is_empty() {
-            return Err(CtlError::Usage(format!(
-                "--env-add `{}` is not KEY=VALUE",
-                env_key(entry)
-            )));
-        }
-    }
-    if let Some(key) = change
-        .env_rm
+    // Check every flag before the first request. A bad argument may be a
+    // value typed in the wrong place, so it is named by position, never echoed.
+    if let Some(i) = change
+        .env_add
         .iter()
-        .find(|k| k.is_empty() || k.contains('='))
+        .position(|e| !e.split_once('=').is_some_and(|(k, _)| valid_key(k)))
     {
-        return Err(CtlError::Usage(format!("--env-rm `{key}` is not a KEY")));
+        return Err(CtlError::Usage(format!(
+            "--env-add argument {} is not KEY=VALUE",
+            i + 1
+        )));
+    }
+    if let Some(i) = change.env_rm.iter().position(|k| !valid_key(k)) {
+        return Err(CtlError::Usage(format!(
+            "--env-rm argument {} is not a KEY",
+            i + 1
+        )));
     }
 
-    let (old, new) = edit(client, id, |spec| {
+    let (old, new, changed) = edit(client, id, |spec| {
         if let Some(n) = change.replicas {
             set_replicas(spec, id, n)?;
         }
@@ -277,7 +282,12 @@ async fn update(
         if let Some(image) = change.image {
             container.insert("Image".to_string(), json!(image));
         }
-        if !change.env_add.is_empty() || !change.env_rm.is_empty() {
+        // Docker's order: removals first, then additions. Removing from a
+        // service without `Env` leaves it without one.
+        if let Some(env) = container.get_mut("Env").and_then(Value::as_array_mut) {
+            env.retain(|e| !change.env_rm.iter().any(|k| k == env_key_of(e)));
+        }
+        if !change.env_add.is_empty() {
             let env = container.entry("Env").or_insert(Value::Null);
             if env.is_null() {
                 *env = json!([]);
@@ -285,8 +295,6 @@ async fn update(
             let env = env.as_array_mut().ok_or_else(|| {
                 CtlError::Usage(format!("service `{id}` has an Env that is not a list"))
             })?;
-            // Docker's order: removals first, then additions.
-            env.retain(|e| !change.env_rm.iter().any(|k| k == env_key_of(e)));
             for entry in change.env_add {
                 let key = env_key(entry);
                 match env.iter_mut().find(|e| env_key_of(e) == key) {
@@ -300,7 +308,7 @@ async fn update(
     .await?;
 
     let changes = describe(&old, &new);
-    let text = if old == new {
+    let text = if !changed {
         format!("{id} already matches; nothing changed")
     } else {
         let list: Vec<String> = changes.iter().map(|(l, c)| format!("{l} {c}")).collect();
@@ -308,7 +316,7 @@ async fn update(
     };
     let value = json!({
         "service": id,
-        "changed": old != new,
+        "changed": changed,
         "changes": changes.into_iter().collect::<BTreeMap<_, _>>(),
     });
     report(format, quiet, &text, value)
@@ -383,21 +391,22 @@ fn not_found(client: &ApiClient, kind: &'static str, id: &str) -> CtlError {
 
 /// Reads the service, applies `change` to a copy of its spec and, only if the
 /// copy differs, posts it and then saves the spec as read as the revision.
-/// Returns the spec as read and the edited copy.
+/// Returns the spec as read, the edited copy and whether it changed.
 async fn edit(
     client: &ApiClient,
     id: &str,
     change: impl FnOnce(&mut Value) -> Result<(), CtlError>,
-) -> Result<(Value, Value), CtlError> {
+) -> Result<(Value, Value, bool), CtlError> {
     let service = read(client, id).await?;
     let old = service["Spec"].clone();
     let mut new = old.clone();
     change(&mut new)?;
-    if new != old {
+    let changed = !same_spec(&new, &old);
+    if changed {
         post_spec(client, id, &service, &new).await?;
         save_revision(client, id, &old)?;
     }
-    Ok((old, new))
+    Ok((old, new, changed))
 }
 
 /// `POST /services/{id}/update?version=<Version.Index>` with the whole spec.
@@ -419,13 +428,22 @@ async fn post_spec(
         .map(drop)
 }
 
-/// Saves the revision once the API has accepted the change.
+/// Saves the revision once the API has accepted the change. If that fails,
+/// the old revision file is removed: it now holds a spec two changes back,
+/// and a rollback to it would be wrong.
 fn save_revision(client: &ApiClient, id: &str, spec: &Value) -> Result<(), CtlError> {
-    state::save_revision(&client.context, id, spec).map_err(|e| {
-        CtlError::Halted(format!(
-            "{id} was changed, but its revision could not be saved ({e}); rollback data for this change is missing"
-        ))
-    })
+    let Err(err) = state::save_revision(&client.context, id, spec) else {
+        return Ok(());
+    };
+    let fate = match state::remove_revision(&client.context, id) {
+        Ok(()) => "the previous revision was removed, so rollback has nothing to restore".to_string(),
+        Err(e) => format!(
+            "the previous revision could not be removed either ({e}); delete it before any rollback, which would restore an older spec"
+        ),
+    };
+    Err(CtlError::Halted(format!(
+        "{id} was changed, but its revision could not be saved ({err}); {fate}"
+    )))
 }
 
 fn set_replicas(spec: &mut Value, id: &str, replicas: u64) -> Result<(), CtlError> {
@@ -454,17 +472,49 @@ fn env_key_of(entry: &Value) -> &str {
     env_key(entry.as_str().unwrap_or(""))
 }
 
-/// Minga keeps the environment in a map, so the order of `Env` can differ
-/// between two reads of the same service. Compare specs with `Env` sorted.
+/// What the audit log records in place of an argument that is not a key.
+const INVALID: &str = "<invalid>";
+
+/// A key that is safe to print and log: no `=`, whitespace or control
+/// characters, so it cannot be a `KEY=VALUE` or a stray value.
+fn valid_key(key: &str) -> bool {
+    !key.is_empty()
+        && !key
+            .chars()
+            .any(|c| c == '=' || c.is_whitespace() || c.is_control())
+}
+
+fn logged_key(key: &str) -> &str {
+    if valid_key(key) {
+        key
+    } else {
+        INVALID
+    }
+}
+
+/// Compares specs the way the server stores them: Minga keeps the
+/// environment in a map, so the order of `Env` can differ between two reads,
+/// and an empty `Env` is the same as none.
 fn same_spec(a: &Value, b: &Value) -> bool {
-    let sorted = |spec: &Value| {
+    let normal = |spec: &Value| {
         let mut spec = spec.clone();
-        if let Some(Value::Array(env)) = spec.pointer_mut("/TaskTemplate/ContainerSpec/Env") {
-            env.sort_by(|x, y| x.as_str().cmp(&y.as_str()));
+        if let Some(container) = spec
+            .pointer_mut("/TaskTemplate/ContainerSpec")
+            .and_then(Value::as_object_mut)
+        {
+            match container.get_mut("Env") {
+                Some(Value::Array(env)) if !env.is_empty() => {
+                    env.sort_by(|x, y| x.as_str().cmp(&y.as_str()))
+                }
+                Some(Value::Array(_) | Value::Null) => {
+                    container.remove("Env");
+                }
+                _ => {}
+            }
         }
         spec
     };
-    sorted(a) == sorted(b)
+    normal(a) == normal(b)
 }
 
 /// What differs from `old` to `new`: image, replicas and the number of
@@ -608,6 +658,25 @@ mod tests {
             err.to_string(),
             "service `shop.proxy` is global and cannot be scaled"
         );
+    }
+
+    #[test]
+    fn an_empty_env_is_the_same_as_none() {
+        let mut none = spec("a", 1, &[]);
+        none["TaskTemplate"]["ContainerSpec"]
+            .as_object_mut()
+            .unwrap()
+            .remove("Env");
+        assert!(same_spec(&none, &spec("a", 1, &[])));
+        assert!(!same_spec(&none, &spec("a", 1, &["A=1"])));
+    }
+
+    #[test]
+    fn only_plain_keys_are_printed_or_logged() {
+        assert_eq!(logged_key("API_URL"), "API_URL");
+        for bad in ["", "TOKEN=abc", "two words", "tab\there"] {
+            assert_eq!(logged_key(bad), INVALID, "{bad:?}");
+        }
     }
 
     #[test]

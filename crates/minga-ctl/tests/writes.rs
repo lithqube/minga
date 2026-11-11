@@ -209,6 +209,48 @@ async fn scale_update_and_rollback_against_a_real_api() {
     assert_eq!(code, 0, "{err}");
     assert_eq!(out, "");
 
+    // A malformed env argument may be a value: it is named by position,
+    // never echoed, and logged as `<invalid>`.
+    for (args, text) in [
+        (
+            ["service", "update", "shop.web", "--env-add", "s3cr3tv4lue"],
+            "error: --env-add argument 1 is not KEY=VALUE",
+        ),
+        (
+            [
+                "service",
+                "update",
+                "shop.web",
+                "--env-rm",
+                "TOKEN=s3cr3tv4lue",
+            ],
+            "error: --env-rm argument 1 is not a KEY",
+        ),
+    ] {
+        let (code, out, err) = run(&cluster, home, &args).await;
+        assert_eq!(code, 1, "{err}");
+        assert!(err.contains(text), "{err}");
+        assert!(!format!("{out}{err}").contains("s3cr3tv4lue"), "{err}");
+    }
+
+    // Removing a key that is not there posts nothing and keeps the revision,
+    // also on a service without any `Env` (shop.proxy, which has no revision).
+    let revision_before = std::fs::read(&revision).unwrap();
+    for service in ["shop.web", "shop.proxy"] {
+        let (code, out, err) = run(
+            &cluster,
+            home,
+            &[
+                "--debug", "service", "update", service, "--env-rm", "MISSING",
+            ],
+        )
+        .await;
+        assert_eq!(code, 0, "{err}");
+        assert!(out.contains("nothing changed"), "{out}");
+        assert!(!err.contains("POST"), "{err}");
+    }
+    assert_eq!(std::fs::read(&revision).unwrap(), revision_before);
+
     // A global service cannot be scaled; a service never changed has no revision.
     let (code, _, err) = run(
         &cluster,
@@ -262,11 +304,18 @@ async fn scale_update_and_rollback_against_a_real_api() {
             "service update",
             "service scale",
             "service scale",
+            "service update",
+            "service update",
+            "service update",
+            "service update",
             "service scale",
             "service rollback",
             "service scale",
         ]
     );
+    assert_eq!(audit[9]["args"]["env_add"], json!(["<invalid>"]));
+    assert_eq!(audit[10]["args"]["env_rm"], json!(["<invalid>"]));
+    assert_eq!(audit[12]["args"]["env_rm"], json!(["MISSING"]));
     assert_eq!(audit[0]["result"], "ok");
     assert_eq!(audit[0]["user"], "tester");
     assert_eq!(audit[0]["context"], "default");
@@ -279,6 +328,7 @@ async fn scale_update_and_rollback_against_a_real_api() {
     assert_eq!(audit[6]["args"]["env_add"], json!(["C"]));
     let text = std::fs::read_to_string(home.join("state/minga-ctl/audit.jsonl")).unwrap();
     assert!(!text.contains("C=3"), "{text}");
+    assert!(!text.contains("s3cr3tv4lue"), "{text}");
     assert_eq!(mode(&home.join("state/minga-ctl/audit.jsonl")), 0o600);
 }
 
@@ -314,6 +364,11 @@ async fn stack_rm_removes_services_and_only_named_resources() {
     }
     let home = tempfile::tempdir().unwrap();
     let home = home.path();
+    // An audit log left with a looser mode is tightened to 0600.
+    let audit_file = home.join("state/minga-ctl/audit.jsonl");
+    std::fs::create_dir_all(audit_file.parent().unwrap()).unwrap();
+    std::fs::write(&audit_file, "").unwrap();
+    std::fs::set_permissions(&audit_file, std::fs::Permissions::from_mode(0o644)).unwrap();
     let networks = ["app_default", "app_shared", "other_net"]
         .map(String::from)
         .to_vec();
@@ -414,4 +469,141 @@ async fn stack_rm_removes_services_and_only_named_resources() {
         audit[1]["args"]["with"],
         json!(["app_default", "other_net"])
     );
+    assert_eq!(mode(&audit_file), 0o600);
+}
+
+/// A stand-in API for failures Minga's handlers cannot produce today (a 409
+/// or a 500 on `DELETE`). Answers `"METHOD /path"` (query ignored) from
+/// `routes`; anything else is Minga's not-implemented 404.
+fn fake_api(routes: Vec<(&'static str, u16, &'static str)>) -> String {
+    use std::io::{Read, Write};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let mut stream = stream.unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 4096];
+            while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                match stream.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => request.extend_from_slice(&chunk[..n]),
+                }
+            }
+            let head = String::from_utf8_lossy(&request);
+            let mut words = head.split_whitespace();
+            let method = words.next().unwrap_or("");
+            let path = words.next().unwrap_or("").split('?').next().unwrap();
+            let key = format!("{method} {path}");
+            let (status, body) = routes
+                .iter()
+                .find(|(route, ..)| *route == key)
+                .map(|(_, status, body)| (*status, *body))
+                .unwrap_or((404, r#"{"message":"endpoint not implemented by Minga"}"#));
+            let response = format!(
+                "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+        }
+    });
+    url
+}
+
+/// The fake cluster for `stack rm app`: two services, a network and a secret.
+fn app_routes(db_delete: (u16, &'static str)) -> Vec<(&'static str, u16, &'static str)> {
+    const SERVICES: &str = r#"[
+        {"ID":"app.web","Spec":{"Labels":{"com.docker.stack.namespace":"app"}}},
+        {"ID":"app.db","Spec":{"Labels":{"com.docker.stack.namespace":"app"}}}
+    ]"#;
+    vec![
+        ("GET /v1.41/services", 200, SERVICES),
+        (
+            "GET /v1.41/networks",
+            200,
+            r#"[{"ID":"app_default","Name":"app_default"}]"#,
+        ),
+        ("GET /v1.41/configs", 200, "[]"),
+        ("GET /v1.41/secrets", 200, r#"[{"ID":"app_db_password"}]"#),
+        ("DELETE /v1.41/services/app.web", 204, ""),
+        ("DELETE /v1.41/services/app.db", db_delete.0, db_delete.1),
+        (
+            "DELETE /v1.41/networks/app_default",
+            409,
+            r#"{"message":"network app_default is in use"}"#,
+        ),
+    ]
+}
+
+#[test]
+fn stack_rm_reports_resources_in_use_and_failed_services() {
+    let home = tempfile::tempdir().unwrap();
+    let home = home.path();
+
+    // A 409 on a named resource is a warning, and the resource stays in the
+    // output, the JSON and the command to run again.
+    let url = fake_api(app_routes((204, "")));
+    let args = ["stack", "rm", "app", "--with", "app_default", "--yes"];
+    let (code, out, err) = ctl(home, &url, &args);
+    assert_eq!(code, 0, "{err}");
+    assert!(
+        err.contains("warning: network app_default was not removed"),
+        "{err}"
+    );
+    assert_eq!(
+        out,
+        "removed 2 services\n\
+         not removed:\n  \
+         network app_default: in use: network app_default is in use\n\
+         left in place (ownership cannot be confirmed):\n  \
+         secret  app_db_password (metadata only)\n\
+         to remove them: minga-ctl stack rm app --with app_default --with app_db_password\n"
+    );
+    let json_args = [
+        "--json",
+        "stack",
+        "rm",
+        "app",
+        "--with",
+        "app_default",
+        "--yes",
+    ];
+    let (code, out, err) = ctl(home, &url, &json_args);
+    assert_eq!(code, 0, "{err}");
+    let out: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(
+        out["not_removed"],
+        json!([{ "kind": "network", "id": "app_default", "reason": "in use: network app_default is in use" }])
+    );
+    assert_eq!(out["removed"], json!([]));
+    assert_eq!(out["removed_services"], json!(["app.db", "app.web"]));
+
+    // A service that cannot be removed (app.db, deleted first) does not stop
+    // the others; everything
+    // is reported, named resources are not tried, and the command exits 2.
+    let url = fake_api(app_routes((500, r#"{"message":"store unavailable"}"#)));
+    let (code, out, err) = ctl(home, &url, &args);
+    assert_eq!(code, 2, "{err}");
+    assert_eq!(
+        out,
+        "removed 1 service\n\
+         not removed:\n  \
+         service app.db: API error 500: store unavailable\n  \
+         network app_default: not tried: some of the stack's services are still there\n\
+         left in place (ownership cannot be confirmed):\n  \
+         secret  app_db_password (metadata only)\n\
+         to remove them: minga-ctl stack rm app --with app_default --with app_db_password\n"
+    );
+    assert!(
+        err.contains(
+            "error: stack rm app did not finish: removed app.web; could not remove service app.db (API error 500: store unavailable)"
+        ),
+        "{err}"
+    );
+    let audit = audit_lines(home);
+    let last = audit.last().unwrap();
+    assert_eq!(last["result"], "error");
+    assert_eq!(last["exit_code"], 2);
+    assert!(last["error"].as_str().unwrap().contains("app.db"), "{last}");
 }

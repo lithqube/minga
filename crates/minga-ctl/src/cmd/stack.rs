@@ -172,40 +172,71 @@ async fn rm(
     }
     confirm("stack rm", yes, &summary)?;
 
-    // 5. Services first, then the named resources; a 409 is a warning.
+    // 5. Services first, then the named resources. Every deletion is tried
+    // and reported; a 409 on a resource is a warning, any other failure
+    // makes the command exit 2 once everything has been reported.
+    let mut removed_services = Vec::new();
+    let mut failed = Vec::new(); // (kind, id, reason)
     for id in &services {
-        client.delete(&format!("services/{id}")).await?;
+        match client.delete(&format!("services/{id}")).await {
+            Ok(_) => removed_services.push(*id),
+            Err(e) => failed.push(("service", id.to_string(), e.to_string())),
+        }
     }
-    let mut lines = Vec::new();
-    if !services.is_empty() {
-        let noun = if services.len() == 1 {
-            "service"
-        } else {
-            "services"
-        };
-        lines.push(format!("removed {} {noun}", services.len()));
-    }
+    let services_failed = !failed.is_empty();
     let mut removed = Vec::new();
+    let mut in_use = Vec::new(); // (candidate, reason)
     for c in &named {
+        if services_failed {
+            // A service still there may use it.
+            let reason = "not tried: some of the stack's services are still there";
+            in_use.push((*c, reason.to_string()));
+            continue;
+        }
         match client.delete(&format!("{}/{}", c.collection, c.id)).await {
-            Ok(_) => {
-                let note = if c.kind == "secret" {
-                    " (metadata only; files on nodes stay)"
-                } else {
-                    ""
-                };
-                lines.push(format!("removed {} {}{note}", c.kind, c.id));
-                removed.push(json!({ "kind": c.kind, "id": c.id }));
-            }
+            Ok(_) => removed.push(*c),
             Err(CtlError::Api {
                 status: 409,
                 message,
-            }) => eprintln!("warning: {} {} was not removed: {message}", c.kind, c.id),
-            Err(e) => return Err(e),
+            }) => {
+                eprintln!("warning: {} {} was not removed: {message}", c.kind, c.id);
+                in_use.push((*c, format!("in use: {message}")));
+            }
+            Err(e) => failed.push((c.kind, c.id.clone(), e.to_string())),
         }
     }
 
-    // 6. What was left in place, and how to remove it.
+    let mut lines = Vec::new();
+    if !removed_services.is_empty() {
+        let n = removed_services.len();
+        let noun = if n == 1 { "service" } else { "services" };
+        lines.push(format!("removed {n} {noun}"));
+    }
+    for c in &removed {
+        let note = if c.kind == "secret" {
+            " (metadata only; files on nodes stay)"
+        } else {
+            ""
+        };
+        lines.push(format!("removed {} {}{note}", c.kind, c.id));
+    }
+    let not_removed: Vec<(&str, &str, &str)> = failed
+        .iter()
+        .map(|(kind, id, reason)| (*kind, id.as_str(), reason.as_str()))
+        .chain(
+            in_use
+                .iter()
+                .map(|(c, r)| (c.kind, c.id.as_str(), r.as_str())),
+        )
+        .collect();
+    if !not_removed.is_empty() {
+        lines.push("not removed:".to_string());
+        for (kind, id, reason) in &not_removed {
+            lines.push(format!("  {kind:<8}{id}: {reason}"));
+        }
+    }
+
+    // 6. What was left in place or not removed, and how to remove it.
     let left: Vec<&Candidate> = candidates
         .iter()
         .filter(|c| !with.contains(&c.id))
@@ -220,19 +251,46 @@ async fn rm(
             };
             lines.push(format!("  {:<8}{}{note}", c.kind, c.id));
         }
-        let flags: String = left.iter().map(|c| format!(" --with {}", c.id)).collect();
+    }
+    let retry: Vec<&str> = not_removed
+        .iter()
+        .filter(|(kind, ..)| *kind != "service")
+        .map(|(_, id, _)| *id)
+        .chain(left.iter().map(|c| c.id.as_str()))
+        .collect();
+    if !retry.is_empty() || services_failed {
+        let flags: String = retry.iter().map(|id| format!(" --with {id}")).collect();
         lines.push(format!("to remove them: minga-ctl stack rm {stack}{flags}"));
     }
+    let entry = |kind: &str, id: &str| json!({ "kind": kind, "id": id });
     let value = json!({
         "stack": stack,
-        "removed_services": services,
-        "removed": removed,
-        "left_in_place": left
+        "removed_services": removed_services,
+        "removed": removed.iter().map(|c| entry(c.kind, &c.id)).collect::<Vec<_>>(),
+        "not_removed": not_removed
             .iter()
-            .map(|c| json!({ "kind": c.kind, "id": c.id }))
+            .map(|(kind, id, reason)| json!({ "kind": kind, "id": id, "reason": reason }))
             .collect::<Vec<_>>(),
+        "left_in_place": left.iter().map(|c| entry(c.kind, &c.id)).collect::<Vec<_>>(),
     });
-    report(format, quiet, &lines.join("\n"), value)
+    report(format, quiet, &lines.join("\n"), value)?;
+
+    if failed.is_empty() {
+        return Ok(());
+    }
+    let list: Vec<String> = failed
+        .iter()
+        .map(|(kind, id, reason)| format!("{kind} {id} ({reason})"))
+        .collect();
+    let done = if removed_services.is_empty() {
+        "no services".to_string()
+    } else {
+        removed_services.join(", ")
+    };
+    Err(CtlError::Halted(format!(
+        "stack rm {stack} did not finish: removed {done}; could not remove {}",
+        list.join(", ")
+    )))
 }
 
 /// Whether a service spec names `id` as a network, config or secret.
