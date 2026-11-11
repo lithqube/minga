@@ -43,8 +43,23 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
     diff == 0
 }
 
-/// Bearer-token gate. When a token is configured, every request must
-/// carry `Authorization: Bearer <token>`; anything else is a 401 with a
+/// The token an `Authorization` header presents: `Bearer <token>`, or HTTP
+/// Basic auth with the token as the password and any username. Basic exists
+/// because Traefik's Swarm provider can only send `username`/`password`.
+fn presented_token(header: &str) -> Option<String> {
+    use base64::Engine as _;
+    if let Some(token) = header.strip_prefix("Bearer ") {
+        return Some(token.to_string());
+    }
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(header.strip_prefix("Basic ")?.trim())
+        .ok()?;
+    let credentials = String::from_utf8(decoded).ok()?;
+    Some(credentials.split_once(':')?.1.to_string())
+}
+
+/// Token gate. When a token is configured, every request must present it
+/// (see [`presented_token`]); anything else is a 401 with a
 /// Docker-compatible error body.
 async fn bearer_auth(
     axum::extract::State(state): axum::extract::State<ApiState>,
@@ -56,9 +71,9 @@ async fn bearer_auth(
             .headers()
             .get(axum::http::header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Bearer "));
+            .and_then(presented_token);
         match presented {
-            Some(token) if constant_time_eq(token, expected) => next.run(req).await,
+            Some(token) if constant_time_eq(&token, expected) => next.run(req).await,
             _ => (
                 axum::http::StatusCode::UNAUTHORIZED,
                 axum::Json(serde_json::json!({"message": "authentication required"})),
@@ -154,7 +169,8 @@ impl ApiServer {
     }
 
     /// Starts the API server; when `auth_token` is set, every request
-    /// must carry it as `Authorization: Bearer <token>`.
+    /// must carry it as `Authorization: Bearer <token>` or as the Basic-auth
+    /// password.
     pub async fn start_with_auth(
         store: Arc<StateStore>,
         bind: &str,
@@ -956,9 +972,24 @@ mod tests {
             .header("Authorization", "Bearer s3cret-token")
             .body(Body::empty())
             .unwrap();
-        let (status, json) = send_request(router, req).await;
+        let (status, json) = send_request(router.clone(), req).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(json["ApiVersion"], "1.41");
+
+        // Basic auth, token as the password (Traefik's Swarm provider):
+        // "traefik:s3cret-token" → 200, "traefik:wrong" → 401.
+        for (credentials, expected) in [
+            ("dHJhZWZpazpzM2NyZXQtdG9rZW4=", StatusCode::OK),
+            ("dHJhZWZpazp3cm9uZw==", StatusCode::UNAUTHORIZED),
+        ] {
+            let req = Request::builder()
+                .uri("/v1.41/version")
+                .header("Authorization", format!("Basic {credentials}"))
+                .body(Body::empty())
+                .unwrap();
+            let (status, _) = send_request(router.clone(), req).await;
+            assert_eq!(status, expected, "Basic {credentials}");
+        }
     }
 
     #[tokio::test]

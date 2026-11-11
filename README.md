@@ -46,7 +46,7 @@ Minga ships as **one binary** (plus the `nats-server` it supervises). There's no
 - **Secrets and logs.** Secrets are external references staged per task and content-addressed, so rotation never changes a running task's files. `minga logs [-f]` shows separated stdout/stderr from a JetStream-retained backlog.
 - **Agent workloads.** `x-minga-agent` Compose services run as WASM modules under wasmtime with fuel and timeout limits. An LLM egress proxy enforces per-workload token budgets, caches responses and redacts secrets. Today the WASM guest gets no host I/O: no WASI, no network, so it can't reach the proxy yet. Memory limits aren't enforced, and Firecracker is a stub.
 - **Observability.** `/metrics`, `/healthz` and `/readyz` on `minga api`, and on manager and worker nodes via `--metrics-bind`. JSON logs on stderr for long-running roles.
-- **Air-gap friendly.** Release archives bundle a checksum-pinned `nats-server`, and `install.sh` verifies `SHA256SUMS`. A task pulls a missing image with the bundled `ctr` (anonymous pulls only), and air-gapped sites can preload images with `ctr` instead.
+- **Air-gap friendly.** Release archives bundle a checksum-pinned `nats-server`, and `install.sh` verifies `SHA256SUMS`. A task pulls a missing image with the bundled `ctr`, using inline credentials from the Docker credential file when it has an entry for the registry, and air-gapped sites can preload images with `minga image pull` or `ctr` instead.
 
 ## Architecture
 
@@ -168,7 +168,7 @@ flowchart TB
 
 ## Quick start: one Linux host
 
-You need Linux, root (the supervisor creates netns, bridges and iptables rules), `iproute2` + `iptables` + `procps` (present in any standard server install; the container image bundles them), and containerd. A task pulls a missing image into the `minga` namespace with `ctr` (on PATH, default containerd socket, anonymous registry access).
+You need Linux, root (the supervisor creates netns, bridges and iptables rules), `iproute2` + `iptables` + `procps` (present in any standard server install; the container image bundles them), and containerd. A task pulls a missing image into the `minga` namespace with `ctr` (on PATH, default containerd socket; registry credentials from `$DOCKER_CONFIG/config.json`, else `~/.docker/config.json`, inline `auth` entries only).
 
 ```bash
 # Installs minga + the checksum-pinned nats-server and verifies SHA256SUMS.

@@ -20,4 +20,4 @@ pub mod proto;
 pub mod runtime;
 
 pub use client::{ClientError, ContainerdClient, DEFAULT_SOCKET};
-pub use runtime::ContainerdRuntime;
+pub use runtime::{pull_with_ctr, ContainerdRuntime};

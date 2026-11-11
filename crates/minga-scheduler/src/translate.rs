@@ -12,7 +12,9 @@
 
 use std::collections::HashMap;
 
-use minga_compose::{AgentExtension, DeployMode, DeviceCount, Project, DEFAULT_NETWORK};
+use minga_compose::{
+    AgentExtension, DeployMode, DeviceCount, Project, StringOrList, DEFAULT_NETWORK,
+};
 use minga_state::types::{
     AgentSpec, Config as StateConfig, FailureAction, Network, ResourceSpec, Secret, Service,
     ServiceMode, UpdateOrder, UpdatePolicy, Volume,
@@ -168,17 +170,21 @@ fn translate_service(
         }
     }
 
-    // Command/entrypoint override the image defaults at runtime.
-    let command = svc
-        .command
-        .as_ref()
-        .map(|c| c.clone().into_vec())
-        .unwrap_or_default();
-    let entrypoint = svc
-        .entrypoint
-        .as_ref()
-        .map(|e| e.clone().into_vec())
-        .unwrap_or_default();
+    // Command/entrypoint override the image defaults at runtime. A string
+    // is split into argv with shell quoting, as Compose does; it is not run
+    // through a shell.
+    let argv = |key: &str, value: &Option<StringOrList>| match value {
+        None => Ok(Vec::new()),
+        Some(StringOrList::List(args)) => Ok(args.clone()),
+        Some(StringOrList::String(line)) => shlex::split(line).ok_or_else(|| {
+            TranslateError::Service(
+                name.to_string(),
+                format!("`{key}` has an unterminated quote or trailing backslash: {line:?}"),
+            )
+        }),
+    };
+    let command = argv("command", &svc.command)?;
+    let entrypoint = argv("entrypoint", &svc.entrypoint)?;
 
     // Labels: service labels plus the stack namespace label (Docker marks
     // stack resources the same way). A valueless label means empty string.
@@ -261,7 +267,7 @@ fn translate_service(
     // Caught here: on the node it fails every start, and a stop-first
     // update would already have removed the old task.
     if let Some(user) = &svc.user {
-        minga_state::types::parse_user(user).map_err(|e| {
+        minga_state::types::validate_user(user).map_err(|e| {
             TranslateError::Service(name.to_string(), format!("invalid user {user:?}: {e}"))
         })?;
     }
@@ -274,20 +280,13 @@ fn translate_service(
     // Translate restart policy from Compose deploy.restart_policy.
     let restart_policy = translate_restart_policy(&deploy.restart_policy, &svc.restart);
 
-    // extra_hosts: resolve "host-gateway" to the host's default route IP.
+    // extra_hosts: `host-gateway` stays literal; the node turns it into the
+    // host's address on the task's bridge when it writes /etc/hosts.
     let extra_hosts: Vec<(String, String)> = svc
         .extra_hosts
         .0
         .iter()
-        .map(|(host, ip_opt)| {
-            let raw = ip_opt.as_deref().unwrap_or("");
-            let ip = if raw == "host-gateway" {
-                host_gateway_ip()
-            } else {
-                raw.to_string()
-            };
-            (host.clone(), ip)
-        })
+        .map(|(host, ip)| (host.clone(), ip.clone().unwrap_or_default()))
         .collect();
 
     Ok(Service {
@@ -571,30 +570,6 @@ fn config_id(stack: &str, name: &str) -> String {
 
 // --- memory parsing -----------------------------------------------------------
 
-/// Returns the host's default route IP for the `host-gateway` extra_hosts alias.
-/// Reads `/proc/net/route` on Linux; falls back to `172.17.0.1` on other platforms.
-fn host_gateway_ip() -> String {
-    #[cfg(target_os = "linux")]
-    {
-        if let Ok(content) = std::fs::read_to_string("/proc/net/route") {
-            for line in content.lines().skip(1) {
-                let cols: Vec<&str> = line.split_whitespace().collect();
-                // Default route: Destination == 00000000
-                if cols.get(1) == Some(&"00000000") {
-                    if let Some(gw_hex) = cols.get(2) {
-                        if let Ok(n) = u32::from_str_radix(gw_hex, 16) {
-                            let b = n.to_le_bytes();
-                            return format!("{}.{}.{}.{}", b[0], b[1], b[2], b[3]);
-                        }
-                    }
-                }
-            }
-        }
-    }
-    // shortcut: returns 172.17.0.1 when /proc/net/route is unavailable or not Linux
-    "172.17.0.1".to_string()
-}
-
 /// Parses a Compose memory string into bytes.
 ///
 /// Accepts plain numbers (bytes) and suffixes `b`, `k`/`kb`/`kib`,
@@ -824,10 +799,17 @@ mod tests {
     }
 
     #[test]
-    fn translate_rejects_a_named_user() {
-        let svc = make_compose_service("image: nginx\nuser: nginx\n");
-        let err = translate_service("web", &svc, "test", &empty_project(), None).unwrap_err();
-        assert!(err.to_string().contains("invalid user"));
+    fn translate_accepts_named_users_and_rejects_malformed_ones() {
+        for user in ["nginx", "app:staff", "1000:docker", "zitadel"] {
+            let svc = make_compose_service(&format!("image: nginx\nuser: {user}\n"));
+            let service = translate_service("web", &svc, "test", &empty_project(), None).unwrap();
+            assert_eq!(service.user.as_deref(), Some(user));
+        }
+        for user in ["\"app:\"", "\"a b\"", "\"-x\"", "\"a:b:c\""] {
+            let svc = make_compose_service(&format!("image: nginx\nuser: {user}\n"));
+            let err = translate_service("web", &svc, "test", &empty_project(), None).unwrap_err();
+            assert!(err.to_string().contains("invalid user"), "{user}: {err}");
+        }
     }
 
     #[test]
@@ -1052,5 +1034,55 @@ volumes:
         assert_eq!(svc.mounts[1].source, "/etc/minga");
         assert_eq!(svc.mounts[1].target, "/config");
         assert!(svc.mounts[1].read_only);
+    }
+
+    fn translate_one(compose: &str) -> Result<Service, TranslateError> {
+        let project = minga_compose::load(compose, &minga_compose::LoadOptions::default())
+            .expect("compose should load")
+            .project;
+        translate_project(&project, "shop", None).map(|mut s| s.services.remove(0))
+    }
+
+    #[test]
+    fn string_command_and_entrypoint_split_like_compose() {
+        let svc = translate_one(
+            r#"
+services:
+  api:
+    image: python:3
+    entrypoint: /docker-entrypoint.sh --verbose
+    command: >
+      gunicorn app:app
+      --bind "0.0.0.0:8000"
+      --log-level 'debug info'
+"#,
+        )
+        .unwrap();
+        assert_eq!(svc.entrypoint, vec!["/docker-entrypoint.sh", "--verbose"]);
+        assert_eq!(
+            svc.command,
+            vec![
+                "gunicorn",
+                "app:app",
+                "--bind",
+                "0.0.0.0:8000",
+                "--log-level",
+                "debug info"
+            ]
+        );
+    }
+
+    #[test]
+    fn string_command_with_unterminated_quote_fails_loudly() {
+        let err = translate_one(
+            r#"
+services:
+  api:
+    image: busybox:1
+    command: echo "oops
+"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("unterminated quote"), "{err}");
     }
 }

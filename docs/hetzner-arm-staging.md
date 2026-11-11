@@ -4,6 +4,8 @@
 
 **Version:** Minga `feat/staging-compat` (targeting v1.0.2)
 
+> **Not yet re-validated:** the API token for Traefik (Basic auth), the node-side `host-gateway` address, the `DOCKER_CONFIG` setup and named users were changed after that run. They are covered by unit tests, and named users also by a daemon-backed test, but not yet by a redeploy of this stack.
+
 > **What this covers.** A real-world staging deploy of a Nuxt BFF, an AI service, a NATS workers process, NATS JetStream, an auth server (ZITADEL), Postgres, a secrets agent, and Traefik for TLS — all on one CAX21 node using only containerd and Minga. No Docker daemon. Private images from GHCR.
 
 ---
@@ -73,6 +75,9 @@ Description=Minga Docker Engine API
 After=network.target minga.service
 
 [Service]
+# MINGA_API_TOKEN: without it the API is unauthenticated, and any container
+# on the host could deploy privileged containers through it.
+EnvironmentFile=/etc/minga/minga-api.env
 ExecStart=/usr/local/bin/minga api \
   --node-id 2 --bind 127.0.0.1:7002 \
   --peer 1=127.0.0.1:7001 \
@@ -85,19 +90,39 @@ RestartSec=5s
 WantedBy=multi-user.target
 ```
 
+**`/etc/minga/minga-api.env`** (root-owned, mode 0600):
+
+```bash
+sudo install -m 0600 /dev/null /etc/minga/minga-api.env
+echo "MINGA_API_TOKEN=$(openssl rand -hex 32)" | sudo tee /etc/minga/minga-api.env >/dev/null
+```
+
+The API listens on every interface so containers can reach it through their bridge gateway. ufw keeps 2375 closed to the internet. If ufw also filters bridge traffic on your host, allow the Minga bridge range to reach the API: `sudo ufw allow from 10.100.0.0/16 to any port 2375 proto tcp`.
+
 ---
 
 ## Compose file highlights
 
 ### Traefik as reverse proxy
 
-Traefik v3's Swarm provider points at the Minga API. Use the host's gateway IP directly (Minga v1.0.2+ supports `extra_hosts: ["host.docker.internal:host-gateway"]`; on v1.0.1, substitute the IP from `ip route | awk '/default/ {print $3}'`):
+Traefik v3's Swarm provider points at the Minga API on the host. `host-gateway` resolves on the node to the host's address on Traefik's bridge (Minga v1.0.2+).
+
+Traefik can't send a bearer token, but it can send Basic auth, and Minga accepts the API token as the Basic-auth password (any username). Put the credentials in an env file kept out of git, mode 0600:
+
+```bash
+# traefik.env
+TRAEFIK_PROVIDERS_SWARM_USERNAME=traefik
+TRAEFIK_PROVIDERS_SWARM_PASSWORD=<the MINGA_API_TOKEN value>
+```
 
 ```yaml
 traefik:
   image: traefik:v3
+  env_file: ./traefik.env
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
   command:
-    - "--providers.swarm.endpoint=http://172.31.1.1:2375"
+    - "--providers.swarm.endpoint=http://host.docker.internal:2375"
     - "--providers.swarm.network=myapp-network"
     - "--entrypoints.web.address=:80"
     - "--entrypoints.websecure.address=:443"
@@ -110,6 +135,8 @@ traefik:
   volumes:
     - traefik-certs:/letsencrypt
 ```
+
+> Minga has one token and no read-only role yet, so Traefik holds full API access. Treat the Traefik container like the API itself. `env_file` values are stored in the service spec, the same as `environment`.
 
 Services opt in with labels:
 ```yaml
@@ -125,38 +152,41 @@ bff:
 
 ### Private GHCR images
 
-Pre-pull before `minga deploy` using `--user`:
+Minga v1.0.2+ reads the Docker credential file on every pull: a task's automatic pull and `minga image pull`. Only inline `auth` entries are read. Credential helpers (`credsStore`, `credHelpers`) are not. The manager runs as root, so point it at a root-owned file explicitly instead of relying on `HOME`:
 
 ```bash
-ctr -n minga images pull \
-  --user "github-username:ghp_your_classic_pat" \
-  ghcr.io/your-org/your-image:tag
-```
-
-Minga v1.0.2+ reads `~/.docker/config.json` automatically on pull (inline `auth` base64 format). Configure it once:
-
-```bash
-mkdir -p ~/.docker
+sudo install -d -m 0700 /etc/minga/docker
+read -rs GHCR_TOKEN   # paste the token; it stays out of shell history
 printf '{"auths":{"ghcr.io":{"auth":"%s"}}}' \
-  "$(echo -n 'github-username:ghp_token' | base64 -w0)" \
-  > ~/.docker/config.json
+  "$(printf '%s' "github-username:$GHCR_TOKEN" | base64 -w0)" \
+  | sudo install -m 0600 /dev/stdin /etc/minga/docker/config.json
+unset GHCR_TOKEN
+echo 'DOCKER_CONFIG=/etc/minga/docker' | sudo tee -a /etc/minga/minga.env
 ```
 
-### Named users (uid override)
+Then pre-pull, or let the first deploy pull:
 
-ZITADEL and Python services often run as named users. Add `user: "UID"` to override:
+```bash
+sudo DOCKER_CONFIG=/etc/minga/docker minga image pull ghcr.io/your-org/your-image:tag
+```
+
+Docker Hub entries written by `docker login` (key `https://index.docker.io/v1/`) match `docker.io` images. `ctr` takes the credentials on its command line, so other local users can see them in `ps` while a pull runs.
+
+### Named users
+
+`user:` takes a name or a uid, with an optional group (`user[:group]`), as in Docker. Names are resolved from the image's own `/etc/passwd` and `/etc/group` when the task starts. A name with no group takes the user's primary group.
 
 ```yaml
 zitadel:
   image: ghcr.io/zitadel/zitadel:latest
-  user: "1000"
+  user: "zitadel"
 
 ai-service:
   image: ghcr.io/your-org/your-ai:latest
-  user: "10001"   # match the uid from the image Dockerfile
+  user: "app:app"
 ```
 
-> Named string users require Minga v1.0.2+.
+> Requires Minga v1.0.2+. Supplementary groups from `/etc/group` are not applied.
 
 ### NATS JetStream
 
@@ -186,14 +216,17 @@ MINGA_API_URL=http://localhost:2375 MINGA_API_TOKEN=$TOKEN \
 
 ## Issues found during first real-world deploy
 
-All five compose-compatibility issues below were found by deploying this stack on a fresh CAX21 node. All are fixed in Minga v1.0.2 (PR #16).
+The issues below were found by deploying this stack on a fresh CAX21 node. The compose-compatibility ones are fixed for Minga v1.0.2.
 
 | Issue | Symptom | Fix |
 |-------|---------|-----|
 | `env_file` rejected | `error: env_file is part of the Compose spec but not supported yet` | PR #16: load files, merge into environment |
-| `extra_hosts` rejected | Same | PR #16: parse + resolve `host-gateway` via `/proc/net/route` |
-| Named `user:` rejected | `named users are not supported; set a numeric user:` | PR #16: resolve name against image `/etc/passwd` |
-| Private image 401 | `ctr: failed to fetch anonymous token: 401 Unauthorized` | PR #16: read `~/.docker/config.json` inline `auth` on pull |
+| `extra_hosts` rejected | Same | PR #16: parse and write a per-task `/etc/hosts`. `host-gateway` now resolves on the node to the bridge address; PR #16 used the default route, which on Hetzner is the upstream router. |
+| Named `user:` rejected | `named users are not supported; set a numeric user:` | Resolved against the image's `/etc/passwd` and `/etc/group` at task start. PR #16 only improved the error. |
+| String `command:` breaks | A folded (`>`) or plain string `command` runs as one argv entry | Split with shell quoting, as Compose does |
+| Private image 401 | `ctr: failed to fetch anonymous token: 401 Unauthorized` | PR #16: read the Docker credential file on auto-pull; now also `minga image pull`, `DOCKER_CONFIG`, and Docker Hub's `https://index.docker.io/v1/` key |
+| `minga image pull` fails on containerd 2.2 | `ctr: unknown command "unpack"` | Pull only; `ctr images pull` unpacks |
+| Traefik gets 401 from the API | API token can't be sent by the Swarm provider | API accepts the token as the Basic-auth password |
 | Relative bind mount fails | `no such file or directory: ./docker/staging/zitadel.yaml` | PR #16: join against compose file parent directory |
 | File bind mount `EEXIST` | `create bind source: File exists (os error 17)` | Workaround: ensure no prior mount at that path; fix planned for v1.0.2 |
 | Stale task `AlreadyExists` | `task already exists` on redeploy after Raft state wipe | Workaround: `ctr -n minga tasks delete --force <id>` then restart containerd |
@@ -203,8 +236,9 @@ All five compose-compatibility issues below were found by deploying this stack o
 ## Checklist before `minga deploy`
 
 - [ ] DNS records pointing to VPS IP
-- [ ] ufw: 22, 80, 443 open; NATS (4222) not exposed externally
+- [ ] ufw: 22, 80, 443 open; NATS (4222) and the API (2375) not exposed externally
+- [ ] `MINGA_API_TOKEN` set in `/etc/minga/minga-api.env` (0600) and Traefik's `traefik.env`
 - [ ] Secrets populated (env vars or secrets-agent)
-- [ ] GHCR credentials in `~/.docker/config.json` (or pre-pull with `--user`)
+- [ ] GHCR credentials in `/etc/minga/docker/config.json`, `DOCKER_CONFIG` set in `minga.env`
 - [ ] `minga validate` returns no errors
 - [ ] `curl http://localhost:9100/readyz` returns `OK`

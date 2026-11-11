@@ -23,7 +23,8 @@ Each ADR ends with an *Implementation status* section saying what shipped and wh
 
 - [Quick start: one Linux host](../README.md#quick-start-one-linux-host): the verified path
 - [systemd unit](../scripts/minga.service) and [environment example](../scripts/minga.env.example)
-- [Talos Linux and Hetzner Cloud](talos-deployment.md): **not validated**. Minga on Talos needs a system extension, which doesn't exist yet.
+- [Talos Linux](talos-deployment.md): validated single-node install on Talos v1.14 through workload start, with no system extension. Bare metal and multi-node are not validated.
+- [Hetzner ARM staging stack](hetzner-arm-staging.md): an 8-service stack with Traefik, private GHCR images and named users on one CAX21 node
 
 ## History and research
 

@@ -129,7 +129,7 @@ pub fn service_spec_to_state(spec: &models::ServiceSpec) -> Result<Service, Stri
     // update would already have removed the old task.
     let user = container.User.clone().filter(|u| !u.is_empty());
     if let Some(user) = &user {
-        minga_state::types::parse_user(user)
+        minga_state::types::validate_user(user)
             .map_err(|e| format!("service '{name}': invalid user {user:?}: {e}"))?;
     }
 
@@ -1230,11 +1230,18 @@ mod tests {
         assert_eq!(back.user, svc.user);
         assert_eq!(back.update, svc.update);
 
+        // Names resolve on the node, so they round-trip; malformed values don't.
         let named = Service {
-            user: Some("nginx".to_string()),
+            user: Some("nginx:www-data".to_string()),
+            ..svc.clone()
+        };
+        let back = service_spec_to_state(&service_to_docker(&named).Spec).unwrap();
+        assert_eq!(back.user, named.user);
+        let malformed = Service {
+            user: Some("nginx:".to_string()),
             ..svc
         };
-        assert!(service_spec_to_state(&service_to_docker(&named).Spec).is_err());
+        assert!(service_spec_to_state(&service_to_docker(&malformed).Spec).is_err());
     }
 
     #[test]

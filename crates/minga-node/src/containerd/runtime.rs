@@ -86,6 +86,127 @@ impl LogRing {
     }
 }
 
+/// Pulls a fully qualified image into the `minga` namespace with `ctr`,
+/// which unpacks it too (containerd v2.2 dropped `ctr images unpack`).
+/// Credentials come from [`registry_auth`]; with none, the pull is anonymous.
+pub async fn pull_with_ctr(image_ref: &str) -> Result<(), RuntimeError> {
+    tracing::info!(image = %image_ref, "pulling image via ctr");
+    let mut args = vec![
+        "-n".to_string(),
+        "minga".into(),
+        "images".into(),
+        "pull".into(),
+    ];
+    // shortcut: `--user` puts the token on ctr's command line, visible to
+    // local users in `ps`; ctr has no other non-interactive way to take it.
+    if let Some(credentials) = registry_auth(image_ref) {
+        args.extend(["--user".to_string(), credentials]);
+    }
+    args.push(image_ref.to_string());
+
+    let pull = tokio::time::timeout(
+        Duration::from_secs(300),
+        tokio::process::Command::new("ctr")
+            .args(&args)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .map_err(|_| RuntimeError::Start(format!("ctr pull {image_ref} timed out after 300s")))?
+    .map_err(|e| RuntimeError::Start(format!("spawn ctr pull: {e}")))?;
+
+    if !pull.status.success() {
+        let stderr = String::from_utf8_lossy(&pull.stderr);
+        return Err(RuntimeError::Start(format!(
+            "ctr pull {image_ref} failed ({}): {stderr}",
+            pull.status
+        )));
+    }
+    tracing::info!(image = %image_ref, "image pulled and unpacked");
+    Ok(())
+}
+
+/// `user:token` for the image's registry from the Docker credential file
+/// (`$DOCKER_CONFIG/config.json`, else `$HOME/.docker/config.json`), the
+/// file `docker login` and `minga-ctl registry login` write.
+pub fn registry_auth(image_ref: &str) -> Option<String> {
+    let path = match std::env::var_os("DOCKER_CONFIG") {
+        Some(dir) => PathBuf::from(dir).join("config.json"),
+        None => PathBuf::from(std::env::var_os("HOME")?).join(".docker/config.json"),
+    };
+    let config: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).ok()?).ok()?;
+    let host = registry_host(image_ref);
+    let found = auth_for_host(&config, host);
+    if found.is_none() {
+        tracing::info!(
+            registry = host,
+            config = %path.display(),
+            "no inline `auth` for this registry (credential helpers are not read); pulling anonymously"
+        );
+    }
+    found
+}
+
+/// The registry an image reference names: its first path component when that
+/// looks like a host, else Docker Hub.
+fn registry_host(image_ref: &str) -> &str {
+    image_ref
+        .split_once('/')
+        .map(|(first, _)| first)
+        .filter(|h| h.contains('.') || h.contains(':') || *h == "localhost")
+        .unwrap_or("docker.io")
+}
+
+/// The decoded `auths.<key>.auth` whose key names `host`. Keys may carry a
+/// scheme or path (`https://index.docker.io/v1/` is how `docker login`
+/// records Docker Hub).
+fn auth_for_host(config: &serde_json::Value, host: &str) -> Option<String> {
+    use base64::Engine as _;
+    let canonical = |key: &str| -> String {
+        let key = key
+            .trim_start_matches("https://")
+            .trim_start_matches("http://");
+        let key = key.split('/').next().unwrap_or(key);
+        match key {
+            "index.docker.io" | "registry-1.docker.io" => "docker.io".into(),
+            other => other.into(),
+        }
+    };
+    let (_, entry) = config["auths"]
+        .as_object()?
+        .iter()
+        .find(|(key, _)| canonical(key) == host)?;
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(entry["auth"].as_str()?)
+        .ok()?;
+    String::from_utf8(decoded).ok().filter(|c| c.contains(':'))
+}
+
+/// A task's /etc/hosts: localhost plus its `extra_hosts`, with `host-gateway`
+/// replaced by the host's address on the task's bridge.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn hosts_file_content(
+    extra_hosts: &[(String, String)],
+    gateway: Option<std::net::Ipv4Addr>,
+) -> Result<String, RuntimeError> {
+    let mut content = "127.0.0.1\tlocalhost\n::1\tlocalhost\n".to_string();
+    for (host, ip) in extra_hosts {
+        let ip = match (ip.as_str(), gateway) {
+            ("host-gateway", Some(gateway)) => gateway.to_string(),
+            ("host-gateway", None) => {
+                return Err(RuntimeError::Start(format!(
+                    "extra_hosts `{host}:host-gateway`: the task's network has no gateway"
+                )))
+            }
+            (ip, _) => ip.to_string(),
+        };
+        content.push_str(&format!("{ip}\t{host}\n"));
+    }
+    Ok(content)
+}
+
 /// A non-root process cannot read a root-owned 0400 file. Each staged copy
 /// belongs to one task, so this exposes it to that task only.
 fn chown_secrets(mounts: &[oci::SecretMount], uid: u32, gid: u32) -> Result<(), RuntimeError> {
@@ -371,14 +492,14 @@ impl ContainerdRuntime {
         );
 
         // Write a per-task /etc/hosts file if the spec has extra_hosts entries.
+        // `host-gateway` is the host's address on the primary bridge, which
+        // is also where the task's resolver points.
         let hosts_path = if spec.extra_hosts.is_empty() {
             None
         } else {
             let hosts_file = netns.resolv_conf.with_extension("hosts");
-            let mut content = "127.0.0.1\tlocalhost\n::1\tlocalhost\n".to_string();
-            for (host, ip) in &spec.extra_hosts {
-                content.push_str(&format!("{ip}\t{host}\n"));
-            }
+            let gateway = crate::netns::gateway_of(&attachments[0].subnet);
+            let content = hosts_file_content(&spec.extra_hosts, gateway)?;
             tokio::fs::write(&hosts_file, &content)
                 .await
                 .map_err(|e| RuntimeError::Start(format!("write hosts: {e}")))?;
@@ -504,72 +625,8 @@ impl ContainerdRuntime {
         }
     }
 
-    /// Pull and unpack an image via `ctr` into the `minga` namespace.
-    ///
-    /// Credentials are read from `~/.docker/config.json` when present and the
-    /// image's registry has an entry there. This lets pre-pulled images stay
-    /// usable across restarts without a separate `docker login` step.
     async fn pull_image(&self, image_ref: &str) -> Result<(), RuntimeError> {
-        tracing::info!(image = %image_ref, "pulling image via ctr");
-
-        // Extract registry host: first path component if it contains '.' or ':'.
-        let registry_host = image_ref
-            .split('/')
-            .next()
-            .filter(|h| h.contains('.') || h.contains(':'))
-            .unwrap_or("docker.io");
-
-        // shortcut: ~/.docker/config.json auth lookup; falls back to anonymous pull.
-        let user_arg: Option<String> = (|| {
-            let home = std::env::var("HOME").ok()?;
-            let path = std::path::Path::new(&home).join(".docker/config.json");
-            let bytes = std::fs::read(&path).ok()?;
-            let v: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-            let auth_b64 = v["auths"][registry_host]["auth"].as_str()?;
-            use base64::Engine as _;
-            let decoded = String::from_utf8(
-                base64::engine::general_purpose::STANDARD
-                    .decode(auth_b64)
-                    .ok()?,
-            )
-            .ok()?;
-            Some(decoded) // "username:token"
-        })();
-
-        let mut pull_args = vec!["-n", "minga", "images", "pull"];
-        let user_owned;
-        if let Some(ref creds) = user_arg {
-            pull_args.push("--user");
-            user_owned = creds.as_str();
-            pull_args.push(user_owned);
-        }
-        pull_args.push(image_ref);
-
-        let pull = tokio::time::timeout(
-            Duration::from_secs(300),
-            tokio::process::Command::new("ctr")
-                .args(&pull_args)
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
-                .kill_on_drop(true)
-                .output(),
-        )
-        .await
-        .map_err(|_| RuntimeError::Start(format!("ctr pull {image_ref} timed out after 300s")))?
-        .map_err(|e| RuntimeError::Start(format!("spawn ctr pull: {e}")))?;
-
-        if !pull.status.success() {
-            let stderr = String::from_utf8_lossy(&pull.stderr);
-            return Err(RuntimeError::Start(format!(
-                "ctr pull {image_ref} failed ({}): {stderr}",
-                pull.status
-            )));
-        }
-
-        // `ctr images pull` on containerd v2 unpacks automatically; a separate
-        // `ctr images unpack` step is not available in containerd v2.2+.
-        tracing::info!(image = %image_ref, "image pulled and unpacked");
-        Ok(())
+        pull_with_ctr(image_ref).await
     }
 
     /// Clear leftovers from a previous attempt at the same task ID.
@@ -717,9 +774,6 @@ impl Runtime for ContainerdRuntime {
         let config = image::load_image(&mut client, &image, &self.snapshotter)
             .await
             .map_err(RuntimeError::Start)?;
-        let (uid, gid) = oci::task_user(spec, &config).map_err(RuntimeError::Start)?;
-        chown_secrets(&secret_mounts, uid, gid)?;
-
         let snapshot_key = format!("minga-{container_id}");
 
         // A previous attempt at this task ID may have left a container, a
@@ -731,6 +785,31 @@ impl Runtime for ContainerdRuntime {
             .prepare_snapshot(&self.snapshotter, &snapshot_key, &config.parent_snapshot)
             .await
             .map_err(|error| RuntimeError::Start(format!("prepare snapshot: {error}")))?;
+
+        // A named user resolves against the image's own /etc/passwd, which
+        // the snapshot's layer directories hold.
+        let user = oci::task_user(spec, &config, &oci::rootfs_dirs(&mounts))
+            .map_err(RuntimeError::Start)
+            .and_then(|(uid, gid)| chown_secrets(&secret_mounts, uid, gid).map(|()| (uid, gid)));
+        let user = match user {
+            Ok(user) => user,
+            Err(error) => {
+                let rollback = Self::rollback_start(
+                    &mut client,
+                    &container_id,
+                    &snapshot_key,
+                    &self.snapshotter,
+                    false,
+                    false,
+                    false,
+                )
+                .await;
+                if !rollback.is_empty() {
+                    tracing::warn!(container = %container_id, "{}", rollback.trim_start_matches("; "));
+                }
+                return Err(error);
+            }
+        };
 
         // Log capture: real FIFO destinations for stdout/stderr, drained
         // into a bounded ring by a per-container reader.
@@ -778,6 +857,7 @@ impl Runtime for ContainerdRuntime {
             spec,
             &secret_mounts,
             &config,
+            user,
             network.as_ref(),
         )
         .map_err(RuntimeError::Start)?;
@@ -1176,6 +1256,44 @@ impl Runtime for ContainerdRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_gateway_becomes_the_bridge_address() {
+        let hosts = [
+            (
+                "host.docker.internal".to_string(),
+                "host-gateway".to_string(),
+            ),
+            ("db".to_string(), "10.0.0.5".to_string()),
+        ];
+        let content = hosts_file_content(&hosts, Some([10, 100, 3, 1].into())).unwrap();
+        assert!(
+            content.contains("10.100.3.1\thost.docker.internal\n"),
+            "{content}"
+        );
+        assert!(content.contains("10.0.0.5\tdb\n"), "{content}");
+        assert!(hosts_file_content(&hosts, None).is_err());
+    }
+
+    #[test]
+    fn registry_auth_matches_docker_login_keys() {
+        // base64("me:tok") and base64("hub:tok")
+        let config = serde_json::json!({"auths": {
+            "https://ghcr.io": {"auth": "bWU6dG9r"},
+            "https://index.docker.io/v1/": {"auth": "aHViOnRvaw=="},
+            "quay.io": {}
+        }});
+        let auth = |image: &str| auth_for_host(&config, registry_host(image));
+        assert_eq!(auth("ghcr.io/org/app:1").as_deref(), Some("me:tok"));
+        assert_eq!(
+            auth("docker.io/library/nginx:1.27").as_deref(),
+            Some("hub:tok")
+        );
+        assert_eq!(auth("quay.io/org/app:1"), None);
+        assert_eq!(auth("registry.example.com:5000/app:1"), None);
+        assert_eq!(registry_host("localhost/app:1"), "localhost");
+        assert_eq!(registry_host("nginx:1.27"), "docker.io");
+    }
 
     #[test]
     fn secrets_go_to_the_task_user_at_0400_and_a_failed_chown_stops_the_task() {

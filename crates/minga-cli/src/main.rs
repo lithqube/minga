@@ -113,7 +113,9 @@ enum AgentCommand {
 enum ImageCommand {
     /// Pull an image from a registry into the Minga containerd namespace.
     Pull {
-        /// Fully qualified image reference (e.g. ghcr.io/org/app:latest).
+        /// Image reference (e.g. ghcr.io/org/app:latest or nginx:1.27).
+        /// Credentials come from the Docker credential file, as `docker login`
+        /// writes it.
         image_ref: String,
     },
 }
@@ -318,9 +320,10 @@ struct ApiArgs {
     /// Address to bind the Docker Engine API server (e.g. 0.0.0.0:2375).
     #[arg(long, default_value = "0.0.0.0:2375")]
     api_bind: String,
-    /// Bearer token required on every API request. Strongly recommended
-    /// when binding anything other than localhost — without it, the API
-    /// is unauthenticated remote code execution by design.
+    /// Token required on every API request, as `Authorization: Bearer` or
+    /// as the Basic-auth password (for Traefik's Swarm provider). Strongly
+    /// recommended when binding anything other than localhost — without it,
+    /// the API is unauthenticated remote code execution by design.
     #[arg(long, env = "MINGA_API_TOKEN")]
     api_token: Option<String>,
 }
@@ -1746,43 +1749,17 @@ fn print_log_entry(entry: &minga_bus::LogEntry) {
 async fn run_image(cmd: ImageCommand) -> ExitCode {
     match cmd {
         ImageCommand::Pull { image_ref } => {
+            // The same path as a task's auto-pull: short refs normalized, the
+            // Docker credential file honoured, no separate unpack step.
+            let image_ref = minga_node::containerd::image::normalize_ref(&image_ref);
             eprintln!("pulling {image_ref} into containerd namespace minga …");
-
-            let pull = tokio::process::Command::new("ctr")
-                .args(["-n", "minga", "images", "pull", &image_ref])
-                .status()
-                .await;
-
-            match pull {
-                Ok(status) if status.success() => {}
-                Ok(status) => {
-                    eprintln!("error: ctr pull exited with {status}");
-                    return ExitCode::FAILURE;
-                }
-                Err(e) => {
-                    eprintln!("error: cannot run ctr: {e}");
-                    return ExitCode::FAILURE;
-                }
-            }
-
-            eprintln!("unpacking {image_ref} …");
-
-            let unpack = tokio::process::Command::new("ctr")
-                .args(["-n", "minga", "images", "unpack", &image_ref])
-                .status()
-                .await;
-
-            match unpack {
-                Ok(status) if status.success() => {
+            match minga_node::containerd::pull_with_ctr(&image_ref).await {
+                Ok(()) => {
                     eprintln!("done");
                     ExitCode::SUCCESS
                 }
-                Ok(status) => {
-                    eprintln!("error: ctr unpack exited with {status}");
-                    ExitCode::FAILURE
-                }
                 Err(e) => {
-                    eprintln!("error: cannot run ctr: {e}");
+                    eprintln!("error: {e}");
                     ExitCode::FAILURE
                 }
             }
