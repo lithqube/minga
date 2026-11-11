@@ -122,7 +122,10 @@ phase 1 takes the API off the network instead.
    | Remote path | `^/[A-Za-z0-9._/-]+$` |
 9. Secret values and registry credentials are read from stdin (or a no-echo
    prompt) only and piped to the remote command's stdin. They are never placed
-   in arguments, logs or the audit log, and never written to the workstation.
+   in arguments, logs or the audit log, and minga-ctl never writes them to
+   the workstation. A credential the operator passes as a file
+   (`registry login --key-file`) is already on the workstation; that copy is
+   the operator's to protect or delete.
 10. `--debug` prints method, path and status, and ssh command lines, to
     stderr. The `Authorization` header is printed as `Bearer <redacted>`.
 11. Commands that remove or replace things (`stack rm`, `image rm`,
@@ -539,8 +542,10 @@ minga-ctl stack rm <stack> [--with <id>]... [--yes]
 
 **`deploy`** (`-c` default `compose.yaml`, `--wait` default `30`)
 
-0. In a context with an SSH target, check the compose file before anything
-   else (see "Where the compose file is resolved" below).
+0. When the node is another machine, check the compose file before anything
+   else (see "Where the compose file is resolved" below). The node is another
+   machine in any context with an SSH target, and in any context whose API
+   endpoint is not a loopback address, such as an `https://` endpoint.
 1. `GET /v1.41/services?filters={"label":["com.docker.stack.namespace=<stack>"]}`
    and keep each existing service's `Spec` in memory.
 2. Run `minga deploy -c <file> [-p …] --wait <secs> --api-url <endpoint> <stack>`
@@ -550,7 +555,10 @@ minga-ctl stack rm <stack> [--with <id>]... [--yes]
    whose `Spec` now differs from step 1, save the step 1 spec as its revision
    file. A service the deploy did not change, or did not reach before failing,
    keeps the revision file it had.
-4. Exit code: 0 if `minga` exits 0, else 2.
+4. Exit code: 2 if `minga` did not exit 0. Also 2 if `minga` succeeded but the
+   read in step 3 or a revision write failed, with
+   ``error: deployed, but could not save revisions for myapp: <reason>`` and
+   ``hint: rollback data for this deploy may be missing``. Otherwise 0.
 
 `minga deploy` validates the compose file itself, and unknown keys fail there.
 
@@ -564,7 +572,7 @@ saved revision for myapp.web (myapp.worker unchanged)
 file on the machine it runs on, and minga-ctl runs it on the operator's
 machine. On `main`, and so from 1.0.2, three things are resolved there:
 
-| In the compose file | Resolved on the operator's machine as | In a context with an SSH target |
+| In the compose file | Resolved on the operator's machine as | When the node is another machine |
 |---|---|---|
 | `env_file` | The files are read and their values go into the service spec | Allowed. It is what a deploy from a workstation should do. The values end up in the spec and in the revision file. |
 | A bind mount with a relative source (`./conf:/etc/app`) | An absolute path under the compose file's directory | Refused: that path is on the workstation, not on the node. |
@@ -575,8 +583,9 @@ The check in step 0 reads the compose file as YAML and looks, per service, for
 whose source starts with `./`, `../` or `~`. If it finds one it exits 1 with
 the "Deploy needs the node" error from section 4.4 and deploys nothing. It is
 a guard on the plain file: it does not follow `extends`, `include` or
-variable interpolation. In a context without an SSH target nothing is
-refused, because the operator's machine is the node.
+variable interpolation. Nothing is refused only when the context has no SSH
+target and its endpoint is a loopback address, because then the operator's
+machine is the node.
 
 To deploy a stack that needs either feature, use absolute paths and explicit
 addresses, or copy the compose file to the node and run minga-ctl there with
@@ -716,13 +725,18 @@ myapp.web.2.3f9a1c2e | listening on :8080
 
 1. `GET /v1.41/services/{id}`. If `Spec.Mode` has no `Replicated`, exit 1:
    ``error: service `shop.proxy` is global and cannot be scaled``.
-2. Set `Spec.Mode.Replicated.Replicas` in a copy of the spec and
-   `POST /v1.41/services/{id}/update?version=<Version.Index>` with the whole
+2. Set `Spec.Mode.Replicated.Replicas` in a copy of the spec. If the copy
+   equals the spec read in step 1, print `myapp.web already has 5 replicas;
+   nothing changed`, exit 0, and touch neither the API nor the revision file.
+3. `POST /v1.41/services/{id}/update?version=<Version.Index>` with the whole
    spec. The server ignores `version` today; it is sent so the call stays
    correct if the server starts checking it.
-3. Only after the API accepts the update, save the spec read in step 1 as the
+4. Only after the API accepts the update, save the spec read in step 1 as the
    revision file. If the POST fails, the revision file is left as it was, so
    a rejected change never replaces the revision you can roll back to.
+
+The revision file therefore always holds a spec that differs from the running
+one: a change that changes nothing never replaces it.
 
 ```
 $ minga-ctl service scale myapp.web --replicas 5
@@ -733,8 +747,8 @@ myapp.web scaled from 3 to 5
 {"service":"myapp.web","replicas":{"from":3,"to":5}}
 ```
 
-**`update`**: same sequence as `scale`: read, edit, post, then save the
-revision. At least one flag is required.
+**`update`**: same sequence as `scale`: read, edit, stop if nothing changed,
+post, then save the revision. At least one flag is required.
 
 | Flag | Edit |
 |---|---|
@@ -773,7 +787,9 @@ myapp.web updated: image ghcr.io/acme/web:1.4.2 -> ghcr.io/acme/web:1.4.3
 **`rollback`**
 
 1. Read the revision file. Missing: exit 3.
-2. `GET /v1.41/services/{id}` (404: exit 3).
+2. `GET /v1.41/services/{id}` (404: exit 3). If the saved spec equals the
+   running one, print `myapp.web already matches the saved revision; nothing
+   changed` and exit 0.
 3. Show what changes (image, replicas, number of changed environment keys)
    and ask for confirmation.
 4. `GET /v1.41/services/{id}` again. If the spec differs from step 2, stop
@@ -958,7 +974,9 @@ myapp_db_password   myapp_db_password   2026-11-10T09:12:44Z
 Logs nodes in to private container registries, so that the automatic pull
 before a task starts can fetch private images. Node-local, like `secret put`:
 the credential goes to each node over SSH on stdin, never through the API,
-and is never stored on the workstation.
+and minga-ctl never writes it to the workstation. With `--key-file` the key
+is a file that already sits on the workstation; minga-ctl reads it and leaves
+it there. Piping the credential from a secret manager avoids that copy.
 
 It needs a Minga that reads registry credentials: `main` since PR #16, to be
 released as 1.0.2. There the automatic pull reads Docker's credential file on
@@ -1023,8 +1041,21 @@ A host must match `^[A-Za-z0-9][A-Za-z0-9.-]*(:[0-9]+)?$` and a username
      that target with an error, and the file is left as it is.
    - Set `auths.<host>.auth` to the base64 of `<user>:<credential>`. Every
      other key in the file is kept.
-   - Write it back with the new content on stdin:
-     `umask 077; mkdir -p '<dir>' && cat > '<file>.minga-ctl.tmp' && mv '<file>.minga-ctl.tmp' '<file>'`.
+   - Write it back with the new content on stdin, in a way that keeps the
+     file readable by the Minga service:
+     - The file exists: write to a temporary file first, then copy over the
+       original in place and remove the temporary file:
+       `umask 077; cat > '<file>.minga-ctl.tmp' && cat '<file>.minga-ctl.tmp' > '<file>' && rm '<file>.minga-ctl.tmp'`.
+       Overwriting in place keeps the file's owner, group and mode. A rename
+       would replace them with the SSH user's, and a Minga service running as
+       another user could then no longer read the file.
+     - The file does not exist: `umask 077; mkdir -p '<dir>' && cat > '<file>'`.
+       The new file belongs to the SSH user with mode 0600, so minga-ctl
+       prints
+       ``note: created /root/.docker/config.json on alice@mgr1.example.net, owner alice, mode 0600; the Minga service must run as that user or as root to read it``.
+
+     The in-place copy is not atomic. A pull that reads the file in that
+     instant sees a partial file and falls back to an anonymous pull.
 
    In a context with no SSH target the same is done on the local filesystem.
    A failure on any target gives exit 2; the other targets still run.
@@ -1157,7 +1188,16 @@ plan.
   entry for another host and unknown top-level keys survive; `logout` removes
   only its host; a `-docker.pkg.dev` host stores the username `_json_key`;
   a file that is not JSON is left unchanged and gives exit 2; `list` output
-  contains no secret.
+  contains no secret; a second `login` on a file with mode 0640 leaves the
+  mode at 0640 (the file is overwritten in place, not renamed).
+- Required: `service scale` to the current replica count posts nothing and
+  leaves the revision file unchanged, so `rollback` still restores the spec
+  from before the last real change. The same for a `service update` that
+  changes nothing.
+- Required: when `MINGA_BIN` succeeds but the API is unreachable for the read
+  after it, `stack deploy` exits 2 and says rollback data may be missing.
+- Required: `stack deploy` with a direct `https://` endpoint refuses the same
+  compose files as with an SSH context.
 - Required: with an SSH context, `stack deploy` of a compose file that uses
   `host-gateway` or a relative bind mount exits 1 before `MINGA_BIN` is run;
   the same file deploys in a local context; `env_file` is allowed in both.
@@ -1224,8 +1264,11 @@ Before each commit: `cargo fmt --all`, `cargo clippy --all-targets -- -D warning
 - When a container has to read the API (Traefik's Swarm provider), the API
   listens beyond loopback and the token is the only barrier between any
   container on the node and the cluster (section 2.2).
-- `stack deploy` through an SSH context refuses compose files that use
-  `host-gateway` or relative bind mounts, because Minga resolves them on the
+- `stack deploy` refuses compose files that use `host-gateway` or relative
+  bind mounts whenever the node is another machine (an SSH context, or a
+  direct endpoint that is not loopback), because Minga resolves them on the
   machine that runs the deploy (section 5.2).
+- `registry login` overwrites an existing credential file in place to keep
+  its owner and mode, so the write is not atomic (section 5.8).
 - Not included: node commands, events, waiting for rollouts, refresh of
   short-lived registry credentials, client certificates (phase 2).
