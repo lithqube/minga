@@ -15,6 +15,10 @@
 
 Each ADR ends with an *Implementation status* section saying what shipped and where the code deviates.
 
+## Plans
+
+- [minga-ctl design plan](minga-ctl-plan.md): proposed companion CLI; SSH-only transport first, mutual TLS and server-side audit next
+
 ## Deployment
 
 - [Quick start: one Linux host](../README.md#quick-start-one-linux-host): the verified path
