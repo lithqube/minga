@@ -43,12 +43,12 @@ export const site = {
   discussionsUrl: null as string | null,
 
   maintainer: { name: 'Cristhian Ferrufino', url: 'https://devferru.substack.com' },
-  maintenanceStatus: 'Active development, pre-1.0. Upgrade every node together.',
+  maintenanceStatus: 'Stable release. Upgrade every node together.',
   license: 'MIT',
   licenseUrl: `${repoUrl}/blob/main/LICENSE`,
   // The version is not configured here: it is read from CHANGELOG.md (src/lib/repo.ts).
-  /** Flip to true once a GitHub release with archives exists; the hero then stops saying "build from source". */
-  releasePublished: false,
+  /** The release page and stable archives are published. */
+  releasePublished: true,
 
   /** GitHub counts. Leave null to hide; fill in by hand or from a CI step. */
   stats: { stars: null as number | null, forks: null as number | null, contributors: null as number | null },

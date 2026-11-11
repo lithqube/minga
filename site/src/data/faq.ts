@@ -8,13 +8,13 @@ export interface Faq {
 export const faq: Faq[] = [
   {
     q: 'Is Minga production-ready?',
-    a: 'It is v0.1.0. The single-host path is verified by execution on Linux (containerd 2.2.1) and macOS, and every claim in the changelog sits next to its known limits. If you need image pull, multi-node container networking or rollback, it is not ready for you yet.',
+    a: 'It is v1.0.1. The single-host path is verified by execution on Linux (containerd 2.2.1) and macOS. This release adds healthcheck enforcement, rolling updates, rollback and anonymous-registry image pulls. Cross-node container networking, joining a running cluster and private-registry credentials remain limitations; real-registry and Talos verification for this release were not run.',
     sources: ['README.md', 'CHANGELOG.md'],
   },
   {
     q: 'Do my Compose files work unchanged?',
-    a: 'That is the goal, and keys Minga does not understand fail loudly with a suggestion instead of being skipped. <code>command</code>, <code>entrypoint</code>, <code>labels</code>, volumes, bind mounts, placement constraints and <code>deploy.restart_policy</code> reach the container; <code>healthcheck</code> is carried but not enforced. Secrets must be <code>external</code> references. Run <code>minga validate -c compose.yaml</code> offline first.',
-    sources: ['README.md', 'docs/roadmap-v0.1.0.md'],
+    a: 'That is the goal, and keys Minga does not understand fail loudly with a suggestion instead of being skipped. <code>command</code>, <code>entrypoint</code>, <code>labels</code>, volumes, bind mounts, placement constraints, <code>deploy.restart_policy</code>, healthchecks and <code>deploy.update_config</code> are supported. Secrets must be <code>external</code> references. Run <code>minga validate -c compose.yaml</code> offline first.',
+    sources: ['README.md', 'CHANGELOG.md'],
   },
   {
     q: 'Can I keep using the docker CLI and Traefik?',
@@ -22,13 +22,13 @@ export const faq: Faq[] = [
     sources: ['README.md', 'docs/talos-deployment.md'],
   },
   {
-    q: 'Why does Minga not pull images?',
-    a: 'The pull path (content transfer plus unpack) is not built yet; it is next on the roadmap. Until then, preload images with <code>ctr -n minga images pull</code>, or <code>ctr -n minga images import &lt;image&gt;.tar</code> on an air-gapped site.',
-    sources: ['README.md'],
+    q: 'How does Minga pull images?',
+    a: 'When an image is missing from the <code>minga</code> containerd namespace, Minga pulls and unpacks it with <code>ctr</code>. Pulls use anonymous registry access and ctr’s default containerd socket; private-registry credentials are not supported. On air-gapped sites, preload with <code>ctr -n minga images import &lt;image&gt;.tar</code>.',
+    sources: ['CHANGELOG.md', 'docs/release-1.0.1.md'],
   },
   {
     q: 'Why does one host run two processes?',
-    a: 'In v0.1.0, <code>minga api</code> is its own Raft voter, so the manager and the API peer with each other. In the target design the API folds into the manager.',
+    a: 'In v1.0.1, <code>minga api</code> is its own Raft voter, so the manager and the API peer with each other. In the target design the API folds into the manager.',
     sources: ['README.md', 'docs/architecture.md'],
   },
   {
@@ -48,17 +48,17 @@ export const faq: Faq[] = [
   },
   {
     q: 'How do I install on an air-gapped site?',
-    a: 'Copy the release archive (minga, nats-server, ctr and the licenses) and your image tarballs to the site. Run <code>ctr -n minga images import &lt;image&gt;.tar</code> on each node and start the roles. Once a release is tagged, <code>install.sh</code> verifies <code>SHA256SUMS</code>; until then, build the binary from source before you go offline.',
-    sources: ['README.md'],
+    a: 'Copy the v1.0.1 release archive (minga, nats-server, ctr and the licenses) and your image tarballs to the site. Run <code>ctr -n minga images import &lt;image&gt;.tar</code> on each node and start the roles. The published <code>install.sh</code> verifies <code>SHA256SUMS</code>.',
+    sources: ['README.md', 'docs/release-1.0.1.md'],
   },
   {
     q: 'Does it run on Talos Linux?',
-    a: 'Yes, on Talos v1.14+: Minga runs as two privileged <code>ContainerConfig</code> containers pulled from the registry — no system extension or custom boot asset. <code>scripts/setup-talos-minga.sh</code> generates, validates and applies the machine config and waits for readiness; workload images preload with a Kubernetes Job that uses the bundled <code>ctr</code>. Validated through workload start on docker-provisioned Talos; bare metal is pending.',
+    a: 'Minga was validated through workload start on a docker-provisioned Talos v1.14 node before v1.0.1. This release has not been verified on Talos; bare-metal validation is also pending. The setup script runs Minga as two privileged <code>ContainerConfig</code> containers.',
     sources: ['docs/talos-deployment.md', 'talos/single-node.yaml'],
   },
   {
     q: 'I published a port. Why might it not answer on the same host?',
-    a: 'Host-local port hairpinning is not in v0.1.0. Test a published port from another machine against the host IP.',
+    a: 'Host-local port hairpinning is not in v1.0.1. Test a published port from another machine against the host IP.',
     sources: ['README.md'],
   },
   {

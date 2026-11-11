@@ -48,9 +48,9 @@ ${deployOutput.split('\n').slice(3).join('\n')}`;
     primary={site.cta.primary}
     secondary={site.cta.secondary}
     tertiary={site.social.discord ? { label: 'Join Discord', href: site.social.discord } : null}
-    prereq="Needs: Linux · root · containerd · Rust toolchain · images preloaded with ctr"
+    prereq="Needs: Linux · root · containerd · iproute2 · iptables · procps"
     status={{
-      text: `Verified on one Linux host (containerd 2.2.1).${site.releasePublished ? '' : ' No release published yet, so you build from source.'} No image pull and no cross-node networking yet.`,
+      text: `Verified on one Linux host (containerd 2.2.1). Image pulls support anonymous registries; no cross-node networking yet.`,
       href: '#when-not',
       linkText: 'Known limits',
     }}

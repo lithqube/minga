@@ -11,7 +11,7 @@ export interface Step {
 
 export const prerequisites = [
   'Linux with root (the supervisor creates netns, bridges and iptables rules)',
-  'Until the first release is tagged: a Rust 1.80+ toolchain and nats-server v2.10.22 on PATH. After: install.sh brings both.',
+  'Install from the v1.0.1 release archive; it includes minga, nats-server and ctr.',
   'containerd running',
   'iproute2, iptables and procps (any standard server install)',
   'Free loopback ports 7001, 7002, 2375 and 9100',
@@ -20,11 +20,12 @@ export const prerequisites = [
 export const steps: Step[] = [
   {
     title: 'Install minga + nats-server (install.sh verifies SHA256SUMS)',
-    note: 'Works once the first release is tagged; until then build from source: cargo build --release -p minga-cli, then sudo install -m 0755 target/release/minga /usr/local/bin/minga (both in the README). Debian 11+, Ubuntu 20.04+, Fedora 32+; add --with-systemd for the unit.',
+    note: 'The installer verifies SHA256SUMS. Supported distro guidance: Debian 11+, Ubuntu 20.04+, Fedora 32+; add --with-systemd for the unit.',
     code: `curl -fsSL https://github.com/lithqube/minga/releases/latest/download/install.sh | sh`,
   },
   {
-    title: 'Preload the images your stack uses (there is no registry pull yet)',
+    title: 'Auto-pull or preload workload images',
+    note: 'Missing images are pulled with ctr from anonymous registries. Private-registry credentials are not supported; preload images for air-gapped or authenticated registries.',
     code: 'sudo ctr -n minga images pull docker.io/library/nginx:1.27',
   },
   {
