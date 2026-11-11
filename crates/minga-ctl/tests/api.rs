@@ -250,6 +250,45 @@ async fn read_commands_against_a_real_api() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn system_proxies_are_ignored_so_the_token_never_reaches_one() {
+    let cluster = cluster().await;
+    let url = cluster.url.clone();
+    // A port nothing listens on: a request sent to the proxy would fail.
+    let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let proxy = format!("http://{}", closed.local_addr().unwrap());
+    drop(closed);
+    let output = tokio::task::spawn_blocking(move || {
+        let home = tempfile::tempdir().unwrap();
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_minga-ctl"));
+        cmd.args(["stack", "ls"])
+            .env("XDG_CONFIG_HOME", home.path().join("config"))
+            .env("HOME", home.path().join("home"))
+            .env("MINGA_CTL_ENDPOINT", &url)
+            .env("MINGA_CTL_TOKEN", TOKEN)
+            .env_remove("MINGA_CTL_CONTEXT");
+        for var in [
+            "HTTP_PROXY",
+            "http_proxy",
+            "HTTPS_PROXY",
+            "https_proxy",
+            "ALL_PROXY",
+            "all_proxy",
+        ] {
+            cmd.env(var, &proxy);
+        }
+        for var in ["NO_PROXY", "no_proxy"] {
+            cmd.env_remove(var);
+        }
+        cmd.output().unwrap()
+    })
+    .await
+    .unwrap();
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{err}");
+    assert!(String::from_utf8_lossy(&output.stdout).contains("shop"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_wrong_token_is_exit_two_with_the_hint() {
     let cluster = cluster().await;
     let url = cluster.url.clone();

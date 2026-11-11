@@ -26,6 +26,18 @@ pub struct ApiClient {
     pub context: String,
     token: Option<String>,
     debug: bool,
+    /// `text()` URLs under this root go through this client instead (the
+    /// SSH tunnel's metrics socket).
+    text_route: Option<(String, reqwest::Client)>,
+}
+
+/// Builder settings every client shares. System proxies are off: the token
+/// must go only to the API or the tunnel, never to `HTTP_PROXY`.
+fn builder() -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
 }
 
 /// The outcome of a request that may name something that does not exist.
@@ -44,9 +56,7 @@ impl ApiClient {
         context: &str,
         debug: bool,
     ) -> Result<Self, CtlError> {
-        let mut builder = reqwest::Client::builder()
-            .timeout(Duration::from_secs(15))
-            .redirect(reqwest::redirect::Policy::none());
+        let mut builder = builder();
         if let Some(path) = tls_cert {
             let pem = std::fs::read(path).map_err(|e| {
                 CtlError::Config(format!("cannot read tls_cert {}: {e}", path.display()))
@@ -71,7 +81,36 @@ impl ApiClient {
             context: context.to_string(),
             token,
             debug,
+            text_route: None,
         })
+    }
+
+    /// A client whose connections all go to the Unix socket `sock` (the SSH
+    /// tunnel). `root` is the API URL as seen from the SSH target; it names
+    /// the API in messages and the `Host` header, and is never resolved.
+    pub fn over_socket(
+        sock: &Path,
+        root: &str,
+        token: Option<String>,
+        context: &str,
+        debug: bool,
+    ) -> Result<Self, CtlError> {
+        let http = socket_client(sock)?;
+        Ok(ApiClient {
+            http,
+            root: root.trim_end_matches('/').to_string(),
+            context: context.to_string(),
+            token,
+            debug,
+            text_route: None,
+        })
+    }
+
+    /// Sends [`ApiClient::text`] requests for URLs under `root` through the
+    /// Unix socket `sock` (the tunnel's metrics forward).
+    pub fn route_text(mut self, root: &str, sock: &Path) -> Result<Self, CtlError> {
+        self.text_route = Some((root.trim_end_matches('/').to_string(), socket_client(sock)?));
+        Ok(self)
     }
 
     /// The root URL requests go to.
@@ -109,7 +148,11 @@ impl ApiClient {
     /// returning the status and body unchanged. The token is sent only when
     /// `url` is on this client's root, never to another host or port.
     pub async fn text(&self, url: &str) -> Result<(u16, String), CtlError> {
-        let mut request = self.http.get(url);
+        let http = match &self.text_route {
+            Some((root, client)) if on_root(root, url) => client,
+            _ => &self.http,
+        };
+        let mut request = http.get(url);
         if let Some(token) = self.token.as_ref().filter(|_| on_root(&self.root, url)) {
             request = request.bearer_auth(token);
         }
@@ -197,6 +240,14 @@ fn expect_found(found: Found, path: &str) -> Result<Value, CtlError> {
             message: format!("/{API_VERSION}/{path} not found"),
         }),
     }
+}
+
+/// A client whose connections all go to the Unix socket `sock`.
+fn socket_client(sock: &Path) -> Result<reqwest::Client, CtlError> {
+    builder()
+        .unix_socket(sock)
+        .build()
+        .map_err(|e| CtlError::Config(format!("cannot build the HTTP client: {e}")))
 }
 
 /// Whether `url` is on `root`: same scheme, host and port, then `/` or the end.

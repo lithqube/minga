@@ -7,6 +7,7 @@ use clap::{Args, Subcommand};
 use crate::config::{self, Context, TokenSource};
 use crate::error::CtlError;
 use crate::output::{self, Format, Rows};
+use crate::transport;
 
 /// Context commands. Local file only; no API call.
 #[derive(Debug, Subcommand)]
@@ -94,7 +95,23 @@ fn add(args: &AddArgs, quiet: bool) -> Result<(), CtlError> {
     if name.is_empty() {
         return Err(CtlError::Usage("a context needs a name".to_string()));
     }
-    if ssh.is_none() {
+    for target in ssh.iter().chain(nodes) {
+        transport::validate_target(target)?;
+    }
+    if let Some(path) = remote_token_file {
+        if ssh.is_none() {
+            return Err(CtlError::Usage(
+                "--remote-token-file needs --ssh: the file is read on the SSH target".to_string(),
+            ));
+        }
+        transport::validate_remote_path(path)?;
+    }
+    if ssh.is_some() {
+        // The same destination rules `connect` applies to the tunnel.
+        for url in std::iter::once(endpoint).chain(metrics_endpoint) {
+            transport::forward_dest(url)?;
+        }
+    } else {
         // The plain-HTTP rule is checked at add time when there is no SSH
         // target to tunnel through.
         config::check_endpoint_policy(None, endpoint)?;

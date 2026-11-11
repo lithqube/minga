@@ -82,23 +82,49 @@ phase 1 takes the API off the network instead.
 **Client behaviour:**
 
 1. A context names an SSH target. For API calls minga-ctl starts the system
-   `ssh` client with a local forward and talks HTTP to the forwarded port:
+   `ssh` client with a local forward to a Unix socket in a new 0700
+   directory:
 
    ```
    ssh -N -o ExitOnForwardFailure=yes \
-       -L 127.0.0.1:<free port>:127.0.0.1:2375 \
-       [-L 127.0.0.1:<free port 2>:127.0.0.1:9100] -- <target>
+       -L <dir>/api.sock:127.0.0.1:2375 \
+       [-L <dir>/metrics.sock:127.0.0.1:9100] -- <target>
    ```
 
-   It waits until the local port accepts a connection (10 s limit) or the
-   child exits, and kills the child when the command ends (`kill_on_drop`).
+   With `ssh`, `api_endpoint` and `metrics_endpoint` must be `http://` to
+   the target's own loopback (`127.0.0.1`, `localhost` or `[::1]`):
+   ssh makes the hop from the target to the destination in plain HTTP, so
+   any other host would see the token. `context add` checks this too.
+
+   The HTTP client connects to the sockets directly; there is no local TCP
+   port. System proxies (`HTTP_PROXY` and friends) are never used. A free TCP port handed to `ssh` would be released first, and
+   another local user who reads the port from `ps` could bind it before
+   `ssh` does and receive the token. Other local users cannot reach the
+   sockets either, so a node that runs the API without a token is not
+   exposed to them.
+
+   It waits until the sockets accept a connection or the child exits. The
+   wait is limited to 10 s when there is no terminal (ssh cannot prompt
+   then); with a terminal the operator may be answering a host-key,
+   passphrase or MFA prompt and can press Ctrl-C instead. The token read
+   (item 3) runs first and without a limit, so prompts are usually
+   answered there. The child is killed when the command ends
+   (`kill_on_drop`). On SIGINT, SIGTERM or SIGHUP minga-ctl kills it, removes
+   the socket directory and exits with 128 + the signal number. On Linux the
+   child also gets `PR_SET_PDEATHSIG`, which covers SIGKILL. Elsewhere a
+   SIGKILL leaves the tunnel running.
+
+   The socket directory is under `$TMPDIR`, or under `/tmp` when the socket
+   paths would exceed `sun_path` (104 bytes on macOS) or contain a character
+   such as `:` that `-L` would misread.
 2. Keys, agent, host-key checking, jump hosts and MFA belong to the operator's
    ssh configuration. minga-ctl never reads keys, never sets
    `StrictHostKeyChecking`, and does not set `BatchMode`, so interactive MFA
    prompts still work. Without a terminal ssh fails instead of prompting.
    A `ControlMaster` entry in `~/.ssh/config` avoids repeated prompts.
 3. The API token is read from the node when the tunnel starts
-   (`ssh -- <target> cat '<remote_token_file>'`), kept in memory and never
+   (`ssh -T -- <target> 'cat' '<remote_token_file>'`; `-T` keeps a
+   `RequestTTY force` in the ssh config from changing the output), kept in memory and never
    written to the workstation.
 4. Direct endpoints (no SSH) are accepted only if the URL is `http://` to
    `127.0.0.1`, `localhost` or `[::1]`, or `https://` (API behind a TLS proxy;
@@ -1227,9 +1253,9 @@ Before each commit: `cargo fmt --all`, `cargo clippy --all-targets -- -D warning
 - Every operator needs an SSH account on a node. Accounts that only read can
   be limited in `sshd_config` with `PermitOpen 127.0.0.1:2375` and no shell,
   but then `logs`, `image` and `secret put` do not work for them.
-- While a command runs, the forwarded local port is reachable by other users
-  of the same workstation. The API token still protects it when the node
-  requires one.
+- With a direct `http://127.0.0.1` endpoint, other users of the same machine
+  can reach the API too. The API token still protects it when the node
+  requires one. The SSH tunnel uses private Unix sockets and has no such port.
 - Rollback covers one previous revision, and only changes made with minga-ctl
   on the same machine. A deploy from CI cannot be rolled back from a laptop.
 - Revision files hold full specs in clear text, including environment values.
