@@ -1,14 +1,14 @@
 //! HTTP client for the Minga Docker Engine API.
 //!
-//! This is the direct transport (plan section 2.2, item 4): `http://` to a
-//! loopback address, or `https://` with an optional pinned CA. Contexts with
-//! an SSH target need the tunnel, which is build-order step 3.
+//! The client only knows a root URL and a token. How that root is reached
+//! (directly, or through an SSH tunnel) is decided in `transport.rs`.
 
+use std::path::Path;
 use std::time::Duration;
 
+use reqwest::Method;
 use serde_json::Value;
 
-use crate::config::{self, Resolved};
 use crate::error::CtlError;
 
 /// API version segment Minga serves.
@@ -17,10 +17,10 @@ const API_VERSION: &str = "v1.41";
 /// The message Minga's fallback route returns for an unregistered path.
 const NOT_IMPLEMENTED: &str = "endpoint not implemented by Minga";
 
-/// A client bound to one context's API endpoint.
+/// A client bound to one API root URL.
 pub struct ApiClient {
     http: reqwest::Client,
-    /// Endpoint without a trailing slash, e.g. `http://127.0.0.1:2375`.
+    /// Root without a trailing slash, e.g. `http://127.0.0.1:2375`.
     root: String,
     /// Context name, for not-found errors.
     pub context: String,
@@ -28,27 +28,26 @@ pub struct ApiClient {
     debug: bool,
 }
 
-/// The outcome of a GET that may name something that does not exist.
+/// The outcome of a request that may name something that does not exist.
 pub enum Found {
     Yes(Value),
     No,
 }
 
 impl ApiClient {
-    /// Builds a client for a resolved context over the direct transport.
-    pub fn direct(resolved: &Resolved, debug: bool) -> Result<Self, CtlError> {
-        if let Some(ssh) = &resolved.context.ssh {
-            return Err(CtlError::Usage(format!(
-                "context `{}` reaches the API over ssh ({ssh}); the SSH tunnel is not built yet",
-                resolved.name
-            )));
-        }
-        config::check_endpoint_policy(None, &resolved.endpoint)?;
-
+    /// A client for `root`. `tls_cert`, when set, is the only CA trusted for
+    /// an `https://` root. The caller has already applied the endpoint policy.
+    pub fn new(
+        root: &str,
+        token: Option<String>,
+        tls_cert: Option<&Path>,
+        context: &str,
+        debug: bool,
+    ) -> Result<Self, CtlError> {
         let mut builder = reqwest::Client::builder()
             .timeout(Duration::from_secs(15))
             .redirect(reqwest::redirect::Policy::none());
-        if let Some(path) = &resolved.context.tls_cert {
+        if let Some(path) = tls_cert {
             let pem = std::fs::read(path).map_err(|e| {
                 CtlError::Config(format!("cannot read tls_cert {}: {e}", path.display()))
             })?;
@@ -66,34 +65,84 @@ impl ApiClient {
         let http = builder
             .build()
             .map_err(|e| CtlError::Config(format!("cannot build the HTTP client: {e}")))?;
-
         Ok(ApiClient {
             http,
-            root: resolved.endpoint.trim_end_matches('/').to_string(),
-            context: resolved.name.clone(),
-            token: resolved.token.clone(),
+            root: root.trim_end_matches('/').to_string(),
+            context: context.to_string(),
+            token,
             debug,
         })
     }
 
+    /// The root URL requests go to.
+    pub fn root(&self) -> &str {
+        &self.root
+    }
+
     /// `GET /v1.41/<path>` with optional Docker `filters`.
     pub async fn get(&self, path: &str, filters: Option<&Value>) -> Result<Value, CtlError> {
-        match self.get_found(path, filters).await? {
-            Found::Yes(value) => Ok(value),
-            Found::No => Err(CtlError::Api {
-                status: 404,
-                message: format!("/{API_VERSION}/{path} not found"),
-            }),
-        }
+        let found = self.get_found(path, filters).await?;
+        expect_found(found, path)
     }
 
     /// Like [`ApiClient::get`], but a plain 404 is [`Found::No`] instead of an
     /// error, so the caller can name what was not found (exit 3).
     pub async fn get_found(&self, path: &str, filters: Option<&Value>) -> Result<Found, CtlError> {
+        let (status, body) = self.send(Method::GET, path, filters, None).await?;
+        classify(&self.root, status, &body)
+    }
+
+    /// `POST /v1.41/<path>` with a JSON body. An empty response body is `null`.
+    pub async fn post(&self, path: &str, body: &Value) -> Result<Value, CtlError> {
+        let (status, text) = self.send(Method::POST, path, None, Some(body)).await?;
+        expect_found(classify(&self.root, status, &text)?, path)
+    }
+
+    /// `DELETE /v1.41/<path>`. A plain 404 is [`Found::No`]; any other error,
+    /// such as a 409 for a resource still in use, is returned as `Api`.
+    pub async fn delete(&self, path: &str) -> Result<Found, CtlError> {
+        let (status, body) = self.send(Method::DELETE, path, None, None).await?;
+        classify(&self.root, status, &body)
+    }
+
+    /// `GET` of a plain-text URL such as `/healthz`, `/readyz` or `/metrics`,
+    /// returning the status and body unchanged. The token is sent only when
+    /// `url` is on this client's root, never to another host or port.
+    pub async fn text(&self, url: &str) -> Result<(u16, String), CtlError> {
+        let mut request = self.http.get(url);
+        if let Some(token) = self.token.as_ref().filter(|_| on_root(&self.root, url)) {
+            request = request.bearer_auth(token);
+        }
+        let response = request.send().await.map_err(|e| CtlError::Unreachable {
+            endpoint: url.to_string(),
+            detail: reqwest_detail(&e),
+        })?;
+        let status = response.status().as_u16();
+        if self.debug {
+            eprintln!("debug: GET {url} -> {status}");
+        }
+        let body = response.text().await.map_err(|e| CtlError::Unreachable {
+            endpoint: url.to_string(),
+            detail: reqwest_detail(&e),
+        })?;
+        Ok((status, body))
+    }
+
+    /// Sends a versioned API request; returns the status and body.
+    async fn send(
+        &self,
+        method: Method,
+        path: &str,
+        filters: Option<&Value>,
+        body: Option<&Value>,
+    ) -> Result<(u16, String), CtlError> {
         let url = format!("{}/{API_VERSION}/{path}", self.root);
-        let mut request = self.http.get(&url);
+        let mut request = self.http.request(method.clone(), &url);
         if let Some(filters) = filters {
             request = request.query(&[("filters", filters.to_string())]);
+        }
+        if let Some(body) = body {
+            request = request.json(body);
         }
         if let Some(token) = &self.token {
             request = request.bearer_auth(token);
@@ -105,30 +154,55 @@ impl ApiClient {
         let status = response.status().as_u16();
         if self.debug {
             // Method, path and status only; the Authorization header is never printed.
-            eprintln!("debug: GET /{API_VERSION}/{path} -> {status}");
+            eprintln!("debug: {method} /{API_VERSION}/{path} -> {status}");
         }
-        let body = response.text().await.map_err(|e| CtlError::Unreachable {
+        let text = response.text().await.map_err(|e| CtlError::Unreachable {
             endpoint: self.root.clone(),
             detail: reqwest_detail(&e),
         })?;
-        match status {
-            200..=299 => serde_json::from_str(&body)
-                .map(Found::Yes)
-                .map_err(|e| CtlError::Api {
-                    status,
-                    message: format!("response is not JSON: {e}"),
-                }),
-            401 => Err(CtlError::Auth {
-                endpoint: self.root.clone(),
-                message: error_message(&body),
-            }),
-            404 if error_message(&body) != NOT_IMPLEMENTED => Ok(Found::No),
-            _ => Err(CtlError::Api {
-                status,
-                message: error_message(&body),
-            }),
-        }
+        Ok((status, text))
     }
+}
+
+/// Maps a status and body: 2xx is the JSON body (`null` when empty), 401 is
+/// `Auth`, a plain 404 is [`Found::No`], anything else is `Api`.
+fn classify(root: &str, status: u16, body: &str) -> Result<Found, CtlError> {
+    match status {
+        200..=299 if body.trim().is_empty() => Ok(Found::Yes(Value::Null)),
+        200..=299 => serde_json::from_str(body)
+            .map(Found::Yes)
+            .map_err(|e| CtlError::Api {
+                status,
+                message: format!("response is not JSON: {e}"),
+            }),
+        401 => Err(CtlError::Auth {
+            endpoint: root.to_string(),
+            message: error_message(body),
+        }),
+        404 if error_message(body) != NOT_IMPLEMENTED => Ok(Found::No),
+        _ => Err(CtlError::Api {
+            status,
+            message: error_message(body),
+        }),
+    }
+}
+
+/// Turns [`Found::No`] into an exit-2 error for callers that expect the path
+/// to exist.
+fn expect_found(found: Found, path: &str) -> Result<Value, CtlError> {
+    match found {
+        Found::Yes(value) => Ok(value),
+        Found::No => Err(CtlError::Api {
+            status: 404,
+            message: format!("/{API_VERSION}/{path} not found"),
+        }),
+    }
+}
+
+/// Whether `url` is on `root`: same scheme, host and port, then `/` or the end.
+fn on_root(root: &str, url: &str) -> bool {
+    url.strip_prefix(root)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
 }
 
 /// The `message` of a Docker error body, or the body itself when it is not
@@ -188,6 +262,45 @@ mod tests {
             error_message("Failed to parse the request body\n"),
             "Failed to parse the request body"
         );
+    }
+
+    #[test]
+    fn statuses_are_classified() {
+        let root = "http://127.0.0.1:2375";
+        assert!(matches!(
+            classify(root, 204, ""),
+            Ok(Found::Yes(Value::Null))
+        ));
+        assert!(matches!(
+            classify(root, 404, r#"{"message":"no such secret"}"#),
+            Ok(Found::No)
+        ));
+        assert!(matches!(
+            classify(
+                root,
+                404,
+                r#"{"message":"endpoint not implemented by Minga"}"#
+            ),
+            Err(CtlError::Api { status: 404, .. })
+        ));
+        assert!(matches!(
+            classify(root, 401, "{}"),
+            Err(CtlError::Auth { .. })
+        ));
+        assert!(matches!(
+            classify(root, 409, r#"{"message":"in use"}"#),
+            Err(CtlError::Api { status: 409, .. })
+        ));
+    }
+
+    #[test]
+    fn the_token_goes_only_to_the_api_root() {
+        let root = "http://127.0.0.1:2375";
+        assert!(on_root(root, "http://127.0.0.1:2375/healthz"));
+        assert!(on_root(root, "http://127.0.0.1:2375"));
+        assert!(!on_root(root, "http://127.0.0.1:23750/metrics"));
+        assert!(!on_root(root, "http://127.0.0.1:9100/metrics"));
+        assert!(!on_root(root, "http://127.0.0.1:2375.evil.example/metrics"));
     }
 
     #[test]

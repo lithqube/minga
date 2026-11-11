@@ -8,6 +8,7 @@ use serde_json::{json, Value};
 use crate::api::ApiClient;
 use crate::error::CtlError;
 use crate::output::{self, Format, Rows};
+use crate::transport::Connection;
 use crate::view;
 
 /// Secret commands.
@@ -20,10 +21,11 @@ pub enum SecretCommand {
 /// Runs a secret command.
 pub async fn run(
     cmd: &SecretCommand,
-    client: &ApiClient,
+    conn: &Connection,
     format: Format,
     quiet: bool,
 ) -> Result<(), CtlError> {
+    let client = &conn.api;
     match cmd {
         SecretCommand::List => list(client, format, quiet).await,
     }

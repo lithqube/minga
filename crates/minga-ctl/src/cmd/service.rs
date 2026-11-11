@@ -10,6 +10,7 @@ use serde_json::{json, Value};
 use crate::api::{self, ApiClient, Found};
 use crate::error::CtlError;
 use crate::output::{self, Format, Rows};
+use crate::transport::Connection;
 use crate::view;
 
 /// Service commands.
@@ -31,10 +32,11 @@ pub enum ServiceCommand {
 /// Runs a service command.
 pub async fn run(
     cmd: &ServiceCommand,
-    client: &ApiClient,
+    conn: &Connection,
     format: Format,
     quiet: bool,
 ) -> Result<(), CtlError> {
+    let client = &conn.api;
     match cmd {
         ServiceCommand::Ls { stack } => ls(client, stack.as_deref(), format, quiet).await,
         ServiceCommand::Ps { service } => ps(client, service, format, quiet).await,
