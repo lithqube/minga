@@ -32,6 +32,10 @@ pub enum CtlError {
     /// `health` ran and at least one check was not `ok`. Exit 2.
     #[error("{failed} health check(s) not ok")]
     HealthFailed { failed: usize },
+    /// A write stopped because the cluster changed under it, or a step after
+    /// an accepted change failed. Exit 2.
+    #[error("{0}")]
+    Halted(String),
     /// A named stack, service or revision does not exist. Exit 3.
     #[error("{kind} `{name}` not found in context `{context}`")]
     NotFound {
@@ -83,7 +87,8 @@ impl CtlError {
             | CtlError::Ssh { .. }
             | CtlError::Auth { .. }
             | CtlError::HealthFailed { .. }
-            | CtlError::Api { .. } => 2,
+            | CtlError::Api { .. }
+            | CtlError::Halted(_) => 2,
             CtlError::NotFound { .. } | CtlError::ContextNotFound { .. } => 3,
         }
     }
@@ -102,9 +107,11 @@ impl CtlError {
                 "check remote_token_file, token_command or MINGA_CTL_TOKEN for the context"
                     .to_string(),
             ),
-            CtlError::Api { .. } => None,
+            CtlError::Api { .. } | CtlError::Halted(_) => None,
             CtlError::HealthFailed { .. } => None,
-            CtlError::NotFound { .. } => None,
+            CtlError::NotFound { kind, .. } => (*kind == "revision").then(|| {
+                "rollback covers only changes made with minga-ctl on this machine".to_string()
+            }),
             CtlError::ContextNotFound { .. } => Some("see `minga-ctl context list`".to_string()),
             CtlError::PlainHttp { .. } => {
                 Some("use --ssh user@HOST, or an https:// endpoint with --tls-cert".to_string())

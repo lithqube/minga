@@ -7,7 +7,7 @@ use minga_ctl::api;
 use minga_ctl::error::CtlError;
 use minga_ctl::output::Format;
 use minga_ctl::transport::{self, Connection};
-use minga_ctl::{cmd, config};
+use minga_ctl::{cmd, config, state};
 
 /// Companion CLI for Minga: contexts, stack and service operations, health,
 /// metrics and release management.
@@ -38,10 +38,10 @@ enum Command {
     /// Manage named contexts.
     #[command(subcommand)]
     Context(cmd::context::ContextCommand),
-    /// List stacks and their tasks.
+    /// List, inspect and remove stacks.
     #[command(subcommand)]
     Stack(cmd::stack::StackCommand),
-    /// List services and their tasks.
+    /// List services, scale, update and roll them back.
     #[command(subcommand)]
     Service(cmd::service::ServiceCommand),
     /// List secret metadata.
@@ -84,12 +84,24 @@ fn run(cli: &Cli) -> Result<(), CtlError> {
     match &cli.command {
         Command::Context(cmd) => cmd::context::run(cmd, format, quiet),
         Command::Stack(cmd) => api::block_on(async {
-            let conn = connect(cli).await?;
-            cmd::stack::run(cmd, &conn, format, quiet).await
+            let resolved = resolve(cli)?;
+            let result = async {
+                let conn = transport::connect(&resolved, cli.debug).await?;
+                cmd::stack::run(cmd, &conn, format, quiet).await
+            }
+            .await;
+            audit(&resolved, cmd.audit(), &result);
+            result
         }),
         Command::Service(cmd) => api::block_on(async {
-            let conn = connect(cli).await?;
-            cmd::service::run(cmd, &conn, format, quiet).await
+            let resolved = resolve(cli)?;
+            let result = async {
+                let conn = transport::connect(&resolved, cli.debug).await?;
+                cmd::service::run(cmd, &conn, format, quiet).await
+            }
+            .await;
+            audit(&resolved, cmd.audit(), &result);
+            result
         }),
         Command::Secret(cmd) => api::block_on(async {
             let conn = connect(cli).await?;
@@ -109,9 +121,34 @@ fn run(cli: &Cli) -> Result<(), CtlError> {
 /// Connects to the selected context. The connection (and, once step 3 lands,
 /// its SSH tunnel) lives until the command returns.
 async fn connect(cli: &Cli) -> Result<Connection, CtlError> {
+    transport::connect(&resolve(cli)?, cli.debug).await
+}
+
+/// Loads the config and resolves the selected context.
+fn resolve(cli: &Cli) -> Result<config::Resolved, CtlError> {
     let config = config::load()?;
-    let resolved = config::resolve(&config, cli.context.as_deref())?;
-    transport::connect(&resolved, cli.debug).await
+    config::resolve(&config, cli.context.as_deref())
+}
+
+/// Appends the audit line for a command that changes state (`entry` is
+/// `None` for reads). A failed append is a warning: by then the change has
+/// already happened or failed.
+fn audit(
+    resolved: &config::Resolved,
+    entry: Option<(&str, serde_json::Value)>,
+    result: &Result<(), CtlError>,
+) {
+    let Some((command, args)) = entry else {
+        return;
+    };
+    let target = resolved
+        .context
+        .ssh
+        .as_deref()
+        .unwrap_or(&resolved.endpoint);
+    if let Err(err) = state::audit(&resolved.name, target, command, &args, result) {
+        eprintln!("warning: could not write the audit log: {err}");
+    }
 }
 
 #[cfg(test)]
