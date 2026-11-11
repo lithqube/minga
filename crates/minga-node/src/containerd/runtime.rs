@@ -566,27 +566,8 @@ impl ContainerdRuntime {
             )));
         }
 
-        let unpack = tokio::time::timeout(
-            Duration::from_secs(120),
-            tokio::process::Command::new("ctr")
-                .args(["-n", "minga", "images", "unpack", image_ref])
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
-                .kill_on_drop(true)
-                .output(),
-        )
-        .await
-        .map_err(|_| RuntimeError::Start(format!("ctr unpack {image_ref} timed out after 120s")))?
-        .map_err(|e| RuntimeError::Start(format!("spawn ctr unpack: {e}")))?;
-
-        if !unpack.status.success() {
-            let stderr = String::from_utf8_lossy(&unpack.stderr);
-            return Err(RuntimeError::Start(format!(
-                "ctr unpack {image_ref} failed ({}): {stderr}",
-                unpack.status
-            )));
-        }
-
+        // `ctr images pull` on containerd v2 unpacks automatically; a separate
+        // `ctr images unpack` step is not available in containerd v2.2+.
         tracing::info!(image = %image_ref, "image pulled and unpacked");
         Ok(())
     }
