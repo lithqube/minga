@@ -2135,6 +2135,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "minga-ctl"
+version = "1.0.1"
+dependencies = [
+ "clap",
+ "serde",
+ "serde_json",
+ "serde_path_to_error",
+ "serde_yaml",
+ "tempfile",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "minga-egress"
 version = "1.0.1"
 dependencies = [
