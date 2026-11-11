@@ -1,0 +1,34 @@
+[package]
+name = "minga-ctl"
+description = "Companion CLI for Minga: contexts, stacks, services, health"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+name = "minga_ctl"
+path = "src/lib.rs"
+
+[[bin]]
+name = "minga-ctl"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+libc.workspace = true
+# The workspace reqwest has no TLS backend; https:// endpoints need one.
+reqwest = { workspace = true, features = ["rustls-tls"] }
+serde.workspace = true
+serde_json.workspace = true
+serde_path_to_error.workspace = true
+serde_yaml.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+minga-api = { path = "../minga-api" }
+minga-node = { path = "../minga-node" }
+minga-scheduler = { path = "../minga-scheduler" }
+minga-state = { path = "../minga-state" }
+tempfile.workspace = true
