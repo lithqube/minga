@@ -177,7 +177,7 @@ async fn a_command_runs_through_the_tunnel_with_the_remote_token() {
     // The token came from the remote file, trimmed, and went only in the header.
     assert_eq!(
         stub.lines("exec.args"),
-        ["--", TARGET, "'cat'", "'/etc/minga/api-token'"]
+        ["-T", "--", TARGET, "'cat'", "'/etc/minga/api-token'"]
     );
     let head = heads[0].to_ascii_lowercase();
     assert!(head.starts_with("get /v1.41/secrets"), "{head}");
@@ -195,12 +195,24 @@ async fn a_command_runs_through_the_tunnel_with_the_remote_token() {
     );
     assert!(
         stderr.contains(&format!(
-            "debug: ssh -- {TARGET} 'cat' '/etc/minga/api-token'"
+            "debug: ssh -T -- {TARGET} 'cat' '/etc/minga/api-token'"
         )),
         "{stderr}"
     );
 
     // The ssh child is killed and the socket directory removed on exit.
+    assert_cleaned_up(&stub, &dir).await;
+}
+
+/// The socket directory named in the recorded tunnel arguments.
+fn socket_dir(stub: &Stub) -> PathBuf {
+    let args = stub.lines("tunnel.args");
+    let (sock, _) = args[4].split_once(':').unwrap();
+    Path::new(sock).parent().unwrap().to_path_buf()
+}
+
+/// The stub tunnel's pid is gone and the socket directory removed.
+async fn assert_cleaned_up(stub: &Stub, dir: &Path) {
     let pid = stub.lines("tunnel.pid")[0].clone();
     let deadline = Instant::now() + Duration::from_secs(5);
     while Command::new("kill")
@@ -213,6 +225,55 @@ async fn a_command_runs_through_the_tunnel_with_the_remote_token() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     assert!(!dir.exists(), "{} was left behind", dir.display());
+}
+
+#[tokio::test]
+async fn a_signal_kills_the_tunnel_and_removes_the_socket_directory() {
+    for signo in [libc::SIGTERM, libc::SIGHUP, libc::SIGINT] {
+        let stub = Stub::new();
+        let child = stub.command(&["secret", "list"], &[]).spawn().unwrap();
+        let pid = libc::pid_t::try_from(child.id()).unwrap();
+        let run = tokio::task::spawn_blocking(move || child.wait_with_output());
+        wait_for(&stub.path("tunnel.args")).await;
+        wait_for(&stub.path("tunnel.pid")).await;
+        let dir = socket_dir(&stub);
+        // SAFETY: kill(2) on the minga-ctl child this test started.
+        assert_eq!(unsafe { libc::kill(pid, signo) }, 0);
+        let out = run.await.unwrap().unwrap();
+        assert_eq!(out.status.code(), Some(128 + signo), "signal {signo}");
+        assert_cleaned_up(&stub, &dir).await;
+    }
+}
+
+#[tokio::test]
+async fn a_hanging_ssh_without_a_terminal_times_out_after_ten_seconds() {
+    let stub = Stub::new();
+    let mut cmd = stub.command(&["secret", "list"], &[]);
+    // A new session has no controlling terminal, as under cron or CI.
+    // SAFETY: setsid is async-signal-safe.
+    unsafe {
+        std::os::unix::process::CommandExt::pre_exec(&mut cmd, || {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let started = Instant::now();
+    let out = tokio::task::spawn_blocking(move || cmd.output())
+        .await
+        .unwrap()
+        .unwrap();
+    let elapsed = started.elapsed();
+    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(
+        text(&out.stderr).trim(),
+        format!("error: ssh to {TARGET} failed: the tunnel did not open within 10 s")
+    );
+    assert!(elapsed >= Duration::from_secs(10), "{elapsed:?}");
+    assert!(elapsed < Duration::from_secs(20), "{elapsed:?}");
+    let dir = socket_dir(&stub);
+    assert_cleaned_up(&stub, &dir).await;
 }
 
 #[test]
