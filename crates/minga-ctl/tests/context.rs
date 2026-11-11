@@ -193,3 +193,45 @@ fn quiet_output_prints_ids_only() {
     assert!(ok, "stderr: {err}");
     assert_eq!(out.trim(), "local");
 }
+
+#[test]
+fn quiet_changes_print_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    for args in [
+        &["--quiet", "context", "add", "local"][..],
+        &["--quiet", "context", "add", "other"][..],
+        &["--quiet", "context", "use", "other"][..],
+        &["--quiet", "context", "delete", "local"][..],
+    ] {
+        let (ok, out, err) = run(dir.path(), args);
+        assert!(ok, "{args:?}: {err}");
+        assert!(out.is_empty(), "{args:?} printed {out:?}");
+    }
+}
+
+#[test]
+fn concurrent_adds_keep_every_context() {
+    let dir = tempfile::tempdir().unwrap();
+    let names: Vec<String> = (0..8).map(|i| format!("ctx{i}")).collect();
+    std::thread::scope(|scope| {
+        for name in &names {
+            let dir = dir.path();
+            scope.spawn(move || {
+                let (ok, _, err) = run(dir, &["context", "add", name]);
+                assert!(ok, "{name}: {err}");
+            });
+        }
+    });
+    let (ok, out, err) = run(dir.path(), &["--quiet", "context", "list"]);
+    assert!(ok, "stderr: {err}");
+    let mut listed: Vec<&str> = out.lines().collect();
+    listed.sort_unstable();
+    assert_eq!(listed, names, "a concurrent add lost a context");
+    let leftovers: Vec<_> = std::fs::read_dir(dir.path().join("config").join("minga-ctl"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|n| n.contains(".tmp."))
+        .collect();
+    assert!(leftovers.is_empty(), "temp files left: {leftovers:?}");
+}

@@ -8,6 +8,8 @@ use std::io::Write;
 
 use serde::Serialize;
 
+use crate::error::CtlError;
+
 /// How a command prints its rows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 pub enum Format {
@@ -64,38 +66,49 @@ impl Rows {
 
 /// Prints rows in the requested format.
 ///
-/// Quiet mode prints only the first column of each row, one per line.
-pub fn print(format: Format, quiet: bool, rows: &Rows) -> Result<(), serde_json::Error> {
+/// Quiet mode prints only the identifier column of each row, one per line.
+/// A failed write to stdout (a closed pipe, a full disk) is an error, so a
+/// caller never reports success for incomplete output.
+pub fn print(format: Format, quiet: bool, rows: &Rows) -> Result<(), CtlError> {
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
-    match format {
-        Format::Table => {
-            if quiet {
-                for cells in &rows.cells {
-                    if let Some(id) = cells.get(rows.id_column) {
-                        let _ = writeln!(out, "{id}");
-                    }
-                }
-            } else {
-                write_table(&mut out, rows);
-            }
-        }
+    let written = match format {
+        Format::Table if quiet => rows
+            .cells
+            .iter()
+            .filter_map(|cells| cells.get(rows.id_column))
+            .try_for_each(|id| writeln!(out, "{id}")),
+        Format::Table => write_table(&mut out, rows),
         Format::Json => {
             let text = serde_json::to_string_pretty(&rows.values)?;
-            let _ = writeln!(out, "{text}");
+            writeln!(out, "{text}")
         }
         Format::Yaml => {
-            let yaml = serde_yaml::to_string(&rows.values).unwrap_or_default();
-            let _ = write!(out, "{yaml}");
+            let yaml =
+                serde_yaml::to_string(&rows.values).map_err(|e| CtlError::Output(e.to_string()))?;
+            write!(out, "{yaml}")
         }
+    };
+    written
+        .and_then(|()| out.flush())
+        .map_err(|e| CtlError::Output(format!("write to stdout: {e}")))
+}
+
+/// Prints a one-line confirmation to stdout unless `quiet` is set.
+pub fn say(quiet: bool, message: &str) -> Result<(), CtlError> {
+    if quiet {
+        return Ok(());
     }
-    Ok(())
+    let mut out = std::io::stdout().lock();
+    writeln!(out, "{message}")
+        .and_then(|()| out.flush())
+        .map_err(|e| CtlError::Output(format!("write to stdout: {e}")))
 }
 
 /// Writes the padded table.
-fn write_table<W: Write>(out: &mut W, rows: &Rows) {
+fn write_table<W: Write>(out: &mut W, rows: &Rows) -> std::io::Result<()> {
     if rows.cells.is_empty() {
-        return;
+        return Ok(());
     }
     let widths: Vec<usize> = rows
         .headers
@@ -121,7 +134,7 @@ fn write_table<W: Write>(out: &mut W, rows: &Rows) {
         }
         line.push_str(&pad(header, widths[i], i == last));
     }
-    let _ = writeln!(out, "{}", line.trim_end());
+    writeln!(out, "{}", line.trim_end())?;
 
     for cells in &rows.cells {
         let mut line = String::new();
@@ -132,8 +145,9 @@ fn write_table<W: Write>(out: &mut W, rows: &Rows) {
             let cell = cells.get(i).map(String::as_str).unwrap_or("");
             line.push_str(&pad(cell, *width, i == last));
         }
-        let _ = writeln!(out, "{}", line.trim_end());
+        writeln!(out, "{}", line.trim_end())?;
     }
+    Ok(())
 }
 
 /// Pads a cell to a column width; the last column is not padded.
@@ -210,7 +224,7 @@ mod tests {
     fn the_table_pads_columns() {
         let rows = sample_rows();
         let mut out = Vec::new();
-        write_table(&mut out, &rows);
+        write_table(&mut out, &rows).unwrap();
         let text = String::from_utf8(out).unwrap();
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines[0], "NAME   COUNT");
@@ -219,10 +233,25 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_write_is_reported() {
+        struct Closed;
+        impl Write for Closed {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let err = write_table(&mut Closed, &sample_rows()).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
+    }
+
+    #[test]
     fn an_empty_table_prints_nothing() {
         let rows = Rows::new(&["NAME"]);
         let mut out = Vec::new();
-        write_table(&mut out, &rows);
+        write_table(&mut out, &rows).unwrap();
         assert!(out.is_empty());
     }
 }

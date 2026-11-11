@@ -68,15 +68,15 @@ pub struct AddArgs {
 /// Runs a context command.
 pub fn run(cmd: &ContextCommand, format: Format, quiet: bool) -> Result<(), CtlError> {
     match cmd {
-        ContextCommand::Add(args) => add(args),
-        ContextCommand::Use { name } => use_context(name),
+        ContextCommand::Add(args) => add(args, quiet),
+        ContextCommand::Use { name } => use_context(name, quiet),
         ContextCommand::List => list(format, quiet),
-        ContextCommand::Delete { name } => delete(name),
+        ContextCommand::Delete { name } => delete(name, quiet),
     }
 }
 
 /// Adds a context and selects it when it is the first one.
-fn add(args: &AddArgs) -> Result<(), CtlError> {
+fn add(args: &AddArgs, quiet: bool) -> Result<(), CtlError> {
     let AddArgs {
         name,
         ssh,
@@ -98,13 +98,6 @@ fn add(args: &AddArgs) -> Result<(), CtlError> {
         // The plain-HTTP rule is checked at add time when there is no SSH
         // target to tunnel through.
         config::check_endpoint_policy(None, endpoint)?;
-    }
-
-    let mut config = config::load()?;
-    if config.contexts.contains_key(name) {
-        return Err(CtlError::Usage(format!(
-            "context `{name}` already exists; use `minga-ctl context delete {name}` first"
-        )));
     }
 
     let command = token_command.as_ref().map(|raw| {
@@ -132,50 +125,55 @@ fn add(args: &AddArgs) -> Result<(), CtlError> {
         registry_auth_file: registry_auth_file.clone(),
     };
 
-    let first = config.contexts.is_empty();
-    config.contexts.insert(name.clone(), context);
-    let selected = *use_current || first;
-    if selected {
-        config.current_context = Some(name.clone());
-    }
-    config::save(&config)?;
+    let selected = config::update(|config| {
+        if config.contexts.contains_key(name) {
+            return Err(CtlError::Usage(format!(
+                "context `{name}` already exists; use `minga-ctl context delete {name}` first"
+            )));
+        }
+        let selected = *use_current || config.contexts.is_empty();
+        config.contexts.insert(name.clone(), context);
+        if selected {
+            config.current_context = Some(name.clone());
+        }
+        Ok(selected)
+    })?;
 
     if selected {
-        println!("context `{name}` added and selected");
+        output::say(quiet, &format!("context `{name}` added and selected"))
     } else {
-        println!("context `{name}` added");
+        output::say(quiet, &format!("context `{name}` added"))
     }
-    Ok(())
 }
 
 /// Switches the current context.
-fn use_context(name: &str) -> Result<(), CtlError> {
-    let mut config = config::load()?;
-    if !config.contexts.contains_key(name) {
-        return Err(CtlError::ContextNotFound {
-            name: name.to_string(),
-        });
-    }
-    config.current_context = Some(name.to_string());
-    config::save(&config)?;
-    println!("context `{name}` selected");
-    Ok(())
+fn use_context(name: &str, quiet: bool) -> Result<(), CtlError> {
+    config::update(|config| {
+        if !config.contexts.contains_key(name) {
+            return Err(CtlError::ContextNotFound {
+                name: name.to_string(),
+            });
+        }
+        config.current_context = Some(name.to_string());
+        Ok(())
+    })?;
+    output::say(quiet, &format!("context `{name}` selected"))
 }
 
 /// Deletes a context; deleting the current one clears the selection.
-fn delete(name: &str) -> Result<(), CtlError> {
-    let mut config = config::load()?;
-    if config.contexts.remove(name).is_none() {
-        return Err(CtlError::ContextNotFound {
-            name: name.to_string(),
-        });
-    }
-    if config.current_context.as_deref() == Some(name) {
-        config.current_context = None;
-    }
-    config::save(&config)?;
-    println!("context `{name}` deleted");
-    Ok(())
+fn delete(name: &str, quiet: bool) -> Result<(), CtlError> {
+    config::update(|config| {
+        if config.contexts.remove(name).is_none() {
+            return Err(CtlError::ContextNotFound {
+                name: name.to_string(),
+            });
+        }
+        if config.current_context.as_deref() == Some(name) {
+            config.current_context = None;
+        }
+        Ok(())
+    })?;
+    output::say(quiet, &format!("context `{name}` deleted"))
 }
 
 /// Lists the contexts.

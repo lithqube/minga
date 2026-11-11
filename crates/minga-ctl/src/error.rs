@@ -105,9 +105,16 @@ impl CtlError {
                 Some("use --ssh user@HOST, or an https:// endpoint with --tls-cert".to_string())
             }
             CtlError::ConfigPermissions { path, .. } => Some(format!("chmod 600 {path}")),
-            CtlError::ConfigUnknownField { .. } => Some(
-                "tokens are not stored in the config; use remote_token_file or token_command"
-                    .to_string(),
+            CtlError::ConfigUnknownField { field, .. } => Some(
+                if ["token", "password", "secret"]
+                    .iter()
+                    .any(|word| field.to_ascii_lowercase().contains(word))
+                {
+                    "tokens are not stored in the config; use remote_token_file or token_command"
+                } else {
+                    "check the key name; `minga-ctl context add --help` lists the context keys"
+                }
+                .to_string(),
             ),
             CtlError::ConfigInvalid { .. } => None,
             CtlError::Output(_) => None,
@@ -203,6 +210,21 @@ mod tests {
         let text = reported.to_string();
         assert!(text.contains("refusing plain HTTP to 10.0.0.1"), "{text}");
         assert!(text.contains("--ssh"), "{text}");
+    }
+
+    #[test]
+    fn the_token_hint_is_only_for_token_fields() {
+        let hint = |field: &str| {
+            CtlError::ConfigUnknownField {
+                path: "config.yaml".into(),
+                field: field.into(),
+            }
+            .hint()
+            .unwrap()
+        };
+        assert!(hint("api_token").contains("tokens are not stored"));
+        assert!(hint("Password").contains("tokens are not stored"));
+        assert!(hint("metrics_endpointt").contains("check the key name"));
     }
 
     #[test]

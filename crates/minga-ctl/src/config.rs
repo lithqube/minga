@@ -172,26 +172,71 @@ pub fn create_private_dir(dir: &Path) -> Result<(), CtlError> {
     set_mode(dir, 0o700)
 }
 
-/// Writes a file with mode 0600, replacing any existing content.
+/// Writes a file with mode 0600, replacing any existing content atomically:
+/// the bytes go to a private temporary file beside it, which is synced and
+/// renamed over `path`. A failed write leaves the old file intact.
 pub fn write_private_file(path: &Path, bytes: &[u8]) -> Result<(), CtlError> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
 
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)
-        .map_err(|e| CtlError::ConfigInvalid {
-            path: display_path(path),
-            detail: e.to_string(),
-        })?;
-    file.write_all(bytes).map_err(|e| CtlError::ConfigInvalid {
+    let fail = |e: std::io::Error| CtlError::ConfigInvalid {
         path: display_path(path),
         detail: e.to_string(),
-    })?;
+    };
+    let mut tmp_name = path.file_name().unwrap_or_default().to_os_string();
+    tmp_name.push(format!(".tmp.{}", std::process::id()));
+    let tmp = path.with_file_name(tmp_name);
+
+    let written = (|| {
+        let _ = fs::remove_file(&tmp); // left by a crashed run with this pid
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        fs::rename(&tmp, path)
+    })();
+    if let Err(e) = written {
+        let _ = fs::remove_file(&tmp);
+        return Err(fail(e));
+    }
     set_mode(path, 0o600)
+}
+
+/// Loads the config, applies `change` and saves the result while holding an
+/// exclusive lock on `config.lock`, so two concurrent `context` commands
+/// cannot overwrite each other's change.
+pub fn update<T>(change: impl FnOnce(&mut Config) -> Result<T, CtlError>) -> Result<T, CtlError> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let dir = config_dir();
+    create_private_dir(&dir)?;
+    let lock_path = dir.join("config.lock");
+    let lock = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(&lock_path)
+        .map_err(|e| CtlError::ConfigInvalid {
+            path: display_path(&lock_path),
+            detail: e.to_string(),
+        })?;
+    // SAFETY: flock on a descriptor this function owns; released on close.
+    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        return Err(CtlError::ConfigInvalid {
+            path: display_path(&lock_path),
+            detail: std::io::Error::last_os_error().to_string(),
+        });
+    }
+    let mut config = load()?;
+    let result = change(&mut config)?;
+    save(&config)?;
+    drop(lock);
+    Ok(result)
 }
 
 /// Refuses a config file that group or others can read.
@@ -253,8 +298,13 @@ pub fn check_endpoint_policy(ssh: Option<&str>, endpoint: &str) -> Result<(), Ct
 
 /// Returns the host of a plain-HTTP endpoint that is not loopback.
 fn plain_http_host(endpoint: &str) -> Option<String> {
-    let rest = endpoint.strip_prefix("http://")?;
-    let authority = rest.split('/').next().unwrap_or("");
+    let (scheme, rest) = endpoint.split_once("://")?;
+    if !scheme.eq_ignore_ascii_case("http") {
+        return None;
+    }
+    // The authority ends at the first `/`, `?` or `#` (WHATWG URL), so
+    // `http://10.0.0.1?@localhost/` names 10.0.0.1, not localhost.
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
     let host = host_of(authority);
     if host.eq_ignore_ascii_case("localhost") || host == "::1" {
         return None;
@@ -435,6 +485,22 @@ contexts:
             CtlError::PlainHttp { host } => assert_eq!(host, "10.0.0.1"),
             other => panic!("expected a plain-HTTP error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_query_or_fragment_cannot_smuggle_a_loopback_host() {
+        for endpoint in [
+            "http://10.0.0.1:2375?@localhost/",
+            "http://10.0.0.1:2375#@127.0.0.1",
+            "http://10.0.0.1?x=1",
+            "HTTP://10.0.0.1:2375",
+        ] {
+            match check_endpoint_policy(None, endpoint) {
+                Err(CtlError::PlainHttp { host }) => assert_eq!(host, "10.0.0.1", "{endpoint}"),
+                other => panic!("{endpoint}: expected a plain-HTTP error, got {other:?}"),
+            }
+        }
+        assert!(check_endpoint_policy(None, "http://user@localhost:2375/v1.41?x=1").is_ok());
     }
 
     #[test]
