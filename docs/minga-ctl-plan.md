@@ -120,6 +120,14 @@ call to a person, there are no roles, and every operator needs an SSH account
 on a node. The local audit log is written by the operator's own machine, so it
 supports the sshd logs but is not independent evidence.
 
+**Revoking an operator.** The API token is shared, and anyone who can read the
+token file can keep a copy; minga-ctl not storing it is a habit of the tool,
+not a guarantee. Removing an operator from the unix group stops further reads
+of the file and nothing else: with SSH access and a retained token they can
+still forward the API port and use it. Revocation is therefore two steps:
+remove the SSH account (or its port forwarding), and rotate the token on the
+node. Phase 2 replaces the shared token with per-operator certificates.
+
 ### 2.3 Phase 2: mutual TLS, roles, audit and revisions on the server
 
 Outline only. Each item changes Minga and goes through an ADR
@@ -141,6 +149,14 @@ Outline only. Each item changes Minga and goes through an ADR
 - **Revisions.** The last settled specs of a service are kept in Raft state
   (they are desired state). `rollback=previous` is honored and `PreviousSpec`
   is returned. This replaces the local revision file.
+- **Update conflicts.** `Version.Index` changes on every update and the API
+  rejects a service update whose `version` is stale with 409. minga-ctl
+  already sends the version it read.
+- **Forced restarts.** The API keeps `TaskTemplate.ForceUpdate` and a change
+  to it replaces the service's tasks, which makes `service update --force`
+  possible.
+- **Resource ownership.** Networks, configs and secret metadata keep their
+  labels, so `stack rm` can tell which ones a stack created.
 - **minga-ctl.** A context gains `client_cert` and `client_key`. SSH is then
   needed only for the node-local commands.
 
@@ -152,7 +168,7 @@ and produce evidence; it cannot provide compliance by itself.
 | Criterion | Phase 1 supports it with | Phase 2 adds | Stays with the organisation |
 |---|---|---|---|
 | CC6.1 logical access | API reachable only on node loopback through SSH; no credentials stored on workstations | Client certificate per operator | SSH key issuance, MFA, device security |
-| CC6.2, CC6.3 provisioning and least privilege | Access is an SSH account plus group membership; removing either removes access. No roles. | `viewer`, `deployer`, `admin`; short-lived certificates | Joiner and leaver process, access reviews |
+| CC6.2, CC6.3 provisioning and least privilege | Access is an SSH account on a node. Group membership only controls who can read the token file. Revoking an operator means removing the SSH account (or its port forwarding) and rotating the shared token. No roles. | `viewer`, `deployer`, `admin`; short-lived certificates | Joiner and leaver process, access reviews |
 | CC6.6 boundary protection | API and metrics on loopback; client refuses plain HTTP off-host | TLS listener | Firewalls, bastion hosts |
 | CC6.7 data in transit | All remote traffic inside SSH; secret values on stdin only | TLS on the API | Key management |
 | CC7.2 monitoring | sshd logs (who, when, from where) plus the client audit log (what) | Server audit line per change, tied to the certificate identity | Log shipping, retention, alerting |
@@ -468,24 +484,28 @@ CURRENT  NAME   TRANSPORT                   ENDPOINT                         TOK
 minga-ctl stack deploy -c <file> [-p <profile>]... [--wait <secs>] <stack>
 minga-ctl stack ls
 minga-ctl stack ps <stack>
-minga-ctl stack rm <stack> [--yes]
+minga-ctl stack rm <stack> [--with <id>]... [--yes]
 ```
 
 **`deploy`** (`-c` default `compose.yaml`, `--wait` default `30`)
 
 1. `GET /v1.41/services?filters={"label":["com.docker.stack.namespace=<stack>"]}`
-   and save each existing service's `Spec` as its revision file.
+   and keep each existing service's `Spec` in memory.
 2. Run `minga deploy -c <file> [-p …] --wait <secs> --api-url <endpoint> <stack>`
    with `MINGA_API_TOKEN` in the child's environment. With SSH the endpoint is
    the tunnel's local URL. Output passes through.
-3. Exit code: 0 if `minga` exits 0, else 2.
+3. Read the services again, whether `minga` succeeded or not. For each service
+   whose `Spec` now differs from step 1, save the step 1 spec as its revision
+   file. A service the deploy did not change, or did not reach before failing,
+   keeps the revision file it had.
+4. Exit code: 0 if `minga` exits 0, else 2.
 
 `minga deploy` validates the compose file itself, and unknown keys fail there.
 
 ```
 $ minga-ctl stack deploy -c compose.yaml myapp
-saved revision for myapp.web, myapp.worker
 <output of minga deploy>
+saved revision for myapp.web (myapp.worker unchanged)
 ```
 
 **`ls`**: `GET /v1.41/services`, grouped by the label
@@ -526,18 +546,30 @@ myapp.worker.1.77b0d4aa myapp.worker  wrk1   running   running    -
 [{"id":"myapp.web.1.3f9a1c2e","service":"myapp.web","node":"mgr1","desired":"running","state":"running","health":"healthy"}]
 ```
 
-**`rm`**
+**`rm`** (`minga-ctl stack rm <stack> [--with <id>]... [--yes]`)
 
-1. List the stack's services as in `deploy` step 1. None: exit 3.
-2. List `GET /v1.41/networks`, `GET /v1.41/configs`, `GET /v1.41/secrets` and
-   keep entries whose ID starts with `<stack>_`. Skip an entry if another
-   existing stack with a longer name is also a prefix of it (stack `app` must
-   not remove `app_v2_net` when stack `app_v2` exists).
-3. Print everything that will be removed and ask for confirmation.
-4. `DELETE /v1.41/services/{id}` for each service, then
-   `DELETE /v1.41/networks/{id}`, `/configs/{id}`, `/secrets/{id}`. A 409 on a
-   network, config or secret is printed as a warning and does not fail the
-   command.
+Only services carry the stack label, so only services are known to belong to
+a stack. Minga keeps no labels on networks, configs or secrets; an ID that
+starts with `<stack>_` suggests the stack created it but does not prove it.
+`rm` therefore removes services, and removes other resources only when they
+are named.
+
+1. List the stack's services as in `deploy` step 1. None: exit 3, unless
+   `--with` is given.
+2. List `GET /v1.41/networks`, `GET /v1.41/configs`, `GET /v1.41/secrets`.
+   Entries whose ID starts with `<stack>_` are candidates.
+3. Check every `--with <id>`. It is refused (exit 1, nothing removed) unless
+   it is a candidate and no service outside the stack refers to it. Service
+   specs list their networks (`TaskTemplate.Networks[].Target`) and secrets
+   (`ContainerSpec.Secrets[].SecretID`).
+4. Print the services and the named resources that will be removed, and ask
+   for confirmation.
+5. `DELETE /v1.41/services/{id}` for each service, then
+   `DELETE /v1.41/networks/{id}`, `/configs/{id}` or `/secrets/{id}` for each
+   named resource. A 409 on a resource is printed as a warning and does not
+   fail the command.
+6. Print the candidates that were left in place, with the command to remove
+   them.
 
 Removing secret metadata does not remove secret files from nodes.
 
@@ -545,11 +577,16 @@ Removing secret metadata does not remove secret files from nodes.
 $ minga-ctl stack rm myapp
 This removes from context `prod`:
   services: myapp.web, myapp.worker
-  networks: myapp_default
-  secrets (metadata only): myapp_db_password
 Continue? [y/N] y
-removed 2 services, 1 network, 1 secret
+removed 2 services
+left in place (ownership cannot be confirmed):
+  network myapp_default
+  secret  myapp_db_password (metadata only)
+to remove them: minga-ctl stack rm myapp --with myapp_default --with myapp_db_password
 ```
+
+Once the services are gone, the same command with `--with` removes the named
+resources.
 
 ### 5.3 `service`
 
@@ -559,7 +596,7 @@ minga-ctl service ps <service>
 minga-ctl service logs <service> [-f] [--tail <n>]
 minga-ctl service scale <service> --replicas <n>
 minga-ctl service update <service> [--image <ref>] [--env-add <KEY=VALUE>]...
-                                   [--env-rm <KEY>]... [--replicas <n>] [--force]
+                                   [--env-rm <KEY>]... [--replicas <n>]
 minga-ctl service rollback <service> [--yes]
 ```
 
@@ -605,11 +642,13 @@ myapp.web.2.3f9a1c2e | listening on :8080
 
 1. `GET /v1.41/services/{id}`. If `Spec.Mode` has no `Replicated`, exit 1:
    ``error: service `shop.proxy` is global and cannot be scaled``.
-2. Save `Spec` as the revision file.
-3. Set `Spec.Mode.Replicated.Replicas` and
+2. Set `Spec.Mode.Replicated.Replicas` in a copy of the spec and
    `POST /v1.41/services/{id}/update?version=<Version.Index>` with the whole
    spec. The server ignores `version` today; it is sent so the call stays
    correct if the server starts checking it.
+3. Only after the API accepts the update, save the spec read in step 1 as the
+   revision file. If the POST fails, the revision file is left as it was, so
+   a rejected change never replaces the revision you can roll back to.
 
 ```
 $ minga-ctl service scale myapp.web --replicas 5
@@ -620,8 +659,8 @@ myapp.web scaled from 3 to 5
 {"service":"myapp.web","replicas":{"from":3,"to":5}}
 ```
 
-**`update`**: same read, save, edit, post sequence. At least one flag is
-required.
+**`update`**: same sequence as `scale`: read, edit, post, then save the
+revision. At least one flag is required.
 
 | Flag | Edit |
 |---|---|
@@ -629,10 +668,22 @@ required.
 | `--env-add KEY=VALUE` | Replace or append in `Spec.TaskTemplate.ContainerSpec.Env` |
 | `--env-rm KEY` | Remove from the same list |
 | `--replicas <n>` | As `scale` |
-| `--force` | Increment `Spec.TaskTemplate.ForceUpdate` |
 
 `--env-add` values are visible in process listings. Use Minga secrets for
 credentials.
+
+There is no `--force`. The API never reads `TaskTemplate.ForceUpdate`
+(`crates/minga-api/src/translate.rs` only writes it as `None`), and tasks are
+replaced only when the translated spec changes. A force-only update would
+report success and restart nothing, so the flag waits for a Minga change.
+
+**Concurrent changes.** The server ignores `version`, so it cannot reject a
+stale update. If two operators read the same spec and each posts an edit, the
+later post replaces the earlier one and neither is told. minga-ctl reads the
+spec immediately before it posts, which keeps the window to one round trip,
+and `rollback` reads again after its confirmation prompt. That narrows the
+window; it does not close it. Closing it needs the server to check `version`
+(section 2.3).
 
 ```
 $ minga-ctl service update myapp.web --image ghcr.io/acme/web:1.4.3
@@ -645,10 +696,14 @@ myapp.web updated: image ghcr.io/acme/web:1.4.2 -> ghcr.io/acme/web:1.4.3
 2. `GET /v1.41/services/{id}` (404: exit 3).
 3. Show what changes (image, replicas, number of changed environment keys)
    and ask for confirmation.
-4. `POST /v1.41/services/{id}/update?version=<Version.Index>` with the saved
+4. `GET /v1.41/services/{id}` again. If the spec differs from step 2, stop
+   with exit 2:
+   ``error: service `myapp.web` changed while waiting for confirmation; run rollback again``.
+5. `POST /v1.41/services/{id}/update?version=<Version.Index>` with the saved
    spec.
-5. On success, save the spec read in step 2 as the new revision file. A second
-   rollback therefore returns to where you started.
+6. On success, save the spec read in step 2 as the new revision file. A second
+   rollback therefore returns to where you started. If the POST fails, the
+   revision file is left as it was.
 
 The server applies it as a normal update, with the service's `UpdateConfig`.
 
@@ -976,8 +1031,13 @@ the "Node's Minga too old" error from section 4.4.
   round trip; if the API's two translations are not inverse, a scale would
   restart tasks.
 - Required: `scale` then `rollback` restores the original service.
-- Required: `stack rm app` leaves `app_v2_net` alone when stack `app_v2`
-  exists.
+- Required: `stack rm app` removes the stack's services and leaves
+  `app_default` and `app_shared` in place; `--with app_default` removes it;
+  `--with other_net` and `--with` of a network another stack's service uses
+  are refused with nothing removed.
+- Required: a `service scale` the API rejects leaves the revision file
+  unchanged, so `rollback` still restores the earlier spec.
+- Required: `rollback` stops when the service changes between its two reads.
 - A 401 from a server started with a token gives exit 2 and the hint text.
 - `tests/wrapped.rs` sets `MINGA_BIN` to a stub script that records its
   arguments, environment and stdin, and checks `stack deploy` and
@@ -1026,11 +1086,20 @@ Before each commit: `cargo fmt --all`, `cargo clippy --all-targets -- -D warning
 - `service scale`, `update` and `rollback` return when the API accepts the
   spec. They do not wait for the rollout; the API reports
   `UpdateStatus.State` as `completed` at all times.
-- `stack rm` finds networks, configs and secret metadata by ID prefix. A
-  network given an explicit `name:` in the compose file is stored under that
-  name (`network_create_to_state` sets the ID to the name), so `stack rm`
-  does not find it and leaves it in place. Resources created outside a stack
-  are never touched.
+- `stack rm` removes services only. Networks, configs and secret metadata
+  are removed when named with `--with`, because Minga keeps no record of
+  which stack created them. The `<stack>_` prefix check is a guard against
+  typing mistakes, not proof of ownership: a resource someone created by hand
+  as `app_shared` passes it. A network given an explicit `name:` in the
+  compose file is stored under that name (`network_create_to_state` sets the
+  ID to the name), fails the prefix check, and cannot be removed with
+  minga-ctl.
+- Two operators changing the same service at the same time can overwrite each
+  other without warning, because the server ignores `version` (section 5.3).
+- The API token is shared. Removing one operator's access means removing
+  their SSH account and rotating the token (section 2.2).
+- If minga-ctl stops between the API accepting an update and the revision
+  file being written, that change has no saved revision.
 - `registry` commands do nothing useful until Minga stores registry
   credentials and uses them when pulling (section 5.8). How the pull
   authenticates without exposing the credential is still open.
