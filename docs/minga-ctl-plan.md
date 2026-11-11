@@ -8,8 +8,9 @@ management. It is a separate binary from `minga` and works for any site that
 runs Minga.
 
 This plan is security-first. Phase 1 needs no change to Minga and is specified
-fully enough to implement. Phase 2 is server work and is outlined; it needs its
-own ADR before it starts.
+fully enough to implement, with one exception: registry login (section 5.8)
+needs a small change on the node side of Minga first. Phase 2 is server work
+and is outlined; it needs its own ADR before it starts.
 
 ## 1. What the code allows today
 
@@ -32,6 +33,7 @@ general. All routes are registered in `crates/minga-api/src/server.rs:91-136`.
 | `minga logs` reads NATS JetStream. Plain NATS is allowed only to loopback. | `main.rs:1670-1719`, `minga-cli/src/bus.rs:68-83` | Logs run on the node. |
 | `minga image pull` runs `ctr` on the machine it is called on. There is no `image ls` or `image rm`. | `main.rs:1740-1770` | Image commands run on the node. |
 | `minga secret put` reads stdin and writes a file in the local secret store. The API stores secret metadata only and rejects a non-empty `Data`. | `main.rs:624-647`, `handlers.rs:673` | Secret values never use the API. |
+| Image pulls are anonymous. `minga image pull` and the automatic pull before a task starts both run `ctr -n minga images pull <ref>` with no credentials. | `main.rs:1744`, `minga-node/src/containerd/runtime.rs:483` | Registry login needs a Minga change (section 5.8). |
 
 Two things the original brief asked for do not exist and are not faked: image
 pull latency and update count metrics.
@@ -98,12 +100,14 @@ phase 1 takes the API off the network instead.
    | Service, task, secret ID | `^[A-Za-z0-9][A-Za-z0-9._-]*$` |
    | Image reference | `^[A-Za-z0-9][A-Za-z0-9._:/@-]*$` |
    | Remote path | `^/[A-Za-z0-9._/-]+$` |
-9. Secret values are read from stdin only and piped to the remote command's
-   stdin. They are never placed in arguments, logs or the audit log.
+9. Secret values and registry credentials are read from stdin (or a no-echo
+   prompt) only and piped to the remote command's stdin. They are never placed
+   in arguments, logs or the audit log, and never written to the workstation.
 10. `--debug` prints method, path and status, and ssh command lines, to
     stderr. The `Authorization` header is printed as `Bearer <redacted>`.
 11. Commands that remove or replace things (`stack rm`, `image rm`,
-    `service rollback`) list what will change and ask for confirmation. With
+    `service rollback`, `registry logout`) list what will change and ask for
+    confirmation. With
     no terminal they fail unless `--yes` is given.
 12. Every command that changes state appends one line to a local audit log
     (section 4.5), on success and on failure.
@@ -175,6 +179,7 @@ path = "src/main.rs"
 chrono.workspace = true
 clap.workspace = true
 reqwest = { workspace = true, features = ["rustls-tls"] }
+rpassword.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true
@@ -192,6 +197,9 @@ Notes:
 - The workspace `reqwest` has no TLS backend; `rustls-tls` is added here for
   `https://` endpoints. Cargo unifies features, so a workspace build also links
   it into `minga`.
+- `rpassword` is the one new workspace dependency (`rpassword = "7"` in the
+  root `[workspace.dependencies]`). It reads the registry token without echo
+  and restores the terminal if the prompt is interrupted.
 - No runtime dependency on other Minga crates. Service specs are handled as
   `serde_json::Value`, so a spec is posted back exactly as it was read, with
   only the edited field changed.
@@ -212,6 +220,7 @@ crates/minga-ctl/
   src/output.rs      table / json / yaml / quiet
   src/state.rs       revision files and audit log
   src/cmd/context.rs stack.rs service.rs image.rs health.rs metrics.rs secret.rs
+          registry.rs
   tests/api.rs       against a real minga_api::ApiServer
   tests/wrapped.rs   wrapped commands against a stub MINGA_BIN
 ```
@@ -385,6 +394,8 @@ for 400, 415 and 422 request rejections) are shown as the message.
 | Config too open | ``error: ~/.config/minga-ctl/config.yaml is readable by group or others (mode 0644)`` then ``hint: chmod 600 ~/.config/minga-ctl/config.yaml`` | 1 |
 | Unknown config key | ``error: ~/.config/minga-ctl/config.yaml: unknown field `api_token` `` then ``hint: tokens are not stored in the config; use remote_token_file or token_command`` | 1 |
 | No terminal for a prompt | ``error: `stack rm` needs confirmation; pass --yes to run without a terminal`` | 1 |
+| No registry credential given | ``error: no credential on stdin for ghcr.io`` then ``hint: run in a terminal to be prompted, or pipe the token to stdin`` | 1 |
+| Node's Minga too old | ``error: `minga` on alice@mgr1.example.net has no `registry` command`` then ``hint: registry login needs a newer Minga on the node (see docs/minga-ctl-plan.md, section 5.8)`` | 2 |
 
 ### 4.5 State files
 
@@ -671,7 +682,8 @@ target is reported, the rest still run, and the exit code is 2.
 
 `minga` has no `image ls` or `image rm`, so those call `ctr` directly. The SSH
 user needs access to the containerd socket; minga-ctl does not call `sudo`.
-`minga image pull` supports anonymous registry access only.
+Pulls are anonymous unless the node holds a credential for the image's
+registry (section 5.8).
 
 ```
 $ minga-ctl image ls
@@ -804,6 +816,154 @@ myapp_db_password   myapp_db_password   2026-11-10T09:12:44Z
 [{"id":"myapp_db_password","name":"myapp_db_password","created":"2026-11-10T09:12:44Z"}]
 ```
 
+### 5.8 `registry`
+
+Logs nodes in to private container registries, so that both
+`minga-ctl image pull` and the automatic pull before a task starts can fetch
+private images. Node-local, like `secret put`: the credential goes to each
+node over SSH on stdin, never through the API, and is never stored on the
+workstation.
+
+```
+minga-ctl registry login <registry> [--username <user>] [--key-file <path>]
+                                    [--password-stdin] [--verify <image ref>]
+                                    [--ssh <target>]...
+minga-ctl registry logout <registry> [--ssh <target>]... [--yes]
+minga-ctl registry list [--ssh <target>]...
+```
+
+Targets are chosen as in section 5.4. A credential must be on every node that
+can run the service; `list` shows which nodes have it.
+
+**Registry names.** `<registry>` is a short name or a host. Known registries
+get a hint that says which credential to create and the smallest scope that
+can pull.
+
+| You type | Host stored | Username | Credential the hint asks for |
+|---|---|---|---|
+| `dockerhub`, `docker.io` | `docker.io` | Docker ID | Access token with the Read-only permission |
+| `ghcr`, `github`, `ghcr.io` | `ghcr.io` | GitHub user name | Personal access token (classic) with only `read:packages` |
+| a host ending in `-docker.pkg.dev`, or `gcr.io`, `*.gcr.io` | as typed | `_json_key`, set automatically | Service account key (JSON) with the Artifact Registry Reader role, passed with `--key-file` |
+| any other `host[:port]` | as typed | asked | Whatever the registry issues, read-only if it has scopes |
+
+A host must match `^[A-Za-z0-9][A-Za-z0-9.-]*(:[0-9]+)?$` and a username
+`^[A-Za-z0-9_][A-Za-z0-9._@-]*$`.
+
+**`login`**
+
+1. Resolve the name to a host and print the hint for that registry.
+2. Username: `--username`, else a prompt. Google registries need no username.
+3. Credential, first match wins:
+   - `--key-file <path>`: the file's contents (Google service account key).
+   - stdin, when stdin is not a terminal. `--password-stdin` is accepted so
+     the `docker login` habit works; it changes nothing.
+   - a prompt without echo, when stdin is a terminal.
+
+   There is no `--password` flag. An empty credential is exit 1.
+4. On each target run `minga registry login <host> --username <user>` with the
+   credential on its stdin. Each target is reported separately; a failure on
+   any target gives exit 2.
+5. With `--verify <image ref>`, run `minga image pull <ref>` on each target
+   and report the result. The reference's host must be the registry just
+   logged in to, else exit 1 before anything is stored.
+6. Append the audit line: host, username and targets. Never the credential.
+
+Running `login` again replaces the stored credential. It takes effect at the
+next pull; nothing is restarted.
+
+```
+$ minga-ctl registry login ghcr --verify ghcr.io/acme/web:1.4.2
+GitHub Container Registry (ghcr.io)
+Create a personal access token (classic) with only the read:packages scope.
+Username: acme-deploy
+Token:
+alice@mgr1.example.net  stored    pull ok
+alice@wrk1.example.net  stored    pull ok
+```
+
+```
+$ minga-ctl registry login europe-west1-docker.pkg.dev --key-file pull-sa.json
+Google Artifact Registry (europe-west1-docker.pkg.dev)
+Use a service account key with the Artifact Registry Reader role.
+alice@mgr1.example.net  stored
+alice@wrk1.example.net  stored
+```
+
+```
+$ op read op://infra/dockerhub/pull-token | minga-ctl registry login dockerhub --username acmebot
+```
+
+```json
+[{"node":"alice@mgr1.example.net","registry":"ghcr.io","username":"acme-deploy","stored":true,"verified":true}]
+```
+
+**`logout`**: asks for confirmation, then runs `minga registry logout <host>`
+on each target. A node that has no credential for the host is reported as
+`not logged in` and is not an error.
+
+**`list`**: runs `minga registry ls` on each target. It shows no secrets.
+
+```
+$ minga-ctl registry list
+NODE                    REGISTRY                      USERNAME      UPDATED
+alice@mgr1.example.net  ghcr.io                       acme-deploy   2026-11-11T14:02:10Z
+alice@mgr1.example.net  europe-west1-docker.pkg.dev   _json_key     2026-11-11T14:05:41Z
+alice@wrk1.example.net  ghcr.io                       acme-deploy   2026-11-11T14:02:11Z
+```
+
+```json
+[{"node":"alice@mgr1.example.net","registry":"ghcr.io","username":"acme-deploy","updated":"2026-11-11T14:02:10Z"}]
+```
+
+In the example `wrk1` has no Google credential, so a task placed there cannot
+pull from that registry.
+
+**What Minga must add first.** minga-ctl only carries the credential to the
+node. Minga has to store it and use it:
+
+- `minga registry login <host> --username <user> [--registry-auth-dir <dir>]`
+  reads the credential from stdin, the same way `minga secret put` does.
+- `minga registry logout <host>` and `minga registry ls`. `ls` prints one line
+  per registry, `host<TAB>username<TAB>updated_at`, and never the credential.
+- Storage: one file per host in `/var/lib/minga/registry-auth` (directory 0700,
+  files 0600, written to a temporary file and renamed).
+  `SecretStore::put` in `crates/minga-node/src/secrets.rs` already writes
+  files this way and can be pointed at that directory. It is a separate
+  directory from the secret store so a registry credential can never be
+  mounted into a task as a Compose secret. Record:
+
+  ```json
+  {"host":"ghcr.io","username":"acme-deploy","secret":"…","updated_at":"2026-11-11T14:02:10Z"}
+  ```
+- Both pull call sites (`crates/minga-cli/src/main.rs:1744` and
+  `crates/minga-node/src/containerd/runtime.rs:483`) look up the host of the
+  image reference and authenticate when a credential is stored.
+  `index.docker.io` and `registry-1.docker.io` are treated as `docker.io`.
+- The credential must not appear in a command line, in another process's
+  environment, or in a log line. `ctr images pull --user <user>:<secret>` puts
+  it on the command line, where every local user of the node can read it while
+  the pull runs, so it is not acceptable as it stands.
+
+**Open point.** How the pull authenticates without exposing the credential is
+not decided here. It belongs to the Minga change and has to be checked against
+the containerd version Minga pins. Candidates: answer `ctr`'s password prompt
+from the parent process, or pull through containerd's gRPC API, which Minga
+already uses to run containers.
+
+Until a node runs a Minga with these commands, `registry` commands fail with
+the "Node's Minga too old" error from section 4.4.
+
+**Limits**
+
+- Credentials that expire within hours stop working when they expire.
+  minga-ctl does not refresh them. This covers AWS ECR login passwords and
+  Google access tokens (`oauth2accesstoken`). Use long-lived, read-only pull
+  credentials.
+- There is no import from `~/.docker/config.json`. Personal Docker logins are
+  often read-write, and copying them to production nodes is the wrong default.
+- The credential is stored in clear text on the node, protected by file
+  permissions, as node-local secrets are.
+
 ## 6. Tests and build order
 
 **Tests**
@@ -823,6 +983,11 @@ myapp_db_password   myapp_db_password   2026-11-10T09:12:44Z
   arguments, environment and stdin, and checks `stack deploy` and
   `secret put`: the token arrives in the environment, the secret value on
   stdin, and neither in the arguments.
+- `tests/wrapped.rs` also checks `registry login`: the credential arrives on
+  the stub's stdin and in neither its arguments nor its environment; `ghcr`
+  resolves to `ghcr.io`; a `-docker.pkg.dev` host sends the username
+  `_json_key`; `--verify` with a reference on another host exits 1 before
+  the stub is called.
 - Unit tests: token and endpoint precedence; refusal of a config with mode
   0644 and of an unknown key; plain-HTTP refusal for a non-loopback host;
   validation and quoting of remote arguments (including a target starting
@@ -840,6 +1005,7 @@ myapp_db_password   myapp_db_password   2026-11-10T09:12:44Z
 4. `state.rs`; `service scale`, `update`, `rollback`; `stack rm`.
 5. Wrapped commands: `stack deploy`, `service logs`, `image`, `secret put`.
 6. `health`, `metrics`.
+7. `registry`, once the Minga change in section 5.8 has landed.
 
 Before each commit: `cargo fmt --all`, `cargo clippy --all-targets -- -D warnings`,
 `cargo test`.
@@ -865,5 +1031,8 @@ Before each commit: `cargo fmt --all`, `cargo clippy --all-targets -- -D warning
   name (`network_create_to_state` sets the ID to the name), so `stack rm`
   does not find it and leaves it in place. Resources created outside a stack
   are never touched.
-- Not included: node commands, events, waiting for rollouts, registry
-  credentials for `image pull`, client certificates (phase 2).
+- `registry` commands do nothing useful until Minga stores registry
+  credentials and uses them when pulling (section 5.8). How the pull
+  authenticates without exposing the credential is still open.
+- Not included: node commands, events, waiting for rollouts, refresh of
+  short-lived registry credentials, client certificates (phase 2).
