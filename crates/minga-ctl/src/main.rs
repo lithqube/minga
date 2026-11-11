@@ -47,6 +47,10 @@ enum Command {
     /// List secret metadata.
     #[command(subcommand)]
     Secret(cmd::secret::SecretCommand),
+    /// Check the API, and optionally a stack's services.
+    Health(cmd::health::HealthArgs),
+    /// Show the Prometheus metrics the cluster reports.
+    Metrics,
 }
 
 /// The output format after `--json` is folded in.
@@ -102,6 +106,14 @@ fn run(cli: &Cli) -> Result<(), CtlError> {
         Command::Secret(cmd) => api::block_on(async {
             let conn = connect(cli).await?;
             cmd::secret::run(cmd, &conn, format, quiet).await
+        }),
+        Command::Health(args) => api::block_on(async {
+            let conn = connect(cli).await?;
+            cmd::health::run(args, &conn, format, quiet).await
+        }),
+        Command::Metrics => api::block_on(async {
+            let conn = connect(cli).await?;
+            cmd::metrics::run(&conn, format, quiet).await
         }),
     }
 }

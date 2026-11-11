@@ -29,6 +29,9 @@ pub enum CtlError {
     /// The API answered with an error. Exit 2.
     #[error("API error {status}: {message}")]
     Api { status: u16, message: String },
+    /// `health` ran and at least one check was not `ok`. Exit 2.
+    #[error("{failed} health check(s) not ok")]
+    HealthFailed { failed: usize },
     /// A write stopped because the cluster changed under it, or a step after
     /// an accepted change failed. Exit 2.
     #[error("{0}")]
@@ -83,6 +86,7 @@ impl CtlError {
             CtlError::Unreachable { .. }
             | CtlError::Ssh { .. }
             | CtlError::Auth { .. }
+            | CtlError::HealthFailed { .. }
             | CtlError::Api { .. }
             | CtlError::Halted(_) => 2,
             CtlError::NotFound { .. } | CtlError::ContextNotFound { .. } => 3,
@@ -104,6 +108,7 @@ impl CtlError {
                     .to_string(),
             ),
             CtlError::Api { .. } | CtlError::Halted(_) => None,
+            CtlError::HealthFailed { .. } => None,
             CtlError::NotFound { kind, .. } => (*kind == "revision").then(|| {
                 "rollback covers only changes made with minga-ctl on this machine".to_string()
             }),
@@ -172,6 +177,11 @@ mod tests {
             .exit_code(),
             2
         );
+    }
+
+    #[test]
+    fn a_failed_health_check_exits_two() {
+        assert_eq!(CtlError::HealthFailed { failed: 1 }.exit_code(), 2);
     }
 
     #[test]
