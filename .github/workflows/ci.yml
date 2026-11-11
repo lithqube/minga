@@ -46,8 +46,11 @@ jobs:
 
       - name: Install containerd
         run: |
-          sudo apt-get update
-          sudo apt-get install -y containerd
+          # shortcut: when the runner cannot reach the Ubuntu archive, use the
+          # containerd the runner image already ships; remove once apt is reliable.
+          if ! (sudo apt-get update && sudo apt-get install -y containerd); then
+            echo "::warning::apt install failed; using the runner image's containerd"
+          fi
           sudo systemctl start containerd
           containerd --version
 
