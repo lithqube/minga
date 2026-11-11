@@ -195,7 +195,7 @@ jobs:
         uses: softprops/action-gh-release@v3
         with:
           generate_release_notes: true
-          # A tag with a hyphen (v1.0.1-rc.1) is a pre-release, so /releases/latest skips it.
+          # Stable tags publish the versioned image, major.minor, and latest.
           prerelease: ${{ contains(github.ref_name, '-') }}
           files: |
             dist/minga-*.tar.gz

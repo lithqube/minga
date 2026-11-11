@@ -54,7 +54,7 @@ export function readmeSection(heading: string): string {
   return lines.slice(start, end < 0 ? undefined : end).join('\n');
 }
 
-/** The README's "Not in v0.1.0" list plus the caveat line after it, as markdown. */
+/** The README's "Not in vX.Y.Z" list plus its caveat line, as markdown. */
 export function readmeLimits(): { items: string[]; note: string } {
   const quote = readRepo('README.md')
     .split('\n')
