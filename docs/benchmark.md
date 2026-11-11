@@ -1,9 +1,12 @@
 # Minga vs Docker Compose vs Docker Swarm — resource benchmark
 
 **Date:** 2026-11-11  
-**Methodology:** Live measurement on identical ARM64 hardware (Hetzner CAX series,
-Ubuntu 24.04 LTS, Ampere Altra) during normal steady-state operation.
-No load testing — idle/low-traffic baseline only.
+**Methodology:** Live measurement on Hetzner CAX-series ARM64 (Ampere Altra,
+Ubuntu 24.04 LTS) during normal steady-state operation. The hardware is not
+identical: Env A and Env B run on CAX21 (4 vCPU, 8 GB), Env C on CAX31
+(8 vCPU, 16 GB). No load testing — idle/low-traffic baseline only.
+Minga's control plane is counted as `minga manager` + `minga api` + its
+`nats-server` sidecar, since Swarm's messaging runs inside `dockerd`.
 
 > All company and product names have been redacted. The three environments are
 > referred to as **Env A** (Minga, single-node), **Env B** (Docker Compose,
@@ -14,10 +17,10 @@ No load testing — idle/low-traffic baseline only.
 
 ## Visual comparison
 
-### Orchestration layer memory (MB RSS, idle)
+### Orchestration layer memory (MB RSS, idle; Minga includes its NATS sidecar)
 
 ```
-Minga (A)          ██████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░  42 MB
+Minga (A)          ██████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░  59 MB
 Docker Compose (B) ████████████████░░░░░░░░░░░░░░░░░░░░░░░░  101 MB
 Docker Swarm (C)   ██████████████████████████████████████████████████  311 MB
                    0        50       100      150      200      250      300+ MB
@@ -26,7 +29,7 @@ Docker Swarm (C)   ████████████████████�
 ### Total runtime overhead (orchestrator + containerd, MB RSS)
 
 ```
-Minga (A)          ████████████████░░░░░░░░░░░░░░░░░░░░░░░░  102 MB
+Minga (A)          ███████████████████░░░░░░░░░░░░░░░░░░░░░  119 MB
 Docker Compose (B) ███████████████████████████░░░░░░░░░░░░░  169 MB
 Docker Swarm (C)   ██████████████████████████████████████████████████████████████  377 MB
                    0        50       100      150      200      250      300      350+ MB
@@ -47,7 +50,7 @@ xychart-beta
     title "Orchestration layer memory (MB RSS, idle)"
     x-axis ["Minga (A)", "Docker Compose (B)", "Docker Swarm (C)"]
     y-axis "MB RSS" 0 --> 400
-    bar [42, 101, 311]
+    bar [59, 101, 311]
 ```
 
 ```mermaid
@@ -55,7 +58,7 @@ xychart-beta
     title "Total runtime overhead — orchestrator + containerd (MB RSS)"
     x-axis ["Minga (A)", "Docker Compose (B)", "Docker Swarm (C)"]
     y-axis "MB RSS" 0 --> 400
-    bar [102, 169, 377]
+    bar [119, 169, 377]
 ```
 
 ---
@@ -117,9 +120,10 @@ xychart-beta
 
 ### 1. Minga control plane is lighter than dockerd
 
-Minga's two-process design (manager + api) uses **42 MB RSS** combined, vs
-**101 MB** for Docker Compose's `dockerd` and **311 MB** for Docker Swarm's
-manager daemon. The gap widens significantly with Swarm because Swarm's manager
+Minga's two processes (manager + api) use **42 MB RSS** combined, and
+**59 MB** with the NATS sidecar that carries their messaging, vs **101 MB**
+for Docker Compose's `dockerd` and **311 MB** for Docker Swarm's manager
+daemon. The gap widens significantly with Swarm because Swarm's manager
 carries Raft state, the overlay network manager, and the service scheduler all
 inside `dockerd`.
 
@@ -136,7 +140,7 @@ At 20+ published ports this difference compounds.
 ### 3. Swarm manager carries significant overhead
 
 The Swarm manager (`dockerd` with `--swarm-mode`) uses **311 MB** on the
-measurement node — 7× Minga's control plane. This includes Raft log state,
+measurement node — about 5× Minga's control plane (59 MB with NATS). This includes Raft log state,
 the overlay VXLAN manager, and heartbeat handling across all 3 nodes.
 On a 3-node cluster the two worker nodes add ~65 MB `dockerd` each.
 
@@ -153,8 +157,8 @@ through in-process goroutines (included in the 311 MB figure).
 
 | Metric                   | Minga                         | Docker Compose | Docker Swarm (manager) |
 | ------------------------ | ----------------------------- | -------------- | ---------------------- |
-| Orchestration RAM        | **42 MB**                     | 101 MB         | 311 MB                 |
-| + runtime (containerd)   | **102 MB total**              | 169 MB total   | 377 MB total           |
+| Orchestration RAM        | **59 MB** (incl. NATS)        | 101 MB         | 311 MB                 |
+| + runtime (containerd)   | **119 MB total**              | 169 MB total   | 377 MB total           |
 | Port proxies             | **0**                         | 1 per port     | 1 per port             |
 | Control-plane CPU (idle) | **~0%**                       | ~0%            | ~0%                    |
 | Multi-node support       | Single-node v1.0.1 (mesh WIP) | No             | Yes (3+ nodes)         |
@@ -168,8 +172,12 @@ through in-process goroutines (included in the 311 MB figure).
 - **Sample size:** single-point measurements, not statistical averages.
 - **Uptime bias:** Env A was 9h old; Env B/C were weeks old. Memory fragmentation
   and log accumulation in dockerd grow over time.
-- **Workload difference:** Env B runs more containers (24 vs 4), which dominates
-  total RAM numbers but not orchestration-layer numbers.
+- **Workload difference:** the environments do not run matched workloads.
+  Env A runs 4 containers, Env B 24, and Env C 8 on the measured node
+  (18 services cluster-wide). The workload dominates total RAM. Daemon memory
+  also grows with the containers and services it manages, so part of the
+  orchestration-layer gap may come from the workload, not the orchestrator.
+  These measurements do not separate the two; a matched-workload run would.
 - **Minga v1.0.1 limitations:** no cross-node networking yet; single-node only.
   A fair Swarm multi-node comparison requires Minga with the WireGuard mesh
   (roadmap item).
@@ -181,8 +189,11 @@ through in-process goroutines (included in the 311 MB figure).
 
 ## Conclusion
 
-For single-node deployments, Minga's control plane uses **~60% less memory**
-than `dockerd` (Docker Compose) and **~73% less** than `dockerd` in Swarm mode.
+For single-node deployments, Minga's control plane (59 MB with its NATS
+sidecar) uses **~42% less memory** than `dockerd` (Docker Compose, 101 MB) and
+**~81% less** than `dockerd` in Swarm mode (311 MB). Counting containerd too,
+the totals are 119 vs 169 MB (~30% less) and 119 vs 377 MB (~68% less).
+With unmatched workloads (see Caveats), treat these as upper bounds.
 The absence of `docker-proxy` processes removes per-port overhead at scale.
 
 For multi-node production use cases, Docker Swarm currently has an availability
@@ -252,5 +263,6 @@ primary credibility risk. 6 of the 8 are fixed in v1.0.2.
 
 **Summary:** Technically sound architecture, v1.0.1 needed hardening before real
 workloads. With v1.0.2 fixes merged, it becomes a viable choice for single-node edge
-deployments. The 60–73% memory advantage over Docker/Swarm is real. Recommend
+deployments. The memory advantage is real: ~42% less than `dockerd` and ~81% less than a
+Swarm manager for the control plane, before workload differences. Recommend
 tracking the WireGuard mesh milestone before adopting for multi-node production.
