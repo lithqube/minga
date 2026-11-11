@@ -82,16 +82,21 @@ phase 1 takes the API off the network instead.
 **Client behaviour:**
 
 1. A context names an SSH target. For API calls minga-ctl starts the system
-   `ssh` client with a local forward and talks HTTP to the forwarded port:
+   `ssh` client with a local forward to a Unix socket in a new 0700
+   directory:
 
    ```
    ssh -N -o ExitOnForwardFailure=yes \
-       -L 127.0.0.1:<free port>:127.0.0.1:2375 \
-       [-L 127.0.0.1:<free port 2>:127.0.0.1:9100] -- <target>
+       -L <dir>/api.sock:127.0.0.1:2375 \
+       [-L <dir>/metrics.sock:127.0.0.1:9100] -- <target>
    ```
 
-   It waits until the local port accepts a connection (10 s limit) or the
+   It waits until the socket accepts a connection (10 s limit) or the
    child exits, and kills the child when the command ends (`kill_on_drop`).
+   minga-ctl then listens on `127.0.0.1:0` itself and relays each connection
+   to the socket. A free TCP port handed to `ssh` would be released first,
+   and another local user who reads the port from `ps` could bind it before
+   `ssh` does and receive the token.
 2. Keys, agent, host-key checking, jump hosts and MFA belong to the operator's
    ssh configuration. minga-ctl never reads keys, never sets
    `StrictHostKeyChecking`, and does not set `BatchMode`, so interactive MFA

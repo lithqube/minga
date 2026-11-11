@@ -7,6 +7,7 @@ use clap::{Args, Subcommand};
 use crate::config::{self, Context, TokenSource};
 use crate::error::CtlError;
 use crate::output::{self, Format, Rows};
+use crate::transport;
 
 /// Context commands. Local file only; no API call.
 #[derive(Debug, Subcommand)]
@@ -93,6 +94,12 @@ fn add(args: &AddArgs, quiet: bool) -> Result<(), CtlError> {
 
     if name.is_empty() {
         return Err(CtlError::Usage("a context needs a name".to_string()));
+    }
+    for target in ssh.iter().chain(nodes) {
+        transport::validate_target(target)?;
+    }
+    if let Some(path) = remote_token_file {
+        transport::validate_remote_path(path)?;
     }
     if ssh.is_none() {
         // The plain-HTTP rule is checked at add time when there is no SSH
