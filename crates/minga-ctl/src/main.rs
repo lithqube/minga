@@ -3,9 +3,10 @@
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use minga_ctl::cmd;
+use minga_ctl::api::{self, ApiClient};
 use minga_ctl::error::CtlError;
 use minga_ctl::output::Format;
+use minga_ctl::{cmd, config};
 
 /// Companion CLI for Minga: contexts, stack and service operations, health,
 /// metrics and release management.
@@ -36,6 +37,15 @@ enum Command {
     /// Manage named contexts.
     #[command(subcommand)]
     Context(cmd::context::ContextCommand),
+    /// List stacks and their tasks.
+    #[command(subcommand)]
+    Stack(cmd::stack::StackCommand),
+    /// List services and their tasks.
+    #[command(subcommand)]
+    Service(cmd::service::ServiceCommand),
+    /// List secret metadata.
+    #[command(subcommand)]
+    Secret(cmd::secret::SecretCommand),
 }
 
 /// The output format after `--json` is folded in.
@@ -65,9 +75,29 @@ fn main() -> ExitCode {
 
 /// Runs the selected command.
 fn run(cli: &Cli) -> Result<(), CtlError> {
+    let (format, quiet) = (cli.format(), cli.quiet);
     match &cli.command {
-        Command::Context(cmd) => cmd::context::run(cmd, cli.format(), cli.quiet),
+        Command::Context(cmd) => cmd::context::run(cmd, format, quiet),
+        Command::Stack(cmd) => {
+            let client = api_client(cli)?;
+            api::block_on(cmd::stack::run(cmd, &client, format, quiet))
+        }
+        Command::Service(cmd) => {
+            let client = api_client(cli)?;
+            api::block_on(cmd::service::run(cmd, &client, format, quiet))
+        }
+        Command::Secret(cmd) => {
+            let client = api_client(cli)?;
+            api::block_on(cmd::secret::run(cmd, &client, format, quiet))
+        }
     }
+}
+
+/// The API client for the selected context.
+fn api_client(cli: &Cli) -> Result<ApiClient, CtlError> {
+    let config = config::load()?;
+    let resolved = config::resolve(&config, cli.context.as_deref())?;
+    ApiClient::direct(&resolved, cli.debug)
 }
 
 #[cfg(test)]
