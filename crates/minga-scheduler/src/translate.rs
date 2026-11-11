@@ -260,6 +260,22 @@ fn translate_service(
     // Translate restart policy from Compose deploy.restart_policy.
     let restart_policy = translate_restart_policy(&deploy.restart_policy, &svc.restart);
 
+    // extra_hosts: resolve "host-gateway" to the host's default route IP.
+    let extra_hosts: Vec<(String, String)> = svc
+        .extra_hosts
+        .0
+        .iter()
+        .map(|(host, ip_opt)| {
+            let raw = ip_opt.as_deref().unwrap_or("");
+            let ip = if raw == "host-gateway" {
+                host_gateway_ip()
+            } else {
+                raw.to_string()
+            };
+            (host.clone(), ip)
+        })
+        .collect();
+
     Ok(Service {
         id: format!("{stack}.{name}"),
         name: name.to_string(),
@@ -280,6 +296,7 @@ fn translate_service(
         healthcheck,
         mounts,
         user: svc.user.clone(),
+        extra_hosts,
         update,
         rollback: match &deploy.rollback_config {
             None => None,
@@ -539,6 +556,30 @@ fn config_id(stack: &str, name: &str) -> String {
 }
 
 // --- memory parsing -----------------------------------------------------------
+
+/// Returns the host's default route IP for the `host-gateway` extra_hosts alias.
+/// Reads `/proc/net/route` on Linux; falls back to `172.17.0.1` on other platforms.
+fn host_gateway_ip() -> String {
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(content) = std::fs::read_to_string("/proc/net/route") {
+            for line in content.lines().skip(1) {
+                let cols: Vec<&str> = line.split_whitespace().collect();
+                // Default route: Destination == 00000000
+                if cols.get(1) == Some(&"00000000") {
+                    if let Some(gw_hex) = cols.get(2) {
+                        if let Ok(n) = u32::from_str_radix(gw_hex, 16) {
+                            let b = n.to_le_bytes();
+                            return format!("{}.{}.{}.{}", b[0], b[1], b[2], b[3]);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // shortcut: returns 172.17.0.1 when /proc/net/route is unavailable or not Linux
+    "172.17.0.1".to_string()
+}
 
 /// Parses a Compose memory string into bytes.
 ///

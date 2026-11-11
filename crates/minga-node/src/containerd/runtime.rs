@@ -360,9 +360,25 @@ impl ContainerdRuntime {
             "containerd: task network prepared"
         );
 
+        // Write a per-task /etc/hosts file if the spec has extra_hosts entries.
+        let hosts_path = if spec.extra_hosts.is_empty() {
+            None
+        } else {
+            let hosts_file = netns.resolv_conf.with_extension("hosts");
+            let mut content = "127.0.0.1\tlocalhost\n::1\tlocalhost\n".to_string();
+            for (host, ip) in &spec.extra_hosts {
+                content.push_str(&format!("{ip}\t{host}\n"));
+            }
+            tokio::fs::write(&hosts_file, &content)
+                .await
+                .map_err(|e| RuntimeError::Start(format!("write hosts: {e}")))?;
+            Some(hosts_file)
+        };
+
         Ok(Some(oci::NetworkSpec {
             netns_path: netns.netns_path.display().to_string(),
             resolv_conf: Some(netns.resolv_conf),
+            hosts_path,
         }))
     }
 

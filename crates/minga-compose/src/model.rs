@@ -70,9 +70,41 @@ pub struct Service {
     pub tmpfs: Option<StringOrList>,
     pub ulimits: IndexMap<String, Ulimit>,
     pub logging: Option<Logging>,
+    pub env_file: Vec<EnvFile>,
+    pub extra_hosts: ListOrMap,
     /// This service's `x-` keys.
     #[serde(skip)]
     pub extensions: IndexMap<String, Value>,
+}
+
+/// One entry in `env_file`: a path plus an optional `required` flag (default true).
+/// Accepts both the short form (`- path/to/file`) and the long form
+/// (`- path: path/to/file\n  required: false`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct EnvFile {
+    pub path: String,
+    pub required: bool,
+}
+
+impl<'de> Deserialize<'de> for EnvFile {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        match Value::deserialize(d)? {
+            Value::String(s) => Ok(Self { path: s, required: true }),
+            Value::Mapping(m) => {
+                let path = m.get("path")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| D::Error::missing_field("path"))?
+                    .to_string();
+                let required = m.get("required")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true);
+                Ok(Self { path, required })
+            }
+            other => Err(D::Error::custom(format!(
+                "env_file entry must be a string or {{path, required}}, got {other:?}"
+            ))),
+        }
+    }
 }
 
 /// `command`, `entrypoint`, `tmpfs` and `healthcheck.test`: one string or a list.

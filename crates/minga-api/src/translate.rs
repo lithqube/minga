@@ -323,6 +323,7 @@ pub fn service_spec_to_state(spec: &models::ServiceSpec) -> Result<Service, Stri
         healthcheck,
         mounts,
         user,
+        extra_hosts: vec![],
         update,
         rollback,
         previous: None,

@@ -195,6 +195,8 @@ pub struct NetworkSpec {
     pub netns_path: String,
     /// Per-task resolv.conf to bind-mount read-only at /etc/resolv.conf.
     pub resolv_conf: Option<std::path::PathBuf>,
+    /// Per-task hosts file (extra_hosts entries) to bind-mount at /etc/hosts.
+    pub hosts_path: Option<std::path::PathBuf>,
 }
 
 /// Generate an OCI runtime spec from a Minga task spec.
@@ -226,6 +228,19 @@ pub fn spec_from_task_with_secrets(
                 destination: "/etc/resolv.conf".to_string(),
                 mount_type: "bind".to_string(),
                 source: resolv.display().to_string(),
+                options: vec![
+                    "bind".to_string(),
+                    "ro".to_string(),
+                    "nosuid".to_string(),
+                    "nodev".to_string(),
+                ],
+            });
+        }
+        if let Some(hosts) = &net.hosts_path {
+            oci.mounts.push(OciMount {
+                destination: "/etc/hosts".to_string(),
+                mount_type: "bind".to_string(),
+                source: hosts.display().to_string(),
                 options: vec![
                     "bind".to_string(),
                     "ro".to_string(),
