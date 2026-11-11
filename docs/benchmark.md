@@ -225,28 +225,30 @@ and deprecated fields).
 
 ### Production blockers found in v1.0.1
 
-| Issue                                          | Severity                                            | Status          |
-| ---------------------------------------------- | --------------------------------------------------- | --------------- |
-| `env_file` not supported                       | High — used in nearly every real stack              | Fixed in v1.0.2 |
-| Named `user:` rejected                         | High — ZITADEL, Python services use named users     | Fixed in v1.0.2 |
-| `ctr images unpack` removed in containerd v2.2 | High — silent deploy failure on Ubuntu 24.04        | Fixed in v1.0.2 |
-| Orphan tasks persist across restarts           | High — requires manual containerd cleanup           | Fixed in v1.0.2 |
-| `extra_hosts` not supported                    | Medium                                              | Fixed in v1.0.2 |
-| `command: >` folded scalar not argv-split      | Medium — breaks multi-line commands                 | Open            |
-| `~/.docker/config.json` not read by `ctr`      | Medium — private registries require manual pre-pull | Fixed in v1.0.2 |
-| Relative bind mounts not resolved              | Medium                                              | Fixed in v1.0.2 |
+| Issue                                          | Severity                                            | Status (v1.0.2)                                                                  |
+| ---------------------------------------------- | --------------------------------------------------- | -------------------------------------------------------------------------------- |
+| `env_file` not supported                       | High — used in nearly every real stack              | Fixed (#16)                                                                      |
+| Named `user:` rejected                         | High — ZITADEL, Python services use named users     | Fixed (#21): resolved from the image's `/etc/passwd`; #16 only improved the error |
+| `ctr images unpack` removed in containerd v2.2 | High — silent deploy failure on Ubuntu 24.04        | Fixed: automatic pull in #18, `minga image pull` in #21                          |
+| Orphan tasks persist across restarts           | High — requires manual containerd cleanup           | Fixed (#18)                                                                      |
+| `extra_hosts` not supported                    | Medium                                              | Fixed (#16); #21 makes `host-gateway` the host's bridge address, not the router  |
+| `command: >` folded scalar not argv-split      | Medium — breaks any string `command`, not just `>`  | Fixed (#21): shell-split as Compose does                                         |
+| `~/.docker/config.json` not read by `ctr`      | Medium — private registries require manual pre-pull | Fixed: automatic pull in #16; #21 adds `minga image pull`, `DOCKER_CONFIG`, Docker Hub keys |
+| Relative bind mounts not resolved              | Medium                                              | Fixed (#16)                                                                      |
 
 8 blockers in a single day of deployment. For a project billing itself as
 "Compose-native," the gap between claimed and actual Compose compatibility was the
-primary credibility risk. 6 of the 8 are fixed in v1.0.2.
+primary credibility risk. #16 and #18 fully fixed four of the 8 and partly fixed
+two; #21 fixes the rest, so all 8 are fixed in v1.0.2. Registry credential helpers
+(`credsStore`, `credHelpers`) are still not read.
 
 ### Where it fits well
 
 | Good fit                                                   | Not yet ready                                            |
 | ---------------------------------------------------------- | -------------------------------------------------------- |
 | Edge/IoT nodes (Swarm/k3s too heavy)                       | Multi-node HA production (no cross-node networking)      |
-| Air-gapped environments (single binary + bundled deps)     | Orgs with private registries and existing Docker tooling |
-| Teams wanting Compose + rolling updates without Kubernetes | Services with complex `command: >` multi-line args       |
+| Air-gapped environments (single binary + bundled deps)     | Registries reached through Docker credential helpers     |
+| Teams wanting Compose + rolling updates without Kubernetes | Clusters that need a read-only API role (one token today) |
 | Self-hosted, low-traffic, single-node stacks               | —                                                        |
 
 ### Rating
