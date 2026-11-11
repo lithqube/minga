@@ -589,6 +589,10 @@ impl ContainerdRuntime {
                 errors.push(format!("kill stale task: {error}"));
             }
         }
+        // Brief pause after SIGKILL so containerd v2 marks the task stopped
+        // before we attempt delete — without this, delete may return
+        // "cannot delete a running process" on containerd 2.2+.
+        tokio::time::sleep(Duration::from_millis(500)).await;
         if let Err(error) = client.delete_task(container_id).await {
             if !is_missing(&error) {
                 errors.push(format!("delete stale task: {error}"));
