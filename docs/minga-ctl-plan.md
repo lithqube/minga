@@ -12,16 +12,17 @@ fully enough to implement. One command group, registry login (section 5.8),
 relies on Minga 1.0.2. Phase 2 is server work and is outlined; it needs its
 own ADR before it starts.
 
-Two open pull requests shaped this version of the plan: PR #16 (Compose
-compatibility fixes for 1.0.2, including registry credentials) and PR #17
-(the Hetzner ARM64 staging guide). Where the plan depends on them it says so.
+Two changes that merged into `main` after v1.0.1 shaped this version of the
+plan: the Compose compatibility fixes (PR #16, merged through PR #18), which
+include registry credentials, and the Hetzner ARM64 staging guide (PR #17).
+Both are on `main` and unreleased; this plan calls the release that will carry
+them 1.0.2.
 
 ## 1. What the code allows today
 
 The design follows what Minga serves, not what the Docker Engine API has in
 general. All routes are registered in `crates/minga-api/src/server.rs:91-136`.
-File and line references are for `main` at v1.0.1 (`bf600b7`); PR #16 moves
-several of them.
+File and line references are for `main` at `b1e49ac`, after PR #18 merged.
 
 | Finding | Where | Effect on minga-ctl |
 |---|---|---|
@@ -31,17 +32,17 @@ several of them.
 | Auth is one shared bearer token, checked on every route including `/metrics`. Failure is 401 `{"message":"authentication required"}`. | `server.rs:49-71` | No per-user identity, roles or audit on the server. |
 | Service update takes a full spec. The `version`, `registryAuthFrom` and `rollback` query parameters are ignored. | `handlers.rs:416-465` | Scale and update are read, edit, post back. |
 | The server keeps one previous spec only while a rollout is in flight and never returns it. | `handlers.rs:441-456`, `Service.previous` in `minga-state/src/types.rs` | Rollback needs its own revision store. |
-| Tasks have a state, not a health field. A task with a healthcheck stays `preparing` until its first probe passes. | `minga-api/src/translate.rs:689-697`, `minga-node/src/supervisor.rs:862-870` | Health is derived from state. |
+| Tasks have a state, not a health field. A task with a healthcheck stays `preparing` until its first probe passes. | `minga-api/src/translate.rs:690-697`, `minga-node/src/supervisor.rs:862-870` | Health is derived from state. |
 | Service IDs are `<stack>.<service>`. Networks, secrets and configs are `<stack>_<name>`. A stack is only the label `com.docker.stack.namespace`. | `minga-scheduler/src/translate.rs` (`{stack}.{name}`, `{stack}_{name}`) | Service arguments are `<stack>.<service>`, not `<stack>_<service>`. |
 | The task `label` filter matches only the stack label. The network `label` filter always returns an empty list. | `handlers.rs:519-531`, `:574` | Stack networks are found by ID prefix. |
 | `/healthz`, `/readyz` and `/metrics` are plain text on the API port. `/readyz` returns 503 with a reason. | `minga-telemetry/src/lib.rs:15-41` | Parsed as text. |
 | The API process updates only `minga_raft_leader`. Task and scheduler metrics live in the manager process, served on `--metrics-bind`. | `server.rs:175-185`, `main.rs:278-281` | A context can name a separate metrics endpoint. |
-| `minga logs` reads NATS JetStream. Plain NATS is allowed only to loopback. | `main.rs:1670-1719`, `minga-cli/src/bus.rs:68-83` | Logs run on the node. |
-| `minga image pull` runs `ctr` on the machine it is called on. There is no `image ls` or `image rm`. | `main.rs:1740-1770` | Image commands run on the node. |
-| `minga secret put` reads stdin and writes a file in the local secret store. The API stores secret metadata only and rejects a non-empty `Data`. | `main.rs:624-647`, `handlers.rs:673` | Secret values never use the API. |
-| Image pulls are anonymous in 1.0.1. `minga image pull` and the automatic pull before a task starts both run `ctr -n minga images pull <ref>` with no credentials. PR #16 makes the automatic pull read `$HOME/.docker/config.json`; `minga image pull` stays anonymous. | `main.rs:1744`, `minga-node/src/containerd/runtime.rs:483` | Registry login maintains that file and needs 1.0.2 (section 5.8). |
-| `minga deploy` translates the compose file on the machine it runs on. With PR #16 that includes reading `env_file` files, joining relative bind-mount sources to the compose file's directory, and turning `extra_hosts: host-gateway` into that machine's default-route address. | `minga-cli/src/main.rs`, `translate_project` in `minga-scheduler/src/translate.rs` | A deploy from a workstation resolves these on the workstation (section 5.2). |
-| Things inside the cluster read the API too. The staging guide in PR #17 runs Traefik as a container whose Swarm provider reads `http://<gateway>:2375`, with the API on `0.0.0.0:2375` behind a host firewall. | `docs/hetzner-arm-staging.md` (PR #17) | The API cannot always be bound to loopback (section 2.2). |
+| `minga logs` reads NATS JetStream. Plain NATS is allowed only to loopback. | `run_logs` at `main.rs:1672`, `minga-cli/src/bus.rs:68-83` | Logs run on the node. |
+| `minga image pull` runs `ctr` on the machine it is called on. There is no `image ls` or `image rm`. | `run_image` at `main.rs:1746` | Image commands run on the node. |
+| `minga secret put` reads stdin and writes a file in the local secret store. The API stores secret metadata only and rejects a non-empty `Data`. | `run_secret` at `main.rs:632`, `handlers.rs:673` | Secret values never use the API. |
+| In 1.0.1 image pulls are anonymous: `minga image pull` and the automatic pull before a task starts both run `ctr -n minga images pull <ref>` with no credentials. On `main` the automatic pull reads `$HOME/.docker/config.json`; `minga image pull` is still anonymous. | `main.rs:1752`, `pull_image` at `minga-node/src/containerd/runtime.rs:539` | Registry login maintains that file and needs 1.0.2 (section 5.8). |
+| `minga deploy` translates the compose file on the machine it runs on. On `main` that includes reading `env_file` files, joining relative bind-mount sources to the compose file's directory, and turning `extra_hosts: host-gateway` into that machine's default-route address. | `minga-cli/src/main.rs`, `host_gateway_ip` at `minga-scheduler/src/translate.rs:576` | A deploy from a workstation resolves these on the workstation (section 5.2). |
+| Things inside the cluster read the API too. The staging guide runs Traefik as a container whose Swarm provider reads `http://<gateway>:2375`, with the API on `0.0.0.0:2375` behind a host firewall. | `docs/hetzner-arm-staging.md` | The API cannot always be bound to loopback (section 2.2). |
 
 Two things the original brief asked for do not exist and are not faked: image
 pull latency and update count metrics.
@@ -63,10 +64,11 @@ phase 1 takes the API off the network instead.
   `--api-token`. `--api-bind` takes one address, so there are two cases:
   - Nothing inside the cluster reads the API: `--api-bind 127.0.0.1:2375`.
     The default is `0.0.0.0:2375`; change it.
-  - A container reads the API, for example Traefik's Swarm provider (PR #17):
+  - A container reads the API, for example Traefik's Swarm provider in the
+    staging guide (`docs/hetzner-arm-staging.md`):
     the API has to listen on an address containers can reach. Keep
     `0.0.0.0:2375` and have the host firewall drop port 2375 on every
-    external interface. The guide in PR #17 does this with `ufw`, leaving
+    external interface. The staging guide does this with `ufw`, leaving
     only 22, 80 and 443 open.
 
   Either way minga-ctl reaches the API through the SSH tunnel to the node's
@@ -560,7 +562,7 @@ saved revision for myapp.web (myapp.worker unchanged)
 
 **Where the compose file is resolved.** `minga deploy` translates the compose
 file on the machine it runs on, and minga-ctl runs it on the operator's
-machine. With Minga 1.0.2 (PR #16) three things are resolved there:
+machine. On `main`, and so from 1.0.2, three things are resolved there:
 
 | In the compose file | Resolved on the operator's machine as | In a context with an SSH target |
 |---|---|---|
@@ -815,7 +817,7 @@ target is reported, the rest still run, and the exit code is 2.
 
 `minga` has no `image ls` or `image rm`, so those call `ctr` directly. The SSH
 user needs access to the containerd socket; minga-ctl does not call `sudo`.
-`minga image pull` is anonymous, in 1.0.1 and with PR #16, so
+`minga image pull` is anonymous, in 1.0.1 and on `main`, so
 `minga-ctl image pull` cannot fetch a private image. Private images are
 pulled by the task that needs them, using the node's registry credentials
 (section 5.8).
@@ -958,8 +960,8 @@ before a task starts can fetch private images. Node-local, like `secret put`:
 the credential goes to each node over SSH on stdin, never through the API,
 and is never stored on the workstation.
 
-It needs Minga 1.0.2 or later on the nodes. That release (PR #16, open when
-this was written) makes the automatic pull read Docker's credential file on
+It needs a Minga that reads registry credentials: `main` since PR #16, to be
+released as 1.0.2. There the automatic pull reads Docker's credential file on
 the node. minga-ctl maintains that file, so `login`, `logout` and `list` need
 no further Minga change.
 
@@ -1013,6 +1015,8 @@ A host must match `^[A-Za-z0-9][A-Za-z0-9.-]*(:[0-9]+)?$` and a username
 4. `GET /v1.41/version`. If Minga is older than 1.0.2, print a warning and
    continue:
    ``warning: Minga 1.0.1 in context `prod` pulls anonymously; the credential is stored but unused until the nodes run 1.0.2 or later``.
+   A node built from `main` before the version is bumped also reports 1.0.1
+   and gets this warning, although it does use the credential.
 5. On each target:
    - Read the file: `if [ -e '<file>' ]; then cat '<file>'; fi`. A missing
      file counts as `{}`. A file that cannot be read or is not JSON stops
@@ -1082,14 +1086,15 @@ alice@wrk1.example.net  ghcr.io                       acme-deploy
 In the example `wrk1` has no Google credential, so a task placed there cannot
 pull from that registry.
 
-**Gaps in PR #16 as it stands.** These are for Minga to close, not minga-ctl.
+**Gaps in what merged.** These are for Minga to close, not minga-ctl. They
+were checked against `main` at `b1e49ac`.
 
 - The credential is on a command line. The pull runs
   `ctr -n minga images pull --user <user>:<secret> <ref>` (`pull_image` in
   `crates/minga-node/src/containerd/runtime.rs`), so every local user of the
   node can read it in the process list while a pull runs. This plan's rule is
   that a credential never appears on a command line (section 2.2, item 9);
-  PR #16 does not meet it yet.
+  the merged code does not meet it yet.
 - Failures are silent. A missing `HOME`, an unreadable or malformed file, or
   a missing entry all lead to an anonymous pull with no log line. The first
   sign is a 401 from the registry when a task starts.
@@ -1098,7 +1103,7 @@ pull from that registry.
   no command pulls on demand with the stored credential. Once
   `minga image pull` uses the same lookup, `login --verify <image ref>` runs
   it on each node after storing.
-- Docker Hub uses a different key. PR #16 looks up `docker.io`, which is what
+- Docker Hub uses a different key. Minga looks up `docker.io`, which is what
   minga-ctl writes. `docker login` writes `https://index.docker.io/v1/`, so a
   file produced by `docker login` on the node is not matched for Docker Hub.
 - `credHelpers` and `credsStore` are not read. minga-ctl writes inline `auth`
