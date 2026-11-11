@@ -193,7 +193,8 @@ For single-node deployments, Minga's control plane (59 MB with its NATS
 sidecar) uses **~42% less memory** than `dockerd` (Docker Compose, 101 MB) and
 **~81% less** than `dockerd` in Swarm mode (311 MB). Counting containerd too,
 the totals are 119 vs 169 MB (~30% less) and 119 vs 377 MB (~68% less).
-With unmatched workloads (see Caveats), treat these as upper bounds.
+These are differences between the measured environments, whose workloads are
+not matched (see Caveats); a matched-workload gap could be larger or smaller.
 The absence of `docker-proxy` processes removes per-port overhead at scale.
 
 For multi-node production use cases, Docker Swarm currently has an availability
@@ -212,8 +213,8 @@ Postgres, secrets agent, AI service, workers) on a fresh Ubuntu 24.04 node._
 
 **The core architecture is sound.** A single binary that reads Compose files natively,
 runs containerd directly, and requires neither Docker daemon nor Kubernetes fills a
-genuine gap. Swarm is deprecated; k3s idles at ~300 MB; plain Docker Compose has no
-rolling updates. Minga targets the right niche.
+genuine gap. Classic Swarm is deprecated (Swarm mode, measured here, is still a Docker
+Engine feature); k3s idles at ~300 MB; plain Docker Compose has no rolling updates. Minga targets the right niche.
 
 **The Raft + NATS design is clean.** Externalising desired state to `openraft + redb`
 and routing events through a NATS sidecar is the correct split — it explains the memory
@@ -265,6 +266,7 @@ two; #21 fixes the rest, so all 8 are fixed in v1.0.2. Registry credential helpe
 
 **Summary:** Technically sound architecture, v1.0.1 needed hardening before real
 workloads. With v1.0.2 fixes merged, it becomes a viable choice for single-node edge
-deployments. The memory advantage is real: ~42% less than `dockerd` and ~81% less than a
-Swarm manager for the control plane, before workload differences. Recommend
+deployments. In these environments the control plane used ~42% less memory than
+`dockerd` and ~81% less than a Swarm manager; a matched-workload run would show how
+much of that gap is the orchestrator itself. Recommend
 tracking the WireGuard mesh milestone before adopting for multi-node production.
