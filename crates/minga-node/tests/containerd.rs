@@ -268,7 +268,7 @@ async fn containerd_logs_capture_stdout_and_stderr() {
 }
 
 /// A named `user:` resolves against the image's own /etc/passwd and
-/// /etc/group (BusyBox: `nobody` is 65534, `nogroup` is 65534).
+/// /etc/group (BusyBox: user `nobody` is 65534, group `root` is 0).
 #[tokio::test]
 async fn containerd_named_user_resolves_from_the_image() {
     let socket = socket_path();
@@ -293,7 +293,7 @@ async fn containerd_named_user_resolves_from_the_image() {
     let task_id = "minga-test-named-user-001".to_string();
     let spec = TaskSpec {
         image: "docker.io/library/busybox:latest".to_string(),
-        user: Some("nobody:nogroup".to_string()),
+        user: Some("nobody:root".to_string()),
         command: vec!["sh".into(), "-c".into(), "id; sleep 30".into()],
         ..Default::default()
     };
@@ -318,8 +318,8 @@ async fn containerd_named_user_resolves_from_the_image() {
     runtime.stop(&task_id).await.expect("stop");
     let out = String::from_utf8_lossy(&out);
     assert!(
-        out.contains("uid=65534") && out.contains("gid=65534"),
-        "process must run as nobody:nogroup, got {out:?}"
+        out.contains("uid=65534") && out.contains("gid=0"),
+        "process must run as nobody:root, got {out:?}"
     );
 
     // An unknown name fails the start and rolls its snapshot back.
