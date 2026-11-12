@@ -349,8 +349,35 @@ pub fn run_token_command(command: &[String]) -> Result<String, CtlError> {
     Ok(token)
 }
 
-/// Merges flags, environment and config into what a command runs against.
+/// Merges flags, environment and config into what a command runs against,
+/// including the API token (which may run `token_command`).
 pub fn resolve(config: &Config, flag_context: Option<&str>) -> Result<Resolved, CtlError> {
+    let mut resolved = resolve_target(config, flag_context)?;
+    let env_token = std::env::var("MINGA_CTL_TOKEN")
+        .ok()
+        .filter(|v| !v.is_empty());
+    let (token_source, token) = match env_token {
+        Some(token) => (TokenSource::Env, Some(token)),
+        None => match &resolved.context.token_command {
+            Some(command) => {
+                let token = run_token_command(command)?;
+                (TokenSource::Command(command.clone()), Some(token))
+            }
+            None => match &resolved.context.remote_token_file {
+                Some(file) => (TokenSource::RemoteFile(file.clone()), None),
+                None => (TokenSource::None, None),
+            },
+        },
+    };
+    resolved.token_source = token_source;
+    resolved.token = token;
+    Ok(resolved)
+}
+
+/// Like [`resolve`], without the API token: for node-local commands
+/// (`registry`, `image`) that never call the API, so a failing
+/// `token_command` cannot block them. `token_source` is `None`.
+pub fn resolve_target(config: &Config, flag_context: Option<&str>) -> Result<Resolved, CtlError> {
     let env_context = std::env::var("MINGA_CTL_CONTEXT")
         .ok()
         .filter(|v| !v.is_empty());
@@ -375,29 +402,12 @@ pub fn resolve(config: &Config, flag_context: Option<&str>) -> Result<Resolved, 
         .or_else(|| context.api_endpoint.clone())
         .unwrap_or_else(|| DEFAULT_ENDPOINT.to_string());
 
-    let env_token = std::env::var("MINGA_CTL_TOKEN")
-        .ok()
-        .filter(|v| !v.is_empty());
-    let (token_source, token) = match env_token {
-        Some(token) => (TokenSource::Env, Some(token)),
-        None => match &context.token_command {
-            Some(command) => {
-                let token = run_token_command(command)?;
-                (TokenSource::Command(command.clone()), Some(token))
-            }
-            None => match &context.remote_token_file {
-                Some(file) => (TokenSource::RemoteFile(file.clone()), None),
-                None => (TokenSource::None, None),
-            },
-        },
-    };
-
     Ok(Resolved {
         name,
         context,
         endpoint,
-        token_source,
-        token,
+        token_source: TokenSource::None,
+        token: None,
     })
 }
 
@@ -537,6 +547,24 @@ contexts:
         let command = vec!["printf".to_string(), "%s".to_string(), "s3cret".to_string()];
         let token = run_token_command(&command).unwrap();
         assert_eq!(token, "s3cret");
+    }
+
+    #[test]
+    fn resolve_target_does_not_run_the_token_command() {
+        let mut config = Config::default();
+        config.contexts.insert(
+            "edge".into(),
+            Context {
+                token_command: Some(vec!["false".to_string()]),
+                ..Context::default()
+            },
+        );
+        // `resolve` runs `false` and fails; `resolve_target` never runs it.
+        assert!(resolve(&config, Some("edge")).is_err());
+        let target = resolve_target(&config, Some("edge")).unwrap();
+        assert_eq!(target.name, "edge");
+        assert_eq!(target.token, None);
+        assert_eq!(target.token_source, TokenSource::None);
     }
 
     #[test]

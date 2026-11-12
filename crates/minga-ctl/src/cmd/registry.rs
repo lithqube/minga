@@ -104,6 +104,7 @@ pub async fn run(
             .registry_auth_file
             .clone()
             .unwrap_or_else(|| DEFAULT_AUTH_FILE.to_string()),
+        default_path: resolved.context.registry_auth_file.is_none(),
         debug,
     };
     if job.targets.iter().any(Option::is_some) {
@@ -136,6 +137,8 @@ struct Job {
     /// `None` is the local machine.
     targets: Vec<Option<String>>,
     path: String,
+    /// `path` is [`DEFAULT_AUTH_FILE`] because the context sets none.
+    default_path: bool,
     debug: bool,
 }
 
@@ -289,10 +292,29 @@ async fn login(
                 node.clone(),
                 if stored { "stored" } else { "failed" }.into(),
             ],
-            json!({ "node": node, "registry": reg.host, "username": user, "stored": stored }),
+            json!({
+                "node": node, "registry": reg.host, "username": user,
+                "file": job.path, "stored": stored,
+            }),
         );
     }
+    if job.default_path && !quiet {
+        eprintln!("{}", default_path_note(&job.path));
+    }
     finish(rows, failed, job, format, quiet)
+}
+
+/// Said after a login to the default file: Minga reads a different file when
+/// its service sets `DOCKER_CONFIG` or runs as another user, and then pulls
+/// would silently stay anonymous.
+fn default_path_note(path: &str) -> String {
+    format!(
+        "note: credentials were written to {path}, the default. Minga reads \
+         $DOCKER_CONFIG/config.json when its service sets DOCKER_CONFIG, else \
+         $HOME/.docker/config.json of the user it runs as. If that is another file \
+         (the staging guide uses /etc/minga/docker/config.json), set the context's \
+         registry_auth_file to it and log in again."
+    )
 }
 
 async fn logout(
@@ -604,6 +626,14 @@ async fn sh(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_default_path_note_names_the_file_and_the_fix() {
+        let note = default_path_note(DEFAULT_AUTH_FILE);
+        assert!(note.contains("/root/.docker/config.json"), "{note}");
+        assert!(note.contains("DOCKER_CONFIG"), "{note}");
+        assert!(note.contains("registry_auth_file"), "{note}");
+    }
 
     #[test]
     fn short_names_resolve_to_hosts() {

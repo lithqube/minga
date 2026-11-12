@@ -134,6 +134,55 @@ fn login_ghcr_creates_the_file_0600_with_the_auth_entry() {
     assert!(audit.contains(r#""command":"registry login""#), "{audit}");
     assert!(audit.contains(r#""username":"acme-deploy""#), "{audit}");
     assert!(!audit.contains(SECRET) && !audit.contains(&auth("acme-deploy")));
+
+    // The context names its file, so there is no default-path warning, and
+    // the JSON result says which file was written.
+    assert!(!err.contains("the default"), "{err}");
+    let (code, out, err) = env.ctl(
+        &[
+            "--json",
+            "registry",
+            "login",
+            "ghcr",
+            "--username",
+            "acme-deploy",
+        ],
+        &format!("{SECRET}\n"),
+    );
+    assert_eq!(code, 0, "{err}");
+    let rows: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(rows[0]["file"], env.file().to_str().unwrap(), "{out}");
+}
+
+#[test]
+fn a_failing_api_token_command_does_not_block_registry_commands() {
+    let env = Env::local();
+    // A second context whose token command always fails; registry commands
+    // never call the API, so they must not run it.
+    let file = env.file();
+    let (code, _, err) = env.ctl(
+        &[
+            "context",
+            "add",
+            "broken-token",
+            "--token-command",
+            "false",
+            "--registry-auth-file",
+            file.to_str().unwrap(),
+            "--use",
+        ],
+        "",
+    );
+    assert_eq!(code, 0, "context add: {err}");
+    let (code, out, err) = env.login("ghcr", "acme-deploy");
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains("stored"), "{out}");
+    let (code, _, err) = env.ctl(&["registry", "list"], "");
+    assert_eq!(code, 0, "{err}");
+    // An API command in the same context still runs it, and fails.
+    let (code, _, err) = env.ctl(&["stack", "ls"], "");
+    assert_eq!(code, 1, "{err}");
+    assert!(err.contains("token command"), "{err}");
 }
 
 #[test]

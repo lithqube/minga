@@ -172,6 +172,8 @@ sudo DOCKER_CONFIG=/etc/minga/docker minga image pull ghcr.io/your-org/your-imag
 
 Docker Hub entries written by `docker login` (key `https://index.docker.io/v1/`) match `docker.io` images. `ctr` takes the credentials on its command line, so other local users can see them in `ps` while a pull runs.
 
+With `minga-ctl registry login`, point the context at the same file, because minga-ctl's default is `/root/.docker/config.json`: `minga-ctl context add staging --ssh <user>@<node> --remote-token-file /etc/minga/api-token --registry-auth-file /etc/minga/docker/config.json`. The SSH user needs read and write access to that file.
+
 ### Named users
 
 `user:` takes a name or a uid, with an optional group (`user[:group]`), as in Docker. Names are resolved from the image's own `/etc/passwd` and `/etc/group` when the task starts. A name with no group takes the user's primary group.

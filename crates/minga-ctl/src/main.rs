@@ -121,7 +121,7 @@ fn run(cli: &Cli) -> Result<(), CtlError> {
             result
         }),
         Command::Image(cmd) => api::block_on(async {
-            let resolved = resolve(cli)?;
+            let resolved = resolve_target(cli)?;
             let result = cmd::image::run(cmd, &resolved, cli.debug, format, quiet).await;
             audit(&resolved, cmd.audit(), &result);
             result
@@ -136,7 +136,7 @@ fn run(cli: &Cli) -> Result<(), CtlError> {
         }),
         Command::Registry(cmd) => api::block_on(cmd::registry::run(
             cmd,
-            &resolve(cli)?,
+            &resolve_target(cli)?,
             format,
             quiet,
             cli.debug,
@@ -150,10 +150,17 @@ async fn connect(cli: &Cli) -> Result<Connection, CtlError> {
     transport::connect(&resolve(cli)?, cli.debug).await
 }
 
-/// Loads the config and resolves the selected context.
+/// Loads the config and resolves the selected context, with its API token.
 fn resolve(cli: &Cli) -> Result<config::Resolved, CtlError> {
     let config = config::load()?;
     config::resolve(&config, cli.context.as_deref())
+}
+
+/// Like [`resolve`], without the API token, for node-local commands that
+/// never call the API (`registry`, `image`).
+fn resolve_target(cli: &Cli) -> Result<config::Resolved, CtlError> {
+    let config = config::load()?;
+    config::resolve_target(&config, cli.context.as_deref())
 }
 
 /// Appends the audit line for a command that changes state (`entry` is
