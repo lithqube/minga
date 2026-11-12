@@ -18,6 +18,7 @@ Each ADR ends with an *Implementation status* section saying what shipped and wh
 ## Plans
 
 - [minga-ctl design plan](minga-ctl-plan.md): the companion CLI; SSH-only transport implemented (phase 1), mutual TLS and server-side audit next
+- [Production-readiness plan](production-readiness-plan.md): what blocks single-node production after v1.0.2 and the order to fix it
 - [Release notes: v1.0.2](release-1.0.2.md)
 
 ## Deployment
