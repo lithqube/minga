@@ -411,7 +411,8 @@ fn deploy_refuses_a_relative_bind_mount_when_the_node_is_another_machine() {
 fn deploy_without_minga_is_exit_1_with_the_hint() {
     let env = Env::new();
     let file = env.compose(NODE_SAFE);
-    let (url, _) = fake_api(vec![ok(json!([]))]);
+    let (url, _) = fake_api(vec![ok(json!([service("app.web", "web:1")]))]);
+    env.seed_revision("app.web", "web:0");
     let (code, _, err) = env.run(
         &["stack", "deploy", "-c", &file, "app"],
         &[
@@ -421,12 +422,18 @@ fn deploy_without_minga_is_exit_1_with_the_hint() {
         b"",
     );
     assert_eq!(code, 1, "stderr: {err}");
+    // Nothing was deployed, so the earlier rollback target is still there.
+    let web = env.revision("app.web").expect("app.web revision");
+    assert_eq!(
+        web["spec"]["TaskTemplate"]["ContainerSpec"]["Image"],
+        "web:0"
+    );
     assert!(
         err.contains("error: `minga` not found on PATH (needed for `stack deploy`)"),
         "{err}"
     );
     assert!(
-        err.contains("hint: install minga or set MINGA_BIN"),
+        err.contains("hint: install minga on this machine (it runs here, not on the node) or set MINGA_BIN; on macOS: cargo install --locked --path crates/minga-cli"),
         "{err}"
     );
 }

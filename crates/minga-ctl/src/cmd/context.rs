@@ -39,7 +39,9 @@ pub struct AddArgs {
     /// API URL. With `--ssh`, as seen from the SSH target.
     #[arg(long, default_value = config::DEFAULT_ENDPOINT)]
     pub endpoint: String,
-    /// File on the SSH target holding the API token.
+    /// File on the SSH target holding the API token: the bare token, or an
+    /// env file with a `MINGA_API_TOKEN=value` line (`export` and quotes
+    /// allowed), such as the API's `EnvironmentFile`.
     #[arg(long)]
     pub remote_token_file: Option<String>,
     /// Local command that prints the token; split on whitespace, run

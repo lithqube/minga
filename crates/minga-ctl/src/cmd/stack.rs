@@ -22,6 +22,12 @@ use crate::view;
 pub enum StackCommand {
     /// Deploy a Compose file with `minga deploy`, saving the previous spec
     /// of every service it changes for `service rollback`.
+    ///
+    /// `minga deploy` runs on THIS machine, the one running minga-ctl, not
+    /// on the node: install the `minga` binary here (the node only needs
+    /// the API). It is `MINGA_BIN` if set, else `minga` on PATH. Release
+    /// archives are Linux only; on macOS build it with
+    /// `cargo install --locked --path crates/minga-cli`.
     Deploy {
         /// Path to the Compose file.
         #[arg(short = 'c', long = "compose-file", default_value = "compose.yaml")]
@@ -199,8 +205,20 @@ async fn deploy(
     if let Some((_, task)) = relay {
         task.abort();
     }
-    let status =
-        status.map_err(|e| image::spawn_error(e, &[RemoteArg::Fixed("minga")], "stack deploy"))?;
+    let status = match status {
+        Ok(status) => status,
+        Err(e) => {
+            // Nothing ran, so put back the revisions step 1 replaced.
+            for (id, old) in earlier {
+                let _ = restore(client, &id, old);
+            }
+            return Err(image::spawn_error(
+                e,
+                &[RemoteArg::Fixed("minga")],
+                "stack deploy",
+            ));
+        }
+    };
 
     // 3. Read again whether or not it succeeded; services it did not change
     // get their earlier revision back.

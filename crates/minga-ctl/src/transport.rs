@@ -404,13 +404,74 @@ async fn read_remote_token(target: &str, path: &str, debug: bool) -> Result<Stri
             "remote_token_file {path} on {target} is not UTF-8 text"
         ))
     })?;
-    let token = text.trim();
+    token_from_file(&text).map_err(|why| {
+        // `why` never holds file content, so the token cannot reach the message.
+        CtlError::Config(format!("remote_token_file {path} on {target} {why}"))
+    })
+}
+
+/// The variable an env file holds the token in.
+const TOKEN_VAR: &str = "MINGA_API_TOKEN";
+
+/// The token in the contents of a `remote_token_file`.
+///
+/// A line `MINGA_API_TOKEN=value` (after an optional `export `, value
+/// optionally in single or double quotes; `#` comment and blank lines are
+/// skipped; the last such line wins) is an env file and gives the value.
+/// Otherwise the whole trimmed file is the token, unless it holds other
+/// `NAME=value` lines: that is an env file without the variable, an error
+/// instead of a 401 later. A bare token may end in `=` (base64 padding); only
+/// an upper-case `NAME=` followed by a value counts as an env line.
+/// shortcut: no escapes in quoted values and no trailing `# comment` on a
+/// value, as systemd's `EnvironmentFile` does; upgrade if a token needs them.
+///
+/// The error is a fragment for the caller's message and never holds content.
+fn token_from_file(text: &str) -> Result<String, &'static str> {
+    let (mut found, mut other) = (None, false);
+    let lines = text.lines().map(str::trim);
+    for line in lines.filter(|l| !l.is_empty() && !l.starts_with('#')) {
+        let line = match line.strip_prefix("export") {
+            Some(rest) if rest.starts_with([' ', '\t']) => rest.trim_start(),
+            _ => line,
+        };
+        let Some((name, value)) = line.split_once('=') else {
+            continue;
+        };
+        if name == TOKEN_VAR {
+            let value = value.trim();
+            let quoted = value.len() >= 2
+                && (value.starts_with('"') || value.starts_with('\''))
+                && value.ends_with(&value[..1]);
+            found = Some(if quoted {
+                &value[1..value.len() - 1]
+            } else {
+                value
+            });
+        } else if is_env_name(name) && !value.bytes().all(|b| b == b'=') {
+            other = true;
+        }
+    }
+    let token = match found {
+        Some(value) => value,
+        None if other => return Err("has no MINGA_API_TOKEN line"),
+        None => text.trim(),
+    };
     if token.is_empty() {
-        return Err(CtlError::Config(format!(
-            "remote_token_file {path} on {target} is empty"
-        )));
+        return Err(if found.is_some() {
+            "has an empty MINGA_API_TOKEN"
+        } else {
+            "is empty"
+        });
     }
     Ok(token.to_string())
+}
+
+/// `[A-Z_][A-Z0-9_]*`, the usual shape of an environment variable name.
+fn is_env_name(name: &str) -> bool {
+    name.starts_with(|c: char| c.is_ascii_uppercase() || c == '_')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
 }
 
 /// The ssh arguments for the tunnel; each forward is `(local socket, host:port)`.
@@ -656,12 +717,16 @@ async fn all_connect(socks: &[PathBuf]) -> bool {
 }
 
 /// Reads ssh's stderr to the end and returns its last line. Under
-/// `--debug` each line is echoed as it arrives.
+/// `--debug` each line is echoed as it arrives. [`benign_ssh_line`] is
+/// neither echoed nor returned.
 async fn drain_stderr(stderr: ChildStderr, debug: bool) -> Option<String> {
     let mut lines = BufReader::new(stderr).lines();
     let mut last = None;
     while let Ok(Some(line)) = lines.next_line().await {
         let line = printable(&line);
+        if benign_ssh_line(&line) {
+            continue;
+        }
         if debug {
             eprintln!("debug: ssh: {line}");
         }
@@ -670,6 +735,21 @@ async fn drain_stderr(stderr: ChildStderr, debug: bool) -> Option<String> {
         }
     }
     last
+}
+
+/// macOS ssh logs a TCP_NODELAY failure for every connection to a `-L`
+/// forward that ends in a Unix socket, because the option does not apply to
+/// one: `Operation not supported` for a request, `Invalid argument` for the
+/// readiness probe, which connects and closes. Both are harmless. Only these
+/// exact lines are dropped; any other ssh output still shows.
+fn benign_ssh_line(line: &str) -> bool {
+    let line = line.trim();
+    let line = line.strip_suffix(" on socket").unwrap_or(line);
+    matches!(
+        line,
+        "setsockopt TCP_NODELAY: Operation not supported"
+            | "setsockopt TCP_NODELAY: Invalid argument"
+    )
 }
 
 /// `CtlError::Ssh` with the last line of ssh's stderr as the detail.
@@ -906,6 +986,29 @@ mod tests {
     }
 
     #[test]
+    fn only_the_tcp_nodelay_notice_is_dropped_from_ssh_stderr() {
+        for benign in [
+            "setsockopt TCP_NODELAY: Operation not supported",
+            "setsockopt TCP_NODELAY: Operation not supported on socket",
+            "  setsockopt TCP_NODELAY: Operation not supported on socket  ",
+            "setsockopt TCP_NODELAY: Invalid argument",
+        ] {
+            assert!(benign_ssh_line(benign), "{benign}");
+        }
+        for shown in [
+            "",
+            "Permission denied (publickey).",
+            "Host key verification failed.",
+            "channel 1: open failed: connect failed: Connection refused",
+            "setsockopt TCP_NODELAY: Permission denied",
+            "setsockopt SO_KEEPALIVE: Operation not supported",
+            "ssh: setsockopt TCP_NODELAY: Operation not supported, then more",
+        ] {
+            assert!(!benign_ssh_line(shown), "{shown}");
+        }
+    }
+
+    #[test]
     fn an_ssh_error_reports_the_last_stderr_line() {
         use std::os::unix::process::ExitStatusExt;
         let status = ExitStatus::from_raw(255 << 8);
@@ -921,5 +1024,67 @@ mod tests {
         assert_eq!(err.exit_code(), 2);
         let err = ssh_error("h", b"\x1b[2Jboom", status);
         assert!(err.to_string().ends_with("?[2Jboom"), "{err}");
+    }
+
+    #[test]
+    fn a_bare_token_file_is_the_trimmed_content() {
+        assert_eq!(token_from_file("  abc123 \n").unwrap(), "abc123");
+        // Base64 padding and a mixed-case `=` are not env lines.
+        assert_eq!(token_from_file("dGVzdA==\n").unwrap(), "dGVzdA==");
+        assert_eq!(token_from_file("Zm9v=\n").unwrap(), "Zm9v=");
+        assert_eq!(token_from_file("abC=dEf\n").unwrap(), "abC=dEf");
+    }
+
+    #[test]
+    fn an_env_file_gives_the_value_of_the_token_variable() {
+        for (file, want) in [
+            ("MINGA_API_TOKEN=abc123\n", "abc123"),
+            ("export MINGA_API_TOKEN=abc123", "abc123"),
+            ("MINGA_API_TOKEN=\"abc123\"\n", "abc123"),
+            ("MINGA_API_TOKEN='abc123'\n", "abc123"),
+            ("MINGA_API_TOKEN=dGVzdA==\n", "dGVzdA=="),
+            (
+                "# api\n\nRUST_LOG=info\n  export\tMINGA_API_TOKEN=\"a b\"\n",
+                "a b",
+            ),
+            ("MINGA_API_TOKEN=old\nMINGA_API_TOKEN=new\n", "new"),
+            (
+                "# MINGA_API_TOKEN=commented\nMINGA_API_TOKEN=real\n",
+                "real",
+            ),
+        ] {
+            assert_eq!(token_from_file(file).as_deref(), Ok(want), "{file:?}");
+        }
+    }
+
+    #[test]
+    fn an_env_file_without_the_variable_is_an_error_not_a_token() {
+        for file in [
+            "RUST_LOG=info\n",
+            "# c\nA_B=1\nexport C=2\n",
+            "OTHER=a\nabc\n",
+        ] {
+            assert_eq!(
+                token_from_file(file),
+                Err("has no MINGA_API_TOKEN line"),
+                "{file:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_file_or_value_is_an_error() {
+        assert_eq!(token_from_file(" \n\n"), Err("is empty"));
+        for file in [
+            "MINGA_API_TOKEN=\n",
+            "MINGA_API_TOKEN=\"\"",
+            "MINGA_API_TOKEN=''",
+        ] {
+            assert_eq!(
+                token_from_file(file),
+                Err("has an empty MINGA_API_TOKEN"),
+                "{file:?}"
+            );
+        }
     }
 }

@@ -38,7 +38,7 @@ enum Command {
     /// Manage named contexts.
     #[command(subcommand)]
     Context(cmd::context::ContextCommand),
-    /// List, inspect and remove stacks.
+    /// Deploy, list, inspect and remove stacks.
     #[command(subcommand)]
     Stack(cmd::stack::StackCommand),
     /// List services, scale, update and roll them back.
