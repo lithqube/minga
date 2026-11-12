@@ -75,10 +75,11 @@ jobs:
           sudo systemctl restart containerd
           # docker depends on containerd, so it bounces too: wait for both.
           for _ in $(seq 1 60); do
-            docker info >/dev/null 2>&1 && sudo ctr version >/dev/null 2>&1 && break
+            # not `docker info`: it exits 1 on the runner even when the daemon is up
+            docker ps >/dev/null 2>&1 && sudo ctr version >/dev/null 2>&1 && break
             sleep 1
           done
-          docker info >/dev/null
+          docker ps >/dev/null
 
           password="$(openssl rand -hex 16)"
           echo "::add-mask::$password"
