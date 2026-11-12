@@ -46,8 +46,12 @@ pub async fn deploy_stack(
                 .map_err(|_| "API token is not valid header data".to_string())?,
         );
     }
+    // The token goes only to the API: no HTTP_PROXY/ALL_PROXY hop, no
+    // redirect to another host (same rule as minga-ctl's client).
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(15))
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
         .default_headers(headers)
         .build()
         .map_err(|e| format!("cannot build HTTP client: {e}"))?;

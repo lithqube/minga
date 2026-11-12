@@ -90,11 +90,25 @@ fn run_deploy(compose: &str, stack: &str, api_url: &str, extra: &[&str]) -> (boo
     ];
     args.extend_from_slice(extra);
 
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_minga"))
-        .args(&args)
-        .stdin(Stdio::null())
-        .output()
-        .expect("minga binary should run");
+    // Every proxy variable points at a closed port, so each deploy also proves
+    // the API token never goes through `HTTP_PROXY`/`ALL_PROXY`.
+    let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let proxy = format!("http://{}", closed.local_addr().unwrap());
+    drop(closed);
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_minga"));
+    cmd.args(&args).stdin(Stdio::null());
+    for var in [
+        "HTTP_PROXY",
+        "http_proxy",
+        "HTTPS_PROXY",
+        "https_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+    ] {
+        cmd.env(var, &proxy);
+    }
+    cmd.env_remove("NO_PROXY").env_remove("no_proxy");
+    let output = cmd.output().expect("minga binary should run");
     let text = format!(
         "{}{}",
         String::from_utf8_lossy(&output.stdout),
