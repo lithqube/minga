@@ -41,10 +41,12 @@ before. Check these first:
   no longer reach each other. A task that relied on either must use a
   published port on the node address.
 - **Tokenless API.** Without `MINGA_API_TOKEN`, a request that carries an
-  `Origin` header or has a DNS name other than `localhost` or `*.localhost` in `Host` gets 403. This stops a web
-  page in a local browser from driving the API through DNS rebinding. Reach a
-  tokenless API by IP address or `localhost` (for Traefik, an endpoint such as
-  `http://<node-ip>:2375` instead of `host.docker.internal`), or set a token.
+  `Origin` header, or whose `Host` is a DNS name other than `localhost` or
+  `*.localhost`, gets 403. This stops a web page in a local browser from
+  driving a loopback-only API through DNS rebinding. It does not authenticate
+  anyone: an API reachable off loopback needs a token. Traefik sends the
+  token as its Basic-auth password (see the
+  [staging guide](hetzner-arm-staging.md#traefik-as-reverse-proxy)).
 - **`minga-ctl stack deploy` over ssh** needs a token in the context
   (`remote_token_file`), because the relay would otherwise expose a tokenless
   API to other users of the workstation.
@@ -77,21 +79,27 @@ minga-ctl --version   # minga-ctl 1.2.0
 | --- | --- |
 | `cargo fmt --all --check`, `cargo clippy --all-targets -- -D warnings` | Pass, in CI on each PR |
 | `cargo test` (workspace) | Pass, in CI on each PR |
-| containerd suites in CI, including masked `/proc/kcore` and read-only `/proc/sys` inside a container | Pass, in CI |
-| Real-kernel `netns` job: cross-bridge drop, published port through the node address, reserved port refused | Pass, in CI |
+| containerd suites, including masked `/proc/kcore` and read-only `/proc/sys` inside a container | Pass, in CI on #51 |
+| Real-kernel `netns` job: published port through the node address | Pass, in CI |
+| Real-kernel `netns` job: cross-bridge drop, published 53/udp refused | Pass, in CI on #50 |
+| All of the above on merged `main` with #48–#54 | Not run until they are merged |
 | Release workflow with pinned actions and verified rustup | Not run until the `v1.2.0` tag is pushed; check the "Set up job" permissions and action SHAs on that run |
 | The audit's owner-observed checks for each lead on a staging node, before and after | Not run |
 | A scoped re-audit of the changed units against this commit | Not run |
 
 ## Publishing
 
-Tag only after #48–#54 are merged and the staging run is done. Pushing the
+Tag only after #48–#55 are merged and the staging run is done. Pushing the
 tag runs the release workflow, which builds the archives, pushes
 `ghcr.io/lithqube/minga:1.2.0`, `:1.2` and `:latest`, and creates the GitHub
 release. Then set `releasePublished` to `true` in `site/src/config/site.ts`.
 
+Tag the merged `main` commit, not whatever is checked out:
+
 ```bash
-git tag -a v1.2.0 -m "v1.2.0"
+git fetch origin
+git log --oneline origin/main | head -20   # the merges of #48–#55 must be listed
+git tag -a v1.2.0 -m "v1.2.0" origin/main
 git push origin v1.2.0
 ```
 

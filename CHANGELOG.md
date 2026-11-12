@@ -4,7 +4,7 @@
 
 Security fixes from a source audit of 1.1.1 (all twelve P1 leads, plus the
 lower-priority leads that share their root causes). Several change behaviour
-that worked before; read the [upgrade notes](docs/release-1.2.0.md#upgrade-notes)
+that worked before; read the [upgrade notes](https://github.com/lithqube/minga/blob/v1.2.0/docs/release-1.2.0.md#upgrade-notes)
 before upgrading. 1.1.1 was prepared but not tagged, so its fix ships here.
 
 ### Upgrading
@@ -13,9 +13,9 @@ before upgrading. 1.1.1 was prepared but not tagged, so its fix ships here.
 - A task whose published port is reserved by the node (53, the Raft, metrics
   and egress ports, the NATS sidecar's 4222 and 8222) or already has a host
   listener fails to start with `port N is in use on this node`.
-- With no API token, a request carrying an `Origin` header or a DNS-name
-  `Host` other than a `localhost` name gets 403. Reach a tokenless API by IP address or `localhost`, or set
-  `MINGA_API_TOKEN`.
+- With no API token, a request carrying an `Origin` header, or a `Host`
+  that is a DNS name other than `localhost` or `*.localhost`, gets 403. Set
+  `MINGA_API_TOKEN` on any API that is reachable off loopback.
 - `minga-ctl stack deploy` through an ssh context needs a token.
 
 ### Security

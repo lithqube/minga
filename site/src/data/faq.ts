@@ -18,7 +18,7 @@ export const faq: Faq[] = [
   },
   {
     q: 'Can I keep using the docker CLI and Traefik?',
-    a: 'Yes, against <code>minga api</code>: <code>docker stack deploy</code>, <code>docker service ls</code>, <code>docker node ls</code> and the Traefik v3 swarm provider. With a token set, the CLI sends it through <code>"HttpHeaders": {"Authorization": "Bearer &lt;token&gt;"}</code> in <code>~/.docker/config.json</code>. Without a token, the API only answers requests addressed to an IP or <code>localhost</code>, so point Traefik at the node’s IP or set a token.',
+    a: 'Yes, against <code>minga api</code>: <code>docker stack deploy</code>, <code>docker service ls</code>, <code>docker node ls</code> and the Traefik v3 swarm provider. With a token set, the CLI sends it through <code>"HttpHeaders": {"Authorization": "Bearer &lt;token&gt;"}</code> in <code>~/.docker/config.json</code>. Traefik sends the token as its Basic-auth password. Set a token on any API reachable off loopback: without one, anyone who can reach the port controls the cluster.',
     sources: ['README.md', 'docs/talos-deployment.md', 'docs/release-1.2.0.md'],
   },
   {
