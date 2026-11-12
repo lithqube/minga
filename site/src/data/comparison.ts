@@ -12,7 +12,7 @@ export interface Row {
 }
 
 export const asOf = '2026-11';
-export const columns = ['Minga v1.1.1', 'Docker Swarm mode', 'k3s'] as const;
+export const columns = ['Minga v1.2.0', 'Docker Swarm mode', 'k3s'] as const;
 
 const swarmDocs = 'https://docs.docker.com/engine/swarm/';
 const k3sDocs = 'https://docs.k3s.io/';
@@ -161,7 +161,7 @@ export const rows: Row[] = [
   {
     capability: 'Maturity',
     cells: [
-      { mark: 'partial', text: 'v1.1.1; first release 2026-11', source: 'CHANGELOG.md' },
+      { mark: 'partial', text: 'v1.2.0; first release 2026-11', source: 'CHANGELOG.md' },
       { mark: 'yes', text: 'In Docker Engine since 2016', source: swarmDocs },
       { mark: 'yes', text: 'CNCF project, certified Kubernetes distribution', source: k3sDocs },
     ],
