@@ -633,7 +633,13 @@ pub(crate) async fn delete_saving(
     // Put the old revision back only when the server answered that it did not
     // delete. A lost response (or an already gone service) may mean it did, and
     // then the new revision is the only way to recreate it.
-    if matches!(result, Err(CtlError::Api { .. } | CtlError::Auth { .. })) {
+    let refused = match &result {
+        // A 2xx the client could not read (not JSON) is still a delete.
+        Err(CtlError::Api { status, .. }) => !(200..300).contains(status),
+        Err(CtlError::Auth { .. }) => true,
+        _ => false,
+    };
+    if refused {
         // Best effort: a revision left at the current spec rolls back to itself.
         let _ = crate::cmd::stack::restore(client, id, old);
     }

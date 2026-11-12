@@ -579,9 +579,16 @@ async fn inspect_over_an_unreachable_node_still_shows_the_service() {
     assert!(env.read("ssh.calls").unwrap().contains("'logs'"));
 }
 
-/// A lost response to `DELETE` leaves the new revision: the service may be gone.
+/// A `DELETE` with no answer, or a 2xx the client cannot read, leaves the new
+/// revision: the service may be gone.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn service_rm_keeps_the_new_revision_when_the_delete_gets_no_answer() {
+async fn service_rm_keeps_the_new_revision_when_the_delete_outcome_is_unknown() {
+    for reply in [None, Some("deleted")] {
+        keeps_the_revision(reply).await;
+    }
+}
+
+async fn keeps_the_revision(delete_reply: Option<&'static str>) {
     use std::io::{Read, Write};
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
@@ -591,15 +598,21 @@ async fn service_rm_keeps_the_new_revision_when_the_delete_gets_no_answer() {
     })
     .to_string();
     std::thread::spawn(move || {
-        // The read is answered; the DELETE is read and the connection dropped.
+        // The read is answered; the DELETE is read, then answered with plain
+        // text or not at all.
         for answer in [true, false] {
             let (mut stream, _) = listener.accept().unwrap();
             let mut buf = [0u8; 4096];
             let _ = stream.read(&mut buf);
-            if answer {
+            let text = match (answer, delete_reply) {
+                (true, _) => Some((&body[..], "application/json")),
+                (false, Some(text)) => Some((text, "text/plain")),
+                (false, None) => None,
+            };
+            if let Some((text, kind)) = text {
                 let reply = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
+                    "HTTP/1.1 200 OK\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{text}",
+                    text.len()
                 );
                 let _ = stream.write_all(reply.as_bytes());
             }
