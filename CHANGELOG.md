@@ -48,11 +48,6 @@ upgrade notes.
   by 1.0.1 does not decode: clear `--data-dir` and redeploy, upgrading every
   node together.
 
-### Changed
-- The persisted service and task layout gained `extra_hosts`. State written
-  by 1.0.1 does not decode: clear `--data-dir` and redeploy, upgrading every
-  node together.
-
 ### Known limits
 - Registry credential helpers (`credsStore`, `credHelpers`) are not read.
   `ctr` receives credentials on its command line, visible in `ps`.
