@@ -65,7 +65,11 @@ export const rows: Row[] = [
   {
     capability: 'Image pull from a registry',
     cells: [
-      { mark: 'partial', text: 'Private-registry pulls from inline Docker credentials; no credential helpers', source: 'CHANGELOG.md' },
+      {
+        mark: 'partial',
+        text: 'Private-registry pulls from inline Docker credentials; no credential helpers',
+        source: 'CHANGELOG.md',
+      },
       { mark: 'yes', text: 'Yes', source: swarmDocs },
       { mark: 'yes', text: 'Yes', source: k3sDocs },
     ],
