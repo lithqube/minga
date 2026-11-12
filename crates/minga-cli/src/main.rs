@@ -114,9 +114,13 @@ enum ImageCommand {
     /// Pull an image from a registry into the Minga containerd namespace.
     Pull {
         /// Image reference (e.g. ghcr.io/org/app:latest or nginx:1.27).
-        /// Credentials come from the Docker credential file, as `docker login`
-        /// writes it.
+        /// Credentials come from the Docker config (`docker login`'s inline
+        /// auths, `credsStore` or `credHelpers`); they go to containerd over
+        /// its API, never on a command line.
         image_ref: String,
+        /// Path to the containerd gRPC socket.
+        #[arg(long, default_value = "/run/containerd/containerd.sock")]
+        containerd_socket: String,
     },
 }
 
@@ -1748,12 +1752,29 @@ fn print_log_entry(entry: &minga_bus::LogEntry) {
 
 async fn run_image(cmd: ImageCommand) -> ExitCode {
     match cmd {
-        ImageCommand::Pull { image_ref } => {
+        ImageCommand::Pull {
+            image_ref,
+            containerd_socket,
+        } => {
             // The same path as a task's auto-pull: short refs normalized, the
-            // Docker credential file honoured, no separate unpack step.
+            // Docker credentials honoured, containerd unpacks.
             let image_ref = minga_node::containerd::image::normalize_ref(&image_ref);
             eprintln!("pulling {image_ref} into containerd namespace minga …");
-            match minga_node::containerd::pull_with_ctr(&image_ref).await {
+            let client =
+                match minga_node::containerd::ContainerdClient::connect(containerd_socket).await {
+                    Ok(client) => client,
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        return ExitCode::FAILURE;
+                    }
+                };
+            match minga_node::containerd::pull_image(
+                &client,
+                &image_ref,
+                minga_node::containerd::DEFAULT_SNAPSHOTTER,
+            )
+            .await
+            {
                 Ok(()) => {
                     eprintln!("done");
                     ExitCode::SUCCESS

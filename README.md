@@ -21,7 +21,7 @@ Named after the [minga](https://en.wikipedia.org/wiki/Minga) of Chiloé, where a
 >
 > - Container networking across nodes: there's no WireGuard mesh yet.
 > - Joining a node to a running cluster: Raft membership is fixed at bootstrap.
-> - Registry credential helpers (`credsStore`, `credHelpers`), and host-local port hairpinning.
+> - Host-local port hairpinning. (Registry credential helpers, and an image pull through containerd's API that honors `--containerd-socket`, are on `main` and not in this release.)
 > - Verification on a real registry, on Talos, or of `minga-ctl` against a real node over SSH was not run for this release: see [the release notes](docs/release-1.0.2.md).
 >
 > Details: [changelog](CHANGELOG.md), [release notes](docs/release-1.0.2.md), [roadmap](docs/roadmap-v0.1.0.md), [architecture notes](docs/architecture.md).
@@ -315,7 +315,7 @@ Next, in order (rationale in [docs/architecture.md](docs/architecture.md)):
 
 1. Managers-only Raft: workers become pure JetStream clients, liveness moves to `MINGA_LEASES`, and nodes can join a running cluster.
 2. A multi-node WireGuard mesh on top of the per-node data plane.
-3. Registry credentials for image pull (an in-process pull that honors `--containerd-socket`).
+3. ~~Registry credentials for image pull (an in-process pull that honors `--containerd-socket`).~~ Done on `main`; ships in the next release.
 4. Host capabilities for agent sandboxes: WASI, egress-only networking, host-injected workload identity, memory limits.
 
 ## Documentation

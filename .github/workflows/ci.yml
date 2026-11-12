@@ -60,8 +60,43 @@ jobs:
           sudo ctr -n minga images pull docker.io/library/busybox:latest
           sudo ctr -n minga images pull docker.io/library/nginx:1.27
 
+      - name: Private registry (registry:2, htpasswd, TLS) with one seeded image
+        run: |
+          # containerd's Transfer API cannot be told to use plain HTTP, so the
+          # registry serves a self-signed cert that containerd and docker trust.
+          mkdir -p "$RUNNER_TEMP/registry"
+          cd "$RUNNER_TEMP/registry"
+          openssl req -x509 -newkey rsa:2048 -nodes -days 1 -keyout registry.key -out registry.crt \
+            -subj "/CN=localhost" -addext "subjectAltName=DNS:localhost,IP:127.0.0.1"
+          sudo cp registry.crt /usr/local/share/ca-certificates/minga-test-registry.crt
+          sudo update-ca-certificates
+          sudo mkdir -p /etc/docker/certs.d/localhost:5000
+          sudo cp registry.crt /etc/docker/certs.d/localhost:5000/ca.crt
+          sudo systemctl restart containerd
+
+          password="$(openssl rand -hex 16)"
+          echo "::add-mask::$password"
+          docker run --rm --entrypoint htpasswd httpd:2 -Bbn minga "$password" > htpasswd
+          docker run -d --name registry -p 127.0.0.1:5000:5000 \
+            -v "$PWD/htpasswd:/auth/htpasswd:ro" -v "$PWD:/certs:ro" \
+            -e REGISTRY_AUTH=htpasswd -e REGISTRY_AUTH_HTPASSWD_REALM=minga \
+            -e REGISTRY_AUTH_HTPASSWD_PATH=/auth/htpasswd \
+            -e REGISTRY_HTTP_TLS_CERTIFICATE=/certs/registry.crt \
+            -e REGISTRY_HTTP_TLS_KEY=/certs/registry.key \
+            registry:2
+          sleep 3
+          echo "$password" | docker login localhost:5000 -u minga --password-stdin
+          docker pull busybox:latest
+          docker tag busybox:latest localhost:5000/minga/private:1
+          docker push localhost:5000/minga/private:1
+          {
+            echo "MINGA_TEST_REGISTRY_IMAGE=localhost:5000/minga/private:1"
+            echo "MINGA_TEST_REGISTRY_USER=minga"
+            echo "MINGA_TEST_REGISTRY_PASSWORD=$password"
+          } >> "$GITHUB_ENV"
+
       - name: Daemon-backed suites (fail closed when the daemon is absent)
-        run: sudo -E env "PATH=$PATH" MINGA_REQUIRE_CONTAINERD=1 cargo test -p minga-node --test containerd --test containerd_client
+        run: sudo -E env "PATH=$PATH" MINGA_REQUIRE_CONTAINERD=1 cargo test -p minga-node --test containerd --test containerd_client --test containerd_pull
 
   netns:
     name: Published-port paths on a real kernel (never silently skipped)

@@ -31,6 +31,7 @@ use minga_state::types::{TaskId, TaskSpec};
 use tokio::sync::Mutex;
 
 use super::client::{ClientError, ContainerdClient};
+use super::credentials::{credential_for, registry_host};
 use super::image;
 use super::oci;
 use super::proto::{Container, Image, ProcessStatus, Runtime as ProtoRuntime};
@@ -52,7 +53,7 @@ const KILL_GRACE_PERIOD: Duration = Duration::from_secs(10);
 const KILL_CHECK_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Default containerd snapshotter.
-const DEFAULT_SNAPSHOTTER: &str = "overlayfs";
+pub const DEFAULT_SNAPSHOTTER: &str = "overlayfs";
 
 /// Default containerd runtime (runc v2).
 const DEFAULT_RUNTIME_NAME: &str = "io.containerd.runc.v2";
@@ -86,28 +87,78 @@ impl LogRing {
     }
 }
 
-/// Pulls a fully qualified image into the `minga` namespace with `ctr`,
-/// which unpacks it too (containerd v2.2 dropped `ctr images unpack`).
-/// Credentials come from [`registry_auth`]; with none, the pull is anonymous.
-pub async fn pull_with_ctr(image_ref: &str) -> Result<(), RuntimeError> {
-    tracing::info!(image = %image_ref, "pulling image via ctr");
-    let mut args = vec![
-        "-n".to_string(),
-        "minga".into(),
-        "images".into(),
-        "pull".into(),
-    ];
-    // shortcut: `--user` puts the token on ctr's command line, visible to
-    // local users in `ps`; ctr has no other non-interactive way to take it.
-    if let Some(credentials) = registry_auth(image_ref) {
-        args.extend(["--user".to_string(), credentials]);
-    }
-    args.push(image_ref.to_string());
+/// How long a pull may take, however it is done.
+const PULL_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// Pulls and unpacks `image_ref` into the `minga` namespace through
+/// containerd's Transfer service on `client`'s own socket. The registry login
+/// (Docker config, credential helpers) is handed to the daemon over a stream,
+/// so it is never on a command line.
+///
+/// A daemon older than containerd 1.7 has no Transfer service: an anonymous
+/// pull then falls back to [`pull_with_ctr`], but a pull that needs a login
+/// fails, because the only other way to pass one is a command-line argument.
+pub async fn pull_image(
+    client: &ContainerdClient,
+    image_ref: &str,
+    snapshotter: &str,
+) -> Result<(), RuntimeError> {
+    let credential = credential_for(image_ref)
+        .await
+        .map_err(|e| RuntimeError::Start(format!("registry credentials for {image_ref}: {e}")))?;
+    tracing::info!(image = %image_ref, authenticated = credential.is_some(), "pulling image via containerd");
+    let auth = credential
+        .as_ref()
+        .map(|credential| (registry_host(image_ref), credential));
     let pull = tokio::time::timeout(
-        Duration::from_secs(300),
-        tokio::process::Command::new("ctr")
-            .args(&args)
+        PULL_TIMEOUT,
+        client.pull_image(image_ref, snapshotter, auth),
+    )
+    .await
+    .map_err(|_| {
+        RuntimeError::Start(format!(
+            "pull {image_ref} timed out after {}s",
+            PULL_TIMEOUT.as_secs()
+        ))
+    })?;
+    match pull {
+        Ok(()) => {
+            tracing::info!(image = %image_ref, "image pulled and unpacked");
+            Ok(())
+        }
+        Err(ClientError::Grpc(status)) if status.code() == tonic::Code::Unimplemented => {
+            if credential.is_some() {
+                return Err(RuntimeError::Start(format!(
+                    "pull {image_ref}: this containerd has no Transfer service, which passing \
+                     registry credentials needs (containerd {MIN_TRANSFER_VERSION} or newer); \
+                     upgrade containerd or pull the image anonymously"
+                )));
+            }
+            tracing::warn!(image = %image_ref, "containerd has no Transfer service (older than {MIN_TRANSFER_VERSION}); pulling anonymously with ctr");
+            pull_with_ctr(client.socket(), image_ref).await
+        }
+        Err(e) => Err(RuntimeError::Start(format!("pull {image_ref}: {e}"))),
+    }
+}
+
+/// The first containerd release with the Transfer service.
+const MIN_TRANSFER_VERSION: &str = "1.7";
+
+/// Anonymous pull with `ctr` (containerd older than 1.7, which has no
+/// Transfer service), on `socket` when given. Never takes credentials.
+pub async fn pull_with_ctr(
+    socket: Option<&std::path::Path>,
+    image_ref: &str,
+) -> Result<(), RuntimeError> {
+    tracing::info!(image = %image_ref, "pulling image via ctr");
+    let mut command = tokio::process::Command::new("ctr");
+    if let Some(socket) = socket {
+        command.arg("--address").arg(socket);
+    }
+    let pull = tokio::time::timeout(
+        PULL_TIMEOUT,
+        command
+            .args(["-n", "minga", "images", "pull", image_ref])
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true)
@@ -126,62 +177,6 @@ pub async fn pull_with_ctr(image_ref: &str) -> Result<(), RuntimeError> {
     }
     tracing::info!(image = %image_ref, "image pulled and unpacked");
     Ok(())
-}
-
-/// `user:token` for the image's registry from the Docker credential file
-/// (`$DOCKER_CONFIG/config.json`, else `$HOME/.docker/config.json`), the
-/// file `docker login` and `minga-ctl registry login` write.
-pub fn registry_auth(image_ref: &str) -> Option<String> {
-    let path = match std::env::var_os("DOCKER_CONFIG") {
-        Some(dir) => PathBuf::from(dir).join("config.json"),
-        None => PathBuf::from(std::env::var_os("HOME")?).join(".docker/config.json"),
-    };
-    let config: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).ok()?).ok()?;
-    let host = registry_host(image_ref);
-    let found = auth_for_host(&config, host);
-    if found.is_none() {
-        tracing::info!(
-            registry = host,
-            config = %path.display(),
-            "no inline `auth` for this registry (credential helpers are not read); pulling anonymously"
-        );
-    }
-    found
-}
-
-/// The registry an image reference names: its first path component when that
-/// looks like a host, else Docker Hub.
-fn registry_host(image_ref: &str) -> &str {
-    image_ref
-        .split_once('/')
-        .map(|(first, _)| first)
-        .filter(|h| h.contains('.') || h.contains(':') || *h == "localhost")
-        .unwrap_or("docker.io")
-}
-
-/// The decoded `auths.<key>.auth` whose key names `host`. Keys may carry a
-/// scheme or path (`https://index.docker.io/v1/` is how `docker login`
-/// records Docker Hub).
-fn auth_for_host(config: &serde_json::Value, host: &str) -> Option<String> {
-    use base64::Engine as _;
-    let canonical = |key: &str| -> String {
-        let key = key
-            .trim_start_matches("https://")
-            .trim_start_matches("http://");
-        let key = key.split('/').next().unwrap_or(key);
-        match key {
-            "index.docker.io" | "registry-1.docker.io" => "docker.io".into(),
-            other => other.into(),
-        }
-    };
-    let (_, entry) = config["auths"]
-        .as_object()?
-        .iter()
-        .find(|(key, _)| canonical(key) == host)?;
-    let decoded = base64::engine::general_purpose::STANDARD
-        .decode(entry["auth"].as_str()?)
-        .ok()?;
-    String::from_utf8(decoded).ok().filter(|c| c.contains(':'))
 }
 
 /// `extra_hosts` are written into a per-task /etc/hosts that only exists for
@@ -638,7 +633,10 @@ impl ContainerdRuntime {
     }
 
     async fn pull_image(&self, image_ref: &str) -> Result<(), RuntimeError> {
-        pull_with_ctr(image_ref).await
+        // A clone shares the connection but not the lock: a long pull must not
+        // hold up other tasks' calls.
+        let client = self.client.lock().await.clone();
+        pull_image(&client, image_ref, &self.snapshotter).await
     }
 
     /// Clear leftovers from a previous attempt at the same task ID.
@@ -1302,26 +1300,6 @@ mod tests {
         );
         assert!(content.contains("10.0.0.5\tdb\n"), "{content}");
         assert!(hosts_file_content(&hosts, None).is_err());
-    }
-
-    #[test]
-    fn registry_auth_matches_docker_login_keys() {
-        // base64("me:tok") and base64("hub:tok")
-        let config = serde_json::json!({"auths": {
-            "https://ghcr.io": {"auth": "bWU6dG9r"},
-            "https://index.docker.io/v1/": {"auth": "aHViOnRvaw=="},
-            "quay.io": {}
-        }});
-        let auth = |image: &str| auth_for_host(&config, registry_host(image));
-        assert_eq!(auth("ghcr.io/org/app:1").as_deref(), Some("me:tok"));
-        assert_eq!(
-            auth("docker.io/library/nginx:1.27").as_deref(),
-            Some("hub:tok")
-        );
-        assert_eq!(auth("quay.io/org/app:1"), None);
-        assert_eq!(auth("registry.example.com:5000/app:1"), None);
-        assert_eq!(registry_host("localhost/app:1"), "localhost");
-        assert_eq!(registry_host("nginx:1.27"), "docker.io");
     }
 
     #[test]

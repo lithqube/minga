@@ -82,5 +82,5 @@ This should be recorded as an ADR (Workers leave Raft) before any code moves. Th
 
 1. Managers-only Raft and worker join (limits 1–3).
 2. WireGuard mesh (limit 5).
-3. In-process image pull with registry credentials, honoring `--containerd-socket`.
+3. In-process image pull with registry credentials, honoring `--containerd-socket`. Done: the pull goes through containerd's Transfer service (containerd 1.7 or newer), reads inline `auths`, `credsStore` and `credHelpers`, and hands the login to the daemon over a stream, so it is never on a command line. On containerd older than 1.7 an anonymous pull falls back to `ctr --address`, and a pull that needs a login fails.
 4. Sandbox host capabilities: WASI with explicit grants, outbound HTTP only to the local egress proxy, host-injected workload identity, enforced memory limits (limit 4).

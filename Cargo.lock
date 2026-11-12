@@ -2225,6 +2225,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
+ "tokio-stream",
  "tonic",
  "tower 0.5.3",
  "tracing",
