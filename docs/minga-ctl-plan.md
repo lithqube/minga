@@ -76,7 +76,7 @@ File and line references are for `main` at `b1e49ac`, after PR #18 merged.
 | `minga logs` reads NATS JetStream. Plain NATS is allowed only to loopback. | `run_logs` at `main.rs:1672`, `minga-cli/src/bus.rs:68-83` | Logs run on the node. |
 | `minga image pull` runs `ctr` on the machine it is called on. There is no `image ls` or `image rm`. | `run_image` at `main.rs:1746` | Image commands run on the node. |
 | `minga secret put` reads stdin and writes a file in the local secret store. The API stores secret metadata only and rejects a non-empty `Data`. | `run_secret` at `main.rs:632`, `handlers.rs:673` | Secret values never use the API. |
-| In 1.0.1 image pulls are anonymous: `minga image pull` and the automatic pull before a task starts both run `ctr -n minga images pull <ref>` with no credentials. On `main` both read `$DOCKER_CONFIG/config.json`, else `$HOME/.docker/config.json`. | `run_image` in `minga-cli/src/main.rs`, `pull_with_ctr` and `registry_auth` in `minga-node/src/containerd/runtime.rs` | Registry login maintains that file and needs 1.0.2 (section 5.8). |
+| In 1.0.1 image pulls are anonymous: `minga image pull` and the automatic pull before a task starts both run `ctr -n minga images pull <ref>` with no credentials. From 1.0.2 both read `$DOCKER_CONFIG/config.json`, else `$HOME/.docker/config.json`; from 1.1.0 they pull through containerd's Transfer API and also read credential helpers. | `run_image` in `minga-cli/src/main.rs`, `credentials.rs` and `ContainerdClient::pull_image` in `minga-node/src/containerd/` | Registry login maintains that file and needs 1.0.2 (section 5.8). |
 | `minga deploy` translates the compose file on the machine it runs on. On `main` that includes reading `env_file` files and joining relative bind-mount sources to the compose file's directory. (`extra_hosts: host-gateway` stays literal and is resolved by the node.) | `minga-cli/src/main.rs`, `minga-compose/src/project.rs` | A deploy from a workstation resolves these on the workstation (section 5.2). |
 | Things inside the cluster read the API too. The staging guide runs Traefik as a container whose Swarm provider reads `http://<gateway>:2375`, with the API on `0.0.0.0:2375` behind a host firewall. | `docs/hetzner-arm-staging.md` | The API cannot always be bound to loopback (section 2.2). |
 
@@ -1229,25 +1229,29 @@ alice@wrk1.example.net  ghcr.io                       acme-deploy
 In the example `wrk1` has no Google credential, so a task placed there cannot
 pull from that registry.
 
-**Gaps in what merged.** These are for Minga to close, not minga-ctl. They
-were checked against `main` at `b1e49ac`.
+**Gaps in what merged, and their status.** These were for Minga to close,
+not minga-ctl. They were found against `main` at `b1e49ac`; the status is as
+of 1.1.0.
 
-- The credential is on a command line. The pull runs
-  `ctr -n minga images pull --user <user>:<secret> <ref>` (`pull_image` in
-  `crates/minga-node/src/containerd/runtime.rs`), so every local user of the
-  node can read it in the process list while a pull runs. This plan's rule is
-  that a credential never appears on a command line (section 2.2, item 9);
-  the merged code does not meet it yet.
-- Failures are quiet. A file with no entry for the registry logs one info
-  line and pulls anonymously. A missing `HOME` or an unreadable or malformed
-  file logs nothing. The first sign is a 401 from the registry.
+- *Closed in 1.1.0.* The credential was on a command line: the pull ran
+  `ctr -n minga images pull --user <user>:<secret> <ref>`, so every local user
+  of the node could read it in the process list. Pulls now go through
+  containerd's Transfer API (`ContainerdClient::pull_image` in
+  `crates/minga-node/src/containerd/`), which asks Minga for the credential
+  over a stream, so it never appears on a command line (section 2.2, item 9).
+  On containerd older than 1.7 a pull that needs a credential fails instead.
+- *Partly closed in 1.1.0.* Failures were quiet. A malformed credential file
+  and a configured helper that is missing or fails are now errors. A file
+  with no entry for the registry still logs one info line and pulls
+  anonymously, so the first sign is a 401 from the registry.
 - `minga image pull` uses the same lookup, so `login --verify <image ref>`
   can run it on each node after storing.
-- Docker Hub uses a different key. Minga looks up `docker.io`, which is what
-  minga-ctl writes. `docker login` writes `https://index.docker.io/v1/`, so a
-  file produced by `docker login` on the node is not matched for Docker Hub.
-- `credHelpers` and `credsStore` are not read. minga-ctl writes inline `auth`
-  entries only.
+- *Closed in 1.0.2.* Docker Hub used a different key: `docker login` writes
+  `https://index.docker.io/v1/`. Minga now treats it, `index.docker.io` and
+  `registry-1.docker.io` as `docker.io`.
+- *Closed in 1.1.0.* `credHelpers` and `credsStore` are read, in that order,
+  before inline `auths`. minga-ctl itself still writes inline `auth` entries
+  only.
 
 A node-side `minga registry login` with its own store and a fixed path would
 be a cleaner contract than a file under `$HOME`. It is not needed for this
@@ -1372,9 +1376,10 @@ Before each commit: `cargo fmt --all`, `cargo clippy --all-targets -- -D warning
 - If minga-ctl stops between the API accepting an update and the revision
   file being written, that change has no saved revision.
 - `registry` commands have no effect on nodes that run Minga older than
-  1.0.2. From 1.0.2 the credential is used, but Minga passes it to `ctr` on
-  the command line, where local users of the node can read it during a pull
-  (section 5.8). That is for Minga to fix.
+  1.0.2. On 1.0.2 the credential is used, but Minga passes it to `ctr` on
+  the command line, where local users of the node can read it during a pull.
+  From 1.1.0 it never appears on a command line, and a pull that needs it
+  requires containerd 1.7 or newer (section 5.8).
 - When a container has to read the API (Traefik's Swarm provider), the API
   listens beyond loopback and the token is the only barrier between any
   container on the node and the cluster (section 2.2).

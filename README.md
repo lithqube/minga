@@ -2,29 +2,31 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.80%2B-orange.svg)](https://www.rust-lang.org)
-[![Status](https://img.shields.io/badge/status-v1.0.2-blue.svg)](CHANGELOG.md)
+[![Status](https://img.shields.io/badge/status-v1.1.0-blue.svg)](CHANGELOG.md)
 
 A single-binary container and agent orchestrator for **edge, on-prem and air-gapped sites**, written in Rust. It runs Compose files natively, speaks enough of the Docker Swarm API to replace it, and treats AI-agent workloads as first-class objects (WASM sandboxes and an LLM egress proxy today).
 
 Named after the [minga](https://en.wikipedia.org/wiki/Minga) of Chiloé, where a community moves a whole house together.
 
-> **Status: `v1.0.2`.** What works, verified by execution on macOS and on Linux (OrbStack Ubuntu, containerd 2.2.1):
+> **Status: `v1.1.0`.** What works, verified by tests on macOS and in Linux CI (containerd suites and a real-kernel networking job); the [release notes](docs/release-1.1.0.md) say what was and was not run on a real node:
 >
 > - **Compose and deploy:** Compose parsing that fails loudly on unknown keys, and `minga deploy` through the Swarm-compatible Docker Engine API (v1.41, optional bearer token).
 > - **Control plane:** Raft consensus with mTLS and write forwarding, a scheduler, and self-registering nodes with membership leases.
 > - **Runtime and networking:** a node supervisor driving a **real containerd runtime**, per-task netns/bridge networking with IPAM and embedded DNS, and real container logs.
 > - **Platform:** NATS/JetStream with TLS, WASM sandboxes, an LLM egress proxy, and Prometheus metrics with health endpoints.
-> - **Updates:** rolling updates honoring `update_config`, enforced healthchecks, automatic rollback, and registry image pull through `ctr`.
-> - **New in `v1.0.2`:** Compose `env_file`, `extra_hosts` (with `host-gateway`) and named users; private-registry pulls from inline Docker credentials; the API token as a Basic-auth password for Traefik; and `minga-ctl`, a companion CLI for contexts, stacks, services, health and registry login (not in the release archive; `cargo install --path crates/minga-ctl`, see [its plan](docs/minga-ctl-plan.md)).
+> - **Updates:** rolling updates honoring `update_config`, enforced healthchecks, automatic rollback, and registry image pull through containerd's Transfer API with Docker credential helpers.
+> - **New in `v1.1.0`:** versioned state, so later upgrades keep it; `minga state export` and `import` for backup and restore ([guide](docs/backup.md)); a failed task records its last error and exit code, shown by the Docker API and `minga-ctl service ps` and `service inspect`; image pulls that keep the credential off the command line and read `credsStore`/`credHelpers`; published ports that only redirect traffic addressed to the node, with host-local and hairpin access; supplementary groups from the image. **Upgrading from 1.0.2 needs one last removal of the Raft files**: see the [release notes](docs/release-1.1.0.md#upgrade-notes).
+> - **`minga-ctl`**, the companion CLI for contexts, stacks, services, health and registry login over SSH (not in the release archive; `cargo install --locked --path crates/minga-ctl`, see [its plan](docs/minga-ctl-plan.md)).
 >
-> **Not in `v1.0.2`:**
+> **Not in `v1.1.0`:**
 >
 > - Container networking across nodes: there's no WireGuard mesh yet.
 > - Joining a node to a running cluster: Raft membership is fixed at bootstrap.
-> - Host-local port hairpinning. (Registry credential helpers, and an image pull through containerd's API that honors `--containerd-socket`, are on `main` and not in this release.)
-> - Verification on a real registry, on Talos, or of `minga-ctl` against a real node over SSH was not run for this release: see [the release notes](docs/release-1.0.2.md).
+> - API roles, TLS on the API listener and a server-side audit log: designed in [ADR 0005](docs/adr/0005-api-identity-and-roles.md) (Proposed), not built. The API has one shared token.
+> - A plain-HTTP registry on containerd 1.7 (the Transfer API has no plain-HTTP option there).
+> - A run of this build on a real staging node, on Talos, or against a hosted private registry: see [the release notes](docs/release-1.1.0.md#verification-status).
 >
-> Details: [changelog](CHANGELOG.md), [release notes](docs/release-1.0.2.md), [roadmap](docs/roadmap-v0.1.0.md), [architecture notes](docs/architecture.md).
+> Details: [changelog](CHANGELOG.md), [release notes](docs/release-1.1.0.md), [production-readiness plan](docs/production-readiness-plan.md), [architecture notes](docs/architecture.md).
 >
 > The Talos install is validated on a single docker-provisioned Talos v1.14 node, not on bare metal. FIPS, SOC 2, VS-NfD and NATO are **not assessed**, which is not the same as "not applicable".
 
@@ -42,12 +44,13 @@ Minga ships as **one binary** (plus the `nats-server` it supervises). There's no
 
 - **Compose-native.** Full spec parsing with interpolation, profiles, merge keys and `x-` extensions. Unknown keys fail loudly with suggestions. `command`, `entrypoint`, `labels`, `healthcheck` (gates task readiness), volumes, bind mounts, placement constraints and `deploy.restart_policy` reach the container.
 - **Swarm-compatible API.** Services, tasks, nodes, networks, secrets and configs, with label filters. `docker stack deploy`, `docker service ls`, `docker node ls` and Traefik v3's swarm provider work against `minga api`.
-- **Raft consensus.** Desired state and placement go through [openraft](https://docs.rs/openraft), persisted in [redb](https://docs.rs/redb). mTLS on the Raft transport and bounded frames. No external etcd.
-- **Container networking on a node.** Deterministic per-task IPs from IPAM (a /24 per network from `10.100.0.0/16`), one bridge per network, a netns and veth pair per task, iptables DNAT for published ports, and embedded DNS (`<svc>`, `tasks.<svc>`, `<svc>.<stack>.minga.local`). Cross-node traffic needs the WireGuard mesh, which is generated as config but not applied yet.
+- **Raft consensus.** Desired state and placement go through [openraft](https://docs.rs/openraft), persisted in [redb](https://docs.rs/redb) as versioned JSON: a node refuses data it cannot read and says why, and fields added later need no wipe. mTLS on the Raft transport and bounded frames. No external etcd.
+- **Backup and restore.** `minga state export` writes services, networks, volumes and secret and config references to a 0600 file; `minga state import` restores them into a fresh cluster, where the scheduler places the tasks again. [docs/backup.md](docs/backup.md) lists what else to copy.
+- **Container networking on a node.** Deterministic per-task IPs from IPAM (a /24 per network from `10.100.0.0/16`), one bridge per network, a netns and veth pair per task, iptables DNAT for published ports (traffic addressed to the node only, reachable from the node itself and from tasks through the node's address), and embedded DNS (`<svc>`, `tasks.<svc>`, `<svc>.<stack>.minga.local`). Cross-node traffic needs the WireGuard mesh, which is generated as config but not applied yet.
 - **Secrets and logs.** Secrets are external references staged per task and content-addressed, so rotation never changes a running task's files. `minga logs [-f]` shows separated stdout/stderr from a JetStream-retained backlog.
 - **Agent workloads.** `x-minga-agent` Compose services run as WASM modules under wasmtime with fuel and timeout limits. An LLM egress proxy enforces per-workload token budgets, caches responses and redacts secrets. Today the WASM guest gets no host I/O: no WASI, no network, so it can't reach the proxy yet. Memory limits aren't enforced, and Firecracker is a stub.
-- **Observability.** `/metrics`, `/healthz` and `/readyz` on `minga api`, and on manager and worker nodes via `--metrics-bind`. JSON logs on stderr for long-running roles.
-- **Air-gap friendly.** Release archives bundle a checksum-pinned `nats-server`, and `install.sh` verifies `SHA256SUMS`. A task pulls a missing image with the bundled `ctr`, using inline credentials from the Docker credential file when it has an entry for the registry, and air-gapped sites can preload images with `minga image pull` or `ctr` instead.
+- **Observability.** `/metrics`, `/healthz` and `/readyz` on `minga api`, and on manager and worker nodes via `--metrics-bind`. JSON logs on stderr for long-running roles. A failed container task keeps its last error and exit code, returned in the Docker API's task status and shown by `minga-ctl service ps` and `service inspect`; an agent task records the error only when it fails to start.
+- **Air-gap friendly.** Release archives bundle a checksum-pinned `nats-server`, and `install.sh` verifies `SHA256SUMS`. A task pulls a missing image through containerd's Transfer API on the configured socket, with credentials from Docker credential helpers or inline `auths` that never appear on a command line; air-gapped sites preload images with `minga image pull` or `ctr` instead.
 
 ## Architecture
 
@@ -93,7 +96,7 @@ flowchart LR
   supB --> ctrB["containerd + netns/bridge"]
 ```
 
-> In `v1.0.2` **every `minga` process is a Raft voter**, including workers and `minga api`, and membership is fixed when the cluster first starts. Only desired state should go through Raft. Node lease renewals still do, as one atomic command every 10s. [docs/architecture.md](docs/architecture.md) explains why this matters for cluster size and quorum, and what replaces it.
+> In `v1.1.0` **every `minga` process is a Raft voter**, including workers and `minga api`, and membership is fixed when the cluster first starts. Only desired state should go through Raft. Node lease renewals still do, as one atomic command every 10s. [docs/architecture.md](docs/architecture.md) explains why this matters for cluster size and quorum, and what replaces it.
 
 ### How a deploy becomes a running container
 
@@ -169,7 +172,7 @@ flowchart TB
 
 ## Quick start: one Linux host
 
-You need Linux, root (the supervisor creates netns, bridges and iptables rules), `iproute2` + `iptables` + `procps` (present in any standard server install; the container image bundles them), and containerd. A task pulls a missing image into the `minga` namespace with `ctr` (on PATH, default containerd socket; registry credentials from `$DOCKER_CONFIG/config.json`, else `~/.docker/config.json`, inline `auth` entries only).
+You need Linux, root (the supervisor creates netns, bridges and iptables rules), `iproute2` + `iptables` + `procps` (present in any standard server install; the container image bundles them), and containerd. A task pulls a missing image into the `minga` namespace through containerd's Transfer API on `--containerd-socket` (containerd 1.7 or newer for private registries). Registry credentials come from `$DOCKER_CONFIG/config.json`, else `~/.docker/config.json`: `credHelpers`, then `credsStore`, then inline `auths`.
 
 ```bash
 # Installs minga + the checksum-pinned nats-server and verifies SHA256SUMS.
@@ -315,21 +318,25 @@ Next, in order (rationale in [docs/architecture.md](docs/architecture.md)):
 
 1. Managers-only Raft: workers become pure JetStream clients, liveness moves to `MINGA_LEASES`, and nodes can join a running cluster.
 2. A multi-node WireGuard mesh on top of the per-node data plane.
-3. ~~Registry credentials for image pull (an in-process pull that honors `--containerd-socket`).~~ Done on `main`; ships in the next release.
+3. ~~Registry credentials for image pull (an in-process pull that honors `--containerd-socket`).~~ Done in `v1.1.0`.
 4. Host capabilities for agent sandboxes: WASI, egress-only networking, host-injected workload identity, memory limits.
 
 ## Documentation
 
 - [Architecture notes](docs/architecture.md): how the pieces fit today, known structural limits, and the plan
+- [Release notes: v1.1.0](docs/release-1.1.0.md)
 - [Release notes: v1.0.2](docs/release-1.0.2.md)
 - [Release notes: v1.0.1](docs/release-1.0.1.md)
+- [Production-readiness plan](docs/production-readiness-plan.md): what single-node production needed after v1.0.2, and what is left
+- [Backup and restore](docs/backup.md)
 - [minga-ctl design plan](docs/minga-ctl-plan.md): the companion CLI and its trust model
 - [Roadmap to v0.1.0](docs/roadmap-v0.1.0.md): the seven release gates and their evidence
 - [ADR 0001: Language split](docs/adr/0001-language-split.md)
 - [ADR 0002: Event bus](docs/adr/0002-event-bus-nats.md): NATS/JetStream behind `minga-bus`
 - [ADR 0003: Agent workloads](docs/adr/0003-agent-workloads.md)
 - [ADR 0004: Observability](docs/adr/0004-observability.md)
-- [Talos deployment guide](docs/talos-deployment.md) (not validated)
+- [ADR 0005: API identity, roles and audit](docs/adr/0005-api-identity-and-roles.md) (Proposed)
+- [Talos deployment guide](docs/talos-deployment.md) (validated on a single Talos v1.14 node, not bare metal)
 - [NATS/JetStream evaluation](docs/research/nats-evaluation.md)
 - [Design document](docs/design.md)
 - [CLAUDE.md](CLAUDE.md): project conventions for AI-assisted development

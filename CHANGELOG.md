@@ -1,5 +1,98 @@
 # Changelog
 
+## [1.1.0] — 2026-11-12
+
+Single-node production fixes from the
+[production-readiness plan](docs/production-readiness-plan.md): state that
+survives later upgrades, backup and restore, image pulls through containerd's
+own API with credential helpers, published ports that behave, and task
+failures that explain themselves. See
+[docs/release-1.1.0.md](docs/release-1.1.0.md) for verification status and
+upgrade notes.
+
+### Upgrading
+- **One last wipe.** State written by 1.0.2 or older is refused at start
+  with `written by minga 1.0.2 or older ... remove raft_log.redb and state.redb`.
+  Remove `raft_log.redb` and `state.redb` from each role's `--data-dir` on
+  every node (not the whole directory: with default paths it also holds
+  secret values, named volumes and agent modules), upgrade every node
+  together, and redeploy. Later upgrades keep state when they only add
+  fields.
+- Credentialed image pulls need containerd 1.7 or newer.
+
+### Added
+- Backup and restore of desired state: `minga state export [-o FILE]
+  [--force]` and `minga state import FILE [--overwrite]`, over
+  `GET`/`POST /v1.41/state`. The export holds services, networks, volumes and
+  secret and config references; not nodes, tasks or secret values. Files are
+  written 0600 and an existing file is not replaced without `--force`.
+  [docs/backup.md](docs/backup.md) covers what else to copy.
+- A failed task records why: `last_error` (one line, credentials scrubbed)
+  and `last_exit_code`, kept while the task restarts. The Docker API returns
+  them in `Status.Err`, `Status.Message` and `ContainerStatus.ExitCode`.
+  `minga-ctl service ps` and `stack ps` gain an `ERROR` column and a hint
+  when tasks are down; new `minga-ctl service inspect`.
+- Docker credential helpers: `credHelpers[host]`, then `credsStore`, then
+  inline `auths`. A configured helper that is missing or fails is an error
+  that names it.
+- `minga image pull --containerd-socket`.
+- Supplementary groups: a named user gets the groups that list it in the
+  image's `/etc/group`.
+- The Docker API maps `ContainerSpec.Hosts` to `extra_hosts` and back.
+- `minga-ctl`: `remote_token_file` may be an env file with a
+  `MINGA_API_TOKEN=` line; `stack deploy --help` says that `minga` runs on
+  the workstation, with the macOS install command.
+
+### Changed
+- Persisted state, Raft log entries and Raft messages are versioned JSON
+  (format 2) instead of bincode. Each redb file stores a `format_version`
+  marker; data without one, or from a newer format, is refused with a
+  message that says why. Rules for changing a persisted type are in
+  `crates/minga-state/src/codec.rs`.
+- Image pulls go through containerd's Transfer API on the configured socket.
+  The credential is never on a command line; the daemon pulls, so its
+  network and CA trust apply. On containerd older than 1.7, anonymous pulls
+  fall back to `ctr --address <socket>` and credentialed pulls fail with a
+  message naming 1.7.
+- A bare numeric `user:` listed in the image's `/etc/passwd` runs with that
+  user's primary group instead of gid 0, as Docker does.
+- A task with `extra_hosts` but no network attachment fails to start
+  instead of silently skipping them.
+- A Docker `config.json` that exists but is not valid JSON is an error
+  instead of being ignored.
+
+### Fixed
+- Published ports redirected any traffic to the published port number,
+  so a task calling a remote host on a port published on the node (for
+  example outbound HTTPS while 443 is published) reached the local task.
+  The DNAT rule now matches node addresses only.
+- Host-local access to published ports (`127.0.0.1:<port>`, the node's own
+  address) and a task reaching a published port through the node's address
+  (hairpin) now work.
+- A failed image pull or user lookup left the task's network namespace
+  behind; teardown also removes the task's `/etc/hosts` file.
+- `minga-ctl stack deploy` without a `minga` binary replaced the saved
+  rollback target before failing.
+- `minga-ctl --debug` printed the harmless macOS ssh notice
+  `setsockopt TCP_NODELAY` for every connection.
+
+### Known limits
+- A Transfer pull on containerd 1.7 cannot reach a plain-HTTP registry;
+  serve TLS with a CA the node trusts.
+- Identity tokens are sent as basic credentials; token refresh is not
+  implemented. Only stub credential helpers were tested, not real ones.
+- The runtime reports exit codes only, so a signal is inferred from
+  128+N and an OOM kill reads as `killed by signal 9`. Agent tasks record a
+  reason only for a failed start. Credential scrubbing works by shape.
+- `minga state import` skips placement checks and updates existing
+  networks, volumes and references even without `--overwrite`.
+- Some start failures after network setup (image load, snapshot prepare,
+  log FIFOs) can still leave a network namespace behind.
+- Nodes of one cluster must run the same version.
+- API roles, server-side audit and server-side revisions are designed in
+  [ADR 0005](docs/adr/0005-api-identity-and-roles.md) (Proposed), not
+  built. `minga-ctl` is not in the release archive.
+
 ## [1.0.2] — 2026-11-12
 
 Compose and staging fixes from the first real-world deploy, private-registry

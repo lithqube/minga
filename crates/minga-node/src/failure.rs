@@ -68,14 +68,21 @@ pub(crate) fn start_error(err: &dyn Display, secrets: &[String]) -> Failure {
     }
 }
 
-/// The registry credentials the node would use for `image`: the `user:token`
-/// pair and the token alone.
+/// The inline registry credential the node holds for `image`: the
+/// `user:token` pair and the token alone.
+///
+/// shortcut: credentials from a helper are not looked up here, since that
+/// would run the helper on every failure; they are blanked by shape only.
+/// Pulls pass them to containerd over a stream, never on a command line, so
+/// they are not expected in error text.
 pub(crate) fn registry_secrets(image: &str) -> Vec<String> {
-    let Some(pair) = crate::containerd::runtime::registry_auth(image) else {
+    let Some(cred) = crate::containerd::credentials::inline_credential(image) else {
         return Vec::new();
     };
-    let token = pair.split_once(':').map(|(_, t)| t.to_string());
-    std::iter::once(pair).chain(token).collect()
+    vec![
+        format!("{}:{}", cred.username, cred.secret()),
+        cred.secret().to_string(),
+    ]
 }
 
 /// One line of at most [`MAX_LEN`] characters with credentials blanked out.

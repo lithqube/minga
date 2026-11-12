@@ -47,8 +47,8 @@ export const site = {
   license: 'MIT',
   licenseUrl: `${repoUrl}/blob/main/LICENSE`,
   // The version is not configured here: it is read from CHANGELOG.md (src/lib/repo.ts).
-  /** The release page and stable archives are published. */
-  releasePublished: true,
+  /** The release page and stable archives are published. Set to true once the tag for the CHANGELOG's latest version is pushed. */
+  releasePublished: false,
 
   /** GitHub counts. Leave null to hide; fill in by hand or from a CI step. */
   stats: { stars: null as number | null, forks: null as number | null, contributors: null as number | null },

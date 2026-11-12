@@ -1,6 +1,6 @@
 # Architecture notes
 
-How Minga fits together **as of `v1.0.2`**, the structural limits that come with it, and the plan to remove them. Settled decisions live in the [ADRs](adr/); this page describes the code as it is.
+How Minga fits together **as of `v1.1.0`**, the structural limits that come with it, and the plan to remove them. Settled decisions live in the [ADRs](adr/); this page describes the code as it is.
 
 ## Processes and state
 
@@ -30,7 +30,7 @@ flowchart LR
 
 ## Persisted format
 
-Raft log entries, state-machine rows and Raft messages are JSON (`crates/minga-state/src/codec.rs`), and each redb file stores a one-byte `format_version` (currently 2). A new field marked `#[serde(default)]` needs nothing else, so state survives that upgrade. `Task.last_error` and `Task.last_exit_code` (why a task last ended) were added this way. Renaming, removing or re-typing a field, or changing what a value means, needs a version bump and a migration step. Frozen fixtures in `crates/minga-state/tests/fixtures/` fail the build when a persisted type changes shape, and a node refuses to open data it cannot read, saying why (data written by 1.0.2 or older: clear `--data-dir`).
+Raft log entries, state-machine rows and Raft messages are JSON (`crates/minga-state/src/codec.rs`), and each redb file stores a one-byte `format_version` (currently 2). A new field marked `#[serde(default)]` needs nothing else, so state survives that upgrade. `Task.last_error` and `Task.last_exit_code` (why a task last ended) were added this way. Renaming, removing or re-typing a field, or changing what a value means, needs a version bump and a migration step. Frozen fixtures in `crates/minga-state/tests/fixtures/` fail the build when a persisted type changes shape, and a node refuses to open data it cannot read, saying why (data written by 1.0.2 or older: remove `raft_log.redb` and `state.redb` from `--data-dir`, not the whole directory).
 
 The wire frame carries the format version but no schema revision, so nodes of one cluster must still run the same version: a node that does not know a new field drops it from the messages it relays. Upgrade every node together.
 
@@ -40,7 +40,7 @@ The wire frame carries the format version but no schema revision, so nodes of on
 
 ## Known structural limits
 
-These are deliberate `v1.0.2` trade-offs, listed so nobody builds on them by accident.
+These are deliberate `v1.1.0` trade-offs, listed so nobody builds on them by accident.
 
 1. **Every node is a Raft voter.** Workers and `minga api` open a full `StateStore`, and membership is the `--peer` list at first start. Consequences:
    - Quorum depends on the number of workers, so flaky edge workers can stall deploys.

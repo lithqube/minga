@@ -7,7 +7,7 @@
 #
 # Usage:
 #   ./setup-talos-minga.sh --node 10.0.0.5
-./setup-talos-minga.sh --node 10.0.0.5 --image ghcr.io/lithqube/minga:v1.0.2
+#   ./setup-talos-minga.sh --node 10.0.0.5 --image ghcr.io/lithqube/minga:1.1.0
 #
 # Flags:
 #   --node IP          node address (required; maintenance mode)

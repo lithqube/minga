@@ -1,4 +1,4 @@
-// Feature list. Every entry maps to a capability that ships in v1.0.2; `caveat` says where it stops.
+// Feature list. Every entry maps to a capability that ships in v1.1.0; `caveat` says where it stops.
 // The two `lead` entries are what an evaluator replacing Swarm checks first, so they get the large
 // treatment; the rest are a compact list (DESIGN.md §5.8, antislop R-14).
 export interface Feature {
@@ -32,7 +32,7 @@ export const features: Feature[] = [
     title: 'Fails loudly by default',
     body: 'Unknown Compose keys are rejected with suggestions, an unplaceable deploy gets HTTP 409 instead of a warning, and /readyz says why it is not ready.',
     caveat:
-      'Healthchecks gate task readiness; named users resolve from the image’s /etc/passwd, without supplementary groups.',
+      'Healthchecks gate task readiness; named users and their groups resolve from the image’s own /etc/passwd and /etc/group.',
     href: '/architecture/',
     linkLabel: 'Read the architecture notes',
     source: 'README.md, CHANGELOG.md',
@@ -41,7 +41,7 @@ export const features: Feature[] = [
     title: 'One binary, checksum-verified',
     body: 'Release archives bundle minga with a checksum-pinned nats-server and ctr plus licenses, install.sh verifies SHA256SUMS and can install the systemd unit, and the same binaries ship as a multi-arch ghcr.io/lithqube/minga image (Talos runs it as a ContainerConfig).',
     caveat:
-      'Private-registry pulls read inline Docker credentials only (no credential helpers), and ctr receives them on its command line.',
+      'Pulls go through containerd’s Transfer API with Docker credential helpers; credentialed pulls need containerd 1.7 or newer.',
     href: '/docs/quickstart/',
     linkLabel: 'Quickstart',
     source: 'CHANGELOG.md, install.sh',
@@ -56,7 +56,7 @@ export const features: Feature[] = [
   },
   {
     title: 'Metrics, health, logs',
-    body: '/metrics, /healthz and /readyz on every role, JSON logs, and minga logs -f with separated stdout and stderr.',
+    body: '/metrics, /healthz and /readyz on every role, JSON logs, minga logs -f with separated stdout and stderr, and the last error and exit code of a failed container task.',
     caveat: 'No distributed tracing yet.',
     href: '/adr/0004-observability/',
     linkLabel: 'ADR 0004: Observability',
@@ -69,6 +69,15 @@ export const features: Feature[] = [
     href: '/changelog/',
     linkLabel: 'Changelog',
     source: 'CHANGELOG.md 0.1.0',
+  },
+  {
+    title: 'State you can upgrade and restore',
+    body: 'Desired state is versioned JSON, so upgrades that add fields keep it, and minga state export and import back it up and restore it into a fresh cluster.',
+    caveat:
+      'Upgrading from v1.0.2 needs one last removal of the Raft files; secret values and volume data are copied separately.',
+    href: '/changelog/',
+    linkLabel: 'Changelog',
+    source: 'CHANGELOG.md, docs/backup.md',
   },
   {
     title: 'Validate before you deploy',

@@ -12,7 +12,7 @@ export interface Row {
 }
 
 export const asOf = '2026-11';
-export const columns = ['Minga v1.0.2', 'Docker Swarm mode', 'k3s'] as const;
+export const columns = ['Minga v1.1.0', 'Docker Swarm mode', 'k3s'] as const;
 
 const swarmDocs = 'https://docs.docker.com/engine/swarm/';
 const k3sDocs = 'https://docs.k3s.io/';
@@ -66,8 +66,8 @@ export const rows: Row[] = [
     capability: 'Image pull from a registry',
     cells: [
       {
-        mark: 'partial',
-        text: 'Private-registry pulls from inline Docker credentials; no credential helpers',
+        mark: 'yes',
+        text: 'Through containerd’s Transfer API, with Docker credential helpers; credentialed pulls need containerd 1.7+, and no plain-HTTP registries on 1.7',
         source: 'CHANGELOG.md',
       },
       { mark: 'yes', text: 'Yes', source: swarmDocs },
@@ -100,6 +100,22 @@ export const rows: Row[] = [
       { mark: 'yes', text: 'Healthchecks enforced; rolling updates and rollback supported', source: 'CHANGELOG.md' },
       { mark: 'yes', text: 'Yes', source: 'https://docs.docker.com/engine/swarm/swarm-tutorial/rolling-update/' },
       { mark: 'yes', text: 'Probes, rollouts and rollback', source: k3sDocs },
+    ],
+  },
+  {
+    capability: 'Backup and restore of cluster state',
+    cells: [
+      {
+        mark: 'yes',
+        text: 'minga state export and import of desired state over the API; secret values and volume data copied separately',
+        source: 'docs/backup.md',
+      },
+      {
+        mark: 'partial',
+        text: 'Copy the swarm state directory from a manager with Docker stopped',
+        source: 'https://docs.docker.com/engine/swarm/admin_guide/',
+      },
+      { mark: 'yes', text: 'etcd snapshots with embedded etcd', source: 'https://docs.k3s.io/cli/etcd-snapshot' },
     ],
   },
   {
@@ -145,7 +161,7 @@ export const rows: Row[] = [
   {
     capability: 'Maturity',
     cells: [
-      { mark: 'partial', text: 'v1.0.2, released 2026-11-12', source: 'CHANGELOG.md' },
+      { mark: 'partial', text: 'v1.1.0; first release 2026-11', source: 'CHANGELOG.md' },
       { mark: 'yes', text: 'In Docker Engine since 2016', source: swarmDocs },
       { mark: 'yes', text: 'CNCF project, certified Kubernetes distribution', source: k3sDocs },
     ],

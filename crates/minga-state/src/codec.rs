@@ -43,7 +43,7 @@ pub enum CodecError {
     WireVersion { got: u8, want: u8 },
     #[error(
         "this data directory was written by minga 1.0.2 or older and cannot be read: \
-         clear --data-dir and redeploy"
+         remove raft_log.redb and state.redb from --data-dir (not the whole directory) and redeploy"
     )]
     OldFormat,
     #[error(
@@ -51,7 +51,10 @@ pub enum CodecError {
          reads {want}): use the newer binary"
     )]
     NewerFormat { found: u8, want: u8 },
-    #[error("no migration from data format {from} to {want}: clear --data-dir and redeploy")]
+    #[error(
+        "no migration from data format {from} to {want}: remove raft_log.redb and state.redb \
+         from --data-dir (not the whole directory) and redeploy"
+    )]
     NoMigration { from: u8, want: u8 },
     #[error("unreadable format_version marker: {0:?}")]
     BadMarker(Vec<u8>),
@@ -170,7 +173,11 @@ mod tests {
         // Data without a marker is what 1.0.2 wrote.
         let err = check_format(None, false).unwrap_err();
         assert!(err.to_string().contains("1.0.2 or older"), "{err}");
-        assert!(err.to_string().contains("clear --data-dir"), "{err}");
+        assert!(
+            err.to_string()
+                .contains("remove raft_log.redb and state.redb"),
+            "{err}"
+        );
 
         let newer = check_format(Some(&[FORMAT_VERSION + 1]), false).unwrap_err();
         assert!(newer.to_string().contains("newer minga"), "{newer}");

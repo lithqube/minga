@@ -2,7 +2,7 @@
 
 **Status:** Validated on a single Hetzner CAX21 node (Ampere Altra ARM64, Ubuntu 24.04 LTS). All 8 services reach `RUNNING`. Validation required `feat/staging-compat` fixes — see [PR #16](https://github.com/lithqube/minga/pull/16).
 
-**Version:** Minga v1.0.2 (first validated on `feat/staging-compat`)
+**Version:** Minga v1.1.0 (first validated with v1.0.2 on `feat/staging-compat`; not yet re-run on v1.1.0)
 
 > **Not yet re-validated:** the API token for Traefik (Basic auth), the node-side `host-gateway` address, the `DOCKER_CONFIG` setup and named users were changed after that run. They are covered by unit tests, and named users also by a daemon-backed test, but not yet by a redeploy of this stack.
 
@@ -25,7 +25,7 @@
 
 ```
 Hetzner CAX21 (Ubuntu 24.04 LTS, ARM64)
-  Minga v1.0.2 (single binary)
+  Minga v1.1.0 (single binary)
     traefik:v3         :80/:443   TLS termination, Swarm-label routing
     bff:3000           internal   Nuxt BFF (private GHCR image, amd64+arm64)
     workers            internal   NATS consumer (same image as bff)
@@ -44,7 +44,7 @@ Only ports 22, 80, and 443 are open to the internet (ufw).
 ## Prerequisites
 
 1. Ubuntu 24.04 LTS on the VPS
-2. Minga v1.0.2 installed (`install.sh --with-systemd`)
+2. Minga v1.1.0 installed (`install.sh --with-systemd`)
 3. Containerd (`apt install containerd`)
 4. `ufw` active, only 22/80/443 open
 
@@ -152,7 +152,7 @@ bff:
 
 ### Private GHCR images
 
-Minga v1.0.2+ reads the Docker credential file on every pull: a task's automatic pull and `minga image pull`. Only inline `auth` entries are read. Credential helpers (`credsStore`, `credHelpers`) are not. The manager runs as root, so point it at a root-owned file explicitly instead of relying on `HOME`:
+Minga v1.0.2+ reads the Docker credential file on every pull: a task's automatic pull and `minga image pull`. v1.0.2 reads inline `auth` entries only; v1.1.0 also reads credential helpers (`credHelpers`, then `credsStore`), which must then be on the manager's `PATH`, and needs containerd 1.7+ for credentialed pulls. The manager runs as root, so point it at a root-owned file explicitly instead of relying on `HOME`:
 
 ```bash
 sudo install -d -m 0700 /etc/minga/docker
@@ -170,7 +170,7 @@ Then pre-pull, or let the first deploy pull:
 sudo DOCKER_CONFIG=/etc/minga/docker minga image pull ghcr.io/your-org/your-image:tag
 ```
 
-Docker Hub entries written by `docker login` (key `https://index.docker.io/v1/`) match `docker.io` images. `ctr` takes the credentials on its command line, so other local users can see them in `ps` while a pull runs.
+Docker Hub entries written by `docker login` (key `https://index.docker.io/v1/`) match `docker.io` images. On v1.0.2, `ctr` takes the credentials on its command line, so other local users can see them in `ps` while a pull runs. From v1.1.0 the pull goes through containerd's Transfer API and the credential never appears on a command line.
 
 With `minga-ctl registry login`, point the context at the same file, because minga-ctl's default is `/root/.docker/config.json`: `minga-ctl context add staging --ssh <user>@<node> --remote-token-file /etc/minga/api-token --registry-auth-file /etc/minga/docker/config.json`. The SSH user needs read and write access to that file.
 
@@ -188,7 +188,7 @@ ai-service:
   user: "app:app"
 ```
 
-> Requires Minga v1.0.2+. Supplementary groups from `/etc/group` are not applied.
+> Requires Minga v1.0.2+. Supplementary groups from `/etc/group` are applied from v1.1.0.
 
 ### NATS JetStream
 
