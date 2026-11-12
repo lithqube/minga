@@ -72,8 +72,8 @@ jobs:
           sudo update-ca-certificates
           sudo mkdir -p /etc/docker/certs.d/localhost:5000
           sudo cp registry.crt /etc/docker/certs.d/localhost:5000/ca.crt
-          sudo systemctl restart containerd
-          # docker depends on containerd, so it bounces too: wait for both.
+          # docker depends on containerd and is not brought back by itself: restart both.
+          sudo systemctl restart containerd docker
           for _ in $(seq 1 60); do
             # not `docker info`: it exits 1 on the runner even when the daemon is up
             docker ps >/dev/null 2>&1 && sudo ctr version >/dev/null 2>&1 && break
