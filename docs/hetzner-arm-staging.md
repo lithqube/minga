@@ -170,7 +170,7 @@ Then pre-pull, or let the first deploy pull:
 sudo DOCKER_CONFIG=/etc/minga/docker minga image pull ghcr.io/your-org/your-image:tag
 ```
 
-Docker Hub entries written by `docker login` (key `https://index.docker.io/v1/`) match `docker.io` images. `ctr` takes the credentials on its command line, so other local users can see them in `ps` while a pull runs.
+Docker Hub entries written by `docker login` (key `https://index.docker.io/v1/`) match `docker.io` images. On v1.0.2, `ctr` takes the credentials on its command line, so other local users can see them in `ps` while a pull runs. From v1.1.0 the pull goes through containerd's Transfer API and the credential never appears on a command line.
 
 With `minga-ctl registry login`, point the context at the same file, because minga-ctl's default is `/root/.docker/config.json`: `minga-ctl context add staging --ssh <user>@<node> --remote-token-file /etc/minga/api-token --registry-auth-file /etc/minga/docker/config.json`. The SSH user needs read and write access to that file.
 

@@ -56,7 +56,7 @@ export const features: Feature[] = [
   },
   {
     title: 'Metrics, health, logs',
-    body: '/metrics, /healthz and /readyz on every role, JSON logs, minga logs -f with separated stdout and stderr, and the last error and exit code of every failed task.',
+    body: '/metrics, /healthz and /readyz on every role, JSON logs, minga logs -f with separated stdout and stderr, and the last error and exit code of a failed container task.',
     caveat: 'No distributed tracing yet.',
     href: '/adr/0004-observability/',
     linkLabel: 'ADR 0004: Observability',

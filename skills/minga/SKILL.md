@@ -69,7 +69,7 @@ Things that surprise people:
 - **Back up desired state** before anything that touches the data directory: `minga state export -o backup.json` (on the node, with `--api-url` and `MINGA_API_TOKEN` like `deploy`). The file holds services, networks, volumes and secret and config references, including environment values, so it is written 0600: treat it as a secret. It does not hold secret values (`--secret-store`), named volume data or TLS material; `docs/backup.md` says how to copy those.
 - **Restore** into a fresh cluster with `minga state import backup.json`. It refuses when a service already exists unless `--overwrite`; ask before using that flag. Nodes and tasks are not in the file: nodes re-register and the scheduler places the tasks again.
 - **Upgrading from 1.0.2 to 1.1.0** needs one last wipe. A 1.1.0 node on a 1.0.2 data directory stops with `written by minga 1.0.2 or older ... remove raft_log.redb and state.redb`. Remove only those two files in each role's `--data-dir`, on every node, and upgrade every node together. **Never delete the whole data directory**: with default paths it also holds secret values (`secrets/`), named volume data (`volumes/`) and agent modules (`modules/`). Ask before removing anything.
-- Later upgrades keep state when they only add fields. Nodes of one cluster must still run the same version; mixed versions refuse each other's Raft messages.
+- Later upgrades keep state when they only add fields. Nodes of one cluster must still run the same version. Nodes with different format versions refuse each other's Raft messages, but two releases that share a format talk to each other, and the older one silently drops fields it does not know.
 
 ## Handling secrets and destructive commands
 

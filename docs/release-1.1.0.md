@@ -52,7 +52,8 @@ So, on every node:
 4. Install v1.1.0 on every node, start the roles, and redeploy your stacks.
 
 Every node of a cluster must run the same version: a node refuses Raft
-messages in another format. From v1.1.0 on, an upgrade that only adds fields
+messages in another format, and two releases that share a format silently drop
+the fields the older one does not know. From v1.1.0 on, an upgrade that only adds fields
 keeps state.
 
 Also check:

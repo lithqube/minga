@@ -8,7 +8,7 @@ export interface Faq {
 export const faq: Faq[] = [
   {
     q: 'Is Minga production-ready?',
-    a: 'It is v1.1.0, aimed at single-host production. It is tested on macOS and in Linux CI, including the containerd suites and a real-kernel check of the published-port paths; this build has not yet been run on a real staging node. v1.1.0 adds versioned state that later upgrades keep, backup and restore, a recorded reason for every failed task, image pulls through containerd’s own API with Docker credential helpers, and published ports that only redirect traffic addressed to the node. Cross-node container networking, joining a running cluster and per-operator API roles are not there yet.',
+    a: 'It is v1.1.0, aimed at single-host production. It is tested on macOS and in Linux CI, including the containerd suites and a real-kernel check of the published-port paths; this build has not yet been run on a real staging node. v1.1.0 adds versioned state that later upgrades keep, backup and restore, a recorded reason for failed tasks (last error and exit code for containers, the start error for agent tasks), image pulls through containerd’s own API with Docker credential helpers, and published ports that only redirect traffic addressed to the node. Cross-node container networking, joining a running cluster and per-operator API roles are not there yet.',
     sources: ['README.md', 'CHANGELOG.md', 'docs/release-1.1.0.md'],
   },
   {
@@ -38,7 +38,7 @@ export const faq: Faq[] = [
   },
   {
     q: 'Why is my service at 0/1?',
-    a: 'Run <code>minga-ctl service inspect &lt;stack&gt;.&lt;service&gt;</code>. Every failed task keeps its last error and exit code, for example <code>exited with code 1</code>, <code>killed by signal 9</code> or the start error. <code>minga-ctl service ps</code> shows the same in its <code>ERROR</code> column, and the Docker API returns it in the task status. Then read the task’s logs with <code>minga-ctl service logs</code>.',
+    a: 'Run <code>minga-ctl service inspect &lt;stack&gt;.&lt;service&gt;</code>. A failed container task keeps its last error and exit code, for example <code>exited with code 1</code>, <code>killed by signal 9</code> or the start error. An agent (WASM) task records a reason only when it fails to start. <code>minga-ctl service ps</code> shows the same in its <code>ERROR</code> column, and the Docker API returns it in the task status. Then read the task’s logs with <code>minga-ctl service logs</code>.',
     sources: ['docs/minga-ctl-plan.md', 'CHANGELOG.md'],
   },
   {
