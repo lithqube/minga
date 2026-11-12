@@ -274,7 +274,7 @@ fn program_path(program: &str) -> OsString {
 
 fn text<'a>(arg: &RemoteArg<'a>) -> &'a str {
     match *arg {
-        RemoteArg::Fixed(text) => text,
+        RemoteArg::Fixed(text) | RemoteArg::Script(text) => text,
         RemoteArg::Value(text) => text,
     }
 }
