@@ -326,7 +326,8 @@ async fn containerd_kernel_paths_are_masked_and_read_only() {
         command: vec![
             "sh".to_string(),
             "-c".to_string(),
-            "if test -w /proc/sys/kernel/core_pattern; then echo sys-writable; else echo sys-protected; fi; \
+            // busybox `test -w` is always true for root, so read the mount flags instead.
+            "if grep -qE '^[^ ]+ /proc/sys [^ ]+ ro[, ]' /proc/self/mounts; then echo sys-protected; else echo sys-writable; fi; \
              if test -s /proc/kcore; then echo kcore-visible; else echo kcore-masked; fi; sleep 30"
                 .to_string(),
         ],
