@@ -79,7 +79,7 @@ async fn ps_shows_the_error_last_and_hints_at_what_to_run() {
     assert!(LONG_ERROR.starts_with(cut.trim_end_matches('…')), "{cut}");
     assert_eq!(
         err.trim(),
-        "2 task(s) not running: see `minga-ctl service ps shop.web` and `minga-ctl service logs shop.web`"
+        "2 task(s) not running: see `minga-ctl service inspect shop.web` and `minga-ctl service logs shop.web`"
     );
 
     // JSON keeps the whole text and the exit code.

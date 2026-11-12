@@ -204,7 +204,7 @@ pub fn not_running_hint(tasks: &Value) -> Option<String> {
         "<service>"
     };
     Some(format!(
-        "{} task(s) not running: see `minga-ctl service ps {service}` and `minga-ctl service logs {service}`",
+        "{} task(s) not running: see `minga-ctl service inspect {service}` and `minga-ctl service logs {service}`",
         down.len()
     ))
 }
@@ -472,12 +472,12 @@ mod tests {
         assert_eq!(not_running_hint(&json!([])), None);
         assert_eq!(
             not_running_hint(&json!([task("a.b", "failed"), task("a.b", "preparing")])).unwrap(),
-            "2 task(s) not running: see `minga-ctl service ps a.b` and `minga-ctl service logs a.b`"
+            "2 task(s) not running: see `minga-ctl service inspect a.b` and `minga-ctl service logs a.b`"
         );
         assert!(
             not_running_hint(&json!([task("a.b", "failed"), task("a.c", "failed")]))
                 .unwrap()
-                .contains("service ps <service>")
+                .contains("service inspect <service>")
         );
     }
 }

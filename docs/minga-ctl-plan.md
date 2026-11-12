@@ -657,7 +657,7 @@ start, cut to 50 characters in the table (`-` when there is none). `-o json`
 and `-o yaml` carry the whole text as `error` and the exit code as
 `exit_code`, both `null` when absent. When any task is not in state
 `running`, `ps` also prints one line on stderr (not with `--quiet`):
-``2 task(s) not running: see `minga-ctl service ps <service>` and `minga-ctl service logs <service>` ``,
+``2 task(s) not running: see `minga-ctl service inspect <service>` and `minga-ctl service logs <service>` ``,
 with the service ID when only one service has such tasks.
 
 ```
