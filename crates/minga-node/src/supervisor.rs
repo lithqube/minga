@@ -55,7 +55,7 @@ use tokio::sync::Mutex;
 use crate::agent::{AgentError, AgentExecutor, AgentStatus};
 use crate::failure::{self, Failure};
 use crate::health::{self, Health};
-use crate::runtime::{Runtime, RuntimeError};
+use crate::runtime::{ContainerStatus, Runtime, RuntimeError};
 
 #[derive(Debug, Error)]
 pub enum SupervisorError {
@@ -71,11 +71,6 @@ pub enum SupervisorError {
 
 /// Tracks which tasks have been started on this node and their container IDs.
 type RunningTasks = Arc<Mutex<HashMap<TaskId, String>>>;
-
-/// Tracks task IDs that were assigned via the bus (vs Raft). The Raft
-/// fallback reconcile only stops containers for Raft-assigned tasks;
-/// bus-assigned tasks are stopped via bus Stop commands.
-type BusAssignedTasks = Arc<Mutex<HashSet<TaskId>>>;
 
 /// Tracks agent task IDs currently running on this node.
 type RunningAgents = Arc<Mutex<HashSet<TaskId>>>;
@@ -188,7 +183,6 @@ pub struct Supervisor {
     node_id: NodeId,
     running: RunningTasks,
     running_agents: RunningAgents,
-    bus_assigned: BusAssignedTasks,
     log_offsets: LogOffsets,
     restart_states: RestartStates,
     health: Arc<Mutex<HashMap<TaskId, Health>>>,
@@ -206,7 +200,6 @@ impl Supervisor {
             node_id,
             running: Arc::new(Mutex::new(HashMap::new())),
             running_agents: Arc::new(Mutex::new(HashSet::new())),
-            bus_assigned: Arc::new(Mutex::new(HashSet::new())),
             log_offsets: Arc::new(Mutex::new(HashMap::new())),
             restart_states: Arc::new(Mutex::new(HashMap::new())),
             health: Arc::new(Mutex::new(HashMap::new())),
@@ -231,7 +224,6 @@ impl Supervisor {
             node_id,
             running: Arc::new(Mutex::new(HashMap::new())),
             running_agents: Arc::new(Mutex::new(HashSet::new())),
-            bus_assigned: Arc::new(Mutex::new(HashSet::new())),
             log_offsets: Arc::new(Mutex::new(HashMap::new())),
             restart_states: Arc::new(Mutex::new(HashMap::new())),
             health: Arc::new(Mutex::new(HashMap::new())),
@@ -256,7 +248,6 @@ impl Supervisor {
             node_id,
             running: Arc::new(Mutex::new(HashMap::new())),
             running_agents: Arc::new(Mutex::new(HashSet::new())),
-            bus_assigned: Arc::new(Mutex::new(HashSet::new())),
             log_offsets: Arc::new(Mutex::new(HashMap::new())),
             restart_states: Arc::new(Mutex::new(HashMap::new())),
             health: Arc::new(Mutex::new(HashMap::new())),
@@ -1009,16 +1000,30 @@ impl Supervisor {
     /// Execute a single command received from the bus.
     async fn execute_command(&self, cmd: Command) -> usize {
         match cmd {
-            Command::Assign { task_id, payload } => {
-                // Deserialize the task spec.
-                let spec: TaskSpec = match minga_state::codec::decode_wire(&payload) {
-                    Ok(spec) => spec,
-                    Err(e) => {
-                        tracing::error!(
+            Command::Assign {
+                task_id,
+                payload: _,
+            } => {
+                // The bus is only a wake-up: anyone who can publish on it could
+                // otherwise start any spec as root. Start the task only as Raft
+                // records it for this node, from the Raft spec, never the payload.
+                // A task not replicated yet is started by the next Raft pass.
+                let spec: TaskSpec = match self.state.get_task(&task_id).await {
+                    Ok(Some(task))
+                        if task.node_id == self.node_id
+                            && !matches!(task.state, TaskState::Stopped | TaskState::Failed) =>
+                    {
+                        task.spec
+                    }
+                    Ok(_) => {
+                        tracing::warn!(
                             task = %task_id,
-                            error = %e,
-                            "failed to deserialize task spec from command"
+                            "ignoring bus Assign for a task Raft does not assign to this node"
                         );
+                        return 0;
+                    }
+                    Err(e) => {
+                        tracing::error!(task = %task_id, error = %e, "cannot read task for bus Assign");
                         return 0;
                     }
                 };
@@ -1048,7 +1053,6 @@ impl Supervisor {
                                 .await
                                 .insert(task_id.clone(), container_id);
                             self.container_started(&task_id, &spec).await;
-                            self.bus_assigned.lock().await.insert(task_id);
                             1
                         }
                         Err(e) => {
@@ -1082,7 +1086,6 @@ impl Supervisor {
                                 );
                                 self.running_agents.lock().await.insert(task_id.clone());
                                 self.mark_task_state(&task_id, TaskState::Running).await;
-                                self.bus_assigned.lock().await.insert(task_id);
                                 1
                             }
                             Err(e) => {
@@ -1100,7 +1103,6 @@ impl Supervisor {
                 }
             }
             Command::Stop { task_id } => {
-                self.bus_assigned.lock().await.remove(&task_id);
                 self.log_offsets.lock().await.remove(&task_id);
 
                 // Check if it's a container or an agent.
@@ -1334,22 +1336,18 @@ impl Supervisor {
         }
 
         // --- stop containers for removed tasks --------------------------------
-        // Only stop Raft-assigned tasks. Bus-assigned tasks are stopped
-        // via bus Stop commands.
-        let bus_assigned = self.bus_assigned.lock().await;
+        // Every running task came from Raft (a bus Assign only starts a task
+        // Raft holds), so anything Raft no longer assigns here is stopped.
         let to_stop_containers: Vec<(TaskId, String)> = running
             .iter()
-            .filter(|(task_id, _)| {
-                !my_task_ids.contains(*task_id) && !bus_assigned.contains(*task_id)
-            })
+            .filter(|(task_id, _)| !my_task_ids.contains(*task_id))
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
         let to_stop_agents: Vec<TaskId> = running_agents
             .iter()
-            .filter(|task_id| !my_task_ids.contains(*task_id) && !bus_assigned.contains(*task_id))
+            .filter(|task_id| !my_task_ids.contains(*task_id))
             .cloned()
             .collect();
-        drop(bus_assigned);
 
         for (task_id, container_id) in to_stop_containers {
             self.log_offsets.lock().await.remove(&task_id);
@@ -1407,6 +1405,61 @@ impl Supervisor {
         Ok(actions)
     }
 
+    /// Startup: containers outlive a supervisor restart under their shims, but
+    /// the in-memory `running` map does not. Adopt every running container that
+    /// Raft still assigns here, so a later removal stops it, and stop the rest
+    /// now: a task deleted or rescheduled while this process was down would
+    /// otherwise keep running untracked, with its secrets, network and ports.
+    /// Returns the number of containers stopped.
+    async fn recover_running_containers(&self) -> usize {
+        let containers = self.runtime.list().await;
+        if containers.is_empty() {
+            return 0;
+        }
+        let tasks = match self.state.list_tasks().await {
+            Ok(tasks) => tasks,
+            Err(e) => {
+                // Without state we cannot tell keep from stop: leave everything.
+                tracing::error!(error = %e, "cannot read tasks to recover containers");
+                return 0;
+            }
+        };
+        let assigned: HashSet<&TaskId> = tasks
+            .iter()
+            .filter(|t| {
+                t.node_id == self.node_id
+                    && !matches!(t.state, TaskState::Stopped | TaskState::Failed)
+            })
+            .map(|t| &t.id)
+            .collect();
+        let mut stopped = 0;
+        for c in containers {
+            if c.status != ContainerStatus::Running {
+                continue;
+            }
+            if assigned.contains(&c.task_id) {
+                tracing::info!(task = %c.task_id, container = %c.id, "adopted running container");
+                self.running.lock().await.insert(c.task_id, c.id);
+                continue;
+            }
+            match self.runtime.stop(&c.id).await {
+                Ok(()) => {
+                    stopped += 1;
+                    minga_telemetry::METRICS.task_stops_total.inc();
+                    tracing::info!(
+                        task = %c.task_id,
+                        container = %c.id,
+                        "stopped a container Raft no longer assigns to this node"
+                    );
+                }
+                Err(e) => {
+                    tracing::error!(task = %c.task_id, container = %c.id, error = %e, "cannot stop leftover container");
+                }
+            }
+        }
+        stopped
+    }
+
     /// Runs the supervisor loop forever, sleeping `interval` between passes.
     pub async fn run(self, interval: Duration) -> ! {
         tracing::info!(node = self.node_id, ?interval, "supervisor loop starting");
@@ -1414,6 +1467,7 @@ impl Supervisor {
         // left over from a previous run. Uses list_tasks (not list_containers)
         // so it also catches tasks whose container entry is already gone.
         self.runtime.purge_stopped_tasks().await;
+        self.recover_running_containers().await;
         loop {
             match self.reconcile_once().await {
                 Ok(0) => {
@@ -1569,6 +1623,73 @@ mod tests {
 
     fn spec_to_payload(spec: &TaskSpec) -> Vec<u8> {
         minga_state::codec::encode_wire(spec).unwrap()
+    }
+
+    /// Puts `task_id` with `spec` on node 1 in Raft, as the scheduler does
+    /// before it publishes, and returns the bus Assign for it.
+    async fn assign_cmd(store: &StateStore, task_id: &str, spec: TaskSpec) -> Command {
+        let mut task = make_task(task_id, 1);
+        task.spec = spec.clone();
+        store.upsert_task(task).await.unwrap();
+        Command::Assign {
+            task_id: task_id.to_string(),
+            payload: spec_to_payload(&spec),
+        }
+    }
+
+    #[tokio::test]
+    async fn bus_assign_for_a_task_missing_from_raft_is_ignored() {
+        let (supervisor, runtime, _store, bus) = setup_with_bus(1).await;
+        let cmd = Command::Assign {
+            task_id: "forged".to_string(),
+            payload: spec_to_payload(&make_spec()),
+        };
+        bus.send_command(1, &cmd).await.unwrap();
+        assert_eq!(supervisor.reconcile_once().await.unwrap(), 0);
+        assert_eq!(runtime.container_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn bus_assign_starts_the_raft_spec_not_the_payload() {
+        let (supervisor, runtime, store, bus) = setup_with_bus(1).await;
+        let mut cmd = assign_cmd(&store, "t1", make_spec()).await;
+        let forged = TaskSpec {
+            image: "evil:latest".to_string(),
+            ..make_spec()
+        };
+        if let Command::Assign { payload, .. } = &mut cmd {
+            *payload = spec_to_payload(&forged);
+        }
+        bus.send_command(1, &cmd).await.unwrap();
+        supervisor.reconcile_once().await.unwrap();
+        let images: Vec<String> = runtime.list().await.into_iter().map(|c| c.image).collect();
+        assert_eq!(images, ["nginx:latest"]);
+    }
+
+    #[tokio::test]
+    async fn startup_adopts_assigned_containers_and_stops_the_rest() {
+        let (supervisor, runtime, store) = setup(1).await;
+        // Containers left running by a previous supervisor process.
+        runtime
+            .start(&"kept".to_string(), &make_spec())
+            .await
+            .unwrap();
+        runtime
+            .start(&"orphan".to_string(), &make_spec())
+            .await
+            .unwrap();
+        // While it was down, "orphan" was removed from Raft; "kept" still runs here.
+        store.upsert_task(make_task("kept", 1)).await.unwrap();
+
+        assert_eq!(supervisor.recover_running_containers().await, 1);
+        assert_eq!(runtime.container_count(), 1);
+        assert_eq!(supervisor.running_tasks().await, ["kept".to_string()]);
+        // Adopted, so the next pass neither restarts it nor leaves it alone
+        // once Raft drops it.
+        assert_eq!(supervisor.reconcile_once().await.unwrap(), 0);
+        store.remove_task("kept".to_string()).await.unwrap();
+        assert_eq!(supervisor.reconcile_once().await.unwrap(), 1);
+        assert_eq!(runtime.container_count(), 0);
     }
 
     async fn setup(node_id: u64) -> (Supervisor, Arc<MockRuntime>, Arc<StateStore>) {
@@ -1783,13 +1904,10 @@ mod tests {
 
     #[tokio::test]
     async fn bus_assign_command_starts_container() {
-        let (supervisor, runtime, _store, bus) = setup_with_bus(1).await;
+        let (supervisor, runtime, store, bus) = setup_with_bus(1).await;
 
         // Send an assign command via the bus.
-        let cmd = Command::Assign {
-            task_id: "t1".to_string(),
-            payload: spec_to_payload(&make_spec()),
-        };
+        let cmd = assign_cmd(&store, "t1", make_spec()).await;
         bus.send_command(1, &cmd).await.unwrap();
 
         let actions = supervisor.reconcile_once().await.unwrap();
@@ -1800,13 +1918,10 @@ mod tests {
 
     #[tokio::test]
     async fn bus_stop_command_stops_container() {
-        let (supervisor, runtime, _store, bus) = setup_with_bus(1).await;
+        let (supervisor, runtime, store, bus) = setup_with_bus(1).await;
 
         // Start via bus command.
-        let cmd = Command::Assign {
-            task_id: "t1".to_string(),
-            payload: spec_to_payload(&make_spec()),
-        };
+        let cmd = assign_cmd(&store, "t1", make_spec()).await;
         bus.send_command(1, &cmd).await.unwrap();
         supervisor.reconcile_once().await.unwrap();
         assert_eq!(runtime.container_count(), 1);
@@ -1849,13 +1964,10 @@ mod tests {
 
     #[tokio::test]
     async fn bus_publishes_task_status() {
-        let (supervisor, _runtime, _store, bus) = setup_with_bus(1).await;
+        let (supervisor, _runtime, store, bus) = setup_with_bus(1).await;
 
         // Start a container via bus command.
-        let cmd = Command::Assign {
-            task_id: "t1".to_string(),
-            payload: spec_to_payload(&make_spec()),
-        };
+        let cmd = assign_cmd(&store, "t1", make_spec()).await;
         bus.send_command(1, &cmd).await.unwrap();
         supervisor.reconcile_once().await.unwrap();
 
@@ -1881,10 +1993,7 @@ mod tests {
         store.upsert_task(make_task("raft-task", 1)).await.unwrap();
 
         // Task via bus.
-        let cmd = Command::Assign {
-            task_id: "bus-task".to_string(),
-            payload: spec_to_payload(&make_spec()),
-        };
+        let cmd = assign_cmd(&store, "bus-task", make_spec()).await;
         bus.send_command(1, &cmd).await.unwrap();
 
         let actions = supervisor.reconcile_once().await.unwrap();
@@ -1899,12 +2008,9 @@ mod tests {
 
     #[tokio::test]
     async fn bus_assign_is_idempotent() {
-        let (supervisor, runtime, _store, bus) = setup_with_bus(1).await;
+        let (supervisor, runtime, store, bus) = setup_with_bus(1).await;
 
-        let cmd = Command::Assign {
-            task_id: "t1".to_string(),
-            payload: spec_to_payload(&make_spec()),
-        };
+        let cmd = assign_cmd(&store, "t1", make_spec()).await;
         bus.send_command(1, &cmd).await.unwrap();
         bus.send_command(1, &cmd).await.unwrap(); // duplicate
 
@@ -1992,12 +2098,9 @@ mod tests {
 
     #[tokio::test]
     async fn bus_assign_agent_starts_agent() {
-        let (supervisor, runtime, agent_exec, _store, bus) = setup_with_agent(1).await;
+        let (supervisor, runtime, agent_exec, store, bus) = setup_with_agent(1).await;
 
-        let cmd = Command::Assign {
-            task_id: "agent-1".to_string(),
-            payload: spec_to_payload(&make_agent_spec()),
-        };
+        let cmd = assign_cmd(&store, "agent-1", make_agent_spec()).await;
         bus.send_command(1, &cmd).await.unwrap();
 
         let actions = supervisor.reconcile_once().await.unwrap();
@@ -2013,18 +2116,16 @@ mod tests {
 
     #[tokio::test]
     async fn bus_stop_agent_stops_agent() {
-        let (supervisor, _runtime, agent_exec, _store, bus) = setup_with_agent(1).await;
+        let (supervisor, _runtime, agent_exec, store, bus) = setup_with_agent(1).await;
 
         // Start agent via bus.
-        let cmd = Command::Assign {
-            task_id: "agent-1".to_string(),
-            payload: spec_to_payload(&make_agent_spec()),
-        };
+        let cmd = assign_cmd(&store, "agent-1", make_agent_spec()).await;
         bus.send_command(1, &cmd).await.unwrap();
         supervisor.reconcile_once().await.unwrap();
         assert_eq!(agent_exec.agent_count(), 1);
 
-        // Stop via bus.
+        // Stop via bus, after the scheduler removed the task from Raft.
+        store.remove_task("agent-1".to_string()).await.unwrap();
         let stop = Command::Stop {
             task_id: "agent-1".to_string(),
         };
@@ -2077,10 +2178,7 @@ mod tests {
             .unwrap();
 
         // Agent task via bus.
-        let cmd = Command::Assign {
-            task_id: "agent-1".to_string(),
-            payload: spec_to_payload(&make_agent_spec()),
-        };
+        let cmd = assign_cmd(&store, "agent-1", make_agent_spec()).await;
         bus.send_command(1, &cmd).await.unwrap();
 
         let actions = supervisor.reconcile_once().await.unwrap();
@@ -2116,13 +2214,10 @@ mod tests {
 
     #[tokio::test]
     async fn agent_status_published_to_bus() {
-        let (supervisor, _runtime, agent_exec, _store, bus) = setup_with_agent(1).await;
+        let (supervisor, _runtime, agent_exec, store, bus) = setup_with_agent(1).await;
         *agent_exec.auto_complete.lock().unwrap() = true;
 
-        let cmd = Command::Assign {
-            task_id: "agent-1".to_string(),
-            payload: spec_to_payload(&make_agent_spec()),
-        };
+        let cmd = assign_cmd(&store, "agent-1", make_agent_spec()).await;
         bus.send_command(1, &cmd).await.unwrap();
         supervisor.reconcile_once().await.unwrap();
 
@@ -2138,12 +2233,9 @@ mod tests {
 
     #[tokio::test]
     async fn running_tasks_includes_agents() {
-        let (supervisor, _runtime, _agent_exec, _store, bus) = setup_with_agent(1).await;
+        let (supervisor, _runtime, _agent_exec, store, bus) = setup_with_agent(1).await;
 
-        let cmd = Command::Assign {
-            task_id: "agent-1".to_string(),
-            payload: spec_to_payload(&make_agent_spec()),
-        };
+        let cmd = assign_cmd(&store, "agent-1", make_agent_spec()).await;
         bus.send_command(1, &cmd).await.unwrap();
         supervisor.reconcile_once().await.unwrap();
 
@@ -2153,12 +2245,9 @@ mod tests {
 
     #[tokio::test]
     async fn agent_assign_is_idempotent() {
-        let (supervisor, _runtime, agent_exec, _store, bus) = setup_with_agent(1).await;
+        let (supervisor, _runtime, agent_exec, store, bus) = setup_with_agent(1).await;
 
-        let cmd = Command::Assign {
-            task_id: "agent-1".to_string(),
-            payload: spec_to_payload(&make_agent_spec()),
-        };
+        let cmd = assign_cmd(&store, "agent-1", make_agent_spec()).await;
         bus.send_command(1, &cmd).await.unwrap();
         bus.send_command(1, &cmd).await.unwrap(); // duplicate
 
@@ -2174,16 +2263,13 @@ mod tests {
 
     #[tokio::test]
     async fn container_logs_streamed_to_bus() {
-        let (supervisor, _runtime, _store, bus) = setup_with_bus(1).await;
+        let (supervisor, _runtime, store, bus) = setup_with_bus(1).await;
 
         // Subscribe to logs before starting.
         let mut log_stream = bus.subscribe_logs("t1").await.unwrap();
 
         // Start a container via bus command.
-        let cmd = Command::Assign {
-            task_id: "t1".to_string(),
-            payload: spec_to_payload(&make_spec()),
-        };
+        let cmd = assign_cmd(&store, "t1", make_spec()).await;
         bus.send_command(1, &cmd).await.unwrap();
         supervisor.reconcile_once().await.unwrap();
 
@@ -2198,14 +2284,11 @@ mod tests {
 
     #[tokio::test]
     async fn container_logs_not_duplicated() {
-        let (supervisor, _runtime, _store, bus) = setup_with_bus(1).await;
+        let (supervisor, _runtime, store, bus) = setup_with_bus(1).await;
 
         let mut log_stream = bus.subscribe_logs("t1").await.unwrap();
 
-        let cmd = Command::Assign {
-            task_id: "t1".to_string(),
-            payload: spec_to_payload(&make_spec()),
-        };
+        let cmd = assign_cmd(&store, "t1", make_spec()).await;
         bus.send_command(1, &cmd).await.unwrap();
 
         // First pass: logs are published (mock returns 3 lines).
@@ -2232,15 +2315,12 @@ mod tests {
 
     #[tokio::test]
     async fn agent_result_published_as_log() {
-        let (supervisor, _runtime, agent_exec, _store, bus) = setup_with_agent(1).await;
+        let (supervisor, _runtime, agent_exec, store, bus) = setup_with_agent(1).await;
         *agent_exec.auto_complete.lock().unwrap() = true;
 
         let mut log_stream = bus.subscribe_logs("agent-1").await.unwrap();
 
-        let cmd = Command::Assign {
-            task_id: "agent-1".to_string(),
-            payload: spec_to_payload(&make_agent_spec()),
-        };
+        let cmd = assign_cmd(&store, "agent-1", make_agent_spec()).await;
         bus.send_command(1, &cmd).await.unwrap();
         supervisor.reconcile_once().await.unwrap();
 
@@ -2254,12 +2334,9 @@ mod tests {
 
     #[tokio::test]
     async fn log_offsets_cleaned_up_on_stop() {
-        let (supervisor, _runtime, _store, bus) = setup_with_bus(1).await;
+        let (supervisor, _runtime, store, bus) = setup_with_bus(1).await;
 
-        let cmd = Command::Assign {
-            task_id: "t1".to_string(),
-            payload: spec_to_payload(&make_spec()),
-        };
+        let cmd = assign_cmd(&store, "t1", make_spec()).await;
         bus.send_command(1, &cmd).await.unwrap();
         supervisor.reconcile_once().await.unwrap();
 
