@@ -132,6 +132,19 @@ pub async fn credential_for(image_ref: &str) -> Result<Option<Credential>, Crede
     Ok(found)
 }
 
+/// The inline `auths` credential for the registry `image_ref` names, read
+/// synchronously and without running any credential helper. For blanking a
+/// known credential out of error text, not for pulling.
+pub(crate) fn inline_credential(image_ref: &str) -> Option<Credential> {
+    inline_credential_in(&config_path()?, image_ref)
+}
+
+fn inline_credential_in(path: &Path, image_ref: &str) -> Option<Credential> {
+    let bytes = std::fs::read(path).ok()?;
+    let config: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    inline_auth(&config, &canonical_host(registry_host(image_ref)))
+}
+
 /// `credHelpers[host]`, else `credsStore`, else the inline `auths` entry.
 async fn lookup(
     config: &serde_json::Value,
@@ -312,6 +325,28 @@ mod tests {
         assert_eq!(get("quay.io/org/app:1").await, None);
         assert_eq!(get("registry.example.com:5000/app:1").await, None);
         assert_eq!(registry_host("localhost/app:1"), "localhost");
+    }
+
+    #[test]
+    fn inline_credential_reads_auths_and_never_runs_a_helper() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        // base64("me:tok"); quay.io is served by a helper that does not exist.
+        std::fs::write(
+            &path,
+            r#"{"auths": {"https://ghcr.io": {"auth": "bWU6dG9r"}},
+                "credHelpers": {"quay.io": "minga-test-missing"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            inline_credential_in(&path, "ghcr.io/org/app:1"),
+            Some(Credential::new("me", "tok"))
+        );
+        assert_eq!(inline_credential_in(&path, "quay.io/org/app:1"), None);
+        assert_eq!(
+            inline_credential_in(&dir.path().join("absent.json"), "ghcr.io/org/app:1"),
+            None
+        );
     }
 
     #[tokio::test]
