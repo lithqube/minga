@@ -83,7 +83,36 @@ pub struct OciLinux {
     pub resources: Option<OciResources>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cgroups_path: Option<String>,
+    #[serde(rename = "maskedPaths", skip_serializing_if = "Vec::is_empty")]
+    pub masked_paths: Vec<String>,
+    #[serde(rename = "readonlyPaths", skip_serializing_if = "Vec::is_empty")]
+    pub readonly_paths: Vec<String>,
 }
+
+/// Paths runc hides (bind-mounts /dev/null or an empty tmpfs over), as Docker does.
+const MASKED_PATHS: &[&str] = &[
+    "/proc/acpi",
+    "/proc/asound",
+    "/proc/interrupts",
+    "/proc/kcore",
+    "/proc/keys",
+    "/proc/latency_stats",
+    "/proc/sched_debug",
+    "/proc/scsi",
+    "/proc/timer_list",
+    "/proc/timer_stats",
+    "/sys/devices/virtual/powercap",
+    "/sys/firmware",
+];
+
+/// Paths runc remounts read-only, as Docker does.
+const READONLY_PATHS: &[&str] = &[
+    "/proc/bus",
+    "/proc/fs",
+    "/proc/irq",
+    "/proc/sys",
+    "/proc/sysrq-trigger",
+];
 
 #[derive(Debug, Clone, Serialize)]
 pub struct OciNamespace {
@@ -304,42 +333,34 @@ pub fn spec_from_task(container_id: &str, spec: &TaskSpec) -> OciSpec {
         env.push("PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string());
     }
 
-    // Resource limits → OCI linux resources.
-    let resources = if spec.resources.memory_bytes > 0 || spec.resources.cpus > 0.0 {
-        let memory = if spec.resources.memory_bytes > 0 {
-            Some(OciMemory {
-                limit: Some(spec.resources.memory_bytes as i64),
-                reservation: None,
-            })
-        } else {
-            None
-        };
-        let cpu = if spec.resources.cpus > 0.0 {
-            // Convert CPUs to quota/period: quota = cpus * period
-            let period = 100_000u64;
-            let quota = (spec.resources.cpus * period as f64) as i64;
-            Some(OciCpu {
-                shares: None,
-                quota: Some(quota),
-                period: Some(period),
-            })
-        } else {
-            None
-        };
-        Some(OciResources {
-            devices: Some(vec![OciDeviceCgroup {
-                allow: false,
-                r#type: None,
-                major: None,
-                minor: None,
-                access: Some("rwm".to_string()),
-            }]),
-            memory,
-            cpu,
-        })
-    } else {
-        None
-    };
+    // Resource limits → OCI linux resources. The deny-all device rule is
+    // always set: containers hold CAP_MKNOD, so without it the device policy
+    // would be whatever the host's runc defaults to.
+    let memory = (spec.resources.memory_bytes > 0).then_some(OciMemory {
+        limit: Some(spec.resources.memory_bytes as i64),
+        reservation: None,
+    });
+    let cpu = (spec.resources.cpus > 0.0).then(|| {
+        // Convert CPUs to quota/period: quota = cpus * period
+        let period = 100_000u64;
+        let quota = (spec.resources.cpus * period as f64) as i64;
+        OciCpu {
+            shares: None,
+            quota: Some(quota),
+            period: Some(period),
+        }
+    });
+    let resources = Some(OciResources {
+        devices: Some(vec![OciDeviceCgroup {
+            allow: false,
+            r#type: None,
+            major: None,
+            minor: None,
+            access: Some("rwm".to_string()),
+        }]),
+        memory,
+        cpu,
+    });
 
     // Standard container namespaces.
     let namespaces = vec![
@@ -459,6 +480,12 @@ pub fn spec_from_task(container_id: &str, spec: &TaskSpec) -> OciSpec {
             namespaces,
             resources,
             cgroups_path: None,
+            // Docker's defaults: a root task must not write host-global
+            // kernel knobs (core_pattern, sysrq-trigger) or read kernel memory.
+            // shortcut: no seccomp profile yet; add Docker's default profile
+            // when the Compose and API hardening keys are honoured.
+            masked_paths: MASKED_PATHS.iter().map(|p| p.to_string()).collect(),
+            readonly_paths: READONLY_PATHS.iter().map(|p| p.to_string()).collect(),
         },
         annotations,
     }
@@ -847,9 +874,29 @@ mod tests {
     }
 
     #[test]
-    fn spec_no_resources_when_zero() {
+    fn spec_without_limits_still_denies_devices() {
         let spec = spec_from_task("c1", &base_spec());
-        assert!(spec.linux.resources.is_none());
+        let resources = spec.linux.resources.expect("resources always set");
+        assert!(resources.memory.is_none() && resources.cpu.is_none());
+        let devices = resources.devices.expect("device rules");
+        assert!(!devices[0].allow, "first device rule must deny all");
+        assert_eq!(devices[0].access.as_deref(), Some("rwm"));
+    }
+
+    #[test]
+    fn spec_masks_and_protects_kernel_paths() {
+        let json = serde_json::to_value(spec_from_task("c1", &base_spec())).unwrap();
+        let list = |key: &str| -> Vec<String> {
+            serde_json::from_value(json["linux"][key].clone()).unwrap()
+        };
+        let masked = list("maskedPaths");
+        let readonly = list("readonlyPaths");
+        for path in ["/proc/kcore", "/proc/keys", "/sys/firmware"] {
+            assert!(masked.iter().any(|p| p == path), "{path} not masked");
+        }
+        for path in ["/proc/sys", "/proc/sysrq-trigger"] {
+            assert!(readonly.iter().any(|p| p == path), "{path} not read-only");
+        }
     }
 
     #[test]
