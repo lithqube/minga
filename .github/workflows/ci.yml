@@ -62,3 +62,16 @@ jobs:
 
       - name: Daemon-backed suites (fail closed when the daemon is absent)
         run: sudo -E env "PATH=$PATH" MINGA_REQUIRE_CONTAINERD=1 cargo test -p minga-node --test containerd --test containerd_client
+
+  netns:
+    name: Published-port paths on a real kernel (never silently skipped)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Network-namespace suite (fails closed when it cannot run)
+        run: sudo -E env "PATH=$PATH" MINGA_REQUIRE_NETNS=1 cargo test -p minga-node --test netns -- --nocapture
