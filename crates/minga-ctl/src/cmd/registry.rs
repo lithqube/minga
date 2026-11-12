@@ -29,15 +29,22 @@ const DEFAULT_AUTH_FILE: &str = "/root/.docker/config.json";
 /// Prints the file, or nothing when it does not exist.
 const READ: &str = r#"if [ -e "$1" ]; then cat -- "$1"; fi"#;
 
-/// Writes stdin to the file. An existing file is overwritten in place, which
-/// keeps its owner, group and mode (a rename would not); the temporary copy
-/// means a cut-off stdin never truncates it. A new file is created 0600.
+/// Writes stdin to a temporary file and renames it over the file, so a failed
+/// write never leaves the file empty or cut off. `cp -p` carries an existing
+/// file's mode and group (and, as root, owner) to the copy; access for others
+/// is dropped, since the file holds credentials. A new file is created 0600.
+/// shortcut: a symlinked file is replaced by a regular file; resolve the link
+/// first if a node needs one.
 const WRITE: &str = r#"umask 077
 t="$1.minga-ctl.tmp"
+rm -f -- "$t" || exit
 if [ -e "$1" ]; then
-  rm -f -- "$t" && cat > "$t" && cat -- "$t" > "$1" && rm -f -- "$t"
+  cp -p -- "$1" "$t" && chmod -- o-rwx "$t" && cat > "$t" && mv -f -- "$t" "$1" ||
+    { s=$?; rm -f -- "$t"; exit "$s"; }
 else
-  mkdir -p -- "$(dirname -- "$1")" && cat > "$1" && echo "created $(id -un)"
+  mkdir -p -- "$(dirname -- "$1")" && cat > "$t" && mv -f -- "$t" "$1" ||
+    { s=$?; rm -f -- "$t"; exit "$s"; }
+  echo "created $(id -un)"
 fi"#;
 
 /// Registry commands.
@@ -175,7 +182,13 @@ fn registry(name: &str) -> Result<Registry, CtlError> {
         google: false,
         hint: hint.to_string(),
     };
-    Ok(match name {
+    // Named as Minga matches it, so login replaces and logout removes the
+    // entry pulls use: `INDEX.docker.io` is `docker.io`.
+    let name = name.to_ascii_lowercase();
+    if !matches!(name.as_str(), "dockerhub" | "ghcr" | "github") {
+        validate_host(&name)?;
+    }
+    Ok(match canonical(&name).as_str() {
         "dockerhub" | "docker.io" => known(
             "docker.io",
             "Docker Hub (docker.io)\nCreate an access token with the Read-only permission.",
@@ -186,7 +199,6 @@ fn registry(name: &str) -> Result<Registry, CtlError> {
              Create a personal access token (classic) with only the read:packages scope.",
         ),
         host => {
-            validate_host(host)?;
             let bare = host.split(':').next().unwrap_or(host);
             let google =
                 bare.ends_with("-docker.pkg.dev") || bare == "gcr.io" || bare.ends_with(".gcr.io");
@@ -243,14 +255,16 @@ fn validate_username(user: &str) -> Result<(), CtlError> {
 
 /// The registry an `auths` key names, as Minga matches it
 /// (`auth_for_host` in minga-node): `https://index.docker.io/v1/`, which
-/// `docker login` writes, is `docker.io`.
-fn canonical(key: &str) -> &str {
+/// `docker login` writes, is `docker.io`. Lowercased, so a key stored as
+/// `GHCR.IO` is replaced by a new `ghcr.io` login.
+fn canonical(key: &str) -> String {
+    let key = key.to_ascii_lowercase();
     let key = key
         .trim_start_matches("https://")
         .trim_start_matches("http://");
     match key.split('/').next().unwrap_or(key) {
-        "index.docker.io" | "registry-1.docker.io" => "docker.io",
-        other => other,
+        "index.docker.io" | "registry-1.docker.io" => "docker.io".to_string(),
+        other => other.to_string(),
     }
 }
 
@@ -642,6 +656,9 @@ mod tests {
         assert!(registry("europe-west1-docker.pkg.dev").unwrap().google);
         assert!(registry("eu.gcr.io").unwrap().google);
         assert!(!registry("registry.example.com:5000").unwrap().google);
+        assert_eq!(registry("index.docker.io").unwrap().host, "docker.io");
+        assert_eq!(registry("GHCR.IO").unwrap().host, "ghcr.io");
+        assert_eq!(registry("Reg.Example.com").unwrap().host, "reg.example.com");
         for bad in ["-x", "a b", "host:", "host:12a", "a/b", "'"] {
             assert!(registry(bad).is_err(), "{bad}");
         }
@@ -659,6 +676,7 @@ mod tests {
     fn docker_login_keys_match_like_minga() {
         assert_eq!(canonical("https://index.docker.io/v1/"), "docker.io");
         assert_eq!(canonical("https://ghcr.io"), "ghcr.io");
+        assert_eq!(canonical("GHCR.IO"), "ghcr.io");
         assert_eq!(
             canonical("registry.example.com:5000"),
             "registry.example.com:5000"

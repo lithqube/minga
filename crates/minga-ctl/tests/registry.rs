@@ -303,6 +303,32 @@ fn a_second_login_keeps_the_mode_of_the_existing_file() {
 }
 
 #[test]
+fn a_login_drops_world_access_and_leaves_no_temporary_file() {
+    let env = Env::local();
+    env.write("{}", 0o644);
+    let (code, _, err) = env.login("ghcr", "acme-deploy");
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(env.mode(), 0o640);
+    let tmp = format!("{}.minga-ctl.tmp", env.file().display());
+    assert!(!std::path::Path::new(&tmp).exists());
+}
+
+#[test]
+fn a_docker_hub_alias_replaces_the_docker_login_entry() {
+    let env = Env::local();
+    let old = json!({ "auths": { "https://index.docker.io/v1/": { "auth": auth("old") } } });
+    env.write(&old.to_string(), 0o600);
+    let (code, _, err) = env.login("INDEX.docker.io", "new");
+    assert_eq!(code, 0, "{err}");
+    let auths = env.json()["auths"].clone();
+    assert_eq!(auths, json!({ "docker.io": { "auth": auth("new") } }));
+    let (code, out, err) = env.ctl(&["registry", "logout", "index.docker.io", "--yes"], "");
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains("removed"), "{out}");
+    assert_eq!(env.json()["auths"], json!({}));
+}
+
+#[test]
 fn an_empty_stdin_is_exit_1_and_changes_nothing() {
     let env = Env::local();
     let (code, _, err) = env.ctl(

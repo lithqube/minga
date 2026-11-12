@@ -13,6 +13,7 @@ use crate::cmd::service::{self, confirm, report};
 use crate::config::{self, Resolved};
 use crate::error::CtlError;
 use crate::output::{self, Format, Rows};
+use crate::state;
 use crate::transport::{Connection, RemoteArg};
 use crate::view;
 
@@ -166,9 +167,12 @@ async fn deploy(
     let client = &conn.api;
     api::check_id("stack", stack)?;
 
-    // 1. The specs as they are now.
+    // 1. The specs as they are now, saved as revisions before the deploy, so
+    // a deploy that is interrupted or cannot be read back never leaves a
+    // revision from an older change to roll back to.
     let filter = view::stack_filter(stack);
     let before = specs(&client.get("services", Some(&filter)).await?);
+    let earlier = save_before(client, &before)?;
 
     // 2. `minga deploy`, the token in its environment only.
     let relay = match conn.api_socket() {
@@ -198,8 +202,9 @@ async fn deploy(
     let status =
         status.map_err(|e| image::spawn_error(e, &[RemoteArg::Fixed("minga")], "stack deploy"))?;
 
-    // 3. Read again whether or not it succeeded; save what changed.
-    let problem = match save_changed(client, &filter, &before).await {
+    // 3. Read again whether or not it succeeded; services it did not change
+    // get their earlier revision back.
+    let problem = match settle(client, &filter, &before, earlier).await {
         Ok((changes, errors)) => {
             output::say(quiet, &changes.summary())?;
             (!errors.is_empty()).then(|| errors.join("; "))
@@ -219,7 +224,9 @@ async fn deploy(
         Some(reason) => Err(CtlError::Hinted {
             code: 2,
             message: format!("deployed, but could not save revisions for {stack}: {reason}"),
-            hint: "rollback data for this deploy may be missing".to_string(),
+            hint: "each service's revision is its spec from before this deploy; for a \
+                   service the deploy did not change, rollback restores that same spec"
+                .to_string(),
         }),
         None => Ok(()),
     }
@@ -263,25 +270,66 @@ impl Changes {
     }
 }
 
-/// Step 3: saves the step 1 spec of each service whose spec changed. A
-/// service the deploy did not change keeps the revision it had. Returns the
-/// changes and the revision writes that failed.
-async fn save_changed(
+/// The revisions [`save_before`] replaced, by service id.
+type Earlier = BTreeMap<String, Option<state::Revision>>;
+
+/// Step 1: saves each service's current spec as its revision and returns the
+/// revisions it replaced. If one save fails, nothing is deployed and the
+/// revisions already replaced are put back.
+fn save_before(client: &ApiClient, before: &BTreeMap<String, Value>) -> Result<Earlier, CtlError> {
+    let mut earlier = Earlier::new();
+    for (id, spec) in before {
+        // An unreadable revision file is not worth keeping.
+        let old = state::load_revision(&client.context, id).ok().flatten();
+        earlier.insert(id.clone(), old);
+        if let Err(err) = state::save_revision(&client.context, id, spec) {
+            for (id, old) in earlier {
+                // Best effort: a revision left at the current spec rolls back to itself.
+                let _ = restore(client, &id, old);
+            }
+            return Err(CtlError::Halted(format!(
+                "cannot save the revision of {id} before deploying ({err}); nothing was deployed"
+            )));
+        }
+    }
+    Ok(earlier)
+}
+
+fn restore(client: &ApiClient, id: &str, old: Option<state::Revision>) -> Result<(), CtlError> {
+    match old {
+        Some(revision) => state::put_revision(&client.context, &revision),
+        None => state::remove_revision(&client.context, id),
+    }
+}
+
+/// Step 3: a service whose spec changed keeps the step 1 revision; one the
+/// deploy did not change (or that is gone) gets its earlier revision back.
+/// Returns the changes and the revision writes that failed.
+async fn settle(
     client: &ApiClient,
     filter: &Value,
     before: &BTreeMap<String, Value>,
+    earlier: Earlier,
 ) -> Result<(Changes, Vec<String>), CtlError> {
     let after = specs(&client.get("services", Some(filter)).await?);
     let mut changes = Changes::default();
     let mut errors = Vec::new();
-    for (id, spec) in after {
-        match before.get(&id) {
-            None => changes.new.push(id),
-            Some(old) if service::same_spec(old, &spec) => changes.unchanged.push(id),
-            Some(old) => match service::save_revision(client, &id, old) {
-                Ok(()) => changes.saved.push(id),
-                Err(err) => errors.push(err.to_string()),
-            },
+    for id in after.keys().filter(|id| !before.contains_key(*id)) {
+        changes.new.push(id.clone());
+    }
+    for (id, old) in earlier {
+        let now = after.get(&id);
+        if now.is_some_and(|spec| !service::same_spec(&before[&id], spec)) {
+            changes.saved.push(id);
+            continue;
+        }
+        if let Err(err) = restore(client, &id, old) {
+            errors.push(format!(
+                "cannot put back the earlier revision of {id} ({err})"
+            ));
+        }
+        if now.is_some() {
+            changes.unchanged.push(id);
         }
     }
     Ok((changes, errors))

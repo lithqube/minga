@@ -573,18 +573,23 @@ minga-ctl stack rm <stack> [--with <id>]... [--yes]
    machine in any context with an SSH target, and in any context whose API
    endpoint is not a loopback address, such as an `https://` endpoint.
 1. `GET /v1.41/services?filters={"label":["com.docker.stack.namespace=<stack>"]}`
-   and keep each existing service's `Spec` in memory.
+   and save each existing service's `Spec` as its revision file, keeping the
+   revision it replaces in memory. A deploy that is interrupted, or whose
+   result cannot be read back, then never leaves a revision from an older
+   change to roll back to. If a save fails, the replaced revisions are put
+   back and nothing is deployed.
 2. Run `minga deploy -c <file> [-p …] --wait <secs> --api-url <endpoint> <stack>`
    with `MINGA_API_TOKEN` in the child's environment. With SSH the endpoint is
    the tunnel's local URL. Output passes through.
-3. Read the services again, whether `minga` succeeded or not. For each service
-   whose `Spec` now differs from step 1, save the step 1 spec as its revision
-   file. A service the deploy did not change, or did not reach before failing,
-   keeps the revision file it had.
+3. Read the services again, whether `minga` succeeded or not. A service whose
+   `Spec` now differs from step 1 keeps the step 1 revision. A service the
+   deploy did not change, or did not reach before failing, gets back the
+   revision file it had.
 4. Exit code: 2 if `minga` did not exit 0. Also 2 if `minga` succeeded but the
    read in step 3 or a revision write failed, with
    ``error: deployed, but could not save revisions for myapp: <reason>`` and
-   ``hint: rollback data for this deploy may be missing``. Otherwise 0.
+   ``hint: each service's revision is its spec from before this deploy; for a service the deploy did not change, rollback restores that same spec``.
+   Otherwise 0.
 
 `minga deploy` validates the compose file itself, and unknown keys fail there.
 
@@ -734,7 +739,8 @@ shop.proxy    shop   global      2         docker.io/library/caddy:2
    on the context's SSH target when it has one, else locally. `<url>` is the
    context's `nats_url`, else `nats://127.0.0.1:4222`.
 3. Each line is printed with the task ID in front. stderr chunks go to stderr.
-   With `-f` the children run until interrupted.
+   With `-f` the children run until interrupted, or until stdout is closed
+   (`| head`): then every child is stopped and the exit code is 0.
 
 There is no JSON form; `--output` is ignored. If NATS on the node needs a
 token, `MINGA_NATS_TOKEN` must be set in the SSH user's environment there;
@@ -1044,6 +1050,12 @@ can pull.
 | a host ending in `-docker.pkg.dev`, or `gcr.io`, `*.gcr.io` | as typed | `_json_key`, set automatically | Service account key (JSON) with the Artifact Registry Reader role, passed with `--key-file` |
 | any other `host[:port]` | as typed | asked | Whatever the registry issues, read-only if it has scopes |
 
+Names are lowercased, and `index.docker.io` and `registry-1.docker.io` are
+`docker.io`, the way Minga matches keys. `login` first removes every key that
+matches the same registry (`https://index.docker.io/v1/` from `docker login`,
+`GHCR.IO`), so the entry Minga uses is the new one, and `logout` removes them
+all.
+
 A host must match `^[A-Za-z0-9][A-Za-z0-9.-]*(:[0-9]+)?$` and a username
 `^[A-Za-z0-9_][A-Za-z0-9._@-]*$`.
 
@@ -1071,19 +1083,18 @@ A host must match `^[A-Za-z0-9][A-Za-z0-9.-]*(:[0-9]+)?$` and a username
      other key in the file is kept.
    - Write it back with the new content on stdin, in a way that keeps the
      file readable by the Minga service:
-     - The file exists: write to a temporary file first, then copy over the
-       original in place and remove the temporary file:
-       `umask 077; cat > '<file>.minga-ctl.tmp' && cat '<file>.minga-ctl.tmp' > '<file>' && rm '<file>.minga-ctl.tmp'`.
-       Overwriting in place keeps the file's owner, group and mode. A rename
-       would replace them with the SSH user's, and a Minga service running as
-       another user could then no longer read the file.
-     - The file does not exist: `umask 077; mkdir -p '<dir>' && cat > '<file>'`.
-       The new file belongs to the SSH user with mode 0600, so minga-ctl
-       prints
+     - The file exists: copy it with `cp -p` to `<file>.minga-ctl.tmp`, which
+       keeps its mode and group (and, as root, its owner), drop access for
+       others with `chmod -- o-rwx`, write the new content into the copy,
+       then `mv -f` it over the file. The rename is atomic: a failed write
+       never leaves the file empty or cut off, and the temporary file is
+       removed. A non-root SSH user becomes the file's owner; the group and
+       its access are kept, so a Minga service reading through the group
+       still can. A symlinked file is replaced by a regular file.
+     - The file does not exist: `umask 077; mkdir -p '<dir>'`, write the
+       temporary file and rename it. The new file belongs to the SSH user
+       with mode 0600, so minga-ctl prints
        ``note: created /root/.docker/config.json on alice@mgr1.example.net, owner alice, mode 0600; the Minga service must run as that user or as root to read it``.
-
-     The in-place copy is not atomic. A pull that reads the file in that
-     instant sees a partial file and falls back to an anonymous pull.
 
    In a context with no SSH target the same is done on the local filesystem.
    A failure on any target gives exit 2; the other targets still run.
@@ -1214,13 +1225,17 @@ plan.
   only its host; a `-docker.pkg.dev` host stores the username `_json_key`;
   a file that is not JSON is left unchanged and gives exit 2; `list` output
   contains no secret; a second `login` on a file with mode 0640 leaves the
-  mode at 0640 (the file is overwritten in place, not renamed).
+  mode at 0640, a file with mode 0644 becomes 0640, and no temporary file is
+  left; `login index.docker.io` replaces a `docker login` entry and `logout`
+  of it removes it.
 - Required: `service scale` to the current replica count posts nothing and
   leaves the revision file unchanged, so `rollback` still restores the spec
   from before the last real change. The same for a `service update` that
   changes nothing.
 - Required: when `MINGA_BIN` succeeds but the API is unreachable for the read
-  after it, `stack deploy` exits 2 and says rollback data may be missing.
+  after it, `stack deploy` exits 2, and the revision is the spec from before
+  this deploy, not one from an older change. A service the deploy did not
+  change keeps its earlier revision.
 - Required: `stack deploy` with a direct `https://` endpoint refuses the same
   compose files as with an SSH context.
 - Required: with an SSH context, `stack deploy` of a compose file that uses
@@ -1294,7 +1309,8 @@ Before each commit: `cargo fmt --all`, `cargo clippy --all-targets -- -D warning
   whenever the node is another machine (an SSH context, or a
   direct endpoint that is not loopback), because Minga resolves them on the
   machine that runs the deploy (section 5.2).
-- `registry login` overwrites an existing credential file in place to keep
-  its owner and mode, so the write is not atomic (section 5.8).
+- `registry login` replaces the credential file by rename. For a non-root
+  SSH user that makes the user its owner; mode and group are kept
+  (section 5.8).
 - Not included: node commands, events, waiting for rollouts, refresh of
   short-lived registry credentials, client certificates (phase 2).
