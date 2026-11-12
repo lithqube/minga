@@ -195,7 +195,9 @@ dependsOn:
 ```
 
 Issue Raft (`--raft-tls-*`) and NATS certificates with `minga tls init-ca` and
-`minga tls issue-node`. Preload workload images on **every** node: convert the
+`minga tls issue-node`. Raft TLS is required here: without it, anyone who can
+reach a node's Raft port can rewrite cluster state, and Minga only logs a
+warning. Preload workload images on **every** node: convert the
 preload Job to a DaemonSet.
 
 ### Changing Minga's configuration later

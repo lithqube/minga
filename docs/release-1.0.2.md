@@ -16,7 +16,7 @@ Most of it came from deploying a multi-service stack on a Hetzner CAX21 node
 | Users | `user:` and an image's `USER` may be `name[:group]`, resolved from the image's own `/etc/passwd` and `/etc/group` at task start |
 | Images | Private-registry pulls from inline `auth` entries in `$DOCKER_CONFIG/config.json`, else `~/.docker/config.json`, for automatic pulls and `minga image pull`; Docker Hub's `https://index.docker.io/v1/` key matches; no more `ctr images unpack`, which containerd 2.2 removed |
 | API | The API token is accepted as the HTTP Basic-auth password, so Traefik's Swarm provider can authenticate |
-| Supervisor | Stopped or orphaned containerd tasks are purged at start, so a restart no longer needs `ctr tasks delete` |
+| Supervisor | Stopped containerd tasks are purged at start, so a restart no longer needs `ctr tasks delete`. Running leftovers, and the network and secrets of exited ones, stayed until 1.2.0 |
 | `minga-ctl` | New companion CLI: contexts, stacks, services (scale, update, rollback, logs), secrets, images, health, metrics and registry login, over the system `ssh` client |
 
 ## Upgrade notes
