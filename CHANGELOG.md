@@ -48,19 +48,11 @@ upgrade notes.
   by 1.0.1 does not decode: clear `--data-dir` and redeploy, upgrading every
   node together.
 
-### Changed
-- The persisted service and task layout gained `extra_hosts`. State written
-  by 1.0.1 does not decode: clear `--data-dir` and redeploy, upgrading every
-  node together.
-
 ### Known limits
 - Registry credential helpers (`credsStore`, `credHelpers`) are not read.
   `ctr` receives credentials on its command line, visible in `ps`.
 - Supplementary groups from the image's `/etc/group` are not applied.
 - `extra_hosts` takes effect only for tasks with node networking.
-- `minga-ctl` has been tested against stubs and test API servers, not
-  against a real node over SSH. Its rollback covers only changes made by
-  `minga-ctl` on the same workstation.
 - `minga-ctl` has been tested against stubs and test API servers, not
   against a real node over SSH. Its rollback covers only changes made by
   `minga-ctl` on the same workstation.

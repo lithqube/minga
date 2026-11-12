@@ -40,7 +40,7 @@ Minga ships as **one binary** (plus the `nats-server` it supervises). There's no
 
 ## Features
 
-- **Compose-native.** Full spec parsing with interpolation, profiles, merge keys and `x-` extensions. Unknown keys fail loudly with suggestions. `command`, `entrypoint`, `labels`, `healthcheck` (carried, not enforced), volumes, bind mounts, placement constraints and `deploy.restart_policy` reach the container.
+- **Compose-native.** Full spec parsing with interpolation, profiles, merge keys and `x-` extensions. Unknown keys fail loudly with suggestions. `command`, `entrypoint`, `labels`, `healthcheck` (gates task readiness), volumes, bind mounts, placement constraints and `deploy.restart_policy` reach the container.
 - **Swarm-compatible API.** Services, tasks, nodes, networks, secrets and configs, with label filters. `docker stack deploy`, `docker service ls`, `docker node ls` and Traefik v3's swarm provider work against `minga api`.
 - **Raft consensus.** Desired state and placement go through [openraft](https://docs.rs/openraft), persisted in [redb](https://docs.rs/redb). mTLS on the Raft transport and bounded frames. No external etcd.
 - **Container networking on a node.** Deterministic per-task IPs from IPAM (a /24 per network from `10.100.0.0/16`), one bridge per network, a netns and veth pair per task, iptables DNAT for published ports, and embedded DNS (`<svc>`, `tasks.<svc>`, `<svc>.<stack>.minga.local`). Cross-node traffic needs the WireGuard mesh, which is generated as config but not applied yet.
