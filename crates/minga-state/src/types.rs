@@ -333,6 +333,14 @@ pub struct Task {
     /// Times the container exited or failed to start and was retried.
     #[serde(default)]
     pub restarts: u32,
+    /// Why the task last exited, failed to start or was killed: one line,
+    /// at most 300 characters, never a secret. Stays set while the task
+    /// restarts; cleared once it has been `Running` for a while.
+    #[serde(default)]
+    pub last_error: Option<String>,
+    /// Exit code of the last run, when the runtime reported one.
+    #[serde(default)]
+    pub last_exit_code: Option<i32>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

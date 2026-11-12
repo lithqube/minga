@@ -39,6 +39,7 @@
 
 pub mod agent;
 pub mod containerd;
+pub(crate) mod failure;
 pub(crate) mod health;
 #[cfg(target_os = "linux")]
 pub mod netns;

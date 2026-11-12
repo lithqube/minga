@@ -703,6 +703,20 @@ pub fn node_to_docker(node: &ClusterNode, is_leader: bool) -> models::Node {
     }
 }
 
+/// The short `TaskStatus.Message`: what the task is doing, or how it ended.
+fn task_message(task: &Task) -> String {
+    match (task.state, task.last_exit_code) {
+        (TaskState::Stopped | TaskState::Failed, Some(code)) => format!("exited with code {code}"),
+        (TaskState::Pending, _) => "pending".into(),
+        (TaskState::Assigned, _) => "assigned".into(),
+        (TaskState::Starting, _) => "starting".into(),
+        (TaskState::Running, _) => "started".into(),
+        (TaskState::Stopping, _) => "shutting down".into(),
+        (TaskState::Stopped, None) => "stopped".into(),
+        (TaskState::Failed, None) => "failed".into(),
+    }
+}
+
 /// Translates a Minga `Task` into a Docker `Task` API response.
 ///
 /// `networks` (the cluster network list) resolves attachment names and
@@ -799,12 +813,17 @@ pub fn task_to_docker(task: &Task, networks: &[Network]) -> models::Task {
         Status: models::TaskStatus {
             Timestamp: Some(Utc::now()),
             State: state.to_string(),
-            Message: None,
-            Err: None,
-            ContainerStatus: None,
+            Message: Some(task_message(task)),
+            Err: task.last_error.clone(),
+            ContainerStatus: task.last_exit_code.map(|code| models::ContainerStatus {
+                ContainerID: None,
+                PID: None,
+                ExitCode: Some(code),
+            }),
         },
         DesiredState: desired_state.to_string(),
         NetworksAttachments: attachments,
+        MingaRestarts: Some(task.restarts),
     }
 }
 
@@ -1414,6 +1433,8 @@ mod tests {
             },
             restarts: 0,
             running_since_unix: None,
+            last_error: None,
+            last_exit_code: None,
         };
         let docker = task_to_docker(&task, &[]);
         assert_eq!(docker.ID, "svc1.1.abcd1234");
@@ -1440,6 +1461,8 @@ mod tests {
             },
             restarts: 0,
             running_since_unix: None,
+            last_error: None,
+            last_exit_code: None,
         };
         let docker = task_to_docker(&task, &[]);
         assert_eq!(docker.Status.State, "pending");
@@ -1462,10 +1485,55 @@ mod tests {
             },
             restarts: 0,
             running_since_unix: None,
+            last_error: None,
+            last_exit_code: None,
         };
         let docker = task_to_docker(&task, &[]);
         assert_eq!(docker.Status.State, "failed");
         assert_eq!(docker.DesiredState, "shutdown");
+    }
+
+    fn task_in(state: TaskState, error: Option<&str>, code: Option<i32>) -> Task {
+        Task {
+            id: "svc1.1.abcd1234".to_string(),
+            service_id: "svc1".to_string(),
+            node_id: 1,
+            state,
+            spec: TaskSpec::default(),
+            restarts: 1,
+            running_since_unix: None,
+            last_error: error.map(String::from),
+            last_exit_code: code,
+        }
+    }
+
+    #[test]
+    fn a_failed_task_reports_its_reason_and_exit_code() {
+        let task = task_in(TaskState::Failed, Some("exited with code 1"), Some(1));
+        let status = task_to_docker(&task, &[]).Status;
+        assert_eq!(status.State, "failed");
+        assert_eq!(status.Message.as_deref(), Some("exited with code 1"));
+        assert_eq!(status.Err.as_deref(), Some("exited with code 1"));
+        assert_eq!(status.ContainerStatus.unwrap().ExitCode, Some(1));
+        assert_eq!(task_to_docker(&task, &[]).MingaRestarts, Some(1));
+    }
+
+    #[test]
+    fn a_task_that_failed_to_start_has_an_error_but_no_exit_code() {
+        let error = "failed to start container: image pull failed";
+        let task = task_in(TaskState::Starting, Some(error), None);
+        let status = task_to_docker(&task, &[]).Status;
+        assert_eq!(status.Message.as_deref(), Some("starting"));
+        assert_eq!(status.Err.as_deref(), Some(error));
+        assert!(status.ContainerStatus.is_none());
+    }
+
+    #[test]
+    fn a_healthy_task_has_a_message_and_no_error_on_the_wire() {
+        let task = task_in(TaskState::Running, None, None);
+        let json = serde_json::to_value(task_to_docker(&task, &[]).Status).unwrap();
+        assert_eq!(json["Message"], "started");
+        assert!(json.get("Err").is_none() && json.get("ContainerStatus").is_none());
     }
 
     #[test]

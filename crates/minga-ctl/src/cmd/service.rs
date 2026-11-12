@@ -34,6 +34,12 @@ pub enum ServiceCommand {
         /// Service ID, `<stack>.<service>`.
         service: String,
     },
+    /// Show a service's image, replicas, ports, networks, update policy and
+    /// healthcheck, and its tasks with state, restarts, exit code and last error.
+    Inspect {
+        /// Service ID, `<stack>.<service>`.
+        service: String,
+    },
     /// Print the logs of a service's running tasks with `minga logs`.
     Logs {
         /// Service ID, `<stack>.<service>`.
@@ -92,9 +98,10 @@ impl ServiceCommand {
     /// state. Environment values are left out: `--env-add` logs the key.
     pub fn audit(&self) -> Option<(&'static str, Value)> {
         match self {
-            ServiceCommand::Ls { .. } | ServiceCommand::Ps { .. } | ServiceCommand::Logs { .. } => {
-                None
-            }
+            ServiceCommand::Ls { .. }
+            | ServiceCommand::Ps { .. }
+            | ServiceCommand::Inspect { .. }
+            | ServiceCommand::Logs { .. } => None,
             ServiceCommand::Scale { service, replicas } => Some((
                 "service scale",
                 json!({ "service": service, "replicas": replicas }),
@@ -139,6 +146,7 @@ pub async fn run(
     match cmd {
         ServiceCommand::Ls { stack } => ls(client, stack.as_deref(), format, quiet).await,
         ServiceCommand::Ps { service } => ps(client, service, format, quiet).await,
+        ServiceCommand::Inspect { service } => inspect(client, service, format, quiet).await,
         ServiceCommand::Logs {
             service,
             follow,
@@ -388,7 +396,47 @@ async fn ps(client: &ApiClient, id: &str, format: Format, quiet: bool) -> Result
         .await?;
     let nodes = view::node_names(&client.get("nodes", None).await?);
     let rows = view::task_rows(&tasks, std::slice::from_ref(&service), &nodes);
-    output::print(format, quiet, &rows)
+    output::print(format, quiet, &rows)?;
+    if !quiet {
+        if let Some(hint) = view::not_running_hint(&tasks) {
+            eprintln!("{hint}");
+        }
+    }
+    Ok(())
+}
+
+/// `GET /services/{id}` (404: exit 3), then that service's tasks.
+async fn inspect(
+    client: &ApiClient,
+    id: &str,
+    format: Format,
+    quiet: bool,
+) -> Result<(), CtlError> {
+    let service = read(client, id).await?;
+    let tasks = client
+        .get("tasks", Some(&json!({ "service": [id] })))
+        .await?;
+    let nodes = view::node_names(&client.get("nodes", None).await?);
+    let rows = view::inspect_task_rows(&tasks, &nodes);
+    let summary = view::spec_summary(&service);
+    match format {
+        // Quiet prints the task IDs only, like `ps`.
+        Format::Table if quiet => output::print(format, quiet, &rows),
+        Format::Table => {
+            output::say(false, &view::spec_text(&summary))?;
+            if !rows.is_empty() {
+                output::say(false, "")?;
+                output::print(format, quiet, &rows)?;
+            }
+            Ok(())
+        }
+        _ => report(
+            format,
+            quiet,
+            "",
+            json!({ "service": summary, "tasks": rows.values }),
+        ),
+    }
 }
 
 /// `scale`: read, set the replicas in a copy, post only if it changed.

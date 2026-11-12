@@ -53,6 +53,7 @@ use thiserror::Error;
 use tokio::sync::Mutex;
 
 use crate::agent::{AgentError, AgentExecutor, AgentStatus};
+use crate::failure::{self, Failure};
 use crate::health::{self, Health};
 use crate::runtime::{Runtime, RuntimeError};
 
@@ -562,9 +563,14 @@ impl Supervisor {
             let _ = self.runtime.stop(&container_id).await;
 
             // Look up the task spec from Raft to get the restart policy.
-            let spec = match self.state.get_task(&task_id).await {
-                Ok(Some(t)) => t.spec,
-                _ => {
+            let record = self.state.get_task(&task_id).await.ok().flatten();
+            let failure = failure::exit(
+                exit_code,
+                record.as_ref().and_then(|t| t.last_error.as_deref()),
+            );
+            let spec = match record {
+                Some(t) => t.spec,
+                None => {
                     let states = self.restart_states.lock().await;
                     if let Some(rs) = states.get(&task_id) {
                         rs.spec.clone()
@@ -586,7 +592,7 @@ impl Supervisor {
                 } else {
                     TaskState::Failed
                 };
-                self.mark_task_state(&task_id, end).await;
+                self.mark_task(&task_id, end, Some(failure)).await;
                 continue;
             }
 
@@ -604,11 +610,12 @@ impl Supervisor {
                     exit_code = ?exit_code,
                     "task exited cleanly, restart policy does not apply"
                 );
-                self.mark_task_state(&task_id, TaskState::Stopped).await;
+                self.mark_task(&task_id, TaskState::Stopped, Some(failure))
+                    .await;
                 continue;
             }
 
-            self.record_restart(&task_id).await;
+            self.record_failure(&task_id, failure, true).await;
 
             // Determine if we should restart, and compute backoff.
             let (attempt, new_spec) = {
@@ -671,6 +678,9 @@ impl Supervisor {
                             error = %e,
                             "failed to restart container"
                         );
+                        let failure =
+                            failure::start_error(&e, &failure::registry_secrets(&new_spec.image));
+                        self.record_failure(&task_id, failure, false).await;
                     }
                 },
                 WorkloadKind::Agent(agent_spec) => {
@@ -840,11 +850,34 @@ impl Supervisor {
     /// lifecycle transitions are rare and belong on the record the
     /// scheduler owns.
     async fn mark_task_state(&self, task_id: &TaskId, state: minga_state::types::TaskState) {
+        self.mark_task(task_id, state, None).await;
+    }
+
+    /// [`Self::mark_task_state`] plus the reason the task ended, in the
+    /// same Raft write.
+    async fn mark_task(
+        &self,
+        task_id: &TaskId,
+        state: minga_state::types::TaskState,
+        failure: Option<Failure>,
+    ) {
         match self.state.get_task(task_id).await {
             Ok(Some(mut task)) => {
-                if task.state != state {
+                let mut changed = task.state != state;
+                if changed {
                     task.running_since_unix = (state == TaskState::Running).then(unix_now);
                     task.state = state;
+                }
+                if let Some(f) = failure {
+                    if task.last_error.as_ref() != Some(&f.error)
+                        || task.last_exit_code != f.exit_code
+                    {
+                        task.last_error = Some(f.error);
+                        task.last_exit_code = f.exit_code;
+                        changed = true;
+                    }
+                }
+                if changed {
                     if let Err(e) = self.state.upsert_task(task).await {
                         tracing::warn!(task = %task_id, error = %e, "failed to record task state");
                     }
@@ -871,15 +904,49 @@ impl Supervisor {
         }
     }
 
-    /// Records that a task's container exited or failed to start and will
-    /// be retried. A rollout treats this as a failure of the new revision.
-    async fn record_restart(&self, task_id: &TaskId) {
-        if let Ok(Some(mut task)) = self.state.get_task(task_id).await {
+    /// Records why a task exited or failed to start, in one Raft write.
+    /// With `restart` it also counts a retry and goes back to `Starting`;
+    /// a rollout treats that as a failure of the new revision. Without it,
+    /// nothing is written when the reason is already on the record (a start
+    /// that fails every pass would otherwise write every pass).
+    async fn record_failure(&self, task_id: &TaskId, failure: Failure, restart: bool) {
+        let Ok(Some(mut task)) = self.state.get_task(task_id).await else {
+            return;
+        };
+        let same = task.last_error.as_ref() == Some(&failure.error)
+            && task.last_exit_code == failure.exit_code;
+        if same && !restart {
+            return;
+        }
+        task.last_error = Some(failure.error);
+        task.last_exit_code = failure.exit_code;
+        if restart {
             task.state = TaskState::Starting;
             task.running_since_unix = None;
             task.restarts += 1;
-            if let Err(e) = self.state.upsert_task(task).await {
-                tracing::warn!(task = %task_id, error = %e, "failed to record task restart");
+        }
+        if let Err(e) = self.state.upsert_task(task).await {
+            tracing::warn!(task = %task_id, error = %e, "failed to record task failure");
+        }
+    }
+
+    /// Forgets the last error of a task that has been `Running` for a while.
+    async fn clear_settled_failures(&self, tasks: &[&Task]) {
+        let now = unix_now();
+        for task in tasks {
+            let settled = task.state == TaskState::Running
+                && task
+                    .running_since_unix
+                    .is_some_and(|since| since + failure::CLEAR_AFTER_SECS <= now);
+            if !(settled && task.last_error.is_some()) {
+                continue;
+            }
+            if let Ok(Some(mut task)) = self.state.get_task(&task.id).await {
+                task.last_error = None;
+                task.last_exit_code = None;
+                if let Err(e) = self.state.upsert_task(task).await {
+                    tracing::warn!(error = %e, "failed to clear task failure");
+                }
             }
         }
     }
@@ -924,8 +991,17 @@ impl Supervisor {
         }
         for task_id in unhealthy {
             tracing::warn!(task = %task_id, "healthcheck failed, killing container");
-            if let Err(e) = self.runtime.kill(&running[&task_id]).await {
-                tracing::error!(task = %task_id, error = %e, "failed to kill unhealthy container");
+            match self.runtime.kill(&running[&task_id]).await {
+                Ok(()) => {
+                    let failure = Failure {
+                        error: failure::HEALTHCHECK_KILL.into(),
+                        exit_code: None,
+                    };
+                    self.record_failure(&task_id, failure, false).await;
+                }
+                Err(e) => {
+                    tracing::error!(task = %task_id, error = %e, "failed to kill unhealthy container")
+                }
             }
         }
     }
@@ -981,6 +1057,9 @@ impl Supervisor {
                                 error = %e,
                                 "failed to start container (bus command)"
                             );
+                            let failure =
+                                failure::start_error(&e, &failure::registry_secrets(&spec.image));
+                            self.record_failure(&task_id, failure, false).await;
                             0
                         }
                     },
@@ -1012,6 +1091,8 @@ impl Supervisor {
                                     error = %e,
                                     "failed to start agent (bus command)"
                                 );
+                                self.record_failure(&task_id, failure::start_error(&e, &[]), false)
+                                    .await;
                                 0
                             }
                         }
@@ -1158,6 +1239,8 @@ impl Supervisor {
             .filter(|t| t.node_id == self.node_id)
             .collect();
 
+        self.clear_settled_failures(&my_tasks).await;
+
         let backing_off: HashSet<TaskId> = {
             let now = std::time::Instant::now();
             let states = self.restart_states.lock().await;
@@ -1207,11 +1290,12 @@ impl Supervisor {
                             error = %e,
                             "failed to start container (raft reconcile)"
                         );
-                        // Once is enough for a rollout to see it; this
-                        // path retries every pass.
-                        if task.restarts == 0 {
-                            self.record_restart(&task.id).await;
-                        }
+                        // Counting the retry once is enough for a rollout to
+                        // see it; this path retries every pass.
+                        let failure =
+                            failure::start_error(&e, &failure::registry_secrets(&task.spec.image));
+                        self.record_failure(&task.id, failure, task.restarts == 0)
+                            .await;
                     }
                 },
                 WorkloadKind::Agent(agent_spec) => {
@@ -1241,6 +1325,8 @@ impl Supervisor {
                                 error = %e,
                                 "failed to start agent (raft reconcile)"
                             );
+                            self.record_failure(&task.id, failure::start_error(&e, &[]), false)
+                                .await;
                         }
                     }
                 }
@@ -1384,6 +1470,8 @@ mod tests {
             },
             restarts: 0,
             running_since_unix: None,
+            last_error: None,
+            last_exit_code: None,
         }
     }
 
@@ -1853,6 +1941,8 @@ mod tests {
             },
             restarts: 0,
             running_since_unix: None,
+            last_error: None,
+            last_exit_code: None,
         }
     }
 
@@ -2222,6 +2312,8 @@ mod tests {
             spec,
             restarts: 0,
             running_since_unix: None,
+            last_error: None,
+            last_exit_code: None,
         };
         store.upsert_task(task).await.unwrap();
 
@@ -2258,6 +2350,8 @@ mod tests {
             spec,
             restarts: 0,
             running_since_unix: None,
+            last_error: None,
+            last_exit_code: None,
         };
         store.upsert_task(task).await.unwrap();
 
@@ -2298,6 +2392,8 @@ mod tests {
             spec,
             restarts: 0,
             running_since_unix: None,
+            last_error: None,
+            last_exit_code: None,
         };
         store.upsert_task(task).await.unwrap();
 
@@ -2327,5 +2423,116 @@ mod tests {
             0,
             "should not restart beyond max_attempts"
         );
+    }
+
+    // --- Why a task ended ----------------------------------------------------
+
+    fn restarting(mut task: Task, condition: RestartCondition) -> Task {
+        task.spec.restart_policy = minga_state::types::RestartPolicy {
+            condition,
+            delay_secs: 0,
+            max_attempts: None,
+        };
+        task
+    }
+
+    async fn crash(rt: &MockRuntime, sup: &Supervisor, code: i32) {
+        let container = rt.list().await[0].id.clone();
+        rt.mark_failed_with_code(&container, code);
+        sup.reconcile_once().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_restarted_task_keeps_the_reason_it_exited() {
+        let (sup, rt, store) = setup(1).await;
+        let task = restarting(make_task("t1", 1), RestartCondition::Any);
+        store.upsert_task(task).await.unwrap();
+        sup.reconcile_once().await.unwrap();
+
+        crash(&rt, &sup, 3).await;
+        let task = store.get_task(&"t1".to_string()).await.unwrap().unwrap();
+        assert_eq!(task.restarts, 1);
+        assert_eq!(task.last_error.as_deref(), Some("exited with code 3"));
+        assert_eq!(task.last_exit_code, Some(3));
+
+        // The new container starts; the reason stays until it has run a while.
+        sup.reconcile_once().await.unwrap();
+        let task = store.get_task(&"t1".to_string()).await.unwrap().unwrap();
+        assert_eq!(task.state, TaskState::Running);
+        assert_eq!(task.last_error.as_deref(), Some("exited with code 3"));
+    }
+
+    #[tokio::test]
+    async fn a_task_that_ends_failed_says_why() {
+        let (sup, rt, store) = setup(1).await;
+        let task = restarting(make_task("t1", 1), RestartCondition::None);
+        store.upsert_task(task).await.unwrap();
+        sup.reconcile_once().await.unwrap();
+
+        crash(&rt, &sup, 137).await;
+        let task = store.get_task(&"t1".to_string()).await.unwrap().unwrap();
+        assert_eq!(task.state, TaskState::Failed);
+        assert_eq!(task.last_exit_code, Some(137));
+        let error = task.last_error.unwrap();
+        assert!(error.starts_with("exited with code 137"), "{error}");
+        assert!(error.contains("signal 9"), "{error}");
+        assert!(!error.to_lowercase().contains("oom"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_failed_start_is_recorded_once_and_cleared_when_the_task_settles() {
+        let (sup, rt, store) = setup(1).await;
+        *rt.fail_starts.lock().unwrap() = true;
+        store.upsert_task(make_task("t1", 1)).await.unwrap();
+
+        sup.reconcile_once().await.unwrap();
+        let task = store.get_task(&"t1".to_string()).await.unwrap().unwrap();
+        assert_eq!(task.restarts, 1);
+        assert_eq!(task.last_exit_code, None);
+        assert_eq!(
+            task.last_error.as_deref(),
+            Some("failed to start container: mock runtime: starts disabled")
+        );
+
+        // The same failure on the next pass is not written again.
+        let before = store.get_task(&"t1".to_string()).await.unwrap().unwrap();
+        sup.reconcile_once().await.unwrap();
+        assert_eq!(
+            store.get_task(&"t1".to_string()).await.unwrap().unwrap(),
+            before
+        );
+
+        // It starts, but has not run long enough to forget the reason...
+        *rt.fail_starts.lock().unwrap() = false;
+        let task = pass_until(&sup, &store, "t1", |t| t.state == TaskState::Running).await;
+        assert!(task.last_error.is_some());
+        sup.reconcile_once().await.unwrap();
+        let task = store.get_task(&"t1".to_string()).await.unwrap().unwrap();
+        assert!(task.last_error.is_some());
+
+        // ...until it has.
+        let mut task = task;
+        task.running_since_unix = Some(unix_now() - failure::CLEAR_AFTER_SECS - 1);
+        store.upsert_task(task).await.unwrap();
+        sup.reconcile_once().await.unwrap();
+        let task = store.get_task(&"t1".to_string()).await.unwrap().unwrap();
+        assert_eq!((task.last_error, task.last_exit_code), (None, None));
+    }
+
+    #[tokio::test]
+    async fn an_unhealthy_task_says_the_healthcheck_killed_it() {
+        let (sup, rt, store) = setup(1).await;
+        store
+            .upsert_task(with_healthcheck(make_task("t1", 1)))
+            .await
+            .unwrap();
+        pass_until(&sup, &store, "t1", |t| t.state == TaskState::Running).await;
+
+        let container = rt.list().await[0].id.clone();
+        rt.exec_codes.lock().unwrap().insert(container, 1);
+        let task = pass_until(&sup, &store, "t1", |t| t.restarts > 0).await;
+        let error = task.last_error.unwrap();
+        assert!(error.starts_with(failure::HEALTHCHECK_KILL), "{error}");
+        assert!(task.last_exit_code.is_some());
     }
 }

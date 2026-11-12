@@ -268,8 +268,25 @@ fn task_fixture() {
         spec: task_spec(),
         running_since_unix: Some(1_794_000_100),
         restarts: 2,
+        last_error: None,
+        last_exit_code: None,
     };
     check("task", &task);
+}
+
+/// The failure reason was added after v2 was frozen: a task written without
+/// it decodes, and one with it round-trips.
+#[test]
+fn a_task_failure_reason_is_optional_and_round_trips() {
+    let text = std::fs::read_to_string(fixture_path("task")).unwrap();
+    let old: Task = codec::decode(text.as_bytes()).unwrap();
+    assert_eq!((&old.last_error, old.last_exit_code), (&None, None));
+
+    let mut task = old;
+    task.last_error = Some("exited with code 1".into());
+    task.last_exit_code = Some(1);
+    let back: Task = codec::decode(&codec::encode(&task).unwrap()).unwrap();
+    assert_eq!(back, task);
 }
 
 #[test]
