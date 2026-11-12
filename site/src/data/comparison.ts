@@ -12,7 +12,7 @@ export interface Row {
 }
 
 export const asOf = '2026-11';
-export const columns = ['Minga v1.0.1', 'Docker Swarm mode', 'k3s'] as const;
+export const columns = ['Minga v1.0.2', 'Docker Swarm mode', 'k3s'] as const;
 
 const swarmDocs = 'https://docs.docker.com/engine/swarm/';
 const k3sDocs = 'https://docs.k3s.io/';
@@ -65,7 +65,7 @@ export const rows: Row[] = [
   {
     capability: 'Image pull from a registry',
     cells: [
-      { mark: 'partial', text: 'Anonymous-registry pulls; no private-registry credentials', source: 'CHANGELOG.md' },
+      { mark: 'partial', text: 'Private-registry pulls from inline Docker credentials; no credential helpers', source: 'CHANGELOG.md' },
       { mark: 'yes', text: 'Yes', source: swarmDocs },
       { mark: 'yes', text: 'Yes', source: k3sDocs },
     ],
@@ -141,7 +141,7 @@ export const rows: Row[] = [
   {
     capability: 'Maturity',
     cells: [
-      { mark: 'partial', text: 'v1.0.1, released 2026-11-11', source: 'CHANGELOG.md' },
+      { mark: 'partial', text: 'v1.0.2, released 2026-11-12', source: 'CHANGELOG.md' },
       { mark: 'yes', text: 'In Docker Engine since 2016', source: swarmDocs },
       { mark: 'yes', text: 'CNCF project, certified Kubernetes distribution', source: k3sDocs },
     ],

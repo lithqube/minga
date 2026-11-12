@@ -2,7 +2,7 @@
 
 **Status:** Validated on a single Hetzner CAX21 node (Ampere Altra ARM64, Ubuntu 24.04 LTS). All 8 services reach `RUNNING`. Validation required `feat/staging-compat` fixes — see [PR #16](https://github.com/lithqube/minga/pull/16).
 
-**Version:** Minga `feat/staging-compat` (targeting v1.0.2)
+**Version:** Minga v1.0.2 (first validated on `feat/staging-compat`)
 
 > **Not yet re-validated:** the API token for Traefik (Basic auth), the node-side `host-gateway` address, the `DOCKER_CONFIG` setup and named users were changed after that run. They are covered by unit tests, and named users also by a daemon-backed test, but not yet by a redeploy of this stack.
 

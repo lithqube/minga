@@ -8,7 +8,7 @@ export interface Faq {
 export const faq: Faq[] = [
   {
     q: 'Is Minga production-ready?',
-    a: 'It is v1.0.1. The single-host path is verified by execution on Linux (containerd 2.2.1) and macOS. This release adds healthcheck enforcement, rolling updates, rollback and anonymous-registry image pulls. Cross-node container networking, joining a running cluster and private-registry credentials remain limitations; real-registry and Talos verification for this release were not run.',
+    a: 'It is v1.0.2. The single-host path is verified by execution on Linux (containerd 2.2.1) and macOS. This release adds Compose <code>env_file</code>, <code>extra_hosts</code> and named users, private-registry pulls from inline Docker credentials, and the <code>minga-ctl</code> companion CLI. Cross-node container networking and joining a running cluster remain limitations; real-registry and Talos verification for this release were not run.',
     sources: ['README.md', 'CHANGELOG.md'],
   },
   {
@@ -23,12 +23,12 @@ export const faq: Faq[] = [
   },
   {
     q: 'How does Minga pull images?',
-    a: 'When an image is missing from the <code>minga</code> containerd namespace, Minga pulls and unpacks it with <code>ctr</code>. Pulls use anonymous registry access and ctr’s default containerd socket; private-registry credentials are not supported. On air-gapped sites, preload with <code>ctr -n minga images import &lt;image&gt;.tar</code>.',
-    sources: ['CHANGELOG.md', 'docs/release-1.0.1.md'],
+    a: 'When an image is missing from the <code>minga</code> containerd namespace, Minga pulls it with <code>ctr</code>. Private registries work through inline <code>auth</code> entries in <code>$DOCKER_CONFIG/config.json</code>, else <code>~/.docker/config.json</code>; credential helpers are not read, and <code>ctr</code> receives the credential on its command line. On air-gapped sites, preload with <code>ctr -n minga images import &lt;image&gt;.tar</code>.',
+    sources: ['CHANGELOG.md', 'docs/release-1.0.2.md'],
   },
   {
     q: 'Why does one host run two processes?',
-    a: 'In v1.0.1, <code>minga api</code> is its own Raft voter, so the manager and the API peer with each other. In the target design the API folds into the manager.',
+    a: 'In v1.0.2, <code>minga api</code> is its own Raft voter, so the manager and the API peer with each other. In the target design the API folds into the manager.',
     sources: ['README.md', 'docs/architecture.md'],
   },
   {
@@ -48,7 +48,7 @@ export const faq: Faq[] = [
   },
   {
     q: 'How do I install on an air-gapped site?',
-    a: 'Copy the v1.0.1 release archive (minga, nats-server, ctr and the licenses) and your image tarballs to the site. Run <code>ctr -n minga images import &lt;image&gt;.tar</code> on each node and start the roles. The published <code>install.sh</code> verifies <code>SHA256SUMS</code>.',
+    a: 'Copy the v1.0.2 release archive (minga, nats-server, ctr and the licenses) and your image tarballs to the site. Run <code>ctr -n minga images import &lt;image&gt;.tar</code> on each node and start the roles. The published <code>install.sh</code> verifies <code>SHA256SUMS</code>.',
     sources: ['README.md', 'docs/release-1.0.1.md'],
   },
   {
@@ -58,7 +58,7 @@ export const faq: Faq[] = [
   },
   {
     q: 'I published a port. Why might it not answer on the same host?',
-    a: 'Host-local port hairpinning is not in v1.0.1. Test a published port from another machine against the host IP.',
+    a: 'Host-local port hairpinning is not in v1.0.2. Test a published port from another machine against the host IP.',
     sources: ['README.md'],
   },
   {

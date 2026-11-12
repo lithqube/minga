@@ -11,7 +11,7 @@ export interface Step {
 
 export const prerequisites = [
   'Linux with root (the supervisor creates netns, bridges and iptables rules)',
-  'Install from the v1.0.1 release archive; it includes minga, nats-server and ctr.',
+  'Install from the v1.0.2 release archive; it includes minga, nats-server and ctr.',
   'containerd running',
   'iproute2, iptables and procps (any standard server install)',
   'Free loopback ports 7001, 7002, 2375 and 9100',
@@ -25,7 +25,7 @@ export const steps: Step[] = [
   },
   {
     title: 'Auto-pull or preload workload images',
-    note: 'Missing images are pulled with ctr from anonymous registries. Private-registry credentials are not supported; preload images for air-gapped or authenticated registries.',
+    note: 'Missing images are pulled with ctr. Private registries need inline auth entries in $DOCKER_CONFIG/config.json, else ~/.docker/config.json; credential helpers are not read. Preload images for air-gapped sites.',
     code: 'sudo ctr -n minga images pull docker.io/library/nginx:1.27',
   },
   {
