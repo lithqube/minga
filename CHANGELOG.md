@@ -61,9 +61,6 @@ upgrade notes.
 - `minga-ctl` has been tested against stubs and test API servers, not
   against a real node over SSH. Its rollback covers only changes made by
   `minga-ctl` on the same workstation.
-- `minga-ctl` has been tested against stubs and test API servers, not
-  against a real node over SSH. Its rollback covers only changes made by
-  `minga-ctl` on the same workstation.
 
 ## [1.0.1] — 2026-11-11
 
