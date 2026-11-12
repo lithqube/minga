@@ -41,6 +41,7 @@
 //! # }
 //! ```
 
+pub mod codec;
 mod command;
 mod error;
 mod log_store;

@@ -34,9 +34,7 @@ pub enum StateCommand {
     /// Refreshes a node's lease in one log entry: sets `last_seen_unix`
     /// and revives the node unless it is draining. A missing record stays
     /// missing (`NotFound`): a removed node is not recreated. Read-modify-
-    /// write from a client would race an operator's drain. Appended last:
-    /// bincode encodes the variant index, so existing log entries keep
-    /// decoding.
+    /// write from a client would race an operator's drain.
     RenewNodeLease {
         id: NodeId,
         last_seen_unix: u64,

@@ -1,0 +1,194 @@
+{
+  "agent": {
+    "egress_url": "http://127.0.0.1:8088",
+    "fuel_limit": 1000000,
+    "memory_limit": 134217728,
+    "module_ref": "/var/lib/minga/modules/summarize.wasm",
+    "prompt": "Summarize",
+    "sandbox_env": {
+      "MODEL": "small"
+    },
+    "timeout_secs": 30,
+    "token_budget": 50000
+  },
+  "command": [
+    "nginx",
+    "-g",
+    "daemon off;"
+  ],
+  "constraints": [
+    "node.role==worker"
+  ],
+  "entrypoint": [
+    "/docker-entrypoint.sh"
+  ],
+  "env": {
+    "MODE": "prod"
+  },
+  "extra_hosts": [
+    [
+      "db",
+      "10.0.0.5"
+    ]
+  ],
+  "healthcheck": {
+    "interval_secs": 10,
+    "retries": 3,
+    "start_period_secs": 5,
+    "test": [
+      "CMD",
+      "true"
+    ],
+    "timeout_secs": 3
+  },
+  "id": "shop.web",
+  "image": "docker.io/library/nginx:1.27",
+  "labels": {
+    "com.docker.stack.namespace": "shop"
+  },
+  "mode": "Replicated",
+  "mounts": [
+    {
+      "kind": "Bind",
+      "read_only": true,
+      "source": "/srv/data",
+      "target": "/data"
+    }
+  ],
+  "name": "web",
+  "networks": [
+    "shop_default"
+  ],
+  "ports": [
+    {
+      "protocol": "tcp",
+      "published": 8080,
+      "target": 80
+    }
+  ],
+  "previous": {
+    "agent": null,
+    "command": [
+      "nginx",
+      "-g",
+      "daemon off;"
+    ],
+    "constraints": [
+      "node.role==worker"
+    ],
+    "entrypoint": [
+      "/docker-entrypoint.sh"
+    ],
+    "env": {
+      "MODE": "prod"
+    },
+    "extra_hosts": [
+      [
+        "db",
+        "10.0.0.5"
+      ]
+    ],
+    "healthcheck": {
+      "interval_secs": 10,
+      "retries": 3,
+      "start_period_secs": 5,
+      "test": [
+        "CMD",
+        "true"
+      ],
+      "timeout_secs": 3
+    },
+    "id": "shop.web",
+    "image": "docker.io/library/nginx:1.26",
+    "labels": {
+      "com.docker.stack.namespace": "shop"
+    },
+    "mode": "Replicated",
+    "mounts": [
+      {
+        "kind": "Bind",
+        "read_only": true,
+        "source": "/srv/data",
+        "target": "/data"
+      }
+    ],
+    "name": "web",
+    "networks": [
+      "shop_default"
+    ],
+    "ports": [
+      {
+        "protocol": "tcp",
+        "published": 8080,
+        "target": 80
+      }
+    ],
+    "previous": null,
+    "replicas": 2,
+    "resources": {
+      "cpus": 0.5,
+      "gpus": 0,
+      "memory_bytes": 268435456
+    },
+    "restart_policy": {
+      "condition": "OnFailure",
+      "delay_secs": 5,
+      "max_attempts": 3
+    },
+    "rollback": {
+      "delay_secs": 0,
+      "failure_action": "Pause",
+      "monitor_secs": 5,
+      "order": "StopFirst",
+      "parallelism": 1
+    },
+    "secrets": [
+      {
+        "secret_id": "shop_password",
+        "target": "/run/secrets/password",
+        "version": "sha256:00"
+      }
+    ],
+    "update": {
+      "delay_secs": 5,
+      "failure_action": "Rollback",
+      "monitor_secs": 10,
+      "order": "StartFirst",
+      "parallelism": 2
+    },
+    "user": "nginx:nginx"
+  },
+  "replicas": 2,
+  "resources": {
+    "cpus": 0.5,
+    "gpus": 0,
+    "memory_bytes": 268435456
+  },
+  "restart_policy": {
+    "condition": "OnFailure",
+    "delay_secs": 5,
+    "max_attempts": 3
+  },
+  "rollback": {
+    "delay_secs": 0,
+    "failure_action": "Pause",
+    "monitor_secs": 5,
+    "order": "StopFirst",
+    "parallelism": 1
+  },
+  "secrets": [
+    {
+      "secret_id": "shop_password",
+      "target": "/run/secrets/password",
+      "version": "sha256:00"
+    }
+  ],
+  "update": {
+    "delay_secs": 5,
+    "failure_action": "Rollback",
+    "monitor_secs": 10,
+    "order": "StartFirst",
+    "parallelism": 2
+  },
+  "user": "nginx:nginx"
+}

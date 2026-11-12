@@ -131,9 +131,8 @@ impl Scheduler {
 
                     // Publish assign command to the bus.
                     if let Some(bus) = &self.bus {
-                        let payload =
-                            bincode::serde::encode_to_vec(&task.spec, bincode::config::standard())
-                                .map_err(|e| SchedulerError::Serialization(e.to_string()))?;
+                        let payload = minga_state::codec::encode_wire(&task.spec)
+                            .map_err(|e| SchedulerError::Serialization(e.to_string()))?;
                         let cmd = Command::Assign {
                             task_id: task.id.clone(),
                             payload,

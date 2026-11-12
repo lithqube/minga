@@ -1,0 +1,18 @@
+{
+  "address": "10.0.0.3:7001",
+  "capacity": {
+    "cpus": 4.0,
+    "gpus": 0,
+    "memory_bytes": 8589934592
+  },
+  "id": 3,
+  "labels": {
+    "zone": "a"
+  },
+  "last_seen_unix": 1794000000,
+  "overlay_ip": "10.100.0.3",
+  "role": "Worker",
+  "status": "Active",
+  "wg_endpoint": "10.0.0.3:51820",
+  "wg_public_key": "pk"
+}

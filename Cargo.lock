@@ -2208,7 +2208,6 @@ version = "1.0.2"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
- "bincode",
  "futures",
  "hyper-util",
  "libc",
@@ -2250,7 +2249,6 @@ dependencies = [
 name = "minga-scheduler"
 version = "1.0.2"
 dependencies = [
- "bincode",
  "minga-bus",
  "minga-compose",
  "minga-net",
@@ -2272,7 +2270,6 @@ name = "minga-state"
 version = "1.0.2"
 dependencies = [
  "anyhow",
- "bincode",
  "openraft",
  "rcgen",
  "redb",

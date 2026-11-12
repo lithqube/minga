@@ -1,7 +1,7 @@
 //! redb-backed Raft log storage.
 //!
 //! Stores log entries, votes and the committed log id in a redb database.
-//! Each log entry is serialized with bincode and stored under its log index.
+//! Each log entry is serialized with [`crate::codec`] and stored under its log index.
 
 use std::fmt::Debug;
 use std::ops::RangeBounds;
@@ -13,14 +13,16 @@ use openraft::{
     AnyError, Entry, ErrorSubject, ErrorVerb, LogId, LogState, OptionalSend, StorageError,
     StorageIOError, Vote,
 };
-use redb::{Database, ReadableTable, TableDefinition};
+use redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition};
 use std::sync::Mutex;
 
+use crate::codec::{check_format, FORMAT_KEY, FORMAT_VERSION};
 use crate::TypeConfig;
 
 /// Log entries: log index → serialized entry.
 const LOGS_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("raft_logs");
-/// Metadata: key → serialized value. Keys: `vote`, `committed`, `last_purged_log_id`.
+/// Metadata: key → serialized value. Keys: `vote`, `committed`, `last_purged_log_id`
+/// and `format_version` (a single byte, not JSON).
 const META_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("raft_meta");
 
 /// A redb-backed Raft log store.
@@ -33,10 +35,22 @@ impl RedbLogStore {
     #[allow(clippy::result_large_err)]
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StorageIOError<u64>> {
         let db = Database::create(path).map_err(io_err)?;
-        // Ensure tables exist.
+        // Ensure tables exist, and that the file was written in the format this
+        // build reads. On an error the transaction is dropped and nothing changes.
         let tx = db.begin_write().map_err(io_err)?;
-        tx.open_table(LOGS_TABLE).map_err(io_err)?;
-        tx.open_table(META_TABLE).map_err(io_err)?;
+        {
+            let logs = tx.open_table(LOGS_TABLE).map_err(io_err)?;
+            let mut meta = tx.open_table(META_TABLE).map_err(io_err)?;
+            let stored = meta
+                .get(FORMAT_KEY)
+                .map_err(io_err)?
+                .map(|v| v.value().to_vec());
+            let empty = logs.is_empty().map_err(io_err)? && meta.is_empty().map_err(io_err)?;
+            if check_format(stored.as_deref(), empty).map_err(io_err)? {
+                meta.insert(FORMAT_KEY, [FORMAT_VERSION].as_slice())
+                    .map_err(io_err)?;
+            }
+        }
         tx.commit().map_err(io_err)?;
         Ok(Self {
             db: Arc::new(Mutex::new(db)),
@@ -82,15 +96,13 @@ impl RaftLogReader<TypeConfig> for RedbLogStore {
         for result in table.range(start..end).map_err(io_err)? {
             let (_key, value) = result.map_err(io_err)?;
             let entry: Entry<TypeConfig> =
-                bincode::serde::decode_from_slice(value.value(), bincode::config::standard())
-                    .map_err(|e| StorageError::IO {
-                        source: StorageIOError::new(
-                            ErrorSubject::Logs,
-                            ErrorVerb::Read,
-                            AnyError::new(&e),
-                        ),
-                    })?
-                    .0;
+                crate::codec::decode(value.value()).map_err(|e| StorageError::IO {
+                    source: StorageIOError::new(
+                        ErrorSubject::Logs,
+                        ErrorVerb::Read,
+                        AnyError::new(&e),
+                    ),
+                })?;
             entries.push(entry);
         }
         Ok(entries)
@@ -111,15 +123,14 @@ impl RaftLogStorage<TypeConfig> for RedbLogStore {
         {
             let meta = tx.open_table(META_TABLE).map_err(io_err)?;
             if let Some(purged) = meta.get("last_purged_log_id").map_err(io_err)? {
-                let (log_id, _): (LogId<u64>, usize) =
-                    bincode::serde::decode_from_slice(purged.value(), bincode::config::standard())
-                        .map_err(|e| StorageError::IO {
-                            source: StorageIOError::new(
-                                ErrorSubject::Logs,
-                                ErrorVerb::Read,
-                                AnyError::new(&e),
-                            ),
-                        })?;
+                let log_id: LogId<u64> =
+                    crate::codec::decode(purged.value()).map_err(|e| StorageError::IO {
+                        source: StorageIOError::new(
+                            ErrorSubject::Logs,
+                            ErrorVerb::Read,
+                            AnyError::new(&e),
+                        ),
+                    })?;
                 last_purged_log_id = Some(log_id);
             }
         }
@@ -130,15 +141,13 @@ impl RaftLogStorage<TypeConfig> for RedbLogStore {
             if let Some(result) = table.range(0..u64::MAX).map_err(io_err)?.next_back() {
                 let (_key, value) = result.map_err(io_err)?;
                 let entry: Entry<TypeConfig> =
-                    bincode::serde::decode_from_slice(value.value(), bincode::config::standard())
-                        .map_err(|e| StorageError::IO {
-                            source: StorageIOError::new(
-                                ErrorSubject::Logs,
-                                ErrorVerb::Read,
-                                AnyError::new(&e),
-                            ),
-                        })?
-                        .0;
+                    crate::codec::decode(value.value()).map_err(|e| StorageError::IO {
+                        source: StorageIOError::new(
+                            ErrorSubject::Logs,
+                            ErrorVerb::Read,
+                            AnyError::new(&e),
+                        ),
+                    })?;
                 last_log_id = Some(entry.log_id);
             }
         }
@@ -158,16 +167,13 @@ impl RaftLogStorage<TypeConfig> for RedbLogStore {
         let tx = db.begin_write().map_err(io_err)?;
         {
             let mut table = tx.open_table(META_TABLE).map_err(io_err)?;
-            let bytes =
-                bincode::serde::encode_to_vec(vote, bincode::config::standard()).map_err(|e| {
-                    StorageError::IO {
-                        source: StorageIOError::new(
-                            ErrorSubject::Vote,
-                            ErrorVerb::Write,
-                            AnyError::new(&e),
-                        ),
-                    }
-                })?;
+            let bytes = crate::codec::encode(vote).map_err(|e| StorageError::IO {
+                source: StorageIOError::new(
+                    ErrorSubject::Vote,
+                    ErrorVerb::Write,
+                    AnyError::new(&e),
+                ),
+            })?;
             table.insert("vote", bytes.as_slice()).map_err(io_err)?;
         }
         tx.commit().map_err(io_err)?;
@@ -180,15 +186,14 @@ impl RaftLogStorage<TypeConfig> for RedbLogStore {
         let table = tx.open_table(META_TABLE).map_err(io_err)?;
         match table.get("vote").map_err(io_err)? {
             Some(v) => {
-                let (vote, _): (Vote<u64>, usize) =
-                    bincode::serde::decode_from_slice(v.value(), bincode::config::standard())
-                        .map_err(|e| StorageError::IO {
-                            source: StorageIOError::new(
-                                ErrorSubject::Vote,
-                                ErrorVerb::Read,
-                                AnyError::new(&e),
-                            ),
-                        })?;
+                let vote: Vote<u64> =
+                    crate::codec::decode(v.value()).map_err(|e| StorageError::IO {
+                        source: StorageIOError::new(
+                            ErrorSubject::Vote,
+                            ErrorVerb::Read,
+                            AnyError::new(&e),
+                        ),
+                    })?;
                 Ok(Some(vote))
             }
             None => Ok(None),
@@ -205,14 +210,13 @@ impl RaftLogStorage<TypeConfig> for RedbLogStore {
             let mut table = tx.open_table(META_TABLE).map_err(io_err)?;
             match committed {
                 Some(log_id) => {
-                    let bytes = bincode::serde::encode_to_vec(log_id, bincode::config::standard())
-                        .map_err(|e| StorageError::IO {
-                            source: StorageIOError::new(
-                                ErrorSubject::Logs,
-                                ErrorVerb::Write,
-                                AnyError::new(&e),
-                            ),
-                        })?;
+                    let bytes = crate::codec::encode(&log_id).map_err(|e| StorageError::IO {
+                        source: StorageIOError::new(
+                            ErrorSubject::Logs,
+                            ErrorVerb::Write,
+                            AnyError::new(&e),
+                        ),
+                    })?;
                     table
                         .insert("committed", bytes.as_slice())
                         .map_err(io_err)?;
@@ -232,15 +236,14 @@ impl RaftLogStorage<TypeConfig> for RedbLogStore {
         let table = tx.open_table(META_TABLE).map_err(io_err)?;
         match table.get("committed").map_err(io_err)? {
             Some(v) => {
-                let (log_id, _): (LogId<u64>, usize) =
-                    bincode::serde::decode_from_slice(v.value(), bincode::config::standard())
-                        .map_err(|e| StorageError::IO {
-                            source: StorageIOError::new(
-                                ErrorSubject::Logs,
-                                ErrorVerb::Read,
-                                AnyError::new(&e),
-                            ),
-                        })?;
+                let log_id: LogId<u64> =
+                    crate::codec::decode(v.value()).map_err(|e| StorageError::IO {
+                        source: StorageIOError::new(
+                            ErrorSubject::Logs,
+                            ErrorVerb::Read,
+                            AnyError::new(&e),
+                        ),
+                    })?;
                 Ok(Some(log_id))
             }
             None => Ok(None),
@@ -262,14 +265,13 @@ impl RaftLogStorage<TypeConfig> for RedbLogStore {
             let mut table = tx.open_table(LOGS_TABLE).map_err(io_err)?;
             for entry in entries {
                 let index = entry.log_id.index;
-                let bytes = bincode::serde::encode_to_vec(&entry, bincode::config::standard())
-                    .map_err(|e| StorageError::IO {
-                        source: StorageIOError::new(
-                            ErrorSubject::LogIndex(index),
-                            ErrorVerb::Write,
-                            AnyError::new(&e),
-                        ),
-                    })?;
+                let bytes = crate::codec::encode(&entry).map_err(|e| StorageError::IO {
+                    source: StorageIOError::new(
+                        ErrorSubject::LogIndex(index),
+                        ErrorVerb::Write,
+                        AnyError::new(&e),
+                    ),
+                })?;
                 table.insert(index, bytes.as_slice()).map_err(io_err)?;
             }
         }
@@ -319,14 +321,13 @@ impl RaftLogStorage<TypeConfig> for RedbLogStore {
         {
             // Record the purged log id.
             let mut meta = tx.open_table(META_TABLE).map_err(io_err)?;
-            let bytes = bincode::serde::encode_to_vec(log_id, bincode::config::standard())
-                .map_err(|e| StorageError::IO {
-                    source: StorageIOError::new(
-                        ErrorSubject::Logs,
-                        ErrorVerb::Write,
-                        AnyError::new(&e),
-                    ),
-                })?;
+            let bytes = crate::codec::encode(&log_id).map_err(|e| StorageError::IO {
+                source: StorageIOError::new(
+                    ErrorSubject::Logs,
+                    ErrorVerb::Write,
+                    AnyError::new(&e),
+                ),
+            })?;
             meta.insert("last_purged_log_id", bytes.as_slice())
                 .map_err(io_err)?;
         }
