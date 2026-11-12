@@ -1025,7 +1025,11 @@ can run the service; `list` shows which nodes have it.
 - It has to be the file Minga reads: `$DOCKER_CONFIG/config.json` when the
   service sets `DOCKER_CONFIG`, else `$HOME/.docker/config.json`. Set the
   path or the service environment to match; otherwise Minga finds no file
-  and pulls anonymously.
+  and pulls anonymously. minga-ctl cannot see the service's environment, so
+  when the context sets no `registry_auth_file`, `login` names the default
+  file it wrote and says so on stderr; the JSON result has a `file` field.
+- `registry` and `image` do not call the API, so they resolve the context
+  without its token and never run `token_command`.
 - The SSH user must be able to read and write the file. minga-ctl does not
   call `sudo`.
 
