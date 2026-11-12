@@ -31,7 +31,8 @@ export const features: Feature[] = [
     icon: 'loud',
     title: 'Fails loudly by default',
     body: 'Unknown Compose keys are rejected with suggestions, an unplaceable deploy gets HTTP 409 instead of a warning, and /readyz says why it is not ready.',
-    caveat: 'Healthchecks gate task readiness; named users resolve from the image’s /etc/passwd, without supplementary groups.',
+    caveat:
+      'Healthchecks gate task readiness; named users resolve from the image’s /etc/passwd, without supplementary groups.',
     href: '/architecture/',
     linkLabel: 'Read the architecture notes',
     source: 'README.md, CHANGELOG.md',
