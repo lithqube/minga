@@ -8,7 +8,8 @@
 //!   usable IP of the network's subnet;
 //! - one named netns per task (`minga-<task-id>`), with a veth pair per
 //!   joined network and the task's IPAM-assigned address;
-//! - published ports via iptables DNAT (host `PREROUTING` + `OUTPUT`);
+//! - published ports via iptables DNAT (host `PREROUTING` for traffic addressed to
+//!   the node, `OUTPUT` for clients on the node itself);
 //! - a per-task `/etc/resolv.conf` pointing at the bridge gateway, where
 //!   the node's DNS server listens.
 //!
@@ -82,6 +83,38 @@ async fn ensure_rule(table: &str, chain: &str, rule: &[&str]) -> Result<(), NetE
     run("iptables", &args).await
 }
 
+/// Which nat rule form to build for a published port.
+#[derive(Clone, Copy)]
+enum Chain {
+    /// `PREROUTING`, only for traffic addressed to the node.
+    PreroutingLocal,
+    /// The 1.0.2 `PREROUTING` rule with no destination match (it also
+    /// captured tasks' outbound traffic). Kept so teardown removes it.
+    PreroutingAny,
+    /// `OUTPUT` over loopback, for clients on the node itself.
+    Output,
+}
+
+/// iptables arguments for one DNAT rule. `op` is `-A` or `-D`.
+fn dnat_rule(op: &str, chain: Chain, proto: &str, published: u16, to: &str) -> Vec<String> {
+    let (name, matches): (&str, &[&str]) = match chain {
+        Chain::PreroutingLocal => ("PREROUTING", &["-m", "addrtype", "--dst-type", "LOCAL"]),
+        Chain::PreroutingAny => ("PREROUTING", &[]),
+        Chain::Output => ("OUTPUT", &["-o", "lo"]),
+    };
+    ["-w", "5", "-t", "nat", op, name]
+        .into_iter()
+        .chain(matches.iter().copied())
+        .chain(["-p", proto, "--dport", &published.to_string()])
+        .chain(["-j", "DNAT", "--to-destination", to])
+        .map(String::from)
+        .collect()
+}
+
+fn as_strs(args: &[String]) -> Vec<&str> {
+    args.iter().map(String::as_str).collect()
+}
+
 /// A short deterministic hash for interface names (IFNAMSIZ is 16 bytes).
 fn short_hash(s: &str) -> String {
     use std::hash::{Hash, Hasher};
@@ -91,7 +124,7 @@ fn short_hash(s: &str) -> String {
 }
 
 /// Bridge name for a network: `minga-<8 hex>`.
-fn bridge_name(network_id: &str) -> String {
+pub fn bridge_name(network_id: &str) -> String {
     format!("minga-{}", short_hash(network_id))
 }
 
@@ -164,6 +197,10 @@ impl NetworkSetup {
         }
     }
 
+    fn resolv_conf_path(&self, ns: &str) -> PathBuf {
+        self.state_dir.join(format!("{ns}.resolv.conf"))
+    }
+
     /// The bridge gateway address for a network (also the DNS listen IP).
     pub fn gateway_for(&self, network_id: &str, state_subnet: Option<&str>) -> Option<Ipv4Addr> {
         subnet_for(network_id, state_subnet)
@@ -191,6 +228,15 @@ impl NetworkSetup {
         // failures surface on the first container start.
         run_tolerated("sysctl", &["-w", "net.ipv4.ip_forward=1"]).await;
 
+        // Lets the host reach published ports at 127.0.0.1: the DNAT'd
+        // packet still carries a loopback source, which the kernel drops on
+        // other interfaces unless route_localnet is on.
+        run_tolerated(
+            "sysctl",
+            &["-w", &format!("net.ipv4.conf.{br}.route_localnet=1")],
+        )
+        .await;
+
         // Task IPs are private to this host: without SNAT, replies from
         // anything off this bridge have no route back.
         let cidr = subnet.to_string();
@@ -198,6 +244,42 @@ impl NetworkSetup {
             "nat",
             "POSTROUTING",
             &["-s", &cidr, "!", "-o", &br, "-j", "MASQUERADE"],
+        )
+        .await?;
+        // Host-originated traffic into the bridge (127.0.0.1 or the node's
+        // own address, after DNAT) needs a source the task can answer.
+        ensure_rule(
+            "nat",
+            "POSTROUTING",
+            &[
+                "-o",
+                &br,
+                "-m",
+                "addrtype",
+                "--src-type",
+                "LOCAL",
+                "-j",
+                "MASQUERADE",
+            ],
+        )
+        .await?;
+        // A task calling the node's address on a published port (itself or a
+        // sibling): masquerade so the reply returns through the host.
+        ensure_rule(
+            "nat",
+            "POSTROUTING",
+            &[
+                "-s",
+                &cidr,
+                "-o",
+                &br,
+                "-m",
+                "conntrack",
+                "--ctstate",
+                "DNAT",
+                "-j",
+                "MASQUERADE",
+            ],
         )
         .await?;
         // Hosts that default FORWARD to DROP (or load br_netfilter) still
@@ -293,6 +375,13 @@ impl NetworkSetup {
             )
             .await?;
             run("ip", ["link", "set", &vh, "master", &br, "up"].as_slice()).await?;
+            // Lets a task reach itself through a published port on the
+            // node's address (the DNAT'd packet leaves by the port it came in).
+            run(
+                "bridge",
+                ["link", "set", "dev", &vh, "hairpin", "on"].as_slice(),
+            )
+            .await?;
             run("ip", ["link", "set", &vc, "netns", ns].as_slice()).await?;
             run("ip", ["-n", ns, "link", "set", &vc, "up"].as_slice()).await?;
             run(
@@ -334,52 +423,14 @@ impl NetworkSetup {
             let Some(published) = port.published else {
                 continue;
             };
-            let proto = port.protocol.as_str();
             let to = format!("{}:{}", primary_ip, port.target);
-            let dport = published.to_string();
-            run(
-                "iptables",
-                &[
-                    "-w",
-                    "5",
-                    "-t",
-                    "nat",
-                    "-A",
-                    "PREROUTING",
-                    "-p",
-                    proto,
-                    "--dport",
-                    &dport,
-                    "-j",
-                    "DNAT",
-                    "--to-destination",
-                    &to,
-                ],
-            )
-            .await?;
-            // Host-local clients (curl from the node itself).
-            run(
-                "iptables",
-                &[
-                    "-w",
-                    "5",
-                    "-t",
-                    "nat",
-                    "-A",
-                    "OUTPUT",
-                    "-o",
-                    "lo",
-                    "-p",
-                    proto,
-                    "--dport",
-                    &dport,
-                    "-j",
-                    "DNAT",
-                    "--to-destination",
-                    &to,
-                ],
-            )
-            .await?;
+            for rule in [
+                dnat_rule("-A", Chain::PreroutingLocal, &port.protocol, published, &to),
+                // Host-local clients (curl from the node itself).
+                dnat_rule("-A", Chain::Output, &port.protocol, published, &to),
+            ] {
+                run("iptables", &as_strs(&rule)).await?;
+            }
         }
 
         // resolv.conf: the gateway hosts the node's DNS server.
@@ -388,7 +439,7 @@ impl NetworkSetup {
         if !search_domains.is_empty() {
             resolv.push_str(&format!("search {}\n", search_domains.join(" ")));
         }
-        let resolv_conf = self.state_dir.join(format!("{ns}.resolv.conf"));
+        let resolv_conf = self.resolv_conf_path(ns);
         tokio::fs::write(&resolv_conf, resolv).await?;
 
         // Record what to tear down.
@@ -412,56 +463,18 @@ impl NetworkSetup {
 
         if let Ok(raw) = tokio::fs::read(&state_path).await {
             if let Ok(state) = serde_json::from_slice::<TaskNetState>(&raw) {
-                if let (Some(ip), true) = (state.ips.first(), !state.ports.is_empty()) {
+                if let Some(ip) = state.ips.first() {
                     for port in &state.ports {
                         let Some(published) = port.published else {
                             continue;
                         };
-                        let proto = port.protocol.as_str();
                         let to = format!("{}:{}", ip, port.target);
-                        let dport = published.to_string();
-                        run_tolerated(
-                            "iptables",
-                            &[
-                                "-w",
-                                "5",
-                                "-t",
-                                "nat",
-                                "-D",
-                                "PREROUTING",
-                                "-p",
-                                proto,
-                                "--dport",
-                                &dport,
-                                "-j",
-                                "DNAT",
-                                "--to-destination",
-                                &to,
-                            ],
-                        )
-                        .await;
-                        run_tolerated(
-                            "iptables",
-                            &[
-                                "-w",
-                                "5",
-                                "-t",
-                                "nat",
-                                "-D",
-                                "OUTPUT",
-                                "-o",
-                                "lo",
-                                "-p",
-                                proto,
-                                "--dport",
-                                &dport,
-                                "-j",
-                                "DNAT",
-                                "--to-destination",
-                                &to,
-                            ],
-                        )
-                        .await;
+                        // The current forms, plus the 1.0.2 PREROUTING form
+                        // that rules written by an older binary may still use.
+                        for chain in [Chain::PreroutingLocal, Chain::PreroutingAny, Chain::Output] {
+                            let rule = dnat_rule("-D", chain, &port.protocol, published, &to);
+                            run_tolerated("iptables", &as_strs(&rule)).await;
+                        }
                     }
                 }
             }
@@ -469,7 +482,10 @@ impl NetworkSetup {
 
         run_tolerated("ip", &["netns", "delete", &ns]).await;
 
-        let _ = tokio::fs::remove_file(self.state_dir.join(format!("{ns}.resolv.conf"))).await;
+        let resolv_conf = self.resolv_conf_path(&ns);
+        // `runtime.rs` writes the task's hosts file beside the resolv.conf.
+        let _ = tokio::fs::remove_file(resolv_conf.with_extension("hosts")).await;
+        let _ = tokio::fs::remove_file(resolv_conf).await;
         let _ = tokio::fs::remove_file(&state_path).await;
         Ok(())
     }
@@ -522,5 +538,31 @@ mod tests {
         let b = subnet_for("shop_default", None).unwrap();
         assert_eq!(a, b);
         assert!(a.to_cidr_string().starts_with("10.100."));
+    }
+
+    #[test]
+    fn prerouting_dnat_only_matches_node_addresses() {
+        let to = "10.100.5.2:8080";
+        let new = dnat_rule("-A", Chain::PreroutingLocal, "tcp", 443, to).join(" ");
+        assert_eq!(
+            new,
+            "-w 5 -t nat -A PREROUTING -m addrtype --dst-type LOCAL -p tcp --dport 443 \
+             -j DNAT --to-destination 10.100.5.2:8080"
+        );
+        // The 1.0.2 form (no destination match) is what teardown must still delete.
+        let old = dnat_rule("-D", Chain::PreroutingAny, "tcp", 443, to).join(" ");
+        assert_eq!(
+            old,
+            "-w 5 -t nat -D PREROUTING -p tcp --dport 443 -j DNAT --to-destination 10.100.5.2:8080"
+        );
+    }
+
+    #[test]
+    fn output_dnat_is_loopback_only() {
+        let rule = dnat_rule("-A", Chain::Output, "udp", 53, "10.100.5.2:5353").join(" ");
+        assert_eq!(
+            rule,
+            "-w 5 -t nat -A OUTPUT -o lo -p udp --dport 53 -j DNAT --to-destination 10.100.5.2:5353"
+        );
     }
 }
