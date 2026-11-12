@@ -8,12 +8,12 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-bincode.workspace = true
 openraft.workspace = true
 redb.workspace = true
 rustls.workspace = true
 rustls-pemfile.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-rustls.workspace = true
@@ -21,6 +21,5 @@ tracing.workspace = true
 
 [dev-dependencies]
 rcgen = "0.13"
-serde_json.workspace = true
 tempfile = "3"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

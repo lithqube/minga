@@ -28,6 +28,12 @@ flowchart LR
 | Task status, logs, agent results | JetStream | `minga logs` reads the retained backlog. |
 | Readiness | In-process | `/readyz`: a Raft leader is known, and on nodes the bus answers. |
 
+## Persisted format
+
+Raft log entries, state-machine rows and Raft messages are JSON (`crates/minga-state/src/codec.rs`), and each redb file stores a one-byte `format_version` (currently 2). A new field marked `#[serde(default)]` needs nothing else, so state survives that upgrade. Renaming, removing or re-typing a field, or changing what a value means, needs a version bump and a migration step. Frozen fixtures in `crates/minga-state/tests/fixtures/` fail the build when a persisted type changes shape, and a node refuses to open data it cannot read, saying why (data written by 1.0.2 or older: clear `--data-dir`).
+
+The wire frame carries the format version but no schema revision, so nodes of one cluster must still run the same version: a node that does not know a new field drops it from the messages it relays. Upgrade every node together.
+
 ## The deploy path
 
 `minga deploy` translates Compose to state types, re-encodes them as Docker `ServiceSpec`s and posts them to `minga api`, which translates them back. Two translators (`minga-scheduler/src/translate.rs` and `minga-api/src/translate.rs`) must agree. Fields with no Docker equivalent ride in labels; for example, the agent spec travels as `minga.agent`. `deploy_e2e::deploy_keeps_restart_policy_and_agent_spec` guards the round trip.

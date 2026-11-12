@@ -15,10 +15,11 @@ use openraft::{
     AnyError, BasicNode, Entry, ErrorSubject, ErrorVerb, LogId, OptionalSend, StorageError,
     StorageIOError, StoredMembership,
 };
-use redb::{Database, ReadableTable, TableDefinition};
+use redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition};
 use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
 
+use crate::codec::{check_format, FORMAT_KEY, FORMAT_VERSION};
 use crate::command::{StateCommand, StateResponse};
 use crate::types::*;
 use crate::TypeConfig;
@@ -80,11 +81,26 @@ impl RedbStateMachine {
     /// Opens or creates a state machine at the given path.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StorageIOError<u64>> {
         let db = Database::create(path).map_err(sm_io_err)?;
+        // Ensure tables exist, and that the file was written in the format this
+        // build reads. On an error the transaction is dropped and nothing changes.
         let tx = db.begin_write().map_err(sm_io_err)?;
+        let mut empty = true;
         for table in ENTITY_TABLES {
-            tx.open_table(table).map_err(sm_io_err)?;
+            let table = tx.open_table(table).map_err(sm_io_err)?;
+            empty &= table.is_empty().map_err(sm_io_err)?;
         }
-        tx.open_table(SM_META_TABLE).map_err(sm_io_err)?;
+        {
+            let mut meta = tx.open_table(SM_META_TABLE).map_err(sm_io_err)?;
+            let stored = meta
+                .get(FORMAT_KEY)
+                .map_err(sm_io_err)?
+                .map(|v| v.value().to_vec());
+            empty &= meta.is_empty().map_err(sm_io_err)?;
+            if check_format(stored.as_deref(), empty).map_err(sm_io_err)? {
+                meta.insert(FORMAT_KEY, [FORMAT_VERSION].as_slice())
+                    .map_err(sm_io_err)?;
+            }
+        }
         tx.commit().map_err(sm_io_err)?;
 
         let mut sm = Self {
@@ -103,15 +119,13 @@ impl RedbStateMachine {
         let meta = tx.open_table(SM_META_TABLE).map_err(sm_io_err)?;
 
         if let Some(v) = meta.get("last_applied").map_err(sm_io_err)? {
-            let (log_id, _): (LogId<u64>, usize) =
-                bincode::serde::decode_from_slice(v.value(), bincode::config::standard())
-                    .map_err(|e| sm_io_err_any(ErrorSubject::Store, ErrorVerb::Read, e))?;
+            let log_id: LogId<u64> = crate::codec::decode(v.value())
+                .map_err(|e| sm_io_err_any(ErrorSubject::Store, ErrorVerb::Read, e))?;
             self.last_applied = Some(log_id);
         }
         if let Some(v) = meta.get("last_membership").map_err(sm_io_err)? {
-            let (membership, _): (StoredMembership<u64, BasicNode>, usize) =
-                bincode::serde::decode_from_slice(v.value(), bincode::config::standard())
-                    .map_err(|e| sm_io_err_any(ErrorSubject::Store, ErrorVerb::Read, e))?;
+            let membership: StoredMembership<u64, BasicNode> = crate::codec::decode(v.value())
+                .map_err(|e| sm_io_err_any(ErrorSubject::Store, ErrorVerb::Read, e))?;
             self.last_membership = membership;
         }
         Ok(())
@@ -126,7 +140,7 @@ impl RedbStateMachine {
         let mut meta = tx.open_table(SM_META_TABLE).map_err(sm_io_err)?;
         match last_applied {
             Some(log_id) => {
-                let bytes = bincode::serde::encode_to_vec(log_id, bincode::config::standard())
+                let bytes = crate::codec::encode(&log_id)
                     .map_err(|e| sm_storage_err(ErrorSubject::Store, ErrorVerb::Write, e))?;
                 meta.insert("last_applied", bytes.as_slice())
                     .map_err(sm_io_err)?;
@@ -135,7 +149,7 @@ impl RedbStateMachine {
                 meta.remove("last_applied").map_err(sm_io_err)?;
             }
         }
-        let bytes = bincode::serde::encode_to_vec(last_membership, bincode::config::standard())
+        let bytes = crate::codec::encode(last_membership)
             .map_err(|e| sm_storage_err(ErrorSubject::Store, ErrorVerb::Write, e))?;
         meta.insert("last_membership", bytes.as_slice())
             .map_err(sm_io_err)?;
@@ -150,7 +164,7 @@ impl RedbStateMachine {
         match cmd {
             StateCommand::UpsertNode(node) => {
                 let mut t = tx.open_table(NODES_TABLE).map_err(sm_io_err)?;
-                let bytes = bincode::serde::encode_to_vec(node, bincode::config::standard())
+                let bytes = crate::codec::encode(node)
                     .map_err(|e| sm_storage_err(ErrorSubject::Store, ErrorVerb::Write, e))?;
                 t.insert(node.id.to_string().as_str(), bytes.as_slice())
                     .map_err(sm_io_err)?;
@@ -167,10 +181,7 @@ impl RedbStateMachine {
                 let existing: Option<ClusterNode> = t
                     .get(key.as_str())
                     .map_err(sm_io_err)?
-                    .map(|v| {
-                        bincode::serde::decode_from_slice(v.value(), bincode::config::standard())
-                            .map(|(n, _)| n)
-                    })
+                    .map(|v| crate::codec::decode::<ClusterNode>(v.value()))
                     .transpose()
                     .map_err(|e| sm_storage_err(ErrorSubject::Store, ErrorVerb::Read, e))?;
                 let Some(mut record) = existing else {
@@ -180,7 +191,7 @@ impl RedbStateMachine {
                 if record.status != NodeStatus::Draining {
                     record.status = NodeStatus::Active;
                 }
-                let bytes = bincode::serde::encode_to_vec(&record, bincode::config::standard())
+                let bytes = crate::codec::encode(&record)
                     .map_err(|e| sm_storage_err(ErrorSubject::Store, ErrorVerb::Write, e))?;
                 t.insert(key.as_str(), bytes.as_slice())
                     .map_err(sm_io_err)?;
@@ -188,7 +199,7 @@ impl RedbStateMachine {
             }
             StateCommand::UpsertService(svc) => {
                 let mut t = tx.open_table(SERVICES_TABLE).map_err(sm_io_err)?;
-                let bytes = bincode::serde::encode_to_vec(svc, bincode::config::standard())
+                let bytes = crate::codec::encode(svc)
                     .map_err(|e| sm_storage_err(ErrorSubject::Store, ErrorVerb::Write, e))?;
                 t.insert(svc.id.as_str(), bytes.as_slice())
                     .map_err(sm_io_err)?;
@@ -201,7 +212,7 @@ impl RedbStateMachine {
             }
             StateCommand::UpsertTask(task) => {
                 let mut t = tx.open_table(TASKS_TABLE).map_err(sm_io_err)?;
-                let bytes = bincode::serde::encode_to_vec(task, bincode::config::standard())
+                let bytes = crate::codec::encode(task)
                     .map_err(|e| sm_storage_err(ErrorSubject::Store, ErrorVerb::Write, e))?;
                 t.insert(task.id.as_str(), bytes.as_slice())
                     .map_err(sm_io_err)?;
@@ -214,7 +225,7 @@ impl RedbStateMachine {
             }
             StateCommand::UpsertNetwork(net) => {
                 let mut t = tx.open_table(NETWORKS_TABLE).map_err(sm_io_err)?;
-                let bytes = bincode::serde::encode_to_vec(net, bincode::config::standard())
+                let bytes = crate::codec::encode(net)
                     .map_err(|e| sm_storage_err(ErrorSubject::Store, ErrorVerb::Write, e))?;
                 t.insert(net.id.as_str(), bytes.as_slice())
                     .map_err(sm_io_err)?;
@@ -227,7 +238,7 @@ impl RedbStateMachine {
             }
             StateCommand::UpsertVolume(vol) => {
                 let mut t = tx.open_table(VOLUMES_TABLE).map_err(sm_io_err)?;
-                let bytes = bincode::serde::encode_to_vec(vol, bincode::config::standard())
+                let bytes = crate::codec::encode(vol)
                     .map_err(|e| sm_storage_err(ErrorSubject::Store, ErrorVerb::Write, e))?;
                 t.insert(vol.id.as_str(), bytes.as_slice())
                     .map_err(sm_io_err)?;
@@ -240,7 +251,7 @@ impl RedbStateMachine {
             }
             StateCommand::UpsertSecret(s) => {
                 let mut t = tx.open_table(SECRETS_TABLE).map_err(sm_io_err)?;
-                let bytes = bincode::serde::encode_to_vec(s, bincode::config::standard())
+                let bytes = crate::codec::encode(s)
                     .map_err(|e| sm_storage_err(ErrorSubject::Store, ErrorVerb::Write, e))?;
                 t.insert(s.id.as_str(), bytes.as_slice())
                     .map_err(sm_io_err)?;
@@ -253,7 +264,7 @@ impl RedbStateMachine {
             }
             StateCommand::UpsertConfig(c) => {
                 let mut t = tx.open_table(CONFIGS_TABLE).map_err(sm_io_err)?;
-                let bytes = bincode::serde::encode_to_vec(c, bincode::config::standard())
+                let bytes = crate::codec::encode(c)
                     .map_err(|e| sm_storage_err(ErrorSubject::Store, ErrorVerb::Write, e))?;
                 t.insert(c.id.as_str(), bytes.as_slice())
                     .map_err(sm_io_err)?;
@@ -279,9 +290,8 @@ impl RedbStateMachine {
         let t = tx.open_table(NODES_TABLE).map_err(|e| e.to_string())?;
         match t.get(id.to_string().as_str()).map_err(|e| e.to_string())? {
             Some(v) => {
-                let (node, _): (ClusterNode, usize) =
-                    bincode::serde::decode_from_slice(v.value(), bincode::config::standard())
-                        .map_err(|e| e.to_string())?;
+                let node: ClusterNode =
+                    crate::codec::decode(v.value()).map_err(|e| e.to_string())?;
                 Ok(Some(node))
             }
             None => Ok(None),
@@ -295,9 +305,7 @@ impl RedbStateMachine {
         let mut nodes = Vec::new();
         for r in t.iter().map_err(|e| e.to_string())? {
             let (_k, v) = r.map_err(|e| e.to_string())?;
-            let (node, _): (ClusterNode, usize) =
-                bincode::serde::decode_from_slice(v.value(), bincode::config::standard())
-                    .map_err(|e| e.to_string())?;
+            let node: ClusterNode = crate::codec::decode(v.value()).map_err(|e| e.to_string())?;
             nodes.push(node);
         }
         Ok(nodes)
@@ -309,9 +317,7 @@ impl RedbStateMachine {
         let t = tx.open_table(SERVICES_TABLE).map_err(|e| e.to_string())?;
         match t.get(id).map_err(|e| e.to_string())? {
             Some(v) => {
-                let (svc, _): (Service, usize) =
-                    bincode::serde::decode_from_slice(v.value(), bincode::config::standard())
-                        .map_err(|e| e.to_string())?;
+                let svc: Service = crate::codec::decode(v.value()).map_err(|e| e.to_string())?;
                 Ok(Some(svc))
             }
             None => Ok(None),
@@ -325,9 +331,7 @@ impl RedbStateMachine {
         let mut services = Vec::new();
         for r in t.iter().map_err(|e| e.to_string())? {
             let (_k, v) = r.map_err(|e| e.to_string())?;
-            let (svc, _): (Service, usize) =
-                bincode::serde::decode_from_slice(v.value(), bincode::config::standard())
-                    .map_err(|e| e.to_string())?;
+            let svc: Service = crate::codec::decode(v.value()).map_err(|e| e.to_string())?;
             services.push(svc);
         }
         Ok(services)
@@ -339,9 +343,7 @@ impl RedbStateMachine {
         let t = tx.open_table(TASKS_TABLE).map_err(|e| e.to_string())?;
         match t.get(id).map_err(|e| e.to_string())? {
             Some(v) => {
-                let (task, _): (Task, usize) =
-                    bincode::serde::decode_from_slice(v.value(), bincode::config::standard())
-                        .map_err(|e| e.to_string())?;
+                let task: Task = crate::codec::decode(v.value()).map_err(|e| e.to_string())?;
                 Ok(Some(task))
             }
             None => Ok(None),
@@ -355,9 +357,7 @@ impl RedbStateMachine {
         let mut tasks = Vec::new();
         for r in t.iter().map_err(|e| e.to_string())? {
             let (_k, v) = r.map_err(|e| e.to_string())?;
-            let (task, _): (Task, usize) =
-                bincode::serde::decode_from_slice(v.value(), bincode::config::standard())
-                    .map_err(|e| e.to_string())?;
+            let task: Task = crate::codec::decode(v.value()).map_err(|e| e.to_string())?;
             tasks.push(task);
         }
         Ok(tasks)
@@ -369,9 +369,7 @@ impl RedbStateMachine {
         let t = tx.open_table(NETWORKS_TABLE).map_err(|e| e.to_string())?;
         match t.get(id).map_err(|e| e.to_string())? {
             Some(v) => {
-                let (net, _): (Network, usize) =
-                    bincode::serde::decode_from_slice(v.value(), bincode::config::standard())
-                        .map_err(|e| e.to_string())?;
+                let net: Network = crate::codec::decode(v.value()).map_err(|e| e.to_string())?;
                 Ok(Some(net))
             }
             None => Ok(None),
@@ -385,9 +383,7 @@ impl RedbStateMachine {
         let mut networks = Vec::new();
         for r in t.iter().map_err(|e| e.to_string())? {
             let (_k, v) = r.map_err(|e| e.to_string())?;
-            let (net, _): (Network, usize) =
-                bincode::serde::decode_from_slice(v.value(), bincode::config::standard())
-                    .map_err(|e| e.to_string())?;
+            let net: Network = crate::codec::decode(v.value()).map_err(|e| e.to_string())?;
             networks.push(net);
         }
         Ok(networks)
@@ -399,9 +395,7 @@ impl RedbStateMachine {
         let t = tx.open_table(VOLUMES_TABLE).map_err(|e| e.to_string())?;
         match t.get(id).map_err(|e| e.to_string())? {
             Some(v) => {
-                let (vol, _): (Volume, usize) =
-                    bincode::serde::decode_from_slice(v.value(), bincode::config::standard())
-                        .map_err(|e| e.to_string())?;
+                let vol: Volume = crate::codec::decode(v.value()).map_err(|e| e.to_string())?;
                 Ok(Some(vol))
             }
             None => Ok(None),
@@ -415,9 +409,7 @@ impl RedbStateMachine {
         let mut volumes = Vec::new();
         for r in t.iter().map_err(|e| e.to_string())? {
             let (_k, v) = r.map_err(|e| e.to_string())?;
-            let (vol, _): (Volume, usize) =
-                bincode::serde::decode_from_slice(v.value(), bincode::config::standard())
-                    .map_err(|e| e.to_string())?;
+            let vol: Volume = crate::codec::decode(v.value()).map_err(|e| e.to_string())?;
             volumes.push(vol);
         }
         Ok(volumes)
@@ -429,9 +421,7 @@ impl RedbStateMachine {
         let t = tx.open_table(SECRETS_TABLE).map_err(|e| e.to_string())?;
         match t.get(id).map_err(|e| e.to_string())? {
             Some(v) => {
-                let (s, _): (Secret, usize) =
-                    bincode::serde::decode_from_slice(v.value(), bincode::config::standard())
-                        .map_err(|e| e.to_string())?;
+                let s: Secret = crate::codec::decode(v.value()).map_err(|e| e.to_string())?;
                 Ok(Some(s))
             }
             None => Ok(None),
@@ -445,9 +435,7 @@ impl RedbStateMachine {
         let mut secrets = Vec::new();
         for r in t.iter().map_err(|e| e.to_string())? {
             let (_k, v) = r.map_err(|e| e.to_string())?;
-            let (s, _): (Secret, usize) =
-                bincode::serde::decode_from_slice(v.value(), bincode::config::standard())
-                    .map_err(|e| e.to_string())?;
+            let s: Secret = crate::codec::decode(v.value()).map_err(|e| e.to_string())?;
             secrets.push(s);
         }
         Ok(secrets)
@@ -459,9 +447,7 @@ impl RedbStateMachine {
         let t = tx.open_table(CONFIGS_TABLE).map_err(|e| e.to_string())?;
         match t.get(id).map_err(|e| e.to_string())? {
             Some(v) => {
-                let (c, _): (Config, usize) =
-                    bincode::serde::decode_from_slice(v.value(), bincode::config::standard())
-                        .map_err(|e| e.to_string())?;
+                let c: Config = crate::codec::decode(v.value()).map_err(|e| e.to_string())?;
                 Ok(Some(c))
             }
             None => Ok(None),
@@ -475,9 +461,7 @@ impl RedbStateMachine {
         let mut configs = Vec::new();
         for r in t.iter().map_err(|e| e.to_string())? {
             let (_k, v) = r.map_err(|e| e.to_string())?;
-            let (c, _): (Config, usize) =
-                bincode::serde::decode_from_slice(v.value(), bincode::config::standard())
-                    .map_err(|e| e.to_string())?;
+            let c: Config = crate::codec::decode(v.value()).map_err(|e| e.to_string())?;
             configs.push(c);
         }
         Ok(configs)
@@ -552,9 +536,8 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
         snapshot: Box<Cursor<Vec<u8>>>,
     ) -> Result<(), StorageError<u64>> {
         let bytes = snapshot.into_inner();
-        let (snap, _): (StateSnapshot, usize) =
-            bincode::serde::decode_from_slice(&bytes, bincode::config::standard())
-                .map_err(|e| sm_storage_err(ErrorSubject::Store, ErrorVerb::Read, e))?;
+        let snap: StateSnapshot = crate::codec::decode(&bytes)
+            .map_err(|e| sm_storage_err(ErrorSubject::Store, ErrorVerb::Read, e))?;
 
         let db = self.db.lock().unwrap();
         let tx = db.begin_write().map_err(sm_io_err)?;
@@ -577,7 +560,7 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
         {
             let mut t = tx.open_table(NODES_TABLE).map_err(sm_io_err)?;
             for node in &snap.nodes {
-                let bytes = bincode::serde::encode_to_vec(node, bincode::config::standard())
+                let bytes = crate::codec::encode(node)
                     .map_err(|e| sm_storage_err(ErrorSubject::Store, ErrorVerb::Write, e))?;
                 t.insert(node.id.to_string().as_str(), bytes.as_slice())
                     .map_err(sm_io_err)?;
@@ -586,7 +569,7 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
         {
             let mut t = tx.open_table(SERVICES_TABLE).map_err(sm_io_err)?;
             for svc in &snap.services {
-                let bytes = bincode::serde::encode_to_vec(svc, bincode::config::standard())
+                let bytes = crate::codec::encode(svc)
                     .map_err(|e| sm_storage_err(ErrorSubject::Store, ErrorVerb::Write, e))?;
                 t.insert(svc.id.as_str(), bytes.as_slice())
                     .map_err(sm_io_err)?;
@@ -595,7 +578,7 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
         {
             let mut t = tx.open_table(TASKS_TABLE).map_err(sm_io_err)?;
             for task in &snap.tasks {
-                let bytes = bincode::serde::encode_to_vec(task, bincode::config::standard())
+                let bytes = crate::codec::encode(task)
                     .map_err(|e| sm_storage_err(ErrorSubject::Store, ErrorVerb::Write, e))?;
                 t.insert(task.id.as_str(), bytes.as_slice())
                     .map_err(sm_io_err)?;
@@ -604,7 +587,7 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
         {
             let mut t = tx.open_table(NETWORKS_TABLE).map_err(sm_io_err)?;
             for net in &snap.networks {
-                let bytes = bincode::serde::encode_to_vec(net, bincode::config::standard())
+                let bytes = crate::codec::encode(net)
                     .map_err(|e| sm_storage_err(ErrorSubject::Store, ErrorVerb::Write, e))?;
                 t.insert(net.id.as_str(), bytes.as_slice())
                     .map_err(sm_io_err)?;
@@ -613,7 +596,7 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
         {
             let mut t = tx.open_table(VOLUMES_TABLE).map_err(sm_io_err)?;
             for vol in &snap.volumes {
-                let bytes = bincode::serde::encode_to_vec(vol, bincode::config::standard())
+                let bytes = crate::codec::encode(vol)
                     .map_err(|e| sm_storage_err(ErrorSubject::Store, ErrorVerb::Write, e))?;
                 t.insert(vol.id.as_str(), bytes.as_slice())
                     .map_err(sm_io_err)?;
@@ -622,7 +605,7 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
         {
             let mut t = tx.open_table(SECRETS_TABLE).map_err(sm_io_err)?;
             for s in &snap.secrets {
-                let bytes = bincode::serde::encode_to_vec(s, bincode::config::standard())
+                let bytes = crate::codec::encode(s)
                     .map_err(|e| sm_storage_err(ErrorSubject::Store, ErrorVerb::Write, e))?;
                 t.insert(s.id.as_str(), bytes.as_slice())
                     .map_err(sm_io_err)?;
@@ -631,7 +614,7 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
         {
             let mut t = tx.open_table(CONFIGS_TABLE).map_err(sm_io_err)?;
             for c in &snap.configs {
-                let bytes = bincode::serde::encode_to_vec(c, bincode::config::standard())
+                let bytes = crate::codec::encode(c)
                     .map_err(|e| sm_storage_err(ErrorSubject::Store, ErrorVerb::Write, e))?;
                 t.insert(c.id.as_str(), bytes.as_slice())
                     .map_err(sm_io_err)?;
@@ -687,9 +670,8 @@ impl RaftSnapshotBuilder<TypeConfig> for RedbSnapshotBuilder {
             let t = tx.open_table(NODES_TABLE).map_err(sm_io_err)?;
             for r in t.iter().map_err(sm_io_err)? {
                 let (_k, v) = r.map_err(sm_io_err)?;
-                let (node, _): (ClusterNode, usize) =
-                    bincode::serde::decode_from_slice(v.value(), bincode::config::standard())
-                        .map_err(|e| sm_storage_err(ErrorSubject::Store, ErrorVerb::Read, e))?;
+                let node: ClusterNode = crate::codec::decode(v.value())
+                    .map_err(|e| sm_storage_err(ErrorSubject::Store, ErrorVerb::Read, e))?;
                 snap.nodes.push(node);
             }
         }
@@ -697,9 +679,8 @@ impl RaftSnapshotBuilder<TypeConfig> for RedbSnapshotBuilder {
             let t = tx.open_table(SERVICES_TABLE).map_err(sm_io_err)?;
             for r in t.iter().map_err(sm_io_err)? {
                 let (_k, v) = r.map_err(sm_io_err)?;
-                let (svc, _): (Service, usize) =
-                    bincode::serde::decode_from_slice(v.value(), bincode::config::standard())
-                        .map_err(|e| sm_storage_err(ErrorSubject::Store, ErrorVerb::Read, e))?;
+                let svc: Service = crate::codec::decode(v.value())
+                    .map_err(|e| sm_storage_err(ErrorSubject::Store, ErrorVerb::Read, e))?;
                 snap.services.push(svc);
             }
         }
@@ -707,9 +688,8 @@ impl RaftSnapshotBuilder<TypeConfig> for RedbSnapshotBuilder {
             let t = tx.open_table(TASKS_TABLE).map_err(sm_io_err)?;
             for r in t.iter().map_err(sm_io_err)? {
                 let (_k, v) = r.map_err(sm_io_err)?;
-                let (task, _): (Task, usize) =
-                    bincode::serde::decode_from_slice(v.value(), bincode::config::standard())
-                        .map_err(|e| sm_storage_err(ErrorSubject::Store, ErrorVerb::Read, e))?;
+                let task: Task = crate::codec::decode(v.value())
+                    .map_err(|e| sm_storage_err(ErrorSubject::Store, ErrorVerb::Read, e))?;
                 snap.tasks.push(task);
             }
         }
@@ -717,9 +697,8 @@ impl RaftSnapshotBuilder<TypeConfig> for RedbSnapshotBuilder {
             let t = tx.open_table(NETWORKS_TABLE).map_err(sm_io_err)?;
             for r in t.iter().map_err(sm_io_err)? {
                 let (_k, v) = r.map_err(sm_io_err)?;
-                let (net, _): (Network, usize) =
-                    bincode::serde::decode_from_slice(v.value(), bincode::config::standard())
-                        .map_err(|e| sm_storage_err(ErrorSubject::Store, ErrorVerb::Read, e))?;
+                let net: Network = crate::codec::decode(v.value())
+                    .map_err(|e| sm_storage_err(ErrorSubject::Store, ErrorVerb::Read, e))?;
                 snap.networks.push(net);
             }
         }
@@ -727,9 +706,8 @@ impl RaftSnapshotBuilder<TypeConfig> for RedbSnapshotBuilder {
             let t = tx.open_table(VOLUMES_TABLE).map_err(sm_io_err)?;
             for r in t.iter().map_err(sm_io_err)? {
                 let (_k, v) = r.map_err(sm_io_err)?;
-                let (vol, _): (Volume, usize) =
-                    bincode::serde::decode_from_slice(v.value(), bincode::config::standard())
-                        .map_err(|e| sm_storage_err(ErrorSubject::Store, ErrorVerb::Read, e))?;
+                let vol: Volume = crate::codec::decode(v.value())
+                    .map_err(|e| sm_storage_err(ErrorSubject::Store, ErrorVerb::Read, e))?;
                 snap.volumes.push(vol);
             }
         }
@@ -737,9 +715,8 @@ impl RaftSnapshotBuilder<TypeConfig> for RedbSnapshotBuilder {
             let t = tx.open_table(SECRETS_TABLE).map_err(sm_io_err)?;
             for r in t.iter().map_err(sm_io_err)? {
                 let (_k, v) = r.map_err(sm_io_err)?;
-                let (s, _): (Secret, usize) =
-                    bincode::serde::decode_from_slice(v.value(), bincode::config::standard())
-                        .map_err(|e| sm_storage_err(ErrorSubject::Store, ErrorVerb::Read, e))?;
+                let s: Secret = crate::codec::decode(v.value())
+                    .map_err(|e| sm_storage_err(ErrorSubject::Store, ErrorVerb::Read, e))?;
                 snap.secrets.push(s);
             }
         }
@@ -747,9 +724,8 @@ impl RaftSnapshotBuilder<TypeConfig> for RedbSnapshotBuilder {
             let t = tx.open_table(CONFIGS_TABLE).map_err(sm_io_err)?;
             for r in t.iter().map_err(sm_io_err)? {
                 let (_k, v) = r.map_err(sm_io_err)?;
-                let (c, _): (Config, usize) =
-                    bincode::serde::decode_from_slice(v.value(), bincode::config::standard())
-                        .map_err(|e| sm_storage_err(ErrorSubject::Store, ErrorVerb::Read, e))?;
+                let c: Config = crate::codec::decode(v.value())
+                    .map_err(|e| sm_storage_err(ErrorSubject::Store, ErrorVerb::Read, e))?;
                 snap.configs.push(c);
             }
         }
@@ -757,20 +733,18 @@ impl RaftSnapshotBuilder<TypeConfig> for RedbSnapshotBuilder {
         {
             let meta = tx.open_table(SM_META_TABLE).map_err(sm_io_err)?;
             if let Some(v) = meta.get("last_applied").map_err(sm_io_err)? {
-                let (log_id, _): (LogId<u64>, usize) =
-                    bincode::serde::decode_from_slice(v.value(), bincode::config::standard())
-                        .map_err(|e| sm_storage_err(ErrorSubject::Store, ErrorVerb::Read, e))?;
+                let log_id: LogId<u64> = crate::codec::decode(v.value())
+                    .map_err(|e| sm_storage_err(ErrorSubject::Store, ErrorVerb::Read, e))?;
                 snap.last_applied = Some(log_id);
             }
             if let Some(v) = meta.get("last_membership").map_err(sm_io_err)? {
-                let (m, _): (StoredMembership<u64, BasicNode>, usize) =
-                    bincode::serde::decode_from_slice(v.value(), bincode::config::standard())
-                        .map_err(|e| sm_storage_err(ErrorSubject::Store, ErrorVerb::Read, e))?;
+                let m: StoredMembership<u64, BasicNode> = crate::codec::decode(v.value())
+                    .map_err(|e| sm_storage_err(ErrorSubject::Store, ErrorVerb::Read, e))?;
                 snap.last_membership = m;
             }
         }
 
-        let bytes = bincode::serde::encode_to_vec(&snap, bincode::config::standard())
+        let bytes = crate::codec::encode(&snap)
             .map_err(|e| sm_storage_err(ErrorSubject::Store, ErrorVerb::Write, e))?;
 
         let last_index = snap.last_applied.map(|l| l.index).unwrap_or(0);

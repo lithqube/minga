@@ -516,16 +516,15 @@ mod tests {
     }
 
     #[test]
-    fn workload_kind_bincode_roundtrip_container() {
+    fn workload_kind_roundtrip_container() {
         let kind = WorkloadKind::Container;
-        let bytes = bincode::serde::encode_to_vec(&kind, bincode::config::standard()).unwrap();
-        let (back, _): (WorkloadKind, _) =
-            bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
+        let bytes = crate::codec::encode(&kind).unwrap();
+        let back: WorkloadKind = crate::codec::decode(&bytes).unwrap();
         assert_eq!(back, kind);
     }
 
     #[test]
-    fn workload_kind_bincode_roundtrip_agent() {
+    fn workload_kind_roundtrip_agent() {
         let kind = WorkloadKind::Agent(AgentSpec {
             module_ref: "./agent.wasm".to_string(),
             fuel_limit: Some(1_000_000),
@@ -536,14 +535,13 @@ mod tests {
             prompt: Some("hello".to_string()),
             sandbox_env: HashMap::from([("MODEL".to_string(), "gpt-4o".to_string())]),
         });
-        let bytes = bincode::serde::encode_to_vec(&kind, bincode::config::standard()).unwrap();
-        let (back, _): (WorkloadKind, _) =
-            bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
+        let bytes = crate::codec::encode(&kind).unwrap();
+        let back: WorkloadKind = crate::codec::decode(&bytes).unwrap();
         assert_eq!(back, kind);
     }
 
     #[test]
-    fn taskspec_bincode_roundtrip_with_agent_kind() {
+    fn taskspec_roundtrip_with_agent_kind() {
         let spec = TaskSpec {
             image: String::new(),
             env: HashMap::new(),
@@ -555,14 +553,13 @@ mod tests {
             }),
             ..Default::default()
         };
-        let bytes = bincode::serde::encode_to_vec(&spec, bincode::config::standard()).unwrap();
-        let (back, _): (TaskSpec, _) =
-            bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
+        let bytes = crate::codec::encode(&spec).unwrap();
+        let back: TaskSpec = crate::codec::decode(&bytes).unwrap();
         assert_eq!(back, spec);
     }
 
     #[test]
-    fn service_bincode_roundtrip_with_agent() {
+    fn service_roundtrip_with_agent() {
         let svc = Service {
             id: "stack.agent".to_string(),
             name: "agent".to_string(),
@@ -591,9 +588,8 @@ mod tests {
             previous: None,
             extra_hosts: vec![],
         };
-        let bytes = bincode::serde::encode_to_vec(&svc, bincode::config::standard()).unwrap();
-        let (back, _): (Service, _) =
-            bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
+        let bytes = crate::codec::encode(&svc).unwrap();
+        let back: Service = crate::codec::decode(&bytes).unwrap();
         assert_eq!(back, svc);
     }
 
@@ -604,9 +600,8 @@ mod tests {
             secrets: vec![SecretRef::new("stack_password", "/run/secrets/db_password")],
             ..Default::default()
         };
-        let bytes = bincode::serde::encode_to_vec(&spec, bincode::config::standard()).unwrap();
-        let (back, _): (TaskSpec, _) =
-            bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
+        let bytes = crate::codec::encode(&spec).unwrap();
+        let back: TaskSpec = crate::codec::decode(&bytes).unwrap();
         assert_eq!(back, spec);
         assert_eq!(back.secrets.len(), 1);
         assert_eq!(back.secrets[0].secret_id, "stack_password");
@@ -630,15 +625,14 @@ mod tests {
     }
 
     #[test]
-    fn restart_policy_bincode_roundtrip() {
+    fn restart_policy_roundtrip() {
         let policy = RestartPolicy {
             condition: RestartCondition::OnFailure,
             delay_secs: 5,
             max_attempts: Some(3),
         };
-        let bytes = bincode::serde::encode_to_vec(&policy, bincode::config::standard()).unwrap();
-        let (back, _): (RestartPolicy, _) =
-            bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
+        let bytes = crate::codec::encode(&policy).unwrap();
+        let back: RestartPolicy = crate::codec::decode(&bytes).unwrap();
         assert_eq!(back, policy);
     }
 
@@ -664,9 +658,8 @@ mod tests {
             },
             ..Default::default()
         };
-        let bytes = bincode::serde::encode_to_vec(&spec, bincode::config::standard()).unwrap();
-        let (back, _): (TaskSpec, _) =
-            bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
+        let bytes = crate::codec::encode(&spec).unwrap();
+        let back: TaskSpec = crate::codec::decode(&bytes).unwrap();
         assert_eq!(back, spec);
     }
 }

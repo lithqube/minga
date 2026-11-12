@@ -1,9 +1,9 @@
-//! Raft network implementation over TCP with bincode serialization.
+//! Raft network implementation over TCP with JSON serialization.
 //!
 //! Each Raft node listens on a TCP port for incoming RPCs (AppendEntries,
 //! Vote, InstallSnapshot). The [`TcpNetworkFactory`] creates clients that
 //! connect to peer nodes and send RPCs. Messages are length-prefixed
-//! (4-byte big-endian) bincode-encoded enums.
+//! (4-byte big-endian) enums encoded by [`crate::codec`].
 //!
 //! For single-node clusters, [`StubNetworkFactory`] is still available —
 //! it never sends RPCs because a single-node Raft never calls the network.
@@ -11,8 +11,8 @@
 //! # Wire protocol
 //!
 //! ```text
-//! Request:  [4-byte BE length][bincode(RaftRequest)]
-//! Response: [4-byte BE length][bincode(RaftReply)]
+//! Request:  [4-byte BE length][format version byte][JSON(RaftRequest)]
+//! Response: [4-byte BE length][format version byte][JSON(RaftReply)]
 //! ```
 
 use openraft::error::{InstallSnapshotError, NetworkError, RPCError, RaftError, Unreachable};
@@ -245,7 +245,7 @@ impl std::fmt::Debug for TcpNetwork {
 impl TcpNetwork {
     /// Sends a request and reads the reply over a fresh TCP connection.
     async fn send(&self, request: RaftRequest) -> Result<RaftReply, TransportError> {
-        let encoded = bincode::serde::encode_to_vec(&request, bincode::config::standard())
+        let encoded = crate::codec::encode_wire(&request)
             .map_err(|e| TransportError::Encode(e.to_string()))?;
 
         tracing::trace!(target = self.target, addr = %self.addr, "raft rpc send");
@@ -276,9 +276,8 @@ impl TcpNetwork {
         let mut buf = vec![0u8; len as usize];
         stream.read_exact(&mut buf).await?;
 
-        let (reply, _): (RaftReply, usize) =
-            bincode::serde::decode_from_slice(&buf, bincode::config::standard())
-                .map_err(|e| TransportError::Decode(e.to_string()))?;
+        let reply: RaftReply =
+            crate::codec::decode_wire(&buf).map_err(|e| TransportError::Decode(e.to_string()))?;
 
         Ok(reply)
     }
@@ -437,9 +436,8 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
     let mut buf = vec![0u8; len as usize];
     stream.read_exact(&mut buf).await?;
 
-    let (request, _): (RaftRequest, usize) =
-        bincode::serde::decode_from_slice(&buf, bincode::config::standard())
-            .map_err(|e| TransportError::Decode(e.to_string()))?;
+    let request: RaftRequest =
+        crate::codec::decode_wire(&buf).map_err(|e| TransportError::Decode(e.to_string()))?;
 
     // Dispatch to Raft.
     let reply = match request {
@@ -462,8 +460,8 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
     };
 
     // Write length-prefixed response.
-    let encoded = bincode::serde::encode_to_vec(&reply, bincode::config::standard())
-        .map_err(|e| TransportError::Encode(e.to_string()))?;
+    let encoded =
+        crate::codec::encode_wire(&reply).map_err(|e| TransportError::Encode(e.to_string()))?;
     stream.write_u32(encoded.len() as u32).await?;
     stream.write_all(&encoded).await?;
     stream.flush().await?;

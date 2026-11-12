@@ -935,11 +935,8 @@ impl Supervisor {
         match cmd {
             Command::Assign { task_id, payload } => {
                 // Deserialize the task spec.
-                let spec: TaskSpec = match bincode::serde::decode_from_slice(
-                    &payload,
-                    bincode::config::standard(),
-                ) {
-                    Ok((spec, _)) => spec,
+                let spec: TaskSpec = match minga_state::codec::decode_wire(&payload) {
+                    Ok(spec) => spec,
                     Err(e) => {
                         tracing::error!(
                             task = %task_id,
@@ -1483,7 +1480,7 @@ mod tests {
     }
 
     fn spec_to_payload(spec: &TaskSpec) -> Vec<u8> {
-        bincode::serde::encode_to_vec(spec, bincode::config::standard()).unwrap()
+        minga_state::codec::encode_wire(spec).unwrap()
     }
 
     async fn setup(node_id: u64) -> (Supervisor, Arc<MockRuntime>, Arc<StateStore>) {

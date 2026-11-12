@@ -1,0 +1,7 @@
+{
+  "committed": false,
+  "leader_id": {
+    "node_id": 1,
+    "term": 3
+  }
+}
