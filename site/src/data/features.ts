@@ -89,7 +89,7 @@ export const features: Feature[] = [
   {
     title: 'Rust on the hot path',
     body: 'Per-packet, per-request and per-sandbox work stays in Rust. Go runs only as a separate process, never through FFI.',
-    caveat: 'No published benchmarks yet.',
+    caveat: 'Only idle memory has been measured (v1.0.1); no load tests.',
     href: '/adr/0001-language-split/',
     linkLabel: 'ADR 0001: Language split',
     source: 'docs/adr/0001-language-split.md',
