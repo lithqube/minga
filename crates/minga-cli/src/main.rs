@@ -490,7 +490,17 @@ async fn open_store(
             };
             minga_state::StateStore::open_secure(node_id, bind, data_dir, peers, tls).await
         }
-        (None, None, None) => minga_state::StateStore::open(node_id, bind, data_dir, peers).await,
+        (None, None, None) => {
+            if !is_loopback_bind(bind) {
+                tracing::warn!(
+                    bind,
+                    "Raft is listening in plaintext on a non-loopback address: any peer that can \
+                     reach it can write cluster state, API token or not. Set --raft-tls-ca, \
+                     --raft-tls-cert and --raft-tls-key (`minga tls init-ca` / `issue-node`)"
+                );
+            }
+            minga_state::StateStore::open(node_id, bind, data_dir, peers).await
+        }
         _ => {
             return Err(
                 "--raft-tls-ca, --raft-tls-cert and --raft-tls-key must be given together".into(),
@@ -652,6 +662,13 @@ async fn run_api(args: ApiArgs) -> ExitCode {
         }
     };
 
+    if args.api_token.is_none() && !is_loopback_bind(&args.api_bind) {
+        tracing::warn!(
+            api_bind = %args.api_bind,
+            "the Docker API has no token and listens beyond loopback: anyone who can reach it \
+             is cluster admin. Set --api-token or MINGA_API_TOKEN"
+        );
+    }
     let server =
         match minga_api::ApiServer::start_with_auth(state.clone(), &args.api_bind, args.api_token)
             .await
@@ -1879,6 +1896,19 @@ fn project_dir(compose_file: &str) -> Option<std::path::PathBuf> {
     dir.canonicalize().ok()
 }
 
+/// Whether a `host:port` bind address only listens on loopback. Unparsable
+/// addresses count as not loopback, so the caller warns rather than stays quiet.
+fn is_loopback_bind(addr: &str) -> bool {
+    let host = match addr.strip_prefix('[') {
+        Some(rest) => rest.split(']').next().unwrap_or(""),
+        None => addr.rsplit_once(':').map_or(addr, |(h, _)| h),
+    };
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
 /// The port of a `host:port` bind address (`[::1]:7001` included).
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn port_of(addr: &str) -> Option<u16> {
@@ -1887,7 +1917,22 @@ fn port_of(addr: &str) -> Option<u16> {
 
 #[cfg(test)]
 mod tests {
-    use super::{port_of, project_dir};
+    use super::{is_loopback_bind, port_of, project_dir};
+
+    #[test]
+    fn loopback_binds_are_recognised() {
+        for addr in [
+            "127.0.0.1:7001",
+            "127.0.0.2:7001",
+            "[::1]:2375",
+            "localhost:2375",
+        ] {
+            assert!(is_loopback_bind(addr), "{addr}");
+        }
+        for addr in ["0.0.0.0:7001", "10.0.0.1:7001", "[::]:2375", "node1:7001"] {
+            assert!(!is_loopback_bind(addr), "{addr}");
+        }
+    }
 
     #[test]
     fn port_of_reads_the_bind_port() {

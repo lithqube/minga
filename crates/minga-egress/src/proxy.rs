@@ -194,14 +194,12 @@ impl EgressProxy {
         let router = self.router();
         let shutdown = Arc::clone(&self.shutdown);
 
-        tokio::spawn(async move {
-            axum::serve(listener, router)
-                .with_graceful_shutdown(async move {
-                    shutdown.notified().await;
-                })
-                .await
-                .ok();
-        });
+        tokio::spawn(minga_telemetry::serve::serve_bounded(
+            listener,
+            router,
+            minga_telemetry::serve::Limits::default(),
+            async move { shutdown.notified().await },
+        ));
 
         self.addr = Some(bound.clone());
         Ok(bound)
