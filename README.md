@@ -233,7 +233,11 @@ sudo minga manager … --sandbox-runtime wasmtime --module-dir /var/lib/minga/mo
 
 For systemd, [`scripts/minga.service`](scripts/minga.service) runs either role from an environment file.
 
+Every command and flag, the environment variables, and which deploy command to use: [docs/cli.md](docs/cli.md).
+
 ## Deployment topologies
+
+Ports, what every node needs, what stays per node, and how far each layout is verified: [docs/topologies.md](docs/topologies.md).
 
 ```mermaid
 flowchart TB
@@ -328,6 +332,8 @@ Next, in order (rationale in [docs/architecture.md](docs/architecture.md)):
 ## Documentation
 
 - [Architecture notes](docs/architecture.md): how the pieces fit today, known structural limits, and the plan
+- [CLI reference](docs/cli.md): every `minga` and `minga-ctl` command, its flags and environment variables, and which deploy command to use
+- [Supported topologies](docs/topologies.md): single host, from a workstation, air-gapped, Talos, container image and multi-node, with what each needs and how far it is verified
 - [Resource benchmark](docs/benchmark.md): idle memory, CPU and process counts against Docker Compose and Swarm
 - [Release notes: v1.2.0](docs/release-1.2.0.md)
 - [Release notes: v1.1.0](docs/release-1.1.0.md)

@@ -23,8 +23,11 @@ the 1.1.1 bind-mount fix, since 1.1.1 was not tagged.
 
 ## Upgrade notes
 
-No state wipe is needed from 1.1.0 or 1.1.1. Upgrade every node together, as
-before. Check these first:
+**State is compatible with 1.1.0: no wipe or migration.** The persisted format
+is unchanged (format 2), and the frozen fixtures in
+`crates/minga-state/tests/fixtures/` are the same as in 1.1.0, so a 1.1.0 data
+directory opens as is. Upgrade every node together, as before. Check these
+first:
 
 - **Raft TLS key mode.** A key file passed to `--raft-tls-key` that is
   readable by group or others is refused; `chmod 600` it. Keys written by
