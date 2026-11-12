@@ -8,8 +8,8 @@ export interface Faq {
 export const faq: Faq[] = [
   {
     q: 'Is Minga production-ready?',
-    a: 'It is v1.1.1, aimed at single-host production. It is tested on macOS and in Linux CI, including the containerd suites and a real-kernel check of the published-port paths; this build has not yet been run on a real staging node. v1.1.0 adds versioned state that later upgrades keep, backup and restore, a recorded reason for failed tasks (last error and exit code for containers, the start error for agent tasks), image pulls through containerd’s own API with Docker credential helpers, and published ports that only redirect traffic addressed to the node. Cross-node container networking, joining a running cluster and per-operator API roles are not there yet.',
-    sources: ['README.md', 'CHANGELOG.md', 'docs/release-1.1.0.md'],
+    a: 'It is v1.2.0, aimed at single-host production. It is tested on macOS and in Linux CI, including the containerd suites and a real-kernel check of the published-port paths; this build has not yet been run on a real staging node. v1.2.0 fixes the findings of a source security audit: owner-only keys and data, task network isolation, Docker’s masked <code>/proc</code> paths, listener timeouts, and a bus that can only start what Raft assigns. v1.1.0 adds versioned state that later upgrades keep, backup and restore, a recorded reason for failed tasks (last error and exit code for containers, the start error for agent tasks), image pulls through containerd’s own API with Docker credential helpers, and published ports that only redirect traffic addressed to the node. Cross-node container networking, joining a running cluster and per-operator API roles are not there yet.',
+    sources: ['README.md', 'CHANGELOG.md', 'docs/release-1.2.0.md'],
   },
   {
     q: 'Do my Compose files work unchanged?',
@@ -18,8 +18,8 @@ export const faq: Faq[] = [
   },
   {
     q: 'Can I keep using the docker CLI and Traefik?',
-    a: 'Yes, against <code>minga api</code>: <code>docker stack deploy</code>, <code>docker service ls</code>, <code>docker node ls</code> and the Traefik v3 swarm provider. With a token set, the CLI sends it through <code>"HttpHeaders": {"Authorization": "Bearer &lt;token&gt;"}</code> in <code>~/.docker/config.json</code>.',
-    sources: ['README.md', 'docs/talos-deployment.md'],
+    a: 'Yes, against <code>minga api</code>: <code>docker stack deploy</code>, <code>docker service ls</code>, <code>docker node ls</code> and the Traefik v3 swarm provider. With a token set, the CLI sends it through <code>"HttpHeaders": {"Authorization": "Bearer &lt;token&gt;"}</code> in <code>~/.docker/config.json</code>. Without a token, the API only answers requests addressed to an IP or <code>localhost</code>, so point Traefik at the node’s IP or set a token.',
+    sources: ['README.md', 'docs/talos-deployment.md', 'docs/release-1.2.0.md'],
   },
   {
     q: 'How does Minga pull images?',
@@ -43,7 +43,7 @@ export const faq: Faq[] = [
   },
   {
     q: 'Why does one host run two processes?',
-    a: 'In v1.1.1, <code>minga api</code> is its own Raft voter, so the manager and the API peer with each other. In the target design the API folds into the manager.',
+    a: 'In v1.2.0, <code>minga api</code> is its own Raft voter, so the manager and the API peer with each other. In the target design the API folds into the manager.',
     sources: ['README.md', 'docs/architecture.md'],
   },
   {
@@ -63,7 +63,7 @@ export const faq: Faq[] = [
   },
   {
     q: 'How do I install on an air-gapped site?',
-    a: 'Copy the v1.1.1 release archive (minga, nats-server, ctr and the licenses) and your image tarballs to the site. Run <code>ctr -n minga images import &lt;image&gt;.tar</code> on each node and start the roles. The published <code>install.sh</code> verifies <code>SHA256SUMS</code>.',
+    a: 'Copy the v1.2.0 release archive (minga, nats-server, ctr and the licenses) and your image tarballs to the site. Run <code>ctr -n minga images import &lt;image&gt;.tar</code> on each node and start the roles. The published <code>install.sh</code> verifies <code>SHA256SUMS</code>.',
     sources: ['README.md', 'docs/release-1.1.0.md'],
   },
   {

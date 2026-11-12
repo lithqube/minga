@@ -1,5 +1,55 @@
 # Changelog
 
+## [1.2.0] — 2026-11-12
+
+Security fixes from a source audit of 1.1.1 (all twelve P1 leads, plus the
+lower-priority leads that share their root causes). Several change behaviour
+that worked before; read the [upgrade notes](docs/release-1.2.0.md#upgrade-notes)
+before upgrading. 1.1.1 was prepared but not tagged, so its fix ships here.
+
+### Upgrading
+- A Raft TLS key readable by group or others is refused at start; `chmod 600`
+  it. `minga tls` now writes keys 0600 in 0700 directories.
+- A task whose published port is reserved by the node (53, the Raft, metrics
+  and egress ports, the NATS sidecar's 4222 and 8222) or already has a host
+  listener fails to start with `port N is in use on this node`.
+- With no API token, a request carrying an `Origin` header or a DNS-name
+  `Host` gets 403. Reach a tokenless API by IP address or `localhost`, or set
+  `MINGA_API_TOKEN`.
+- `minga-ctl stack deploy` through an ssh context needs a token.
+
+### Security
+- Owner-only files: `--data-dir` is tightened to 0700 and the redb files to
+  0600 at start; the NATS sidecar directory is 0700 and its `server.conf`
+  0600; `install.sh` creates `/etc/minga` 0700 and `minga.env` 0600.
+- The API token never leaves through a proxy or a redirect: `minga deploy`
+  and `minga state` ignore proxy variables and do not follow redirects, and
+  `minga-ctl` removes proxy variables from the `minga deploy` it runs.
+- Task networking: a task cannot reach services the node binds on
+  `127.0.0.1`, and traffic between two stacks' bridges is dropped, while
+  published ports stay reachable through the node address.
+- Containers get Docker's default masked paths (`/proc/kcore`,
+  `/proc/keys`, `/sys/firmware` and others) and read-only paths
+  (`/proc/sys`, `/proc/sysrq-trigger` and others), and the deny-all device
+  rule is set even without CPU or memory limits.
+- A bus Assign only starts a task that Raft assigns to the node, always from
+  the Raft spec. On start the supervisor adopts containers Raft still
+  assigns to it and stops the rest.
+- The API, metrics and egress listeners close a connection that sends no
+  request head within 10s and cap concurrent connections at 1024. The Raft
+  RPC server times out the TLS handshake (10s) and each read (60s), and caps
+  connections at 512.
+- A Raft bind off loopback without `--raft-tls-*`, and an API bind off
+  loopback without a token, log a warning at start.
+- Release workflow: every action is pinned to a commit SHA, jobs get the
+  least permissions they need, checkouts do not keep credentials, and
+  rustup is a pinned, checksum-verified download.
+
+### Known limits
+- Raft without TLS off loopback still starts, with a warning. Use
+  `--raft-tls-*` on every multi-node cluster.
+- There is no seccomp profile yet.
+
 ## [1.1.1] — 2026-11-12
 
 A fix for relative bind mounts, found on a staging node running 1.1.0. The

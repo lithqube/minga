@@ -2,13 +2,13 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.80%2B-orange.svg)](https://www.rust-lang.org)
-[![Status](https://img.shields.io/badge/status-v1.1.1-blue.svg)](CHANGELOG.md)
+[![Status](https://img.shields.io/badge/status-v1.2.0-blue.svg)](CHANGELOG.md)
 
 A single-binary container and agent orchestrator for **edge, on-prem and air-gapped sites**, written in Rust. It runs Compose files natively, speaks enough of the Docker Swarm API to replace it, and treats AI-agent workloads as first-class objects (WASM sandboxes and an LLM egress proxy today).
 
 Named after the [minga](https://en.wikipedia.org/wiki/Minga) of Chiloé, where a community moves a whole house together.
 
-> **Status: `v1.1.1`.** What works, verified by tests on macOS and in Linux CI (containerd suites and a real-kernel networking job); the [release notes](docs/release-1.1.0.md) say what was and was not run on a real node:
+> **Status: `v1.2.0`.** What works, verified by tests on macOS and in Linux CI (containerd suites and a real-kernel networking job); the [release notes](docs/release-1.2.0.md) say what was and was not run on a real node:
 >
 > - **Compose and deploy:** Compose parsing that fails loudly on unknown keys, and `minga deploy` through the Swarm-compatible Docker Engine API (v1.41, optional bearer token).
 > - **Control plane:** Raft consensus with mTLS and write forwarding, a scheduler, and self-registering nodes with membership leases.
@@ -16,18 +16,20 @@ Named after the [minga](https://en.wikipedia.org/wiki/Minga) of Chiloé, where a
 > - **Platform:** NATS/JetStream with TLS, WASM sandboxes, an LLM egress proxy, and Prometheus metrics with health endpoints.
 > - **Updates:** rolling updates honoring `update_config`, enforced healthchecks, automatic rollback, and registry image pull through containerd's Transfer API with Docker credential helpers.
 > - **New in `v1.1.0`:** versioned state, so later upgrades keep it; `minga state export` and `import` for backup and restore ([guide](docs/backup.md)); a failed task records its last error and exit code, shown by the Docker API and `minga-ctl service ps` and `service inspect`; image pulls that keep the credential off the command line and read `credsStore`/`credHelpers`; published ports that only redirect traffic addressed to the node, with host-local and hairpin access; supplementary groups from the image. **Upgrading from 1.0.2 needs one last removal of the Raft files**: see the [release notes](docs/release-1.1.0.md#upgrade-notes).
+> - **Security fixes in `v1.2.0`**, from a source audit: TLS keys, Raft data and the NATS config are owner-only; the admin token is never sent through a proxy or redirect; tasks cannot reach other stacks' bridges or the node's loopback services, and a published port cannot take a node port; containers get Docker's masked and read-only `/proc` paths and a deny-all device rule; a bus Assign only starts what Raft assigns; the API and metrics listeners time out slow clients and cap connections; a tokenless API refuses browser-shaped requests. Plaintext Raft and a tokenless API off loopback log a warning. See the [upgrade notes](docs/release-1.2.0.md#upgrade-notes).
 > - **Fixed in `v1.1.1`:** relative bind mounts with the default `-c compose.yaml` resolve against the current directory, and the API refuses a relative bind source instead of letting the node guess.
 > - **`minga-ctl`**, the companion CLI for contexts, stacks, services, health and registry login over SSH (not in the release archive; `cargo install --locked --path crates/minga-ctl`, see [its plan](docs/minga-ctl-plan.md)).
 >
-> **Not in `v1.1.1`:**
+> **Not in `v1.2.0`:**
 >
 > - Container networking across nodes: there's no WireGuard mesh yet.
 > - Joining a node to a running cluster: Raft membership is fixed at bootstrap.
 > - API roles, TLS on the API listener and a server-side audit log: designed in [ADR 0005](docs/adr/0005-api-identity-and-roles.md) (Proposed), not built. The API has one shared token.
 > - A plain-HTTP registry on containerd 1.7 (the Transfer API has no plain-HTTP option there).
-> - A run of this build on a real staging node, on Talos, or against a hosted private registry: see [the release notes](docs/release-1.1.0.md#verification-status).
+> - A run of this build on a real staging node, on Talos, or against a hosted private registry: see [the release notes](docs/release-1.2.0.md#verification-status).
+> - A seccomp profile, and enforcement of Raft TLS off loopback (it only warns).
 >
-> Details: [changelog](CHANGELOG.md), [release notes](docs/release-1.1.0.md), [production-readiness plan](docs/production-readiness-plan.md), [architecture notes](docs/architecture.md).
+> Details: [changelog](CHANGELOG.md), [release notes](docs/release-1.2.0.md), [production-readiness plan](docs/production-readiness-plan.md), [architecture notes](docs/architecture.md).
 >
 > The Talos install is validated on a single docker-provisioned Talos v1.14 node, not on bare metal. FIPS, SOC 2, VS-NfD and NATO are **not assessed**, which is not the same as "not applicable".
 
@@ -97,7 +99,7 @@ flowchart LR
   supB --> ctrB["containerd + netns/bridge"]
 ```
 
-> In `v1.1.1` **every `minga` process is a Raft voter**, including workers and `minga api`, and membership is fixed when the cluster first starts. Only desired state should go through Raft. Node lease renewals still do, as one atomic command every 10s. [docs/architecture.md](docs/architecture.md) explains why this matters for cluster size and quorum, and what replaces it.
+> In `v1.2.0` **every `minga` process is a Raft voter**, including workers and `minga api`, and membership is fixed when the cluster first starts. Only desired state should go through Raft. Node lease renewals still do, as one atomic command every 10s. [docs/architecture.md](docs/architecture.md) explains why this matters for cluster size and quorum, and what replaces it.
 
 ### How a deploy becomes a running container
 
@@ -325,6 +327,7 @@ Next, in order (rationale in [docs/architecture.md](docs/architecture.md)):
 ## Documentation
 
 - [Architecture notes](docs/architecture.md): how the pieces fit today, known structural limits, and the plan
+- [Release notes: v1.2.0](docs/release-1.2.0.md)
 - [Release notes: v1.1.0](docs/release-1.1.0.md)
 - [Release notes: v1.0.2](docs/release-1.0.2.md)
 - [Release notes: v1.0.1](docs/release-1.0.1.md)
