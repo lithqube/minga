@@ -2,9 +2,11 @@
 //!
 //! `tests/fixtures/v<FORMAT_VERSION>/*.json` hold the JSON of every persisted
 //! type with every field filled in. They must keep decoding in every later
-//! build. If a test here fails because the JSON changed, a persisted type
-//! changed shape: bump `FORMAT_VERSION`, add a migration (see `codec.rs`) and
-//! write a new fixture directory. Never edit the fixtures of an existing version.
+//! build, and every key and value in them must still be written as is. A field
+//! added later with `#[serde(default)]` passes: the fixture is a subset of the
+//! new JSON. If a test here fails, a persisted type was renamed, removed or
+//! re-typed: bump `FORMAT_VERSION`, add a migration (see `codec.rs`) and write a
+//! new fixture directory. Never edit the fixtures of an existing version.
 //!
 //! To write the fixtures of a new version:
 //! `MINGA_WRITE_FIXTURES=1 cargo test -p minga-state --test format`
@@ -33,6 +35,45 @@ fn fixture_path(name: &str) -> PathBuf {
         .join(format!("{name}.json"))
 }
 
+/// True when every key and value of `old` is in `new`; `new` may have more
+/// object keys (fields added since `old` was written).
+fn contains(new: &serde_json::Value, old: &serde_json::Value) -> bool {
+    use serde_json::Value::{Array, Object};
+    match (new, old) {
+        (Object(n), Object(o)) => o
+            .iter()
+            .all(|(k, v)| n.get(k).is_some_and(|nv| contains(nv, v))),
+        (Array(n), Array(o)) => n.len() == o.len() && n.iter().zip(o).all(|(a, b)| contains(a, b)),
+        _ => new == old,
+    }
+}
+
+#[test]
+fn a_fixture_accepts_added_fields_and_rejects_changed_ones() {
+    use serde_json::json;
+    let old = json!({"id": "a", "tags": [{"k": 1}], "gone": null});
+    assert!(contains(&old, &old));
+    // A field added later.
+    assert!(contains(
+        &json!({"id": "a", "tags": [{"k": 1, "new": true}], "gone": null, "extra": 1}),
+        &old
+    ));
+    // Removed, renamed, re-typed or changed.
+    assert!(!contains(&json!({"id": "a", "tags": [{"k": 1}]}), &old));
+    assert!(!contains(
+        &json!({"id": "b", "tags": [{"k": 1}], "gone": null}),
+        &old
+    ));
+    assert!(!contains(
+        &json!({"id": "a", "tags": [{"k": "1"}], "gone": null}),
+        &old
+    ));
+    assert!(!contains(
+        &json!({"id": "a", "tags": [], "gone": null}),
+        &old
+    ));
+}
+
 /// Compares `value` with its fixture, and decodes the fixture back.
 fn check<T: Serialize + DeserializeOwned>(name: &str, value: &T) {
     let actual = serde_json::to_value(value).unwrap();
@@ -47,14 +88,17 @@ fn check<T: Serialize + DeserializeOwned>(name: &str, value: &T) {
     let text = std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("missing fixture {}: {e}", path.display()));
     let expected: serde_json::Value = serde_json::from_str(&text).unwrap();
-    assert_eq!(
-        actual, expected,
-        "{name}: the persisted JSON changed; see the module comment"
+    assert!(
+        contains(&actual, &expected),
+        "{name}: the persisted JSON changed shape; see the module comment\nnow: {actual}\nfixture: {expected}"
     );
     // The stored bytes must decode and encode back to the same JSON.
     let decoded: T = codec::decode(text.as_bytes())
         .unwrap_or_else(|e| panic!("{name}: fixture no longer decodes: {e}"));
-    assert_eq!(serde_json::to_value(&decoded).unwrap(), expected, "{name}");
+    assert!(
+        contains(&serde_json::to_value(&decoded).unwrap(), &expected),
+        "{name}: the fixture does not survive a decode and encode"
+    );
 }
 
 fn map(pairs: &[(&str, &str)]) -> HashMap<String, String> {
