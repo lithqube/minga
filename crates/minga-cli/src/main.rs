@@ -1036,10 +1036,25 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
     // overlay networks, so they need neither.
     #[cfg(target_os = "linux")]
     let networking: Option<Arc<minga_node::NetworkSetup>> = if args.runtime == "containerd" {
-        Some(Arc::new(minga_node::NetworkSetup::new(format!(
-            "{}/net",
-            args.data_dir
-        ))))
+        // A task may not publish a port this process serves: its DNAT rule
+        // would capture the node's own clients and their tokens.
+        let mut reserved: Vec<(u16, String)> = [
+            (Some(args.bind.as_str()), "Raft"),
+            (args.metrics_bind.as_deref(), "metrics"),
+            (args.egress_bind.as_deref(), "egress proxy"),
+        ]
+        .into_iter()
+        .filter_map(|(addr, by)| Some((port_of(addr?)?, by.to_string())))
+        .collect();
+        if is_manager && args.nats_url.is_none() {
+            let sidecar = sidecar::SidecarOptions::default();
+            reserved.push((sidecar.client_port, "NATS sidecar".into()));
+            reserved.push((sidecar.monitor_port, "NATS sidecar monitor".into()));
+        }
+        Some(Arc::new(
+            minga_node::NetworkSetup::new(format!("{}/net", args.data_dir))
+                .with_reserved_tcp_ports(reserved),
+        ))
     } else {
         None
     };
@@ -1894,9 +1909,15 @@ fn is_loopback_bind(addr: &str) -> bool {
             .is_ok_and(|ip| ip.is_loopback())
 }
 
+/// The port of a `host:port` bind address (`[::1]:7001` included).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn port_of(addr: &str) -> Option<u16> {
+    addr.rsplit_once(':')?.1.parse().ok()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{is_loopback_bind, project_dir};
+    use super::{is_loopback_bind, port_of, project_dir};
 
     #[test]
     fn loopback_binds_are_recognised() {
@@ -1911,6 +1932,13 @@ mod tests {
         for addr in ["0.0.0.0:7001", "10.0.0.1:7001", "[::]:2375", "node1:7001"] {
             assert!(!is_loopback_bind(addr), "{addr}");
         }
+    }
+
+    #[test]
+    fn port_of_reads_the_bind_port() {
+        assert_eq!(port_of("0.0.0.0:7001"), Some(7001));
+        assert_eq!(port_of("[::1]:9100"), Some(9100));
+        assert_eq!(port_of("no-port"), None);
     }
 
     #[test]

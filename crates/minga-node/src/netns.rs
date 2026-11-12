@@ -11,7 +11,10 @@
 //! - published ports via iptables DNAT (host `PREROUTING` for traffic addressed to
 //!   the node, `OUTPUT` for clients on the node itself);
 //! - a per-task `/etc/resolv.conf` pointing at the bridge gateway, where
-//!   the node's DNS server listens.
+//!   the node's DNS server listens;
+//! - isolation: tasks on different networks cannot reach each other except
+//!   through published ports, a task cannot reach the host's 127.0.0.0/8,
+//!   and a task cannot publish a port the node itself uses.
 //!
 //! Everything is driven through `ip`/`iptables` commands: boring,
 //! inspectable with the same tools an operator would use, and loud on
@@ -39,6 +42,14 @@ pub enum NetError {
     Subnet(NetworkId, String),
     #[error("task IP {0} is not in subnet {1}")]
     IpOutsideSubnet(String, String),
+    /// The node itself uses this port: a DNAT rule would capture the node's
+    /// own clients (NATS, API, DNS) and hand their credentials to the task.
+    #[error("published port {port}/{proto} is in use on this node ({by})")]
+    PortInUse {
+        port: u16,
+        proto: String,
+        by: String,
+    },
 }
 
 /// Runs a command; on non-zero exit, fails with its stderr.
@@ -115,6 +126,73 @@ fn as_strs(args: &[String]) -> Vec<&str> {
     args.iter().map(String::as_str).collect()
 }
 
+/// `INPUT` rule: a task may not open a connection to 127.0.0.0/8 through its
+/// bridge. `route_localnet` (needed for host -> 127.0.0.1:published) would
+/// otherwise let a task with CAP_NET_RAW reach loopback-only host services
+/// (CVE-2020-8558). Replies to host-originated connections stay allowed.
+fn loopback_guard_rule(br: &str) -> Vec<String> {
+    [
+        "-i",
+        br,
+        "-d",
+        "127.0.0.0/8",
+        "-m",
+        "conntrack",
+        "!",
+        "--ctstate",
+        "RELATED,ESTABLISHED",
+        "-j",
+        "DROP",
+    ]
+    .map(String::from)
+    .to_vec()
+}
+
+/// `FORWARD` rules isolating one bridge from every other minga bridge, in
+/// insert order (`ensure_rule` inserts at the top, so the last one ends up
+/// first): drop new traffic to another network unless it was DNAT'd to a
+/// published port, then let same-bridge traffic (br_netfilter) through.
+/// iptables allows one `-o` per rule, hence the separate same-bridge accept.
+fn isolation_rules(br: &str) -> [Vec<String>; 2] {
+    let drop = [
+        "-i",
+        br,
+        "-o",
+        "minga-+",
+        "-m",
+        "conntrack",
+        "!",
+        "--ctstate",
+        "DNAT",
+        "-j",
+        "DROP",
+    ];
+    let same = ["-i", br, "-o", br, "-j", "ACCEPT"];
+    [
+        drop.map(String::from).to_vec(),
+        same.map(String::from).to_vec(),
+    ]
+}
+
+/// Ports with a listening TCP socket or a bound UDP socket in a
+/// `/proc/net/{tcp,tcp6,udp,udp6}` table (the host's own network namespace).
+fn bound_ports(table: &str, tcp: bool) -> std::collections::BTreeSet<u16> {
+    table
+        .lines()
+        .skip(1)
+        .filter_map(|line| {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            let local = fields.get(1)?;
+            let state = fields.get(3)?;
+            // 0A is TCP_LISTEN; any UDP socket in the table is bound.
+            if tcp && *state != "0A" {
+                return None;
+            }
+            u16::from_str_radix(local.rsplit_once(':')?.1, 16).ok()
+        })
+        .collect()
+}
+
 /// A short deterministic hash for interface names (IFNAMSIZ is 16 bytes).
 fn short_hash(s: &str) -> String {
     use std::hash::{Hash, Hasher};
@@ -181,6 +259,9 @@ struct TaskNetState {
 pub struct NetworkSetup {
     /// Node data dir for networking state (`<data_dir>/net`).
     state_dir: PathBuf,
+    /// Ports the node owns even when nothing listens on them yet (a sidecar
+    /// that restarts after a task's rule exists): (protocol, port, owner).
+    reserved: Vec<(String, u16, String)>,
 }
 
 /// The netns handle path. `/var/run/netns` is the one location every tool
@@ -191,10 +272,61 @@ fn netns_path(ns: &str) -> PathBuf {
 }
 
 impl NetworkSetup {
+    /// The embedded DNS server listens on every bridge gateway on port 53,
+    /// so 53 is always reserved.
     pub fn new(state_dir: impl Into<PathBuf>) -> Self {
         Self {
             state_dir: state_dir.into(),
+            reserved: ["tcp", "udp"]
+                .map(|p| (p.to_string(), 53, "embedded DNS".to_string()))
+                .to_vec(),
         }
+    }
+
+    /// Adds node-owned TCP ports (Raft, NATS sidecar, metrics, egress).
+    pub fn with_reserved_tcp_ports(
+        mut self,
+        ports: impl IntoIterator<Item = (u16, String)>,
+    ) -> Self {
+        self.reserved.extend(
+            ports
+                .into_iter()
+                .map(|(port, by)| ("tcp".to_string(), port, by)),
+        );
+        self
+    }
+
+    /// Refuses a published port the node uses: a reserved one, or one a host
+    /// process listens on (Docker fails the same way, "port is already allocated").
+    fn check_port_free(&self, proto: &str, port: u16) -> Result<(), NetError> {
+        let in_use = |by: &str| NetError::PortInUse {
+            port,
+            proto: proto.to_string(),
+            by: by.to_string(),
+        };
+        if let Some((_, _, by)) = self
+            .reserved
+            .iter()
+            .find(|(p, n, _)| p.eq_ignore_ascii_case(proto) && *n == port)
+        {
+            return Err(in_use(by.as_str()));
+        }
+        let tcp = !proto.eq_ignore_ascii_case("udp");
+        let tables: &[&str] = if tcp {
+            &["/proc/net/tcp", "/proc/net/tcp6"]
+        } else {
+            &["/proc/net/udp", "/proc/net/udp6"]
+        };
+        for table in tables {
+            // Missing on non-Linux test hosts; a node always has them.
+            let Ok(text) = std::fs::read_to_string(table) else {
+                continue;
+            };
+            if bound_ports(&text, tcp).contains(&port) {
+                return Err(in_use("a host process listens on it"));
+            }
+        }
+        Ok(())
     }
 
     fn resolv_conf_path(&self, ns: &str) -> PathBuf {
@@ -282,6 +414,7 @@ impl NetworkSetup {
             ],
         )
         .await?;
+        ensure_rule("filter", "INPUT", &as_strs(&loopback_guard_rule(&br))).await?;
         // Hosts that default FORWARD to DROP (or load br_netfilter) still
         // pass task traffic and published ports.
         ensure_rule("filter", "FORWARD", &["-i", &br, "-j", "ACCEPT"]).await?;
@@ -300,6 +433,11 @@ impl NetworkSetup {
             ],
         )
         .await?;
+        // Networks are isolated from each other, as Docker's bridges are;
+        // inserted last so they sit above the accepts.
+        for rule in isolation_rules(&br) {
+            ensure_rule("filter", "FORWARD", &as_strs(&rule)).await?;
+        }
         Ok(())
     }
 
@@ -319,6 +457,12 @@ impl NetworkSetup {
                 task_id.to_string(),
                 "task has no network attachments".into(),
             ));
+        }
+
+        for port in ports {
+            if let Some(published) = port.published {
+                self.check_port_free(&port.protocol, published)?;
+            }
         }
 
         tokio::fs::create_dir_all(&self.state_dir).await?;
@@ -564,5 +708,54 @@ mod tests {
             rule,
             "-w 5 -t nat -A OUTPUT -o lo -p udp --dport 53 -j DNAT --to-destination 10.100.5.2:5353"
         );
+    }
+
+    #[test]
+    fn bridge_guard_rules() {
+        assert_eq!(
+            loopback_guard_rule("minga-abc").join(" "),
+            "-i minga-abc -d 127.0.0.0/8 -m conntrack ! --ctstate RELATED,ESTABLISHED -j DROP"
+        );
+        let [drop, same] = isolation_rules("minga-abc");
+        assert_eq!(
+            drop.join(" "),
+            "-i minga-abc -o minga-+ -m conntrack ! --ctstate DNAT -j DROP"
+        );
+        assert_eq!(same.join(" "), "-i minga-abc -o minga-abc -j ACCEPT");
+    }
+
+    #[test]
+    fn bound_ports_reads_listening_tcp_and_bound_udp() {
+        let tcp = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+   0: 0100007F:107E 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 1 1 0 100 0 0 10 0
+   1: 0100007F:94F2 0100007F:107E 01 00000000:00000000 00:00000000 00000000     0        0 2 1 0 20 4 30 10 -1
+";
+        // 0x107E = 4222 listens; 0x94F2 is the client side of an established connection.
+        assert_eq!(
+            bound_ports(tcp, true).into_iter().collect::<Vec<_>>(),
+            [4222]
+        );
+        let udp = "   sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops
+  10: 0107640A:0035 00000000:0000 07 00000000:00000000 00:00000000 00000000     0        0 3 2 0 0
+";
+        assert_eq!(
+            bound_ports(udp, false).into_iter().collect::<Vec<_>>(),
+            [53]
+        );
+    }
+
+    #[test]
+    fn node_ports_are_refused_for_publishing() {
+        let setup = NetworkSetup::new("/nonexistent").with_reserved_tcp_ports([
+            (7001, "Raft".to_string()),
+            (4222, "NATS sidecar".to_string()),
+        ]);
+        let err = setup.check_port_free("tcp", 4222).unwrap_err().to_string();
+        assert!(
+            err.contains("4222/tcp") && err.contains("NATS sidecar"),
+            "{err}"
+        );
+        assert!(setup.check_port_free("udp", 53).is_err(), "embedded DNS");
+        assert!(setup.check_port_free("TCP", 7001).is_err());
     }
 }

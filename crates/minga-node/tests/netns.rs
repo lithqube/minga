@@ -7,7 +7,10 @@
 //! - host -> the node's own address reaches the task;
 //! - a sibling task -> the node's address reaches the task;
 //! - the task -> the node's address reaches itself (hairpin);
-//! - a task -> a NON-local address on the published port is NOT redirected.
+//! - a task -> a NON-local address on the published port is NOT redirected;
+//! - a task on another network cannot reach the task's IP directly, but can
+//!   reach its published port through the node address;
+//! - publishing a node-owned port (53, the embedded DNS) is refused.
 //!
 //! The "node address" is 198.51.100.7 added to `lo` (a LOCAL address that
 //! needs no real NIC); the "external host" is a namespace behind a veth at
@@ -36,6 +39,7 @@ const NODE_ADDR: &str = "198.51.100.7";
 const EXT_HOST: &str = "203.0.113.1";
 const EXT_ADDR: &str = "203.0.113.9";
 const NETWORK: &str = "netns_test_default";
+const NETWORK2: &str = "netns_test_other";
 const EXT_NS: &str = "minga-nstest-ext";
 
 const SERVER: &str = r#"
@@ -235,6 +239,63 @@ async fn scenario(setup: &NetworkSetup) -> Result<(), String> {
         fetch(Some("minga-nstest-client"), EXT_ADDR, PUBLISHED),
         "external",
     )?;
+
+    // A task on another network: isolated from the first network's tasks,
+    // but published ports stay reachable through the node address.
+    setup
+        .setup_task(
+            "nstest-other",
+            &[TaskNetAttachment {
+                network_id: NETWORK2.into(),
+                ip: "10.231.8.10".parse().unwrap(),
+                subnet: Cidr::parse("10.231.8.0/24").unwrap(),
+            }],
+            &[],
+            &[],
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+    match sh(
+        "ip",
+        &[
+            "netns",
+            "exec",
+            "minga-nstest-other",
+            "python3",
+            "-c",
+            CLIENT,
+            "10.231.7.10",
+            &TARGET.to_string(),
+        ],
+    ) {
+        Err(_) => eprintln!("ok: other network -> task IP is dropped"),
+        Ok(body) => return Err(format!("other network reached the task directly: {body:?}")),
+    }
+    expect(
+        "other network -> node address:published",
+        fetch(Some("minga-nstest-other"), NODE_ADDR, PUBLISHED),
+        "task",
+    )?;
+
+    // Port 53 belongs to the embedded DNS server on every gateway.
+    let dns = [PortMapping {
+        target: 5353,
+        published: Some(53),
+        protocol: "udp".into(),
+    }];
+    match setup
+        .setup_task("nstest-dns", &attach("10.231.7.12"), &dns, &[])
+        .await
+    {
+        Err(minga_node::netns::NetError::PortInUse { .. }) => {
+            eprintln!("ok: publishing 53/udp is refused")
+        }
+        other => {
+            return Err(format!(
+                "publishing 53/udp: wanted PortInUse, got {other:?}"
+            ))
+        }
+    }
     Ok(())
 }
 
@@ -254,9 +315,10 @@ async fn published_ports_reach_the_task_and_only_node_addresses() {
     let result = scenario(&setup).await;
 
     // Always clean up, then report.
-    for task in ["nstest-web", "nstest-client"] {
+    for task in ["nstest-web", "nstest-client", "nstest-other", "nstest-dns"] {
         let _ = setup.teardown_task(task).await;
     }
+    let _ = sh("ip", &["link", "del", &bridge_name(NETWORK2)]);
     let _ = sh("ip", &["netns", "delete", EXT_NS]);
     let _ = sh("ip", &["link", "del", "nstexth"]);
     let _ = sh(
