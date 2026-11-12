@@ -1,8 +1,21 @@
 # Changelog
 
-## [Unreleased]
+## [1.0.2] — 2026-11-12
+
+Compose and staging fixes from the first real-world deploy, private-registry
+pulls, and the `minga-ctl` companion CLI. See
+[docs/release-1.0.2.md](docs/release-1.0.2.md) for verification status and
+upgrade notes.
 
 ### Added
+- `minga-ctl`, a companion CLI (new crate `crates/minga-ctl`, binary
+  `minga-ctl`): named contexts, `stack`, `service` (scale, update, rollback
+  from a local revision, logs), `secret`, `image`, `health`, `metrics` and
+  `registry login/logout/list`. Remote contexts go over the system `ssh`
+  client only; the API token is read from the node and never stored on the
+  workstation; secrets travel on stdin; changes append to a local audit log.
+  It is not in the release archive: `cargo install --path crates/minga-ctl`.
+  Design and trust model: [docs/minga-ctl-plan.md](docs/minga-ctl-plan.md).
 - Compose `env_file` (string or `{path, required}` entries), merged under
   `environment`, which wins on conflicts.
 - Compose `extra_hosts`, written to a per-task `/etc/hosts`. `host-gateway`
@@ -30,11 +43,27 @@
 - `extra_hosts: host-gateway` resolved to the host's default route, which on
   most VMs is the upstream router rather than the host.
 
+### Changed
+- The persisted service and task layout gained `extra_hosts`. State written
+  by 1.0.1 does not decode: clear `--data-dir` and redeploy, upgrading every
+  node together.
+
+### Changed
+- The persisted service and task layout gained `extra_hosts`. State written
+  by 1.0.1 does not decode: clear `--data-dir` and redeploy, upgrading every
+  node together.
+
 ### Known limits
 - Registry credential helpers (`credsStore`, `credHelpers`) are not read.
   `ctr` receives credentials on its command line, visible in `ps`.
 - Supplementary groups from the image's `/etc/group` are not applied.
 - `extra_hosts` takes effect only for tasks with node networking.
+- `minga-ctl` has been tested against stubs and test API servers, not
+  against a real node over SSH. Its rollback covers only changes made by
+  `minga-ctl` on the same workstation.
+- `minga-ctl` has been tested against stubs and test API servers, not
+  against a real node over SSH. Its rollback covers only changes made by
+  `minga-ctl` on the same workstation.
 
 ## [1.0.1] — 2026-11-11
 

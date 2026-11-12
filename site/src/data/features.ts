@@ -1,4 +1,4 @@
-// Feature list. Every entry maps to a capability that ships in v1.0.1; `caveat` says where it stops.
+// Feature list. Every entry maps to a capability that ships in v1.0.2; `caveat` says where it stops.
 // The two `lead` entries are what an evaluator replacing Swarm checks first, so they get the large
 // treatment; the rest are a compact list (DESIGN.md §5.8, antislop R-14).
 export interface Feature {
@@ -31,7 +31,8 @@ export const features: Feature[] = [
     icon: 'loud',
     title: 'Fails loudly by default',
     body: 'Unknown Compose keys are rejected with suggestions, an unplaceable deploy gets HTTP 409 instead of a warning, and /readyz says why it is not ready.',
-    caveat: 'Healthchecks gate task readiness; named image users must be numeric uid[:gid].',
+    caveat:
+      'Healthchecks gate task readiness; named users resolve from the image’s /etc/passwd, without supplementary groups.',
     href: '/architecture/',
     linkLabel: 'Read the architecture notes',
     source: 'README.md, CHANGELOG.md',
@@ -39,7 +40,8 @@ export const features: Feature[] = [
   {
     title: 'One binary, checksum-verified',
     body: 'Release archives bundle minga with a checksum-pinned nats-server and ctr plus licenses, install.sh verifies SHA256SUMS and can install the systemd unit, and the same binaries ship as a multi-arch ghcr.io/lithqube/minga image (Talos runs it as a ContainerConfig).',
-    caveat: 'Image pulls support anonymous registries only and use ctr’s default containerd socket.',
+    caveat:
+      'Private-registry pulls read inline Docker credentials only (no credential helpers), and ctr receives them on its command line.',
     href: '/docs/quickstart/',
     linkLabel: 'Quickstart',
     source: 'CHANGELOG.md, install.sh',

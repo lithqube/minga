@@ -2,28 +2,29 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.80%2B-orange.svg)](https://www.rust-lang.org)
-[![Status](https://img.shields.io/badge/status-v1.0.1-blue.svg)](CHANGELOG.md)
+[![Status](https://img.shields.io/badge/status-v1.0.2-blue.svg)](CHANGELOG.md)
 
 A single-binary container and agent orchestrator for **edge, on-prem and air-gapped sites**, written in Rust. It runs Compose files natively, speaks enough of the Docker Swarm API to replace it, and treats AI-agent workloads as first-class objects (WASM sandboxes and an LLM egress proxy today).
 
 Named after the [minga](https://en.wikipedia.org/wiki/Minga) of Chiloé, where a community moves a whole house together.
 
-> **Status: `v1.0.1`.** Source version is promoted; publishing release assets requires pushing tag `v1.0.1`. What works, verified by execution on macOS and on Linux (OrbStack Ubuntu, containerd 2.2.1):
+> **Status: `v1.0.2`.** What works, verified by execution on macOS and on Linux (OrbStack Ubuntu, containerd 2.2.1):
 >
 > - **Compose and deploy:** Compose parsing that fails loudly on unknown keys, and `minga deploy` through the Swarm-compatible Docker Engine API (v1.41, optional bearer token).
 > - **Control plane:** Raft consensus with mTLS and write forwarding, a scheduler, and self-registering nodes with membership leases.
 > - **Runtime and networking:** a node supervisor driving a **real containerd runtime**, per-task netns/bridge networking with IPAM and embedded DNS, and real container logs.
 > - **Platform:** NATS/JetStream with TLS, WASM sandboxes, an LLM egress proxy, and Prometheus metrics with health endpoints.
 > - **Updates:** rolling updates honoring `update_config`, enforced healthchecks, automatic rollback, and registry image pull through `ctr`.
+> - **New in `v1.0.2`:** Compose `env_file`, `extra_hosts` (with `host-gateway`) and named users; private-registry pulls from inline Docker credentials; the API token as a Basic-auth password for Traefik; and `minga-ctl`, a companion CLI for contexts, stacks, services, health and registry login (not in the release archive; `cargo install --path crates/minga-ctl`, see [its plan](docs/minga-ctl-plan.md)).
 >
-> **Not in `v1.0.1`:**
+> **Not in `v1.0.2`:**
 >
 > - Container networking across nodes: there's no WireGuard mesh yet.
 > - Joining a node to a running cluster: Raft membership is fixed at bootstrap.
-> - Private-registry credentials for image pull, and host-local port hairpinning.
-> - Verification on a real registry or on Talos for this release was not run: see [the release notes](docs/release-1.0.1.md).
+> - Registry credential helpers (`credsStore`, `credHelpers`), and host-local port hairpinning.
+> - Verification on a real registry, on Talos, or of `minga-ctl` against a real node over SSH was not run for this release: see [the release notes](docs/release-1.0.2.md).
 >
-> Details: [changelog](CHANGELOG.md), [release notes](docs/release-1.0.1.md), [roadmap](docs/roadmap-v0.1.0.md), [architecture notes](docs/architecture.md).
+> Details: [changelog](CHANGELOG.md), [release notes](docs/release-1.0.2.md), [roadmap](docs/roadmap-v0.1.0.md), [architecture notes](docs/architecture.md).
 >
 > The Talos install is validated on a single docker-provisioned Talos v1.14 node, not on bare metal. FIPS, SOC 2, VS-NfD and NATO are **not assessed**, which is not the same as "not applicable".
 
@@ -92,7 +93,7 @@ flowchart LR
   supB --> ctrB["containerd + netns/bridge"]
 ```
 
-> In `v1.0.1` **every `minga` process is a Raft voter**, including workers and `minga api`, and membership is fixed when the cluster first starts. Only desired state should go through Raft. Node lease renewals still do, as one atomic command every 10s. [docs/architecture.md](docs/architecture.md) explains why this matters for cluster size and quorum, and what replaces it.
+> In `v1.0.2` **every `minga` process is a Raft voter**, including workers and `minga api`, and membership is fixed when the cluster first starts. Only desired state should go through Raft. Node lease renewals still do, as one atomic command every 10s. [docs/architecture.md](docs/architecture.md) explains why this matters for cluster size and quorum, and what replaces it.
 
 ### How a deploy becomes a running container
 
@@ -320,7 +321,9 @@ Next, in order (rationale in [docs/architecture.md](docs/architecture.md)):
 ## Documentation
 
 - [Architecture notes](docs/architecture.md): how the pieces fit today, known structural limits, and the plan
+- [Release notes: v1.0.2](docs/release-1.0.2.md)
 - [Release notes: v1.0.1](docs/release-1.0.1.md)
+- [minga-ctl design plan](docs/minga-ctl-plan.md): the companion CLI and its trust model
 - [Roadmap to v0.1.0](docs/roadmap-v0.1.0.md): the seven release gates and their evidence
 - [ADR 0001: Language split](docs/adr/0001-language-split.md)
 - [ADR 0002: Event bus](docs/adr/0002-event-bus-nats.md): NATS/JetStream behind `minga-bus`
