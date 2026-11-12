@@ -73,6 +73,12 @@ jobs:
           sudo mkdir -p /etc/docker/certs.d/localhost:5000
           sudo cp registry.crt /etc/docker/certs.d/localhost:5000/ca.crt
           sudo systemctl restart containerd
+          # docker depends on containerd, so it bounces too: wait for both.
+          for _ in $(seq 1 60); do
+            docker info >/dev/null 2>&1 && sudo ctr version >/dev/null 2>&1 && break
+            sleep 1
+          done
+          docker info >/dev/null
 
           password="$(openssl rand -hex 16)"
           echo "::add-mask::$password"
