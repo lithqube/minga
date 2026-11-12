@@ -184,7 +184,9 @@ if [ "$WITH_SYSTEMD" = "1" ]; then
     $sudo_sys install -m 0644 "$tmp/minga.service" /etc/systemd/system/minga.service
     # minga.env holds tokens (MINGA_NATS_TOKEN, API tokens): root-only.
     $sudo_sys install -d -m 0700 /etc/minga
-    if [ -f /etc/minga/minga.env ]; then
+    # Checked as root: once /etc/minga is 0700, the calling user cannot see
+    # into it, and a false negative would overwrite the configured file.
+    if $sudo_sys test -f /etc/minga/minga.env; then
         $sudo_sys chmod 0600 /etc/minga/minga.env
         echo "kept existing /etc/minga/minga.env, now mode 0600 (template: $share/minga.env.example)"
         $sudo_sys install -m 0644 "$tmp/minga.env.example" "$share/minga.env.example"
