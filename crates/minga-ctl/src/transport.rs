@@ -309,6 +309,9 @@ pub enum RemoteArg<'a> {
     /// A value from config, flags or the server. It may not start with `-`,
     /// so it can never be read as an option.
     Value(&'a str),
+    /// A fixed `sh -c` script the code chooses. It is quoted but not
+    /// character-checked; values reach it only as later `Value` arguments.
+    Script(&'static str),
 }
 
 /// Runs `argv` on `target` over ssh and returns its status and output.
@@ -429,6 +432,7 @@ pub fn exec_args(target: &str, argv: &[RemoteArg<'_>]) -> Result<Vec<String>, Ct
         let (text, ok) = match *arg {
             RemoteArg::Fixed(text) => (text, remote_arg_ok(text)),
             RemoteArg::Value(text) => (text, remote_arg_ok(text) && !text.starts_with('-')),
+            RemoteArg::Script(text) => (text, true),
         };
         if !ok {
             return Err(CtlError::Usage(format!(
