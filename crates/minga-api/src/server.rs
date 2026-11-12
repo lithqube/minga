@@ -80,8 +80,45 @@ async fn bearer_auth(
             )
                 .into_response(),
         }
+    } else if let Some(why) = rebinding_risk(req.headers()) {
+        (
+            axum::http::StatusCode::FORBIDDEN,
+            axum::Json(serde_json::json!({
+                "message": format!("{why}; a tokenless API only answers direct clients (set --api-token to lift this)")
+            })),
+        )
+            .into_response()
     } else {
         next.run(req).await
+    }
+}
+
+/// Why a request to a tokenless API may come from a web page, if it may.
+///
+/// Without a token the bind address is the only boundary, and DNS rebinding
+/// lets a page in a local browser cross it: the page reaches us under its own
+/// hostname, and browsers send `Origin` on cross-site and same-origin writes.
+/// Docker and minga clients send neither an `Origin` nor a non-IP `Host`.
+fn rebinding_risk(headers: &axum::http::HeaderMap) -> Option<&'static str> {
+    if headers.contains_key(axum::http::header::ORIGIN) {
+        return Some("request carries an Origin header");
+    }
+    let host = headers
+        .get(axum::http::header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    // `[::1]:2375`, `10.0.0.5:2375`, `localhost`.
+    let name = match host.strip_prefix('[') {
+        Some(rest) => rest.split(']').next().unwrap_or(""),
+        None => host.rsplit_once(':').map_or(host, |(h, _)| h),
+    };
+    if name.is_empty()
+        || name.eq_ignore_ascii_case("localhost")
+        || name.parse::<std::net::IpAddr>().is_ok()
+    {
+        None
+    } else {
+        Some("Host is a DNS name")
     }
 }
 
@@ -209,11 +246,12 @@ impl ApiServer {
         };
         let router = build_router_with_auth(store, Arc::new(ready_state), auth_token);
 
-        let handle = tokio::spawn(async move {
-            if let Err(e) = axum::serve(listener, router).await {
-                tracing::error!(error = %e, "API server error");
-            }
-        });
+        let handle = tokio::spawn(minga_telemetry::serve::serve_bounded(
+            listener,
+            router,
+            minga_telemetry::serve::Limits::default(),
+            std::future::pending(),
+        ));
 
         tracing::info!(addr = %addr, "Docker Engine API server listening");
 
@@ -940,6 +978,47 @@ mod tests {
             .unwrap();
         let (status, _) = send_request(router, req).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn tokenless_api_refuses_browser_shaped_requests() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            StateStore::open(1, "127.0.0.1:0", dir.path(), BTreeMap::new())
+                .await
+                .unwrap(),
+        );
+        let router = build_router_with_auth(store, Arc::new(ReadyState::new()), None);
+        let status = |host: &str, origin: Option<&str>| {
+            let mut req = Request::builder()
+                .uri("/v1.41/version")
+                .header("Host", host);
+            if let Some(origin) = origin {
+                req = req.header("Origin", origin);
+            }
+            let router = router.clone();
+            let req = req.body(Body::empty()).unwrap();
+            async move { send_request(router, req).await.0 }
+        };
+
+        // Docker and minga clients: an IP or localhost, no Origin.
+        for host in [
+            "127.0.0.1:2375",
+            "[::1]:2375",
+            "localhost:2375",
+            "10.0.0.5:2375",
+        ] {
+            assert_eq!(status(host, None).await, StatusCode::OK, "{host}");
+        }
+        // DNS rebinding: the page's own hostname, or any request with an Origin.
+        assert_eq!(
+            status("evil.example:2375", None).await,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            status("127.0.0.1:2375", Some("http://evil.example:2375")).await,
+            StatusCode::FORBIDDEN
+        );
     }
 
     #[tokio::test]

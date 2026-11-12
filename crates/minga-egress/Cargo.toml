@@ -8,6 +8,7 @@ license.workspace = true
 
 [dependencies]
 axum.workspace = true
+minga-telemetry = { path = "../minga-telemetry" }
 lru.workspace = true
 rand.workspace = true
 regex.workspace = true

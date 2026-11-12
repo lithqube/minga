@@ -139,6 +139,14 @@ impl RaftTlsConfig {
 /// 64 MiB leaves room for snapshot chunks (openraft default: 3 MiB).
 const MAX_FRAME_BYTES: u32 = 64 * 1024 * 1024;
 
+/// How long a peer may take to finish the TLS handshake. Without a deadline an
+/// uncredentialed peer that never completes it holds a socket and a task forever.
+const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// How long a peer may take to send one request frame (up to `MAX_FRAME_BYTES`).
+const REQUEST_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+/// Concurrent inbound RPC connections; more wait in the kernel backlog.
+const MAX_CONNECTIONS: usize = 512;
+
 /// A Raft RPC sent over the wire.
 #[derive(Debug, Serialize, Deserialize)]
 enum RaftRequest {
@@ -383,22 +391,38 @@ pub async fn serve_raft_rpc(
         "raft rpc server listening"
     );
 
+    let limit = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
     let handle = tokio::spawn(async move {
         loop {
+            let permit = limit
+                .clone()
+                .acquire_owned()
+                .await
+                .expect("the connection semaphore is never closed");
             match listener.accept().await {
                 Ok((stream, peer)) => {
                     let raft = raft.clone();
                     let tls = tls.clone();
                     tokio::spawn(async move {
+                        let _permit = permit;
                         // When TLS is configured, an uncredentialed peer
                         // fails the handshake here and never reaches Raft.
                         let stream: BoxStream = match tls {
                             Some(config) => {
                                 let acceptor = tokio_rustls::TlsAcceptor::from(config);
-                                match acceptor.accept(stream).await {
-                                    Ok(s) => Box::new(s),
-                                    Err(e) => {
+                                match tokio::time::timeout(
+                                    HANDSHAKE_TIMEOUT,
+                                    acceptor.accept(stream),
+                                )
+                                .await
+                                {
+                                    Ok(Ok(s)) => Box::new(s),
+                                    Ok(Err(e)) => {
                                         tracing::debug!(%peer, error = %e, "raft rpc TLS handshake rejected");
+                                        return;
+                                    }
+                                    Err(_) => {
+                                        tracing::debug!(%peer, "raft rpc TLS handshake timed out");
                                         return;
                                     }
                                 }
@@ -426,15 +450,25 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
     mut stream: S,
     raft: Raft<TypeConfig>,
 ) -> Result<(), TransportError> {
-    // Read length-prefixed request.
-    let len = stream.read_u32().await?;
-    if len > MAX_FRAME_BYTES {
-        return Err(TransportError::Decode(format!(
-            "frame length {len} exceeds {MAX_FRAME_BYTES} byte cap"
-        )));
-    }
-    let mut buf = vec![0u8; len as usize];
-    stream.read_exact(&mut buf).await?;
+    // Read length-prefixed request, within a deadline.
+    let buf = tokio::time::timeout(REQUEST_READ_TIMEOUT, async {
+        let len = stream.read_u32().await?;
+        if len > MAX_FRAME_BYTES {
+            return Err(TransportError::Decode(format!(
+                "frame length {len} exceeds {MAX_FRAME_BYTES} byte cap"
+            )));
+        }
+        let mut buf = vec![0u8; len as usize];
+        stream.read_exact(&mut buf).await?;
+        Ok(buf)
+    })
+    .await
+    .map_err(|_| {
+        TransportError::Io(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "request read timed out",
+        ))
+    })??;
 
     let request: RaftRequest =
         crate::codec::decode_wire(&buf).map_err(|e| TransportError::Decode(e.to_string()))?;
