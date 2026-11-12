@@ -1,6 +1,7 @@
 ---
 import BaseLayout from '../layouts/BaseLayout.astro';
 import ArchitectureDiagram from '../components/ArchitectureDiagram.astro';
+import Callout from '../components/Callout.astro';
 import CodeBlock from '../components/CodeBlock.astro';
 import ComparisonTable from '../components/ComparisonTable.astro';
 import CTA from '../components/CTA.astro';
@@ -15,6 +16,7 @@ import { features } from '../data/features';
 import { assertInReadme, deployOutput, deployOutputLabel, prerequisites, steps } from '../data/quickstart';
 import { featuredArticles } from '../data/writing';
 import { latestRelease, listAdrs, readRepo, readmeLimits, renderRepoMarkdown } from '../lib/repo';
+import { githubUrl } from '../lib/routes';
 import { softwareLd } from '../lib/seo';
 
 const { version } = latestRelease();
@@ -146,6 +148,48 @@ ${deployOutput.split('\n').slice(3).join('\n')}`;
           </ol>
         </div>
       </div>
+    </div>
+  </section>
+
+  <section class="section" aria-labelledby="footprint">
+    <div class="wrap">
+      <h2 id="footprint">What it costs to run</h2>
+      <p class="lede">
+        Idle memory (RSS) of the orchestration layer, measured on three Hetzner ARM64 hosts: Minga v1.0.1, a Docker
+        Compose host and a Docker Swarm manager.
+      </p>
+      <div class="grid grid-3">
+        <div class="card">
+          <p class="stat mono">59 MB</p>
+          <h3>Minga control plane</h3>
+          <p>
+            Manager, API and the NATS sidecar. <code>dockerd</code> used 101 MB on the Compose host and 311 MB on the
+            Swarm manager.
+          </p>
+        </div>
+        <div class="card">
+          <p class="stat mono">119 MB</p>
+          <h3>With containerd</h3>
+          <p>The same comparison counting the container runtime: 169 MB for Compose, 377 MB for Swarm.</p>
+        </div>
+        <div class="card">
+          <p class="stat mono">0</p>
+          <h3>Port proxy processes</h3>
+          <p>
+            Published ports use iptables DNAT. The Compose host ran one <code>docker-proxy</code> per published port, 4
+            in all.
+          </p>
+        </div>
+      </div>
+      <Callout kind="limit">
+        One idle snapshot per host, no load test. The workloads are not matched (4, 24 and 8 containers on the measured
+        node), Minga had been up 9 hours and the Docker hosts for weeks, and the Swarm manager ran on a bigger node.
+        Part of the gap may come from the workload, not the orchestrator. v1.0.1 was measured; v{version} has not been
+        re-measured yet.
+      </Callout>
+      <p>
+        <a href={githubUrl('docs/benchmark.md')}>Full benchmark: method, environments and caveats</a>
+      </p>
     </div>
   </section>
 
@@ -407,6 +451,11 @@ ${deployOutput.split('\n').slice(3).join('\n')}`;
   }
   .sites dd {
     margin: 0.3em 0 0;
+  }
+  .stat {
+    font: 700 var(--step-4) var(--mono);
+    color: var(--accent);
+    margin: 0 0 0.2em;
   }
   .compact-list {
     list-style: none;
