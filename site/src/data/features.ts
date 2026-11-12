@@ -1,4 +1,4 @@
-// Feature list. Every entry maps to a capability that ships in v1.1.0; `caveat` says where it stops.
+// Feature list. Every entry maps to a capability that ships in v1.1.1; `caveat` says where it stops.
 // The two `lead` entries are what an evaluator replacing Swarm checks first, so they get the large
 // treatment; the rest are a compact list (DESIGN.md §5.8, antislop R-14).
 export interface Feature {

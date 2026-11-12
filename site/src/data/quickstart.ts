@@ -11,7 +11,7 @@ export interface Step {
 
 export const prerequisites = [
   'Linux with root (the supervisor creates netns, bridges and iptables rules)',
-  'Install from the v1.1.0 release archive; it includes minga, nats-server and ctr.',
+  'Install from the v1.1.1 release archive; it includes minga, nats-server and ctr.',
   'containerd running (1.7 or newer for private registries)',
   'iproute2, iptables and procps (any standard server install)',
   'Free loopback ports 7001, 7002, 2375 and 9100',

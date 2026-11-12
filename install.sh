@@ -4,7 +4,7 @@
 # Usage:
 #   curl -fsSL https://github.com/lithqube/minga/releases/latest/download/install.sh | sh
 #   curl -fsSL .../install.sh | sh -s -- --with-systemd
-#   ./install.sh --version v1.1.0 --prefix /opt/minga/bin
+#   ./install.sh --version v1.1.1 --prefix /opt/minga/bin
 #   ./install.sh --uninstall
 #
 # Options (environment equivalents work too):
@@ -32,7 +32,7 @@ usage() {
 Usage:
   curl -fsSL https://github.com/lithqube/minga/releases/latest/download/install.sh | sh
   curl -fsSL .../install.sh | sh -s -- --with-systemd
-  ./install.sh --version v1.1.0 --prefix /opt/minga/bin
+  ./install.sh --version v1.1.1 --prefix /opt/minga/bin
   ./install.sh --uninstall
 
 Options (environment equivalents work too):
@@ -129,7 +129,7 @@ case "$arch" in
     *) fail "unsupported architecture: $arch" ;;
 esac
 
-# Accept "1.1.0" for "v1.1.0".
+# Accept "1.1.1" for "v1.1.1".
 if [ "$VERSION" != "latest" ] && [ "${VERSION#v}" = "$VERSION" ]; then
     VERSION="v$VERSION"
 fi

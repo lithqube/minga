@@ -29,7 +29,7 @@ Flags change between releases. Before running a command you have not run in this
 
 **Compose files deploy unchanged.** Minga rejects unknown or unsupported keys with an error instead of skipping them, because a silently dropped key means the workload runs differently from what the file says. When validation rejects a key, do not delete or rewrite it to get past the error. Tell the user which key and service it is and what dropping it would change, and let them decide.
 
-Relative bind mounts resolve on the machine that runs the deploy. `minga-ctl stack deploy` refuses them when the node is another machine; use an absolute path on the node, or deploy from the node.
+Relative bind mounts resolve on the machine that runs the deploy, against the compose file's directory (the current directory for a bare `-c compose.yaml`, from v1.1.1). The API refuses a relative source, so a client that does not resolve them gets an error, not a guess. `minga-ctl stack deploy` refuses them when the node is another machine; use an absolute path on the node, or deploy from the node. A task failing with `failed to fulfil mount request: ... no such file or directory` on v1.1.0 or older is usually a relative source the node resolved against its own working directory: redeploy with v1.1.1 or an absolute path.
 
 ## Day-2 with minga-ctl
 
