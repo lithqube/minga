@@ -182,13 +182,15 @@ if [ "$WITH_SYSTEMD" = "1" ]; then
     [ -f "$tmp/minga.service" ] || fail "this archive predates the systemd files; use a newer release"
     [ "$(id -u)" = "0" ] || [ -n "$sudo_sys" ] || fail "--with-systemd needs root or sudo"
     $sudo_sys install -m 0644 "$tmp/minga.service" /etc/systemd/system/minga.service
-    $sudo_sys mkdir -p /etc/minga
+    # minga.env holds tokens (MINGA_NATS_TOKEN, API tokens): root-only.
+    $sudo_sys install -d -m 0700 /etc/minga
     if [ -f /etc/minga/minga.env ]; then
-        echo "kept existing /etc/minga/minga.env (template: $share/minga.env.example)"
+        $sudo_sys chmod 0600 /etc/minga/minga.env
+        echo "kept existing /etc/minga/minga.env, now mode 0600 (template: $share/minga.env.example)"
         $sudo_sys install -m 0644 "$tmp/minga.env.example" "$share/minga.env.example"
     else
-        $sudo_sys install -m 0644 "$tmp/minga.env.example" /etc/minga/minga.env
-        echo "wrote /etc/minga/minga.env template"
+        $sudo_sys install -m 0600 "$tmp/minga.env.example" /etc/minga/minga.env
+        echo "wrote /etc/minga/minga.env template (mode 0600)"
     fi
     $sudo_sys systemctl daemon-reload
     echo "next: edit /etc/minga/minga.env, then: sudo systemctl enable --now minga"

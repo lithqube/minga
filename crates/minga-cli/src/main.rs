@@ -1,5 +1,6 @@
 mod bus;
 mod deploy;
+mod private;
 mod sidecar;
 mod state;
 
@@ -756,9 +757,9 @@ fn run_tls(cmd: TlsCommand) -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
-            if let Err(e) = std::fs::create_dir_all(&dir)
+            if let Err(e) = private::create_dir(&dir)
                 .and_then(|()| std::fs::write(&ca_pem, ca.pem()))
-                .and_then(|()| std::fs::write(&ca_key_pem, key.serialize_pem()))
+                .and_then(|()| private::write_file(&ca_key_pem, key.serialize_pem().as_bytes()))
             {
                 eprintln!("error: writing CA material: {e}");
                 return ExitCode::FAILURE;
@@ -834,9 +835,9 @@ fn run_tls(cmd: TlsCommand) -> ExitCode {
             };
             let node_pem = out_dir.join("node.pem");
             let node_key_pem = out_dir.join("node-key.pem");
-            if let Err(e) = std::fs::create_dir_all(&out_dir)
+            if let Err(e) = private::create_dir(&out_dir)
                 .and_then(|()| std::fs::write(&node_pem, cert.pem()))
-                .and_then(|()| std::fs::write(&node_key_pem, key.serialize_pem()))
+                .and_then(|()| private::write_file(&node_key_pem, key.serialize_pem().as_bytes()))
             {
                 eprintln!("error: writing node material: {e}");
                 return ExitCode::FAILURE;
