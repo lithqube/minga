@@ -1,6 +1,9 @@
 # minga-ctl: design plan
 
-Status: proposed, 2026-11-11. Nothing here is implemented yet.
+Status: phase 1 implemented, 2026-11-12. All seven build-order steps in
+section 6 are in `crates/minga-ctl`. They are covered by tests against stubs
+and test API servers, but have not yet been run against a real node over
+SSH. Phase 2 (section 2.3) is not started.
 
 `minga-ctl` is a companion CLI for Minga: named contexts for several
 environments, stack and service operations, health, metrics and release
