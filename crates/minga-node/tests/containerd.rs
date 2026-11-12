@@ -128,6 +128,34 @@ async fn missing_image_fails_after_pull_attempt() {
     );
 }
 
+/// A failed pull must be reported before any network is set up. The runtime
+/// here has no node networking, so a task with IPs fails on that first if the
+/// network is prepared ahead of the pull.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn pull_failure_comes_before_network_setup() {
+    let socket = socket_path();
+    if !containerd_available_at(&socket) {
+        eprintln!("SKIP: containerd not available at {socket}");
+        return;
+    }
+    let Ok(runtime) = ContainerdRuntime::connect(&socket).await else {
+        eprintln!("SKIP: cannot connect to containerd");
+        return;
+    };
+    let mut spec = test_spec("docker.io/library/minga-nonexistent-image:never");
+    spec.ips = HashMap::from([("net".to_string(), "10.99.0.2".to_string())]);
+    let err = runtime
+        .start(&"minga-pull-failure-probe".to_string(), &spec)
+        .await
+        .expect_err("missing image must fail closed");
+    let msg = err.to_string();
+    assert!(
+        !msg.contains("networking is not configured"),
+        "the network must not be prepared before the image is pulled: {msg}"
+    );
+}
+
 #[tokio::test]
 async fn containerd_stop_nonexistent_is_graceful() {
     let socket = socket_path();
@@ -290,42 +318,66 @@ async fn containerd_named_user_resolves_from_the_image() {
     let logs_dir = tempfile::tempdir().unwrap();
     let runtime = runtime.with_logs_dir(logs_dir.path());
 
-    let task_id = "minga-test-named-user-001".to_string();
-    let spec = TaskSpec {
-        image: "docker.io/library/busybox:latest".to_string(),
-        user: Some("nobody:root".to_string()),
-        command: vec!["sh".into(), "-c".into(), "id; sleep 30".into()],
-        ..Default::default()
-    };
-    runtime
-        .start(&task_id, &spec)
-        .await
-        .expect("a named user from the image's passwd must start");
-
-    let mut out = Vec::new();
-    for _ in 0..20 {
-        out = runtime
-            .logs(&task_id, 0)
-            .await
-            .into_iter()
-            .flat_map(|c| c.data)
-            .collect();
-        if out.windows(9).any(|w| w == b"uid=65534") {
-            break;
+    // Starts a busybox task as `user`, returning its `id` and `id -G` output.
+    let run = |task_id: &'static str, user: &'static str| {
+        let runtime = &runtime;
+        async move {
+            let task_id = task_id.to_string();
+            let spec = TaskSpec {
+                image: "docker.io/library/busybox:latest".to_string(),
+                user: Some(user.to_string()),
+                command: vec![
+                    "sh".into(),
+                    "-c".into(),
+                    "id; echo G=$(id -G); sleep 30".into(),
+                ],
+                ..Default::default()
+            };
+            runtime
+                .start(&task_id, &spec)
+                .await
+                .expect("a user from the image's passwd must start");
+            let mut out = Vec::new();
+            for _ in 0..20 {
+                out = runtime
+                    .logs(&task_id, 0)
+                    .await
+                    .into_iter()
+                    .flat_map(|c| c.data)
+                    .collect();
+                if out.windows(2).any(|w| w == b"G=") && out.ends_with(b"\n") {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            runtime.stop(&task_id).await.expect("stop");
+            String::from_utf8_lossy(&out).into_owned()
         }
-        tokio::time::sleep(Duration::from_millis(250)).await;
-    }
-    runtime.stop(&task_id).await.expect("stop");
-    let out = String::from_utf8_lossy(&out);
+    };
+
+    let out = run("minga-test-named-user-001", "nobody:root").await;
     assert!(
         out.contains("uid=65534") && out.contains("gid=0"),
         "process must run as nobody:root, got {out:?}"
     );
 
+    // A named user is a member of the image's groups: busybox lists root
+    // in `wheel` (gid 10), which must be a supplementary group.
+    let out = run("minga-test-named-user-003", "root").await;
+    assert!(out.contains("G=0 10"), "root must be in wheel, got {out:?}");
+
+    // A numeric uid in the image's passwd takes its primary group, not 0.
+    let out = run("minga-test-named-user-004", "65534").await;
+    assert!(
+        out.contains("uid=65534") && out.contains("gid=65534"),
+        "a listed uid must run with its primary gid, got {out:?}"
+    );
+
     // An unknown name fails the start and rolls its snapshot back.
     let unknown = TaskSpec {
+        image: "docker.io/library/busybox:latest".to_string(),
         user: Some("no-such-user".to_string()),
-        ..spec
+        ..Default::default()
     };
     let error = runtime
         .start(&"minga-test-named-user-002".to_string(), &unknown)
