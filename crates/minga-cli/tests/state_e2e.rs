@@ -61,12 +61,27 @@ async fn cluster() -> (Arc<StateStore>, String, tempfile::TempDir) {
 }
 
 /// Runs `minga <args>`; returns (success, stdout, stderr).
+///
+/// Every proxy variable points at a closed port, so each call also proves the
+/// token and the snapshot never go through `HTTP_PROXY`/`ALL_PROXY`.
 fn minga(args: &[&str]) -> (bool, String, String) {
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_minga"))
-        .args(args)
-        .stdin(Stdio::null())
-        .output()
-        .expect("minga binary should run");
+    let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let proxy = format!("http://{}", closed.local_addr().unwrap());
+    drop(closed);
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_minga"));
+    cmd.args(args).stdin(Stdio::null());
+    for var in [
+        "HTTP_PROXY",
+        "http_proxy",
+        "HTTPS_PROXY",
+        "https_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+    ] {
+        cmd.env(var, &proxy);
+    }
+    cmd.env_remove("NO_PROXY").env_remove("no_proxy");
+    let out = cmd.output().expect("minga binary should run");
     (
         out.status.success(),
         String::from_utf8_lossy(&out.stdout).into_owned(),

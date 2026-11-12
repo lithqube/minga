@@ -22,8 +22,12 @@ fn client(opts: &ApiOptions) -> Result<reqwest::Client, String> {
                 .map_err(|_| "API token is not valid header data".to_string())?,
         );
     }
+    // The token and the snapshot go only to the API: no HTTP_PROXY/ALL_PROXY
+    // hop, no redirect to another host (same rule as minga-ctl's client).
     reqwest::Client::builder()
         .timeout(Duration::from_secs(60))
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
         .default_headers(headers)
         .build()
         .map_err(|e| format!("cannot build HTTP client: {e}"))
