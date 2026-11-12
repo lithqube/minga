@@ -1407,10 +1407,10 @@ impl Supervisor {
 
     /// Startup: containers outlive a supervisor restart under their shims, but
     /// the in-memory `running` map does not. Adopt every running container that
-    /// Raft still assigns here, so a later removal stops it, and stop the rest
-    /// now: a task deleted or rescheduled while this process was down would
-    /// otherwise keep running untracked, with its secrets, network and ports.
-    /// Returns the number of containers stopped.
+    /// Raft still assigns here, so a later removal stops it, and stop and remove
+    /// every other container, running or exited: a task deleted or rescheduled
+    /// while this process was down would otherwise keep running untracked, or
+    /// keep its secrets, network and ports. Returns the number removed.
     async fn recover_running_containers(&self) -> usize {
         let containers = self.runtime.list().await;
         if containers.is_empty() {
@@ -1434,14 +1434,16 @@ impl Supervisor {
             .collect();
         let mut stopped = 0;
         for c in containers {
-            if c.status != ContainerStatus::Running {
-                continue;
-            }
             if assigned.contains(&c.task_id) {
-                tracing::info!(task = %c.task_id, container = %c.id, "adopted running container");
-                self.running.lock().await.insert(c.task_id, c.id);
+                // A stopped one is left for reconcile, which restarts or replaces it.
+                if c.status == ContainerStatus::Running {
+                    tracing::info!(task = %c.task_id, container = %c.id, "adopted running container");
+                    self.running.lock().await.insert(c.task_id, c.id);
+                }
                 continue;
             }
+            // Stopped leftovers too: `stop` also removes their netns, DNAT
+            // rules, snapshot and staged secrets.
             match self.runtime.stop(&c.id).await {
                 Ok(()) => {
                     stopped += 1;
@@ -1678,10 +1680,16 @@ mod tests {
             .start(&"orphan".to_string(), &make_spec())
             .await
             .unwrap();
-        // While it was down, "orphan" was removed from Raft; "kept" still runs here.
+        // An exited container whose netns and secrets were never torn down.
+        runtime
+            .start(&"dead-orphan".to_string(), &make_spec())
+            .await
+            .unwrap();
+        runtime.mark_failed("dead-orphan");
+        // While it was down, the orphans were removed from Raft; "kept" still runs here.
         store.upsert_task(make_task("kept", 1)).await.unwrap();
 
-        assert_eq!(supervisor.recover_running_containers().await, 1);
+        assert_eq!(supervisor.recover_running_containers().await, 2);
         assert_eq!(runtime.container_count(), 1);
         assert_eq!(supervisor.running_tasks().await, ["kept".to_string()]);
         // Adopted, so the next pass neither restarts it nor leaves it alone

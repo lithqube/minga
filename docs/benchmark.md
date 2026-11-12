@@ -231,7 +231,7 @@ and deprecated fields).
 | `env_file` not supported                       | High — used in nearly every real stack              | Fixed (#16)                                                                      |
 | Named `user:` rejected                         | High — ZITADEL, Python services use named users     | Fixed (#21): resolved from the image's `/etc/passwd`; #16 only improved the error |
 | `ctr images unpack` removed in containerd v2.2 | High — silent deploy failure on Ubuntu 24.04        | Fixed: automatic pull in #18, `minga image pull` in #21                          |
-| Orphan tasks persist across restarts           | High — requires manual containerd cleanup           | Fixed (#18)                                                                      |
+| Orphan tasks persist across restarts           | High — requires manual containerd cleanup           | Stopped tasks fixed (#18); running leftovers and exited containers' network and secrets from 1.2.0 |
 | `extra_hosts` not supported                    | Medium                                              | Fixed (#16); #21 makes `host-gateway` the host's bridge address, not the router  |
 | `command: >` folded scalar not argv-split      | Medium — breaks any string `command`, not just `>`  | Fixed (#21): shell-split as Compose does                                         |
 | `~/.docker/config.json` not read by `ctr`      | Medium — private registries require manual pre-pull | Fixed: automatic pull in #16; #21 adds `minga image pull`, `DOCKER_CONFIG`, Docker Hub keys |
