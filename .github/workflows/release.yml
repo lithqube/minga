@@ -7,11 +7,17 @@ on:
   # builds the archives and pushes ghcr.io/<owner>/minga:edge only.
   workflow_dispatch:
 
+# Read-only by default; only the image and publish jobs get write scopes.
+# Every action is pinned to a full commit SHA: a moved tag cannot change
+# what runs with those scopes.
 permissions:
-  contents: write
-  packages: write
+  contents: read
 
 env:
+  # The release is built with this exact toolchain. RUSTUP_TOOLCHAIN wins
+  # over rust-toolchain.toml's floating `stable` channel.
+  RUSTUP_TOOLCHAIN: "1.99.0"
+  RUSTUP_VERSION: "1.29.3"
   # Bundled next to `minga`; the manager's NATS sidecar looks there first.
   NATS_VERSION: v2.10.22
   # Bundled as `ctr`: workload images are preloaded into the `minga`
@@ -27,14 +33,17 @@ jobs:
         include:
           # nats_sha256 / ctr_sha256: from the upstream release's SHA256SUMS,
           # pinned so a replaced archive fails before it is extracted.
+          # rustup_sha256: static.rust-lang.org/rustup/archive/<RUSTUP_VERSION>/<target>/rustup-init.sha256
           - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
+            rustup_sha256: b1c8cb14e30889e7e2999e6b69e62d9e9b9ffc0f4df8180564d306d9680e6c55
             nats_arch: amd64
             nats_sha256: db0b3ccbe4cbdd3872ae7486ec4f6b0f85824632a0789f4da2e0a8518390483e
             ctr_arch: amd64
             ctr_sha256: 50e53500800f4f74d0d8b2e57e939297eab68b0fe11a0957b771d5faa61fae5b
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
+            rustup_sha256: 9f608c142e0e38a78957d0661ba1dfaf0b6fb37184cfaa4b9a0aa57af6184282
             nats_arch: arm64
             nats_sha256: b4da77b2b194dc5fcf13a1df0dad59ba7e87ae4423f254c50534015b7c8a2369
             ctr_arch: arm64
@@ -54,11 +63,18 @@ jobs:
           apt-get update
           apt-get install -y --no-install-recommends git curl ca-certificates build-essential pkg-config perl
 
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
 
       - name: Install Rust
         run: |
-          curl -fsSL https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
+          # Pinned rustup-init, checked against its published SHA-256, instead of `curl | sh`.
+          curl -fsSL -o rustup-init "https://static.rust-lang.org/rustup/archive/${RUSTUP_VERSION}/${{ matrix.target }}/rustup-init"
+          echo "${{ matrix.rustup_sha256 }}  rustup-init" | sha256sum -c -
+          chmod +x rustup-init
+          ./rustup-init -y --default-toolchain "$RUSTUP_TOOLCHAIN" --profile minimal
+          rm rustup-init
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
           # GITHUB_PATH only reaches later steps; this step needs the
           # toolchain on PATH right now (rustup lands in $HOME/.cargo/bin).
@@ -77,7 +93,7 @@ jobs:
             exit 1
           fi
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
 
       - name: Build the release binary
         run: cargo build --release -p minga-cli --target ${{ matrix.target }}
@@ -118,7 +134,7 @@ jobs:
             minga nats-server ctr NATS-LICENSE install.sh README.md LICENSE CHANGELOG.md \
             minga.service minga.env.example
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: minga-${{ matrix.target }}
           path: minga-${{ matrix.target }}.tar.gz
@@ -127,10 +143,15 @@ jobs:
     name: Push image to GHCR
     needs: build
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
 
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           path: artifacts
           merge-multiple: true
@@ -145,17 +166,17 @@ jobs:
           tar -xzf artifacts/minga-aarch64-unknown-linux-gnu.tar.gz -C dist/linux-arm64
           cp LICENSE dist/
 
-      - uses: docker/setup-qemu-action@v4
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4
 
-      - uses: docker/setup-buildx-action@v4
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
 
-      - uses: docker/login-action@v4
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: docker/metadata-action@v6
+      - uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
         id: meta
         with:
           images: ghcr.io/${{ github.repository }}
@@ -166,7 +187,7 @@ jobs:
             type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/') && !contains(github.ref_name, '-') }}
             type=raw,value=edge,enable=${{ github.event_name == 'workflow_dispatch' }}
 
-      - uses: docker/build-push-action@v7
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
         with:
           context: dist
           file: ./Dockerfile
@@ -180,10 +201,14 @@ jobs:
     needs: build
     if: github.event_name == 'push'
     runs-on: ubuntu-24.04
+    permissions:
+      contents: write
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
 
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           path: dist
           merge-multiple: true
@@ -192,7 +217,7 @@ jobs:
         run: cd dist && sha256sum minga-*.tar.gz > SHA256SUMS && cat SHA256SUMS
 
       - name: Upload release assets
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3
         with:
           generate_release_notes: true
           # Stable tags publish the versioned image, major.minor, and latest.
