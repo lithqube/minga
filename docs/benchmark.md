@@ -270,3 +270,128 @@ deployments. In these environments the control plane used ~42% less memory than
 `dockerd` and ~81% less than a Swarm manager; a matched-workload run would show how
 much of that gap is the orchestrator itself. Recommend
 tracking the WireGuard mesh milestone before adopting for multi-node production.
+
+---
+
+## Update: v1.2.0-rc.1 benchmark (2026-11-12)
+
+_Same VPS (Hetzner CAX21, ARM64, Ubuntu 24.04). Measured after upgrading from
+v1.1.0 to v1.2.0-rc.1 and redeploying an 11-service stack (7 running,
+4 pending images/secrets). Host uptime at measurement: 1 day 10h; the uptime of
+the Minga processes themselves was not recorded._
+
+> This update compares two different workloads on one host, one snapshot per
+> version. It shows that the control plane did not grow much. It does not
+> isolate what the 1.2.0 changes cost; see [the caveats](#caveats-for-this-update).
+
+### Memory footprint — orchestration layer
+
+| Component               | v1.0.1 (baseline) | v1.2.0-rc.1 | Delta    |
+| ----------------------- | ----------------- | ----------- | -------- |
+| `minga manager`         | 23 MB             | 24 MB       | +1 MB    |
+| `minga api`             | 19 MB             | 20 MB       | +1 MB    |
+| `nats-server` sidecar   | 17 MB             | 17 MB       | ±0       |
+| **Minga control plane** | **59 MB**         | **61 MB**   | +2 MB    |
+| `containerd`            | 60 MB             | 65 MB       | +5 MB    |
+| **Orchestration total** | **~119 MB**       | **~126 MB** | +7 MB    |
+| Containerd shims        | 3                 | 7           | +4 shims |
+
+The total is the control plane plus `containerd`. As in the baseline table
+above, it leaves out the container shims, for every environment, so shim sizes
+are not compared here. The workloads differ (4 vs 7 running containers), so the
++7 MB cannot be assigned to the version or to the workload.
+
+```mermaid
+xychart-beta
+    title "Orchestration overhead (MB RSS); Docker figures are from the original run"
+    x-axis ["Minga v1.0.1", "Minga v1.2.0-rc.1", "Docker Compose", "Docker Swarm"]
+    y-axis "MB RSS" 0 --> 400
+    bar [119, 126, 169, 377]
+```
+
+### System overview
+
+| Metric                 | v1.0.1             | v1.2.0-rc.1        |
+| ---------------------- | ------------------ | ------------------ |
+| Services deployed      | 8 (4 running)      | 11 (7 running)     |
+| Total host processes   | 152                | 171                |
+| Total RAM used         | 571 MB (7.6%)      | 1,480 MB (19.1%)   |
+| CPU idle               | 100%               | 95.6%              |
+| Load average           | 0.00 / 0.02 / 0.00 | 0.17 / 0.45 / 0.34 |
+| docker-proxy processes | 0                  | 0                  |
+| Disk used              | 8.2 GB             | 12 GB              |
+
+The RAM increase (571 → 1,480 MB) is application workload: Infisical (764 MB
+`node`), Fastify (161 MB `node`), Traefik (89 MB), three Postgres instances.
+The control plane differed by 2 MB between the two runs. That figure includes
+everything that differs between them (workload, state size, process age), not
+only the 1.2.0 changes.
+
+### Security hardening: where it acts (cost not measured)
+
+v1.2.0-rc.1 addresses the 12 P1 leads of a source-only security audit. None was
+confirmed as exploitable before the fixes, and the plaintext-Raft lead gets a
+warning only. The table says where each change acts, not what it costs. None of
+these costs was measured, and process RSS is not the right metric for them:
+they act in the kernel, in runc or in file modes, so container start latency
+and rule counts would be.
+
+| Hardening change                   | Where it acts                                                                          | Cost         |
+| ---------------------------------- | -------------------------------------------------------------------------------------- | ------------ |
+| Task network isolation             | iptables rules per bridge (loopback guard, cross-bridge drop); per-task netns is older | Not measured |
+| Masked and read-only `/proc` paths | OCI `maskedPaths` and `readonlyPaths`, applied by runc                                 | Not measured |
+| Owner-only files                   | File modes on keys, data directories and config                                        | Not measured |
+| Listener limits                    | Header-read timeout and connection cap on the API, metrics and egress listeners        | Not measured |
+
+The API token check is not in this table: tokens predate 1.2.0, and the check
+only applies when a token is configured.
+
+### Blocker status update
+
+| Issue (from v1.0.1 assessment)                 | v1.2.0-rc.1 status                                                                                                                              |
+| ---------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| `env_file` not supported                       | Fixed (v1.0.2)                                                                                                                                  |
+| Named `user:` rejected                         | Fixed (v1.0.2)                                                                                                                                  |
+| `ctr images unpack` removed in containerd v2.2 | Fixed (v1.0.2)                                                                                                                                  |
+| Orphan tasks persist across restarts           | Stopped tasks fixed in v1.0.2; running leftovers, and exited containers' network and secrets, from v1.2.0                                       |
+| `extra_hosts` not supported                    | Fixed (v1.0.2)                                                                                                                                  |
+| `command: >` folded scalar not argv-split      | Fixed (v1.0.2)                                                                                                                                  |
+| `~/.docker/config.json` not read by `ctr`      | Fixed (v1.0.2)                                                                                                                                  |
+| Relative bind mounts not resolved              | Fixed in v1.0.2 for a compose file with a directory part; the default `-c compose.yaml` is fixed in v1.2.0 (prepared as v1.1.1, never released) |
+
+### Updated rating
+
+| Dimension                                  | v1.0.1 | v1.0.2 | v1.2.0-rc.1 |
+| ------------------------------------------ | ------ | ------ | ----------- |
+| Architecture and design                    | 8/10   | 8/10   | 8/10        |
+| Compose compatibility                      | 4/10   | 7/10   | 7/10        |
+| Security posture                           | 4/10   | 5/10   | Pending     |
+| Production readiness (single-node)         | 5/10   | 7/10   | Pending     |
+| Operational tooling (minga-ctl, prune, rm) | 3/10   | 4/10   | 7/10        |
+| Multi-node production readiness            | 3/10   | 3/10   | 3/10        |
+| Documentation                              | 6/10   | 6/10   | 7/10        |
+
+Ratings that depend on the staging checks in
+[release-1.2.0.md](release-1.2.0.md#verification-status) stay pending until
+those have run. Compose compatibility stays at 7/10: 1.2.0 adds no Compose
+feature beyond the bind-mount fix.
+
+**v1.2.0-rc.1 summary:** On the same VPS the control plane measured 61 MB
+against 59 MB for v1.0.1, under a larger workload and with fresh processes. The
+audit's P1 leads are addressed in code but not yet validated on a node, so the
+security and production-readiness ratings wait for the staging checks. All 8
+of the original v1.0.1 blockers are fixed; two of them needed a release after
+v1.0.2 (see above).
+
+### Caveats for this update
+
+- **One snapshot per version**, not averages.
+- **Different workloads:** 8 services (4 running) against 11 (7 running).
+- **Process age:** the v1.0.1 baseline process was 9 h old. The uptime of the
+  rc.1 processes was not recorded; the rc.1 archive was published on the date
+  of this update, so they started that day at the earliest. Fresh processes
+  tend to show lower RSS than long-running ones.
+- **Shims** are left out of the totals, as in the baseline.
+- **Hardening costs** were not measured.
+- The Docker Compose and Swarm figures are from the original run on other
+  hosts, not re-measured.
