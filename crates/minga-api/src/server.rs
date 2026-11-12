@@ -143,6 +143,13 @@ pub fn build_router_with_auth(
         .route("/:version/configs/create", post(handlers::create_config))
         .route("/:version/configs/:id", get(handlers::get_config))
         .route("/:version/configs/:id", delete(handlers::delete_config))
+        // State backup and restore (admin-only once roles exist, ADR 0005).
+        .route(
+            "/:version/state",
+            get(handlers::export_state)
+                .post(handlers::import_state)
+                .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024)),
+        )
         // Fallback.
         .fallback(handlers::fallback)
         .with_state(api_state.clone())
@@ -1025,5 +1032,44 @@ mod tests {
         let (status, json) = send_request(router, req).await;
         assert_eq!(status, StatusCode::OK);
         assert!(json.as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn state_routes_need_the_token_and_check_version_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            StateStore::open(1, "127.0.0.1:0", dir.path(), BTreeMap::new())
+                .await
+                .unwrap(),
+        );
+        let router = build_router_with_auth(
+            store,
+            Arc::new(ReadyState::new()),
+            Some("s3cret".to_string()),
+        );
+
+        let req = Request::builder()
+            .uri("/v1.41/state")
+            .body(Body::empty())
+            .unwrap();
+        let (status, _) = send_request(router.clone(), req).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        // A newer file whose shape we cannot parse is refused on its version.
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1.41/state")
+            .header("Authorization", "Bearer s3cret")
+            .header("Content-Type", "application/json")
+            .body(Body::from(
+                r#"{"format_version": 99, "services": "new shape"}"#,
+            ))
+            .unwrap();
+        let (status, json) = send_request(router, req).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(json["message"]
+            .as_str()
+            .unwrap()
+            .contains("format version 99"));
     }
 }

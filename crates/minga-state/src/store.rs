@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use openraft::{BasicNode, Raft};
+use serde::{Deserialize, Serialize};
 use tokio::time::timeout;
 
 use crate::command::{StateCommand, StateResponse};
@@ -22,6 +23,24 @@ use crate::TypeConfig;
 
 /// How long to wait for leader election or write acknowledgment.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Desired state in a portable form, for backup and restore.
+///
+/// Holds services, networks, volumes and secret/config metadata. Nodes and
+/// tasks are left out: nodes re-register themselves and the scheduler
+/// re-places tasks. Secrets and configs are references, never values. Service
+/// specs do carry environment values, so treat a snapshot as sensitive.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct StateSnapshot {
+    /// [`crate::codec::FORMAT_VERSION`] of the build that exported it.
+    pub format_version: u8,
+    pub exported_at_unix: u64,
+    pub services: Vec<Service>,
+    pub networks: Vec<Network>,
+    pub volumes: Vec<Volume>,
+    pub secrets: Vec<Secret>,
+    pub configs: Vec<StateConfig>,
+}
 
 /// The cluster state store. Owns the Raft instance and provides
 /// a high-level API for the rest of Minga.
@@ -442,5 +461,63 @@ impl StateStore {
             .list_configs()
             .await
             .map_err(StateError::storage)
+    }
+
+    // --- backup and restore -----------------------------------------------------
+
+    /// Reads desired state into a [`StateSnapshot`].
+    pub async fn export(&self) -> Result<StateSnapshot, StateError> {
+        Ok(StateSnapshot {
+            format_version: crate::codec::FORMAT_VERSION,
+            exported_at_unix: crate::types::unix_now(),
+            services: self.list_services().await?,
+            networks: self.list_networks().await?,
+            volumes: self.list_volumes().await?,
+            secrets: self.list_secrets().await?,
+            configs: self.list_configs().await?,
+        })
+    }
+
+    /// Writes a snapshot through Raft, dependencies first: networks, secrets,
+    /// configs, volumes, then services. Nothing is written when the snapshot
+    /// is refused. Existing networks, volumes, secrets and configs are
+    /// upserted; existing services make this fail with
+    /// [`StateError::Conflict`] unless `overwrite` is set.
+    pub async fn import(&self, snapshot: StateSnapshot, overwrite: bool) -> Result<(), StateError> {
+        let want = crate::codec::FORMAT_VERSION;
+        if snapshot.format_version != want {
+            // shortcut: no migration exists yet, so any other version is refused.
+            return Err(StateError::BadSnapshot(format!(
+                "snapshot has format version {}, this build reads {want}",
+                snapshot.format_version
+            )));
+        }
+        if !overwrite {
+            let mut clashes = Vec::new();
+            for s in &snapshot.services {
+                if self.get_service(&s.id).await?.is_some() {
+                    clashes.push(s.id.clone());
+                }
+            }
+            if !clashes.is_empty() {
+                return Err(StateError::Conflict(clashes.join(", ")));
+            }
+        }
+        for n in snapshot.networks {
+            self.upsert_network(n).await?;
+        }
+        for s in snapshot.secrets {
+            self.upsert_secret(s).await?;
+        }
+        for c in snapshot.configs {
+            self.upsert_config(c).await?;
+        }
+        for v in snapshot.volumes {
+            self.upsert_volume(v).await?;
+        }
+        for s in snapshot.services {
+            self.upsert_service(s).await?;
+        }
+        Ok(())
     }
 }

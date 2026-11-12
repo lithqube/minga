@@ -55,7 +55,7 @@ use std::io::Cursor;
 pub use command::{StateCommand, StateResponse};
 pub use error::StateError;
 pub use network::{serve_raft_rpc, StubNetworkFactory, TcpNetworkFactory};
-pub use store::StateStore;
+pub use store::{StateSnapshot, StateStore};
 
 // The openraft type configuration for Minga's state store.
 openraft::declare_raft_types!(
