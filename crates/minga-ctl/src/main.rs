@@ -54,6 +54,9 @@ enum Command {
     Health(cmd::health::HealthArgs),
     /// Show the Prometheus metrics the cluster reports.
     Metrics,
+    /// Log nodes in to private container registries.
+    #[command(subcommand)]
+    Registry(cmd::registry::RegistryCommand),
 }
 
 /// The output format after `--json` is folded in.
@@ -131,6 +134,13 @@ fn run(cli: &Cli) -> Result<(), CtlError> {
             let conn = connect(cli).await?;
             cmd::metrics::run(&conn, format, quiet).await
         }),
+        Command::Registry(cmd) => api::block_on(cmd::registry::run(
+            cmd,
+            &resolve(cli)?,
+            format,
+            quiet,
+            cli.debug,
+        )),
     }
 }
 
