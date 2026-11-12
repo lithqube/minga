@@ -61,6 +61,13 @@ impl Pki {
         std::fs::write(dir.join("ca.pem"), self.ca.pem()).unwrap();
         std::fs::write(dir.join("node.pem"), cert.pem()).unwrap();
         std::fs::write(dir.join("node-key.pem"), key.serialize_pem()).unwrap();
+        // `minga tls` writes keys 0600 and the Raft loader refuses anything wider.
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            dir.join("node-key.pem"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
 
         RaftTlsConfig {
             ca_cert: dir.join("ca.pem"),
@@ -177,4 +184,20 @@ async fn foreign_ca_peer_cannot_join() {
         "a peer with a foreign CA's certificate must not join"
     );
     std::mem::forget(dir2);
+}
+
+#[tokio::test]
+async fn world_readable_node_key_is_refused() {
+    use std::os::unix::fs::PermissionsExt;
+    let pki = Pki::new();
+    let tls = pki.issue("n1");
+    std::fs::set_permissions(&tls.key, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let [addr] = free_addrs();
+    let dir = tempfile::tempdir().unwrap();
+
+    let err = match StateStore::open_secure(1, &addr, dir.path(), BTreeMap::new(), tls).await {
+        Ok(_) => panic!("a 0644 node key must be refused"),
+        Err(e) => e.to_string(),
+    };
+    assert!(err.contains("group or others"), "unexpected error: {err}");
 }

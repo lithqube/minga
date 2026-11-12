@@ -93,10 +93,9 @@ impl StateStore {
         tls: Option<RaftTlsConfig>,
     ) -> Result<Self, StateError> {
         let data_dir = data_dir.as_ref();
-        tokio::fs::create_dir_all(data_dir).await?;
-
         let log_path = data_dir.join("raft_log.redb");
         let sm_path = data_dir.join("state.redb");
+        owner_only(data_dir, &[&log_path, &sm_path])?;
 
         let log_store =
             RedbLogStore::open(&log_path).map_err(|e| StateError::storage(e.to_string()))?;
@@ -519,5 +518,56 @@ impl StateStore {
             self.upsert_service(s).await?;
         }
         Ok(())
+    }
+}
+
+/// Makes the data directory 0700 and each store file 0600 before redb opens them.
+///
+/// The Raft log and state machine hold every service's environment values in
+/// plaintext, so they get the same owner-only treatment as `minga state export`.
+/// Both are tightened when they already exist, so an upgrade fixes older installs.
+fn owner_only(dir: &Path, files: &[&Path]) -> std::io::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)?;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    for file in files {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(file)?
+            .set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::owner_only;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn data_dir_and_store_files_end_up_owner_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("data");
+        let file = dir.join("state.redb");
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+
+        owner_only(&dir, &[&file]).unwrap();
+        assert_eq!(mode(&dir), 0o700);
+        assert_eq!(mode(&file), 0o600);
+
+        // An install from before this change is tightened and keeps its data.
+        std::fs::write(&file, b"existing").unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+        owner_only(&dir, &[&file]).unwrap();
+        assert_eq!(mode(&dir), 0o700);
+        assert_eq!(mode(&file), 0o600);
+        assert_eq!(std::fs::read(&file).unwrap(), b"existing");
     }
 }
