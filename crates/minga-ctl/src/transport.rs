@@ -51,6 +51,11 @@ impl Connection {
             _tunnel: None,
         }
     }
+
+    /// The tunnel's API socket, when the connection goes over SSH.
+    pub fn api_socket(&self) -> Option<&Path> {
+        self._tunnel.as_ref().map(|t| t.api_sock.as_path())
+    }
 }
 
 /// Connects to the resolved context's cluster.
@@ -374,6 +379,16 @@ pub async fn remote_exec(
         stdout: output.stdout,
         stderr: output.stderr,
     })
+}
+
+/// `ssh` running `argv` on `target`, for a caller that streams its output
+/// (`service logs -f`). The same validation and quoting as [`remote_exec`].
+pub fn remote_command(
+    target: &str,
+    argv: &[RemoteArg<'_>],
+    debug: bool,
+) -> Result<Command, CtlError> {
+    Ok(ssh_command(&exec_args(target, argv)?, debug))
 }
 
 /// Reads the API token from `path` on `target`; in memory only.

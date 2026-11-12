@@ -118,6 +118,12 @@ impl ApiClient {
         &self.root
     }
 
+    /// The bearer token, for a wrapped `minga` that needs it in its
+    /// environment. Never put it in arguments.
+    pub fn token(&self) -> Option<&str> {
+        self.token.as_deref()
+    }
+
     /// `GET /v1.41/<path>` with optional Docker `filters`.
     pub async fn get(&self, path: &str, filters: Option<&Value>) -> Result<Value, CtlError> {
         let found = self.get_found(path, filters).await?;

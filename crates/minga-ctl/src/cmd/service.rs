@@ -1,19 +1,24 @@
 //! `minga-ctl service` (plan section 5.3).
-//!
-//! `logs` comes in build-order step 5.
 
 use std::collections::{BTreeMap, HashMap};
-use std::io::{BufRead, IsTerminal};
+use std::io::{BufRead, IsTerminal, Write};
+use std::process::Stdio;
 
 use clap::{ArgGroup, Subcommand};
 use serde_json::{json, Value};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, BufReader};
 
 use crate::api::{self, ApiClient, Found};
+use crate::cmd::image;
+use crate::config::Resolved;
 use crate::error::CtlError;
 use crate::output::{self, Format, Rows};
 use crate::state;
-use crate::transport::Connection;
+use crate::transport::{self, Connection, RemoteArg};
 use crate::view;
+
+/// NATS URL for `minga logs` when the context sets none.
+const DEFAULT_NATS_URL: &str = "nats://127.0.0.1:4222";
 
 /// Service commands.
 #[derive(Debug, Subcommand)]
@@ -28,6 +33,17 @@ pub enum ServiceCommand {
     Ps {
         /// Service ID, `<stack>.<service>`.
         service: String,
+    },
+    /// Print the logs of a service's running tasks with `minga logs`.
+    Logs {
+        /// Service ID, `<stack>.<service>`.
+        service: String,
+        /// Keep printing new lines until interrupted.
+        #[arg(short = 'f', long)]
+        follow: bool,
+        /// Lines to show from the end of each task's log; 0 means all.
+        #[arg(long, default_value_t = 100)]
+        tail: u64,
     },
     /// Set the replica count of a replicated service.
     Scale {
@@ -76,7 +92,9 @@ impl ServiceCommand {
     /// state. Environment values are left out: `--env-add` logs the key.
     pub fn audit(&self) -> Option<(&'static str, Value)> {
         match self {
-            ServiceCommand::Ls { .. } | ServiceCommand::Ps { .. } => None,
+            ServiceCommand::Ls { .. } | ServiceCommand::Ps { .. } | ServiceCommand::Logs { .. } => {
+                None
+            }
             ServiceCommand::Scale { service, replicas } => Some((
                 "service scale",
                 json!({ "service": service, "replicas": replicas }),
@@ -112,6 +130,8 @@ impl ServiceCommand {
 pub async fn run(
     cmd: &ServiceCommand,
     conn: &Connection,
+    resolved: &Resolved,
+    debug: bool,
     format: Format,
     quiet: bool,
 ) -> Result<(), CtlError> {
@@ -119,6 +139,11 @@ pub async fn run(
     match cmd {
         ServiceCommand::Ls { stack } => ls(client, stack.as_deref(), format, quiet).await,
         ServiceCommand::Ps { service } => ps(client, service, format, quiet).await,
+        ServiceCommand::Logs {
+            service,
+            follow,
+            tail,
+        } => logs(client, resolved, service, *follow, *tail, debug).await,
         ServiceCommand::Scale { service, replicas } => {
             scale(client, service, *replicas, format, quiet).await
         }
@@ -143,6 +168,127 @@ pub async fn run(
             })
             .await
         }
+    }
+}
+
+/// `minga logs` for each running task, on the context's SSH target or here.
+/// Every line gets the task ID in front; stderr stays on stderr.
+async fn logs(
+    client: &ApiClient,
+    resolved: &Resolved,
+    id: &str,
+    follow: bool,
+    tail: u64,
+    debug: bool,
+) -> Result<(), CtlError> {
+    read(client, id).await?;
+    let filter = json!({ "service": [id], "desired-state": ["running"] });
+    let tasks = client.get("tasks", Some(&filter)).await?;
+    let nats = resolved
+        .context
+        .nats_url
+        .as_deref()
+        .unwrap_or(DEFAULT_NATS_URL);
+    let tail = tail.to_string();
+    let mut running = Vec::new();
+    for task in view::items(&tasks) {
+        let task = view::id(task);
+        transport::validate_id(task)?;
+        let mut argv = vec![
+            RemoteArg::Fixed("minga"),
+            RemoteArg::Fixed("logs"),
+            RemoteArg::Value(task),
+            RemoteArg::Fixed("--tail"),
+            RemoteArg::Value(&tail),
+        ];
+        if follow {
+            argv.push(RemoteArg::Fixed("-f"));
+        }
+        argv.extend([RemoteArg::Fixed("--nats-url"), RemoteArg::Value(nats)]);
+        let ssh = resolved.context.ssh.as_deref();
+        let mut cmd = match ssh {
+            Some(target) => transport::remote_command(target, &argv, debug)?,
+            None => image::local_command(&argv, "service logs")?,
+        };
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let child = cmd.spawn().map_err(|e| match ssh {
+            Some(target) => CtlError::Ssh {
+                target: target.to_string(),
+                detail: format!("cannot run ssh: {e}"),
+            },
+            None => image::spawn_error(e, &argv, "service logs"),
+        })?;
+        running.push(tokio::spawn(stream(task.to_string(), child)));
+    }
+    if running.is_empty() {
+        eprintln!("{id} has no running tasks");
+    }
+    let mut failed = Vec::new();
+    for handle in running {
+        let (task, status) = handle
+            .await
+            .map_err(|e| CtlError::Halted(format!("a log stream stopped: {e}")))?;
+        match status.map(|s| s.code()) {
+            Ok(Some(0)) => {}
+            Ok(Some(127)) => {
+                return Err(CtlError::MissingBinary {
+                    bin: "minga".to_string(),
+                    command: "service logs".to_string(),
+                })
+            }
+            Ok(Some(255)) if resolved.context.ssh.is_some() => {
+                failed.push(format!("{task} (ssh failed)"))
+            }
+            Ok(code) => failed.push(format!(
+                "{task} (exit {})",
+                code.map_or("signal".to_string(), |c| c.to_string())
+            )),
+            Err(e) => failed.push(format!("{task} ({e})")),
+        }
+    }
+    if failed.is_empty() {
+        return Ok(());
+    }
+    Err(CtlError::Halted(format!(
+        "`minga logs` failed for {}",
+        failed.join(", ")
+    )))
+}
+
+/// Copies a child's stdout and stderr line by line, each with `task | ` in
+/// front, and waits for it.
+async fn stream(
+    task: String,
+    mut child: tokio::process::Child,
+) -> (String, std::io::Result<std::process::ExitStatus>) {
+    let out = child.stdout.take().map(BufReader::new);
+    let err = child.stderr.take().map(BufReader::new);
+    let prefix = format!("{task} | ");
+    let (_, _, status) = tokio::join!(
+        copy_lines(out, &prefix, false),
+        copy_lines(err, &prefix, true),
+        child.wait()
+    );
+    (task, status)
+}
+
+async fn copy_lines(reader: Option<impl AsyncBufRead + Unpin>, prefix: &str, to_stderr: bool) {
+    let Some(mut reader) = reader else { return };
+    let mut line = Vec::new();
+    while matches!(reader.read_until(b'\n', &mut line).await, Ok(n) if n > 0) {
+        if !line.ends_with(b"\n") {
+            line.push(b'\n');
+        }
+        let mut bytes = prefix.as_bytes().to_vec();
+        bytes.append(&mut line);
+        // One write per line keeps lines from different tasks whole.
+        let _ = if to_stderr {
+            std::io::stderr().lock().write_all(&bytes)
+        } else {
+            std::io::stdout().lock().write_all(&bytes)
+        };
     }
 }
 
@@ -373,7 +519,7 @@ pub async fn rollback(
 }
 
 /// `GET /services/{id}`; a 404 is exit 3.
-async fn read(client: &ApiClient, id: &str) -> Result<Value, CtlError> {
+pub(crate) async fn read(client: &ApiClient, id: &str) -> Result<Value, CtlError> {
     api::check_id("service", id)?;
     match client.get_found(&format!("services/{id}"), None).await? {
         Found::Yes(service) => Ok(service),
@@ -431,7 +577,7 @@ async fn post_spec(
 /// Saves the revision once the API has accepted the change. If that fails,
 /// the old revision file is removed: it now holds a spec two changes back,
 /// and a rollback to it would be wrong.
-fn save_revision(client: &ApiClient, id: &str, spec: &Value) -> Result<(), CtlError> {
+pub(crate) fn save_revision(client: &ApiClient, id: &str, spec: &Value) -> Result<(), CtlError> {
     let Err(err) = state::save_revision(&client.context, id, spec) else {
         return Ok(());
     };
@@ -495,7 +641,7 @@ fn logged_key(key: &str) -> &str {
 /// Compares specs the way the server stores them: Minga keeps the
 /// environment in a map, so the order of `Env` can differ between two reads,
 /// and an empty `Env` is the same as none.
-fn same_spec(a: &Value, b: &Value) -> bool {
+pub(crate) fn same_spec(a: &Value, b: &Value) -> bool {
     let normal = |spec: &Value| {
         let mut spec = spec.clone();
         if let Some(container) = spec

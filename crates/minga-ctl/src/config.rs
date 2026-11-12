@@ -316,7 +316,7 @@ fn plain_http_host(endpoint: &str) -> Option<String> {
 }
 
 /// The host part of an authority, without userinfo, port or brackets.
-fn host_of(authority: &str) -> &str {
+pub(crate) fn host_of(authority: &str) -> &str {
     let authority = authority.rsplit('@').next().unwrap_or(authority);
     if let Some(rest) = authority.strip_prefix('[') {
         // An IPv6 literal: `[::1]:2375`.
