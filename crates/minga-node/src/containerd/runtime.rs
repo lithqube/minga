@@ -184,6 +184,18 @@ fn auth_for_host(config: &serde_json::Value, host: &str) -> Option<String> {
     String::from_utf8(decoded).ok().filter(|c| c.contains(':'))
 }
 
+/// `extra_hosts` are written into a per-task /etc/hosts that only exists for
+/// tasks with a network attachment; refuse the rest instead of skipping them.
+fn check_extra_hosts_have_network(spec: &TaskSpec) -> Result<(), RuntimeError> {
+    if spec.ips.is_empty() && !spec.extra_hosts.is_empty() {
+        return Err(RuntimeError::Start(format!(
+            "extra_hosts ({} entries) need a network, but the task is attached to none",
+            spec.extra_hosts.len()
+        )));
+    }
+    Ok(())
+}
+
 /// A task's /etc/hosts: localhost plus its `extra_hosts`, with `host-gateway`
 /// replaced by the host's address on the task's bridge.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -752,7 +764,14 @@ impl Runtime for ContainerdRuntime {
         let container_id = task_id.clone();
         let secret_mounts = self.resolve_secrets(&container_id, spec)?;
         let spec = &self.resolve_mounts(spec).await?;
+        check_extra_hosts_have_network(spec)?;
 
+        // containerd keys images by fully-qualified reference; Compose files
+        // habitually use the short form (`nginx:1.27`).
+        let image_ref = image::normalize_ref(&spec.image);
+        let image = self.ensure_image(&image_ref).await?;
+
+        // After the pull: a failed pull must not leave a network behind.
         #[cfg(target_os = "linux")]
         let network = self.prepare_network(&container_id, spec).await?;
         #[cfg(not(target_os = "linux"))]
@@ -764,11 +783,6 @@ impl Runtime for ContainerdRuntime {
             }
             None
         };
-
-        // containerd keys images by fully-qualified reference; Compose files
-        // habitually use the short form (`nginx:1.27`).
-        let image_ref = image::normalize_ref(&spec.image);
-        let image = self.ensure_image(&image_ref).await?;
 
         let mut client = self.client.lock().await;
         let config = image::load_image(&mut client, &image, &self.snapshotter)
@@ -790,7 +804,7 @@ impl Runtime for ContainerdRuntime {
         // the snapshot's layer directories hold.
         let user = oci::task_user(spec, &config, &oci::rootfs_dirs(&mounts))
             .map_err(RuntimeError::Start)
-            .and_then(|(uid, gid)| chown_secrets(&secret_mounts, uid, gid).map(|()| (uid, gid)));
+            .and_then(|user| chown_secrets(&secret_mounts, user.uid, user.gid).map(|()| user));
         let user = match user {
             Ok(user) => user,
             Err(error) => {
@@ -807,6 +821,8 @@ impl Runtime for ContainerdRuntime {
                 if !rollback.is_empty() {
                     tracing::warn!(container = %container_id, "{}", rollback.trim_start_matches("; "));
                 }
+                #[cfg(target_os = "linux")]
+                self.teardown_network(&container_id).await;
                 return Err(error);
             }
         };
@@ -1256,6 +1272,19 @@ impl Runtime for ContainerdRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extra_hosts_without_a_network_refuse_to_start() {
+        let mut spec = TaskSpec::default();
+        assert!(check_extra_hosts_have_network(&spec).is_ok());
+        spec.extra_hosts = vec![("db".into(), "10.0.0.5".into())];
+        let error = check_extra_hosts_have_network(&spec).unwrap_err();
+        assert!(error.to_string().contains("extra_hosts"), "{error}");
+        spec.ips = vec![("net".into(), "10.0.0.2".into())]
+            .into_iter()
+            .collect();
+        assert!(check_extra_hosts_have_network(&spec).is_ok());
+    }
 
     #[test]
     fn host_gateway_becomes_the_bridge_address() {

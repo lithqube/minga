@@ -50,10 +50,13 @@ pub struct OciProcess {
     pub no_new_privileges: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct OciUser {
     pub uid: u32,
     pub gid: u32,
+    /// Supplementary groups, from the user's memberships in `/etc/group`.
+    #[serde(rename = "additionalGids", skip_serializing_if = "Vec::is_empty")]
+    pub additional_gids: Vec<u32>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -382,7 +385,7 @@ pub fn spec_from_task(container_id: &str, spec: &TaskSpec) -> OciSpec {
         oci_version: OCI_VERSION.to_string(),
         process: OciProcess {
             terminal: false,
-            user: OciUser { uid: 0, gid: 0 },
+            user: OciUser::default(),
             args: vec![], // Use image's default entrypoint/cmd
             env,
             cwd: "/".to_string(),
@@ -510,36 +513,52 @@ pub fn spec_to_any_with_secrets(
     })
 }
 
-/// The uid and gid a task's process runs as: its own `user`, else the image's.
+/// The user a task's process runs as: its own `user`, else the image's.
 /// Names are looked up in the image's `/etc/passwd` and `/etc/group`, read
-/// from `rootfs` (the snapshot's directories, top layer first). A user name
-/// without a group takes that user's primary group, as Docker does.
+/// from `rootfs` (the snapshot's directories, top layer first). A user
+/// without a group takes that user's primary group, as Docker does, and the
+/// groups listing the user as a member become supplementary groups. A
+/// numeric `uid:gid` is used as given, with no lookups.
 pub fn task_user(
     spec: &TaskSpec,
     image: &ImageConfiguration,
     rootfs: &[PathBuf],
-) -> Result<(u32, u32), String> {
+) -> Result<OciUser, String> {
     let user = match &spec.user {
         Some(user) => user,
-        None if image.user.is_empty() => return Ok((0, 0)),
+        None if image.user.is_empty() => return Ok(OciUser::default()),
         None => &image.user,
     };
-    if let Ok(ids) = minga_state::types::parse_user(user) {
-        return Ok(ids);
+    if user.contains(':') {
+        if let Ok((uid, gid)) = minga_state::types::parse_user(user) {
+            return Ok(OciUser {
+                uid,
+                gid,
+                additional_gids: Vec::new(),
+            });
+        }
     }
     resolve_user(user, rootfs)
         .map_err(|e| format!("user `{user}`: {e}; or set a numeric `user:` on the service"))
 }
 
-fn resolve_user(user: &str, rootfs: &[PathBuf]) -> Result<(u32, u32), String> {
+fn resolve_user(user: &str, rootfs: &[PathBuf]) -> Result<OciUser, String> {
     let (name, group) = match user.split_once(':') {
         Some((name, group)) => (name, Some(group)),
         None => (user, None),
     };
-    let (uid, primary_gid) = match name.parse::<u32>() {
-        Ok(uid) => (uid, 0),
+    // A numeric uid need not be in the image (scratch images have no
+    // /etc/passwd); it then runs with group 0 and no supplementary groups.
+    let (uid, user_name, primary_gid) = match name.parse::<u32>() {
+        Ok(uid) => match read_etc(rootfs, "passwd")
+            .ok()
+            .and_then(|f| passwd_by_uid(&f, uid))
+        {
+            Some((name, gid)) => (uid, Some(name), gid),
+            None => (uid, None, 0),
+        },
         Err(_) => match lookup(&read_etc(rootfs, "passwd")?, name) {
-            Some((uid, Some(gid))) => (uid, gid),
+            Some((uid, Some(gid))) => (uid, Some(name.to_string()), gid),
             _ => return Err(format!("no user `{name}` in the image's /etc/passwd")),
         },
     };
@@ -552,7 +571,46 @@ fn resolve_user(user: &str, rootfs: &[PathBuf]) -> Result<(u32, u32), String> {
                 .ok_or_else(|| format!("no group `{group}` in the image's /etc/group"))?,
         },
     };
-    Ok((uid, gid))
+    // A missing or unreadable /etc/group only means no supplementary groups.
+    let mut additional_gids = match (&user_name, read_etc(rootfs, "group")) {
+        (Some(name), Ok(file)) => member_gids(&file, name),
+        _ => Vec::new(),
+    };
+    additional_gids.retain(|g| *g != gid);
+    Ok(OciUser {
+        uid,
+        gid,
+        additional_gids,
+    })
+}
+
+/// The name and primary gid of the passwd entry for `uid`.
+fn passwd_by_uid(file: &str, uid: u32) -> Option<(String, u32)> {
+    file.lines().find_map(|line| {
+        let mut fields = line.split(':');
+        let name = fields.next()?;
+        fields.next()?; // password
+        if fields.next()?.parse::<u32>().ok()? != uid {
+            return None;
+        }
+        Some((name.to_string(), fields.next()?.parse().ok()?))
+    })
+}
+
+/// The gids of the groups in a group file (`name:x:gid:member,member`) that
+/// list `user` as a member, sorted and without duplicates.
+fn member_gids(file: &str, user: &str) -> Vec<u32> {
+    let mut gids: Vec<u32> = file
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split(':').skip(2);
+            let gid = fields.next()?.parse().ok()?;
+            fields.next()?.split(',').any(|m| m == user).then_some(gid)
+        })
+        .collect();
+    gids.sort_unstable();
+    gids.dedup();
+    gids
 }
 
 /// The id fields of `name`'s line in a passwd (`name:x:uid:gid:…`) or group
@@ -619,7 +677,7 @@ pub fn spec_to_any_with_image(
     spec: &TaskSpec,
     secret_mounts: &[SecretMount],
     image: &ImageConfiguration,
-    (uid, gid): (u32, u32),
+    user: OciUser,
     network: Option<&NetworkSpec>,
 ) -> Result<prost_types::Any, String> {
     // Docker override semantics: an explicit task entrypoint replaces the
@@ -644,7 +702,7 @@ pub fn spec_to_any_with_image(
     let mut oci = spec_from_task_with_secrets(container_id, spec, secret_mounts, network);
     oci.process.args = args;
     oci.process.cwd = image.cwd.clone();
-    oci.process.user = OciUser { uid, gid };
+    oci.process.user = user;
     let mut env = image.env.clone();
     let mut overrides: Vec<_> = spec.env.iter().collect();
     overrides.sort_by_key(|(key, _)| *key);
@@ -694,7 +752,19 @@ mod tests {
             user: "1000:1001".into(),
             parent_snapshot: "unused".into(),
         };
-        let any = spec_to_any_with_image("c1", &task, &[], &image, (1000, 1001), None).unwrap();
+        let any = spec_to_any_with_image(
+            "c1",
+            &task,
+            &[],
+            &image,
+            OciUser {
+                uid: 1000,
+                gid: 1001,
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&any.value).unwrap();
         assert_eq!(
             json["process"]["args"],
@@ -953,6 +1023,14 @@ mod override_tests {
         }
     }
 
+    fn ids(uid: u32, gid: u32) -> OciUser {
+        OciUser {
+            uid,
+            gid,
+            additional_gids: Vec::new(),
+        }
+    }
+
     #[test]
     fn task_user_prefers_the_task_and_refuses_an_unknown_name() {
         let named = ImageConfiguration {
@@ -962,10 +1040,10 @@ mod override_tests {
         let mut task = TaskSpec::default();
         let error = task_user(&task, &named, &[]).unwrap_err();
         assert!(error.contains("nodejs"), "{error}");
-        assert_eq!(task_user(&task, &image(), &[]), Ok((0, 0)));
+        assert_eq!(task_user(&task, &image(), &[]), Ok(ids(0, 0)));
 
         task.user = Some("1001:65533".into());
-        assert_eq!(task_user(&task, &named, &[]), Ok((1001, 65533)));
+        assert_eq!(task_user(&task, &named, &[]), Ok(ids(1001, 65533)));
     }
 
     /// Two snapshot layers: `upper` overrides `/etc/passwd`, `lower` holds
@@ -996,10 +1074,23 @@ mod override_tests {
             };
             task_user(&task, &image(), &rootfs)
         };
-        assert_eq!(user("zitadel"), Ok((1000, 1000)));
-        assert_eq!(user("zitadel:staff"), Ok((1000, 50)));
-        assert_eq!(user("zitadel:7"), Ok((1000, 7)));
-        assert_eq!(user("1234:staff"), Ok((1234, 50)));
+        let with_groups = |uid, gid, additional_gids| OciUser {
+            uid,
+            gid,
+            additional_gids,
+        };
+        // `staff` lists zitadel as a member: a supplementary group.
+        assert_eq!(user("zitadel"), Ok(with_groups(1000, 1000, vec![50])));
+        // Naming the group as the primary one leaves nothing to add.
+        assert_eq!(user("zitadel:staff"), Ok(with_groups(1000, 50, vec![])));
+        assert_eq!(user("zitadel:7"), Ok(with_groups(1000, 7, vec![50])));
+        // A numeric uid listed in passwd takes its primary group and groups.
+        assert_eq!(user("1000"), Ok(with_groups(1000, 1000, vec![50])));
+        // Not listed (uid 1 is only in the shadowed lower layer): group 0.
+        assert_eq!(user("1"), Ok(ids(1, 0)));
+        // A fully numeric `uid:gid` is used as given.
+        assert_eq!(user("1000:7"), Ok(ids(1000, 7)));
+        assert_eq!(user("1234:staff"), Ok(ids(1234, 50)));
         assert!(user("nobody").unwrap_err().contains("no user `nobody`"));
         assert!(user("zitadel:wheel")
             .unwrap_err()
@@ -1046,7 +1137,7 @@ mod override_tests {
     }
 
     fn args_of(spec: &TaskSpec) -> Vec<String> {
-        let any = spec_to_any_with_image("c1", spec, &[], &image(), (0, 0), None).unwrap();
+        let any = spec_to_any_with_image("c1", spec, &[], &image(), ids(0, 0), None).unwrap();
         let json: serde_json::Value = serde_json::from_slice(&any.value).unwrap();
         serde_json::from_value(json["process"]["args"].clone()).unwrap()
     }
@@ -1103,7 +1194,7 @@ mod override_tests {
             ],
             ..Default::default()
         };
-        let any = spec_to_any_with_image("c1", &spec, &[], &image(), (0, 0), None).unwrap();
+        let any = spec_to_any_with_image("c1", &spec, &[], &image(), ids(0, 0), None).unwrap();
         let json: serde_json::Value = serde_json::from_slice(&any.value).unwrap();
         let mounts = json["mounts"].as_array().unwrap();
         let data = mounts

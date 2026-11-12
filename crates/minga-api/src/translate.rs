@@ -298,6 +298,23 @@ pub fn service_spec_to_state(spec: &models::ServiceSpec) -> Result<Service, Stri
         secrets.push(SecretRef::new(reference.SecretID.clone(), target));
     }
 
+    // Swarm `Hosts` entries are `IP hostname [alias...]` (hosts(5)).
+    let mut extra_hosts = Vec::new();
+    for entry in &container.Hosts {
+        let mut fields = entry.split_whitespace();
+        match (fields.next(), fields.next()) {
+            (Some(ip), Some(host)) => {
+                extra_hosts.push((host.to_string(), ip.to_string()));
+                extra_hosts.extend(fields.map(|alias| (alias.to_string(), ip.to_string())));
+            }
+            _ => {
+                return Err(format!(
+                    "service '{name}': host entry {entry:?} is not `IP hostname`"
+                ))
+            }
+        }
+    }
+
     Ok(Service {
         id: name.clone(),
         name,
@@ -323,7 +340,7 @@ pub fn service_spec_to_state(spec: &models::ServiceSpec) -> Result<Service, Stri
         healthcheck,
         mounts,
         user,
-        extra_hosts: vec![],
+        extra_hosts,
         update,
         rollback,
         previous: None,
@@ -462,6 +479,11 @@ pub fn service_to_docker(svc: &Service) -> models::Service {
         Args: svc.entrypoint.clone(),
         Mounts: mounts,
         User: svc.user.clone(),
+        Hosts: svc
+            .extra_hosts
+            .iter()
+            .map(|(host, ip)| format!("{ip} {host}"))
+            .collect(),
         Healthcheck: healthcheck,
         Secrets: secrets,
         ..Default::default()
@@ -1224,9 +1246,25 @@ mod tests {
             },
             rollback: None,
             previous: None,
-            extra_hosts: vec![],
+            extra_hosts: vec![
+                ("db".to_string(), "10.0.0.5".to_string()),
+                (
+                    "host.docker.internal".to_string(),
+                    "host-gateway".to_string(),
+                ),
+            ],
         };
-        let back = service_spec_to_state(&service_to_docker(&svc).Spec).unwrap();
+        let docker = service_to_docker(&svc);
+        let hosts = &docker
+            .Spec
+            .TaskTemplate
+            .ContainerSpec
+            .as_ref()
+            .unwrap()
+            .Hosts;
+        assert_eq!(hosts, &["10.0.0.5 db", "host-gateway host.docker.internal"]);
+        let back = service_spec_to_state(&docker.Spec).unwrap();
+        assert_eq!(back.extra_hosts, svc.extra_hosts);
         assert_eq!(back.user, svc.user);
         assert_eq!(back.update, svc.update);
 
@@ -1242,6 +1280,21 @@ mod tests {
             ..svc
         };
         assert!(service_spec_to_state(&service_to_docker(&malformed).Spec).is_err());
+    }
+
+    #[test]
+    fn host_entries_take_aliases_and_reject_a_bare_ip() {
+        let mut spec = sample_docker_spec();
+        let container = spec.TaskTemplate.ContainerSpec.as_mut().unwrap();
+        container.Hosts = vec!["10.0.0.5 db db.local".to_string()];
+        let svc = service_spec_to_state(&spec).unwrap();
+        assert_eq!(
+            svc.extra_hosts,
+            [("db", "10.0.0.5"), ("db.local", "10.0.0.5")].map(|(h, i)| (h.into(), i.into()))
+        );
+        spec.TaskTemplate.ContainerSpec.as_mut().unwrap().Hosts = vec!["10.0.0.5".to_string()];
+        let error = service_spec_to_state(&spec).unwrap_err();
+        assert!(error.contains("IP hostname"), "{error}");
     }
 
     #[test]
