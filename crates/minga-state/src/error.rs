@@ -21,6 +21,14 @@ pub enum StateError {
 
     #[error("serialization error: {0}")]
     Serde(String),
+
+    /// An import would replace services that already exist.
+    #[error("services already exist: {0} (import with overwrite to replace them)")]
+    Conflict(String),
+
+    /// An import file this build cannot read.
+    #[error("{0}")]
+    BadSnapshot(String),
 }
 
 impl StateError {

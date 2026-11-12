@@ -24,6 +24,7 @@ Each ADR ends with an *Implementation status* section saying what shipped and wh
 
 ## Deployment
 
+- [Backup and restore](backup.md): `minga state export`/`import`, what it leaves out (secret values, volume data, TLS, NATS), and the cold-copy alternative
 - [Quick start: one Linux host](../README.md#quick-start-one-linux-host): the verified path
 - [systemd unit](../scripts/minga.service) and [environment example](../scripts/minga.env.example)
 - [Talos Linux](talos-deployment.md): validated single-node install on Talos v1.14 through workload start, with no system extension. Bare metal and multi-node are not validated.

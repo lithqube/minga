@@ -34,6 +34,53 @@ impl AppState {
 }
 
 // ---------------------------------------------------------------------------
+// State backup and restore
+// ---------------------------------------------------------------------------
+
+/// `GET /v{version}/state` — export desired state (see `docs/backup.md`).
+///
+/// Admin-only once roles exist (docs/adr/0005-api-identity-and-roles.md,
+/// Proposed): the snapshot carries service environment values.
+pub async fn export_state(
+    State(app): State<Arc<AppState>>,
+) -> ApiResult<Json<minga_state::StateSnapshot>> {
+    Ok(Json(app.store.export().await?))
+}
+
+/// Query of `POST /v{version}/state`.
+#[derive(serde::Deserialize)]
+pub struct ImportQuery {
+    #[serde(default)]
+    overwrite: bool,
+}
+
+/// `POST /v{version}/state` — import a snapshot; 409 when a service already
+/// exists unless `?overwrite=true`. Admin-only once roles exist (see
+/// [`export_state`]).
+pub async fn import_state(
+    State(app): State<Arc<AppState>>,
+    Query(q): Query<ImportQuery>,
+    Json(body): Json<serde_json::Value>,
+) -> ApiResult<Json<serde_json::Value>> {
+    // Check the version before the shape: a newer file may not parse as ours.
+    let want = minga_state::codec::FORMAT_VERSION;
+    match body.get("format_version").and_then(|v| v.as_u64()) {
+        Some(v) if v == u64::from(want) => {}
+        other => {
+            return Err(bad_request(format!(
+                "snapshot has format version {}, this build reads {want}",
+                other.map_or("none".to_string(), |v| v.to_string())
+            )))
+        }
+    }
+    let snapshot: minga_state::StateSnapshot = serde_json::from_value(body)?;
+    let services = snapshot.services.len();
+    app.store.import(snapshot, q.overwrite).await?;
+    tracing::info!(services, overwrite = q.overwrite, "state imported via API");
+    Ok(ok_message(format!("imported {services} service(s)")))
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 

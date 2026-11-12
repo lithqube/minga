@@ -1,6 +1,7 @@
 mod bus;
 mod deploy;
 mod sidecar;
+mod state;
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -43,6 +44,11 @@ enum Command {
         /// Seconds to wait for tasks to be placed before failing.
         #[arg(long, default_value = "30")]
         wait: u64,
+    },
+    /// Back up and restore desired state (services, networks, volumes).
+    State {
+        #[command(subcommand)]
+        cmd: StateCommand,
     },
     /// Overlay network management.
     Net {
@@ -97,6 +103,50 @@ enum Command {
         #[command(subcommand)]
         cmd: ImageCommand,
     },
+}
+
+#[derive(Subcommand)]
+enum StateCommand {
+    /// Export desired state as JSON. The file holds service environment
+    /// values: keep it private.
+    Export {
+        /// Write to FILE (mode 0600) instead of stdout.
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        /// Overwrite FILE if it exists.
+        #[arg(long, requires = "output")]
+        force: bool,
+        #[command(flatten)]
+        api: StateApiArgs,
+    },
+    /// Import a file written by `minga state export`.
+    Import {
+        file: PathBuf,
+        /// Replace services that already exist instead of failing.
+        #[arg(long)]
+        overwrite: bool,
+        #[command(flatten)]
+        api: StateApiArgs,
+    },
+}
+
+#[derive(Args)]
+struct StateApiArgs {
+    /// URL of a `minga api` server. Can also be set via MINGA_API_URL.
+    #[arg(long, env = "MINGA_API_URL", default_value = "http://127.0.0.1:2375")]
+    api_url: String,
+    /// Bearer token when the API requires one (MINGA_API_TOKEN).
+    #[arg(long, env = "MINGA_API_TOKEN")]
+    api_token: Option<String>,
+}
+
+impl From<StateApiArgs> for state::ApiOptions {
+    fn from(a: StateApiArgs) -> Self {
+        Self {
+            api_url: a.api_url,
+            api_token: a.api_token,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -521,6 +571,22 @@ async fn main() -> ExitCode {
                 wait: Duration::from_secs(wait),
             };
             if let Err(e) = deploy::deploy_stack(&translated, &opts).await {
+                eprintln!("error: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+        Command::State { cmd } => {
+            let result = match cmd {
+                StateCommand::Export { output, force, api } => {
+                    state::export(&api.into(), output.as_deref(), force).await
+                }
+                StateCommand::Import {
+                    file,
+                    overwrite,
+                    api,
+                } => state::import(&api.into(), &file, overwrite).await,
+            };
+            if let Err(e) = result {
                 eprintln!("error: {e}");
                 return ExitCode::FAILURE;
             }
