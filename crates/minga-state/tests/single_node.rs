@@ -96,6 +96,8 @@ fn sample_task(id: &str, service_id: &str, node_id: u64) -> Task {
         },
         restarts: 0,
         running_since_unix: None,
+        last_error: None,
+        last_exit_code: None,
     }
 }
 

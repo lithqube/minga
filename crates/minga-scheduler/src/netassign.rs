@@ -117,6 +117,8 @@ mod tests {
             },
             restarts: 0,
             running_since_unix: None,
+            last_error: None,
+            last_exit_code: None,
         }
     }
 

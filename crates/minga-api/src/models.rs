@@ -820,6 +820,10 @@ pub struct Task {
     pub DesiredState: String,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub NetworksAttachments: Vec<NetworkAttachment>,
+    /// Minga extension, not in the Docker API: how often the task was
+    /// restarted. Docker clients ignore unknown fields.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub MingaRestarts: Option<u32>,
 }
 
 /// A task's attachment to a network, with its assigned addresses.
@@ -1464,6 +1468,7 @@ mod tests {
             },
             DesiredState: "running".to_string(),
             NetworksAttachments: vec![],
+            MingaRestarts: None,
         };
         let json = serde_json::to_value(&task).unwrap();
         assert_eq!(json["ID"], "task1");

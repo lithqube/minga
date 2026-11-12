@@ -671,7 +671,13 @@ async fn ps(client: &ApiClient, stack: &str, format: Format, quiet: bool) -> Res
     let tasks = client.get("tasks", Some(&filter)).await?;
     let nodes = view::node_names(&client.get("nodes", None).await?);
     let rows = view::task_rows(&tasks, view::items(&services), &nodes);
-    output::print(format, quiet, &rows)
+    output::print(format, quiet, &rows)?;
+    if !quiet {
+        if let Some(hint) = view::not_running_hint(&tasks) {
+            eprintln!("{hint}");
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

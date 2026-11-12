@@ -243,6 +243,8 @@ pub fn place_service(
                     spec,
                     restarts: 0,
                     running_since_unix: None,
+                    last_error: None,
+                    last_exit_code: None,
                 });
                 consume(avail, &service.resources);
             }
@@ -268,6 +270,8 @@ pub fn place_service(
                             spec,
                             restarts: 0,
                             running_since_unix: None,
+                            last_error: None,
+                            last_exit_code: None,
                         });
                         consume(avail, &service.resources);
                         placed = true;
@@ -510,6 +514,8 @@ mod tests {
             },
             restarts: 0,
             running_since_unix: None,
+            last_error: None,
+            last_exit_code: None,
         }];
         let tasks = place_service(&service, &nodes, &existing, &[], 0);
         assert_eq!(tasks.len(), 2);
@@ -544,6 +550,8 @@ mod tests {
             },
             restarts: 0,
             running_since_unix: None,
+            last_error: None,
+            last_exit_code: None,
         }];
         let tasks = place_service(&service, &nodes, &existing, &[], 0);
         assert_eq!(tasks.len(), 1);

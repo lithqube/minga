@@ -697,15 +697,24 @@ shop    5
 | yes | `running` | `healthy` |
 | yes | anything else | `-` |
 
+`ERROR` is the last column, so scripts that read the earlier ones keep
+working. It is `Status.Err`, the reason the task last exited or failed to
+start, cut to 50 characters in the table (`-` when there is none). `-o json`
+and `-o yaml` carry the whole text as `error` and the exit code as
+`exit_code`, both `null` when absent. When any task is not in state
+`running`, `ps` also prints one line on stderr (not with `--quiet`):
+``2 task(s) not running: see `minga-ctl service inspect <service>` and `minga-ctl service logs <service>` ``,
+with the service ID when only one service has such tasks.
+
 ```
-ID                      SERVICE       NODE   DESIRED   STATE      HEALTH
-myapp.web.1.3f9a1c2e    myapp.web     mgr1   running   running    healthy
-myapp.web.2.3f9a1c2e    myapp.web     wrk1   running   preparing  starting
-myapp.worker.1.77b0d4aa myapp.worker  wrk1   running   running    -
+ID                      SERVICE       NODE   DESIRED   STATE      HEALTH    ERROR
+myapp.web.1.3f9a1c2e    myapp.web     mgr1   running   running    healthy   -
+myapp.web.2.3f9a1c2e    myapp.web     wrk1   running   preparing  starting  exited with code 1
+myapp.worker.1.77b0d4aa myapp.worker  wrk1   running   running    -         -
 ```
 
 ```json
-[{"id":"myapp.web.1.3f9a1c2e","service":"myapp.web","node":"mgr1","desired":"running","state":"running","health":"healthy"}]
+[{"id":"myapp.web.1.3f9a1c2e","service":"myapp.web","node":"mgr1","desired":"running","state":"running","health":"healthy","error":null,"exit_code":null}]
 ```
 
 **`rm`** (`minga-ctl stack rm <stack> [--with <id>]... [--yes]`)
@@ -755,6 +764,7 @@ resources.
 ```
 minga-ctl service ls [--stack <stack>]
 minga-ctl service ps <service>
+minga-ctl service inspect <service>
 minga-ctl service logs <service> [-f] [--tail <n>]
 minga-ctl service scale <service> --replicas <n>
 minga-ctl service update <service> [--image <ref>] [--env-add <KEY=VALUE>]...
@@ -779,7 +789,21 @@ shop.proxy    shop   global      2         docker.io/library/caddy:2
 ```
 
 **`ps`**: `GET /v1.41/services/{id}` (404: exit 3), then
-`GET /v1.41/tasks?filters={"service":["<id>"]}`. Same columns as `stack ps`.
+`GET /v1.41/tasks?filters={"service":["<id>"]}`. Same columns, ERROR column
+and stderr hint as `stack ps`.
+
+**`inspect`**: the same two reads plus `GET /v1.41/nodes`. It prints the
+service's image, mode and replicas, ports, networks, update policy and
+healthcheck, then its tasks with `STATE`, `RESTARTS`, `EXIT` (exit code of
+the last run) and `ERROR` in full. `-o json` and `-o yaml` print one object,
+`{"service": {...}, "tasks": [...]}`. `RESTARTS` comes from `MingaRestarts`,
+a Minga field on the task that Docker clients ignore.
+
+Why a task ended comes from the node's supervisor, which records it on the
+task: `exited with code N` (with the signal when the code is 128 plus one),
+or the error from starting the container, cut to 300 characters and with
+registry credentials removed. It stays while the task restarts and is cleared
+after the task has been `running` for 60 seconds.
 
 **`logs`** (`--tail` default `100`, `0` means all)
 
@@ -1361,5 +1385,12 @@ Before each commit: `cargo fmt --all`, `cargo clippy --all-targets -- -D warning
 - `registry login` replaces the credential file by rename. For a non-root
   SSH user that makes the user its owner; mode and group are kept
   (section 5.8).
+- A task's error is one line, 300 characters at most. The runtime reports an
+  exit code only: a task killed by the out-of-memory killer reads as
+  `killed by signal 9`, and a process that itself exits with 137 reads the
+  same. Credentials are removed by exact value, URL user info, `key=value`
+  pairs and `Bearer`, `Basic` and `--user` arguments; a secret echoed in any
+  other shape would pass through. Agent (WASM) tasks that end are not given a
+  reason except for a failed start.
 - Not included: node commands, events, waiting for rollouts, refresh of
   short-lived registry credentials, client certificates (phase 2).
