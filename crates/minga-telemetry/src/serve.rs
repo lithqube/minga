@@ -159,7 +159,9 @@ mod tests {
     async fn an_idle_keep_alive_connection_is_closed() {
         let addr = server(short()).await;
         let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
-        s.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n").await.unwrap();
+        s.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+            .await
+            .unwrap();
         let mut buf = [0u8; 1024];
         let n = s.read(&mut buf).await.unwrap();
         assert!(String::from_utf8_lossy(&buf[..n]).starts_with("HTTP/1.1 200"));
