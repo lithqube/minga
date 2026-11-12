@@ -7,7 +7,7 @@ use clap::Subcommand;
 use serde_json::{json, Value};
 use tokio::net::{TcpListener, UnixStream};
 
-use crate::api::{self, ApiClient};
+use crate::api::{self, ApiClient, Found};
 use crate::cmd::image;
 use crate::cmd::service::{self, confirm, report};
 use crate::config::{self, Resolved};
@@ -314,7 +314,14 @@ async fn deploy(conn: &Connection, args: &DeployArgs<'_>, quiet: bool) -> Result
 
     // 5. Prune what step 0 confirmed, or say what --prune would remove.
     if prune {
-        prune_services(client, &absent, &before, quiet).await?;
+        if let Err(err) = prune_services(client, &absent, &before, quiet).await {
+            return Err(match problem {
+                Some(reason) => CtlError::Halted(format!(
+                    "{err}; also could not save revisions for {stack}: {reason}"
+                )),
+                None => err,
+            });
+        }
     } else if !absent.is_empty() && !quiet {
         eprintln!(
             "note: {} in stack {stack} but not in {compose_file}; --prune removes {}",
@@ -346,14 +353,9 @@ async fn prune_services(
     let mut pruned = Vec::new();
     let mut failed = Vec::new();
     for id in absent {
-        let result = match client.delete(&format!("services/{id}")).await {
-            // Gone already: nothing to remove or save.
-            Err(CtlError::Api { status: 404, .. }) => continue,
-            Ok(_) => service::save_revision(client, id, &before[id]),
-            Err(e) => Err(e),
-        };
-        match result {
-            Ok(()) => pruned.push(id.as_str()),
+        match service::delete_saving(client, id, &before[id]).await {
+            Ok(Found::Yes(_)) => pruned.push(id.as_str()),
+            Ok(Found::No) => {} // gone already: nothing to remove
             Err(e) => failed.push(format!("{id} ({e})")),
         }
     }
@@ -432,7 +434,11 @@ fn save_before(client: &ApiClient, before: &BTreeMap<String, Value>) -> Result<E
     Ok(earlier)
 }
 
-fn restore(client: &ApiClient, id: &str, old: Option<state::Revision>) -> Result<(), CtlError> {
+pub(crate) fn restore(
+    client: &ApiClient,
+    id: &str,
+    old: Option<state::Revision>,
+) -> Result<(), CtlError> {
     match old {
         Some(revision) => state::put_revision(&client.context, &revision),
         None => state::remove_revision(&client.context, id),

@@ -649,8 +649,10 @@ minga-ctl stack rm <stack> [--with <id>]... [--yes]
 5. Only when `minga` exited 0. With `--prune`, `DELETE /v1.41/services/{id}`
    for each service confirmed in step 0 that is still there (the stack's
    label is what selected them, so another stack's services are never
-   touched), then save its `Spec` from step 1 as its revision, so
-   `service rollback` recreates it. Every one is tried; a failure exits 2 with
+   touched), after saving its `Spec` from step 1 as its revision, so
+   `service rollback` recreates it; as in `service rm`, a failed delete puts
+   the earlier revision back. If pruning fails after step 3 could not save a
+   revision, the error names both. Every one is tried; a failure exits 2 with
    ``error: deployed, but could not prune <id> (<reason>)``. Without
    `--prune`, one note on stderr (not with `--quiet`):
    ``note: myapp.old in stack myapp but not in compose.yaml; --prune removes it``.
@@ -831,7 +833,8 @@ a Minga field on the task that Docker clients ignore.
 
 For each task whose state is not `running` it also runs `minga logs <task id>
 --tail <n> --nats-url <url>` the way `logs` does (`--tail` default `20`, `0`
-means all; all tasks at once, 20 seconds at most each) and prints the lines
+means all, applied to lines again here because one log entry can hold many;
+four at a time, 20 seconds at most each once started) and prints the lines
 under the table, each labelled `[stdout]` or `[stderr]` after the stream of
 that command, with control characters shown as `?`. If the command cannot run
 (no `minga` there, exit 255 over SSH for an unreachable node, any other
@@ -872,10 +875,10 @@ myapp.web.2.3f9a1c2e | listening on :8080
 
 1. `GET /v1.41/services/{id}` (404: exit 3).
 2. Show the service (mode, image) and ask for confirmation.
-3. `DELETE /v1.41/services/{id}`.
-4. Save the `Spec` read in step 1 as the revision file, so `rollback`
-   recreates the service. If that write fails the service is already gone and
-   the command exits 2 saying so, as `scale` does.
+3. Save the `Spec` read in step 1 as the revision file, so `rollback`
+   recreates the service. If that write fails nothing is deleted (exit 2).
+4. `DELETE /v1.41/services/{id}`. If that fails, or the service is already
+   gone (exit 3), the revision it replaced is put back.
 
 ```
 $ minga-ctl service rm myapp.old

@@ -18,6 +18,8 @@ echo "$@" >> "$STUB_DIR/calls"
 if [ "$1" = logs ]; then
   echo "boot line"
   echo "oops" >&2
+  # One log entry can hold many lines, so `--tail` may return more than asked.
+  [ -n "$STUB_LINES" ] && seq 1 "$STUB_LINES" | sed 's/^/line /'
 fi
 exit "${STUB_EXIT:-0}"
 "#;
@@ -388,6 +390,23 @@ async fn inspect_shows_the_end_of_each_failed_tasks_output() {
     assert_eq!(code, 0);
     assert!(out.contains("last 3 lines of output"), "{out}");
     assert!(env.calls()[1].contains("--tail 3"));
+
+    // `--tail` counts lines even when the node returns more.
+    let (_, out, _) = env
+        .run(
+            &cluster,
+            &["service", "inspect", "shop.web", "--tail", "3"],
+            &[("STUB_LINES", "10")],
+        )
+        .await;
+    assert!(
+        out.contains("[stdout] line 10") && out.contains("[stdout] line 8"),
+        "{out}"
+    );
+    assert!(
+        !out.contains("line 7") && !out.contains("boot line"),
+        "{out}"
+    );
 
     // JSON keeps its fields and gains `logs` on the tasks that are down.
     let (code, out, err) = env

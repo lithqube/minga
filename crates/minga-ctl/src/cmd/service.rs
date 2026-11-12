@@ -426,7 +426,11 @@ async fn ps(client: &ApiClient, id: &str, format: Format, quiet: bool) -> Result
     Ok(())
 }
 
+/// How many `minga logs` run at once for `inspect`.
+static LOGS_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
+
 /// How long one `minga logs` may take before its task is reported as skipped.
+/// The wait for a slot is not counted.
 const LOGS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// `GET /services/{id}` (404: exit 3), then that service's tasks and, for
@@ -534,7 +538,12 @@ fn task_output(
     })();
     // Started now, so the tasks' commands run together.
     let handle = prepared.map(|mut cmd| {
-        tokio::spawn(async move { tokio::time::timeout(LOGS_TIMEOUT, cmd.output()).await })
+        tokio::spawn(async move {
+            // A few ssh logins at a time: many at once can exceed the
+            // node's `MaxStartups` and look like an unreachable node.
+            let _permit = LOGS_SLOTS.acquire().await;
+            tokio::time::timeout(LOGS_TIMEOUT, cmd.output()).await
+        })
     });
     async move {
         let out = match handle {
@@ -548,11 +557,17 @@ fn task_output(
         };
         match out.status.code() {
             Some(0) => {
+                // `minga logs --tail` counts log entries, which may hold many
+                // lines, so the last `tail` lines are taken here.
                 let lines = |bytes: &[u8]| -> Vec<String> {
-                    String::from_utf8_lossy(bytes)
-                        .lines()
-                        .map(str::to_string)
-                        .collect()
+                    let text = String::from_utf8_lossy(bytes);
+                    let all: Vec<&str> = text.lines().collect();
+                    let from = if tail == 0 {
+                        0
+                    } else {
+                        all.len().saturating_sub(tail as usize)
+                    };
+                    all[from..].iter().map(|l| l.to_string()).collect()
                 };
                 Ok((lines(&out.stdout), lines(&out.stderr)))
             }
@@ -598,8 +613,31 @@ fn logs_text(task: &Value, tail: u64) -> String {
     text
 }
 
-/// `rm`: read (404: exit 3), confirm, `DELETE`, then save the spec as the
-/// revision so `rollback` can recreate the service.
+/// `DELETE /services/{id}` after saving `spec` as the revision, so a service
+/// is never gone without one. If the save fails nothing is deleted; if the
+/// delete fails (or finds nothing) the revision it replaced is put back.
+pub(crate) async fn delete_saving(
+    client: &ApiClient,
+    id: &str,
+    spec: &Value,
+) -> Result<Found, CtlError> {
+    // An unreadable revision file is not worth keeping.
+    let old = state::load_revision(&client.context, id).ok().flatten();
+    state::save_revision(&client.context, id, spec).map_err(|err| {
+        CtlError::Halted(format!(
+            "cannot save the revision of {id} ({err}); nothing was removed"
+        ))
+    })?;
+    let result = client.delete(&format!("services/{id}")).await;
+    if !matches!(result, Ok(Found::Yes(_))) {
+        // Best effort: a revision left at the current spec rolls back to itself.
+        let _ = crate::cmd::stack::restore(client, id, old);
+    }
+    result
+}
+
+/// `rm`: read (404: exit 3), confirm, save the spec as the revision so
+/// `rollback` can recreate the service, then `DELETE`.
 async fn rm(
     client: &ApiClient,
     id: &str,
@@ -621,8 +659,9 @@ async fn rm(
             client.context
         ),
     )?;
-    client.delete(&format!("services/{id}")).await?;
-    save_revision(client, id, spec)?;
+    if let Found::No = delete_saving(client, id, spec).await? {
+        return Err(not_found(client, "service", id));
+    }
     report(
         format,
         quiet,
