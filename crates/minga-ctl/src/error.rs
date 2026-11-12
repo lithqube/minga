@@ -106,6 +106,11 @@ impl CtlError {
         match self {
             CtlError::Usage(_) => None,
             CtlError::Config(_) => None,
+            CtlError::MissingBinary { command, .. } if command == "stack deploy" => Some(
+                "install minga on this machine (it runs here, not on the node) or set MINGA_BIN; \
+                 on macOS: cargo install --locked --path crates/minga-cli"
+                    .to_string(),
+            ),
             CtlError::MissingBinary { .. } => Some("install minga or set MINGA_BIN".to_string()),
             CtlError::Unreachable { .. } => {
                 Some("is `minga api` running there? see `minga-ctl context list`".to_string())

@@ -21,6 +21,39 @@ include registry credentials, and the Hetzner ARM64 staging guide (PR #17).
 Both are on `main` and unreleased; this plan calls the release that will carry
 them 1.0.2.
 
+## Quick start
+
+Install `minga-ctl` on the workstation: it is not in the release archive.
+
+```
+cargo install --locked --path crates/minga-ctl
+```
+
+Add a context for the node. The token file on the node is either the bare
+token or an env file with a `MINGA_API_TOKEN=` line (item 3 of section 2.2):
+
+```
+minga-ctl context add staging --ssh <user>@<node> --remote-token-file /etc/minga/minga-api.env
+minga-ctl stack ls
+```
+
+`stack deploy` runs `minga deploy` on the workstation, the machine running
+minga-ctl, through the tunnel. It does not run on the node, and the node needs
+only the API. So the `minga` binary must be installed on the workstation:
+`MINGA_BIN` if set, else `minga` on `PATH`. The release archives are Linux
+only, so on macOS build it from a checkout:
+
+```
+cargo install --locked --path crates/minga-cli
+```
+
+```
+minga-ctl stack deploy -c compose.yaml myapp
+```
+
+Without `minga` the command stops with exit 1 before anything is deployed
+(``error: `minga` not found on PATH``, section 4.4). Command details are in section 5.
+
 ## 1. What the code allows today
 
 The design follows what Minga serves, not what the Docker Engine API has in
@@ -128,7 +161,17 @@ phase 1 takes the API off the network instead.
 3. The API token is read from the node when the tunnel starts
    (`ssh -T -- <target> 'cat' '<remote_token_file>'`; `-T` keeps a
    `RequestTTY force` in the ssh config from changing the output), kept in memory and never
-   written to the workstation.
+   written to the workstation. The file holds either the bare token (the
+   whole trimmed content, which may contain `=`) or an env file such as the
+   API's `EnvironmentFile=/etc/minga/minga-api.env`: a line
+   `MINGA_API_TOKEN=value`, optionally after `export `, with the value
+   optionally in single or double quotes. Blank lines and `#` comment lines
+   are skipped, and the last such line wins. An env file with other
+   `NAME=value` lines (upper-case names) but no `MINGA_API_TOKEN` line, or
+   with an empty value, is an error naming the variable instead of a token
+   that the API answers with 401. Quoted values have no escapes and a value
+   has no trailing `# comment`. Errors name the file and the node and never
+   show its content.
 4. Direct endpoints (no SSH) are accepted only if the URL is `http://` to
    `127.0.0.1`, `localhost` or `[::1]`, or `https://` (API behind a TLS proxy;
    `tls_cert` pins the CA). Plain HTTP to any other host is refused. There is
@@ -445,7 +488,7 @@ With no config file and no environment override, minga-ctl uses
 | `MINGA_CTL_CONTEXT` | Context to use instead of `current_context`. |
 | `MINGA_CTL_ENDPOINT` | Replaces the context's `api_endpoint`. The plain-HTTP rule still applies. |
 | `MINGA_CTL_TOKEN` | API token. Wins over `token_command` and `remote_token_file`. |
-| `MINGA_BIN` | Path of the local `minga` binary. |
+| `MINGA_BIN` | Path of the local `minga` binary, which `stack deploy` runs on this machine. |
 
 Precedence: flag, then environment, then context, then default.
 Token precedence: `MINGA_CTL_TOKEN`, `token_command`, `remote_token_file`, none.
@@ -485,7 +528,7 @@ for 400, 415 and 422 request rejections) are shown as the message.
 | Stack not found | ``error: stack `myapp` not found in context `prod` `` | 3 |
 | Service not found | ``error: service `myapp.web` not found in context `prod` `` | 3 |
 | No saved revision | ``error: revision `myapp.web` not found in context `prod` `` then ``hint: rollback covers only changes made with minga-ctl on this machine`` | 3 |
-| `minga` missing | ``error: `minga` not found on PATH (needed for `stack deploy`)`` then ``hint: install minga or set MINGA_BIN`` | 1 |
+| `minga` missing | ``error: `minga` not found on PATH (needed for `stack deploy`)`` then ``hint: install minga on this machine (it runs here, not on the node) or set MINGA_BIN; on macOS: cargo install --locked --path crates/minga-cli`` | 1 |
 | Config too open | ``error: ~/.config/minga-ctl/config.yaml is readable by group or others (mode 0644)`` then ``hint: chmod 600 ~/.config/minga-ctl/config.yaml`` | 1 |
 | Unknown config key | ``error: ~/.config/minga-ctl/config.yaml: unknown field `api_token` `` then ``hint: tokens are not stored in the config; use remote_token_file or token_command`` | 1 |
 | No terminal for a prompt | ``error: `stack rm` needs confirmation; pass --yes to run without a terminal`` | 1 |
@@ -582,8 +625,11 @@ minga-ctl stack rm <stack> [--with <id>]... [--yes]
    change to roll back to. If a save fails, the replaced revisions are put
    back and nothing is deployed.
 2. Run `minga deploy -c <file> [-p …] --wait <secs> --api-url <endpoint> <stack>`
-   with `MINGA_API_TOKEN` in the child's environment. With SSH the endpoint is
-   the tunnel's local URL. Output passes through.
+   with `MINGA_API_TOKEN` in the child's environment. This runs on the
+   machine running minga-ctl, never on the node, so `minga` must be
+   installed there (`MINGA_BIN`, else `PATH`; see the quick start for
+   macOS). With SSH the endpoint is the tunnel's local URL. Output passes
+   through.
 3. Read the services again, whether `minga` succeeded or not. A service whose
    `Spec` now differs from step 1 keeps the step 1 revision. A service the
    deploy did not change, or did not reach before failing, gets back the

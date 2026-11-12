@@ -204,6 +204,74 @@ async fn a_command_runs_through_the_tunnel_with_the_remote_token() {
     assert_cleaned_up(&stub, &dir).await;
 }
 
+/// Runs `secret list` with the remote file holding `file`; returns the
+/// request head the API saw and ctl's stderr.
+async fn head_for_remote_file(file: &str) -> (String, String) {
+    let stub = Stub::new();
+    let child = stub
+        .command(&["secret", "list"], &[("STUB_TOKEN", file)])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let run = tokio::task::spawn_blocking(move || child.wait_with_output());
+    wait_for(&stub.path("tunnel.args")).await;
+    let sock = socket_dir(&stub).join("api.sock");
+    let heads = serve_api(UnixListener::bind(&sock).unwrap(), 1).await;
+    let out = run.await.unwrap().unwrap();
+    assert!(out.status.success(), "stderr: {}", text(&out.stderr));
+    (heads[0].to_ascii_lowercase(), text(&out.stderr))
+}
+
+#[tokio::test]
+async fn a_bare_remote_token_may_contain_equals_signs() {
+    let (head, _) = head_for_remote_file("dGVzdC10b2tlbg==\n").await;
+    assert!(
+        head.contains("authorization: bearer dgvzdc10b2tlbg==\r\n"),
+        "{head}"
+    );
+}
+
+#[tokio::test]
+async fn an_env_file_remote_token_sends_only_the_value() {
+    let file = "# minga api\nRUST_LOG=info\n\nexport MINGA_API_TOKEN=\"abc=123\"\n";
+    let (head, stderr) = head_for_remote_file(file).await;
+    assert!(head.contains("authorization: bearer abc=123\r\n"), "{head}");
+    assert!(!stderr.contains("abc=123"), "{stderr}");
+}
+
+#[test]
+fn an_env_file_without_the_variable_is_refused_without_echoing_it() {
+    let stub = Stub::new();
+    let (ok, _, err) = stub.ctl(
+        &["secret", "list"],
+        &[("STUB_TOKEN", "OTHER_SECRET=hunter2\n")],
+    );
+    assert!(!ok);
+    assert!(
+        err.contains("remote_token_file /etc/minga/api-token on"),
+        "{err}"
+    );
+    assert!(err.contains("has no MINGA_API_TOKEN line"), "{err}");
+    assert!(
+        !err.contains("hunter2") && !err.contains("OTHER_SECRET"),
+        "{err}"
+    );
+    assert!(!stub.path("tunnel.args").exists());
+}
+
+#[test]
+fn an_empty_env_file_value_is_refused_before_the_tunnel() {
+    let stub = Stub::new();
+    let (ok, _, err) = stub.ctl(
+        &["secret", "list"],
+        &[("STUB_TOKEN", "MINGA_API_TOKEN=\"\"\n")],
+    );
+    assert!(!ok);
+    assert!(err.contains("has an empty MINGA_API_TOKEN"), "{err}");
+    assert!(!stub.path("tunnel.args").exists());
+}
+
 /// The socket directory named in the recorded tunnel arguments.
 fn socket_dir(stub: &Stub) -> PathBuf {
     let args = stub.lines("tunnel.args");
