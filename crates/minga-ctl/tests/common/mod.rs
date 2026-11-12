@@ -156,8 +156,19 @@ pub fn service(name: &str, stack: &str, mode: Value, container: Value) -> Value 
 /// Runs `minga-ctl` with config and state under `home`; returns (exit
 /// code, stdout, stderr). Stdin is not a terminal.
 pub fn ctl(home: &Path, endpoint: &str, args: &[&str]) -> (i32, String, String) {
+    ctl_with(home, endpoint, args, &[])
+}
+
+/// [`ctl`] with extra environment variables.
+pub fn ctl_with(
+    home: &Path,
+    endpoint: &str,
+    args: &[&str],
+    env: &[(&str, &str)],
+) -> (i32, String, String) {
     let output = Command::new(env!("CARGO_BIN_EXE_minga-ctl"))
         .args(args)
+        .envs(env.iter().copied())
         .env("XDG_CONFIG_HOME", home.join("config"))
         .env("XDG_STATE_HOME", home.join("state"))
         .env("HOME", home.join("home"))

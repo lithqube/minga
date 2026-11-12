@@ -200,8 +200,9 @@ phase 1 takes the API off the network instead.
    the operator's to protect or delete.
 10. `--debug` prints method, path and status, and ssh command lines, to
     stderr. The `Authorization` header is printed as `Bearer <redacted>`.
-11. Commands that remove or replace things (`stack rm`, `image rm`,
-    `service rollback`, `registry logout`) list what will change and ask for
+11. Commands that remove or replace things (`stack rm`, `stack deploy
+    --prune`, `service rm`, `image rm`, `service rollback`, `registry
+    logout`) list what will change and ask for
     confirmation. With
     no terminal they fail unless `--yes` is given.
 12. Every command that changes state appends one line to a local audit log
@@ -606,7 +607,7 @@ CURRENT  NAME   TRANSPORT                   ENDPOINT                         TOK
 ### 5.2 `stack`
 
 ```
-minga-ctl stack deploy -c <file> [-p <profile>]... [--wait <secs>] <stack>
+minga-ctl stack deploy -c <file> [-p <profile>]... [--wait <secs>] [--prune [--yes]] <stack>
 minga-ctl stack ls
 minga-ctl stack ps <stack>
 minga-ctl stack rm <stack> [--with <id>]... [--yes]
@@ -618,6 +619,12 @@ minga-ctl stack rm <stack> [--with <id>]... [--yes]
    else (see "Where the compose file is resolved" below). The node is another
    machine in any context with an SSH target, and in any context whose API
    endpoint is not a loopback address, such as an `https://` endpoint.
+   Then find the stack's services that the file does not name: the IDs from
+   step 1 that are not `<stack>.<key>` for a key under `services:`. With
+   `--prune` they are listed and confirmed here, before anything is deployed
+   (no terminal and no `--yes`: exit 1, nothing deployed), and a file with no
+   services is refused (exit 1), since pruning would empty the stack; use
+   `stack rm`. Without `--prune` they are only named in step 5.
 1. `GET /v1.41/services?filters={"label":["com.docker.stack.namespace=<stack>"]}`
    and save each existing service's `Spec` as its revision file, keeping the
    revision it replaces in memory. A deploy that is interrupted, or whose
@@ -639,6 +646,16 @@ minga-ctl stack rm <stack> [--with <id>]... [--yes]
    ``error: deployed, but could not save revisions for myapp: <reason>`` and
    ``hint: each service's revision is its spec from before this deploy; for a service the deploy did not change, rollback restores that same spec``.
    Otherwise 0.
+5. Only when `minga` exited 0. With `--prune`, `DELETE /v1.41/services/{id}`
+   for each service confirmed in step 0 that is still there (the stack's
+   label is what selected them, so another stack's services are never
+   touched), after saving its `Spec` from step 1 as its revision, so
+   `service rollback` recreates it; as in `service rm`, a delete the API
+   refuses puts the earlier revision back. If pruning fails after step 3 could not save a
+   revision, the error names both. Every one is tried; a failure exits 2 with
+   ``error: deployed, but could not prune <id> (<reason>)``. Without
+   `--prune`, one note on stderr (not with `--quiet`):
+   ``note: myapp.old in stack myapp but not in compose.yaml; --prune removes it``.
 
 `minga deploy` validates the compose file itself, and unknown keys fail there.
 
@@ -646,7 +663,21 @@ minga-ctl stack rm <stack> [--with <id>]... [--yes]
 $ minga-ctl stack deploy -c compose.yaml myapp
 <output of minga deploy>
 saved revision for myapp.web (myapp.worker unchanged)
+note: myapp.old in stack myapp but not in compose.yaml; --prune removes it
+
+$ minga-ctl stack deploy -c compose.yaml --prune myapp
+After the deploy this removes from context `prod`:
+  services: myapp.old
+(their specs are saved; `service rollback` recreates one)
+Continue? [y/N] y
+<output of minga deploy>
+saved revision for myapp.web (myapp.worker unchanged)
+pruned myapp.old
 ```
+
+`--prune` reads the service names from the compose file itself, not from
+`minga deploy`. Every key under `services:` counts as in the file, whatever
+its `profiles`, so a service behind a profile you did not enable is kept.
 
 **Where the compose file is resolved.** `minga deploy` translates the compose
 file on the machine it runs on, and minga-ctl runs it on the operator's
@@ -764,11 +795,12 @@ resources.
 ```
 minga-ctl service ls [--stack <stack>]
 minga-ctl service ps <service>
-minga-ctl service inspect <service>
+minga-ctl service inspect <service> [--tail <n>]
 minga-ctl service logs <service> [-f] [--tail <n>]
 minga-ctl service scale <service> --replicas <n>
 minga-ctl service update <service> [--image <ref>] [--env-add <KEY=VALUE>]...
                                    [--env-rm <KEY>]... [--replicas <n>]
+minga-ctl service rm <service> [--yes]
 minga-ctl service rollback <service> [--yes]
 ```
 
@@ -799,6 +831,20 @@ the last run) and `ERROR` in full. `-o json` and `-o yaml` print one object,
 `{"service": {...}, "tasks": [...]}`. `RESTARTS` comes from `MingaRestarts`,
 a Minga field on the task that Docker clients ignore.
 
+For each task whose state is not `running` it also runs `minga logs <task id>
+--tail <n> --nats-url <url>` the way `logs` does (`--tail` default `20`, `0`
+means all, applied to lines again here because one log entry can hold many;
+four at a time, 20 seconds at most each once started) and prints the lines
+under the table, each labelled `[stdout]` or `[stderr]` after the stream of
+that command, with control characters shown as `?`. If the command cannot run
+(no `minga` there, exit 255 over SSH for an unreachable node, any other
+non-zero exit, a timeout) the task gets one line, `skipped: <why>`, and the
+command still exits 0. In `-o json` and `-o yaml` those tasks gain
+`"logs": {"stdout": [...], "stderr": [...], "error": null}` (`error` holds the
+reason, and the two lists are empty, when it was skipped); running tasks have
+no `logs` key, and no existing field changes. `--quiet` prints task IDs and
+contacts no node.
+
 Why a task ended comes from the node's supervisor, which records it on the
 task: `exited with code N` (with the signal when the code is 128 plus one),
 or the error from starting the container, cut to 300 characters and with
@@ -823,6 +869,24 @@ minga-ctl does not carry NATS credentials.
 $ minga-ctl service logs myapp.web --tail 2
 myapp.web.1.3f9a1c2e | listening on :8080
 myapp.web.2.3f9a1c2e | listening on :8080
+```
+
+**`rm`**
+
+1. `GET /v1.41/services/{id}` (404: exit 3).
+2. Show the service (mode, image) and ask for confirmation.
+3. Save the `Spec` read in step 1 as the revision file, so `rollback`
+   recreates the service. If that write fails nothing is deleted (exit 2).
+4. `DELETE /v1.41/services/{id}`. If the API refuses it, the revision it
+   replaced is put back. If there is no answer (the delete may have happened)
+   or the service is already gone (exit 3), the new revision stays, since it
+   is the only way to recreate the service.
+
+```
+$ minga-ctl service rm myapp.old
+This removes service myapp.old (replicated x1, ghcr.io/acme/old:1) from context `prod`; `service rollback` can bring it back.
+Continue? [y/N] y
+myapp.old removed; `minga-ctl service rollback myapp.old` recreates it
 ```
 
 **`scale`**
@@ -891,8 +955,11 @@ myapp.web updated: image ghcr.io/acme/web:1.4.2 -> ghcr.io/acme/web:1.4.3
 **`rollback`**
 
 1. Read the revision file. Missing: exit 3.
-2. `GET /v1.41/services/{id}` (404: exit 3). If the saved spec equals the
-   running one, print `myapp.web already matches the saved revision; nothing
+2. `GET /v1.41/services/{id}`. A 404 means `service rm` or `stack deploy
+   --prune` removed it: ask for confirmation, then `POST
+   /v1.41/services/create` with the saved spec (a 409 means it came back
+   meanwhile), print `myapp.old recreated` and stop; the revision stays. If
+   the saved spec equals the running one, print `myapp.web already matches the saved revision; nothing
    changed` and exit 0.
 3. Show what changes (image, replicas, number of changed environment keys)
    and ask for confirmation.
@@ -1290,6 +1357,17 @@ plan.
 - Required: a `service scale` the API rejects leaves the revision file
   unchanged, so `rollback` still restores the earlier spec.
 - Required: `rollback` stops when the service changes between its two reads.
+- `tests/ops_loop.rs`, against a real API with a stub `minga` and `ssh`:
+  `stack deploy --prune` removes only the stack's services that the file
+  lacks (not those of `appx` or `other`), saves their revisions, needs
+  `--yes` without a terminal before it deploys anything, prunes nothing when
+  `minga deploy` fails, and `service rollback` recreates one; without
+  `--prune` stderr has the note. `service rm` removes, saves the revision and
+  audits; a missing service is exit 3, no terminal without `--yes` is exit 1
+  with the service kept. `service inspect` shows the stubbed output of the
+  failed task only, in text and JSON, skips with a note when `minga logs`
+  fails or the node is unreachable over SSH, and `--quiet` runs no command.
+  Not covered: typing `n` at the prompt (it needs a pseudo-terminal).
 - A 401 from a server started with a token gives exit 2 and the hint text.
 - `tests/wrapped.rs` sets `MINGA_BIN` to a stub script that records its
   arguments, environment and stdin, and checks `stack deploy` and
@@ -1358,6 +1436,12 @@ Before each commit: `cargo fmt --all`, `cargo clippy --all-targets -- -D warning
 - `service scale`, `update` and `rollback` return when the API accepts the
   spec. They do not wait for the rollout; the API reports
   `UpdateStatus.State` as `completed` at all times.
+- `stack deploy --prune` and `service rm` remove services only, and keep
+  one revision per service: removing a service that already has a revision
+  replaces it. Removing a service removes its tasks too, so read
+  `service inspect` first if you need their errors. `--prune` takes names from the compose file as
+  written: it does not follow variables in service keys, and keeps a service
+  behind a profile that was not enabled (section 5.2).
 - `stack rm` removes services only. Networks, configs and secret metadata
   are removed when named with `--with`, because Minga keeps no record of
   which stack created them. The `<stack>_` prefix check is a guard against

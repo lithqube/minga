@@ -35,10 +35,15 @@ pub enum ServiceCommand {
         service: String,
     },
     /// Show a service's image, replicas, ports, networks, update policy and
-    /// healthcheck, and its tasks with state, restarts, exit code and last error.
+    /// healthcheck, its tasks with state, restarts, exit code and last error,
+    /// and the last lines of output of each task that is not running.
     Inspect {
         /// Service ID, `<stack>.<service>`.
         service: String,
+        /// Lines of output to show for each task that is not running; 0
+        /// means all. Fetched with `minga logs` on the node.
+        #[arg(long, default_value_t = 20)]
+        tail: u64,
     },
     /// Print the logs of a service's running tasks with `minga logs`.
     Logs {
@@ -83,7 +88,17 @@ pub enum ServiceCommand {
         #[arg(long)]
         replicas: Option<u64>,
     },
-    /// Return a service to the spec saved before minga-ctl last changed it.
+    /// Remove a service. Its spec is saved first, so `service rollback`
+    /// can bring it back.
+    Rm {
+        /// Service ID, `<stack>.<service>`.
+        service: String,
+        /// Do not ask for confirmation.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Return a service to the spec saved before minga-ctl last changed it,
+    /// or recreate one that minga-ctl removed.
     Rollback {
         /// Service ID, `<stack>.<service>`.
         service: String,
@@ -125,6 +140,9 @@ impl ServiceCommand {
                     "replicas": replicas,
                 }),
             )),
+            ServiceCommand::Rm { service, yes } => {
+                Some(("service rm", json!({ "service": service, "yes": yes })))
+            }
             ServiceCommand::Rollback { service, yes } => Some((
                 "service rollback",
                 json!({ "service": service, "yes": yes }),
@@ -146,7 +164,9 @@ pub async fn run(
     match cmd {
         ServiceCommand::Ls { stack } => ls(client, stack.as_deref(), format, quiet).await,
         ServiceCommand::Ps { service } => ps(client, service, format, quiet).await,
-        ServiceCommand::Inspect { service } => inspect(client, service, format, quiet).await,
+        ServiceCommand::Inspect { service, tail } => {
+            inspect(client, resolved, service, *tail, debug, format, quiet).await
+        }
         ServiceCommand::Logs {
             service,
             follow,
@@ -170,6 +190,7 @@ pub async fn run(
             };
             update(client, service, &change, format, quiet).await
         }
+        ServiceCommand::Rm { service, yes } => rm(client, service, *yes, format, quiet).await,
         ServiceCommand::Rollback { service, yes } => {
             rollback(client, service, format, quiet, |summary| {
                 confirm("service rollback", *yes, summary)
@@ -405,10 +426,21 @@ async fn ps(client: &ApiClient, id: &str, format: Format, quiet: bool) -> Result
     Ok(())
 }
 
-/// `GET /services/{id}` (404: exit 3), then that service's tasks.
+/// How many `minga logs` run at once for `inspect`.
+static LOGS_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
+
+/// How long one `minga logs` may take before its task is reported as skipped.
+/// The wait for a slot is not counted.
+const LOGS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// `GET /services/{id}` (404: exit 3), then that service's tasks and, for
+/// each task that is not running, the end of its output.
 async fn inspect(
     client: &ApiClient,
+    resolved: &Resolved,
     id: &str,
+    tail: u64,
+    debug: bool,
     format: Format,
     quiet: bool,
 ) -> Result<(), CtlError> {
@@ -417,16 +449,42 @@ async fn inspect(
         .get("tasks", Some(&json!({ "service": [id] })))
         .await?;
     let nodes = view::node_names(&client.get("nodes", None).await?);
-    let rows = view::inspect_task_rows(&tasks, &nodes);
+    let mut rows = view::inspect_task_rows(&tasks, &nodes);
     let summary = view::spec_summary(&service);
+    // Quiet prints the task IDs only, like `ps`: no node is contacted.
+    if quiet {
+        return match format {
+            Format::Table => output::print(format, quiet, &rows),
+            _ => Ok(()),
+        };
+    }
+
+    let mut outputs = Vec::new(); // (row index, output)
+    for (i, task) in rows.values.iter().enumerate() {
+        if task["state"] != "running" {
+            let task = task["id"].as_str().unwrap_or("").to_string();
+            outputs.push((i, task_output(resolved, task, tail, debug)));
+        }
+    }
+    for (i, output) in outputs {
+        let output = output.await;
+        rows.values[i]["logs"] = match &output {
+            Ok((stdout, stderr)) => json!({ "stdout": stdout, "stderr": stderr, "error": null }),
+            Err(why) => json!({ "stdout": [], "stderr": [], "error": why }),
+        };
+    }
+
     match format {
-        // Quiet prints the task IDs only, like `ps`.
-        Format::Table if quiet => output::print(format, quiet, &rows),
         Format::Table => {
             output::say(false, &view::spec_text(&summary))?;
             if !rows.is_empty() {
                 output::say(false, "")?;
                 output::print(format, quiet, &rows)?;
+            }
+            for task in &rows.values {
+                if task["logs"].is_object() {
+                    output::say(false, &logs_text(task, tail))?;
+                }
             }
             Ok(())
         }
@@ -437,6 +495,189 @@ async fn inspect(
             json!({ "service": summary, "tasks": rows.values }),
         ),
     }
+}
+
+/// One task's output as `minga logs` printed it: (stdout lines, stderr
+/// lines), or why it could not be read (unreachable node, no `minga`).
+type TaskOutput = Result<(Vec<String>, Vec<String>), String>;
+
+/// Runs `minga logs <task> --tail N` on the context's SSH target or here,
+/// the way `service logs` does, and waits for it.
+fn task_output(
+    resolved: &Resolved,
+    task: String,
+    tail: u64,
+    debug: bool,
+) -> impl std::future::Future<Output = TaskOutput> {
+    let ssh = resolved.context.ssh.clone();
+    let nats = resolved
+        .context
+        .nats_url
+        .clone()
+        .unwrap_or_else(|| DEFAULT_NATS_URL.to_string());
+    let prepared = (|| {
+        transport::validate_id(&task)?;
+        let tail = tail.to_string();
+        let argv = [
+            RemoteArg::Fixed("minga"),
+            RemoteArg::Fixed("logs"),
+            RemoteArg::Value(&task),
+            RemoteArg::Fixed("--tail"),
+            RemoteArg::Value(&tail),
+            RemoteArg::Fixed("--nats-url"),
+            RemoteArg::Value(&nats),
+        ];
+        let mut cmd = match &ssh {
+            Some(target) => transport::remote_command(target, &argv, debug)?,
+            None => image::local_command(&argv, "service inspect")?,
+        };
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        Ok::<_, CtlError>(cmd)
+    })();
+    // Started now, so the tasks' commands run together.
+    let handle = prepared.map(|mut cmd| {
+        tokio::spawn(async move {
+            // A few ssh logins at a time: many at once can exceed the
+            // node's `MaxStartups` and look like an unreachable node.
+            let _permit = LOGS_SLOTS.acquire().await;
+            tokio::time::timeout(LOGS_TIMEOUT, cmd.output()).await
+        })
+    });
+    async move {
+        let out = match handle {
+            Err(e) => return Err(e.to_string()),
+            Ok(handle) => match handle.await {
+                Ok(Ok(Ok(out))) => out,
+                Ok(Ok(Err(e))) => return Err(format!("cannot run minga logs: {e}")),
+                Ok(Err(_)) => return Err("timed out".to_string()),
+                Err(e) => return Err(e.to_string()),
+            },
+        };
+        match out.status.code() {
+            Some(0) => {
+                // `minga logs --tail` counts log entries, which may hold many
+                // lines, so the last `tail` lines are taken here.
+                let lines = |bytes: &[u8]| -> Vec<String> {
+                    let text = String::from_utf8_lossy(bytes);
+                    let all: Vec<&str> = text.lines().collect();
+                    let from = if tail == 0 {
+                        0
+                    } else {
+                        all.len().saturating_sub(tail as usize)
+                    };
+                    all[from..].iter().map(|l| l.to_string()).collect()
+                };
+                Ok((lines(&out.stdout), lines(&out.stderr)))
+            }
+            Some(127) => Err("`minga` not found on the node".to_string()),
+            Some(255) if ssh.is_some() => Err("node unreachable (ssh failed)".to_string()),
+            Some(code) => Err(format!("`minga logs` exited {code}")),
+            None => Err("`minga logs` was killed".to_string()),
+        }
+    }
+}
+
+/// The text form of one task's `logs` field: each line labelled with its
+/// stream, control characters (a container controls its own output) shown as `?`.
+fn logs_text(task: &Value, tail: u64) -> String {
+    let id = task["id"].as_str().unwrap_or("");
+    let last = if tail == 0 {
+        "output".to_string()
+    } else {
+        format!("last {tail} lines of output")
+    };
+    let logs = &task["logs"];
+    let mut text = format!("\n{id} ({}): {last}", task["state"].as_str().unwrap_or("-"));
+    if let Some(why) = logs["error"].as_str() {
+        text.push_str(&format!("\n  skipped: {why}"));
+        return text;
+    }
+    let mut empty = true;
+    for stream in ["stdout", "stderr"] {
+        for line in logs[stream].as_array().into_iter().flatten() {
+            empty = false;
+            let line: String = line
+                .as_str()
+                .unwrap_or("")
+                .chars()
+                .map(|c| if c.is_control() && c != '\t' { '?' } else { c })
+                .collect();
+            text.push_str(&format!("\n  [{stream}] {line}"));
+        }
+    }
+    if empty {
+        text.push_str("\n  (no output)");
+    }
+    text
+}
+
+/// `DELETE /services/{id}` after saving `spec` as the revision, so a service
+/// is never gone without one. If the save fails nothing is deleted; if the
+/// API refuses the delete the revision it replaced is put back; if the
+/// outcome is unknown (no answer) the new revision stays.
+pub(crate) async fn delete_saving(
+    client: &ApiClient,
+    id: &str,
+    spec: &Value,
+) -> Result<Found, CtlError> {
+    // An unreadable revision file is not worth keeping.
+    let old = state::load_revision(&client.context, id).ok().flatten();
+    state::save_revision(&client.context, id, spec).map_err(|err| {
+        CtlError::Halted(format!(
+            "cannot save the revision of {id} ({err}); nothing was removed"
+        ))
+    })?;
+    let result = client.delete(&format!("services/{id}")).await;
+    // Put the old revision back only when the server answered that it did not
+    // delete. A lost response (or an already gone service) may mean it did, and
+    // then the new revision is the only way to recreate it.
+    let refused = match &result {
+        // A 2xx the client could not read (not JSON) is still a delete.
+        Err(CtlError::Api { status, .. }) => !(200..300).contains(status),
+        Err(CtlError::Auth { .. }) => true,
+        _ => false,
+    };
+    if refused {
+        // Best effort: a revision left at the current spec rolls back to itself.
+        let _ = crate::cmd::stack::restore(client, id, old);
+    }
+    result
+}
+
+/// `rm`: read (404: exit 3), confirm, save the spec as the revision so
+/// `rollback` can recreate the service, then `DELETE`.
+async fn rm(
+    client: &ApiClient,
+    id: &str,
+    yes: bool,
+    format: Format,
+    quiet: bool,
+) -> Result<(), CtlError> {
+    let service = read(client, id).await?;
+    let spec = &service["Spec"];
+    let (mode, desired) = view::mode(&service);
+    let replicas = desired.map_or(String::new(), |n| format!(" x{n}"));
+    confirm(
+        "service rm",
+        yes,
+        &format!(
+            "This removes service {id} ({mode}{replicas}, {}) from context `{}`; \
+             `service rollback` can bring it back.",
+            view::image(&service),
+            client.context
+        ),
+    )?;
+    if let Found::No = delete_saving(client, id, spec).await? {
+        return Err(not_found(client, "service", id));
+    }
+    report(
+        format,
+        quiet,
+        &format!("{id} removed; `minga-ctl service rollback {id}` recreates it"),
+        json!({ "service": id, "removed": true }),
+    )
 }
 
 /// `scale`: read, set the replicas in a copy, post only if it changed.
@@ -553,7 +794,9 @@ async fn update(
 
 /// `rollback`: post the saved revision after `confirm` agrees and the service
 /// has not changed since it was read. On success the spec it replaced becomes
-/// the new revision, so a second rollback returns to where it started.
+/// the new revision, so a second rollback returns to where it started. A
+/// service that is gone (`service rm`, `stack deploy --prune`) is created
+/// again from its revision.
 pub async fn rollback(
     client: &ApiClient,
     id: &str,
@@ -564,7 +807,10 @@ pub async fn rollback(
     api::check_id("service", id)?;
     let revision = state::load_revision(&client.context, id)?
         .ok_or_else(|| not_found(client, "revision", id))?;
-    let first = read(client, id).await?;
+    let first = match client.get_found(&format!("services/{id}"), None).await? {
+        Found::Yes(service) => service,
+        Found::No => return recreate(client, id, &revision, format, quiet, confirm).await,
+    };
     let current = &first["Spec"];
     if same_spec(&revision.spec, current) {
         let text = format!("{id} already matches the saved revision; nothing changed");
@@ -598,6 +844,36 @@ pub async fn rollback(
         quiet,
         &format!("{id} rolled back"),
         json!({ "service": id, "rolled_back": true }),
+    )
+}
+
+/// `rollback` of a removed service: `POST /services/create` with the revision.
+/// The revision stays, and now equals the service.
+async fn recreate(
+    client: &ApiClient,
+    id: &str,
+    revision: &state::Revision,
+    format: Format,
+    quiet: bool,
+    confirm: impl FnOnce(&str) -> Result<(), CtlError>,
+) -> Result<(), CtlError> {
+    confirm(&format!(
+        "Recreate {id} in context `{}` from the revision saved {}:\n  image: {}",
+        client.context,
+        revision.saved_at,
+        revision
+            .spec
+            .pointer("/TaskTemplate/ContainerSpec/Image")
+            .and_then(Value::as_str)
+            .unwrap_or("-"),
+    ))?;
+    // A 409 here means the service came back while waiting for the answer.
+    client.post("services/create", &revision.spec).await?;
+    report(
+        format,
+        quiet,
+        &format!("{id} recreated"),
+        json!({ "service": id, "rolled_back": true, "recreated": true }),
     )
 }
 

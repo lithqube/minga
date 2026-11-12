@@ -45,7 +45,9 @@ minga-ctl service inspect <stack>.<service>
 minga-ctl service logs -f <stack>.<service>
 minga-ctl service scale --replicas 3 <stack>.<service>
 minga-ctl service update --image <ref> <stack>.<service>
+minga-ctl service rm <stack>.<service>
 minga-ctl service rollback <stack>.<service>
+minga-ctl stack deploy -c compose.yaml --prune <stack>   # also removes the stack's services the file lacks
 minga-ctl secret put <stack>_<key> < value-file
 minga-ctl registry login ghcr --username <user>     # credential on stdin
 minga-ctl image pull <ref>
@@ -60,6 +62,8 @@ Things that surprise people:
 
 - `scale`, `update` and `rollback` return when the API accepts the spec. They do not wait for the rollout, so check `service ps` afterwards.
 - `rollback` restores one previous revision, and only for changes made with `minga-ctl` on the same machine. A deploy from CI cannot be rolled back from a laptop.
+- A service deleted from the Compose file keeps running after a plain `stack deploy`; it prints a note naming it. `--prune` removes it, and `service rm` removes one service. Both save the spec, and `service rollback` recreates it.
+- `service inspect` also prints the last 20 lines of output of each task that is not running (`--tail`), or says why it could not.
 - `stack rm` removes services only. Networks, configs and secrets go only when named with `--with <stack>_...`.
 - Plain HTTP to a host other than loopback is refused, with no override. Use `--ssh`, or an `https://` endpoint with `--tls-cert`.
 - Exit codes: 1 user or config error, 2 API / transport / auth / failed health check, 3 the named thing does not exist.
@@ -75,7 +79,7 @@ Things that surprise people:
 
 - Tokens and secret values never go in arguments or config files, since both end up in process listings and shell history. `secret put` and `registry login` read stdin. The `minga-ctl` config has no token field on purpose; use `--remote-token-file`, `--token-command` or `MINGA_CTL_TOKEN`.
 - `service update --env-add` values are visible in process listings. Use Minga secrets for credentials.
-- Ask the user before `stack rm`, `service rollback`, `image rm`, `registry logout`, `state import --overwrite`, removing Raft files, or anything that restarts a role. Do not pass `--yes` unless they said to.
+- Ask the user before `stack rm`, `stack deploy --prune`, `service rm`, `service rollback`, `image rm`, `registry logout`, `state import --overwrite`, removing Raft files, or anything that restarts a role. Do not pass `--yes` unless they said to.
 - Without `MINGA_API_TOKEN` on `minga api` the API is unauthenticated, and anything that reaches it can deploy privileged containers. Flag that if you see it. There are no roles yet: everyone with the token is an admin.
 
 ## Troubleshooting
