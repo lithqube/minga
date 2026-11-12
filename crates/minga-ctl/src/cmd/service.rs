@@ -615,7 +615,8 @@ fn logs_text(task: &Value, tail: u64) -> String {
 
 /// `DELETE /services/{id}` after saving `spec` as the revision, so a service
 /// is never gone without one. If the save fails nothing is deleted; if the
-/// delete fails (or finds nothing) the revision it replaced is put back.
+/// API refuses the delete the revision it replaced is put back; if the
+/// outcome is unknown (no answer) the new revision stays.
 pub(crate) async fn delete_saving(
     client: &ApiClient,
     id: &str,
@@ -629,7 +630,10 @@ pub(crate) async fn delete_saving(
         ))
     })?;
     let result = client.delete(&format!("services/{id}")).await;
-    if !matches!(result, Ok(Found::Yes(_))) {
+    // Put the old revision back only when the server answered that it did not
+    // delete. A lost response (or an already gone service) may mean it did, and
+    // then the new revision is the only way to recreate it.
+    if matches!(result, Err(CtlError::Api { .. } | CtlError::Auth { .. })) {
         // Best effort: a revision left at the current spec rolls back to itself.
         let _ = crate::cmd::stack::restore(client, id, old);
     }

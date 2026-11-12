@@ -650,8 +650,8 @@ minga-ctl stack rm <stack> [--with <id>]... [--yes]
    for each service confirmed in step 0 that is still there (the stack's
    label is what selected them, so another stack's services are never
    touched), after saving its `Spec` from step 1 as its revision, so
-   `service rollback` recreates it; as in `service rm`, a failed delete puts
-   the earlier revision back. If pruning fails after step 3 could not save a
+   `service rollback` recreates it; as in `service rm`, a delete the API
+   refuses puts the earlier revision back. If pruning fails after step 3 could not save a
    revision, the error names both. Every one is tried; a failure exits 2 with
    ``error: deployed, but could not prune <id> (<reason>)``. Without
    `--prune`, one note on stderr (not with `--quiet`):
@@ -877,8 +877,10 @@ myapp.web.2.3f9a1c2e | listening on :8080
 2. Show the service (mode, image) and ask for confirmation.
 3. Save the `Spec` read in step 1 as the revision file, so `rollback`
    recreates the service. If that write fails nothing is deleted (exit 2).
-4. `DELETE /v1.41/services/{id}`. If that fails, or the service is already
-   gone (exit 3), the revision it replaced is put back.
+4. `DELETE /v1.41/services/{id}`. If the API refuses it, the revision it
+   replaced is put back. If there is no answer (the delete may have happened)
+   or the service is already gone (exit 3), the new revision stays, since it
+   is the only way to recreate the service.
 
 ```
 $ minga-ctl service rm myapp.old

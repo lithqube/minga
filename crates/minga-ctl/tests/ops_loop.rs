@@ -74,7 +74,16 @@ impl Env {
         args: &[&str],
         env: &[(&str, &str)],
     ) -> (i32, String, String) {
-        let (home, url) = (self.dir.path().to_path_buf(), cluster.url.clone());
+        self.run_at(&cluster.url, args, env).await
+    }
+
+    async fn run_at(
+        &self,
+        url: &str,
+        args: &[&str],
+        env: &[(&str, &str)],
+    ) -> (i32, String, String) {
+        let (home, url) = (self.dir.path().to_path_buf(), url.to_string());
         let minga = self.path("bin/minga").display().to_string();
         let dir = home.display().to_string();
         let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
@@ -568,4 +577,42 @@ async fn inspect_over_an_unreachable_node_still_shows_the_service() {
         "{stdout}"
     );
     assert!(env.read("ssh.calls").unwrap().contains("'logs'"));
+}
+
+/// A lost response to `DELETE` leaves the new revision: the service may be gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn service_rm_keeps_the_new_revision_when_the_delete_gets_no_answer() {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let body = json!({
+        "ID": "app.web", "Version": { "Index": 1 },
+        "Spec": spec("app.web", "app", "web:9"),
+    })
+    .to_string();
+    std::thread::spawn(move || {
+        // The read is answered; the DELETE is read and the connection dropped.
+        for answer in [true, false] {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            if answer {
+                let reply = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(reply.as_bytes());
+            }
+        }
+    });
+    let env = Env::new();
+    let (code, _, err) = env
+        .run_at(&url, &["service", "rm", "app.web", "--yes"], &[])
+        .await;
+    assert_eq!(code, 2, "{err}");
+    let revision = env.revision("app.web").expect("the revision stays");
+    assert_eq!(
+        revision["spec"]["TaskTemplate"]["ContainerSpec"]["Image"],
+        "web:9"
+    );
 }
