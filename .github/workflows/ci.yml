@@ -60,42 +60,51 @@ jobs:
           sudo ctr -n minga images pull docker.io/library/busybox:latest
           sudo ctr -n minga images pull docker.io/library/nginx:1.27
 
-      - name: Private registry (registry:2, htpasswd, TLS) with one seeded image
+      - name: Private registry (distribution, htpasswd, TLS) with one seeded image
         run: |
-          # containerd's Transfer API cannot be told to use plain HTTP, so the
-          # registry serves a self-signed cert that containerd and docker trust.
+          # Installing containerd above removed the runner's docker-ce, so the
+          # registry is the distro package, not a container. containerd's
+          # Transfer API cannot be told to use plain HTTP (1.7 has no such
+          # field), so it serves TLS with a self-signed cert the daemon trusts.
+          sudo apt-get install -y docker-registry apache2-utils skopeo
+          sudo systemctl disable --now docker-registry
           mkdir -p "$RUNNER_TEMP/registry"
           cd "$RUNNER_TEMP/registry"
           openssl req -x509 -newkey rsa:2048 -nodes -days 1 -keyout registry.key -out registry.crt \
             -subj "/CN=localhost" -addext "subjectAltName=DNS:localhost,IP:127.0.0.1"
           sudo cp registry.crt /usr/local/share/ca-certificates/minga-test-registry.crt
           sudo update-ca-certificates
-          sudo mkdir -p /etc/docker/certs.d/localhost:5000
-          sudo cp registry.crt /etc/docker/certs.d/localhost:5000/ca.crt
-          # docker depends on containerd and is not brought back by itself: restart both.
-          sudo systemctl restart containerd docker
-          for _ in $(seq 1 60); do
-            # not `docker info`: it exits 1 on the runner even when the daemon is up
-            docker ps >/dev/null 2>&1 && sudo ctr version >/dev/null 2>&1 && break
-            sleep 1
-          done
-          docker ps >/dev/null
+          sudo systemctl restart containerd
 
           password="$(openssl rand -hex 16)"
           echo "::add-mask::$password"
-          docker run --rm --entrypoint htpasswd httpd:2 -Bbn minga "$password" > htpasswd
-          docker run -d --name registry -p 127.0.0.1:5000:5000 \
-            -v "$PWD/htpasswd:/auth/htpasswd:ro" -v "$PWD:/certs:ro" \
-            -e REGISTRY_AUTH=htpasswd -e REGISTRY_AUTH_HTPASSWD_REALM=minga \
-            -e REGISTRY_AUTH_HTPASSWD_PATH=/auth/htpasswd \
-            -e REGISTRY_HTTP_TLS_CERTIFICATE=/certs/registry.crt \
-            -e REGISTRY_HTTP_TLS_KEY=/certs/registry.key \
-            registry:2
-          sleep 3
-          echo "$password" | docker login localhost:5000 -u minga --password-stdin
-          docker pull busybox:latest
-          docker tag busybox:latest localhost:5000/minga/private:1
-          docker push localhost:5000/minga/private:1
+          htpasswd -Bbn minga "$password" > htpasswd
+          cat > config.yml <<EOF
+          version: 0.1
+          storage:
+            filesystem:
+              rootdirectory: $PWD/data
+          http:
+            addr: 127.0.0.1:5000
+            tls:
+              certificate: $PWD/registry.crt
+              key: $PWD/registry.key
+          auth:
+            htpasswd:
+              realm: minga
+              path: $PWD/htpasswd
+          EOF
+          nohup docker-registry serve config.yml > registry.log 2>&1 &
+          for _ in $(seq 1 30); do
+            curl -s -o /dev/null --cacert registry.crt https://localhost:5000/v2/ && break
+            sleep 1
+          done
+          curl -s -o /dev/null -w 'anonymous /v2/ -> %{http_code}\n' --cacert registry.crt https://localhost:5000/v2/
+
+          # Seed a single-platform copy of busybox. (skopeo takes the login as an
+          # argument: fine for a throwaway masked password on an ephemeral runner.)
+          skopeo copy --dest-creds "minga:$password" \
+            docker://docker.io/library/busybox:latest docker://localhost:5000/minga/private:1
           {
             echo "MINGA_TEST_REGISTRY_IMAGE=localhost:5000/minga/private:1"
             echo "MINGA_TEST_REGISTRY_USER=minga"
