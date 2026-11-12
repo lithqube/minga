@@ -50,7 +50,7 @@ ${deployOutput.split('\n').slice(3).join('\n')}`;
     tertiary={site.social.discord ? { label: 'Join Discord', href: site.social.discord } : null}
     prereq="Needs: Linux · root · containerd · iproute2 · iptables · procps"
     status={{
-      text: `Verified on one Linux host (containerd 2.2.1). Private-registry pulls use inline Docker credentials; no cross-node networking yet.`,
+      text: `Single host. Tested in Linux CI with containerd and a real kernel; no cross-node networking or API roles yet.`,
       href: '#when-not',
       linkText: 'Known limits',
     }}

@@ -390,7 +390,7 @@ async fn a_state_file_without_a_marker_is_refused() {
     set_marker(path.join("state.redb"), SM_META, None);
     let err = open_error(&path).await;
     assert!(err.contains("1.0.2 or older"), "{err}");
-    assert!(err.contains("clear --data-dir"), "{err}");
+    assert!(err.contains("remove raft_log.redb and state.redb"), "{err}");
 }
 
 #[tokio::test]

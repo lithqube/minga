@@ -1,6 +1,20 @@
 # Plan: single-node production-readiness fixes
 
-Status: planned, 2026-11-12. Nothing in this document is implemented yet.
+Status, 2026-11-12: steps A to E and F1 are merged and ship in v1.1.0
+([release notes](release-1.1.0.md)); F2 to F4 wait for
+[ADR 0005](adr/0005-api-identity-and-roles.md) to be accepted. The sections
+below are the plan as written; where the build differed, the PR says so.
+
+| Step | What | Status |
+| --- | --- | --- |
+| A | Published-port rules | Merged, #37 |
+| B | Runtime gaps (groups, `extra_hosts`, pull cleanup) | Merged, #39 |
+| C | Versioned state format | Merged, #38 |
+| D | Backup and restore | Merged, #40; the route is `/v1.41/state`, not `/minga/v1/state` |
+| E | Image pull without `ctr` | Merged, #43 |
+| F1 | ADR 0005 | Merged as Proposed, #36 |
+| F2 to F4 | API TLS and roles, server-side revisions, minga-ctl client certificates | Not started |
+| From staging | Task failure reasons (#42), minga-ctl papercuts (#41) | Merged; not in the original plan |
 
 ## Context
 
