@@ -65,17 +65,25 @@ pub fn load_revision(context: &str, service: &str) -> Result<Option<Revision>, C
 
 /// Saves `spec` as the revision of `service` in `context`, atomically.
 pub fn save_revision(context: &str, service: &str, spec: &Value) -> Result<(), CtlError> {
-    let path = revision_path(context, service)?;
+    put_revision(
+        context,
+        &Revision {
+            saved_at: now(),
+            service_id: service.to_string(),
+            spec: spec.clone(),
+        },
+    )
+}
+
+/// Writes `revision` back as it was, atomically: `stack deploy` puts back
+/// the revision of a service it did not change.
+pub fn put_revision(context: &str, revision: &Revision) -> Result<(), CtlError> {
+    let path = revision_path(context, &revision.service_id)?;
     let revisions = dir().join("revisions");
     for dir in [dir(), revisions.clone(), revisions.join(context)] {
         config::create_private_dir(&dir)?;
     }
-    let revision = Revision {
-        saved_at: now(),
-        service_id: service.to_string(),
-        spec: spec.clone(),
-    };
-    let mut bytes = serde_json::to_vec(&revision)?;
+    let mut bytes = serde_json::to_vec(revision)?;
     bytes.push(b'\n');
     config::write_private_file(&path, &bytes)
 }

@@ -27,6 +27,7 @@ cat > "$f.stdin"
 if [ "$1" = logs ]; then
   echo "line one"
   echo "warn" >&2
+  [ -n "$STUB_FOLLOW" ] && exec sleep 30
 fi
 if [ -n "$STUB_CURL" ]; then
   url=""; prev=""
@@ -143,6 +144,18 @@ impl Env {
             .map(|t| serde_json::from_str(&t).unwrap())
     }
 
+    /// A revision left by an earlier change: `id` at `image`.
+    fn seed_revision(&self, id: &str, image: &str) {
+        let dir = self.path("state/minga-ctl/revisions/default");
+        std::fs::create_dir_all(&dir).unwrap();
+        let revision = json!({
+            "saved_at": "2026-01-01T00:00:00Z",
+            "service_id": id,
+            "spec": service(id, image)["Spec"],
+        });
+        std::fs::write(dir.join(format!("{id}.json")), revision.to_string()).unwrap();
+    }
+
     fn ssh_context(&self) {
         let args = [
             "context",
@@ -252,6 +265,8 @@ fn deploy_passes_the_token_in_the_environment_and_saves_only_changed_revisions()
             service("app.new", "new:1")
         ])),
     ]);
+    // From an earlier change: the deploy leaves app.worker unchanged, so this stays.
+    env.seed_revision("app.worker", "worker:0");
     let token = "tok-deploy-5678";
     let (code, out, err) = env.run(
         &[
@@ -295,7 +310,12 @@ fn deploy_passes_the_token_in_the_environment_and_saves_only_changed_revisions()
         web["spec"]["TaskTemplate"]["ContainerSpec"]["Image"],
         "web:1"
     );
-    assert_eq!(env.revision("app.worker"), None);
+    let worker = env.revision("app.worker").expect("app.worker revision");
+    assert_eq!(worker["saved_at"], "2026-01-01T00:00:00Z");
+    assert_eq!(
+        worker["spec"]["TaskTemplate"]["ContainerSpec"]["Image"],
+        "worker:0"
+    );
     assert_eq!(env.revision("app.new"), None);
     assert_eq!(
         out.trim(),
@@ -316,6 +336,8 @@ fn deploy_exits_2_when_the_read_after_minga_fails() {
     let file = env.compose(NODE_SAFE);
     // One reply: the read before the deploy. The read after is refused.
     let (url, _) = fake_api(vec![ok(json!([service("app.web", "web:1")]))]);
+    // From an earlier change; rolling back to it now would skip a change.
+    env.seed_revision("app.web", "web:0");
     let (code, _, err) = env.run(
         &["stack", "deploy", "-c", &file, "app"],
         &[("MINGA_CTL_ENDPOINT", &url)],
@@ -328,8 +350,14 @@ fn deploy_exits_2_when_the_read_after_minga_fails() {
         "{err}"
     );
     assert!(
-        err.contains("hint: rollback data for this deploy may be missing"),
+        err.contains("hint: each service's revision is its spec from before this deploy"),
         "{err}"
+    );
+    // Saved before minga ran, so the stale web:0 revision is gone.
+    let web = env.revision("app.web").expect("app.web revision");
+    assert_eq!(
+        web["spec"]["TaskTemplate"]["ContainerSpec"]["Image"],
+        "web:1"
     );
     assert_eq!(env.audit()[0]["exit_code"], 2);
 }
@@ -567,6 +595,32 @@ fn a_failed_target_is_exit_2_and_skips_the_declaration() {
     assert!(out.contains("good  provisioned"), "{out}");
     assert!(heads.lock().unwrap().is_empty(), "the API was called");
     assert!(!err.contains("hunter2") && !out.contains("hunter2"));
+}
+
+#[test]
+fn service_logs_follow_ends_when_stdout_is_closed() {
+    let env = Env::new();
+    let (url, _) = fake_api(vec![
+        ok(service("app.web", "web:1")),
+        ok(json!([{ "ID": "app.web.1.aa" }, { "ID": "app.web.2.bb" }])),
+    ]);
+    let start = Instant::now();
+    let mut child = env
+        .command(
+            &["service", "logs", "app.web", "-f"],
+            &[("MINGA_CTL_ENDPOINT", &url), ("STUB_FOLLOW", "1")],
+        )
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Like `| head` exiting: the first line minga-ctl writes hits a closed pipe.
+    drop(child.stdout.take());
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    // Both stubs sleep 30s; ending well before that means they were stopped.
+    assert!(start.elapsed() < Duration::from_secs(20));
 }
 
 #[test]

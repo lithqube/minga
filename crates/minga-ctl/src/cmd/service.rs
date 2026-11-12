@@ -190,6 +190,8 @@ async fn logs(
         .as_deref()
         .unwrap_or(DEFAULT_NATS_URL);
     let tail = tail.to_string();
+    // Set once stdout is closed (`| head`): every stream then stops.
+    let (closed, _) = tokio::sync::watch::channel(false);
     let mut running = Vec::new();
     for task in view::items(&tasks) {
         let task = view::id(task);
@@ -220,7 +222,11 @@ async fn logs(
             },
             None => image::spawn_error(e, &argv, "service logs"),
         })?;
-        running.push(tokio::spawn(stream(task.to_string(), child)));
+        running.push(tokio::spawn(stream(
+            task.to_string(),
+            child,
+            closed.clone(),
+        )));
     }
     if running.is_empty() {
         eprintln!("{id} has no running tasks");
@@ -230,6 +236,10 @@ async fn logs(
         let (task, status) = handle
             .await
             .map_err(|e| CtlError::Halted(format!("a log stream stopped: {e}")))?;
+        if *closed.borrow() {
+            // The reader went away; the streams were stopped on purpose.
+            continue;
+        }
         match status.map(|s| s.code()) {
             Ok(Some(0)) => {}
             Ok(Some(127)) => {
@@ -258,24 +268,45 @@ async fn logs(
 }
 
 /// Copies a child's stdout and stderr line by line, each with `task | ` in
-/// front, and waits for it.
+/// front, and waits for it. When stdout is closed, it sets `closed`, and on
+/// `closed` (from any stream) it kills the child, so `-f | head` ends.
 async fn stream(
     task: String,
     mut child: tokio::process::Child,
+    closed: tokio::sync::watch::Sender<bool>,
 ) -> (String, std::io::Result<std::process::ExitStatus>) {
     let out = child.stdout.take().map(BufReader::new);
     let err = child.stderr.take().map(BufReader::new);
     let prefix = format!("{task} | ");
-    let (_, _, status) = tokio::join!(
-        copy_lines(out, &prefix, false),
-        copy_lines(err, &prefix, true),
-        child.wait()
-    );
+    let mut stop = closed.subscribe();
+    let copy_out = async {
+        if !copy_lines(out, &prefix, false).await {
+            closed.send_replace(true);
+        }
+    };
+    let wait = async {
+        tokio::select! {
+            status = child.wait() => status,
+            // The guard `wait_for` returns is dropped here, before any await.
+            _ = async { drop(stop.wait_for(|closed| *closed).await) } => {
+                let _ = child.kill().await;
+                child.wait().await
+            }
+        }
+    };
+    let (_, _, status) = tokio::join!(copy_out, copy_lines(err, &prefix, true), wait);
     (task, status)
 }
 
-async fn copy_lines(reader: Option<impl AsyncBufRead + Unpin>, prefix: &str, to_stderr: bool) {
-    let Some(mut reader) = reader else { return };
+/// Returns false if the output could not be written (a closed pipe).
+async fn copy_lines(
+    reader: Option<impl AsyncBufRead + Unpin>,
+    prefix: &str,
+    to_stderr: bool,
+) -> bool {
+    let Some(mut reader) = reader else {
+        return true;
+    };
     let mut line = Vec::new();
     while matches!(reader.read_until(b'\n', &mut line).await, Ok(n) if n > 0) {
         if !line.ends_with(b"\n") {
@@ -284,12 +315,16 @@ async fn copy_lines(reader: Option<impl AsyncBufRead + Unpin>, prefix: &str, to_
         let mut bytes = prefix.as_bytes().to_vec();
         bytes.append(&mut line);
         // One write per line keeps lines from different tasks whole.
-        let _ = if to_stderr {
+        let written = if to_stderr {
             std::io::stderr().lock().write_all(&bytes)
         } else {
             std::io::stdout().lock().write_all(&bytes)
         };
+        if written.is_err() {
+            return false;
+        }
     }
+    true
 }
 
 /// `GET /services` and `GET /tasks`; REPLICAS is running tasks over desired.
