@@ -141,15 +141,19 @@ impl NatsSidecar {
         // Create data directories.
         let nats_dir = opts.data_dir.join("nats");
         let jetstream_dir = nats_dir.join("jetstream");
-        tokio::fs::create_dir_all(&jetstream_dir)
-            .await
+        // Owner-only: the config holds the client token and the stream holds
+        // task specs with their environment values.
+        crate::private::create_dir(&jetstream_dir)
+            .and_then(|()| {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&nats_dir, std::fs::Permissions::from_mode(0o700))
+            })
             .map_err(|e| SidecarError::DataDir(e.to_string()))?;
 
         // Generate and write config.
         let config_path = nats_dir.join("server.conf");
         let config = generate_config(opts, &jetstream_dir);
-        tokio::fs::write(&config_path, &config)
-            .await
+        crate::private::write_file(&config_path, config.as_bytes())
             .map_err(|e| SidecarError::ConfigWrite(e.to_string()))?;
         tracing::debug!(path = %config_path.display(), "generated nats-server config");
 

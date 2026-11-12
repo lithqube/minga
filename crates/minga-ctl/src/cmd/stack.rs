@@ -216,6 +216,7 @@ async fn deploy(conn: &Connection, args: &DeployArgs<'_>, quiet: bool) -> Result
     } = *args;
     let client = &conn.api;
     api::check_id("stack", stack)?;
+    relay_needs_token(conn.api_socket().is_some(), client.token())?;
 
     // 1. The specs as they are now, saved as revisions before the deploy, so
     // a deploy that is interrupted or cannot be read back never leaves a
@@ -270,6 +271,11 @@ async fn deploy(conn: &Connection, args: &DeployArgs<'_>, quiet: bool) -> Result
         .env_remove("MINGA_CTL_TOKEN")
         .env_remove("MINGA_API_URL")
         .kill_on_drop(true);
+    // The child carries the token: keep it off any proxy, even if an older
+    // `minga` on PATH still honours the proxy variables.
+    for var in PROXY_VARS {
+        cmd.env_remove(var);
+    }
     match client.token() {
         Some(token) => cmd.env("MINGA_API_TOKEN", token),
         None => cmd.env_remove("MINGA_API_TOKEN"),
@@ -478,13 +484,37 @@ async fn settle(
     Ok((changes, errors))
 }
 
+const PROXY_VARS: [&str; 6] = [
+    "HTTP_PROXY",
+    "http_proxy",
+    "HTTPS_PROXY",
+    "https_proxy",
+    "ALL_PROXY",
+    "all_proxy",
+];
+
+/// The relay below is reachable by every local user while the deploy runs.
+/// That is safe only because the node API asks for the token, so refuse a
+/// context without one instead of opening the tunnel to anyone on this machine.
+fn relay_needs_token(uses_relay: bool, token: Option<&str>) -> Result<(), CtlError> {
+    if uses_relay && token.is_none() {
+        return Err(CtlError::Usage(
+            "stack deploy over ssh needs an API token for this context: the deploy relay \
+             opens a loopback port that any local user could use to reach the node API. \
+             Set one with `context add --remote-token-file` or `--token-command`, or MINGA_CTL_TOKEN"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
 /// `minga deploy` needs an HTTP URL, but the SSH tunnel is a Unix socket.
 /// This binds a loopback TCP port itself (so no other user can take the
 /// port first and receive the token) and relays it to the socket while the
 /// child runs.
 /// shortcut: another local user can connect to the port during the deploy
-/// and reach the API, which still asks them for the token. Upgrade: a
-/// Unix-socket option in `minga deploy`.
+/// and reach the API, which still asks them for the token (`deploy` refuses a
+/// context without one). Upgrade: a Unix-socket option in `minga deploy`.
 async fn relay(sock: &Path) -> Result<(String, tokio::task::JoinHandle<()>), CtlError> {
     let fail = |e: std::io::Error| {
         CtlError::Usage(format!("cannot open a local port for `minga deploy`: {e}"))
@@ -893,5 +923,14 @@ mod tests {
         assert_eq!(&reply, b"ping");
         echo.await.unwrap();
         task.abort();
+    }
+
+    #[test]
+    fn the_relay_is_refused_without_a_token() {
+        let err = relay_needs_token(true, None).unwrap_err();
+        assert!(err.to_string().contains("needs an API token"), "{err}");
+        assert!(relay_needs_token(true, Some("t")).is_ok());
+        // A direct endpoint opens no relay, so a missing token is the API's call.
+        assert!(relay_needs_token(false, None).is_ok());
     }
 }

@@ -60,7 +60,23 @@ impl RaftTlsConfig {
     fn load_key(
         path: &std::path::Path,
     ) -> Result<rustls::pki_types::PrivateKeyDer<'static>, std::io::Error> {
-        let mut rd = std::io::BufReader::new(std::fs::File::open(path)?);
+        let file = std::fs::File::open(path)?;
+        // Anyone who can read a node key can join Raft as that node and commit
+        // any desired state, so refuse it like the NATS key check does.
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = file.metadata()?.permissions().mode() & 0o777;
+            if mode & 0o077 != 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!(
+                        "private key {} has mode {mode:o}; it must not be readable by group or others (chmod 600)",
+                        path.display()
+                    ),
+                ));
+            }
+        }
+        let mut rd = std::io::BufReader::new(file);
         loop {
             match rustls_pemfile::read_one(&mut rd)? {
                 Some(rustls_pemfile::Item::Pkcs1Key(k)) => return Ok(k.into()),

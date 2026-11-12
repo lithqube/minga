@@ -296,6 +296,76 @@ async fn containerd_logs_capture_stdout_and_stderr() {
     );
 }
 
+/// A root task cannot write host-global kernel knobs or read kernel memory:
+/// /proc/sys is read-only and /proc/kcore is masked. Checked with `test`
+/// only, so a regression never writes the CI host's core_pattern.
+#[tokio::test]
+async fn containerd_kernel_paths_are_masked_and_read_only() {
+    let socket = socket_path();
+    if !containerd_available_at(&socket) {
+        eprintln!("SKIP: containerd not available at {socket}");
+        return;
+    }
+    let runtime = match ContainerdRuntime::connect(&socket).await {
+        Ok(rt) => rt,
+        Err(e) => {
+            assert!(
+                std::env::var_os("MINGA_REQUIRE_CONTAINERD").is_none(),
+                "required containerd connection failed: {e}"
+            );
+            eprintln!("SKIP: cannot connect to containerd: {e}");
+            return;
+        }
+    };
+    let logs_dir = tempfile::tempdir().unwrap();
+    let runtime = runtime.with_logs_dir(logs_dir.path());
+
+    let task_id = "minga-test-kernel-paths-001".to_string();
+    let spec = minga_state::types::TaskSpec {
+        image: "docker.io/library/busybox:latest".to_string(),
+        command: vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            // busybox `test -w` is always true for root, so read the mount flags instead.
+            "if grep -qE '^[^ ]+ /proc/sys [^ ]+ ro[, ]' /proc/self/mounts; then echo sys-protected; else echo sys-writable; fi; \
+             if test -s /proc/kcore; then echo kcore-visible; else echo kcore-masked; fi; sleep 30"
+                .to_string(),
+        ],
+        ..Default::default()
+    };
+    runtime
+        .start(&task_id, &spec)
+        .await
+        .expect("failed to start container");
+
+    let mut out = String::new();
+    for _ in 0..20 {
+        out = runtime
+            .logs(&task_id, 0)
+            .await
+            .iter()
+            .filter(|c| c.stream == minga_node::runtime::LogStream::Stdout)
+            .map(|c| String::from_utf8_lossy(&c.data).into_owned())
+            .collect();
+        if out.contains("kcore-") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    runtime
+        .stop(&task_id)
+        .await
+        .expect("failed to stop container");
+    assert!(
+        out.contains("sys-protected"),
+        "/proc/sys must be read-only: {out:?}"
+    );
+    assert!(
+        out.contains("kcore-masked"),
+        "/proc/kcore must be masked: {out:?}"
+    );
+}
+
 /// A named `user:` resolves against the image's own /etc/passwd and
 /// /etc/group (BusyBox: user `nobody` is 65534, group `root` is 0).
 #[tokio::test]
