@@ -12,6 +12,7 @@
 - [ADR 0002: Event bus: NATS/JetStream](adr/0002-event-bus-nats.md)
 - [ADR 0003: Agent workloads](adr/0003-agent-workloads.md)
 - [ADR 0004: Observability](adr/0004-observability.md)
+- [ADR 0005: API identity, roles and audit](adr/0005-api-identity-and-roles.md) (proposed)
 
 Each ADR ends with an *Implementation status* section saying what shipped and where the code deviates.
 
