@@ -10,6 +10,8 @@ The release candidate `v1.2.0-rc.1` is cut from the `release/1.2.0` branch for
 the staging run; 1.2.0 is tagged from the same branch once it passes.
 
 ### Upgrading
+- State from 1.1.0 is kept as is: the persisted format is unchanged (format 2),
+  so no wipe or migration is needed. Upgrade every node together.
 - A Raft TLS key readable by group or others is refused at start; `chmod 600`
   it. `minga tls` now writes keys 0600 in 0700 directories.
 - A task whose published port is reserved by the node (53, the Raft, metrics

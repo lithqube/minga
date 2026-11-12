@@ -19,6 +19,7 @@ Named after the [minga](https://en.wikipedia.org/wiki/Minga) of Chiloé, where a
 > - **Security fixes in `v1.2.0`**, from a source audit: TLS keys, Raft data and the NATS config are owner-only; the admin token is never sent through a proxy or redirect; tasks cannot reach other stacks' bridges or the node's loopback services, and a published port cannot take a node port; containers get Docker's masked and read-only `/proc` paths and a deny-all device rule; a bus Assign only starts what Raft assigns; the API and metrics listeners time out slow clients and cap connections; a tokenless API refuses browser-shaped requests. Plaintext Raft and a tokenless API off loopback log a warning. See the [upgrade notes](docs/release-1.2.0.md#upgrade-notes).
 > - **Fixed in `v1.1.1`:** relative bind mounts with the default `-c compose.yaml` resolve against the current directory, and the API refuses a relative bind source instead of letting the node guess.
 > - **`minga-ctl`**, the companion CLI for contexts, stacks, services, health and registry login over SSH (not in the release archive; `cargo install --locked --path crates/minga-ctl`, see [its plan](docs/minga-ctl-plan.md)).
+> - **Idle footprint, measured on `v1.0.1`:** the control plane (manager, API and the NATS sidecar) used 59 MB, against 101 MB for `dockerd` on a Docker Compose host and 311 MB on a Swarm manager; 119, 169 and 377 MB counting containerd; no `docker-proxy` processes, where the Compose host ran 4. One idle snapshot per host on Hetzner ARM64, workloads not matched, so part of the gap may come from the workload. [Method and caveats](docs/benchmark.md).
 >
 > **Not in `v1.2.0`:**
 >
@@ -232,7 +233,11 @@ sudo minga manager … --sandbox-runtime wasmtime --module-dir /var/lib/minga/mo
 
 For systemd, [`scripts/minga.service`](scripts/minga.service) runs either role from an environment file.
 
+Every command and flag, the environment variables, and which deploy command to use: [docs/cli.md](docs/cli.md).
+
 ## Deployment topologies
+
+Ports, what every node needs, what stays per node, and how far each layout is verified: [docs/topologies.md](docs/topologies.md).
 
 ```mermaid
 flowchart TB
@@ -327,6 +332,9 @@ Next, in order (rationale in [docs/architecture.md](docs/architecture.md)):
 ## Documentation
 
 - [Architecture notes](docs/architecture.md): how the pieces fit today, known structural limits, and the plan
+- [CLI reference](docs/cli.md): every `minga` and `minga-ctl` command, its flags and environment variables, and which deploy command to use
+- [Supported topologies](docs/topologies.md): single host, from a workstation, air-gapped, Talos, container image and multi-node, with what each needs and how far it is verified
+- [Resource benchmark](docs/benchmark.md): idle memory, CPU and process counts against Docker Compose and Swarm
 - [Release notes: v1.2.0](docs/release-1.2.0.md)
 - [Release notes: v1.1.0](docs/release-1.1.0.md)
 - [Release notes: v1.0.2](docs/release-1.0.2.md)

@@ -18,6 +18,8 @@ Flags change between releases. Before running a command you have not run in this
 
 `minga-ctl` is not in the release archive: `cargo install --locked --path crates/minga-ctl` from a checkout of the release tag. It runs the `minga` binary **on the operator's machine** for `stack deploy` (through the tunnel), so `minga` must be on PATH there or `MINGA_BIN` set; the node only needs the API. Release archives are Linux only, so on macOS build it with `cargo install --locked --path crates/minga-cli`.
 
+Which deploy command: `minga-ctl stack deploy` from a workstation (it saves specs for `service rollback` and has `--prune`); `minga deploy` on the node itself, in CI or in scripts (neither). `docs/cli.md` has every command, flag and environment variable; `docs/topologies.md` has the supported layouts and what each needs.
+
 ## Deploying a Compose file
 
 1. **Validate offline.** `minga validate -c compose.yaml` (add `-p <profile>` as needed). It prints the services in startup order.
@@ -105,6 +107,7 @@ On the node itself, `minga-ctl` still needs a context: `minga-ctl context add lo
 | Image pull fails, or `401 Unauthorized` on pull | The daemon pulls (containerd's Transfer API), so containerd's network, proxy and CA trust apply, not the `minga` process's. Credentials come from `$DOCKER_CONFIG/config.json`, else `~/.docker/config.json`: `credHelpers`, then `credsStore`, then inline `auths`; a named helper must be on the manager's PATH. Credentialed pulls need containerd 1.7+, and a plain-HTTP registry cannot be reached on 1.7. Fix with `minga-ctl registry login`, or preload with `minga-ctl image pull` / `ctr -n minga images import`. |
 | Agent (`x-minga-agent`) task never runs | The node was not started with `--sandbox-runtime wasmtime`, or the `.wasm` module is not staged in `--module-dir`. |
 | `cannot connect to containerd` | `--containerd-socket` takes a filesystem path, not a `unix://` URL. |
+| Tasks show `running` but no container exists (`ctr -n minga containers ls` is empty) | The node runs the default `--runtime mock`, which is in-memory. Start `manager` / `worker` with `--runtime containerd`; `scripts/minga.service` already passes it. |
 | `task already exists` after a state wipe | Stale containerd task: `ctr -n minga tasks delete --force <id>`. Ask first. |
 | Containers on different nodes cannot reach each other | Expected today: there is no cross-node mesh yet. |
 | `minga-ctl`: `rejected the credentials (401)` | Token source for the context is wrong. Check `remote_token_file` (a bare token, or an env file with `MINGA_API_TOKEN=`), `token_command`, `MINGA_CTL_TOKEN`. |
@@ -132,6 +135,8 @@ Say these before promising a design that depends on them, and confirm against th
 In a checkout of https://github.com/lithqube/minga these are local files; read the one that matches the task instead of guessing.
 
 - `README.md`: status, quick start, role flags, topologies, air-gapped install.
+- `docs/cli.md`: every `minga` and `minga-ctl` command, its flags and defaults, environment variables, exit codes, and which deploy command to use.
+- `docs/topologies.md`: single host, workstation, air-gapped, Talos, container image and multi-node; ports, what stays per node, and how far each is verified.
 - `docs/release-1.2.0.md`: the security changes, upgrade checks and what was verified; `docs/release-1.1.0.md` for upgrades from 1.0.2.
 - `docs/backup.md`: export, import, what else to copy, cold copy.
 - `docs/minga-ctl-plan.md`: every `minga-ctl` command with examples, error texts, known limits (sections 4, 5 and 7).

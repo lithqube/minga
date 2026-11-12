@@ -20,12 +20,15 @@ Each ADR ends with an *Implementation status* section saying what shipped and wh
 
 - [minga-ctl design plan](minga-ctl-plan.md): the companion CLI; SSH-only transport implemented (phase 1), mutual TLS and server-side audit next
 - [Production-readiness plan](production-readiness-plan.md): what blocked single-node production after v1.0.2, what v1.1.0 fixed, and what is left
+- [Resource benchmark](benchmark.md): idle memory, CPU and process counts against Docker Compose and Swarm, with the caveats
 - [Release notes: v1.2.0](release-1.2.0.md)
 - [Release notes: v1.1.0](release-1.1.0.md)
 - [Release notes: v1.0.2](release-1.0.2.md)
 
 ## Deployment
 
+- [Supported topologies](topologies.md): single host, from a workstation, air-gapped, Talos, container image and multi-node, with what each needs and how far it is verified
+- [CLI reference](cli.md): every `minga` and `minga-ctl` command, its flags and environment variables, and which deploy command to use
 - [Backup and restore](backup.md): `minga state export`/`import`, what it leaves out (secret values, volume data, TLS, NATS), and the cold-copy alternative
 - [Quick start: one Linux host](../README.md#quick-start-one-linux-host): the verified path
 - [systemd unit](../scripts/minga.service) and [environment example](../scripts/minga.env.example)
