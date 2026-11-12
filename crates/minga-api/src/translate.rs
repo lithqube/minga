@@ -252,6 +252,17 @@ pub fn service_spec_to_state(spec: &models::ServiceSpec) -> Result<Service, Stri
         let Some(source) = m.Source.clone() else {
             return Err(format!("mount for target `{}` has no source", m.Target));
         };
+        // The node would resolve a relative path against its own working
+        // directory, which is not where the compose file is.
+        if kind == minga_state::types::MountKind::Bind
+            && !std::path::Path::new(&source).is_absolute()
+        {
+            return Err(format!(
+                "bind mount source `{source}` for `{}` is relative; use an absolute path on the node \
+                 (minga deploy resolves relative sources against the compose file's directory)",
+                m.Target
+            ));
+        }
         mounts.push(minga_state::types::ServiceMount {
             kind,
             source,
@@ -1164,6 +1175,34 @@ mod tests {
         };
         let err = service_spec_to_state(&spec).unwrap_err();
         assert!(err.contains("Image is required"));
+    }
+
+    #[test]
+    fn a_relative_bind_source_is_refused_and_an_absolute_one_kept() {
+        let mount = |kind: &str, source: &str| models::Mount {
+            mount_type: kind.to_string(),
+            Source: Some(source.to_string()),
+            Target: "/etc/app.yaml".to_string(),
+            ReadOnly: Some(true),
+            BindOptions: None,
+            VolumeOptions: None,
+            TmpfsOptions: None,
+        };
+        let with = |m: models::Mount| {
+            let mut spec = sample_docker_spec();
+            spec.TaskTemplate.ContainerSpec.as_mut().unwrap().Mounts = vec![m];
+            service_spec_to_state(&spec)
+        };
+
+        for relative in ["./docker/app.yaml", "docker/app.yaml", "../app.yaml"] {
+            let err = with(mount("bind", relative)).unwrap_err();
+            assert!(err.contains("is relative"), "{relative}: {err}");
+        }
+        let svc = with(mount("bind", "/srv/app/docker/app.yaml")).unwrap();
+        assert_eq!(svc.mounts[0].source, "/srv/app/docker/app.yaml");
+        // A named volume's source is a name, not a path.
+        let svc = with(mount("volume", "shop_data")).unwrap();
+        assert_eq!(svc.mounts[0].source, "shop_data");
     }
 
     #[test]
