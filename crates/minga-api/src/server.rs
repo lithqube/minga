@@ -98,7 +98,7 @@ async fn bearer_auth(
 /// Without a token the bind address is the only boundary, and DNS rebinding
 /// lets a page in a local browser cross it: the page reaches us under its own
 /// hostname, and browsers send `Origin` on cross-site and same-origin writes.
-/// Docker and minga clients send neither an `Origin` nor a non-IP `Host`.
+/// Docker and minga clients send no `Origin`, and a `Host` that is an IP or a `localhost` name.
 fn rebinding_risk(headers: &axum::http::HeaderMap) -> Option<&'static str> {
     if headers.contains_key(axum::http::header::ORIGIN) {
         return Some("request carries an Origin header");
@@ -112,8 +112,12 @@ fn rebinding_risk(headers: &axum::http::HeaderMap) -> Option<&'static str> {
         Some(rest) => rest.split(']').next().unwrap_or(""),
         None => host.rsplit_once(':').map_or(host, |(h, _)| h),
     };
+    // Browsers resolve `*.localhost` to loopback themselves (RFC 6761), so no
+    // page can rebind it; the Docker client sends `api.moby.localhost`.
+    let lower = name.to_ascii_lowercase();
     if name.is_empty()
-        || name.eq_ignore_ascii_case("localhost")
+        || lower == "localhost"
+        || lower.ends_with(".localhost")
         || name.parse::<std::net::IpAddr>().is_ok()
     {
         None
@@ -1007,6 +1011,7 @@ mod tests {
             "[::1]:2375",
             "localhost:2375",
             "10.0.0.5:2375",
+            "api.moby.localhost",
         ] {
             assert_eq!(status(host, None).await, StatusCode::OK, "{host}");
         }
