@@ -14,10 +14,11 @@
 //! [`Runtime`]: crate::runtime::Runtime
 
 pub mod client;
+pub mod credentials;
 pub mod image;
 pub mod oci;
 pub mod proto;
 pub mod runtime;
 
 pub use client::{ClientError, ContainerdClient, DEFAULT_SOCKET};
-pub use runtime::{pull_with_ctr, ContainerdRuntime};
+pub use runtime::{pull_image, ContainerdRuntime, DEFAULT_SNAPSHOTTER};

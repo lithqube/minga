@@ -18,8 +18,14 @@ use tonic::transport::{Channel, Endpoint};
 use tonic::Request;
 use tower::service_fn;
 
+use prost::Message as _;
+
+use super::credentials::Credential;
 use super::image::BlobDescriptor;
 use super::proto::*;
+
+/// Makes each pull's credential stream name unique within the process.
+static NEXT_STREAM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 #[derive(Debug, Error)]
 pub enum ClientError {
@@ -45,9 +51,11 @@ impl From<tonic::Status> for ClientError {
     }
 }
 
-/// A client connected to a containerd daemon.
+/// A client connected to a containerd daemon. Cloning shares the connection.
+#[derive(Clone)]
 pub struct ContainerdClient {
     channel: Channel,
+    socket: Option<std::path::PathBuf>,
 }
 
 /// Default containerd socket path.
@@ -60,6 +68,7 @@ impl ContainerdClient {
     ) -> Result<Self, ClientError> {
         let socket_path = socket_path.as_ref().to_path_buf();
         let path_str = socket_path.display().to_string();
+        let socket = socket_path.clone();
 
         let channel = Endpoint::from_static("http://localhost")
             .connect_with_connector(service_fn(move |_| {
@@ -73,12 +82,23 @@ impl ContainerdClient {
             .map_err(|e| ClientError::Connect(path_str.clone(), e.to_string()))?;
 
         tracing::debug!(socket = %path_str, "connected to containerd");
-        Ok(Self { channel })
+        Ok(Self {
+            channel,
+            socket: Some(socket),
+        })
     }
 
     /// Create a client from an existing channel (for testing).
     pub fn from_channel(channel: Channel) -> Self {
-        Self { channel }
+        Self {
+            channel,
+            socket: None,
+        }
+    }
+
+    /// The Unix socket this client connected to, if it connected by path.
+    pub fn socket(&self) -> Option<&Path> {
+        self.socket.as_deref()
     }
 
     // --- ContainerService ---------------------------------------------------
@@ -318,6 +338,142 @@ impl ContainerdClient {
             Err(ClientError::Grpc(status)) if status.code() == tonic::Code::NotFound => Ok(None),
             Err(e) => Err(e),
         }
+    }
+
+    // --- Transfer and Streaming ---------------------------------------------
+
+    /// Pulls `reference` into the image store and unpacks it with
+    /// `snapshotter`, all inside containerd (Transfer service, containerd
+    /// 1.7 or newer). With `auth` = `(registry host, credential)`, the daemon asks
+    /// for the login over a stream and the secret is only ever sent to that
+    /// registry; it never touches argv or the environment.
+    ///
+    /// `Unimplemented` (a daemon older than 1.7) comes back as
+    /// `ClientError::Grpc` for the caller to handle.
+    pub async fn pull_image(
+        &self,
+        reference: &str,
+        snapshotter: &str,
+        auth: Option<(&str, &Credential)>,
+    ) -> Result<(), ClientError> {
+        // Closing the auth stream and stopping its task is tied to this guard.
+        let mut auth_task = None;
+        let mut resolver = None;
+        if let Some((registry, credential)) = auth {
+            let id = format!(
+                "minga-pull-{}-{}",
+                std::process::id(),
+                NEXT_STREAM.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            );
+            auth_task = Some(self.serve_credentials(&id, registry, credential).await?);
+            resolver = Some(RegistryResolver { auth_stream: id });
+        }
+        let platform = Platform {
+            os: "linux".into(),
+            architecture: match std::env::consts::ARCH {
+                "x86_64" => "amd64",
+                "aarch64" => "arm64",
+                other => other,
+            }
+            .into(),
+            variant: String::new(),
+        };
+        let request = TransferRequest {
+            source: Some(any_of(
+                type_urls::OCI_REGISTRY,
+                &OciRegistry {
+                    reference: reference.to_string(),
+                    resolver,
+                },
+            )),
+            destination: Some(any_of(
+                type_urls::IMAGE_STORE,
+                &ImageStore {
+                    name: reference.to_string(),
+                    platforms: vec![platform.clone()],
+                    unpacks: vec![UnpackConfiguration {
+                        platform: Some(platform),
+                        snapshotter: snapshotter.to_string(),
+                    }],
+                },
+            )),
+        };
+        let result: Result<(), ClientError> = self.clone().unary(request, paths::TRANSFER).await;
+        if let Some(task) = auth_task {
+            task.abort();
+        }
+        result.map(|_| ())
+    }
+
+    /// Opens stream `id` and answers the daemon's `AuthRequest`s on it until
+    /// the returned task is aborted. Only `registry` gets the credential.
+    async fn serve_credentials(
+        &self,
+        id: &str,
+        registry: &str,
+        credential: &Credential,
+    ) -> Result<tokio::task::JoinHandle<()>, ClientError> {
+        let (tx, rx) = tokio::sync::mpsc::channel::<prost_types::Any>(4);
+        tx.send(any_of(
+            type_urls::STREAM_INIT,
+            &StreamInit { id: id.into() },
+        ))
+        .await
+        .expect("receiver is alive");
+        let mut request = Request::new(tokio_stream::wrappers::ReceiverStream::new(rx));
+        request.metadata_mut().insert(
+            "containerd-namespace",
+            "minga".parse().expect("static namespace"),
+        );
+        let mut grpc = Grpc::new(self.channel.clone());
+        grpc.ready().await.map_err(|e| ClientError::Rpc {
+            method: paths::STREAM.to_string(),
+            message: e.to_string(),
+        })?;
+        let mut inbound = grpc
+            .streaming(
+                request,
+                PathAndQuery::from_static(paths::STREAM),
+                ProstCodec::<prost_types::Any, prost_types::Any>::default(),
+            )
+            .await?
+            .into_inner();
+        // The daemon echoes StreamInit once the stream is registered.
+        inbound.message().await?;
+
+        let registry = super::credentials::canonical_host(registry);
+        let credential = credential.clone();
+        Ok(tokio::spawn(async move {
+            while let Ok(Some(message)) = inbound.message().await {
+                if message.type_url != type_urls::AUTH_REQUEST {
+                    continue;
+                }
+                let Ok(ask) = AuthRequest::decode(message.value.as_slice()) else {
+                    continue;
+                };
+                // Redirects and token realms are other hosts: they get nothing.
+                let answer = if super::credentials::canonical_host(&ask.host) == registry {
+                    AuthResponse {
+                        auth_type: auth_type::CREDENTIALS,
+                        username: credential.username.clone(),
+                        secret: credential.secret().to_string(),
+                    }
+                } else {
+                    tracing::debug!(host = %ask.host, "refusing credentials for another host");
+                    AuthResponse {
+                        auth_type: auth_type::NONE,
+                        ..Default::default()
+                    }
+                };
+                if tx
+                    .send(any_of(type_urls::AUTH_RESPONSE, &answer))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        }))
     }
 
     // --- Content and snapshot services -------------------------------------

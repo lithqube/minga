@@ -123,7 +123,8 @@ async fn missing_image_fails_after_pull_attempt() {
         .expect_err("missing image must fail closed");
     let msg = err.to_string();
     assert!(
-        msg.contains("ctr pull") || msg.contains("still missing"),
+        msg.contains("pull docker.io/library/minga-nonexistent-image:never")
+            || msg.contains("still missing"),
         "should report pull failure or missing image: {msg}"
     );
 }

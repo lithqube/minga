@@ -399,6 +399,139 @@ pub struct GetImageResponse {
 }
 
 // ---------------------------------------------------------------------------
+// Transfer and Streaming (containerd >= 1.7)
+//
+// Hand-written from `api/services/transfer/v1/transfer.proto`,
+// `api/types/transfer/{registry,imagestore}.proto` and
+// `api/services/streaming/v1/streaming.proto`, which are identical on the
+// fields used here in containerd v1.7.20 and main (2.x). Fields added in 2.x
+// (`host_dir`, `default_scheme`, `http_debug`, `logs_stream`) are left out;
+// an old daemon would ignore them and we do not need them.
+// ---------------------------------------------------------------------------
+
+/// Wraps a message in an `Any`. containerd registers its transfer messages
+/// under the bare proto name, with no `type.googleapis.com/` prefix.
+pub fn any_of<M: Message>(type_url: &str, message: &M) -> prost_types::Any {
+    prost_types::Any {
+        type_url: type_url.to_string(),
+        value: message.encode_to_vec(),
+    }
+}
+
+pub mod type_urls {
+    pub const OCI_REGISTRY: &str = "containerd.types.transfer.OCIRegistry";
+    pub const IMAGE_STORE: &str = "containerd.types.transfer.ImageStore";
+    pub const AUTH_REQUEST: &str = "containerd.types.transfer.AuthRequest";
+    pub const AUTH_RESPONSE: &str = "containerd.types.transfer.AuthResponse";
+    pub const STREAM_INIT: &str = "containerd.services.streaming.v1.StreamInit";
+}
+
+/// `containerd.services.transfer.v1.TransferRequest`
+#[derive(Clone, PartialEq, Message)]
+pub struct TransferRequest {
+    #[prost(message, optional, tag = "1")]
+    pub source: Option<prost_types::Any>,
+    #[prost(message, optional, tag = "2")]
+    pub destination: Option<prost_types::Any>,
+}
+
+/// `containerd.services.streaming.v1.StreamInit`
+#[derive(Clone, PartialEq, Message)]
+pub struct StreamInit {
+    #[prost(string, tag = "1")]
+    pub id: String,
+}
+
+/// `containerd.types.transfer.OCIRegistry`
+#[derive(Clone, PartialEq, Message)]
+pub struct OciRegistry {
+    #[prost(string, tag = "1")]
+    pub reference: String,
+    #[prost(message, optional, tag = "2")]
+    pub resolver: Option<RegistryResolver>,
+}
+
+/// `containerd.types.transfer.RegistryResolver`
+#[derive(Clone, PartialEq, Message)]
+pub struct RegistryResolver {
+    /// Id of a streaming-service stream the daemon asks for credentials on.
+    #[prost(string, tag = "1")]
+    pub auth_stream: String,
+}
+
+/// `containerd.types.Platform`
+#[derive(Clone, PartialEq, Message)]
+pub struct Platform {
+    #[prost(string, tag = "1")]
+    pub os: String,
+    #[prost(string, tag = "2")]
+    pub architecture: String,
+    #[prost(string, tag = "3")]
+    pub variant: String,
+}
+
+/// `containerd.types.transfer.ImageStore`: the destination of a pull.
+#[derive(Clone, PartialEq, Message)]
+pub struct ImageStore {
+    #[prost(string, tag = "1")]
+    pub name: String,
+    #[prost(message, repeated, tag = "3")]
+    pub platforms: Vec<Platform>,
+    #[prost(message, repeated, tag = "10")]
+    pub unpacks: Vec<UnpackConfiguration>,
+}
+
+/// `containerd.types.transfer.UnpackConfiguration`
+#[derive(Clone, PartialEq, Message)]
+pub struct UnpackConfiguration {
+    #[prost(message, optional, tag = "1")]
+    pub platform: Option<Platform>,
+    #[prost(string, tag = "2")]
+    pub snapshotter: String,
+}
+
+/// `containerd.types.transfer.AuthRequest`: the daemon asking for
+/// credentials for `host`.
+#[derive(Clone, PartialEq, Message)]
+pub struct AuthRequest {
+    #[prost(string, tag = "1")]
+    pub host: String,
+    #[prost(string, tag = "2")]
+    pub reference: String,
+    #[prost(string, repeated, tag = "3")]
+    pub wwwauthenticate: Vec<String>,
+}
+
+/// `containerd.types.transfer.AuthType`
+pub mod auth_type {
+    pub const NONE: i32 = 0;
+    pub const CREDENTIALS: i32 = 1;
+}
+
+/// `containerd.types.transfer.AuthResponse`. `Debug` is written by hand so
+/// the secret never reaches a log.
+#[derive(Clone, PartialEq, Message)]
+#[prost(skip_debug)]
+pub struct AuthResponse {
+    #[prost(int32, tag = "1")]
+    pub auth_type: i32,
+    #[prost(string, tag = "2")]
+    pub secret: String,
+    #[prost(string, tag = "3")]
+    pub username: String,
+}
+
+impl std::fmt::Debug for AuthResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthResponse")
+            .field("auth_type", &self.auth_type)
+            .field("username", &self.username)
+            .field("secret", &"<redacted>")
+            .finish()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // containerd.services.content.v1 and snapshots.v1
 // ---------------------------------------------------------------------------
 
@@ -495,6 +628,8 @@ pub mod paths {
     pub const TASK_WAIT: &str = "/containerd.services.tasks.v1.Tasks/Wait";
 
     pub const IMAGE_GET: &str = "/containerd.services.images.v1.Images/Get";
+    pub const TRANSFER: &str = "/containerd.services.transfer.v1.Transfer/Transfer";
+    pub const STREAM: &str = "/containerd.services.streaming.v1.Streaming/Stream";
     pub const CONTENT_READ: &str = "/containerd.services.content.v1.Content/Read";
     pub const SNAPSHOT_STAT: &str = "/containerd.services.snapshots.v1.Snapshots/Stat";
     pub const SNAPSHOT_PREPARE: &str = "/containerd.services.snapshots.v1.Snapshots/Prepare";
