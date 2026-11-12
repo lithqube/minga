@@ -6,6 +6,8 @@ Security fixes from a source audit of 1.1.1 (all twelve P1 leads, plus the
 lower-priority leads that share their root causes). Several change behaviour
 that worked before; read the [upgrade notes](https://github.com/lithqube/minga/blob/v1.2.0/docs/release-1.2.0.md#upgrade-notes)
 before upgrading. 1.1.1 was prepared but not tagged, so its fix ships here.
+The release candidate `v1.2.0-rc.1` is cut from the `release/1.2.0` branch for
+the staging run; 1.2.0 is tagged from the same branch once it passes.
 
 ### Upgrading
 - A Raft TLS key readable by group or others is refused at start; `chmod 600`
@@ -33,8 +35,9 @@ before upgrading. 1.1.1 was prepared but not tagged, so its fix ships here.
   (`/proc/sys`, `/proc/sysrq-trigger` and others), and the deny-all device
   rule is set even without CPU or memory limits.
 - A bus Assign only starts a task that Raft assigns to the node, always from
-  the Raft spec. On start the supervisor adopts containers Raft still
-  assigns to it and stops the rest.
+  the Raft spec. On start the supervisor adopts running containers Raft
+  still assigns to it and removes every other container, running or exited,
+  with its network, DNAT rules, snapshot and staged secrets.
 - The API, metrics and egress listeners close a connection that sends no
   request head within 10s and cap concurrent connections at 1024. The Raft
   RPC server times out the TLS handshake (10s) and each read (60s), and caps

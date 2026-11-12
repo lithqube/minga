@@ -20,6 +20,7 @@ the 1.1.1 bind-mount fix, since 1.1.1 was not tagged.
 | Release | Actions pinned to commit SHAs, per-job permissions, no persisted checkout credentials, pinned and verified rustup | #52 |
 | Listeners | Header-read timeout and connection cap on the API, metrics and egress listeners; handshake and read timeouts and a connection cap on Raft RPC; a tokenless API refuses browser-shaped requests; warnings for plaintext Raft and a tokenless API off loopback | #53 |
 | Supervisor | A bus Assign starts only what Raft assigns, from the Raft spec; containers left over from before a restart are adopted or stopped | #54 |
+| Supervisor | Exited leftover containers are removed at start too, with their network, DNAT rules and staged secrets; docs no longer overstate 1.0.2's cleanup; Raft TLS is documented as required off loopback | #56 |
 
 ## Upgrade notes
 
@@ -82,24 +83,53 @@ minga-ctl --version   # minga-ctl 1.2.0
 | containerd suites, including masked `/proc/kcore` and read-only `/proc/sys` inside a container | Pass, in CI on #51 |
 | Real-kernel `netns` job: published port through the node address | Pass, in CI |
 | Real-kernel `netns` job: cross-bridge drop, published 53/udp refused | Pass, in CI on #50 |
-| All of the above on merged `main` with #48–#54 | Not run until they are merged |
-| Release workflow with pinned actions and verified rustup | Not run until the `v1.2.0` tag is pushed; check the "Set up job" permissions and action SHAs on that run |
+| All of the above on merged `main` (51ae4d3, with #48–#56) | Pass, in CI |
+| Release workflow with pinned actions and verified rustup | Not run until `v1.2.0-rc.1` is pushed; check the "Set up job" permissions and action SHAs on that run |
 | The audit's owner-observed checks for each lead on a staging node, before and after | Not run |
 | A scoped re-audit of the changed units against this commit | Not run |
 
-## Publishing
+## Release candidate
 
-Tag only after #48–#55 are merged and the staging run is done. Pushing the
-tag runs the release workflow, which builds the archives, pushes
-`ghcr.io/lithqube/minga:1.2.0`, `:1.2` and `:latest`, and creates the GitHub
-release. Then set `releasePublished` to `true` in `site/src/config/site.ts`.
+The `release/1.2.0` branch is cut from `main` at 51ae4d3 (#48–#56 merged) with
+the version set to `1.2.0-rc.1`. Only release fixes land on it, through pull
+requests against `release/1.2.0`; each one is merged back into `main`.
 
-Tag the merged `main` commit, not whatever is checked out:
+Tagging the candidate runs the release workflow as a prerelease: it builds the
+archives, pushes only `ghcr.io/lithqube/minga:1.2.0-rc.1` (not `:1.2` or
+`:latest`), and creates a GitHub prerelease, so `install.sh` without
+`--version` still installs 1.1.0.
 
 ```bash
 git fetch origin
-git log --oneline origin/main | head -20   # the merges of #48–#55 must be listed
-git tag -a v1.2.0 -m "v1.2.0" origin/main
+git tag -a v1.2.0-rc.1 -m "v1.2.0-rc.1" origin/release/1.2.0
+git push origin v1.2.0-rc.1
+```
+
+Install it on the staging node and run the checks in the table above:
+
+```bash
+curl -fsSL https://github.com/lithqube/minga/releases/download/v1.2.0-rc.1/install.sh \
+  | sh -s -- --version v1.2.0-rc.1
+minga --version   # 1.2.0-rc.1
+```
+
+A fix found in staging goes to `release/1.2.0`, bumps the version to
+`1.2.0-rc.2`, and gets a new candidate tag.
+
+## Publishing
+
+Once a candidate passes staging, set `version = "1.2.0"` in `Cargo.toml` on
+`release/1.2.0` (through a pull request), then tag that commit. Pushing the
+tag builds the archives, pushes `ghcr.io/lithqube/minga:1.2.0`, `:1.2` and
+`:latest`, and creates the GitHub release. Merge `release/1.2.0` back into
+`main`, then set `releasePublished` to `true` in `site/src/config/site.ts`.
+
+Tag the release branch commit, not whatever is checked out:
+
+```bash
+git fetch origin
+grep -m1 '^version' <(git show origin/release/1.2.0:Cargo.toml)   # version = "1.2.0"
+git tag -a v1.2.0 -m "v1.2.0" origin/release/1.2.0
 git push origin v1.2.0
 ```
 
