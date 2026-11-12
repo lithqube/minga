@@ -41,7 +41,7 @@ before. Check these first:
   no longer reach each other. A task that relied on either must use a
   published port on the node address.
 - **Tokenless API.** Without `MINGA_API_TOKEN`, a request that carries an
-  `Origin` header or has a DNS name in `Host` gets 403. This stops a web
+  `Origin` header or has a DNS name other than `localhost` or `*.localhost` in `Host` gets 403. This stops a web
   page in a local browser from driving the API through DNS rebinding. Reach a
   tokenless API by IP address or `localhost` (for Traefik, an endpoint such as
   `http://<node-ip>:2375` instead of `host.docker.internal`), or set a token.

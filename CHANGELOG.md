@@ -14,7 +14,7 @@ before upgrading. 1.1.1 was prepared but not tagged, so its fix ships here.
   and egress ports, the NATS sidecar's 4222 and 8222) or already has a host
   listener fails to start with `port N is in use on this node`.
 - With no API token, a request carrying an `Origin` header or a DNS-name
-  `Host` gets 403. Reach a tokenless API by IP address or `localhost`, or set
+  `Host` other than a `localhost` name gets 403. Reach a tokenless API by IP address or `localhost`, or set
   `MINGA_API_TOKEN`.
 - `minga-ctl stack deploy` through an ssh context needs a token.
 
