@@ -55,7 +55,8 @@ async fn a_failed_revision_save_removes_the_old_revision() {
         service: "shop.api".to_string(),
         replicas: 2,
     };
-    let result = service::run(&scale, &conn, Format::Table, true).await;
+    let resolved = minga_ctl::config::resolve(&Default::default(), None).unwrap();
+    let result = service::run(&scale, &conn, &resolved, false, Format::Table, true).await;
 
     match result {
         Err(err @ CtlError::Halted(_)) => {

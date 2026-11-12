@@ -36,6 +36,13 @@ pub enum CtlError {
     /// an accepted change failed. Exit 2.
     #[error("{0}")]
     Halted(String),
+    /// A failure with its own exit code and hint (plan section 4.4).
+    #[error("{message}")]
+    Hinted {
+        code: u8,
+        message: String,
+        hint: String,
+    },
     /// A named stack, service or revision does not exist. Exit 3.
     #[error("{kind} `{name}` not found in context `{context}`")]
     NotFound {
@@ -90,6 +97,7 @@ impl CtlError {
             | CtlError::Api { .. }
             | CtlError::Halted(_) => 2,
             CtlError::NotFound { .. } | CtlError::ContextNotFound { .. } => 3,
+            CtlError::Hinted { code, .. } => *code,
         }
     }
 
@@ -109,6 +117,7 @@ impl CtlError {
             ),
             CtlError::Api { .. } | CtlError::Halted(_) => None,
             CtlError::HealthFailed { .. } => None,
+            CtlError::Hinted { hint, .. } => Some(hint.clone()),
             CtlError::NotFound { kind, .. } => (*kind == "revision").then(|| {
                 "rollback covers only changes made with minga-ctl on this machine".to_string()
             }),

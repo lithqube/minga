@@ -44,9 +44,12 @@ enum Command {
     /// List services, scale, update and roll them back.
     #[command(subcommand)]
     Service(cmd::service::ServiceCommand),
-    /// List secret metadata.
+    /// Provision secrets on nodes and list secret metadata.
     #[command(subcommand)]
     Secret(cmd::secret::SecretCommand),
+    /// Pull, list and remove images on nodes.
+    #[command(subcommand)]
+    Image(cmd::image::ImageCommand),
     /// Check the API, and optionally a stack's services.
     Health(cmd::health::HealthArgs),
     /// Show the Prometheus metrics the cluster reports.
@@ -86,6 +89,7 @@ fn run(cli: &Cli) -> Result<(), CtlError> {
         Command::Stack(cmd) => api::block_on(async {
             let resolved = resolve(cli)?;
             let result = async {
+                cmd.preflight(&resolved)?;
                 let conn = transport::connect(&resolved, cli.debug).await?;
                 cmd::stack::run(cmd, &conn, format, quiet).await
             }
@@ -97,15 +101,27 @@ fn run(cli: &Cli) -> Result<(), CtlError> {
             let resolved = resolve(cli)?;
             let result = async {
                 let conn = transport::connect(&resolved, cli.debug).await?;
-                cmd::service::run(cmd, &conn, format, quiet).await
+                cmd::service::run(cmd, &conn, &resolved, cli.debug, format, quiet).await
             }
             .await;
             audit(&resolved, cmd.audit(), &result);
             result
         }),
         Command::Secret(cmd) => api::block_on(async {
-            let conn = connect(cli).await?;
-            cmd::secret::run(cmd, &conn, format, quiet).await
+            let resolved = resolve(cli)?;
+            let result = async {
+                let conn = transport::connect(&resolved, cli.debug).await?;
+                cmd::secret::run(cmd, &conn, &resolved, cli.debug, format, quiet).await
+            }
+            .await;
+            audit(&resolved, cmd.audit(), &result);
+            result
+        }),
+        Command::Image(cmd) => api::block_on(async {
+            let resolved = resolve(cli)?;
+            let result = cmd::image::run(cmd, &resolved, cli.debug, format, quiet).await;
+            audit(&resolved, cmd.audit(), &result);
+            result
         }),
         Command::Health(args) => api::block_on(async {
             let conn = connect(cli).await?;

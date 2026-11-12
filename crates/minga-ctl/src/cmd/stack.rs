@@ -1,22 +1,39 @@
 //! `minga-ctl stack` (plan section 5.2).
-//!
-//! `deploy` comes in build-order step 5.
 
 use std::collections::BTreeMap;
+use std::path::Path;
 
 use clap::Subcommand;
 use serde_json::{json, Value};
+use tokio::net::{TcpListener, UnixStream};
 
 use crate::api::{self, ApiClient};
-use crate::cmd::service::{confirm, report};
+use crate::cmd::image;
+use crate::cmd::service::{self, confirm, report};
+use crate::config::{self, Resolved};
 use crate::error::CtlError;
 use crate::output::{self, Format, Rows};
-use crate::transport::Connection;
+use crate::transport::{Connection, RemoteArg};
 use crate::view;
 
 /// Stack commands.
 #[derive(Debug, Subcommand)]
 pub enum StackCommand {
+    /// Deploy a Compose file with `minga deploy`, saving the previous spec
+    /// of every service it changes for `service rollback`.
+    Deploy {
+        /// Path to the Compose file.
+        #[arg(short = 'c', long = "compose-file", default_value = "compose.yaml")]
+        compose_file: String,
+        /// Profile to enable; repeat for several.
+        #[arg(short = 'p', long = "profile", value_name = "PROFILE")]
+        profiles: Vec<String>,
+        /// Seconds `minga deploy` waits for tasks to be placed.
+        #[arg(long, default_value_t = 30)]
+        wait: u64,
+        /// Name of the stack.
+        stack: String,
+    },
     /// List the stacks: services grouped by their stack label.
     Ls,
     /// List a stack's tasks.
@@ -44,12 +61,257 @@ impl StackCommand {
     pub fn audit(&self) -> Option<(&'static str, Value)> {
         match self {
             StackCommand::Ls | StackCommand::Ps { .. } => None,
+            StackCommand::Deploy {
+                compose_file,
+                profiles,
+                wait,
+                stack,
+            } => Some((
+                "stack deploy",
+                json!({ "stack": stack, "compose_file": compose_file, "profiles": profiles, "wait": wait }),
+            )),
             StackCommand::Rm { stack, with, yes } => Some((
                 "stack rm",
                 json!({ "stack": stack, "with": with, "yes": yes }),
             )),
         }
     }
+
+    /// Checks that run before connecting: `deploy` step 0, the bind-mount
+    /// guard, when the node is another machine.
+    pub fn preflight(&self, resolved: &Resolved) -> Result<(), CtlError> {
+        match self {
+            StackCommand::Deploy { compose_file, .. } if node_is_remote(resolved) => {
+                check_bind_mounts(compose_file)
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
+/// The node is another machine with an SSH target, or with an API endpoint
+/// that is not a loopback address (an `https://` proxy, for example).
+fn node_is_remote(resolved: &Resolved) -> bool {
+    resolved.context.ssh.is_some() || !is_loopback(&resolved.endpoint)
+}
+
+fn is_loopback(endpoint: &str) -> bool {
+    let rest = endpoint
+        .split_once("://")
+        .map_or(endpoint, |(_, rest)| rest);
+    let host = config::host_of(rest.split(['/', '?', '#']).next().unwrap_or(""));
+    host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1" || host == "::1"
+}
+
+/// Refuses a Compose file with a relative bind mount: `minga deploy` would
+/// resolve it on this machine, not on the node.
+fn check_bind_mounts(file: &str) -> Result<(), CtlError> {
+    let text = std::fs::read_to_string(file)
+        .map_err(|e| CtlError::Usage(format!("cannot read {file}: {e}")))?;
+    let doc: serde_yaml::Value = serde_yaml::from_str(&text)
+        .map_err(|e| CtlError::Usage(format!("{file} is not valid YAML: {e}")))?;
+    match relative_bind(&doc) {
+        Some((service, source)) => Err(CtlError::Hinted {
+            code: 1,
+            message: format!(
+                "{file} bind-mounts {source} (service `{service}`), which would resolve on this machine, not on the node"
+            ),
+            hint: "use an absolute path on the node, or run minga-ctl on the node with a local context"
+                .to_string(),
+        }),
+        None => Ok(()),
+    }
+}
+
+/// The first `(service, source)` whose volume source is relative.
+/// shortcut: reads the plain file only; `extends`, `include` and variable
+/// interpolation are not followed (plan 5.2). Upgrade if those show up in
+/// remote deploys.
+fn relative_bind(doc: &serde_yaml::Value) -> Option<(String, String)> {
+    for (name, service) in doc.get("services")?.as_mapping()? {
+        let Some(volumes) = service.get("volumes").and_then(|v| v.as_sequence()) else {
+            continue;
+        };
+        for volume in volumes {
+            let source = match volume {
+                // `./conf:/etc/app[:ro]`; a bare `/data` is an anonymous volume.
+                serde_yaml::Value::String(short) => short.split_once(':').map(|(s, _)| s),
+                long => long.get("source").and_then(|s| s.as_str()),
+            };
+            if let Some(source) = source.filter(|s| is_relative(s)) {
+                let name = name.as_str().unwrap_or("?").to_string();
+                return Some((name, source.to_string()));
+            }
+        }
+    }
+    None
+}
+
+fn is_relative(source: &str) -> bool {
+    matches!(source, "." | "..")
+        || source.starts_with("./")
+        || source.starts_with("../")
+        || source.starts_with('~')
+}
+
+/// `deploy` steps 1 to 4 (plan 5.2).
+async fn deploy(
+    conn: &Connection,
+    compose_file: &str,
+    profiles: &[String],
+    wait: u64,
+    stack: &str,
+    quiet: bool,
+) -> Result<(), CtlError> {
+    let client = &conn.api;
+    api::check_id("stack", stack)?;
+
+    // 1. The specs as they are now.
+    let filter = view::stack_filter(stack);
+    let before = specs(&client.get("services", Some(&filter)).await?);
+
+    // 2. `minga deploy`, the token in its environment only.
+    let relay = match conn.api_socket() {
+        Some(sock) => Some(relay(sock).await?),
+        None => None,
+    };
+    let url = relay
+        .as_ref()
+        .map_or_else(|| client.root().to_string(), |(url, _)| url.clone());
+    let mut cmd = tokio::process::Command::new(image::minga_bin());
+    cmd.args(["deploy", "-c", compose_file]);
+    for profile in profiles {
+        cmd.args(["-p", profile]);
+    }
+    cmd.args(["--wait", &wait.to_string(), "--api-url", &url, stack])
+        .env_remove("MINGA_CTL_TOKEN")
+        .env_remove("MINGA_API_URL")
+        .kill_on_drop(true);
+    match client.token() {
+        Some(token) => cmd.env("MINGA_API_TOKEN", token),
+        None => cmd.env_remove("MINGA_API_TOKEN"),
+    };
+    let status = cmd.status().await;
+    if let Some((_, task)) = relay {
+        task.abort();
+    }
+    let status =
+        status.map_err(|e| image::spawn_error(e, &[RemoteArg::Fixed("minga")], "stack deploy"))?;
+
+    // 3. Read again whether or not it succeeded; save what changed.
+    let problem = match save_changed(client, &filter, &before).await {
+        Ok((changes, errors)) => {
+            output::say(quiet, &changes.summary())?;
+            (!errors.is_empty()).then(|| errors.join("; "))
+        }
+        Err(err) => Some(err.to_string()),
+    };
+
+    // 4. The exit code.
+    if !status.success() {
+        let mut message = format!("minga deploy failed ({status})");
+        if let Some(reason) = problem {
+            message.push_str(&format!("; could not save revisions for {stack}: {reason}"));
+        }
+        return Err(CtlError::Halted(message));
+    }
+    match problem {
+        Some(reason) => Err(CtlError::Hinted {
+            code: 2,
+            message: format!("deployed, but could not save revisions for {stack}: {reason}"),
+            hint: "rollback data for this deploy may be missing".to_string(),
+        }),
+        None => Ok(()),
+    }
+}
+
+/// Service ID to `Spec`.
+fn specs(services: &Value) -> BTreeMap<String, Value> {
+    view::items(services)
+        .iter()
+        .map(|s| (view::id(s).to_string(), s["Spec"].clone()))
+        .collect()
+}
+
+/// What a deploy did to the stack's services.
+#[derive(Default)]
+struct Changes {
+    saved: Vec<String>,
+    unchanged: Vec<String>,
+    new: Vec<String>,
+}
+
+impl Changes {
+    /// `saved revision for myapp.web (myapp.worker unchanged)`.
+    fn summary(&self) -> String {
+        let mut text = if self.saved.is_empty() {
+            "no revision saved".to_string()
+        } else {
+            format!("saved revision for {}", self.saved.join(", "))
+        };
+        let mut notes = Vec::new();
+        if !self.unchanged.is_empty() {
+            notes.push(format!("{} unchanged", self.unchanged.join(", ")));
+        }
+        if !self.new.is_empty() {
+            notes.push(format!("{} new", self.new.join(", ")));
+        }
+        if !notes.is_empty() {
+            text.push_str(&format!(" ({})", notes.join("; ")));
+        }
+        text
+    }
+}
+
+/// Step 3: saves the step 1 spec of each service whose spec changed. A
+/// service the deploy did not change keeps the revision it had. Returns the
+/// changes and the revision writes that failed.
+async fn save_changed(
+    client: &ApiClient,
+    filter: &Value,
+    before: &BTreeMap<String, Value>,
+) -> Result<(Changes, Vec<String>), CtlError> {
+    let after = specs(&client.get("services", Some(filter)).await?);
+    let mut changes = Changes::default();
+    let mut errors = Vec::new();
+    for (id, spec) in after {
+        match before.get(&id) {
+            None => changes.new.push(id),
+            Some(old) if service::same_spec(old, &spec) => changes.unchanged.push(id),
+            Some(old) => match service::save_revision(client, &id, old) {
+                Ok(()) => changes.saved.push(id),
+                Err(err) => errors.push(err.to_string()),
+            },
+        }
+    }
+    Ok((changes, errors))
+}
+
+/// `minga deploy` needs an HTTP URL, but the SSH tunnel is a Unix socket.
+/// This binds a loopback TCP port itself (so no other user can take the
+/// port first and receive the token) and relays it to the socket while the
+/// child runs.
+/// shortcut: another local user can connect to the port during the deploy
+/// and reach the API, which still asks them for the token. Upgrade: a
+/// Unix-socket option in `minga deploy`.
+async fn relay(sock: &Path) -> Result<(String, tokio::task::JoinHandle<()>), CtlError> {
+    let fail = |e: std::io::Error| {
+        CtlError::Usage(format!("cannot open a local port for `minga deploy`: {e}"))
+    };
+    let listener = TcpListener::bind("127.0.0.1:0").await.map_err(fail)?;
+    let addr = listener.local_addr().map_err(fail)?;
+    let sock = sock.to_path_buf();
+    let task = tokio::spawn(async move {
+        while let Ok((mut tcp, _)) = listener.accept().await {
+            let sock = sock.clone();
+            tokio::spawn(async move {
+                if let Ok(mut unix) = UnixStream::connect(&sock).await {
+                    let _ = tokio::io::copy_bidirectional(&mut tcp, &mut unix).await;
+                }
+            });
+        }
+    });
+    Ok((format!("http://{addr}"), task))
 }
 
 /// Runs a stack command.
@@ -61,6 +323,12 @@ pub async fn run(
 ) -> Result<(), CtlError> {
     let client = &conn.api;
     match cmd {
+        StackCommand::Deploy {
+            compose_file,
+            profiles,
+            wait,
+            stack,
+        } => deploy(conn, compose_file, profiles, *wait, stack, quiet).await,
         StackCommand::Ls => ls(client, format, quiet).await,
         StackCommand::Ps { stack } => ps(client, stack, format, quiet).await,
         StackCommand::Rm { stack, with, yes } => rm(client, stack, with, *yes, format, quiet).await,
@@ -338,4 +606,83 @@ async fn ps(client: &ApiClient, stack: &str, format: Format, quiet: bool) -> Res
     let nodes = view::node_names(&client.get("nodes", None).await?);
     let rows = view::task_rows(&tasks, view::items(&services), &nodes);
     output::print(format, quiet, &rows)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn yaml(text: &str) -> serde_yaml::Value {
+        serde_yaml::from_str(text).unwrap()
+    }
+
+    #[test]
+    fn relative_bind_mounts_are_found_in_short_and_long_form() {
+        let short = yaml("services:\n  traefik:\n    volumes: ['./conf:/etc/traefik:ro']\n");
+        assert_eq!(
+            relative_bind(&short),
+            Some(("traefik".to_string(), "./conf".to_string()))
+        );
+        let long = yaml(
+            "services:\n  web:\n    volumes:\n      - type: bind\n        source: ../data\n        target: /data\n",
+        );
+        assert_eq!(
+            relative_bind(&long),
+            Some(("web".to_string(), "../data".to_string()))
+        );
+        for source in [".", "~/x"] {
+            let doc = yaml(&format!("services:\n  a:\n    volumes: ['{source}:/x']\n"));
+            assert!(relative_bind(&doc).is_some(), "{source}");
+        }
+    }
+
+    #[test]
+    fn absolute_and_named_volumes_and_other_keys_pass() {
+        let doc = yaml(
+            "services:\n  a:\n    env_file: ./a.env\n    extra_hosts: ['h:host-gateway']\n    volumes: ['/srv/conf:/etc/a', 'data:/var/lib/a', '/anon']\nvolumes:\n  data: {}\n",
+        );
+        assert_eq!(relative_bind(&doc), None);
+    }
+
+    #[test]
+    fn only_loopback_endpoints_are_this_machine() {
+        for local in [
+            "http://127.0.0.1:2375",
+            "http://localhost:2375",
+            "https://[::1]:2376",
+        ] {
+            assert!(is_loopback(local), "{local}");
+        }
+        for remote in [
+            "https://minga.example.net",
+            "https://10.0.0.1:2376",
+            "https://localhost.example.net",
+        ] {
+            assert!(!is_loopback(remote), "{remote}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_relay_forwards_a_tcp_connection_to_the_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("api.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let echo = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4];
+            stream.read_exact(&mut buf).await.unwrap();
+            stream.write_all(&buf).await.unwrap();
+        });
+        let (url, task) = relay(&path).await.unwrap();
+        let mut tcp = tokio::net::TcpStream::connect(url.trim_start_matches("http://"))
+            .await
+            .unwrap();
+        tcp.write_all(b"ping").await.unwrap();
+        let mut reply = [0u8; 4];
+        tcp.read_exact(&mut reply).await.unwrap();
+        assert_eq!(&reply, b"ping");
+        echo.await.unwrap();
+        task.abort();
+    }
 }
