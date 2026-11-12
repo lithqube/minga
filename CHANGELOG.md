@@ -8,6 +8,8 @@ that worked before; read the [upgrade notes](https://github.com/lithqube/minga/b
 before upgrading. 1.1.1 was prepared but not tagged, so its fix ships here.
 
 ### Upgrading
+- State from 1.1.0 is kept as is: the persisted format is unchanged (format 2),
+  so no wipe or migration is needed. Upgrade every node together.
 - A Raft TLS key readable by group or others is refused at start; `chmod 600`
   it. `minga tls` now writes keys 0600 in 0700 directories.
 - A task whose published port is reserved by the node (53, the Raft, metrics

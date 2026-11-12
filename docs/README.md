@@ -27,6 +27,8 @@ Each ADR ends with an *Implementation status* section saying what shipped and wh
 
 ## Deployment
 
+- [Supported topologies](topologies.md): single host, from a workstation, air-gapped, Talos, container image and multi-node, with what each needs and how far it is verified
+- [CLI reference](cli.md): every `minga` and `minga-ctl` command, its flags and environment variables, and which deploy command to use
 - [Backup and restore](backup.md): `minga state export`/`import`, what it leaves out (secret values, volume data, TLS, NATS), and the cold-copy alternative
 - [Quick start: one Linux host](../README.md#quick-start-one-linux-host): the verified path
 - [systemd unit](../scripts/minga.service) and [environment example](../scripts/minga.env.example)
