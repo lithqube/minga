@@ -8,7 +8,7 @@ export interface Faq {
 export const faq: Faq[] = [
   {
     q: 'Is Minga production-ready?',
-    a: 'It is v1.1.0, aimed at single-host production. It is tested on macOS and in Linux CI, including the containerd suites and a real-kernel check of the published-port paths; this build has not yet been run on a real staging node. v1.1.0 adds versioned state that later upgrades keep, backup and restore, a recorded reason for failed tasks (last error and exit code for containers, the start error for agent tasks), image pulls through containerd’s own API with Docker credential helpers, and published ports that only redirect traffic addressed to the node. Cross-node container networking, joining a running cluster and per-operator API roles are not there yet.',
+    a: 'It is v1.1.1, aimed at single-host production. It is tested on macOS and in Linux CI, including the containerd suites and a real-kernel check of the published-port paths; this build has not yet been run on a real staging node. v1.1.0 adds versioned state that later upgrades keep, backup and restore, a recorded reason for failed tasks (last error and exit code for containers, the start error for agent tasks), image pulls through containerd’s own API with Docker credential helpers, and published ports that only redirect traffic addressed to the node. Cross-node container networking, joining a running cluster and per-operator API roles are not there yet.',
     sources: ['README.md', 'CHANGELOG.md', 'docs/release-1.1.0.md'],
   },
   {
@@ -43,7 +43,7 @@ export const faq: Faq[] = [
   },
   {
     q: 'Why does one host run two processes?',
-    a: 'In v1.1.0, <code>minga api</code> is its own Raft voter, so the manager and the API peer with each other. In the target design the API folds into the manager.',
+    a: 'In v1.1.1, <code>minga api</code> is its own Raft voter, so the manager and the API peer with each other. In the target design the API folds into the manager.',
     sources: ['README.md', 'docs/architecture.md'],
   },
   {
@@ -63,7 +63,7 @@ export const faq: Faq[] = [
   },
   {
     q: 'How do I install on an air-gapped site?',
-    a: 'Copy the v1.1.0 release archive (minga, nats-server, ctr and the licenses) and your image tarballs to the site. Run <code>ctr -n minga images import &lt;image&gt;.tar</code> on each node and start the roles. The published <code>install.sh</code> verifies <code>SHA256SUMS</code>.',
+    a: 'Copy the v1.1.1 release archive (minga, nats-server, ctr and the licenses) and your image tarballs to the site. Run <code>ctr -n minga images import &lt;image&gt;.tar</code> on each node and start the roles. The published <code>install.sh</code> verifies <code>SHA256SUMS</code>.',
     sources: ['README.md', 'docs/release-1.1.0.md'],
   },
   {

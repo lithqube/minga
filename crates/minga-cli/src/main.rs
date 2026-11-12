@@ -552,10 +552,7 @@ async fn main() -> ExitCode {
             let Some(loaded) = load(&compose) else {
                 return ExitCode::FAILURE;
             };
-            let project_dir = std::path::Path::new(&compose.compose_file)
-                .parent()
-                .filter(|&p| !p.as_os_str().is_empty())
-                .map(|p| p.canonicalize().unwrap_or_else(|_| p.to_path_buf()));
+            let project_dir = project_dir(&compose.compose_file);
             let translated = match minga_scheduler::translate_project(
                 &loaded.project,
                 &stack,
@@ -1851,5 +1848,39 @@ async fn run_image(cmd: ImageCommand) -> ExitCode {
                 }
             }
         }
+    }
+}
+
+/// The absolute directory relative bind-mount sources resolve against: the
+/// compose file's directory, which for a bare file name (the default
+/// `compose.yaml`) is the current directory. `None` if it cannot be resolved;
+/// the API then refuses any relative source instead of letting the node guess.
+fn project_dir(compose_file: &str) -> Option<std::path::PathBuf> {
+    let dir = match std::path::Path::new(compose_file).parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => std::path::Path::new("."),
+    };
+    dir.canonicalize().ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::project_dir;
+
+    #[test]
+    fn a_bare_compose_file_name_resolves_against_the_current_directory() {
+        let cwd = std::env::current_dir().unwrap().canonicalize().unwrap();
+        // `-c compose.yaml`, the default, used to leave relative sources unresolved.
+        assert_eq!(project_dir("compose.yaml").as_deref(), Some(cwd.as_path()));
+        assert_eq!(
+            project_dir("./compose.yaml").as_deref(),
+            Some(cwd.as_path())
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("compose.yaml");
+        let want = dir.path().canonicalize().unwrap();
+        assert_eq!(project_dir(file.to_str().unwrap()), Some(want));
+        assert_eq!(project_dir("/nonexistent-minga-dir/compose.yaml"), None);
     }
 }

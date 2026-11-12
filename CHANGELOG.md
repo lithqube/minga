@@ -1,5 +1,27 @@
 # Changelog
 
+## [1.1.1] — 2026-11-12
+
+A fix for relative bind mounts, found on a staging node running 1.1.0. The
+[1.1.0 upgrade notes](docs/release-1.1.0.md#upgrade-notes) apply when
+coming from 1.0.2; from 1.1.0 no wipe is needed.
+
+### Fixed
+- `minga deploy -c compose.yaml`, the default, left relative bind-mount
+  sources such as `./config/app.yaml` unresolved, because the file name has
+  no directory part. The node then resolved them against its own working
+  directory: a manager started from the project directory found the file,
+  one started by systemd failed with `failed to fulfil mount request: ...
+  no such file or directory`. They now resolve against the current
+  directory. The code was the same in 1.0.2, so this is not a 1.1.0
+  regression.
+
+### Changed
+- The API refuses a bind mount whose source is not an absolute path,
+  whatever the client, instead of storing a path the node would resolve
+  against its working directory. Services stored with a relative source by
+  an earlier version fail to start as before; redeploy them.
+
 ## [1.1.0] — 2026-11-12
 
 Single-node production fixes from the
