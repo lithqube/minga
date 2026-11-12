@@ -1,6 +1,6 @@
 //! `minga-ctl stack` (plan section 5.2).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use clap::Subcommand;
@@ -38,6 +38,15 @@ pub enum StackCommand {
         /// Seconds `minga deploy` waits for tasks to be placed.
         #[arg(long, default_value_t = 30)]
         wait: u64,
+        /// After a successful deploy, remove the stack's services that are
+        /// not in the Compose file, as `docker stack deploy --prune` does.
+        /// Each one's spec is saved first, so `service rollback` can bring
+        /// it back.
+        #[arg(long)]
+        prune: bool,
+        /// With --prune, do not ask for confirmation.
+        #[arg(long, requires = "prune")]
+        yes: bool,
         /// Name of the stack.
         stack: String,
     },
@@ -72,10 +81,15 @@ impl StackCommand {
                 compose_file,
                 profiles,
                 wait,
+                prune,
+                yes,
                 stack,
             } => Some((
                 "stack deploy",
-                json!({ "stack": stack, "compose_file": compose_file, "profiles": profiles, "wait": wait }),
+                json!({
+                    "stack": stack, "compose_file": compose_file, "profiles": profiles,
+                    "wait": wait, "prune": prune, "yes": yes,
+                }),
             )),
             StackCommand::Rm { stack, with, yes } => Some((
                 "stack rm",
@@ -161,15 +175,45 @@ fn is_relative(source: &str) -> bool {
         || source.starts_with('~')
 }
 
-/// `deploy` steps 1 to 4 (plan 5.2).
-async fn deploy(
-    conn: &Connection,
-    compose_file: &str,
-    profiles: &[String],
+/// What `deploy` is asked to do beyond `minga deploy` itself.
+struct DeployArgs<'a> {
+    compose_file: &'a str,
+    profiles: &'a [String],
     wait: u64,
-    stack: &str,
-    quiet: bool,
-) -> Result<(), CtlError> {
+    prune: bool,
+    yes: bool,
+    stack: &'a str,
+}
+
+/// The IDs (`<stack>.<name>`) of the services in a Compose file.
+/// shortcut: every key under `services` counts, whatever its profiles, so a
+/// profile-gated service is never pruned or named in the note; `minga
+/// deploy` rejects `include`, so no other file adds services.
+fn compose_services(file: &str, stack: &str) -> Result<BTreeSet<String>, CtlError> {
+    let text = std::fs::read_to_string(file)
+        .map_err(|e| CtlError::Usage(format!("cannot read {file}: {e}")))?;
+    let doc: serde_yaml::Value = serde_yaml::from_str(&text)
+        .map_err(|e| CtlError::Usage(format!("{file} is not valid YAML: {e}")))?;
+    Ok(doc
+        .get("services")
+        .and_then(|s| s.as_mapping())
+        .into_iter()
+        .flatten()
+        .filter_map(|(name, _)| name.as_str())
+        .map(|name| format!("{stack}.{name}"))
+        .collect())
+}
+
+/// `deploy` steps 1 to 5 (plan 5.2).
+async fn deploy(conn: &Connection, args: &DeployArgs<'_>, quiet: bool) -> Result<(), CtlError> {
+    let DeployArgs {
+        compose_file,
+        profiles,
+        wait,
+        prune,
+        yes,
+        stack,
+    } = *args;
     let client = &conn.api;
     api::check_id("stack", stack)?;
 
@@ -178,6 +222,35 @@ async fn deploy(
     // revision from an older change to roll back to.
     let filter = view::stack_filter(stack);
     let before = specs(&client.get("services", Some(&filter)).await?);
+
+    // 0. Services of the stack that the file does not name. With --prune they
+    // are confirmed now, before anything is deployed; a file that names none
+    // is refused, since pruning would empty the stack.
+    let in_file = match compose_services(compose_file, stack) {
+        Ok(names) => Some(names),
+        Err(e) if prune => return Err(e),
+        Err(_) => None, // `minga deploy` reports an unreadable file
+    };
+    if prune && in_file.as_ref().is_some_and(BTreeSet::is_empty) {
+        return Err(CtlError::Usage(format!(
+            "{compose_file} has no services; refusing to prune the whole stack (use `stack rm`)"
+        )));
+    }
+    let absent: Vec<String> = in_file
+        .iter()
+        .flat_map(|names| before.keys().filter(|id| !names.contains(*id)))
+        .cloned()
+        .collect();
+    if prune && !absent.is_empty() {
+        let summary = format!(
+            "After the deploy this removes from context `{}`:\n  services: {}\n\
+             (their specs are saved; `service rollback` recreates one)",
+            client.context,
+            absent.join(", ")
+        );
+        confirm("stack deploy --prune", yes, &summary)?;
+    }
+
     let earlier = save_before(client, &before)?;
 
     // 2. `minga deploy`, the token in its environment only.
@@ -238,6 +311,17 @@ async fn deploy(
         }
         return Err(CtlError::Halted(message));
     }
+
+    // 5. Prune what step 0 confirmed, or say what --prune would remove.
+    if prune {
+        prune_services(client, &absent, &before, quiet).await?;
+    } else if !absent.is_empty() && !quiet {
+        eprintln!(
+            "note: {} in stack {stack} but not in {compose_file}; --prune removes {}",
+            absent.join(", "),
+            if absent.len() == 1 { "it" } else { "them" }
+        );
+    }
     match problem {
         Some(reason) => Err(CtlError::Hinted {
             code: 2,
@@ -248,6 +332,41 @@ async fn deploy(
         }),
         None => Ok(()),
     }
+}
+
+/// Step 5: removes each service confirmed in step 0 that is still there,
+/// then saves its spec (as it was before the deploy) as its revision. Every
+/// one is tried; failures are reported together.
+async fn prune_services(
+    client: &ApiClient,
+    absent: &[String],
+    before: &BTreeMap<String, Value>,
+    quiet: bool,
+) -> Result<(), CtlError> {
+    let mut pruned = Vec::new();
+    let mut failed = Vec::new();
+    for id in absent {
+        let result = match client.delete(&format!("services/{id}")).await {
+            // Gone already: nothing to remove or save.
+            Err(CtlError::Api { status: 404, .. }) => continue,
+            Ok(_) => service::save_revision(client, id, &before[id]),
+            Err(e) => Err(e),
+        };
+        match result {
+            Ok(()) => pruned.push(id.as_str()),
+            Err(e) => failed.push(format!("{id} ({e})")),
+        }
+    }
+    if !pruned.is_empty() {
+        output::say(quiet, &format!("pruned {}", pruned.join(", ")))?;
+    }
+    if failed.is_empty() {
+        return Ok(());
+    }
+    Err(CtlError::Halted(format!(
+        "deployed, but could not prune {}",
+        failed.join(", ")
+    )))
 }
 
 /// Service ID to `Spec`.
@@ -393,8 +512,20 @@ pub async fn run(
             compose_file,
             profiles,
             wait,
+            prune,
+            yes,
             stack,
-        } => deploy(conn, compose_file, profiles, *wait, stack, quiet).await,
+        } => {
+            let args = DeployArgs {
+                compose_file,
+                profiles,
+                wait: *wait,
+                prune: *prune,
+                yes: *yes,
+                stack,
+            };
+            deploy(conn, &args, quiet).await
+        }
         StackCommand::Ls => ls(client, format, quiet).await,
         StackCommand::Ps { stack } => ps(client, stack, format, quiet).await,
         StackCommand::Rm { stack, with, yes } => rm(client, stack, with, *yes, format, quiet).await,
