@@ -7,7 +7,7 @@ description: Operate a Minga cluster (the single-binary Rust orchestrator that r
 
 Minga runs Compose files on one binary: Raft holds desired state and placement, NATS/JetStream carries status, logs and liveness, containerd runs the containers. This skill is for operating it. For changing Minga's own code, follow the repository's `CLAUDE.md` instead.
 
-Flags change between releases. Before running a command you have not run in this session, check `minga <cmd> --help` or `minga-ctl <cmd> -h` rather than trusting this file. Check the version first (`minga --version`, `minga-ctl --version`): this file is written for v1.2.0.
+Flags change between releases. Before running a command you have not run in this session, check `minga <cmd> --help` or `minga-ctl <cmd> -h` rather than trusting this file. Check the version first (`minga --version`, `minga-ctl --version`): this file is written for v1.2.0. A release candidate (`1.2.0-rc.N`) behaves as 1.2.0 here. A node on 1.1.0 or older does not have the 1.2.0 behaviour below, so say which version it runs before applying 1.2.0 advice.
 
 ## Two CLIs
 
@@ -116,6 +116,7 @@ On the node itself, `minga-ctl` still needs a context: `minga-ctl context add lo
 | API answers 403: `request carries an Origin header` or `Host is a DNS name` | Tokenless API (1.2.0+). Set `MINGA_API_TOKEN` on `minga api` and give clients the token; Traefik sends it as its Basic-auth password. |
 | A task cannot reach a service on the node's `127.0.0.1`, or another stack's containers | Blocked on purpose from 1.2.0. Publish the service's port and use the node address. |
 | A workload fails writing `/proc/sys/...`, or reading `/proc/kcore` | `/proc/sys` is read-only and Docker's sensitive paths are masked inside containers (1.2.0+). |
+| A stopped Minga task container is gone after a node restart | Expected from 1.2.0: at start the supervisor removes every container with a `minga/task_id` label that Raft does not assign to that node, running or exited, with its network and staged secrets, and adopts the ones Raft still assigns. The journal logs each removal. To keep a workload, deploy it through Minga. |
 | `stack deploy over ssh needs an API token for this context` | Add a token to the context (`--remote-token-file`, `--token-command` or `MINGA_CTL_TOKEN`). |
 | `minga-ctl stack deploy`: minga not found | It runs `minga` on the operator's machine, not the node. Install it there or set `MINGA_BIN`. |
 
