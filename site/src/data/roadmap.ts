@@ -88,7 +88,9 @@ export const milestones: Milestone[] = [
     date: '2026-11-13',
     status: 'shipped',
     title: 'Security hardening from a source audit',
-    features: ['At start, a node adopts the containers Raft still assigns to it and removes the Minga containers it no longer assigns'],
+    features: [
+      'At start, a node adopts the containers Raft still assigns to it and removes the Minga containers it no longer assigns',
+    ],
     security: [
       'Owner-only TLS keys, Raft data and NATS config',
       'The admin token never goes through a proxy or redirect',
