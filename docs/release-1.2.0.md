@@ -108,7 +108,9 @@ Once a candidate passes staging, set `version = "1.2.0"` in `Cargo.toml` on
 `release/1.2.0` (through a pull request), then tag that commit. Pushing the
 tag builds the archives, pushes `ghcr.io/lithqube/minga:1.2.0`, `:1.2` and
 `:latest`, and creates the GitHub release. Merge `release/1.2.0` back into
-`main`, then set `releasePublished` to `true` in `site/src/config/site.ts`.
+`main` only after that run has succeeded and the release and image are
+published, because merging deploys the site; then set `releasePublished` to
+`true` in `site/src/config/site.ts`.
 
 Tag the release branch commit, not whatever is checked out:
 
