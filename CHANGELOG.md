@@ -39,8 +39,10 @@ from the `release/1.2.0` branch.
   rule is set even without CPU or memory limits.
 - A bus Assign only starts a task that Raft assigns to the node, always from
   the Raft spec. On start the supervisor adopts running containers Raft
-  still assigns to it and removes every other container, running or exited,
-  with its network, DNAT rules, snapshot and staged secrets.
+  still assigns to it, and removes the Minga containers (those labelled with a
+  task ID) that Raft no longer assigns to it, running or exited, with their
+  network, DNAT rules, snapshot and staged secrets. An assigned container that
+  has exited is left for reconcile to restart or replace.
 - The API, metrics and egress listeners close a connection that sends no
   request head within 10s and cap concurrent connections at 1024. The Raft
   RPC server times out the TLS handshake (10s) and each read (60s), and caps
