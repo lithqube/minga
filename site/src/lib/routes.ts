@@ -6,7 +6,6 @@ const routes: Record<string, string> = {
   'CHANGELOG.md': '/changelog/',
   'docs/README.md': '/docs/',
   'docs/architecture.md': '/architecture/',
-  'docs/roadmap-v0.1.0.md': '/roadmap/',
   'docs/talos-deployment.md': '/docs/talos-deployment/',
   'docs/design.md': '/docs/design/',
   'docs/research/nats-evaluation.md': '/docs/research/nats-evaluation/',
