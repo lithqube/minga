@@ -7,7 +7,7 @@ description: Operate a Minga cluster (the single-binary Rust orchestrator that r
 
 Minga runs Compose files on one binary: Raft holds desired state and placement, NATS/JetStream carries status, logs and liveness, containerd runs the containers. This skill is for operating it. For changing Minga's own code, follow the repository's `CLAUDE.md` instead.
 
-Flags change between releases. Before running a command you have not run in this session, check `minga <cmd> --help` or `minga-ctl <cmd> -h` rather than trusting this file. Check the version first (`minga --version`, `minga-ctl --version`): this file is written for v1.2.0. A release candidate reports `1.2.0-rc.N` and behaves as 1.2.0 here; the latest stable release is still 1.1.0 until 1.2.0 is tagged, so say which one a node runs before applying 1.2.0 advice.
+Flags change between releases. Before running a command you have not run in this session, check `minga <cmd> --help` or `minga-ctl <cmd> -h` rather than trusting this file. Check the version first (`minga --version`, `minga-ctl --version`): this file is written for v1.2.0. A release candidate (`1.2.0-rc.N`) behaves as 1.2.0 here. A node on 1.1.0 or older does not have the 1.2.0 behaviour below, so say which version it runs before applying 1.2.0 advice.
 
 ## Two CLIs
 

@@ -1,13 +1,14 @@
 # Changelog
 
-## [1.2.0] — 2026-11-12
+## [1.2.0] — 2026-11-13
 
-Security fixes from a source audit of 1.1.1 (all twelve P1 leads, plus the
-lower-priority leads that share their root causes). Several change behaviour
+Security fixes from a source audit of 1.1.1: the twelve P1 leads (eleven fixed
+in code, and a startup warning for plaintext Raft), plus the lower-priority
+leads that share their root causes. Several change behaviour
 that worked before; read the [upgrade notes](https://github.com/lithqube/minga/blob/v1.2.0/docs/release-1.2.0.md#upgrade-notes)
 before upgrading. 1.1.1 was prepared but not tagged, so its fix ships here.
-The release candidate `v1.2.0-rc.1` is cut from the `release/1.2.0` branch for
-the staging run; 1.2.0 is tagged from the same branch once it passes.
+It was published first as the release candidate `v1.2.0-rc.1` (2026-11-12),
+from the `release/1.2.0` branch.
 
 ### Upgrading
 - State from 1.1.0 is kept as is: the persisted format is unchanged (format 2),

@@ -97,7 +97,10 @@ async fn replicated_bus_survives_losing_one_server() {
     let bus = NatsBus::connect(&seeds)
         .await
         .expect("connect to the seed list");
-    bus.ensure_replicas(3).await.expect("raise replicas");
+    // "Server is ready" comes before the three servers form a JetStream
+    // cluster, and on a busy CI runner that takes longer than the 10 s
+    // `ensure_replicas` waits by itself.
+    eventually("raise replicas", || bus.ensure_replicas(3)).await;
     for stream in [
         "MINGA_EVENTS",
         "MINGA_COMMANDS",
