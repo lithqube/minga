@@ -1,20 +1,250 @@
 ---
+import Logo from '../components/Logo.astro';
 import DocsLayout from '../layouts/DocsLayout.astro';
-import { readmeSection, renderRepoFile, renderRepoMarkdown } from '../lib/repo';
+import { url } from '../config/site';
+import { milestones, type Milestone } from '../data/roadmap';
+import { githubUrl } from '../lib/routes';
 
-const next = await renderRepoMarkdown(readmeSection('Roadmap').replace(/^## .+\n/, ''), 'README.md');
-const gates = await renderRepoFile('docs/roadmap-v0.1.0.md');
+const slug = (m: Milestone) =>
+  `${m.version}-${m.title}`
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-|-$/g, '');
+// The newest shipped release carries the house: that is where the crossing is now.
+const current = milestones.filter((m) => m.status === 'shipped').at(-1);
+const status = { shipped: 'Shipped', next: 'Next', proposed: 'Proposed' } as const;
+const headings = milestones.map((m) => ({ depth: 2, slug: slug(m), text: `${m.version}: ${m.title}` }));
+const sources = [...new Set(milestones.map((m) => m.source))];
+// `backticks` in the data are commands and keys: odd-numbered parts render as code.
+const parts = (text: string) => text.split('`').map((t, i) => ({ t, code: i % 2 === 1 }));
+// The logo's wave, repeated: M0 6, then 20 crests of 13 units.
+const wave = `M0 6 q6.5 -5 13 0${' t13 0'.repeat(19)}`;
 ---
 
 <DocsLayout
   title="Roadmap"
-  description="What Minga does next, in order, and the seven v0.1.0 release gates with their executable exit criteria."
+  description="The features and security work Minga shipped in each release, and what comes next."
   crumbs={[{ name: 'Roadmap', path: '/roadmap/' }]}
-  sources={['README.md', 'docs/roadmap-v0.1.0.md']}
-  headings={[...next.headings, { depth: 2, slug: 'gates', text: 'v0.1.0 gates (historical)' }, ...gates.headings]}
+  sources={sources}
+  headings={headings}
   current="/roadmap/"
 >
-  <Fragment set:html={next.html} />
-  <h2 id="gates">v0.1.0 gates (historical): {gates.title}</h2>
-  <Fragment set:html={gates.html} />
+  <header class="masthead">
+    <Logo size={64} />
+    <p class="lede">
+      A <span lang="es">minga de tiradura</span> moves a house across the water one pull at a time. Each release below
+      is one pull: the features and security work it shipped, then what comes next. Fixes and smaller changes are in the{' '}
+      <a href={url('/changelog/')}>changelog</a>.
+    </p>
+  </header>
+  <svg class="wave" viewBox="0 0 260 12" preserveAspectRatio="none" aria-hidden="true" focusable="false">
+    <path d={wave}></path>
+  </svg>
+
+  <ul class="legend" aria-label="Legend">
+    <li>
+      <span class="tag feature">Feature</span>
+    </li>
+    <li>
+      <span class="tag security">Security</span>
+    </li>
+    <li>
+      <span class="pill ok">Shipped</span>
+    </li>
+    <li>
+      <span class="pill next">Next</span>
+    </li>
+    <li>
+      <span class="pill">Proposed</span>
+    </li>
+  </ul>
+
+  <ol class="rail">
+    {milestones.map((m) => (
+      <li class:list={['stop', m.status, { current: m === current }]}>
+        <span class="marker" aria-hidden="true">
+          {m === current && <Logo size={36} />}
+        </span>
+        <article class="card" aria-labelledby={slug(m)}>
+          <p class="meta">
+            <span class:list={['pill', { ok: m.status === 'shipped', next: m.status === 'next' }]}>
+              {status[m.status]}
+            </span>
+            {m.date && <time datetime={m.date}>{m.date}</time>}
+            {m === current && <span class="here">Current release</span>}
+          </p>
+          <h2 id={slug(m)}>
+            {m.status === 'shipped' && <span class="ver">{m.version}</span>} {m.title}
+          </h2>
+          <div class="cols">
+            {m.features.length > 0 && (
+              <section>
+                <h3 class="tag feature">Feature</h3>
+                <ul>
+                  {m.features.map((f) => (
+                    <li>{parts(f).map((p) => (p.code ? <code>{p.t}</code> : p.t))}</li>
+                  ))}
+                </ul>
+              </section>
+            )}
+            {m.security.length > 0 && (
+              <section>
+                <h3 class="tag security">Security</h3>
+                <ul>
+                  {m.security.map((s) => (
+                    <li>{parts(s).map((p) => (p.code ? <code>{p.t}</code> : p.t))}</li>
+                  ))}
+                </ul>
+              </section>
+            )}
+          </div>
+          <p class="src">
+            <a href={githubUrl(m.source)}>Source: {m.source}</a>
+          </p>
+        </article>
+      </li>
+    ))}
+  </ol>
 </DocsLayout>
+
+<style>
+  .masthead {
+    display: flex;
+    gap: 20px;
+    align-items: center;
+    flex-wrap: wrap;
+  }
+  .masthead .lede {
+    flex: 1 1 280px;
+    margin: 0;
+  }
+  .wave {
+    display: block;
+    width: 100%;
+    height: 12px;
+    margin: 20px 0 16px;
+  }
+  .wave path {
+    fill: none;
+    stroke: var(--accent-2);
+    stroke-width: 1.5;
+    vector-effect: non-scaling-stroke;
+  }
+  .legend {
+    list-style: none;
+    padding: 0;
+    margin: 0 0 8px;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px 16px;
+  }
+  .tag {
+    display: inline-block;
+    font: 700 var(--step--1) var(--mono);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    margin: 0 0 0.4em;
+  }
+  .tag.feature {
+    color: var(--accent);
+  }
+  .tag.security {
+    color: var(--accent-2);
+  }
+  .pill.next {
+    color: var(--accent);
+    border-color: currentColor;
+  }
+
+  /* The crossing: a solid magenta rail for what shipped, dashed for what is ahead. */
+  .rail {
+    list-style: none;
+    padding: 0;
+    margin: 24px 0 0;
+  }
+  .stop {
+    position: relative;
+    padding: 0 0 24px 44px;
+  }
+  .stop::before {
+    content: '';
+    position: absolute;
+    left: 15px;
+    top: 0;
+    bottom: 0;
+    width: 2px;
+    background: var(--accent-2);
+  }
+  .stop.next::before,
+  .stop.proposed::before {
+    background: repeating-linear-gradient(to bottom, var(--muted) 0 6px, transparent 6px 12px);
+  }
+  .stop:last-child::before {
+    bottom: auto;
+    height: 18px;
+  }
+  .marker {
+    position: absolute;
+    left: 8px;
+    top: 10px;
+    width: 16px;
+    height: 16px;
+    background: var(--bg);
+    border: 2px solid var(--accent-2);
+  }
+  .stop.next .marker,
+  .stop.proposed .marker {
+    border: 2px dashed var(--muted);
+  }
+  .stop.current .marker {
+    left: -2px;
+    top: 0;
+    width: 36px;
+    height: 36px;
+    border: 0;
+  }
+  .stop.current .card {
+    border-color: var(--accent);
+  }
+  .card h2 {
+    margin: 0.2em 0 0.6em;
+    font-size: var(--step-2);
+  }
+  .ver {
+    font-family: var(--mono);
+    color: var(--accent);
+  }
+  .meta {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px 12px;
+    margin: 0;
+    font: var(--step--1) var(--mono);
+    color: var(--muted);
+  }
+  .here {
+    color: var(--accent);
+    font-weight: 700;
+  }
+  .cols {
+    display: grid;
+    gap: 8px 28px;
+  }
+  @media (min-width: 720px) {
+    .cols {
+      grid-template-columns: 1fr 1fr;
+    }
+  }
+  .cols ul {
+    margin: 0 0 0.6em;
+    padding-left: 1.1em;
+  }
+  .cols li {
+    margin-bottom: 0.35em;
+  }
+  .src {
+    margin: 0.4em 0 0;
+    font-size: var(--step--1);
+  }
+</style>
