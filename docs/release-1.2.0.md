@@ -87,37 +87,20 @@ minga-ctl --version   # minga-ctl 1.2.0
 | Real-kernel `netns` job: published port through the node address | Pass, in CI |
 | Real-kernel `netns` job: cross-bridge drop, published 53/udp refused | Pass, in CI on #50 |
 | All of the above on merged `main` (51ae4d3, with #48–#56) | Pass, in CI |
-| Release workflow with pinned actions and verified rustup | Not run until `v1.2.0-rc.1` is pushed; check the "Set up job" permissions and action SHAs on that run |
+| Release workflow with pinned actions and verified rustup | Pass on `v1.2.0-rc.1` (run 43302593658): all four jobs passed; the build jobs ran with `contents: read`, the image job with `contents: read` and `packages: write`, Publish with `contents: write`; only `ghcr.io/lithqube/minga:1.2.0-rc.1` was pushed. The `v1.2.0` run is the first to push `:1.2` and `:latest` |
+| `v1.2.0-rc.1` on the staging VPS: upgrade from 1.1.0 and redeploy of an 11-service stack | Ran, as reported in the [benchmark update](benchmark.md#update-v120-rc1-benchmark-2026-11-12); this is not a check of the audit leads |
 | The audit's owner-observed checks for each lead on a staging node, before and after | Not run |
 | A scoped re-audit of the changed units against this commit | Not run |
 
 ## Release candidate
 
-The `release/1.2.0` branch is cut from `main` at 51ae4d3 (#48–#56 merged) with
-the version set to `1.2.0-rc.1`. Only release fixes land on it, through pull
-requests against `release/1.2.0`; each one is merged back into `main`.
-
-Tagging the candidate runs the release workflow as a prerelease: it builds the
-archives, pushes only `ghcr.io/lithqube/minga:1.2.0-rc.1` (not `:1.2` or
-`:latest`), and creates a GitHub prerelease, so `install.sh` without
-`--version` still installs 1.1.0.
-
-```bash
-git fetch origin
-git tag -a v1.2.0-rc.1 -m "v1.2.0-rc.1" origin/release/1.2.0
-git push origin v1.2.0-rc.1
-```
-
-Install it on the staging node and run the checks in the table above:
-
-```bash
-curl -fsSL https://github.com/lithqube/minga/releases/download/v1.2.0-rc.1/install.sh \
-  | sh -s -- --version v1.2.0-rc.1
-minga --version   # 1.2.0-rc.1
-```
-
-A fix found in staging goes to `release/1.2.0`, bumps the version to
-`1.2.0-rc.2`, and gets a new candidate tag.
+`v1.2.0-rc.1` was tagged on 2026-11-12 from the `release/1.2.0` branch, which
+was cut from `main` at 51ae4d3 (#48–#56) with the version set to `1.2.0-rc.1`.
+The release workflow published it as a GitHub prerelease and pushed only
+`ghcr.io/lithqube/minga:1.2.0-rc.1`, so `install.sh` without `--version` kept
+installing 1.1.0. Documentation merged on `main` afterwards (#57–#59) came in
+through #60. Release fixes land on `release/1.2.0` through pull requests, and
+the branch is merged back into `main` after the release.
 
 ## Publishing
 
