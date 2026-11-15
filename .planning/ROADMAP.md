@@ -44,3 +44,35 @@ Sequential implementation for one developer: B (NATS TLS/transport boundary) →
 - [x] Gate 5 — transport security and secrets staging (Raft mTLS verified live, API bearer auth 401/200 live, NATS token, `minga tls` PKI, content-addressed per-task secret staging with rotation semantics).
 - [x] Gate 6 — real container logs (FIFO destinations, per-container bounded readers, JetStream history). Verified live: separated streams, backlog + follow surviving a supervisor restart.
 - [x] Gate 7 — shippable: CI (incl. daemon-backed job with `MINGA_REQUIRE_CONTAINERD=1`), linux/amd64 + linux/arm64 release workflow, `install.sh`, v0.1.0 version bump, CHANGELOG, corrected README/Talos docs; clean-checkout proof green.
+
+## Phase 12: Managers-only Raft
+**Goal:** Only managers vote. Workers become JetStream clients that get assignments, report status and keep server-stamped leases on the bus, and can join a running cluster. Managers can be added and removed at runtime, and `minga api` folds into the manager.
+**Depends on:** v1.2.0 (shipped 2026-11-13). Releases 1.0.1–1.2.0 were done outside this planning workspace; see `CHANGELOG.md`.
+**Requirements:** MOR-ADR, MOR-LEASE, MOR-STATUS, MOR-ASSIGN, MOR-AUTHZ, MOR-JOIN, MOR-FOLD, MOR-NATS, MOR-PART, MOR-PROOF
+**Plans:** `.planning/phases/12-managers-only-raft/12-PLAN.md`
+**Mode:** standard
+**Status:** Planned
+
+- [ ] 12-01 — ADR 0006: Workers leave Raft (no code)
+- [ ] 12-02 — Liveness and registration off Raft
+- [ ] 12-03 — Actual task state off Raft
+- [ ] 12-04 — Assignment KV, workers without a StateStore, one dispatch path, NATS subject permissions
+- [ ] 12-05 — Join and remove managers, cluster the managers' NATS sidecars (can run in parallel with 12-02…12-04)
+- [ ] 12-06 — Fold `minga api` into the manager
+- [ ] 12-07 — Live proof, docs, CHANGELOG, site roadmap
+
+## Phase 13: WireGuard mesh and routing mesh
+**Goal:** Containers on different nodes reach each other over kernel WireGuard, with the same names and IPs, including edge workers behind NAT (relayed through managers). Published ports in Swarm's default `ingress` mode answer on every node.
+**Depends on:** Phase 12 (registration over the bus, `MINGA_ASSIGN` and its write permissions). 13-02 is independent and can land first.
+**Requirements:** WG-ADR, WG-SUBNET, WG-KEYS, WG-PEERS, WG-NAT, WG-ISOL, WG-INGRESS, WG-PROOF
+**Plans:** `.planning/phases/13-wireguard-mesh/13-PLAN.md`
+**Mode:** standard
+**Status:** Planned
+
+- [ ] 13-01 — ADR 0007: WireGuard mesh and routing mesh (no code)
+- [ ] 13-02 — Unique subnets and strict network `driver_opts` (independent of Phase 12)
+- [ ] 13-03 — Node keys and the `minga-wg0` interface
+- [ ] 13-04 — Peer sets, /32 routes, proxy ARP, cross-node isolation
+- [ ] 13-05 — NAT traversal by relay through managers
+- [ ] 13-06 — Routing mesh (`mode: ingress` as in Swarm, cluster-wide port reservation)
+- [ ] 13-07 — Live proof on VMs, iperf3 numbers, docs, CHANGELOG, site roadmap
