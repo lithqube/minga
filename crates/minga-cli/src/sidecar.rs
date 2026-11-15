@@ -298,7 +298,14 @@ fn generate_config(opts: &SidecarOptions, jetstream_dir: &Path) -> String {
             append_user(
                 &mut out,
                 &format!("minga-manager-{node_id}"),
-                &["$JS.API.>".into(), "$KV.>".into(), "minga.>".into()],
+                // $JS.FC: flow-control replies; without them an ordered
+                // consumer (KV listing, watches) stalls on large payloads.
+                &[
+                    "$JS.API.>".into(),
+                    "$JS.FC.>".into(),
+                    "$KV.>".into(),
+                    "minga.>".into(),
+                ],
                 &[
                     "$JS.API.>".into(),
                     "$KV.>".into(),
@@ -536,6 +543,7 @@ mod tests {
         let config = generate_config(&opts, Path::new("/var/lib/minga/nats/jetstream"));
 
         assert!(config.contains("user: \"minga-manager-2\""));
+        assert!(config.contains("\"$JS.FC.>\""));
         assert!(config.contains("user: \"minga-worker-7\""));
         assert!(config.contains("\"$KV.MINGA_STATUS.node.7.task.>\""));
         assert!(config.contains("\"$KV.MINGA_ASSIGN.node.7.task.>\""));

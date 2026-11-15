@@ -189,6 +189,17 @@ async fn partial_lease_set_after_an_empty_one_does_not_remove_tasks() {
         "node 2 has not renewed yet; its task must stay"
     );
 
+    // Node 2 renews: recovery is complete and the grace window ends.
+    bus.refresh_lease(2, b"registration").await.unwrap();
+    scheduler.reconcile_once().await.unwrap();
+    // A later lost lease is a real node failure, acted on right away.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    bus.refresh_lease(1, b"registration").await.unwrap();
+    assert!(
+        !scheduler.reconcile_once().await.unwrap().is_empty(),
+        "a finished grace window must not delay removing node 2's task"
+    );
+
     drop(scheduler);
     Arc::try_unwrap(store)
         .ok()

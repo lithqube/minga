@@ -441,7 +441,7 @@ authorization {{
         {{
             user: "minga-manager-1"
             permissions: {{
-                publish: {{ allow: ["$JS.API.>", "$KV.>", "minga.>"] }}
+                publish: {{ allow: ["$JS.API.>", "$JS.FC.>", "$KV.>", "minga.>"] }}
                 subscribe: {{ allow: ["$JS.API.>", "$KV.>", "minga.>", "_INBOX.>"] }}
             }}
         }},
@@ -596,6 +596,12 @@ async fn worker_certificate_cannot_write_assignments_or_other_nodes_status_and_l
     .expect("listing stalled: flow-control replies denied?")
     .unwrap();
     assert_eq!(listed.len(), 65);
+    // The scheduler lists every assignment as the manager.
+    let listed = tokio::time::timeout(Duration::from_secs(20), manager.list_assignments(""))
+        .await
+        .expect("manager listing stalled: flow-control replies denied?")
+        .unwrap();
+    assert_eq!(listed.len(), 67);
     for i in 0..64 {
         manager
             .delete_assignment(&format!("node.7.task.big-{i:02}"))

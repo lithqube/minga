@@ -174,6 +174,10 @@ impl Scheduler {
             }
             // With every registered node live, no lease can be missing in error.
             let all_live = nodes.iter().all(|node| live_nodes.contains(&node.id));
+            if all_live {
+                // Recovery is complete; a later missing lease is a real failure.
+                *self.lease_grace_until.lock().unwrap() = None;
+            }
             if none_live || (in_grace && !all_live) {
                 tracing::warn!(
                     live = live_nodes.len(),
