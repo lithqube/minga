@@ -7,3 +7,4 @@ Rust single-binary orchestrator replacing Docker Swarm for edge/on-prem/air-gapp
 - Only desired state and placement go through Raft. Heartbeats, task status and agent run steps go through JetStream.
 - Compose files must deploy unchanged; unknown keys fail loudly instead of being skipped.
 - Before committing: `cargo fmt --all`, `cargo clippy --all-targets -- -D warnings`, `cargo test`.
+- Keep the disk free. In a worktree, build with `CARGO_TARGET_DIR=<main checkout>/target`: a worktree's own `target/` grows to 20–50 GB. Once your PR is merged or abandoned, remove your worktree (`git worktree remove`), delete your local branch (`git branch -d`), and delete temp files you created outside the scratchpad (test containers, networks, downloads). Only remove what you created: never a worktree that is locked or belongs to another session.
