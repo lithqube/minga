@@ -1,13 +1,13 @@
 # CLI reference
 
-Minga has two command-line tools. This page says what each command is for,
-where it runs and which flags matter. For the complete flag list of the version
-you run, use `minga <command> --help` and `minga-ctl <command> --help`; this
-page was written from the `--help` output of v1.2.0.
+Minga has two command-line tools. This page documents the current manager-only
+Raft CLI shape and describes what each command does, where it runs and which
+flags matter. For the exact flags in your build, run `minga <command> --help`
+and `minga-ctl <command> --help`.
 
 | Tool | Runs on | What it does | Ships in |
 | --- | --- | --- | --- |
-| `minga` | Every node, for the `manager`, `worker` and `api` roles; any machine for the client commands | Runs the cluster, and deploys, validates, backs up state, reads logs, pulls images and issues certificates | The release archive and the `ghcr.io/lithqube/minga` image |
+| `minga` | Every node for the `manager` and `worker` roles; any machine for client commands | Runs the cluster, serves the manager's Docker API, and deploys, validates, backs up state, reads logs, pulls images and issues certificates | The release archive and the `ghcr.io/lithqube/minga` image |
 | `minga-ctl` | The operator's workstation | Named contexts, stacks, services, secrets, images, registry logins and health checks, over SSH or HTTPS | Not in the archive: `cargo install --locked --path crates/minga-ctl` from a checkout of the release tag |
 
 Supported layouts (single host, multi-node, Talos, air-gapped) are in
@@ -15,9 +15,9 @@ Supported layouts (single host, multi-node, Talos, air-gapped) are in
 
 ## Which deploy command to use
 
-Both commands deploy a Compose file through `minga api`. `minga-ctl stack
-deploy` runs `minga deploy` on the workstation, through its tunnel, and adds
-the day-2 parts:
+Both commands deploy a Compose file through the manager's Docker API. `minga-ctl
+stack deploy` runs `minga deploy` on the workstation, through its tunnel, and
+adds the day-2 parts:
 
 | | `minga deploy` | `minga-ctl stack deploy` |
 | --- | --- | --- |
@@ -38,30 +38,30 @@ Compose file keeps running with either command.
 ### Node roles
 
 ```bash
-minga manager --node-id <ID> --bind <ADDR> [flags]   # scheduler + supervisor (+ NATS sidecar)
-minga worker  --node-id <ID> --nats-url <URL> [flags] # supervisor only
-minga api     --node-id <ID> --bind <ADDR> [flags]   # Docker Engine API (v1.41 subset)
+minga manager --node-id <ID> --bind <ADDR> [--api-bind <ADDR>] [flags] # scheduler + API + supervisor (+ NATS sidecar)
+minga worker  --node-id <ID> --nats-url <URL> [flags]                # supervisor only
 ```
 
-Only managers vote in Raft. Workers are JetStream clients and do not open a
-`StateStore`; `minga api` remains a voter until the API-folding plan. A new
-manager uses `--join` to open without bootstrapping and wait for an administrator
-to add it through the authenticated API.
+`minga api` is retired and exits with guidance to use `minga manager --api-bind`.
+Only managers vote in Raft and serve the Docker Engine API. Workers are
+JetStream clients and do not open a `StateStore`. A new manager uses `--join`
+to open without bootstrapping and wait for an administrator to add it through
+the authenticated API.
 
 With the manager API token configured, add a running joiner with
 `POST /minga/managers` and `{ "id": ID, "raft_addr": "HOST:PORT" }`.
 The API waits for catch-up before promotion. Remove it with
 `DELETE /minga/managers/ID`; the last manager cannot be removed.
 
-**Raft flags (manager and API; not workers)**
+**Raft flags (managers only)**
 
 | Flag | Default | Notes |
 | --- | --- | --- |
 | `--node-id <ID>` | required | Unique, stable ID for this Raft node. |
 | `--bind <ADDR>` | required | Address the Raft RPC server listens on and peers dial, for example `127.0.0.1:7001`. |
 | `--peer <ID=ADDR>` | none | Initial cluster membership only. Repeat for the other voters when bootstrapping; `--join` cannot be combined with `--peer`. |
-| `--join` | off | Manager-only. Never initializes a pristine store; waits for a manager to add this node. |
-| `--data-dir <DIR>` | `/var/lib/minga` | Manager/API Raft data (`raft_log.redb`, `state.redb`), plus node-local `secrets/`, `volumes/` and `modules/`. Workers never open Raft files. Tightened to 0700 at start. |
+| `--join` | off | Never initializes a pristine store; waits for a manager to add this node. |
+| `--data-dir <DIR>` | `/var/lib/minga` | Manager Raft data (`raft_log.redb`, `state.redb`), plus node-local `secrets/`, `volumes/` and `modules/`. Workers never open Raft files. Tightened to 0700 at start. |
 | `--raft-tls-ca`, `--raft-tls-cert`, `--raft-tls-key` | none | All three together enable Raft mTLS. Required off loopback (otherwise a warning). The key must not be readable by group or others. |
 
 **Manager and worker flags**
@@ -97,14 +97,12 @@ minga worker --node-id ID --nats-url tls://manager-1:4222,tls://manager-2:4222
 The node ID must match the certificate identity. No Raft bind, peer list, Raft
 certificate flags, or previous Raft data directory is needed.
 
-**API flags**
+**API flags (manager only)**
 
 | Flag | Default | Notes |
 | --- | --- | --- |
-| `--api-bind <ADDR>` | `0.0.0.0:2375` | Every interface by default. Bind `127.0.0.1:2375` unless containers (Traefik) must reach it, and then set a token. |
-| `--api-token`, `MINGA_API_TOKEN` | none | Required as `Authorization: Bearer <token>`, or as the Basic-auth password for Traefik's Swarm provider. Set it through the environment (an `EnvironmentFile`), not the flag, so it stays out of process listings. Manager membership endpoints require a configured token even when other API routes are tokenless. |
-| `--nats-url <URL>`, `MINGA_NATS_URL` | `nats://127.0.0.1:4222` | NATS used by the API node's placement scheduler to check server-expiring node leases. |
-| `--nats-token`, `MINGA_NATS_TOKEN` | none | NATS client token, when required. |
+| `--api-bind <ADDR>` | `0.0.0.0:2375` | The manager's Docker API listener. Bind `127.0.0.1:2375` unless containers (Traefik) must reach it; when reachable beyond loopback, configure a token and firewall the port. |
+| `--api-token`, `MINGA_API_TOKEN` | none | Bearer token on API requests, or Basic-auth password for Traefik's Swarm provider. Prefer the environment (`EnvironmentFile`) over the flag so the token is not in process listings. Manager membership endpoints always require a configured token. |
 
 ### Client commands
 
@@ -219,9 +217,9 @@ stack or context does not exist.
 | Variable | Read by | Meaning |
 | --- | --- | --- |
 | `MINGA_API_URL` | `minga deploy`, `minga state` | API URL (default `http://127.0.0.1:2375`). |
-| `MINGA_API_TOKEN` | `minga api`; `minga deploy`, `minga state` | The API token, server and client side. |
-| `MINGA_NATS_URL` | Node roles, `minga api`, `minga logs`, `minga agent ls` | NATS URL. |
-| `MINGA_NATS_TOKEN` | Node roles, `minga api` | NATS token (not used over TLS). |
+| `MINGA_API_TOKEN` | `minga manager`; `minga deploy`, `minga state` | API token, server and client side. |
+| `MINGA_NATS_URL` | Manager/worker roles, `minga logs`, `minga agent ls` | NATS URL. |
+| `MINGA_NATS_TOKEN` | Manager/worker roles | NATS token (not used over TLS). |
 | `MINGA_NATS_TLS_CA`, `MINGA_NATS_TLS_CERT`, `MINGA_NATS_TLS_KEY`, `MINGA_NATS_TLS_SERVER_NAME` | Everything that connects to NATS | Client certificate settings for a `tls://` URL. |
 | `MINGA_NATS_REPLICAS` | Node roles | Same as `--nats-replicas`. |
 | `MINGA_NATS_SERVER_BIN` | `minga manager` | The `nats-server` the sidecar runs, instead of the one next to `minga` or on `PATH`. |
@@ -238,6 +236,6 @@ stack or context does not exist.
 `/etc/minga/minga.env` ([template](../scripts/minga.env.example)): `MINGA_ROLE`,
 `MINGA_NODE_ID`, `MINGA_BIND` and `MINGA_EXTRA_ARGS` for everything else. The
 unit already passes `--data-dir /var/lib/minga`, `--runtime containerd` and
-`--containerd-socket`, so do not repeat them. `minga api` needs a second unit
-with its own node ID and data directory; the
-[staging guide](hetzner-arm-staging.md#single-node-configuration) has one.
+`--containerd-socket`, so do not repeat them. The manager serves the API with
+`--api-bind`; it does not need a second `minga api` unit. Set `MINGA_API_TOKEN`
+in the manager's environment file.

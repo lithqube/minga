@@ -2,7 +2,7 @@
 
 **Status:** Validated on a single Hetzner CAX21 node (Ampere Altra ARM64, Ubuntu 24.04 LTS). All 8 services reach `RUNNING`. Validation required `feat/staging-compat` fixes — see [PR #16](https://github.com/lithqube/minga/pull/16).
 
-**Version:** Minga v1.1.0 (first validated with v1.0.2 on `feat/staging-compat`; not yet re-run on v1.1.0)
+**Version:** The stack was validated with Minga v1.1.0; the one-process manager configuration below requires the Phase 12 CLI and has not yet been run on staging.
 
 > **Not yet re-validated:** the API token for Traefik (Basic auth), the node-side `host-gateway` address, the `DOCKER_CONFIG` setup and named users were changed after that run. They are covered by unit tests, and named users also by a daemon-backed test, but not yet by a redeploy of this stack.
 
@@ -36,7 +36,7 @@ Hetzner CAX21 (Ubuntu 24.04 LTS, ARM64)
     secrets-agent      internal   Renders /opt/app/secrets/secrets.env every 60s
 ```
 
-Traefik discovers routes from Swarm labels via `minga api` at `:2375`.
+Traefik discovers routes from Swarm labels via the manager's API at `:2375`.
 Only ports 22, 80, and 443 are open to the internet (ufw).
 
 ---
@@ -56,48 +56,30 @@ curl -fsSL https://github.com/lithqube/minga/releases/latest/download/install.sh
 
 ## Single-node configuration
 
-Two processes on one host: `minga manager` (scheduler + supervisor) and `minga api` (Docker Engine API). Both are Raft voters and must start together.
+One `minga manager` process on the host is the Raft voter, scheduler,
+supervisor, Docker Engine API and NATS sidecar.
 
-**`/etc/minga/minga.env`** (manager):
+**`/etc/minga/minga.env`** (root-owned, mode 0600):
 ```
 MINGA_ROLE=manager
 MINGA_NODE_ID=1
 MINGA_BIND=127.0.0.1:7001
-MINGA_EXTRA_ARGS=--peer 2=127.0.0.1:7002 --metrics-bind 127.0.0.1:9100
+MINGA_EXTRA_ARGS=--metrics-bind 127.0.0.1:9100 --api-bind 0.0.0.0:2375
 ```
 
-> The `minga.service` installed by `install.sh` already passes `--data-dir`, `--runtime containerd` and `--containerd-socket` — do not repeat them in `MINGA_EXTRA_ARGS`.
-
-**`/etc/systemd/system/minga-api.service`** (second process):
-```ini
-[Unit]
-Description=Minga Docker Engine API
-After=network.target minga.service
-
-[Service]
-# MINGA_API_TOKEN: without it the API is unauthenticated, and any container
-# on the host could deploy privileged containers through it.
-EnvironmentFile=/etc/minga/minga-api.env
-ExecStart=/usr/local/bin/minga api \
-  --node-id 2 --bind 127.0.0.1:7002 \
-  --peer 1=127.0.0.1:7001 \
-  --data-dir /var/lib/minga-api \
-  --api-bind 0.0.0.0:2375
-Restart=on-failure
-RestartSec=5s
-
-[Install]
-WantedBy=multi-user.target
-```
-
-**`/etc/minga/minga-api.env`** (root-owned, mode 0600):
+The `minga.service` installed by `install.sh` already passes `--data-dir`,
+`--runtime containerd` and `--containerd-socket` — do not repeat them in
+`MINGA_EXTRA_ARGS`. Generate and protect the token file:
 
 ```bash
-sudo install -m 0600 /dev/null /etc/minga/minga-api.env
-echo "MINGA_API_TOKEN=$(openssl rand -hex 32)" | sudo tee /etc/minga/minga-api.env >/dev/null
+sudo chmod 0600 /etc/minga/minga.env
+sudo sh -c 'umask 077; printf "MINGA_API_TOKEN=%s\n" "$(openssl rand -hex 32)" >> /etc/minga/minga.env'
 ```
 
-The API listens on every interface so containers can reach it through their bridge gateway. ufw keeps 2375 closed to the internet. If ufw also filters bridge traffic on your host, allow the Minga bridge range to reach the API: `sudo ufw allow from 10.100.0.0/16 to any port 2375 proto tcp`.
+The API listens on every interface so containers can reach it through their
+bridge gateway. ufw keeps 2375 closed to the internet. If ufw also filters
+bridge traffic on your host, allow the Minga bridge range to reach the API:
+`sudo ufw allow from 10.100.0.0/16 to any port 2375 proto tcp`.
 
 ---
 

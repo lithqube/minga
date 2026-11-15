@@ -88,6 +88,13 @@ fn minga(args: &[&str]) -> (bool, String, String) {
     )
 }
 
+#[test]
+fn standalone_api_command_points_to_manager_api_bind() {
+    let (success, _, stderr) = minga(&["api"]);
+    assert!(!success);
+    assert!(stderr.contains("minga manager --api-bind"), "{stderr}");
+}
+
 fn deploy(url: &str) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("compose.yaml");

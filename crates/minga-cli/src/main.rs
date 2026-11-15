@@ -71,8 +71,9 @@ enum Command {
         #[command(subcommand)]
         cmd: SecretCommand,
     },
-    /// Run the Docker Engine API server (Swarm-compatible REST API).
-    Api(ApiArgs),
+    /// Retired command. The Docker Engine API runs in the manager.
+    /// Use `minga manager --api-bind` instead.
+    Api,
     /// Dry-run or apply the v1.2.0 worker-voter migration.
     MigrateV1(MigrateV1Args),
     /// Agent sandbox management.
@@ -388,6 +389,12 @@ struct NodeArgs {
     /// (e.g. 0.0.0.0:9100). Not served when unset.
     #[arg(long, env = "MINGA_METRICS_BIND")]
     metrics_bind: Option<String>,
+    /// Bind address for the Docker Engine API. Managers default to 0.0.0.0:2375.
+    #[arg(long)]
+    api_bind: Option<String>,
+    /// Token required on API requests. Prefer MINGA_API_TOKEN to keep it out of process listings.
+    #[arg(long, env = "MINGA_API_TOKEN")]
+    api_token: Option<String>,
     /// Range each network's /24 is allocated from (by the Raft leader).
     /// Refused when it overlaps one of this host's routes.
     #[arg(long, env = "MINGA_OVERLAY_SUPERNET", default_value = minga_net::DEFAULT_SUPERNET)]
@@ -402,51 +409,6 @@ struct ComposeArgs {
     /// Profile to enable; repeat for several, or use `*` for all.
     #[arg(short, long = "profile")]
     profiles: Vec<String>,
-}
-
-#[derive(Args)]
-struct ApiArgs {
-    /// This node's Raft ID.
-    #[arg(long)]
-    node_id: u64,
-    /// Address to bind the Raft RPC server (e.g. 0.0.0.0:50051).
-    #[arg(long)]
-    bind: String,
-    /// Data directory for Raft state (raft_log.redb, state.redb).
-    #[arg(long, default_value = "/var/lib/minga")]
-    data_dir: String,
-    /// Peer node as id=address (repeatable). Include all other nodes.
-    #[arg(long = "peer")]
-    peers: Vec<String>,
-    /// PEM file with the cluster CA certificate. Enables mTLS on the Raft
-    /// transport; all three raft-tls flags are required together.
-    #[arg(long)]
-    raft_tls_ca: Option<String>,
-    /// PEM file with this node's Raft certificate (SAN `minga-node`).
-    #[arg(long)]
-    raft_tls_cert: Option<String>,
-    /// PEM file with this node's Raft private key.
-    #[arg(long)]
-    raft_tls_key: Option<String>,
-    /// NATS server URL for lease-aware placement (defaults to the local manager sidecar).
-    #[arg(long, env = "MINGA_NATS_URL", default_value = "nats://127.0.0.1:4222")]
-    nats_url: String,
-    /// NATS client token, when the server requires one.
-    #[arg(long, env = "MINGA_NATS_TOKEN")]
-    nats_token: Option<String>,
-    /// Address to bind the Docker Engine API server (e.g. 0.0.0.0:2375).
-    #[arg(long, default_value = "0.0.0.0:2375")]
-    api_bind: String,
-    /// Token required on every API request, as `Authorization: Bearer` or
-    /// as the Basic-auth password (for Traefik's Swarm provider). Strongly
-    /// recommended when binding anything other than localhost — without it,
-    /// the API is unauthenticated remote code execution by design.
-    #[arg(long, env = "MINGA_API_TOKEN")]
-    api_token: Option<String>,
-    /// Range each network's /24 is allocated from (by the Raft leader).
-    /// Refused when it overlaps one of this host's routes.
-    #[arg(long, env = "MINGA_OVERLAY_SUPERNET", default_value = minga_net::DEFAULT_SUPERNET)]
-    overlay_supernet: String,
 }
 
 #[derive(Subcommand)]
@@ -607,10 +569,7 @@ async fn main() -> ExitCode {
     let cli = Cli::parse();
     // Long-running roles log JSON for collectors; one-shot commands stay
     // human-readable.
-    if matches!(
-        cli.command,
-        Command::Manager(_) | Command::Worker(_) | Command::Api(_)
-    ) {
+    if matches!(cli.command, Command::Manager(_) | Command::Worker(_)) {
         minga_telemetry::init_logging();
     } else {
         tracing_subscriber::fmt()
@@ -682,7 +641,10 @@ async fn main() -> ExitCode {
         Command::Wg { cmd } => return run_wg(cmd),
         Command::Tls { cmd } => return run_tls(cmd),
         Command::Secret { cmd } => return run_secret(cmd),
-        Command::Api(args) => return run_api(args).await,
+        Command::Api => {
+            eprintln!("error: `minga api` was folded into the manager; use `minga manager --api-bind <ADDR>`");
+            return ExitCode::FAILURE;
+        }
         Command::Sandbox { cmd } => return run_sandbox(cmd).await,
         Command::Egress(args) => return run_egress(args).await,
         Command::MigrateV1(args) => return run_migrate_v1(args).await,
@@ -783,107 +745,6 @@ async fn run_migrate_v1(args: MigrateV1Args) -> ExitCode {
             ExitCode::FAILURE
         }
     }
-}
-
-/// Runs the Docker Engine API server: opens the state store and starts
-/// the HTTP API server. The API server can run on any node — reads are
-/// served locally, writes are proposed to Raft (forwarded to the leader).
-async fn run_api(args: ApiArgs) -> ExitCode {
-    let supernet = match overlay_supernet(&args.overlay_supernet) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("error: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-    let peers = match parse_peers(&args.peers) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("error: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-
-    tracing::info!(
-        node_id = args.node_id,
-        bind = %args.bind,
-        api_bind = %args.api_bind,
-        data_dir = %args.data_dir,
-        "starting Docker Engine API server"
-    );
-
-    let state = match open_store(
-        args.node_id,
-        &args.bind,
-        &args.data_dir,
-        peers,
-        &args.raft_tls_ca,
-        &args.raft_tls_cert,
-        &args.raft_tls_key,
-        false,
-    )
-    .await
-    {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("error: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-    let bus = match bus::connect_bus(&args.nats_url, args.nats_token.as_deref(), 1).await {
-        Ok(bus) => bus,
-        Err(error) => {
-            eprintln!(
-                "error: cannot connect to NATS at {}: {error}",
-                args.nats_url
-            );
-            return ExitCode::FAILURE;
-        }
-    };
-
-    if args.api_token.is_none() && !is_loopback_bind(&args.api_bind) {
-        tracing::warn!(
-            api_bind = %args.api_bind,
-            "the Docker API has no token and listens beyond loopback: anyone who can reach it \
-             is cluster admin. Set --api-token or MINGA_API_TOKEN"
-        );
-    }
-    let server = match minga_api::ApiServer::start_with_bus_and_auth(
-        state.clone(),
-        bus.clone(),
-        &args.api_bind,
-        args.api_token,
-    )
-    .await
-    {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("error: cannot start API server: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-
-    // The reconcile loop must exist on every Raft voter: the scheduler is
-    // leadership-gated, and an API-only node can be elected leader. Without
-    // this, a cluster whose leader is an API node places no tasks.
-    let scheduler = minga_scheduler::Scheduler::with_bus(state, bus).with_supernet(supernet);
-    let reconcile = scheduler.run(Duration::from_secs(2));
-    tokio::pin!(reconcile);
-
-    println!("Docker Engine API listening on http://{}", server.addr());
-    println!("Try: curl http://{}/_ping", server.addr());
-    println!("     DOCKER_HOST=tcp://{} docker service ls", server.addr());
-
-    // Wait forever (until SIGINT).
-    tokio::select! {
-        _ = &mut reconcile => {},
-        _ = tokio::signal::ctrl_c() => {
-            tracing::info!("shutting down API server");
-        },
-    }
-    server.shutdown();
-
-    ExitCode::SUCCESS
 }
 
 /// Cluster PKI operations: CA creation and node certificate issuance.
@@ -1070,6 +931,8 @@ fn worker_has_manager_only_flags(args: &NodeArgs) -> bool {
         || args.nats_replicas.is_some()
         || args.join
         || args.nats_cluster_port.is_some()
+        || args.api_bind.is_some()
+        || args.api_token.is_some()
 }
 
 /// Runs a node (manager or worker): managers open Raft state, while workers
@@ -1080,7 +943,9 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
         return ExitCode::FAILURE;
     }
     if !is_manager && worker_has_manager_only_flags(&args) {
-        eprintln!("error: Raft bind, peer, TLS, and replica flags are manager-only");
+        eprintln!(
+            "error: Raft and API bind/token flags, peer, TLS, and replica flags are manager-only"
+        );
         return ExitCode::FAILURE;
     }
     if is_manager && args.join && !args.peers.is_empty() {
@@ -1328,6 +1193,38 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    let api_server = if is_manager {
+        let api_bind = args.api_bind.as_deref().unwrap_or("0.0.0.0:2375");
+        if args.api_token.is_none() && !is_loopback_bind(api_bind) {
+            tracing::warn!(
+                api_bind,
+                "the Docker API has no token and listens beyond loopback: anyone who can reach it \
+                 is cluster admin. Set --api-token or MINGA_API_TOKEN"
+            );
+        }
+        match minga_api::ApiServer::start_with_bus_and_auth(
+            state
+                .as_ref()
+                .expect("manager StateStore initialized")
+                .clone(),
+            bus.clone(),
+            api_bind,
+            args.api_token.clone(),
+        )
+        .await
+        {
+            Ok(server) => {
+                tracing::info!(addr = %server.addr(), "Docker Engine API listening");
+                Some(server)
+            }
+            Err(error) => {
+                eprintln!("error: cannot start API server: {error}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        None
+    };
 
     let ready = minga_telemetry::ReadyState::new();
     if let Some(state) = state.clone() {
@@ -1377,6 +1274,12 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
         .into_iter()
         .filter_map(|(addr, by)| Some((port_of(addr?)?, by.to_string())))
         .collect();
+        if is_manager {
+            let api_bind = args.api_bind.as_deref().unwrap_or("0.0.0.0:2375");
+            if let Some(port) = port_of(api_bind) {
+                reserved.push((port, "Docker API".into()));
+            }
+        }
         if is_manager && args.nats_url.is_none() {
             let sidecar = sidecar::SidecarOptions::default();
             reserved.push((sidecar.client_port, "NATS sidecar".into()));
@@ -1555,6 +1458,9 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
                 tracing::info!(node_id = args.node_id, "shutting down worker");
             },
         }
+    }
+    if let Some(server) = api_server {
+        server.shutdown();
     }
 
     ExitCode::SUCCESS
@@ -2276,6 +2182,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn worker_rejects_manager_api_flags() {
+        let cli = Cli::try_parse_from([
+            "minga",
+            "worker",
+            "--node-id",
+            "7",
+            "--api-bind",
+            "127.0.0.1:2375",
+            "--api-token",
+            "secret",
+        ])
+        .unwrap();
+        let Command::Worker(args) = cli.command else {
+            panic!("expected worker command");
+        };
+        assert_eq!(run_node(args, false).await, std::process::ExitCode::FAILURE);
+    }
+
+    #[tokio::test]
     async fn manager_rejects_route_port_without_route_tls() {
         let cli = Cli::try_parse_from([
             "minga",
@@ -2292,6 +2217,33 @@ mod tests {
             panic!("expected manager command");
         };
         assert_eq!(run_node(args, true).await, std::process::ExitCode::FAILURE);
+    }
+    #[test]
+    fn manager_api_flags_parse() {
+        let cli = Cli::try_parse_from([
+            "minga",
+            "manager",
+            "--node-id",
+            "1",
+            "--bind",
+            "127.0.0.1:7001",
+            "--api-bind",
+            "127.0.0.1:2375",
+            "--api-token",
+            "secret",
+        ])
+        .unwrap();
+        let Command::Manager(args) = cli.command else {
+            panic!("expected manager command");
+        };
+        assert_eq!(args.api_bind.as_deref(), Some("127.0.0.1:2375"));
+        assert_eq!(args.api_token.as_deref(), Some("secret"));
+    }
+
+    #[test]
+    fn api_command_parses_as_retired_command() {
+        let cli = Cli::try_parse_from(["minga", "api"]).unwrap();
+        assert!(matches!(cli.command, Command::Api));
     }
     #[test]
     fn manager_join_and_route_tls_flags_parse() {

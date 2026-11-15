@@ -6,7 +6,7 @@ Minga keeps two kinds of state. **Desired state** (services, networks, volumes, 
 
 ## What the export holds
 
-`minga state export` calls `GET /v1.41/state` on `minga api` and writes:
+`minga state export` calls `GET /v1.41/state` on the manager's API and writes:
 
 | Field | Content |
 |---|---|
@@ -60,7 +60,7 @@ Import writes through Raft in dependency order: networks, secrets, configs, volu
 1. Install the same `minga` version (or newer, if the file's `format_version` matches). Check with `minga --version` and the `format_version` field of the file.
 2. Restore host files: TLS files, `/etc/minga/minga.env`, and the secret store (`/var/lib/minga/secrets`) with its permissions.
 3. Restore volume data into `<data-dir>/volumes` if you backed it up.
-4. Start the processes as you did originally, with empty data directories. On one host that is the manager and `minga api` (see the [quick start](../README.md#quick-start-one-linux-host)), each with its own `--data-dir`. Wait until `minga api` is serving (`/readyz` returns 200) and a node has registered.
+4. Start the manager with an empty `--data-dir` and wait until its API is serving (`/readyz` returns 200) and a node has registered. On a single host, this is one `minga manager` process (see the [quick start](../README.md#quick-start-one-linux-host)).
 5. Import:
    ```bash
    minga state import minga-state.json --api-url http://127.0.0.1:2375
@@ -71,10 +71,10 @@ A node that was in the old cluster and comes back with a stale `--data-dir` keep
 
 ## Cold copy: the alternative
 
-If you can stop the node, copy the Raft state itself. Every `minga` process that is a Raft voter has its own `--data-dir` holding `raft_log.redb` and `state.redb`: the manager's, and the one given to `minga api`. A single host has two.
+The manager's `--data-dir` holds Raft state (`raft_log.redb` and `state.redb`), along with node-local data. A single-host cluster has one Raft data directory.
 
-1. Stop **both** processes (`SIGINT`, so they shut down cleanly; `systemctl stop` does this for the shipped unit).
-2. Copy both data directories with permissions kept (`sudo tar -cpf ...`). Include `secrets`, `volumes` and `nats` if they live under them.
-3. To restore, put the directories back on a host with the **same node ids, bind addresses and peer lists**, and start both processes.
+1. Stop the manager cleanly (`SIGINT`, or `systemctl stop` for the shipped unit).
+2. Copy its data directory with permissions kept (`sudo tar -cpf ...`). Include `secrets`, `volumes` and `nats` if they live under it.
+3. To restore, put the directory back on a host with the same node ID and bind address, then start the manager.
 
 A cold copy restores nodes, tasks and Raft membership exactly, but only for a `minga` build that reads the same data format (a newer format is refused, an older one has no migration). Do not copy the files of a running process: redb files copied mid-write may be unusable. Use `minga state export` for a backup without downtime, and the cold copy when you need an exact image or are moving a whole cluster.
