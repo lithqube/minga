@@ -1,8 +1,8 @@
 //! Task IP assignment at placement time.
 //!
 //! Every task gets a deterministic IP on each of its service's networks:
-//! the subnet comes from the network's state record (or is derived
-//! deterministically from the network ID), and the IP comes from a
+//! the subnet comes from the network's state record (the leader stores
+//! one for every network, see [`fill_subnets`]), and the IP comes from a
 //! hash-probe of the task ID within that subnet ([`minga_net::Ipam`]).
 //!
 //! Determinism is what makes reconciliation idempotent: a task's IP is a
@@ -25,16 +25,79 @@ pub enum NetAssignError {
     Ipam(NetworkId, IpamError),
 }
 
-/// The subnet of a network: explicit from state, or a deterministic /24
-/// derived from the network ID.
+/// The subnet stored for a network. A network without one is an error:
+/// only the leader assigns subnets ([`fill_subnets`]).
 fn subnet_for(network: &Network) -> Result<Cidr, NetAssignError> {
-    match &network.subnet {
-        Some(raw) => {
-            Cidr::parse(raw).map_err(|e| NetAssignError::Subnet(network.id.clone(), e.to_string()))
+    let raw = network.subnet.as_deref().ok_or_else(|| {
+        NetAssignError::Subnet(network.id.clone(), "no subnet stored yet".to_string())
+    })?;
+    Cidr::parse(raw).map_err(|e| NetAssignError::Subnet(network.id.clone(), e.to_string()))
+}
+
+/// Stores a subnet on every network that has none and returns the indices
+/// it changed, plus one error per network it could not place.
+///
+/// A network created before subnets were stored, with live tasks, keeps
+/// the /24 its tasks already use (the old per-ID hash), so nothing moves.
+/// Every other network gets the first /24 of `supernet` that no network
+/// overlaps.
+pub fn fill_subnets(
+    networks: &mut [Network],
+    tasks: &[Task],
+    supernet: &Cidr,
+) -> (Vec<usize>, Vec<NetAssignError>) {
+    let mut changed = Vec::new();
+    for (i, net) in networks.iter_mut().enumerate() {
+        if net.subnet.is_some() {
+            continue;
         }
-        None => allocate_subnet(&network.id)
-            .map_err(|e| NetAssignError::Subnet(network.id.clone(), e.to_string())),
+        let live_ip = tasks
+            .iter()
+            .filter(|t| !matches!(t.state, TaskState::Stopped | TaskState::Failed))
+            .find_map(|t| t.spec.ips.get(&net.id)?.parse::<Ipv4Addr>().ok());
+        if let Some(ip) = live_ip {
+            let base = Ipv4Addr::from(u32::from(ip) & !0xff);
+            net.subnet = Some(format!("{base}/24"));
+            changed.push(i);
+        }
     }
+    let mut taken: Vec<Cidr> = networks
+        .iter()
+        .filter_map(|n| Cidr::parse(n.subnet.as_deref()?).ok())
+        .collect();
+    let mut errors = Vec::new();
+    for (i, net) in networks.iter_mut().enumerate() {
+        if net.subnet.is_some() {
+            continue;
+        }
+        match allocate_subnet(supernet, &taken) {
+            Ok(subnet) => {
+                net.subnet = Some(subnet.to_cidr_string());
+                taken.push(subnet);
+                changed.push(i);
+            }
+            Err(e) => errors.push(NetAssignError::Ipam(net.id.clone(), e)),
+        }
+    }
+    (changed, errors)
+}
+
+/// Pairs of networks whose stored subnets overlap, as (a, b, a's subnet,
+/// b's subnet). Tasks on such a pair break each other's bridges.
+pub fn subnet_collisions(networks: &[Network]) -> Vec<(NetworkId, NetworkId, String, String)> {
+    let parsed: Vec<(&Network, Cidr)> = networks
+        .iter()
+        .filter_map(|n| Some((n, Cidr::parse(n.subnet.as_deref()?).ok()?)))
+        .collect();
+    let mut out = Vec::new();
+    for (i, (a, sa)) in parsed.iter().enumerate() {
+        for (b, sb) in &parsed[i + 1..] {
+            if sa.overlaps(sb) {
+                out.push((a.id.clone(), b.id.clone(), sa.to_string(), sb.to_string()));
+            }
+        }
+    }
+    out
 }
 
 /// Builds an IPAM for `network` seeded with the IPs of all non-terminal
@@ -132,11 +195,60 @@ mod tests {
     }
 
     #[test]
-    fn auto_allocates_subnet_when_absent() {
+    fn network_without_stored_subnet_is_an_error() {
         let nets = vec![network("shop_default", None)];
-        let ips = assign_task_ips("shop.web.1", &["shop_default".to_string()], &nets, &[]).unwrap();
-        let ip: Ipv4Addr = ips["shop_default"].parse().unwrap();
-        assert_eq!(ip.octets()[0], 10, "supernet is 10.100.0.0/16");
+        let err = assign_task_ips("shop.web.1", &["shop_default".to_string()], &nets, &[]);
+        assert!(err.unwrap_err().to_string().contains("no subnet stored"));
+    }
+
+    fn supernet() -> Cidr {
+        Cidr::parse(minga_net::DEFAULT_SUPERNET).unwrap()
+    }
+
+    #[test]
+    fn three_hundred_networks_get_256_distinct_subnets_then_exhaust() {
+        let mut nets: Vec<Network> = (0..300).map(|i| network(&format!("n{i}"), None)).collect();
+        let (changed, errors) = fill_subnets(&mut nets, &[], &supernet());
+        assert_eq!(changed.len(), 256);
+        let distinct: std::collections::HashSet<_> =
+            nets.iter().filter_map(|n| n.subnet.clone()).collect();
+        assert_eq!(distinct.len(), 256);
+        assert!(subnet_collisions(&nets).is_empty());
+        assert_eq!(errors.len(), 44);
+        assert!(
+            errors[0].to_string().contains("supernet exhausted"),
+            "{}",
+            errors[0]
+        );
+    }
+
+    #[test]
+    fn legacy_network_keeps_the_subnet_its_tasks_use() {
+        let mut nets = vec![
+            network("explicit", Some("10.100.0.0/24")),
+            network("idle", None),
+            network("legacy", None),
+        ];
+        let tasks = vec![task("legacy.web.1", &[("legacy", "10.100.1.9")])];
+        let (changed, errors) = fill_subnets(&mut nets, &tasks, &supernet());
+        assert!(errors.is_empty());
+        assert_eq!(changed, vec![2, 1]);
+        assert_eq!(nets[2].subnet.as_deref(), Some("10.100.1.0/24"));
+        // The idle network skips both taken /24s.
+        assert_eq!(nets[1].subnet.as_deref(), Some("10.100.2.0/24"));
+        // A second pass changes nothing.
+        assert!(fill_subnets(&mut nets, &tasks, &supernet()).0.is_empty());
+    }
+
+    #[test]
+    fn colliding_legacy_networks_are_reported_not_moved() {
+        let mut nets = vec![network("a", None), network("b", Some("10.100.7.0/24"))];
+        let tasks = vec![task("a.web.1", &[("a", "10.100.7.20")])];
+        fill_subnets(&mut nets, &tasks, &supernet());
+        assert_eq!(nets[0].subnet.as_deref(), Some("10.100.7.0/24"));
+        let hits = subnet_collisions(&nets);
+        assert_eq!(hits.len(), 1);
+        assert_eq!((hits[0].0.as_str(), hits[0].1.as_str()), ("a", "b"));
     }
 
     #[test]

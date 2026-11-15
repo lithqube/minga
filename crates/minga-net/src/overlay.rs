@@ -180,8 +180,8 @@ impl OverlayManager {
         name: impl Into<String>,
         wg_port: Option<u16>,
     ) -> Result<(), OverlayError> {
-        let id = id.into();
-        let subnet = ipam::allocate_subnet(&id)?;
+        let taken: Vec<Cidr> = self.networks.values().map(|n| n.subnet).collect();
+        let subnet = ipam::allocate_subnet(&default_supernet()?, &taken)?;
         self.create_network(id, name, &subnet.to_cidr_string(), wg_port)
     }
 
@@ -322,6 +322,21 @@ pub fn allocate_mesh_subnet() -> Result<Cidr, OverlayError> {
     Ok(Cidr::parse("10.200.0.0/16")?)
 }
 
+/// Checks a network's driver options (Compose `driver_opts`, Docker
+/// `Options`). Only `encrypted` is accepted, as a no-op; anything else
+/// fails loudly instead of being dropped.
+pub fn check_driver_opts<'a>(
+    network: &str,
+    keys: impl IntoIterator<Item = &'a str>,
+) -> Result<(), String> {
+    match keys.into_iter().find(|k| *k != "encrypted") {
+        Some(k) => Err(format!(
+            "network {network}: unsupported driver option `{k}` (Minga accepts only `encrypted`)"
+        )),
+        None => Ok(()),
+    }
+}
+
 /// Get the default service supernet.
 pub fn default_supernet() -> Result<Cidr, OverlayError> {
     Ok(Cidr::parse(DEFAULT_SUPERNET)?)
@@ -354,6 +369,22 @@ mod tests {
             .unwrap();
         let result = mgr.create_network("net-1", "dup", "10.100.1.0/24", None);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn driver_opts_accept_only_encrypted() {
+        check_driver_opts("n", ["encrypted"]).unwrap();
+        let err = check_driver_opts("n", ["encrypted", "com.docker.network.mtu"]).unwrap_err();
+        assert!(err.contains("`com.docker.network.mtu`"), "{err}");
+    }
+
+    #[test]
+    fn create_network_auto_never_reuses_a_subnet() {
+        let mut mgr = test_manager();
+        mgr.create_network_auto("a", "a", None).unwrap();
+        mgr.create_network_auto("b", "b", None).unwrap();
+        let (a, b) = (mgr.get_network("a").unwrap(), mgr.get_network("b").unwrap());
+        assert!(!a.subnet.overlaps(&b.subnet));
     }
 
     #[test]

@@ -74,18 +74,33 @@ pub enum SchedulerError {
 pub struct Scheduler {
     state: Arc<StateStore>,
     bus: Option<Arc<dyn EventBus>>,
+    supernet: minga_net::Cidr,
+    /// Subnet collisions already logged, so each is reported once.
+    reported: std::sync::Mutex<std::collections::HashSet<(String, String)>>,
 }
 
 impl Scheduler {
     pub fn new(state: Arc<StateStore>) -> Self {
-        Self { state, bus: None }
+        Self {
+            state,
+            bus: None,
+            supernet: minga_net::Cidr::parse(minga_net::DEFAULT_SUPERNET)
+                .expect("default supernet parses"),
+            reported: Default::default(),
+        }
+    }
+
+    /// Allocates network subnets from `supernet` instead of 10.100.0.0/16.
+    pub fn with_supernet(mut self, supernet: minga_net::Cidr) -> Self {
+        self.supernet = supernet;
+        self
     }
 
     /// Create a scheduler that publishes commands to the event bus.
     pub fn with_bus(state: Arc<StateStore>, bus: Arc<dyn EventBus>) -> Self {
         Self {
-            state,
             bus: Some(bus),
+            ..Self::new(state)
         }
     }
 
@@ -104,7 +119,8 @@ impl Scheduler {
         let nodes = self.state.list_nodes().await?;
         let services = self.state.list_services().await?;
         let tasks = self.state.list_tasks().await?;
-        let networks = self.state.list_networks().await?;
+        let mut networks = self.state.list_networks().await?;
+        self.fill_subnets(&mut networks, &tasks).await?;
 
         let actions = plan(
             &services,
@@ -197,6 +213,37 @@ impl Scheduler {
         }
 
         Ok(actions)
+    }
+
+    /// Stores a subnet for every network that has none (Raft serializes
+    /// these through the leader, so two networks never race for one /24)
+    /// and logs each subnet collision once.
+    async fn fill_subnets(
+        &self,
+        networks: &mut [minga_state::types::Network],
+        tasks: &[minga_state::types::Task],
+    ) -> Result<(), SchedulerError> {
+        let (changed, errors) = netassign::fill_subnets(networks, tasks, &self.supernet);
+        for e in errors {
+            tracing::error!(error = %e, "cannot assign a network subnet");
+        }
+        for i in changed {
+            let net = &networks[i];
+            tracing::info!(network = %net.id, subnet = ?net.subnet, "network subnet assigned");
+            self.state.upsert_network(net.clone()).await?;
+        }
+        let mut reported = self.reported.lock().unwrap_or_else(|e| e.into_inner());
+        for (a, b, sa, sb) in netassign::subnet_collisions(networks) {
+            if reported.insert((a.clone(), b.clone())) {
+                tracing::error!(
+                    "networks {a} ({sa}) and {b} ({sb}) overlap, so their tasks break each \
+                     other's bridges. Fix: remove the services on one of them and the network \
+                     itself, then redeploy; it gets a free /24 (or set a non-overlapping \
+                     `ipam` subnet in its Compose file)"
+                );
+            }
+        }
+        Ok(())
     }
 
     /// Runs the reconcile loop forever, sleeping `interval` between passes.

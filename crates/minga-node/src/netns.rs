@@ -212,17 +212,13 @@ fn veth_names(task_id: &str, network_id: &str) -> (String, String) {
     (format!("v{h}h"), format!("v{h}c"))
 }
 
-/// The subnet of a network: explicit from state, or a deterministic /24
-/// derived from the network ID — the same rule the scheduler's IPAM uses
-/// (`minga_scheduler::netassign`), so node and scheduler agree.
+/// The subnet stored for a network in state. The node never computes one:
+/// the Raft leader assigns every network a unique subnet, and a network
+/// without one yet is an error.
 pub fn subnet_for(network_id: &str, state_subnet: Option<&str>) -> Result<Cidr, NetError> {
-    match state_subnet {
-        Some(raw) => {
-            Cidr::parse(raw).map_err(|e| NetError::Subnet(network_id.to_string(), e.to_string()))
-        }
-        None => minga_net::ipam::allocate_subnet(network_id)
-            .map_err(|e| NetError::Subnet(network_id.to_string(), e.to_string())),
-    }
+    let err = |e: String| NetError::Subnet(network_id.to_string(), e);
+    let raw = state_subnet.ok_or_else(|| err("no subnet stored in state yet".to_string()))?;
+    Cidr::parse(raw).map_err(|e| err(e.to_string()))
 }
 
 /// The gateway IP of a subnet: its first usable address. The bridge and
@@ -673,15 +669,12 @@ mod tests {
     }
 
     #[test]
-    fn subnet_rule_matches_scheduler() {
+    fn subnet_comes_only_from_state() {
         // Explicit wins.
         let s = subnet_for("net", Some("10.99.0.0/24")).unwrap();
         assert_eq!(s.to_cidr_string(), "10.99.0.0/24");
-        // Auto is deterministic and inside the default supernet.
-        let a = subnet_for("shop_default", None).unwrap();
-        let b = subnet_for("shop_default", None).unwrap();
-        assert_eq!(a, b);
-        assert!(a.to_cidr_string().starts_with("10.100."));
+        // The node never derives one itself.
+        assert!(subnet_for("shop_default", None).is_err());
     }
 
     #[test]

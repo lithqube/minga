@@ -204,17 +204,12 @@ enum NetCommand {
     Create {
         /// Network name.
         name: String,
-        /// Subnet CIDR (e.g. 10.100.0.0/24). If omitted, auto-allocated from 10.100.0.0/16.
+        /// Subnet CIDR (e.g. 10.100.0.0/24). If omitted, the first /24 of 10.100.0.0/16.
         #[arg(long)]
         subnet: Option<String>,
         /// WireGuard listen port (default 51820).
         #[arg(long)]
         wg_port: Option<u16>,
-    },
-    /// Allocate the next available subnet from the default supernet.
-    AllocSubnet {
-        /// Network name (used for deterministic allocation).
-        name: String,
     },
     /// Show CIDR information for a subnet.
     Inspect {
@@ -336,6 +331,10 @@ struct NodeArgs {
     /// (e.g. 0.0.0.0:9100). Not served when unset.
     #[arg(long, env = "MINGA_METRICS_BIND")]
     metrics_bind: Option<String>,
+    /// Range each network's /24 is allocated from (by the Raft leader).
+    /// Refused when it overlaps one of this host's routes.
+    #[arg(long, env = "MINGA_OVERLAY_SUPERNET", default_value = minga_net::DEFAULT_SUPERNET)]
+    overlay_supernet: String,
 }
 
 #[derive(Args)]
@@ -381,6 +380,10 @@ struct ApiArgs {
     /// the API is unauthenticated remote code execution by design.
     #[arg(long, env = "MINGA_API_TOKEN")]
     api_token: Option<String>,
+    /// Range each network's /24 is allocated from (by the Raft leader).
+    /// Refused when it overlaps one of this host's routes.
+    #[arg(long, env = "MINGA_OVERLAY_SUPERNET", default_value = minga_net::DEFAULT_SUPERNET)]
+    overlay_supernet: String,
 }
 
 #[derive(Subcommand)]
@@ -624,10 +627,26 @@ async fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// Parses `--overlay-supernet`, refusing one that overlaps this host's
+/// routes. Off Linux there is no `/proc/net/route` and nothing to check.
+fn overlay_supernet(raw: &str) -> Result<minga_net::Cidr, String> {
+    let cidr = minga_net::Cidr::parse(raw).map_err(|e| format!("--overlay-supernet: {e}"))?;
+    let routes = std::fs::read_to_string("/proc/net/route").unwrap_or_default();
+    minga_net::cidr::check_supernet(&cidr, &routes)?;
+    Ok(cidr)
+}
+
 /// Runs the Docker Engine API server: opens the state store and starts
 /// the HTTP API server. The API server can run on any node — reads are
 /// served locally, writes are proposed to Raft (forwarded to the leader).
 async fn run_api(args: ApiArgs) -> ExitCode {
+    let supernet = match overlay_supernet(&args.overlay_supernet) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
     let peers = match parse_peers(&args.peers) {
         Ok(p) => p,
         Err(e) => {
@@ -683,7 +702,7 @@ async fn run_api(args: ApiArgs) -> ExitCode {
     // The reconcile loop must exist on every Raft voter: the scheduler is
     // leadership-gated, and an API-only node can be elected leader. Without
     // this, a cluster whose leader is an API node places no tasks.
-    let scheduler = minga_scheduler::Scheduler::new(state);
+    let scheduler = minga_scheduler::Scheduler::new(state).with_supernet(supernet);
     let reconcile = scheduler.run(Duration::from_secs(2));
     tokio::pin!(reconcile);
 
@@ -875,6 +894,13 @@ fn run_tls(cmd: TlsCommand) -> ExitCode {
 /// Runs a node (manager or worker): opens the state store, starts the
 /// supervisor, and (for managers) the scheduler.
 async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
+    let supernet = match overlay_supernet(&args.overlay_supernet) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
     let peers = match parse_peers(&args.peers) {
         Ok(p) => p,
         Err(e) => {
@@ -1197,7 +1223,7 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
     let interval = Duration::from_secs(args.interval);
 
     if is_manager {
-        let scheduler = minga_scheduler::Scheduler::with_bus(state, bus);
+        let scheduler = minga_scheduler::Scheduler::with_bus(state, bus).with_supernet(supernet);
         tracing::info!(
             node_id = args.node_id,
             "starting manager loops (scheduler + supervisor)"
@@ -1422,16 +1448,6 @@ fn run_net(cmd: NetCommand) -> ExitCode {
                 }
             }
         }
-        NetCommand::AllocSubnet { name } => match minga_net::ipam::allocate_subnet(&name) {
-            Ok(cidr) => {
-                println!("allocated subnet for '{name}': {cidr}");
-                println!("  usable hosts: {}", cidr.usable_hosts());
-            }
-            Err(e) => {
-                eprintln!("error: {e}");
-                return ExitCode::FAILURE;
-            }
-        },
         NetCommand::Inspect { cidr } => match minga_net::Cidr::parse(&cidr) {
             Ok(c) => {
                 println!("CIDR: {c}");

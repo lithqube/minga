@@ -71,15 +71,25 @@ pub async fn deploy_stack(
 
     // --- networks, secrets, configs (idempotent) ------------------------------
     for net in &translated.networks {
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "Name": net.name,
             "Driver": net.driver,
             "Attachable": net.attachable,
             "Labels": {"com.docker.stack.namespace": opts.stack},
         });
+        if let Some(subnet) = &net.subnet {
+            body["IPAM"] = serde_json::json!({"Config": [{"Subnet": subnet}]});
+        }
         match post(&client, &base, "networks/create", &body).await? {
             (201, _) => println!("network {}: created", net.name),
-            (409, _) => println!("network {}: already exists", net.name),
+            // A 409 is also how the API refuses an overlapping subnet.
+            (409, body)
+                if body["message"]
+                    .as_str()
+                    .is_some_and(|m| m.ends_with("already exists")) =>
+            {
+                println!("network {}: already exists", net.name)
+            }
             (status, body) => {
                 return Err(format!(
                     "network {}: create failed ({status}): {body}",

@@ -102,7 +102,7 @@ Raft flags plus `--api-bind` and `--api-token`.
 
 ### Planning utilities
 
-`minga net create`, `net alloc-subnet` and `net inspect`, and `minga wg
+`minga net create` and `net inspect`, and `minga wg
 keygen`, `wg pubkey` and `wg config`, compute and print subnets, WireGuard keys
 and a sample interface config. **They change nothing**: they do not create a
 network, configure an interface or write to Raft. Compose networks are created
