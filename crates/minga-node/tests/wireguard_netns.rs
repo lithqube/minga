@@ -517,14 +517,18 @@ async fn wireguard_routes_shared_tasks_and_isolates_other_networks() -> Result<(
     node_link(&node_c, &underlay, 2, "198.18.0.3/24")?;
     ip_ns(
         &node_a,
-        &["route", "replace", "default", "via", "198.18.0.3"],
+        &["route", "replace", "10.243.0.0/24", "via", "198.18.0.3"],
     )?;
     ip_ns(
         &node_c,
-        &["route", "replace", "default", "via", "198.18.0.1"],
+        &["route", "replace", "10.242.0.0/24", "via", "198.18.0.1"],
     )?;
     for namespace in [node_a.as_str(), node_c.as_str()] {
-        in_ns(namespace, "sysctl", &["-w", "net.ipv4.ip_forward=1"])?;
+        in_ns(
+            namespace,
+            "sysctl",
+            &["-w", "net.ipv4.conf.all.rp_filter=0"],
+        )?;
         in_ns(
             namespace,
             "iptables",
