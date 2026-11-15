@@ -80,6 +80,14 @@ pub enum LogStream {
 pub trait Runtime: Send + Sync {
     /// Starts a container for the given task. Returns the container ID.
     async fn start(&self, task_id: &TaskId, spec: &TaskSpec) -> Result<String, RuntimeError>;
+    async fn start_assigned(
+        &self,
+        task_id: &TaskId,
+        spec: &TaskSpec,
+        _networks: &[minga_state::types::Network],
+    ) -> Result<String, RuntimeError> {
+        self.start(task_id, spec).await
+    }
 
     /// Stops and removes a container.
     async fn stop(&self, container_id: &str) -> Result<(), RuntimeError>;

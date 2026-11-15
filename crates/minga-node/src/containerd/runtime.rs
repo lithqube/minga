@@ -330,13 +330,9 @@ pub struct ContainerdRuntime {
     log_rings: Arc<Mutex<HashMap<String, Arc<LogRing>>>>,
     /// Reader task handles, aborted on stop.
     log_readers: Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>>,
-    /// Node networking: netns/bridge/port setup, plus cluster state for
-    /// network subnet resolution. Required to start tasks with IPs.
+    /// Network setup; assignment records carry the subnet metadata.
     #[cfg(target_os = "linux")]
-    networking: Option<(
-        Arc<crate::netns::NetworkSetup>,
-        Arc<minga_state::StateStore>,
-    )>,
+    networking: Option<Arc<crate::netns::NetworkSetup>>,
 }
 
 impl ContainerdRuntime {
@@ -428,12 +424,8 @@ impl ContainerdRuntime {
     /// starting it would produce a container with no interfaces, which is
     /// the silent-failure mode networking exists to eliminate.
     #[cfg(target_os = "linux")]
-    pub fn with_networking(
-        mut self,
-        setup: Arc<crate::netns::NetworkSetup>,
-        state: Arc<minga_state::StateStore>,
-    ) -> Self {
-        self.networking = Some((setup, state));
+    pub fn with_networking(mut self, setup: Arc<crate::netns::NetworkSetup>) -> Self {
+        self.networking = Some(setup);
         self
     }
 
@@ -443,22 +435,17 @@ impl ContainerdRuntime {
         &self,
         task_id: &str,
         spec: &TaskSpec,
+        networks: &[minga_state::types::Network],
     ) -> Result<Option<oci::NetworkSpec>, RuntimeError> {
         if spec.ips.is_empty() {
             return Ok(None);
         }
-        let (setup, state) = self.networking.as_ref().ok_or_else(|| {
+        let setup = self.networking.as_ref().ok_or_else(|| {
             RuntimeError::Start(format!(
                 "task has IP assignments on {} network(s) but node networking is not configured",
                 spec.ips.len()
             ))
         })?;
-
-        let networks = state
-            .list_networks()
-            .await
-            .map_err(|e| RuntimeError::Start(format!("list networks: {e}")))?;
-
         let mut attachments = Vec::new();
         for (net_id, raw_ip) in &spec.ips {
             let network = networks.iter().find(|n| &n.id == net_id).ok_or_else(|| {
@@ -475,9 +462,7 @@ impl ContainerdRuntime {
                 subnet,
             });
         }
-        // Deterministic primary network (default route + resolver).
         attachments.sort_by(|a, b| a.network_id.cmp(&b.network_id));
-
         let search: Vec<String> = match spec.env.get("MINGA_STACK") {
             Some(stack) => vec![
                 format!("{stack}.{}", minga_net::MINGA_DOMAIN),
@@ -485,22 +470,10 @@ impl ContainerdRuntime {
             ],
             None => vec![minga_net::MINGA_DOMAIN.to_string()],
         };
-
         let netns = setup
             .setup_task(task_id, &attachments, &spec.ports, &search)
             .await
             .map_err(|e| RuntimeError::Start(format!("network setup: {e}")))?;
-
-        tracing::info!(
-            task_id = %task_id,
-            netns = %netns.netns_path.display(),
-            ips = ?spec.ips,
-            "containerd: task network prepared"
-        );
-
-        // Write a per-task /etc/hosts file if the spec has extra_hosts entries.
-        // `host-gateway` is the host's address on the primary bridge, which
-        // is also where the task's resolver points.
         let hosts_path = if spec.extra_hosts.is_empty() {
             None
         } else {
@@ -512,7 +485,6 @@ impl ContainerdRuntime {
                 .map_err(|e| RuntimeError::Start(format!("write hosts: {e}")))?;
             Some(hosts_file)
         };
-
         Ok(Some(oci::NetworkSpec {
             netns_path: netns.netns_path.display().to_string(),
             resolv_conf: Some(netns.resolv_conf),
@@ -537,7 +509,7 @@ impl ContainerdRuntime {
     /// Tears down a task's network, tolerating its absence.
     #[cfg(target_os = "linux")]
     async fn teardown_network(&self, task_id: &str) {
-        if let Some((setup, _)) = &self.networking {
+        if let Some(setup) = &self.networking {
             if let Err(e) = setup.teardown_task(task_id).await {
                 tracing::warn!(task = %task_id, error = %e, "network teardown failed");
             }
@@ -759,19 +731,23 @@ impl ContainerdRuntime {
 #[async_trait]
 impl Runtime for ContainerdRuntime {
     async fn start(&self, task_id: &TaskId, spec: &TaskSpec) -> Result<String, RuntimeError> {
+        self.start_assigned(task_id, spec, &[]).await
+    }
+
+    async fn start_assigned(
+        &self,
+        task_id: &TaskId,
+        spec: &TaskSpec,
+        networks: &[minga_state::types::Network],
+    ) -> Result<String, RuntimeError> {
         let container_id = task_id.clone();
         let secret_mounts = self.resolve_secrets(&container_id, spec)?;
         let spec = &self.resolve_mounts(spec).await?;
         check_extra_hosts_have_network(spec)?;
-
-        // containerd keys images by fully-qualified reference; Compose files
-        // habitually use the short form (`nginx:1.27`).
         let image_ref = image::normalize_ref(&spec.image);
         let image = self.ensure_image(&image_ref).await?;
-
-        // After the pull: a failed pull must not leave a network behind.
         #[cfg(target_os = "linux")]
-        let network = self.prepare_network(&container_id, spec).await?;
+        let network = self.prepare_network(&container_id, spec, networks).await?;
         #[cfg(not(target_os = "linux"))]
         let network: Option<oci::NetworkSpec> = {
             if !spec.ips.is_empty() {
@@ -779,6 +755,7 @@ impl Runtime for ContainerdRuntime {
                     "task networking requires Linux (netns + bridges)".into(),
                 ));
             }
+            let _ = networks;
             None
         };
 

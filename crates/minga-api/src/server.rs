@@ -881,7 +881,7 @@ mod tests {
             running_since_unix: Some(999),
         };
         bus.put_status(
-            &subjects::kv_task_status("svc.1"),
+            &subjects::kv_node_task_status(report.node_id, "svc.1"),
             &report.to_bytes().unwrap(),
         )
         .await
