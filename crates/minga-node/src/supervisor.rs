@@ -56,7 +56,8 @@ impl Assignments {
             .map_err(|e| e.to_string())?;
         entries
             .into_iter()
-            .filter(|(key, _)| key.starts_with("node."))
+            // Skip `node.N.wg` peer sets: only task keys decode as assignments.
+            .filter(|(key, _)| key.starts_with("node.") && key.contains(".task."))
             .map(|(key, bytes)| {
                 let assignment: TaskAssignment = minga_state::codec::decode_wire(&bytes)
                     .map_err(|e| format!("invalid assignment {key}: {e}"))?;
@@ -158,11 +159,16 @@ impl SupervisorNetworking {
     }
 }
 
-/// Builds DNS records from MINGA_ASSIGN network/DNS entries.
+/// Builds DNS records from MINGA_ASSIGN network/DNS entries. Only networks
+/// with a task on this node are published: the resolver listens on those
+/// gateways, and names from networks this node does not serve must not leak.
 #[cfg(any(target_os = "linux", test))]
-fn build_dns_store(assignments: &[NetworkAssignment]) -> minga_net::DnsStore {
+fn build_dns_store(assignments: &[NetworkAssignment], node_id: NodeId) -> minga_net::DnsStore {
     let mut store = minga_net::DnsStore::new();
-    for assignment in assignments {
+    for assignment in assignments
+        .iter()
+        .filter(|assignment| assignment.tasks.iter().any(|task| task.node_id == node_id))
+    {
         for task in &assignment.tasks {
             let Ok(ip) = task.ip.parse::<std::net::Ipv4Addr>() else {
                 continue;
@@ -334,7 +340,7 @@ impl Supervisor {
                 return;
             }
         };
-        let store = build_dns_store(&assignments);
+        let store = build_dns_store(&assignments, self.node_id);
         *net.dns_store.write().unwrap() = store;
         let mut binds: Vec<std::net::SocketAddr> = assignments
             .iter()
@@ -1819,7 +1825,19 @@ mod assignment_tests {
             ],
         };
 
-        let dns = build_dns_store(&[record]);
+        let mut remote_only = record.clone();
+        remote_only.network.id = "network-2".to_string();
+        remote_only.tasks = vec![minga_state::types::NetworkDnsTask {
+            node_id: 8,
+            task_id: "task-3".to_string(),
+            service_name: "web".to_string(),
+            stack: "plant".to_string(),
+            ip: "10.0.1.12".to_string(),
+        }];
+
+        let dns = build_dns_store(&[record, remote_only], 7);
+        // Remote tasks on a shared network resolve; a network with no local
+        // task contributes nothing.
         assert_eq!(
             dns.resolve(&minga_net::dns::service_fqdn("web", "plant")),
             vec![

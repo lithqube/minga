@@ -103,6 +103,36 @@ impl Server {
     }
 }
 
+impl Server {
+    /// Waits until the server listens on `port` (`ss` flag `-lnt` or `-lnu`),
+    /// failing early if the process exits.
+    async fn wait_listening(
+        &mut self,
+        namespace: &str,
+        ss_flags: &str,
+        port: u16,
+    ) -> Result<(), String> {
+        let suffix = format!(":{port}");
+        for _ in 0..50 {
+            if let Ok(Some(status)) = self.0.try_wait() {
+                return Err(format!("server in {namespace} exited early: {status}"));
+            }
+            let listening = in_ns(namespace, "ss", &[ss_flags]).unwrap_or_default();
+            if listening
+                .lines()
+                .filter_map(|line| line.split_whitespace().nth(3))
+                .any(|local| local.ends_with(&suffix))
+            {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        Err(format!(
+            "server in {namespace} did not listen on port {port} within 5s"
+        ))
+    }
+}
+
 impl Drop for Server {
     fn drop(&mut self) {
         let _ = self.0.kill();
@@ -736,10 +766,12 @@ async fn wireguard_routes_shared_tasks_and_isolates_other_networks() -> Result<(
         ping(&task_a, "10.243.0.30", None).is_err(),
         "a task on another overlay must not be reachable"
     );
-    let _dns = Server::start(&node_a, DNS_SERVER);
-    let _web = Server::start(&task_b, HTTP_SERVER);
-    let _isolated = Server::start(&task_c, HTTP_SERVER);
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    let mut dns = Server::start(&node_a, DNS_SERVER);
+    let mut web = Server::start(&task_b, HTTP_SERVER);
+    let mut isolated = Server::start(&task_c, HTTP_SERVER);
+    dns.wait_listening(&node_a, "-lnu", 53).await?;
+    web.wait_listening(&task_b, "-lnt", 8080).await?;
+    isolated.wait_listening(&task_c, "-lnt", 8080).await?;
 
     ping(&task_a, "10.242.0.20", None)?;
     let response = in_ns(&task_a, "python3", &["-c", HTTP_CLIENT])?;
