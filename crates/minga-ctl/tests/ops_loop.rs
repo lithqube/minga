@@ -376,7 +376,7 @@ async fn with_a_failed_task() -> (Cluster, String, String) {
         cluster
             .bus
             .put_status(
-                &subjects::kv_task_status(&task.id),
+                &subjects::kv_node_task_status(task.node_id, &task.id),
                 &report.to_bytes().unwrap(),
             )
             .await
