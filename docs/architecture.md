@@ -76,7 +76,7 @@ flowchart LR
 - There's one dispatch path, and `minga api` folds into the manager process.
 - Joining is a managers-only operation (`change_membership`). Existing clusters migrate by shrinking membership down to the managers.
 
-This should be recorded as an ADR (Workers leave Raft) before any code moves. The runner-up is keeping workers in Raft as non-voting learners. It's cheaper, but every node would still replicate full state, and liveness would still go through Raft.
+See [ADR 0006: Workers Leave Raft](adr/0006-workers-leave-raft.md) for the decisions behind this target shape. It must be merged before code moves.
 
 ## Order of work
 
