@@ -105,17 +105,20 @@ export const milestones: Milestone[] = [
     source: 'CHANGELOG.md',
   },
   {
-    version: 'Next',
-    status: 'next',
+    version: 'Unreleased',
+    status: 'shipped',
     title: 'Managers-only Raft',
     features: [
-      'Workers become plain JetStream clients; only managers vote',
-      'Nodes can join a running cluster',
-      'Node liveness moves from Raft to JetStream leases',
-      'Quorum no longer depends on unreliable edge workers',
+      'Workers run as JetStream clients; only managers vote in Raft',
+      'Managers can join and leave a running cluster',
+      'Node leases, task status and assignments use JetStream',
+      'The manager serves the Docker Engine API in one process',
     ],
-    security: ['Workers no longer hold a copy of the full cluster state'],
-    source: 'README.md',
+    security: [
+      'Workers read only their own assignments and write only their own status and lease',
+      'Worker identities no longer receive a copy of full Raft state',
+    ],
+    source: 'CHANGELOG.md',
   },
   {
     version: 'Then',

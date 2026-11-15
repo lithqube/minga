@@ -1,8 +1,20 @@
 # Planning state
 
-**Current:** Phase 12 — Managers-only Raft, **planned** 2026-11-15 (`.planning/phases/12-managers-only-raft/12-PLAN.md`). Next action: 12-01, write ADR 0006. Phase 13 (WireGuard mesh and routing mesh) is planned after it (`.planning/phases/13-wireguard-mesh/13-PLAN.md`); its 13-02 (unique subnets) can land any time. Shipped since Phase 11, outside this workspace: v1.0.1, v1.0.2, v1.1.0, v1.1.1, v1.2.0 (see `CHANGELOG.md`).
+**Current:** Phase 12 — Managers-only Raft, 12-07 live proof recorded; final verification and PR merge pending. Plan: `.planning/phases/12-managers-only-raft/12-PLAN.md`. Phase 13 (WireGuard mesh and routing mesh) is next after Phase 12 closes; its 13-02 (unique subnets) can land independently. Shipped since Phase 11: v1.0.1, v1.0.2, v1.1.0, v1.1.1, v1.2.0 (see `CHANGELOG.md`).
+
+**Phase 12 live evidence (12-07, 2026-11-15):**
+
+- **T1:** One Linux manager/API with containerd and mTLS Raft deployed a real task. State export/import round-tripped; manager and sidecar restart on the same data directory recovered the service and running task.
+- **T2 partition and manager outage:** With two workers, a 120-second network cut left the old task running while a replacement started on the other worker. On healing, the stale copy stopped and placement stayed on the replacement. A 5-second manager outage left task processes and PIDs unchanged; after restart, deploy succeeded.
+- **T2 zero and third worker:** With both workers stopped beyond lease TTL, `minga deploy --wait 3` accepted the service then exited 1 with `only 0/1 task(s) placed within 3s`. A third worker joined and received a replica.
+- **T3 managers:** Three mTLS managers and two workers deployed real tasks. Stopping manager 2 did not prevent a new deploy or `minga logs --tail 0`; adding manager 4 to the voter set and removing it during running services succeeded, with tasks intact.
+- **T3 log limitation:** Stopping manager 3, which hosted the single-copy `MINGA_LOGS` stream, caused `minga logs` to hang. Restoring it restored reads. Logs remain RF1 by ADR 0002; manager quorum does not make this stream available.
+- **Bus authorization:** Live TLS NATS test `worker_certificate_cannot_write_assignments_or_other_nodes_status_and_leases` verifies own-assignment reads and denies foreign assignment writes, foreign status/lease writes and foreign-key reads.
+- **v1.2.0 migration:** Built and ran the actual v1.2.0 Linux binary with managers 1/2 and worker 99, then deployed `phase12-v120-live.legacy`. Current manager migration dry-run identified `{1,2,99}` → `{1}`; apply committed `[1]`. Service remained listed and its container task `phase12-v120-live.legacy.1.03948649` stayed RUNNING at containerd PID 1599. Replaced the old worker with the current JetStream worker using the same data directory; it adopted the existing container at PID 1599.
+- **T4 scope:** The live topology exercised managers-only Raft with two workers and a separate third-worker join. No 5,000-worker load test was run; cross-node container networking remains unsupported pending Phase 13.
 
 ---
+
 
 **Phase:** 11 — First production release (`v0.1.0`)
 **Status:** **Phase 11 complete — all 7 gates landed.** `v0.1.0` is shippable: CI on every push (including daemon-backed tests that fail closed without the daemon), linux/amd64 + linux/arm64 release artifacts, `install.sh`, changelog, corrected docs.
@@ -40,4 +52,4 @@ Waves 1–9 predate this GSD planning workspace and their claims were **not** in
 
 **10-01 host gate remains BLOCKED** by user choice: Talos staging is out of scope for `v0.1.0` and no hcloud provisioning is authorized. OrbStack Ubuntu is Linux evidence only. Do not advance Talos-dependent claims or compliance qualification — FIPS, SOC 2, VS-NfD and NATO are **not assessed**, which is different from not applicable.
 
-**Immediate next action:** Phase 11 is complete. Candidate follow-ups, in dependency order: (1) tag `v0.1.0` to exercise the release workflow; (2) image pull (content transfer + unpack) so preloading stops being manual; (3) Raft membership changes (learner join / voter removal) so nodes can join a running cluster; (4) multi-node WireGuard mesh on top of the Gate-3 single-node data plane; (5) spec-update reprovisioning and healthcheck enforcement. Talos/hcloud staging stays blocked pending authorization; compliance is not assessed.
+**Immediate next action:** Phase 12 — Managers-only Raft is in final verification/PR review. After it lands, proceed with Phase 13 (WireGuard mesh and routing mesh); its 13-02 (unique subnets) can land independently. Cross-node container networking remains unsupported until that work. Talos/hcloud staging stays blocked pending authorization; compliance is not assessed.

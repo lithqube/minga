@@ -450,10 +450,15 @@ authorization {{
                     "$JS.API.STREAM.INFO.KV_MINGA_STATUS",
                     "$JS.API.STREAM.INFO.KV_MINGA_ASSIGN",
                     "$JS.API.STREAM.INFO.KV_MINGA_LEASES",
+                    "$JS.API.DIRECT.GET.KV_MINGA_ASSIGN.$KV.MINGA_ASSIGN.node.7.task.>",
+                    "$JS.API.DIRECT.GET.KV_MINGA_ASSIGN.$KV.MINGA_ASSIGN.net.>",
+                    "$JS.API.DIRECT.GET.KV_MINGA_LEASES.$KV.MINGA_LEASES.lease.node.7",
+                    "$JS.API.DIRECT.GET.KV_MINGA_STATUS.$KV.MINGA_STATUS.node.7.task.>",
                     "$JS.API.CONSUMER.CREATE.KV_MINGA_ASSIGN",
                     "$JS.API.CONSUMER.CREATE.KV_MINGA_ASSIGN.>",
                     "$JS.API.CONSUMER.INFO.KV_MINGA_ASSIGN",
                     "$JS.API.CONSUMER.INFO.KV_MINGA_ASSIGN.>",
+                    "$JS.API.CONSUMER.MSG.NEXT.KV_MINGA_ASSIGN.>",
                     "$KV.MINGA_LEASES.lease.node.7",
                     "$KV.MINGA_STATUS.node.7.task.>"
                 ] }}
@@ -528,6 +533,14 @@ async fn worker_certificate_cannot_write_assignments_or_other_nodes_status_and_l
         .put_assignment("node.7.task.allowed", b"assignment")
         .await
         .unwrap();
+    manager
+        .put_assignment("node.8.task.foreign", b"foreign")
+        .await
+        .unwrap();
+    manager
+        .put_assignment("net.test", b"network")
+        .await
+        .unwrap();
 
     let worker_config = worker_client_config(dir.path(), &pki);
     let worker_bus = NatsBus::connect_worker_secure(&url, &worker_config, 7)
@@ -543,6 +556,30 @@ async fn worker_certificate_cannot_write_assignments_or_other_nodes_status_and_l
         .expect("watch remains open");
     assert_eq!(event.key, "node.7.task.allowed");
     assert_eq!(event.value.as_deref(), Some(&b"assignment"[..]));
+    assert_eq!(
+        worker_bus
+            .get_assignment("node.7.task.allowed")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(&b"assignment"[..])
+    );
+    let assignments = worker_bus.list_assignments("node.7.task.").await.unwrap();
+    assert_eq!(
+        assignments
+            .iter()
+            .map(|(key, _)| key.as_str())
+            .collect::<Vec<_>>(),
+        ["node.7.task.allowed"]
+    );
+    let networks = worker_bus.list_assignments("net.").await.unwrap();
+    assert_eq!(
+        networks
+            .iter()
+            .map(|(key, _)| key.as_str())
+            .collect::<Vec<_>>(),
+        ["net.test"]
+    );
 
     let worker = async_nats::connect_with_options(&url, worker_config.connect_options().unwrap())
         .await
@@ -564,6 +601,14 @@ async fn worker_certificate_cannot_write_assignments_or_other_nodes_status_and_l
             .as_deref(),
         Some(&b"running"[..])
     );
+    assert_eq!(
+        worker_bus
+            .get_status("node.7.task.allowed")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(&b"running"[..])
+    );
     let own_lease = tokio::time::timeout(
         Duration::from_secs(2),
         publish_jetstream_message(&worker, "$KV.MINGA_LEASES.lease.node.7", b"alive"),
@@ -574,6 +619,7 @@ async fn worker_certificate_cannot_write_assignments_or_other_nodes_status_and_l
         "worker's own lease write should be authorized: {own_lease:?}"
     );
     assert!(manager.is_alive(7).await.unwrap());
+    assert!(worker_bus.is_alive(7).await.unwrap());
 
     for subject in [
         "$KV.MINGA_ASSIGN.node.7.task.forbidden",

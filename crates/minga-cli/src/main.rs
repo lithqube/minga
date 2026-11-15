@@ -786,6 +786,18 @@ fn run_secret(cmd: SecretCommand) -> ExitCode {
     }
 }
 
+fn node_certificate_names(node_id: u64, role: NodeCertificateRole) -> Vec<String> {
+    let identity = match role {
+        NodeCertificateRole::Manager => format!("minga-manager-{node_id}"),
+        NodeCertificateRole::Worker => format!("minga-worker-{node_id}"),
+    };
+    let mut names = vec![minga_state::network::MINGA_NODE_NAME.to_string(), identity];
+    if matches!(role, NodeCertificateRole::Manager) {
+        names.push("localhost".to_string());
+    }
+    names
+}
+
 fn run_tls(cmd: TlsCommand) -> ExitCode {
     match cmd {
         TlsCommand::InitCa { dir } => {
@@ -883,15 +895,8 @@ fn run_tls(cmd: TlsCommand) -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
-            let nats_identity = match role {
-                NodeCertificateRole::Manager => format!("minga-manager-{node_id}"),
-                NodeCertificateRole::Worker => format!("minga-worker-{node_id}"),
-            };
-            let params = rcgen::CertificateParams::new(vec![
-                minga_state::network::MINGA_NODE_NAME.to_string(),
-                nats_identity,
-            ])
-            .expect("node params");
+            let params = rcgen::CertificateParams::new(node_certificate_names(node_id, role))
+                .expect("node params");
             let cert = match params.signed_by(&key, &ca, &ca_key) {
                 Ok(c) => c,
                 Err(e) => {
@@ -933,6 +938,34 @@ fn worker_has_manager_only_flags(args: &NodeArgs) -> bool {
         || args.nats_cluster_port.is_some()
         || args.api_bind.is_some()
         || args.api_token.is_some()
+}
+
+async fn wait_for_node_shutdown() {
+    #[cfg(unix)]
+    {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut terminate) => {
+                tokio::select! {
+                    result = tokio::signal::ctrl_c() => {
+                        if let Err(error) = result {
+                            tracing::warn!(%error, "failed to receive Ctrl-C");
+                        }
+                    }
+                    _ = terminate.recv() => {}
+                }
+            }
+            Err(error) => {
+                tracing::error!(%error, "failed to register SIGTERM handler");
+                if let Err(error) = tokio::signal::ctrl_c().await {
+                    tracing::warn!(%error, "failed to receive Ctrl-C");
+                }
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    if let Err(error) = tokio::signal::ctrl_c().await {
+        tracing::warn!(%error, "failed to receive Ctrl-C");
+    }
 }
 
 /// Runs a node (manager or worker): managers open Raft state, while workers
@@ -1443,7 +1476,7 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
             _ = scheduler.run(interval) => {},
             _ = minga_node::run_node_registration(state.clone(), bus.clone()) => {},
             _ = supervisor.run(interval) => {},
-            _ = tokio::signal::ctrl_c() => {
+            _ = wait_for_node_shutdown() => {
                 tracing::info!(node_id = args.node_id, "shutting down manager");
             },
         }
@@ -1454,7 +1487,7 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
         );
         tokio::select! {
             _ = supervisor.run(interval) => {},
-            _ = tokio::signal::ctrl_c() => {
+            _ = wait_for_node_shutdown() => {
                 tracing::info!(node_id = args.node_id, "shutting down worker");
             },
         }
@@ -2142,8 +2175,8 @@ fn port_of(addr: &str) -> Option<u16> {
 #[cfg(test)]
 mod tests {
     use super::{
-        is_loopback_bind, port_of, project_dir, run_node, worker_has_manager_only_flags, Cli,
-        Command,
+        is_loopback_bind, node_certificate_names, port_of, project_dir, run_node,
+        worker_has_manager_only_flags, Cli, Command, NodeCertificateRole,
     };
     use clap::Parser;
 
@@ -2238,6 +2271,18 @@ mod tests {
         };
         assert_eq!(args.api_bind.as_deref(), Some("127.0.0.1:2375"));
         assert_eq!(args.api_token.as_deref(), Some("secret"));
+    }
+
+    #[test]
+    fn manager_certificate_names_cover_local_sidecar_tls_without_expanding_worker_identity() {
+        assert_eq!(
+            node_certificate_names(1, NodeCertificateRole::Manager),
+            ["minga-node", "minga-manager-1", "localhost"]
+        );
+        assert_eq!(
+            node_certificate_names(2, NodeCertificateRole::Worker),
+            ["minga-node", "minga-worker-2"]
+        );
     }
 
     #[test]
