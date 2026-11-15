@@ -164,14 +164,17 @@ impl Scheduler {
                 .lock()
                 .unwrap()
                 .is_some_and(|until| std::time::Instant::now() < until);
-            let any_registered_live = nodes.iter().any(|node| live_nodes.contains(&node.id));
-            if !any_registered_live && !nodes.is_empty() {
+            let none_live =
+                !nodes.is_empty() && !nodes.iter().any(|node| live_nodes.contains(&node.id));
+            if none_live {
                 // Leases may be coming back; a partial set right after this
                 // must not count as dead nodes either.
                 *self.lease_grace_until.lock().unwrap() =
                     Some(std::time::Instant::now() + LEASE_GRACE);
             }
-            if in_grace || (!any_registered_live && !nodes.is_empty()) {
+            // With every registered node live, no lease can be missing in error.
+            let all_live = nodes.iter().all(|node| live_nodes.contains(&node.id));
+            if none_live || (in_grace && !all_live) {
                 tracing::warn!(
                     live = live_nodes.len(),
                     registered = nodes.len(),
