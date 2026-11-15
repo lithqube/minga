@@ -8,9 +8,14 @@
 use std::time::Duration;
 
 use minga_bus::{Command, EventBus, NatsBus};
-use testcontainers::{core::WaitFor, runners::AsyncRunner, ContainerAsync, GenericImage, ImageExt};
+use testcontainers::{
+    core::{logs::LogFrame, WaitFor},
+    runners::AsyncRunner,
+    ContainerAsync, GenericImage, ImageExt,
+};
 
 const NATS_PORT: u16 = 4222;
+const MONITOR_PORT: u16 = 8222;
 
 /// Starts three JetStream servers routed to each other on a private network.
 async fn start_cluster() -> Option<(Vec<ContainerAsync<GenericImage>>, String)> {
@@ -23,16 +28,24 @@ async fn start_cluster() -> Option<(Vec<ContainerAsync<GenericImage>>, String)> 
         .collect::<Vec<_>>()
         .join(",");
 
-    let mut containers = Vec::new();
-    let mut urls = Vec::new();
-    for name in &names {
-        let image = GenericImage::new("nats", "2.10-alpine")
+    let starts = names.iter().map(|name| {
+        let prefix = name.clone();
+        GenericImage::new("nats", "2.10-alpine")
             .with_exposed_port(NATS_PORT.into())
+            .with_exposed_port(MONITOR_PORT.into())
             .with_wait_for(WaitFor::message_on_stderr("Server is ready"))
             .with_network(&network)
             .with_container_name(name)
+            // Server logs (debug level, with the peer-selection reasons) show
+            // only when the test fails: the harness captures them otherwise.
+            .with_log_consumer(move |frame: &LogFrame| {
+                eprint!("[{prefix}] {}", String::from_utf8_lossy(frame.bytes()));
+            })
             .with_cmd(vec![
                 "-js".to_string(),
+                "-D".to_string(),
+                "-m".to_string(),
+                MONITOR_PORT.to_string(),
                 "-n".to_string(),
                 name.clone(),
                 "--cluster_name".to_string(),
@@ -41,19 +54,65 @@ async fn start_cluster() -> Option<(Vec<ContainerAsync<GenericImage>>, String)> 
                 "nats://0.0.0.0:6222".to_string(),
                 "--routes".to_string(),
                 routes.clone(),
-            ]);
-        let container = match image.start().await {
-            Ok(c) => c,
+            ])
+            .start()
+    });
+
+    // Started together, so no server joins after the meta leader is elected.
+    let mut containers = Vec::new();
+    for started in futures::future::join_all(starts).await {
+        match started {
+            Ok(c) => containers.push(c),
             Err(e) => {
                 eprintln!("skipping: cannot start NATS container: {e}");
                 return None;
             }
-        };
+        }
+    }
+    let mut urls = Vec::new();
+    let mut monitors = Vec::new();
+    for container in &containers {
         let port = container.get_host_port_ipv4(NATS_PORT).await.ok()?;
         urls.push(format!("nats://127.0.0.1:{port}"));
-        containers.push(container);
+        let port = container.get_host_port_ipv4(MONITOR_PORT).await.ok()?;
+        monitors.push(format!("http://127.0.0.1:{port}/jsz"));
     }
+    wait_for_meta_group(&monitors).await;
     Some((containers, urls.join(",")))
+}
+
+/// Waits until every server reports a meta leader and a three-peer meta
+/// group. "Server is ready" comes before either, and a meta group short of
+/// three peers is what fails R3 placement with a bare "no suitable peers".
+async fn wait_for_meta_group(monitors: &[String]) {
+    let http = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("http client");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let mut views = Vec::new();
+        for url in monitors {
+            let view = match http.get(url).send().await {
+                Ok(resp) => resp.json::<serde_json::Value>().await.ok(),
+                Err(_) => None,
+            };
+            views.push(view.map(|jsz| jsz["meta_cluster"].clone()));
+        }
+        let formed = views.iter().all(|meta| {
+            meta.as_ref().is_some_and(|m| {
+                m["cluster_size"] == 3 && m["leader"].as_str().is_some_and(|l| !l.is_empty())
+            })
+        });
+        if formed {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "JetStream meta group did not reach three peers: {views:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
 }
 
 async fn replicas(bus: &NatsBus, stream: &str) -> usize {
@@ -97,9 +156,8 @@ async fn replicated_bus_survives_losing_one_server() {
     let bus = NatsBus::connect(&seeds)
         .await
         .expect("connect to the seed list");
-    // "Server is ready" comes before the three servers form a JetStream
-    // cluster, and on a busy CI runner that takes longer than the 10 s
-    // `ensure_replicas` waits by itself.
+    // Every server is a meta peer by now, but the leader learns each peer's
+    // limits from its periodic stats; until then placement reports it offline.
     eventually("raise replicas", || bus.ensure_replicas(3)).await;
     for stream in [
         "MINGA_EVENTS",
