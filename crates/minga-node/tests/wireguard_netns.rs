@@ -246,7 +246,7 @@ fn create_task(cleanup: &mut Cleanup, network: TaskNetwork<'_>) -> Result<String
     ip_ns(&task, &["route", "add", "default", "via", gateway])?;
     let resolver = PathBuf::from(format!("/etc/netns/{task}/resolv.conf"));
     let resolver_dir = resolver.parent().expect("resolver parent");
-    fs::create_dir(resolver_dir).map_err(|error| error.to_string())?;
+    fs::create_dir_all(resolver_dir).map_err(|error| error.to_string())?;
     cleanup.resolver_dirs.push(resolver_dir.to_path_buf());
     fs::write(
         &resolver,

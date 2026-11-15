@@ -517,39 +517,41 @@ struct TaskNetState {
     #[serde(default)]
     veths: Vec<String>,
 }
-fn task_veth_for_ip(task_links: &str, host_links: &str, ip: Ipv4Addr) -> Option<String> {
-    task_links.lines().find_map(|line| {
+fn task_veth_for_ip(
+    task_links: &str,
+    task_addresses: &str,
+    host_links: &str,
+    ip: Ipv4Addr,
+) -> Option<String> {
+    let task_name = task_addresses.lines().find_map(|line| {
         let mut fields = line.split_whitespace();
         fields.next()?;
-        let task_name = fields.next()?.trim_end_matches(':');
-        let host_index = task_name.rsplit_once("@if")?.1.parse::<u32>().ok()?;
-        let mut matches_ip = false;
-        while let Some(field) = fields.next() {
-            if field == "inet" {
-                matches_ip = fields
-                    .next()
-                    .and_then(|address| address.split('/').next())
-                    .and_then(|address| address.parse::<Ipv4Addr>().ok())
-                    == Some(ip);
-                break;
-            }
-        }
-        if !matches_ip {
+        let name = fields.next()?.split('@').next()?.trim_end_matches(':');
+        fields.next()?;
+        let address = fields.next()?.split('/').next()?.parse::<Ipv4Addr>().ok()?;
+        (address == ip).then_some(name)
+    })?;
+    let host_index = task_links.lines().find_map(|line| {
+        let mut fields = line.split_whitespace();
+        fields.next()?;
+        let name = fields.next()?.trim_end_matches(':');
+        if name.split('@').next()? != task_name {
             return None;
         }
-        host_links.lines().find_map(|line| {
-            let mut fields = line.split_whitespace();
-            let index = fields.next()?.trim_end_matches(':').parse::<u32>().ok()?;
-            if index != host_index {
-                return None;
-            }
-            fields.next().map(|name| {
-                name.split('@')
-                    .next()
-                    .unwrap_or(name)
-                    .trim_end_matches(':')
-                    .to_owned()
-            })
+        name.rsplit_once("@if")?.1.parse::<u32>().ok()
+    })?;
+    host_links.lines().find_map(|line| {
+        let mut fields = line.split_whitespace();
+        let index = fields.next()?.trim_end_matches(':').parse::<u32>().ok()?;
+        if index != host_index {
+            return None;
+        }
+        fields.next().map(|name| {
+            name.split('@')
+                .next()
+                .unwrap_or(name)
+                .trim_end_matches(':')
+                .to_owned()
         })
     })
 }
@@ -1151,12 +1153,13 @@ impl NetworkSetup {
                 });
             }
             if state.veths.len() != state.ips.len() {
-                let task_links =
+                let task_links = output("ip", &["-n", namespace, "-o", "link", "show"]).await?;
+                let task_addresses =
                     output("ip", &["-n", namespace, "-o", "-4", "addr", "show"]).await?;
                 state.veths = state
                     .ips
                     .iter()
-                    .map(|ip| task_veth_for_ip(&task_links, &host_links, *ip))
+                    .map(|ip| task_veth_for_ip(&task_links, &task_addresses, &host_links, *ip))
                     .collect::<Option<Vec<_>>>()
                     .ok_or_else(|| NetError::Command {
                         cmd: format!("ip -n {namespace} -o -4 addr show"),
@@ -1300,11 +1303,16 @@ mod tests {
     }
     #[test]
     fn task_ip_maps_to_host_veth_after_restart() {
-        let task_links =
-            "2: at0@if41: <BROADCAST,UP> mtu 1500\n    inet 10.242.0.10/24 scope global at0";
+        let task_links = "2: at0@if41: <BROADCAST,UP> mtu 1500";
+        let task_addresses = "2: at0    inet 10.242.0.10/24 scope global at0";
         let host_links = "41: ta0@if2: <BROADCAST,UP> mtu 1500";
         assert_eq!(
-            task_veth_for_ip(task_links, host_links, Ipv4Addr::new(10, 242, 0, 10)),
+            task_veth_for_ip(
+                task_links,
+                task_addresses,
+                host_links,
+                Ipv4Addr::new(10, 242, 0, 10),
+            ),
             Some("ta0".into())
         );
     }
