@@ -92,6 +92,22 @@ pub struct NatsBus {
     worker_node_id: Option<u64>,
 }
 
+/// Turns a KV stream message into a put or delete event.
+fn kv_event(prefix_subject: &str, message: &jetstream::Message) -> Option<KvEvent> {
+    let key = message.subject.strip_prefix(prefix_subject)?.to_string();
+    let deleted = message
+        .headers
+        .as_ref()
+        .and_then(|headers| headers.get("KV-Operation"))
+        .is_some_and(|op| matches!(op.as_str(), "DEL" | "PURGE"));
+    let (op, value) = if deleted {
+        (KvOp::Delete, None)
+    } else {
+        (KvOp::Put, Some(message.payload.to_vec()))
+    };
+    Some(KvEvent { key, value, op })
+}
+
 impl NatsBus {
     /// The underlying JetStream context.
     ///
@@ -99,6 +115,42 @@ impl NatsBus {
     /// JetStream access (stream inspection, admin operations).
     pub fn jetstream(&self) -> &JetStream {
         &self.js
+    }
+
+    /// An ordered consumer on MINGA_ASSIGN filtered to `prefix`, with its
+    /// pending count. It is named so the filter travels in the create
+    /// subject, where the worker ACL can bind it (see `subjects::worker_acl`).
+    async fn assignment_consumer(
+        &self,
+        prefix: &str,
+        deliver_policy: DeliverPolicy,
+    ) -> Result<(u64, jetstream::consumer::push::Ordered)> {
+        let inbox = self.client.new_inbox();
+        let name = inbox.rsplit('.').next().unwrap_or_default().to_string();
+        let consumer = self
+            .assignments_kv
+            .stream
+            .create_consumer(jetstream::consumer::push::OrderedConfig {
+                name: Some(name),
+                deliver_subject: inbox,
+                description: Some("assignment consumer".to_string()),
+                filter_subject: format!("{}{prefix}>", self.assignments_kv.prefix),
+                replay_policy: jetstream::consumer::ReplayPolicy::Instant,
+                deliver_policy,
+                ..Default::default()
+            })
+            .await
+            .map_err(|error| BusError::Kv(format!("assignment consumer: {error}")))?;
+        let pending = consumer.cached_info().num_pending;
+        let messages = consumer
+            .messages()
+            .await
+            .map_err(|error| BusError::Kv(format!("assignment messages: {error}")))?;
+        Ok((pending, messages))
+    }
+
+    fn assignment_event(&self, message: &jetstream::Message) -> Option<KvEvent> {
+        kv_event(&self.assignments_kv.prefix, message)
     }
 
     /// Raises the [`REPLICATED`] streams and buckets to `replicas` copies.
@@ -618,27 +670,32 @@ impl EventBus for NatsBus {
 
     async fn list_assignments(&self, prefix: &str) -> Result<Vec<(String, Vec<u8>)>> {
         self.check_worker_prefix(prefix)?;
-        let mut keys = self
-            .assignments_kv
-            .keys()
-            .await
-            .map_err(|error| BusError::Kv(format!("list assignments: {error}")))?;
-        let mut entries = Vec::new();
-        while let Some(key) = keys.next().await {
-            let key = key.map_err(|error| BusError::Kv(format!("assignment key: {error}")))?;
-            if !key.starts_with(prefix) {
-                continue;
+        let (pending, mut messages) = self
+            .assignment_consumer(prefix, DeliverPolicy::LastPerSubject)
+            .await?;
+        // Keyed, so a key updated mid-listing yields its latest value once.
+        let mut entries = std::collections::BTreeMap::new();
+        if pending == 0 {
+            return Ok(Vec::new());
+        }
+        while let Some(message) = messages.next().await {
+            let message =
+                message.map_err(|error| BusError::Kv(format!("list assignments: {error}")))?;
+            let left = message
+                .info()
+                .map_err(|error| BusError::Kv(format!("assignment info: {error}")))?
+                .pending;
+            if let Some(event) = self.assignment_event(&message) {
+                match event.value {
+                    Some(value) => entries.insert(event.key, value),
+                    None => entries.remove(&event.key),
+                };
             }
-            if let Some(value) = self
-                .assignments_kv
-                .get(key.clone())
-                .await
-                .map_err(|error| BusError::Kv(format!("get assignment {key}: {error}")))?
-            {
-                entries.push((key, value.to_vec()));
+            if left == 0 {
+                break;
             }
         }
-        Ok(entries)
+        Ok(entries.into_iter().collect())
     }
 
     async fn delete_assignment(&self, key: &str) -> Result<()> {
@@ -651,29 +708,13 @@ impl EventBus for NatsBus {
 
     async fn watch_assignments(&self, prefix: &str) -> Result<KvStream> {
         self.check_worker_prefix(prefix)?;
-        let watcher = self
-            .assignments_kv
-            .watch_from_revision(format!("{prefix}>"), 1)
-            .await
-            .map_err(|error| BusError::Kv(format!("watch assignments: {error}")))?;
-        let prefix = prefix.to_string();
-        let stream = watcher.filter_map(move |entry_result| {
-            let prefix = prefix.clone();
+        let (_, messages) = self.assignment_consumer(prefix, DeliverPolicy::All).await?;
+        let prefix_subject = self.assignments_kv.prefix.clone();
+        let stream = messages.filter_map(move |message| {
+            let prefix_subject = prefix_subject.clone();
             async move {
-                match entry_result {
-                    Ok(entry) if entry.key.starts_with(&prefix) => {
-                        let op = match entry.operation {
-                            KvOperation::Put => KvOp::Put,
-                            KvOperation::Delete | KvOperation::Purge => KvOp::Delete,
-                        };
-                        let value = (op == KvOp::Put).then(|| entry.value.to_vec());
-                        Some(KvEvent {
-                            key: entry.key,
-                            value,
-                            op,
-                        })
-                    }
-                    Ok(_) => None,
+                match message {
+                    Ok(message) => kv_event(&prefix_subject, &message),
                     Err(error) => {
                         tracing::warn!(error = %error, "assignment watch error");
                         None

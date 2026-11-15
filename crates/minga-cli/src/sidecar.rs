@@ -298,7 +298,14 @@ fn generate_config(opts: &SidecarOptions, jetstream_dir: &Path) -> String {
             append_user(
                 &mut out,
                 &format!("minga-manager-{node_id}"),
-                &["$JS.API.>".into(), "$KV.>".into(), "minga.>".into()],
+                // $JS.FC: flow-control replies; without them an ordered
+                // consumer (KV listing, watches) stalls on large payloads.
+                &[
+                    "$JS.API.>".into(),
+                    "$JS.FC.>".into(),
+                    "$KV.>".into(),
+                    "minga.>".into(),
+                ],
                 &[
                     "$JS.API.>".into(),
                     "$KV.>".into(),
@@ -311,42 +318,12 @@ fn generate_config(opts: &SidecarOptions, jetstream_dir: &Path) -> String {
         worker_ids.sort_unstable();
         worker_ids.dedup();
         for node_id in worker_ids {
+            let (publish, subscribe) = minga_bus::subjects::worker_acl(node_id);
             append_user(
                 &mut out,
                 &format!("minga-worker-{node_id}"),
-                &[
-                    format!("$KV.MINGA_LEASES.lease.node.{node_id}"),
-                    format!("$KV.MINGA_STATUS.node.{node_id}.task.>"),
-                    format!("minga.log.node.{node_id}.>"),
-                    "$JS.API.STREAM.INFO.KV_MINGA_ASSIGN".into(),
-                    "$JS.API.STREAM.INFO.KV_MINGA_STATUS".into(),
-                    "$JS.API.STREAM.INFO.KV_MINGA_LEASES".into(),
-                    format!("$JS.API.KV.GET.KV_MINGA_ASSIGN.node.{node_id}.task.>"),
-                    "$JS.API.KV.GET.KV_MINGA_ASSIGN.net.>".into(),
-                    "$JS.API.KV.LIST.KV_MINGA_ASSIGN".into(),
-                    format!(
-                        "$JS.API.DIRECT.GET.KV_MINGA_ASSIGN.$KV.MINGA_ASSIGN.node.{node_id}.task.>"
-                    ),
-                    "$JS.API.DIRECT.GET.KV_MINGA_ASSIGN.$KV.MINGA_ASSIGN.net.>".into(),
-                    format!(
-                        "$JS.API.DIRECT.GET.KV_MINGA_LEASES.$KV.MINGA_LEASES.lease.node.{node_id}"
-                    ),
-                    format!(
-                        "$JS.API.DIRECT.GET.KV_MINGA_STATUS.$KV.MINGA_STATUS.node.{node_id}.task.>"
-                    ),
-                    "$JS.API.CONSUMER.CREATE.KV_MINGA_ASSIGN".into(),
-                    "$JS.API.CONSUMER.CREATE.KV_MINGA_ASSIGN.>".into(),
-                    "$JS.API.CONSUMER.INFO.KV_MINGA_ASSIGN".into(),
-                    "$JS.API.CONSUMER.INFO.KV_MINGA_ASSIGN.>".into(),
-                    "$JS.API.CONSUMER.MSG.NEXT.KV_MINGA_ASSIGN.>".into(),
-                ],
-                &[
-                    format!("$KV.MINGA_ASSIGN.node.{node_id}.task.>"),
-                    "$KV.MINGA_ASSIGN.net.>".into(),
-                    format!("$KV.MINGA_LEASES.lease.node.{node_id}"),
-                    format!("$KV.MINGA_STATUS.node.{node_id}.task.>"),
-                    "_INBOX.>".into(),
-                ],
+                &publish,
+                &subscribe,
             );
         }
         out.push_str("  ]\n}\n\n");
@@ -566,15 +543,10 @@ mod tests {
         let config = generate_config(&opts, Path::new("/var/lib/minga/nats/jetstream"));
 
         assert!(config.contains("user: \"minga-manager-2\""));
+        assert!(config.contains("\"$JS.FC.>\""));
         assert!(config.contains("user: \"minga-worker-7\""));
         assert!(config.contains("\"$KV.MINGA_STATUS.node.7.task.>\""));
         assert!(config.contains("\"$KV.MINGA_ASSIGN.node.7.task.>\""));
-        assert!(config
-            .contains("\"$JS.API.DIRECT.GET.KV_MINGA_ASSIGN.$KV.MINGA_ASSIGN.node.7.task.>\""));
-        assert!(config
-            .contains("\"$JS.API.DIRECT.GET.KV_MINGA_STATUS.$KV.MINGA_STATUS.node.7.task.>\""));
-        assert!(!config.contains("\"$JS.API.DIRECT.GET.KV_MINGA_STATUS.$KV.MINGA_STATUS.node.8"));
-        assert!(!config.contains("\"$JS.API.DIRECT.GET.KV_MINGA_ASSIGN.$KV.MINGA_ASSIGN.node.8"));
         assert!(!config.contains("\"$KV.MINGA_ASSIGN.node.8"));
         assert!(!config.contains("\"$KV.MINGA_STATUS.node.8"));
     }

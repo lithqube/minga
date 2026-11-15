@@ -113,6 +113,47 @@ pub fn kv_lease(node_id: u64) -> String {
     format!("lease.node.{node_id}")
 }
 
+/// NATS permissions for the `minga-worker-{id}` identity: `(publish, subscribe)`.
+///
+/// Worker N may read only its own assignments (plus network metadata) and
+/// write only its own status and lease. Consumer creation and direct gets are
+/// granted only on subjects that carry the filter or key, so the server can
+/// bind them to `node.{id}`; a consumer whose filter rides in the payload is
+/// refused.
+pub fn worker_acl(node_id: u64) -> (Vec<String>, Vec<String>) {
+    let own_tasks = format!("$KV.MINGA_ASSIGN.{}>", kv_assignment_node_prefix(node_id));
+    let networks = "$KV.MINGA_ASSIGN.net.>".to_string();
+    let own_status = format!("$KV.MINGA_STATUS.node.{node_id}.task.>");
+    let own_lease = format!("$KV.MINGA_LEASES.{}", kv_lease(node_id));
+    let publish = vec![
+        own_lease.clone(),
+        own_status.clone(),
+        format!("{PREFIX}.log.node.{node_id}.>"),
+        "$JS.API.STREAM.INFO.KV_MINGA_ASSIGN".into(),
+        "$JS.API.STREAM.INFO.KV_MINGA_STATUS".into(),
+        "$JS.API.STREAM.INFO.KV_MINGA_LEASES".into(),
+        // Flow-control replies; without them an ordered consumer stalls.
+        "$JS.FC.KV_MINGA_ASSIGN.>".into(),
+        // CONSUMER.CREATE.<stream>.<name>.<filter>: the server rejects a
+        // payload filter that differs from the one in the subject.
+        format!("$JS.API.CONSUMER.CREATE.KV_MINGA_ASSIGN.*.{own_tasks}"),
+        format!("$JS.API.CONSUMER.CREATE.KV_MINGA_ASSIGN.*.{networks}"),
+        "$JS.API.CONSUMER.INFO.KV_MINGA_ASSIGN.>".into(),
+        format!("$JS.API.DIRECT.GET.KV_MINGA_ASSIGN.{own_tasks}"),
+        format!("$JS.API.DIRECT.GET.KV_MINGA_ASSIGN.{networks}"),
+        format!("$JS.API.DIRECT.GET.KV_MINGA_STATUS.{own_status}"),
+        format!("$JS.API.DIRECT.GET.KV_MINGA_LEASES.{own_lease}"),
+    ];
+    let subscribe = vec![
+        own_tasks,
+        networks,
+        own_lease,
+        own_status,
+        "_INBOX.>".into(),
+    ];
+    (publish, subscribe)
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------

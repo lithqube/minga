@@ -46,7 +46,9 @@ impl From<minga_state::StateError> for ApiError {
     fn from(e: minga_state::StateError) -> Self {
         use minga_state::StateError as E;
         match e {
-            E::Conflict(_) | E::Membership(_) => ApiError::Conflict(e.to_string()),
+            E::Conflict(_) | E::Membership(_) | E::NotLeader(_) => {
+                ApiError::Conflict(e.to_string())
+            }
             E::BadSnapshot(_) => ApiError::BadRequest(e.to_string()),
             _ => ApiError::State(e.to_string()),
         }

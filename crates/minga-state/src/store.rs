@@ -6,6 +6,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use openraft::error::{ClientWriteError, RaftError};
 use openraft::{BasicNode, Raft};
 use serde::{Deserialize, Serialize};
 use tokio::time::timeout;
@@ -53,6 +54,15 @@ pub struct StateStore {
     tls_client: Option<std::sync::Arc<rustls::ClientConfig>>,
     /// Serializes membership changes initiated through this store.
     membership_change: tokio::sync::Mutex<()>,
+}
+
+/// Membership changes run only on the leader. A follower says which manager
+/// leads instead of surfacing a raw `ForwardToLeader` error.
+fn membership_error(e: RaftError<NodeId, ClientWriteError<NodeId, BasicNode>>) -> StateError {
+    match e.forward_to_leader() {
+        Some(forward) => StateError::NotLeader(forward.leader_id),
+        None => StateError::Raft(e.to_string()),
+    }
 }
 
 impl StateStore {
@@ -259,6 +269,7 @@ impl StateStore {
     /// Adds a manager as a learner, waits for it to catch up, then promotes it.
     pub async fn add_manager(&self, id: NodeId, raft_addr: String) -> Result<(), StateError> {
         let _guard = self.membership_change.lock().await;
+        self.require_leader().await?;
         if id == self.node_id {
             return Err(StateError::Membership(format!(
                 "manager {id} is already this node"
@@ -292,7 +303,7 @@ impl StateStore {
             )
             .await
             .map_err(|_| StateError::Raft(format!("manager {id} did not catch up in 60 seconds")))?
-            .map_err(|e| StateError::Raft(e.to_string()))?;
+            .map_err(membership_error)?;
         }
 
         let mut voters = self
@@ -304,13 +315,14 @@ impl StateStore {
         timeout(DEFAULT_TIMEOUT, self.raft.change_membership(voters, false))
             .await
             .map_err(|_| StateError::Raft("manager promotion timed out".into()))?
-            .map_err(|e| StateError::Raft(e.to_string()))?;
+            .map_err(membership_error)?;
         Ok(())
     }
 
     /// Removes a manager, refusing to remove the last voter.
     pub async fn remove_manager(&self, id: NodeId) -> Result<(), StateError> {
         let _guard = self.membership_change.lock().await;
+        self.require_leader().await?;
         let mut voters = self
             .manager_voters()
             .await
@@ -330,7 +342,7 @@ impl StateStore {
         timeout(DEFAULT_TIMEOUT, self.raft.change_membership(voters, false))
             .await
             .map_err(|_| StateError::Raft("manager removal timed out".into()))?
-            .map_err(|e| StateError::Raft(e.to_string()))?;
+            .map_err(membership_error)?;
         Ok(())
     }
 
@@ -344,6 +356,7 @@ impl StateStore {
         manager_ids: Vec<NodeId>,
     ) -> Result<Vec<NodeId>, StateError> {
         let _guard = self.membership_change.lock().await;
+        self.require_leader().await?;
         let current = self
             .manager_voters()
             .await
@@ -373,7 +386,7 @@ impl StateStore {
             )
             .await
             .map_err(|_| StateError::Raft("manager migration timed out".into()))?
-            .map_err(|e| StateError::Raft(e.to_string()))?;
+            .map_err(membership_error)?;
         }
         Ok(removed)
     }
@@ -400,6 +413,15 @@ impl StateStore {
             .shutdown()
             .await
             .map_err(|e| StateError::Fatal(e.to_string()))
+    }
+
+    /// Membership changes are not forwarded; a follower names the leader.
+    async fn require_leader(&self) -> Result<(), StateError> {
+        if self.is_leader().await {
+            Ok(())
+        } else {
+            Err(StateError::NotLeader(self.current_leader().await))
+        }
     }
 
     // --- write operations (go through Raft) -----------------------------------
