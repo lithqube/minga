@@ -67,6 +67,7 @@ struct Cleanup {
     namespaces: Vec<String>,
     resolver_dirs: Vec<PathBuf>,
     underlay: Option<String>,
+    bridge_nf_call_iptables: String,
 }
 
 impl Drop for Cleanup {
@@ -77,6 +78,11 @@ impl Drop for Cleanup {
         if let Some(underlay) = &self.underlay {
             let _ = sh("ip", &["link", "delete", underlay]);
         }
+        let setting = format!(
+            "net.bridge.bridge-nf-call-iptables={}",
+            self.bridge_nf_call_iptables.trim()
+        );
+        let _ = sh("sysctl", &["-w", &setting]);
         for dir in &self.resolver_dirs {
             let _ = fs::remove_dir_all(dir);
         }
@@ -501,11 +507,16 @@ async fn wireguard_routes_shared_tasks_and_isolates_other_networks() -> Result<(
 
     let pid = std::process::id();
     let underlay = format!("mwbr{}", pid % 100_000);
+    let bridge_nf_call_iptables =
+        fs::read_to_string("/proc/sys/net/bridge/bridge-nf-call-iptables")
+            .map_err(|error| error.to_string())?;
     let mut cleanup = Cleanup {
         namespaces: Vec::new(),
         resolver_dirs: Vec::new(),
         underlay: None,
+        bridge_nf_call_iptables,
     };
+    sh("sysctl", &["-w", "net.bridge.bridge-nf-call-iptables=0"])?;
     let node_a = add_namespace(&mut cleanup, format!("mwg{pid}a"))?;
     let node_b = add_namespace(&mut cleanup, format!("mwg{pid}b"))?;
     let node_c = add_namespace(&mut cleanup, format!("mwg{pid}c"))?;
