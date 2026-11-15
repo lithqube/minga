@@ -23,13 +23,33 @@ pub enum WgError {
     InvalidEndpoint(String),
 }
 
-/// A WireGuard keypair.
-#[derive(Debug, Clone)]
+/// A WireGuard keypair. `Debug` redacts the private key.
+#[derive(Clone)]
 pub struct KeyPair {
     /// Base64-encoded private key (44 chars).
     pub private_key: String,
     /// Base64-encoded public key (44 chars).
     pub public_key: String,
+}
+
+impl std::fmt::Debug for KeyPair {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KeyPair")
+            .field("private_key", &"<redacted>")
+            .field("public_key", &self.public_key)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for InterfaceConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InterfaceConfig")
+            .field("private_key", &"<redacted>")
+            .field("listen_port", &self.listen_port)
+            .field("address", &self.address)
+            .field("peers", &self.peers)
+            .finish()
+    }
 }
 
 impl KeyPair {
@@ -108,8 +128,8 @@ pub struct WireGuardPeerSet {
     pub networks: Vec<WireGuardNetworkAssignment>,
 }
 
-/// Configuration for a local WireGuard interface.
-#[derive(Debug, Clone)]
+/// Configuration for a local WireGuard interface. `Debug` redacts the private key.
+#[derive(Clone)]
 pub struct InterfaceConfig {
     /// Base64-encoded private key.
     pub private_key: String,
@@ -232,6 +252,21 @@ mod tests {
     fn derive_public_invalid_key() {
         assert!(KeyPair::public_from_private("not-base64!").is_err());
         assert!(KeyPair::public_from_private("dG9vLXNob3J0").is_err()); // too short
+    }
+
+    #[test]
+    fn debug_output_redacts_private_key() {
+        let kp = KeyPair::generate();
+        let config = InterfaceConfig {
+            private_key: kp.private_key.clone(),
+            listen_port: 51820,
+            address: "10.100.0.1/24".into(),
+            peers: Vec::new(),
+        };
+        for debug in [format!("{kp:?}"), format!("{config:?}")] {
+            assert!(!debug.contains(&kp.private_key), "{debug}");
+            assert!(debug.contains("<redacted>"));
+        }
     }
 
     #[test]
