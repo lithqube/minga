@@ -104,6 +104,7 @@ const WG_FORWARD_CHAIN: &str = "MINGA_WG_FORWARD";
 const TASK_SOURCE_CHAIN: &str = "MINGA_TASK_SOURCE";
 const TASK_FAIL_CLOSED_IN_CHAIN: &str = "MINGA_TASK_FAIL_CLOSED_IN";
 const TASK_FAIL_CLOSED_OUT_CHAIN: &str = "MINGA_TASK_FAIL_CLOSED_OUT";
+const TASK_MASQUERADE_CHAIN: &str = "MINGA_MASQUERADE";
 
 async fn remove_wireguard_rules() {
     run_tolerated(
@@ -671,31 +672,11 @@ impl NetworkSetup {
 
         // Task IPs are private to this host, so external egress needs SNAT.
         let cidr = subnet.to_string();
-        // Remove the pre-mesh rule so existing bridges do not masquerade
-        // task sources on WireGuard egress.
-        run_tolerated(
-            "iptables",
-            &[
-                "-w",
-                "5",
-                "-t",
-                "nat",
-                "-D",
-                "POSTROUTING",
-                "-s",
-                &cidr,
-                "!",
-                "-o",
-                &br,
-                "-j",
-                "MASQUERADE",
-            ],
-        )
-        .await;
-        ensure_rule(
-            "nat",
-            "POSTROUTING",
-            &[
+        // Remove legacy direct rules; task egress now passes through one chain
+        // so bridge and WireGuard exclusions don't require duplicate -o flags.
+        for rule in [
+            vec!["-s", &cidr, "!", "-o", &br, "-j", "MASQUERADE"],
+            vec![
                 "-s",
                 &cidr,
                 "!",
@@ -707,6 +688,27 @@ impl NetworkSetup {
                 "-j",
                 "MASQUERADE",
             ],
+        ] {
+            let mut args = vec!["-w", "5", "-t", "nat", "-D", "POSTROUTING"];
+            args.extend(rule);
+            run_tolerated("iptables", &args).await;
+        }
+        run_tolerated(
+            "iptables",
+            &["-w", "5", "-t", "nat", "-N", TASK_MASQUERADE_CHAIN],
+        )
+        .await;
+        ensure_rule(
+            "nat",
+            TASK_MASQUERADE_CHAIN,
+            &["-o", "minga-+", "-j", "RETURN"],
+        )
+        .await?;
+        ensure_rule("nat", TASK_MASQUERADE_CHAIN, &["-j", "MASQUERADE"]).await?;
+        ensure_rule(
+            "nat",
+            "POSTROUTING",
+            &["-s", &cidr, "-j", TASK_MASQUERADE_CHAIN],
         )
         .await?;
         // Host-originated traffic into the bridge (127.0.0.1 or the node's
