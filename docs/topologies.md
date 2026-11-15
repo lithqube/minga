@@ -1,51 +1,51 @@
 # Supported topologies
 
-Which layouts Minga supports in v1.2.0, what each one needs, and how far each
-has been verified. Commands and flags are in the [CLI reference](cli.md).
+Which layouts the current manager-only Raft code supports, what each one needs,
+and how far each has been verified. Commands and flags are in the [CLI
+reference](cli.md).
 
 | Topology | Status | Verified by |
 | --- | --- | --- |
-| [Single host](#single-host) | **Supported; the verified path** | Linux CI with containerd and a real kernel (networking, published ports); a single-node staging VPS on v1.1.0 ([staging guide](hetzner-arm-staging.md)). v1.2.0 has not run on a staging node yet. |
+| [Single host](#single-host) | **Supported; single-process smoke verified** | Manager with mock runtime and the NATS sidecar on macOS: API deploy plus `state export`/`import` round-trip; Linux CI covers containerd networking, and the v1.1.0 staging setup used two processes (current CLI not yet staged). |
 | [Single host, operated from a workstation](#operating-from-a-workstation) | Supported | `minga-ctl` integration tests against a real API server in CI |
 | [Air-gapped single host](#air-gapped) | Supported | The same binaries and steps as a single host; no separate validation run is recorded |
 | [Talos Linux, single node](#talos-linux) | Supported | Docker-provisioned Talos v1.14.5 (arm64) through workload start; bare metal not validated |
 | [Container image](#container-image) | Supported | Image verified on arm64 |
 | [Multi-node](#multi-node) | **Control plane only** | In-process multi-node tests in CI (Raft with mTLS, a NATS cluster); not validated on separate machines |
 
-Not supported in v1.2.0: containers on different nodes reaching each other,
-adding a node to a running cluster, nodes running different versions, and TLS
-on the API listener. See [what is not supported](#not-supported).
+Not supported: containers on different nodes reaching each other, nodes running
+different versions, and TLS on the API listener. See
+[what is not supported](#not-supported).
 
 ## Single host
 
-Two processes on one Linux host. `minga api` is its own Raft voter today, so
-the manager and the API peer with each other:
+One process on one Linux host. `minga manager` is the sole Raft voter and
+serves the Docker Engine API:
 
 ```mermaid
 flowchart LR
   subgraph host["One Linux host"]
-    m["minga manager<br/>scheduler + supervisor"] <-->|Raft 127.0.0.1| a["minga api<br/>:2375"]
+    m["minga manager<br/>Raft voter + scheduler + supervisor + API :2375"]
     m --> n["nats-server sidecar<br/>127.0.0.1:4222"]
     m --> c[containerd]
   end
-  op["minga deploy / minga-ctl"] -->|Docker API| a
+  op["minga deploy / minga-ctl"] -->|Docker API| m
 ```
 
 | Process | Typical flags |
 | --- | --- |
-| `minga manager` | `--node-id 1 --bind 127.0.0.1:7001 --peer 2=127.0.0.1:7002 --runtime containerd --metrics-bind 127.0.0.1:9100` |
-| `minga api` | `--node-id 2 --bind 127.0.0.1:7002 --peer 1=127.0.0.1:7001 --data-dir /var/lib/minga-api --api-bind 127.0.0.1:2375`, with `MINGA_API_TOKEN` in its environment |
+| `minga manager` | `--node-id 1 --bind 127.0.0.1:7001 --runtime containerd --metrics-bind 127.0.0.1:9100 --api-bind 127.0.0.1:2375`, with `MINGA_API_TOKEN` in its environment |
 
-The [quick start](../README.md#quick-start-one-linux-host) runs this in two
-terminals; the [staging guide](hetzner-arm-staging.md#single-node-configuration)
-runs it as two systemd units.
+The [quick start](../README.md#quick-start-one-linux-host) starts one
+manager; the [staging guide](hetzner-arm-staging.md#single-node-configuration)
+configures one systemd unit.
 
 **Ports on the host**
 
 | Port | Bound by | Default | Reach from |
 | --- | --- | --- | --- |
-| Raft (`--bind`) | each process | none; choose, for example 7001 and 7002 | The other voters only. Keep it on 127.0.0.1 here. |
-| 2375 (`--api-bind`) | `minga api` | `0.0.0.0:2375` | Operators and tools. Bind 127.0.0.1 unless containers such as Traefik must reach it, then set a token and firewall the port. |
+| Raft (`--bind`) | `minga manager` | required; one voter on a single host | Other managers. Keep it on 127.0.0.1 for this one-manager topology. |
+| 2375 (`--api-bind`) | `minga manager` | `0.0.0.0:2375` | Operators and tools. Bind 127.0.0.1 unless containers such as Traefik must reach it, then set a token and firewall the port. |
 | 4222, 8222 | the NATS sidecar | 127.0.0.1 only | The node itself. |
 | `--metrics-bind` | `minga manager` | not served | Your monitoring. |
 | `--egress-bind` | `minga manager` | not served | Agent tasks on the node. |
@@ -122,29 +122,31 @@ stacks across nodes, not one stack whose services talk across nodes.
 
 ```mermaid
 flowchart TB
-  natsx[("external NATS<br/>tls://, client certificates")]
+  natsx[("NATS cluster<br/>route TLS")]
   m1["manager 1"] <-->|Raft mTLS| m2["manager 2"]
   m2 <-->|Raft mTLS| m3["manager 3"]
-  a["minga api"] <-->|Raft mTLS| m1
-  w["worker"] <-->|Raft mTLS| m1
-  m1 & m2 & m3 & a & w -->|commands, status, logs| natsx
+  w["worker"] -->|client mTLS| natsx
+  m1 & m2 & m3 -->|JetStream| natsx
 ```
 
-**Every node needs**
+**Managers**
 
-- A unique `--node-id`, a `--bind` address the other nodes can reach, and a
-  `--peer` entry for **every** other voter, `minga api` included. Membership
-  is fixed at first start, so start all of them together.
+- Each manager needs a unique `--node-id`, a `--bind` address reachable by the
+  other voters, and an initial `--peer` entry for every other voter when bootstrapping.
+  A joining manager uses `--join` and is added through the authenticated API.
 - Raft TLS: `--raft-tls-ca`, `--raft-tls-cert` and `--raft-tls-key`, from
   `minga tls init-ca` and `minga tls issue-node` (keys 0600). Without it,
   anything that reaches a Raft port can rewrite cluster state; Minga only logs
   a warning.
-- The same external NATS: `--nats-url tls://...` (a comma-separated list for a
-  cluster) and `MINGA_NATS_TLS_CA`, `MINGA_NATS_TLS_CERT`,
-  `MINGA_NATS_TLS_KEY` and `MINGA_NATS_TLS_SERVER_NAME`. A manager without
-  `--nats-url` starts its own sidecar on 127.0.0.1 and splits the bus. Set
-  `--nats-replicas 3` on the managers with a NATS cluster of three or more.
-- The same Minga version. Upgrade every node together.
+- Use the same external NATS cluster, or route-TLS sidecars on each manager.
+  Set `--nats-replicas 3` on managers with a three-server NATS cluster.
+
+**Workers**
+
+- Connect to the managers' NATS seed list with `--nats-url` and their
+  certificate identity. Workers have no Raft bind, peer list, or Raft data.
+- Token-only NATS mode is development-only and does not isolate workers.
+- The same Minga version must run on every node. Upgrade all nodes together.
 
 **What stays per node**
 
@@ -160,22 +162,17 @@ flowchart TB
 
 **Limits today**
 
-- Every node is a Raft voter, workers and `minga api` included, so quorum
-  depends on all of them, and an unreliable worker can stall deploys.
-- Only managers and `minga api` place tasks. If a worker becomes Raft leader,
-  placement stops until leadership moves back.
-- Node liveness goes through Raft leases compared with the leader's clock, so
-  clock skew of more than 30 s misjudges liveness.
-
-The plan to lift these (workers leaving Raft, a WireGuard mesh) is in
-[architecture.md](architecture.md#target-shape).
+- Cross-node container networking is not available until the WireGuard mesh
+  lands. Keep communicating services on one node with placement constraints.
+- During a worker partition, a task can run on both the disconnected worker and
+  its replacement until the worker reconnects. This is at-least-once delivery;
+  see [ADR 0006](adr/0006-workers-leave-raft.md#11-bus-partitions-preserve-running-tasks).
 
 ## Not supported
 
-| Not supported in v1.2.0 | What to do instead |
+| Currently unsupported | What to do instead |
 | --- | --- |
 | Containers on different nodes reaching each other | Keep services that talk to each other on one node with placement constraints. |
-| Adding a node to a running cluster | Plan the full `--peer` list up front. A new member means re-creating the cluster with the new list and restoring desired state with `minga state export` and `minga state import`. |
 | Nodes on different Minga versions | Upgrade all nodes together. |
 | TLS on the API listener | Reach the API through SSH (`minga-ctl`) or keep it on a trusted network with a token. |
 | Read-only or per-user API access | One shared token; [ADR 0005](adr/0005-api-identity-and-roles.md) is the proposed design. |

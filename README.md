@@ -47,18 +47,18 @@ Minga ships as **one binary** (plus the `nats-server` it supervises). There's no
 ## Features
 
 - **Compose-native.** Full spec parsing with interpolation, profiles, merge keys and `x-` extensions. Unknown keys fail loudly with suggestions. `command`, `entrypoint`, `labels`, `healthcheck` (gates task readiness), volumes, bind mounts, placement constraints and `deploy.restart_policy` reach the container.
-- **Swarm-compatible API.** Services, tasks, nodes, networks, secrets and configs, with label filters. `docker stack deploy`, `docker service ls`, `docker node ls` and Traefik v3's swarm provider work against `minga api`.
+- **Swarm-compatible API.** Services, tasks, nodes, networks, secrets and configs, with label filters. `docker stack deploy`, `docker service ls`, `docker node ls` and Traefik v3's swarm provider work against the manager's API.
 - **Raft consensus.** Desired state and placement go through [openraft](https://docs.rs/openraft), persisted in [redb](https://docs.rs/redb) as versioned JSON: a node refuses data it cannot read and says why, and fields added later need no wipe. mTLS on the Raft transport and bounded frames. No external etcd.
 - **Backup and restore.** `minga state export` writes services, networks, volumes and secret and config references to a 0600 file; `minga state import` restores them into a fresh cluster, where the scheduler places the tasks again. [docs/backup.md](docs/backup.md) lists what else to copy.
 - **Container networking on a node.** Deterministic per-task IPs from IPAM (each network gets its own /24 from `10.100.0.0/16`, or from `--overlay-supernet`, stored in Raft by the leader), one bridge per network, a netns and veth pair per task, iptables DNAT for published ports (traffic addressed to the node only, reachable from the node itself and from tasks through the node's address), and embedded DNS (`<svc>`, `tasks.<svc>`, `<svc>.<stack>.minga.local`). Cross-node traffic needs the WireGuard mesh, which is generated as config but not applied yet.
 - **Secrets and logs.** Secrets are external references staged per task and content-addressed, so rotation never changes a running task's files. `minga logs [-f]` shows separated stdout/stderr from a JetStream-retained backlog.
 - **Agent workloads.** `x-minga-agent` Compose services run as WASM modules under wasmtime with fuel and timeout limits. An LLM egress proxy enforces per-workload token budgets, caches responses and redacts secrets. Today the WASM guest gets no host I/O: no WASI, no network, so it can't reach the proxy yet. Memory limits aren't enforced, and Firecracker is a stub.
-- **Observability.** `/metrics`, `/healthz` and `/readyz` on `minga api`, and on manager and worker nodes via `--metrics-bind`. JSON logs on stderr for long-running roles. A failed container task keeps its last error and exit code, returned in the Docker API's task status and shown by `minga-ctl service ps` and `service inspect`; an agent task records the error only when it fails to start.
+- **Observability.** `/metrics`, `/healthz` and `/readyz` on the manager API, and on manager and worker nodes via `--metrics-bind`. JSON logs on stderr for long-running roles. A failed container task keeps its last error and exit code, returned in the Docker API's task status and shown by `minga-ctl service ps` and `service inspect`; an agent task records the error only when it fails to start.
 - **Air-gap friendly.** Release archives bundle a checksum-pinned `nats-server`, and `install.sh` verifies `SHA256SUMS`. A task pulls a missing image through containerd's Transfer API on the configured socket, with credentials from Docker credential helpers or inline `auths` that never appear on a command line; air-gapped sites preload images with `minga image pull` or `ctr` instead.
 
 ## Architecture
 
-Every role is the same `minga` binary. The manager runs the scheduler and the node supervisor, and spawns `nats-server` as a child process. Workers run the supervisor only. `minga api` serves the Docker Engine API and runs its own leadership-gated scheduler.
+Every role is the same `minga` binary. A manager is a Raft voter and runs the scheduler, API and supervisor, and spawns `nats-server` as a child process. Workers run the supervisor only and connect to JetStream; they do not open Raft state.
 
 ```mermaid
 flowchart LR
@@ -68,15 +68,11 @@ flowchart LR
     logs["minga logs"]
   end
 
-  subgraph mgr["minga manager (host A)"]
+  subgraph mgr["minga manager (Raft voter)"]
+    api["Docker Engine API v1.41<br/>+ /metrics /healthz /readyz"]
     sched["Scheduler<br/>(leader only)"]
     supA["Supervisor"]
     nats[("nats-server sidecar<br/>JetStream")]
-  end
-
-  subgraph apiproc["minga api (host A)"]
-    api["Docker Engine API v1.41<br/>+ /metrics /healthz /readyz"]
-    sched2["Scheduler<br/>(leader only)"]
   end
 
   subgraph wrk["minga worker (host B…N)"]
@@ -87,27 +83,29 @@ flowchart LR
 
   deploy -- HTTP --> api
   docker -- HTTP --> api
-  api -- writes --> raft
+  api -- desired state --> raft
   sched -- reads/writes --> raft
-  sched2 -- reads/writes --> raft
-  sched -- assign/stop --> nats
-  supA -- reads --> raft
-  supB -- reads --> raft
+  sched -- assignments --> nats
+  supA -- reads assignments --> nats
+  supB -- reads assignments --> nats
   supA -- status, logs, leases --> nats
   supB -- status, logs, leases --> nats
+  api -- actual task state --> nats
   logs -- reads --> nats
   supA --> ctrA["containerd + netns/bridge"]
   supB --> ctrB["containerd + netns/bridge"]
 ```
 
-> In `v1.2.0` **every `minga` process is a Raft voter**, including workers and `minga api`, and membership is fixed when the cluster first starts. Only desired state should go through Raft. Node lease renewals still do, as one atomic command every 10s. [docs/architecture.md](docs/architecture.md) explains why this matters for cluster size and quorum, and what replaces it.
+> Only managers vote in Raft. Workers receive assignments and report status,
+> logs and leases through JetStream; they never read or write Raft state.
+> [docs/architecture.md](docs/architecture.md) describes the state boundaries.
 
 ### How a deploy becomes a running container
 
 ```mermaid
 sequenceDiagram
   participant U as minga deploy
-  participant A as minga api
+  participant A as manager API
   participant R as Raft (leader)
   participant S as Scheduler (leader)
   participant B as NATS JetStream
@@ -120,14 +118,14 @@ sequenceDiagram
   loop every interval
     S->>R: list nodes, services, tasks
     S->>R: upsert task (node, IPs)
-    S->>B: Assign command
+    S->>B: publish assignment
   end
-  N->>B: pull Assign, refresh lease
-  N->>R: reconcile against local Raft replica (catch-up path)
+  N->>B: pull assignment, refresh lease
+  N->>N: reconcile MINGA_ASSIGN
   N->>N: netns + veth + IP, stage secrets
   N->>C: create container + task (FIFO stdout/stderr)
-  N->>R: mark task running
-  N->>B: status report, log chunks
+  N->>B: report task status
+  N->>B: report logs
   U->>A: GET /tasks until placed
 ```
 
@@ -154,7 +152,7 @@ flowchart TB
 ### Design principles
 
 - **Rust on the hot path.** Per-packet, per-request and per-sandbox work stays in Rust. Go components (embedded NATS) run as separate processes; there's no FFI. See [ADR 0001](docs/adr/0001-language-split.md).
-- **Only desired state goes through Raft.** Heartbeats, task status and agent run steps belong on JetStream ([ADR 0002](docs/adr/0002-event-bus-nats.md)). Node leases don't follow this yet; see the note above.
+- **Only desired state and placement go through Raft.** Heartbeats, task status, agent run steps and node leases belong on JetStream ([ADR 0002](docs/adr/0002-event-bus-nats.md)).
 - **Compose files deploy unchanged.** Unknown keys fail loudly instead of being skipped.
 - **Simplicity over complexity.** One binary, and no external dependencies for consensus or storage.
 
@@ -193,18 +191,13 @@ sudo install -m 0755 target/release/minga /usr/local/bin/minga
 sudo ctr -n minga images pull docker.io/library/nginx:1.27
 ```
 
-Today `minga api` is its own Raft voter, so a single host runs two processes that peer with each other:
+Start one manager process. It is the Raft voter, scheduler, supervisor,
+Docker Engine API and NATS sidecar:
 
 ```bash
-# Terminal 1: manager (scheduler + supervisor + NATS sidecar on 127.0.0.1:4222)
-sudo minga manager --node-id 1 --bind 127.0.0.1:7001 --peer 2=127.0.0.1:7002 \
+sudo MINGA_API_TOKEN=change-me minga manager --node-id 1 \
+  --bind 127.0.0.1:7001 --api-bind 127.0.0.1:2375 \
   --data-dir /var/lib/minga --runtime containerd --metrics-bind 127.0.0.1:9100
-```
-
-```bash
-# Terminal 2: Docker Engine API on :2375
-sudo MINGA_API_TOKEN=change-me minga api --node-id 2 --bind 127.0.0.1:7002 \
-  --peer 1=127.0.0.1:7001 --data-dir /var/lib/minga-api --api-bind 127.0.0.1:2375
 ```
 
 ```bash
@@ -241,23 +234,28 @@ Ports, what every node needs, what stays per node, and how far each layout is ve
 
 ```mermaid
 flowchart TB
-  subgraph single["1 · Single host (verified on Linux)"]
-    m1["minga manager<br/>+ nats sidecar"] <-->|Raft| a1["minga api"]
-    m1 --> ct1[containerd]
+  subgraph single["1 · Single host"]
+    m1["one minga manager<br/>Raft voter + API + NATS sidecar"] --> ct1[containerd]
   end
 
   subgraph multi["2 · Multi-node cluster (control plane only)"]
     direction LR
-    natsx[("external NATS<br/>tls://, mTLS")]
+    natsx[("manager sidecars with route TLS<br/>or external NATS")]
     mA["manager 1"] <-->|Raft mTLS| mB["manager 2"]
-    mB <-->|Raft mTLS| mC["manager 3 / api"]
-    w1["worker"] <-->|Raft mTLS| mA
-    mA & mB & mC & w1 -->|status, logs, commands| natsx
+    mB <-->|Raft mTLS| mC["manager 3"]
+    w1["worker"] -->|JetStream client mTLS| natsx
+    mA & mB & mC -->|JetStream| natsx
   end
 ```
 
-1. **Single host.** This is the verified path: containers reach each other by service name, and published ports work. It's the quick start above.
-2. **Multi-node.** Raft (with `--raft-tls-*`) and scheduling across nodes work. Three limits: every node must be listed with `--peer` and started together, containers on different nodes can't reach each other yet, and placement pauses if a worker wins the Raft election. The manager's NATS sidecar listens only on loopback, so **every manager and worker** must point at one external NATS server or cluster: a `tls://` URL (a comma-separated list for a cluster, with `--nats-replicas 3` on the managers so losing one NATS server loses no bus state) plus `MINGA_NATS_TLS_CA`, `MINGA_NATS_TLS_CERT`, `MINGA_NATS_TLS_KEY` and `MINGA_NATS_TLS_SERVER_NAME`. Those connections are certificate-only, since `--nats-token` is ignored over TLS. A manager left without `--nats-url` spawns its own private sidecar and splits the bus. Issue Raft certificates with `minga tls init-ca` and `minga tls issue-node`. **Raft TLS is required off loopback**: without `--raft-tls-*`, anyone who can reach the Raft port can rewrite cluster state, and a node bound off loopback without it only logs a warning.
+1. **Single host.** One process and one Raft voter serve the API and run tasks.
+   Containers reach each other by service name, and published ports work.
+2. **Multi-node.** Only managers vote in Raft. Workers connect to JetStream and
+   can join at runtime; managers can be added or removed through the API.
+   Managers use clustered route-TLS sidecars or an external NATS cluster.
+   Containers on different nodes still cannot reach each other until the
+   WireGuard mesh lands. See [supported topologies](docs/topologies.md) for
+   manager and worker flags, port requirements and current limits.
 3. **Talos Linux.** **Validated single-node install** on Talos v1.14: Minga runs as two `ContainerConfig` containers pulled from GHCR — no system extension, no custom boot asset — and workload images preload via a Kubernetes Job using the bundled `ctr`. Guide: [docs/talos-deployment.md](docs/talos-deployment.md). Bare-metal and multi-node are not hardware-validated.
 4. **Air-gapped.** Copy the release archive (with `minga`, `nats-server` and the licenses) and image tarballs to the site. Then run `ctr -n minga images import <image>.tar` on each node and start the roles as above. No step needs a network connection.
 
