@@ -43,6 +43,23 @@ pub fn load_or_generate_keypair(data_dir: &Path) -> Result<KeyPair, WireGuardErr
         source,
     })?;
     let path = data_dir.join("wg.key");
+    if path.symlink_metadata().is_ok() {
+        return read_keypair(&path);
+    }
+
+    // Write the key to a private temp file, then link it into place: `wg.key`
+    // only ever appears complete, and a concurrent start reads the winner's.
+    static NEXT_TMP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let tmp = data_dir.join(format!(
+        "wg.key.tmp.{}.{}",
+        std::process::id(),
+        NEXT_TMP.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let key_file_error = |path: &Path| {
+        let path = path.to_path_buf();
+        move |source| WireGuardError::KeyFile { path, source }
+    };
+    let keypair = KeyPair::generate();
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -50,29 +67,26 @@ pub fn load_or_generate_keypair(data_dir: &Path) -> Result<KeyPair, WireGuardErr
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-
-    match options.open(&path) {
-        Ok(mut file) => {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                file.set_permissions(std::fs::Permissions::from_mode(0o600))
-                    .map_err(|source| WireGuardError::KeyFile {
-                        path: path.clone(),
-                        source,
-                    })?;
-            }
-            let keypair = KeyPair::generate();
-            file.write_all(keypair.private_key.as_bytes())
-                .and_then(|()| file.sync_all())
-                .map_err(|source| WireGuardError::KeyFile {
-                    path: path.clone(),
-                    source,
-                })?;
+    // A leftover from a crashed process with a reused pid is stale.
+    let _ = fs::remove_file(&tmp);
+    let mut file = options.open(&tmp).map_err(key_file_error(&tmp))?;
+    let linked = file
+        .write_all(keypair.private_key.as_bytes())
+        .and_then(|()| file.sync_all())
+        .map_err(key_file_error(&tmp))
+        .map(|()| fs::hard_link(&tmp, &path));
+    drop(file);
+    let _ = fs::remove_file(&tmp);
+    match linked? {
+        Ok(()) => {
+            // Persist the new directory entry before the key is registered.
+            fs::File::open(data_dir)
+                .and_then(|dir| dir.sync_all())
+                .map_err(key_file_error(data_dir))?;
             Ok(keypair)
         }
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => read_keypair(&path),
-        Err(source) => Err(WireGuardError::KeyFile { path, source }),
+        Err(source) => Err(key_file_error(&path)(source)),
     }
 }
 
@@ -250,20 +264,31 @@ pub async fn run_wireguard_assignments(
             if event.key != key {
                 continue;
             }
-            apply_peer_assignment(
-                node_id,
-                event.value.as_deref(),
-                event.op == KvOp::Delete,
-                &key_path,
-                listen_port,
-                mtu,
-                &mut peer_count,
-            );
+            // `ip` and `wg` block; keep them off the runtime the scheduler
+            // and supervisor share.
+            let key_path = key_path.clone();
+            let current = peer_count;
+            peer_count = tokio::task::spawn_blocking(move || {
+                let mut peer_count = current;
+                apply_peer_assignment(
+                    node_id,
+                    event.value.as_deref(),
+                    event.op == KvOp::Delete,
+                    &key_path,
+                    listen_port,
+                    mtu,
+                    &mut peer_count,
+                );
+                peer_count
+            })
+            .await
+            .unwrap_or(current);
         }
         tracing::warn!(
             node_id,
             "WireGuard peer assignment watch ended; reconnecting"
         );
+        tokio::time::sleep(Duration::from_secs(1)).await;
     }
 }
 
@@ -349,6 +374,34 @@ mod tests {
                 fs::metadata(path).unwrap().permissions().mode() & 0o777,
                 0o600
             );
+        }
+    }
+
+    #[test]
+    fn concurrent_starts_agree_on_one_complete_key() {
+        for _ in 0..20 {
+            let dir = tempfile::tempdir().unwrap();
+            let start = Arc::new(std::sync::Barrier::new(32));
+            let handles: Vec<_> = (0..32)
+                .map(|_| {
+                    let path = dir.path().to_path_buf();
+                    let start = start.clone();
+                    std::thread::spawn(move || {
+                        start.wait();
+                        load_or_generate_keypair(&path).map(|keypair| keypair.private_key)
+                    })
+                })
+                .collect();
+            let keys: Vec<_> = handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap().expect("no start sees a partial key"))
+                .collect();
+            assert!(keys.iter().all(|key| key == &keys[0]));
+            let leftovers: Vec<_> = fs::read_dir(dir.path())
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect();
+            assert_eq!(leftovers, ["wg.key"], "no temp files are left behind");
         }
     }
 
