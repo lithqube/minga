@@ -27,7 +27,7 @@ use crate::{constraints, netassign};
 /// A node counts for placement if it is active, currently has a bus lease,
 /// and matches all of the service's constraints. Callers filter expired
 /// leases before handing nodes to this pure planner.
-fn is_eligible(n: &ClusterNode, service: &Service) -> bool {
+pub(crate) fn is_eligible(n: &ClusterNode, service: &Service) -> bool {
     n.status == NodeStatus::Active
         && service
             .constraints

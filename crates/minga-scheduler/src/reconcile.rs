@@ -17,7 +17,7 @@ use minga_state::types::{
     UpdateOrder,
 };
 
-use crate::placement::{place_service, slot_of};
+use crate::placement::{is_eligible, place_service, slot_of};
 
 /// An action the reconcile loop should take to converge the cluster.
 #[derive(Debug, Clone, PartialEq)]
@@ -84,15 +84,24 @@ pub fn plan(
 
     // --- per-service: create missing, remove stale ----------------------------
     for service in services {
-        let desired = place_service(service, nodes, tasks, networks, now_unix);
-        let desired_ids: HashSet<&str> = desired.iter().map(|t| t.id.as_str()).collect();
-
+        let mut desired = place_service(service, nodes, tasks, networks, now_unix);
         let existing = existing_by_service
             .get(service.id.as_str())
             .map(|v| v.as_slice())
             .unwrap_or(&[]);
         let existing_by_id: HashMap<&str, &Task> =
             existing.iter().map(|t| (t.id.as_str(), *t)).collect();
+        for task in &mut desired {
+            if let Some(previous) = existing_by_id.get(task.id.as_str()) {
+                if nodes
+                    .iter()
+                    .any(|node| node.id == previous.node_id && is_eligible(node, service))
+                {
+                    task.node_id = previous.node_id;
+                }
+            }
+        }
+        let desired_ids: HashSet<&str> = desired.iter().map(|t| t.id.as_str()).collect();
         let desired_slots: HashSet<&str> = desired.iter().map(|t| slot_of(&t.id)).collect();
 
         // Stale tasks either hand their slot to a newer revision, or have
@@ -134,6 +143,7 @@ pub fn plan(
         let busy = desired
             .iter()
             .filter(|t| match current(t) {
+                Some(task) if task.node_id != t.node_id => false,
                 Some(task) if has_failed(task) => update.failure_action != FailureAction::Continue,
                 Some(task) => {
                     task.state != TaskState::Running
@@ -155,6 +165,12 @@ pub fn plan(
                 .map_or(&[][..], Vec::as_slice);
 
             if let Some(new) = current(task) {
+                if new.node_id != task.node_id {
+                    // Placement changed. Reassign the stable task ID; projection
+                    // cleanup removes its old bus key.
+                    actions.push(ReconcileAction::CreateTask(Box::new(task.clone())));
+                    continue;
+                }
                 // With a healthcheck, Running means the first probe passed.
                 // A new task that fails leaves the old one up.
                 if new.state == TaskState::Running && !has_failed(new) {
@@ -552,6 +568,31 @@ mod tests {
         let mut ids = task_ids(&actions);
         ids.sort();
         assert_eq!(ids, vec!["-web.1", "-web.2"]);
+    }
+
+    #[test]
+    fn task_on_missing_node_is_reassigned_to_live_node() {
+        let service = svc("web", 1);
+        let existing = vec![task("web.1", "web", 1)];
+
+        let actions = plan(&[service], &existing, &[node(2)], &[], 0);
+
+        assert_eq!(actions.len(), 1);
+        let ReconcileAction::CreateTask(reassigned) = &actions[0] else {
+            panic!("missing-node task should be reassigned");
+        };
+        assert_eq!(reassigned.id, existing[0].id);
+        assert_eq!(reassigned.node_id, 2);
+    }
+
+    #[test]
+    fn reassigned_task_stays_on_replacement_when_old_node_returns() {
+        let service = svc("web", 1);
+        let existing = vec![task("web.1", "web", 2)];
+
+        let actions = plan(&[service], &existing, &[node(1), node(2)], &[], 0);
+
+        assert!(actions.is_empty());
     }
 
     #[test]
