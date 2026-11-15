@@ -1,53 +1,25 @@
 //! Node supervisor: the reconcile loop that runs tasks on this node.
 //!
-//! The supervisor runs on every node (manager and worker). It receives
-//! task assign/stop commands via the event bus, executes them through
-//! the container [`Runtime`], and reports actual state back over the bus.
+//! The supervisor consumes assignment records from MINGA_ASSIGN, executes
+//! them through the container [`Runtime`], and reports actual state over
+//! the bus.
 //!
-//! Task status (running, failed, etc.) is tracked locally — it does NOT
-//! go through Raft. Per the architecture principle: "Only desired state
-//! and placement go through Raft. Heartbeats, task status and agent run
-//! steps go through JetStream."
+//! Task status is published to MINGA_STATUS, not Raft. Per the architecture
+//! principle: "Only desired state and placement go through Raft. Heartbeats,
+//! task status and agent run steps go through JetStream."
 //!
-//! # Reconcile loop
-//!
-//! ```text
-//! loop {
-//!     // Bus path: pull commands and publish status
-//!     while let Some(cmd) = bus.next_command(node_id) {
-//!         match cmd {
-//!             Assign { task_id, spec } => runtime.start(task_id, spec),
-//!             Stop { task_id } => runtime.stop(task_id),
-//!         }
-//!     }
-//!     for task in running_tasks {
-//!         bus.put_status(task.{id}, TaskStatusReport::running(task))
-//!     }
-//!
-//!     // Raft fallback: reconcile with desired state (catch-up after restart)
-//!     tasks = state.list_tasks().filter(node_id == self.node_id)
-//!     for task in tasks where task.id not in running {
-//!         runtime.start(task.id, task.spec)
-//!     }
-//!     for task_id in running where task_id not in tasks {
-//!         runtime.stop(task_id)
-//!     }
-//!
-//!     sleep(interval)
-//! }
-//! ```
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
 use minga_bus::{
-    subjects, Command, EventBus, LogEntry, LogStream, TaskActualState, TaskStatusReport,
+    subjects, EventBus, KvStream, LogEntry, LogStream, TaskActualState, TaskStatusReport,
 };
 use minga_state::types::{
-    unix_now, NodeId, RestartCondition, Task, TaskId, TaskSpec, TaskState, WorkloadKind,
+    unix_now, NetworkAssignment, NodeId, RestartCondition, TaskAssignment, TaskId, TaskSpec,
+    TaskState, WorkloadKind,
 };
-use minga_state::{StateError, StateStore};
 use thiserror::Error;
 use tokio::sync::Mutex;
 
@@ -56,10 +28,76 @@ use crate::failure::{self, Failure};
 use crate::health::{self, Health};
 use crate::runtime::{ContainerStatus, Runtime, RuntimeError};
 
+#[derive(Clone)]
+pub struct Assignments {
+    bus: Arc<dyn EventBus>,
+    prefix: String,
+    node_id: Option<NodeId>,
+}
+
+impl Assignments {
+    /// Manager sources list all assignment keys; worker sources are node-scoped.
+    pub fn new(bus: Arc<dyn EventBus>, node_id: Option<NodeId>) -> Self {
+        let prefix = node_id
+            .map(|id| format!("node.{id}.task."))
+            .unwrap_or_default();
+        Self {
+            bus,
+            prefix,
+            node_id,
+        }
+    }
+
+    pub async fn list(&self) -> Result<Vec<TaskAssignment>, String> {
+        let entries = self
+            .bus
+            .list_assignments(&self.prefix)
+            .await
+            .map_err(|e| e.to_string())?;
+        entries
+            .into_iter()
+            .filter(|(key, _)| key.starts_with("node."))
+            .map(|(key, bytes)| {
+                let assignment: TaskAssignment = minga_state::codec::decode_wire(&bytes)
+                    .map_err(|e| format!("invalid assignment {key}: {e}"))?;
+                if self.node_id.is_some_and(|node| assignment.node_id != node)
+                    || key != format!("node.{}.task.{}", assignment.node_id, assignment.task_id)
+                {
+                    return Err(format!("assignment key/value mismatch: {key}"));
+                }
+                Ok(assignment)
+            })
+            .collect()
+    }
+
+    pub async fn watch(&self) -> Result<KvStream, String> {
+        self.bus
+            .watch_assignments(&self.prefix)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    pub async fn networks(&self) -> Result<Vec<NetworkAssignment>, String> {
+        let entries = self
+            .bus
+            .list_assignments("net.")
+            .await
+            .map_err(|e| e.to_string())?;
+        entries
+            .into_iter()
+            .map(|(key, bytes)| {
+                let assignment: NetworkAssignment = minga_state::codec::decode_wire(&bytes)
+                    .map_err(|e| format!("invalid network assignment {key}: {e}"))?;
+                if key != format!("net.{}", assignment.network.id) {
+                    return Err(format!("network assignment key/value mismatch: {key}"));
+                }
+                Ok(assignment)
+            })
+            .collect()
+    }
+}
 #[derive(Debug, Error)]
 pub enum SupervisorError {
-    #[error("state error: {0}")]
-    State(#[from] StateError),
     #[error("runtime error: {0}")]
     Runtime(#[from] RuntimeError),
     #[error("agent error: {0}")]
@@ -93,9 +131,8 @@ struct RestartState {
 type RestartStates = Arc<Mutex<HashMap<TaskId, RestartState>>>;
 
 /// Node networking for the supervisor: DNS service discovery backed by
-/// cluster state. The data plane itself (netns/bridges) is applied by the
-/// container runtime; the supervisor keeps DNS records and listeners in
-/// sync with the tasks placed here.
+/// MINGA_ASSIGN network records. The data plane itself (netns/bridges) is
+/// applied by the container runtime.
 #[cfg(target_os = "linux")]
 pub struct SupervisorNetworking {
     setup: Arc<crate::netns::NetworkSetup>,
@@ -121,46 +158,29 @@ impl SupervisorNetworking {
     }
 }
 
-/// Builds DNS records from services and this node's tasks: every
-/// non-terminal task IP is registered under both the service FQDN
-/// (`web.shop.minga.local`) and its own task FQDN. Pure data — compiled
-/// wherever Linux or tests run.
+/// Builds DNS records from MINGA_ASSIGN network/DNS entries.
 #[cfg(any(target_os = "linux", test))]
-fn build_dns_store(
-    services: &[minga_state::types::Service],
-    tasks: &[minga_state::types::Task],
-) -> minga_net::DnsStore {
-    use minga_state::types::TaskState;
-
+fn build_dns_store(assignments: &[NetworkAssignment], node_id: NodeId) -> minga_net::DnsStore {
     let mut store = minga_net::DnsStore::new();
-    for task in tasks {
-        if task.state != TaskState::Running {
-            continue;
-        }
-        let Some(svc) = services.iter().find(|s| s.id == task.service_id) else {
-            continue;
-        };
-        let stack = svc
-            .env
-            .get("MINGA_STACK")
-            .map(String::as_str)
-            .unwrap_or("default");
-        // The DNS name is the short service name. `svc.id` is always
-        // `stack.name`; `svc.name` is only bare on the Compose path —
-        // the API path re-derives it as the full ID.
-        let prefix = format!("{stack}.");
-        let short = svc.id.strip_prefix(&prefix).unwrap_or(&svc.name);
-        for raw_ip in task.spec.ips.values() {
-            let Ok(ip) = raw_ip.parse::<std::net::Ipv4Addr>() else {
+    for assignment in assignments {
+        for task in assignment
+            .tasks
+            .iter()
+            .filter(|task| task.node_id == node_id)
+        {
+            let Ok(ip) = task.ip.parse::<std::net::Ipv4Addr>() else {
                 continue;
             };
-            // Docker semantics: the bare service name resolves directly
-            // (musl-based images have no search-domain support, so the
-            // short name must exist as a record, not only via `search`).
-            store.add(short, ip);
-            store.add(format!("tasks.{short}"), ip);
-            store.add(minga_net::dns::service_fqdn(short, stack), ip);
-            store.add(minga_net::dns::task_fqdn(&task.id, short, stack), ip);
+            store.add(&task.service_name, ip);
+            store.add(format!("tasks.{}", task.service_name), ip);
+            store.add(
+                minga_net::dns::service_fqdn(&task.service_name, &task.stack),
+                ip,
+            );
+            store.add(
+                minga_net::dns::task_fqdn(&task.task_id, &task.service_name, &task.stack),
+                ip,
+            );
         }
     }
     store
@@ -169,13 +189,11 @@ fn build_dns_store(
 /// The node supervisor. Runs a reconcile loop that converges the local
 /// container/agent state with the tasks assigned to this node.
 ///
-/// When constructed with [`Supervisor::with_bus`], the supervisor also
-/// receives commands via the event bus and reports status back over it.
-///
-/// When constructed with [`Supervisor::with_agent_executor`], the
-/// supervisor can also run agent (WASM sandbox) workloads.
+/// A worker supervisor reads node-scoped assignment records and reports
+/// actual state over the bus. It does not consume task commands or access
+/// the consensus state store.
 pub struct Supervisor {
-    state: Arc<StateStore>,
+    assignments: Assignments,
     runtime: Arc<dyn Runtime>,
     agent_executor: Option<Arc<dyn AgentExecutor>>,
     bus: Option<Arc<dyn EventBus>>,
@@ -184,6 +202,8 @@ pub struct Supervisor {
     running_agents: RunningAgents,
     log_offsets: LogOffsets,
     restart_states: RestartStates,
+    finished: Arc<Mutex<HashSet<TaskId>>>,
+    task_assignments: Arc<Mutex<HashMap<TaskId, TaskAssignment>>>,
     health: Arc<Mutex<HashMap<TaskId, Health>>>,
     #[cfg(target_os = "linux")]
     networking: Option<SupervisorNetworking>,
@@ -200,65 +220,50 @@ struct TaskStatusUpdate {
 }
 
 impl Supervisor {
-    pub fn new(state: Arc<StateStore>, runtime: Arc<dyn Runtime>, node_id: NodeId) -> Self {
-        Self {
-            state,
-            runtime,
-            agent_executor: None,
-            bus: None,
-            node_id,
-            running: Arc::new(Mutex::new(HashMap::new())),
-            running_agents: Arc::new(Mutex::new(HashSet::new())),
-            log_offsets: Arc::new(Mutex::new(HashMap::new())),
-            restart_states: Arc::new(Mutex::new(HashMap::new())),
-            health: Arc::new(Mutex::new(HashMap::new())),
-            #[cfg(target_os = "linux")]
-            networking: None,
-        }
+    pub fn new(assignments: Assignments, runtime: Arc<dyn Runtime>, node_id: NodeId) -> Self {
+        Self::build(assignments, runtime, None, None, node_id)
     }
 
-    /// Create a supervisor that receives commands and reports status
-    /// via the event bus.
-    pub fn with_bus(
-        state: Arc<StateStore>,
-        runtime: Arc<dyn Runtime>,
-        bus: Arc<dyn EventBus>,
-        node_id: NodeId,
-    ) -> Self {
-        Self {
-            state,
-            runtime,
-            agent_executor: None,
-            bus: Some(bus),
-            node_id,
-            running: Arc::new(Mutex::new(HashMap::new())),
-            running_agents: Arc::new(Mutex::new(HashSet::new())),
-            log_offsets: Arc::new(Mutex::new(HashMap::new())),
-            restart_states: Arc::new(Mutex::new(HashMap::new())),
-            health: Arc::new(Mutex::new(HashMap::new())),
-            #[cfg(target_os = "linux")]
-            networking: None,
-        }
+    pub fn with_bus(runtime: Arc<dyn Runtime>, bus: Arc<dyn EventBus>, node_id: NodeId) -> Self {
+        let assignments = Assignments::new(bus.clone(), Some(node_id));
+        Self::build(assignments, runtime, Some(bus), None, node_id)
     }
 
-    /// Create a supervisor with bus and agent executor support.
     pub fn with_agent_executor(
-        state: Arc<StateStore>,
         runtime: Arc<dyn Runtime>,
         bus: Arc<dyn EventBus>,
         agent_executor: Arc<dyn AgentExecutor>,
         node_id: NodeId,
     ) -> Self {
-        Self {
-            state,
+        let assignments = Assignments::new(bus.clone(), Some(node_id));
+        Self::build(
+            assignments,
             runtime,
-            agent_executor: Some(agent_executor),
-            bus: Some(bus),
+            Some(bus),
+            Some(agent_executor),
+            node_id,
+        )
+    }
+
+    fn build(
+        assignments: Assignments,
+        runtime: Arc<dyn Runtime>,
+        bus: Option<Arc<dyn EventBus>>,
+        agent_executor: Option<Arc<dyn AgentExecutor>>,
+        node_id: NodeId,
+    ) -> Self {
+        Self {
+            assignments,
+            runtime,
+            agent_executor,
+            bus,
             node_id,
             running: Arc::new(Mutex::new(HashMap::new())),
             running_agents: Arc::new(Mutex::new(HashSet::new())),
             log_offsets: Arc::new(Mutex::new(HashMap::new())),
             restart_states: Arc::new(Mutex::new(HashMap::new())),
+            finished: Arc::new(Mutex::new(HashSet::new())),
+            task_assignments: Arc::new(Mutex::new(HashMap::new())),
             health: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(target_os = "linux")]
             networking: None,
@@ -293,16 +298,11 @@ impl Supervisor {
     /// Runs one reconciliation pass. Returns the number of actions taken
     /// (containers started + stopped).
     pub async fn reconcile_once(&self) -> Result<usize, SupervisorError> {
-        let mut actions = 0;
-
-        // --- Bus path: commands, lease, status --------------------------------
+        let mut actions = self.assignment_reconcile().await;
         if let Some(bus) = &self.bus {
-            actions += self.bus_reconcile(bus).await;
+            self.publish_status(bus).await;
+            self.stream_logs(bus).await;
         }
-
-        // --- Raft fallback: reconcile with desired state ----------------------
-        actions += self.raft_reconcile().await?;
-
         self.check_health().await;
 
         // --- Restart policy: check failed containers, restart if needed -------
@@ -322,98 +322,30 @@ impl Supervisor {
         Ok(actions)
     }
 
-    /// Rebuilds DNS records from cluster state and reconciles the DNS
-    /// server's listen addresses with the networks' bridge gateways.
-    /// Runs every pass: the record rebuild is cheap and idempotent, and
-    /// the server restarts only when the bind set actually changes.
+    /// Rebuilds DNS records from network assignment entries and reconciles
+    /// listener addresses with the networks' bridge gateways.
+    /// The server restarts only when the bind set actually changes.
     #[cfg(target_os = "linux")]
     async fn sync_dns(&self) {
         let Some(net) = &self.networking else {
             return;
         };
 
-        let services = match self.state.list_services().await {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::error!(error = %e, "dns sync: list services failed");
+        let assignments = match self.assignments.networks().await {
+            Ok(assignments) => assignments,
+            Err(error) => {
+                tracing::warn!(%error, "dns sync: cannot read network assignments");
                 return;
             }
         };
-        let tasks = match self.state.list_tasks().await {
-            Ok(t) => t,
-            Err(e) => {
-                tracing::error!(error = %e, "dns sync: list tasks failed");
-                return;
-            }
-        };
-        let networks = match self.state.list_networks().await {
-            Ok(n) => n,
-            Err(e) => {
-                tracing::error!(error = %e, "dns sync: list networks failed");
-                return;
-            }
-        };
-
-        // Only this node's tasks answer from this node's listener — the
-        // records are the same cluster-wide, but only local tasks are
-        // reachable through this node's bridges.
-        let mut my_tasks: Vec<_> = tasks
-            .iter()
-            .filter(|task| task.node_id == self.node_id)
-            .cloned()
-            .collect();
-        for task in &mut my_tasks {
-            task.state = TaskState::Starting;
-        }
-        if let Some(bus) = &self.bus {
-            match bus.list_status().await {
-                Ok(entries) => {
-                    for (key, bytes) in entries {
-                        if !key.starts_with("task.") {
-                            continue;
-                        }
-                        let report = match TaskStatusReport::from_bytes(&bytes) {
-                            Ok(report) if key == subjects::kv_task_status(&report.task_id) => {
-                                report
-                            }
-                            Ok(_) => continue,
-                            Err(error) => {
-                                tracing::warn!(key, error = %error, "dns sync: invalid task status");
-                                continue;
-                            }
-                        };
-                        if report.node_id != self.node_id {
-                            continue;
-                        }
-                        if let Some(task) =
-                            my_tasks.iter_mut().find(|task| task.id == report.task_id)
-                        {
-                            task.state = match report.state {
-                                TaskActualState::Starting => TaskState::Starting,
-                                TaskActualState::Running => TaskState::Running,
-                                TaskActualState::Stopped => TaskState::Stopped,
-                                TaskActualState::Failed => TaskState::Failed,
-                            };
-                        }
-                    }
-                }
-                Err(error) => {
-                    tracing::warn!(error = %error, "dns sync: cannot read task status");
-                }
-            }
-        }
-        let store = build_dns_store(&services, &my_tasks);
-        tracing::debug!(
-            records = store.len(),
-            services = services.len(),
-            my_tasks = my_tasks.len(),
-            "dns: records rebuilt"
-        );
+        let store = build_dns_store(&assignments, self.node_id);
         *net.dns_store.write().unwrap() = store;
-
-        let mut binds: Vec<std::net::SocketAddr> = networks
+        let mut binds: Vec<std::net::SocketAddr> = assignments
             .iter()
-            .filter_map(|n| net.setup.gateway_for(&n.id, n.subnet.as_deref()))
+            .filter_map(|assignment| {
+                net.setup
+                    .gateway_for(&assignment.network.id, assignment.network.subnet.as_deref())
+            })
             .map(|ip| std::net::SocketAddr::new(std::net::IpAddr::V4(ip), 53))
             .collect();
         binds.sort();
@@ -477,19 +409,13 @@ impl Supervisor {
                     .map(|s| matches!(s, AgentStatus::Completed))
                     .unwrap_or(false);
 
-                let spec = match self.state.get_task(&task_id).await {
-                    Ok(Some(t)) => t.spec,
-                    _ => {
+                let spec = match self.task_assignments.lock().await.get(&task_id) {
+                    Some(assignment) => assignment.spec.clone(),
+                    None => {
                         let states = self.restart_states.lock().await;
                         match states.get(&task_id) {
                             Some(rs) => rs.spec.clone(),
-                            None => {
-                                tracing::warn!(
-                                    task = %task_id,
-                                    "failed agent not found in state, cannot restart"
-                                );
-                                continue;
-                            }
+                            None => continue,
                         }
                     }
                 };
@@ -507,6 +433,7 @@ impl Supervisor {
                         task = %task_id,
                         "agent exited cleanly, restart policy does not apply"
                     );
+                    self.finished.lock().await.insert(task_id.clone());
                     self.running_agents.lock().await.remove(&task_id);
                     continue;
                 }
@@ -530,6 +457,7 @@ impl Supervisor {
                                 "agent failed, max restart attempts reached"
                             );
                             states.remove(&task_id);
+                            self.finished.lock().await.insert(task_id.clone());
                             self.running_agents.lock().await.remove(&task_id);
                             continue;
                         }
@@ -602,28 +530,22 @@ impl Supervisor {
             // exited, this only removes the task and container records.
             let _ = self.runtime.stop(&container_id).await;
 
-            // Look up the task spec from Raft to get the restart policy.
-            let record = self.state.get_task(&task_id).await.ok().flatten();
+            let assignment = self.task_assignments.lock().await.get(&task_id).cloned();
             let prior_error = match &self.bus {
                 Some(bus) => self
                     .read_task_status(bus, &task_id)
                     .await
                     .and_then(|status| status.last_error),
-                None => record.as_ref().and_then(|task| task.last_error.clone()),
+                None => None,
             };
             let failure = failure::exit(exit_code, prior_error.as_deref());
-            let spec = match record {
-                Some(t) => t.spec,
+            let spec = match assignment {
+                Some(assignment) => assignment.spec,
                 None => {
                     let states = self.restart_states.lock().await;
-                    if let Some(rs) = states.get(&task_id) {
-                        rs.spec.clone()
-                    } else {
-                        tracing::warn!(
-                            task = %task_id,
-                            "terminated task not found in state, cannot restart"
-                        );
-                        continue;
+                    match states.get(&task_id) {
+                        Some(rs) => rs.spec.clone(),
+                        None => continue,
                     }
                 }
             };
@@ -636,6 +558,7 @@ impl Supervisor {
                 } else {
                     TaskState::Failed
                 };
+                self.finished.lock().await.insert(task_id.clone());
                 self.mark_task(&task_id, end, Some(failure)).await;
                 continue;
             }
@@ -654,6 +577,7 @@ impl Supervisor {
                     exit_code = ?exit_code,
                     "task exited cleanly, restart policy does not apply"
                 );
+                self.finished.lock().await.insert(task_id.clone());
                 self.mark_task(&task_id, TaskState::Stopped, Some(failure))
                     .await;
                 continue;
@@ -682,6 +606,7 @@ impl Supervisor {
                         );
                         states.remove(&task_id);
                         drop(states);
+                        self.finished.lock().await.insert(task_id.clone());
                         self.mark_task_state(&task_id, TaskState::Failed).await;
                         continue;
                     }
@@ -699,8 +624,19 @@ impl Supervisor {
             };
 
             // Restart the task.
+            let networks = self
+                .task_assignments
+                .lock()
+                .await
+                .get(&task_id)
+                .map(|assignment| assignment.networks.clone())
+                .unwrap_or_default();
             match &new_spec.kind {
-                WorkloadKind::Container => match self.runtime.start(&task_id, &new_spec).await {
+                WorkloadKind::Container => match self
+                    .runtime
+                    .start_assigned(&task_id, &new_spec, &networks)
+                    .await
+                {
                     Ok(new_container_id) => {
                         minga_telemetry::METRICS.task_restarts_total.inc();
                         tracing::info!(
@@ -762,35 +698,6 @@ impl Supervisor {
         actions
     }
 
-    /// Bus reconcile: pull commands and publish status.
-    async fn bus_reconcile(&self, bus: &Arc<dyn EventBus>) -> usize {
-        let mut actions = 0;
-
-        // Pull commands (non-blocking, 100ms timeout per pull).
-        loop {
-            match tokio::time::timeout(Duration::from_millis(100), bus.next_command(self.node_id))
-                .await
-            {
-                Ok(Ok(cmd)) => {
-                    actions += self.execute_command(cmd).await;
-                }
-                Ok(Err(e)) => {
-                    tracing::error!(node = self.node_id, error = %e, "bus command error");
-                    break;
-                }
-                Err(_) => break, // timeout — no more commands
-            }
-        }
-
-        // Publish status reports for running tasks.
-        self.publish_status(bus).await;
-
-        // Stream container/agent logs to the bus.
-        self.stream_logs(bus).await;
-
-        actions
-    }
-
     /// Stream log output from running containers and agents to the bus.
     /// Tracks per-task offsets to avoid re-publishing the same lines.
     async fn stream_logs(&self, bus: &Arc<dyn EventBus>) {
@@ -821,7 +728,7 @@ impl Supervisor {
                     data: chunk.data.clone(),
                     timestamp: now_millis(),
                 };
-                if let Err(e) = bus.publish_log(task_id, &entry).await {
+                if let Err(e) = bus.publish_node_log(self.node_id, task_id, &entry).await {
                     tracing::warn!(task = %task_id, error = %e, "failed to publish log entry");
                 }
             }
@@ -867,7 +774,9 @@ impl Supervisor {
                                 data,
                                 timestamp: now_millis(),
                             };
-                            if let Err(e) = bus.publish_log(task_id, &entry).await {
+                            if let Err(e) =
+                                bus.publish_node_log(self.node_id, task_id, &entry).await
+                            {
                                 tracing::warn!(
                                     task = %task_id,
                                     error = %e,
@@ -911,7 +820,7 @@ impl Supervisor {
         bus: &Arc<dyn EventBus>,
         task_id: &TaskId,
     ) -> Option<TaskStatusReport> {
-        let key = subjects::kv_task_status(task_id);
+        let key = subjects::kv_node_task_status(self.node_id, task_id);
         match bus.get_status(&key).await {
             Ok(Some(bytes)) => match TaskStatusReport::from_bytes(&bytes) {
                 Ok(report) if report.node_id == self.node_id => Some(report),
@@ -935,7 +844,7 @@ impl Supervisor {
         task_id: &TaskId,
         update: TaskStatusUpdate,
     ) {
-        let key = subjects::kv_task_status(task_id);
+        let key = subjects::kv_node_task_status(self.node_id, task_id);
         let current = match bus.get_status(&key).await {
             Ok(Some(bytes)) => match TaskStatusReport::from_bytes(&bytes) {
                 Ok(report) if report.node_id == self.node_id => Some(report),
@@ -1081,34 +990,6 @@ impl Supervisor {
         .await;
     }
 
-    /// Forgets a failure once its running task has settled.
-    async fn clear_settled_failures(&self, tasks: &[&Task]) {
-        let Some(bus) = &self.bus else {
-            return;
-        };
-        let now = unix_now();
-        for task in tasks {
-            let Some(status) = self.read_task_status(bus, &task.id).await else {
-                continue;
-            };
-            let settled = status.state == TaskActualState::Running
-                && status
-                    .running_since_unix
-                    .is_some_and(|since| since + failure::CLEAR_AFTER_SECS <= now);
-            if settled && status.last_error.is_some() {
-                self.update_task_status(
-                    bus,
-                    &task.id,
-                    TaskStatusUpdate {
-                        clear_failure: true,
-                        ..Default::default()
-                    },
-                )
-                .await;
-            }
-        }
-    }
-
     /// Starts due probes and acts on finished ones. Probes run in their
     /// own tasks: one can take as long as its timeout.
     async fn check_health(&self) {
@@ -1159,172 +1040,6 @@ impl Supervisor {
                 }
                 Err(e) => {
                     tracing::error!(task = %task_id, error = %e, "failed to kill unhealthy container")
-                }
-            }
-        }
-    }
-
-    /// Execute a single command received from the bus.
-    async fn execute_command(&self, cmd: Command) -> usize {
-        match cmd {
-            Command::Assign {
-                task_id,
-                payload: _,
-            } => {
-                // The bus is only a wake-up: anyone who can publish on it could
-                // otherwise start any spec as root. Start the task only as Raft
-                // records it for this node, from the Raft spec, never the payload.
-                // A task not replicated yet is started by the next Raft pass.
-                let spec: TaskSpec = match self.state.get_task(&task_id).await {
-                    Ok(Some(task))
-                        if task.node_id == self.node_id
-                            && !matches!(task.state, TaskState::Stopped | TaskState::Failed) =>
-                    {
-                        task.spec
-                    }
-                    Ok(_) => {
-                        tracing::warn!(
-                            task = %task_id,
-                            "ignoring bus Assign for a task Raft does not assign to this node"
-                        );
-                        return 0;
-                    }
-                    Err(e) => {
-                        tracing::error!(task = %task_id, error = %e, "cannot read task for bus Assign");
-                        return 0;
-                    }
-                };
-
-                // Skip if already running (container or agent).
-                {
-                    let running = self.running.lock().await;
-                    let agents = self.running_agents.lock().await;
-                    if running.contains_key(&task_id) || agents.contains(&task_id) {
-                        return 0;
-                    }
-                }
-
-                // Dispatch by workload kind.
-                match &spec.kind {
-                    WorkloadKind::Container => match self.runtime.start(&task_id, &spec).await {
-                        Ok(container_id) => {
-                            minga_telemetry::METRICS.task_starts_total.inc();
-                            tracing::info!(
-                                task = %task_id,
-                                container = %container_id,
-                                node = self.node_id,
-                                "started container (bus command)"
-                            );
-                            self.running
-                                .lock()
-                                .await
-                                .insert(task_id.clone(), container_id);
-                            self.container_started(&task_id, &spec).await;
-                            1
-                        }
-                        Err(e) => {
-                            tracing::error!(
-                                task = %task_id,
-                                error = %e,
-                                "failed to start container (bus command)"
-                            );
-                            let failure =
-                                failure::start_error(&e, &failure::registry_secrets(&spec.image));
-                            self.record_failure(&task_id, failure, false).await;
-                            0
-                        }
-                    },
-                    WorkloadKind::Agent(agent_spec) => {
-                        let Some(exec) = &self.agent_executor else {
-                            tracing::error!(
-                                task = %task_id,
-                                "agent task assigned but no agent executor configured"
-                            );
-                            return 0;
-                        };
-                        match exec.start(&task_id, agent_spec).await {
-                            Ok(agent_id) => {
-                                minga_telemetry::METRICS.task_starts_total.inc();
-                                tracing::info!(
-                                    task = %task_id,
-                                    agent = %agent_id,
-                                    node = self.node_id,
-                                    "started agent (bus command)"
-                                );
-                                self.running_agents.lock().await.insert(task_id.clone());
-                                self.mark_task_state(&task_id, TaskState::Running).await;
-                                1
-                            }
-                            Err(e) => {
-                                tracing::error!(
-                                    task = %task_id,
-                                    error = %e,
-                                    "failed to start agent (bus command)"
-                                );
-                                self.record_failure(&task_id, failure::start_error(&e, &[]), false)
-                                    .await;
-                                0
-                            }
-                        }
-                    }
-                }
-            }
-            Command::Stop { task_id } => {
-                self.log_offsets.lock().await.remove(&task_id);
-
-                // Check if it's a container or an agent.
-                let container_id = self.running.lock().await.remove(&task_id);
-                let was_agent = self.running_agents.lock().await.remove(&task_id);
-
-                if let Some(id) = container_id {
-                    match self.runtime.stop(&id).await {
-                        Ok(()) => {
-                            minga_telemetry::METRICS.task_stops_total.inc();
-                            tracing::info!(
-                                task = %task_id,
-                                container = %id,
-                                node = self.node_id,
-                                "stopped container (bus command)"
-                            );
-                            self.mark_task_state(&task_id, TaskState::Stopped).await;
-                            1
-                        }
-                        Err(e) => {
-                            tracing::error!(
-                                task = %task_id,
-                                container = %id,
-                                error = %e,
-                                "failed to stop container (bus command)"
-                            );
-                            0
-                        }
-                    }
-                } else if was_agent {
-                    if let Some(exec) = &self.agent_executor {
-                        match exec.stop(&task_id).await {
-                            Ok(()) => {
-                                minga_telemetry::METRICS.task_stops_total.inc();
-                                tracing::info!(
-                                    task = %task_id,
-                                    node = self.node_id,
-                                    "stopped agent (bus command)"
-                                );
-                                1
-                            }
-                            Err(e) => {
-                                tracing::error!(
-                                    task = %task_id,
-                                    error = %e,
-                                    "failed to stop agent (bus command)"
-                                );
-                                0
-                            }
-                        }
-                    } else {
-                        1
-                    }
-                } else {
-                    0
                 }
             }
         }
@@ -1383,242 +1098,194 @@ impl Supervisor {
         }
     }
 
-    /// Raft fallback reconcile: read tasks from the state store and
-    /// converge local containers and agents. Catches up after a supervisor
-    /// restart when bus commands may have been missed.
-    async fn raft_reconcile(&self) -> Result<usize, SupervisorError> {
-        let all_tasks = self.state.list_tasks().await?;
-        let my_task_ids: HashSet<TaskId> = all_tasks
-            .iter()
-            .filter(|t| t.node_id == self.node_id)
-            .map(|t| t.id.clone())
-            .collect();
-        let my_tasks: Vec<&Task> = all_tasks
-            .iter()
-            .filter(|t| t.node_id == self.node_id)
-            .collect();
-
-        self.clear_settled_failures(&my_tasks).await;
-
-        let backing_off: HashSet<TaskId> = {
-            let now = std::time::Instant::now();
-            let states = self.restart_states.lock().await;
-            states
-                .iter()
-                .filter(|(_, s)| now < s.next_retry)
-                .map(|(id, _)| id.clone())
-                .collect()
-        };
-
-        let mut running = self.running.lock().await;
-        let mut running_agents = self.running_agents.lock().await;
-        let mut actions = 0;
-
-        // --- start containers/agents for new tasks ----------------------------
-        for task in &my_tasks {
-            let already_container = running.contains_key(&task.id);
-            let already_agent = running_agents.contains(&task.id);
-            if already_container || already_agent {
-                continue;
-            }
-            // Not running on purpose: finished, out of restart attempts, or
-            // waiting out the restart backoff.
-            if backing_off.contains(&task.id)
-                || matches!(task.state, TaskState::Stopped | TaskState::Failed)
-            {
-                continue;
-            }
-
-            match &task.spec.kind {
-                WorkloadKind::Container => match self.runtime.start(&task.id, &task.spec).await {
-                    Ok(container_id) => {
-                        minga_telemetry::METRICS.task_starts_total.inc();
-                        tracing::info!(
-                            task = %task.id,
-                            container = %container_id,
-                            node = self.node_id,
-                            "started container (raft reconcile)"
-                        );
-                        running.insert(task.id.clone(), container_id);
-                        actions += 1;
-                        self.container_started(&task.id, &task.spec).await;
-                    }
-                    Err(e) => {
-                        tracing::error!(
-                            task = %task.id,
-                            error = %e,
-                            "failed to start container (raft reconcile)"
-                        );
-                        let failure =
-                            failure::start_error(&e, &failure::registry_secrets(&task.spec.image));
-                        // Desired-state records no longer carry restart counts.
-                        let restarts = match &self.bus {
-                            Some(bus) => self
-                                .read_task_status(bus, &task.id)
-                                .await
-                                .map_or(0, |status| status.restarts),
-                            None => task.restarts,
-                        };
-                        self.record_failure(&task.id, failure, restarts == 0).await;
-                    }
-                },
-                WorkloadKind::Agent(agent_spec) => {
-                    let Some(exec) = &self.agent_executor else {
-                        tracing::error!(
-                            task = %task.id,
-                            "agent task in state but no agent executor configured"
-                        );
-                        continue;
-                    };
-                    match exec.start(&task.id, agent_spec).await {
-                        Ok(agent_id) => {
-                            minga_telemetry::METRICS.task_starts_total.inc();
-                            tracing::info!(
-                                task = %task.id,
-                                agent = %agent_id,
-                                node = self.node_id,
-                                "started agent (raft reconcile)"
-                            );
-                            running_agents.insert(task.id.clone());
-                            actions += 1;
-                            self.mark_task_state(&task.id, TaskState::Running).await;
-                        }
-                        Err(e) => {
-                            tracing::error!(
-                                task = %task.id,
-                                error = %e,
-                                "failed to start agent (raft reconcile)"
-                            );
-                            self.record_failure(&task.id, failure::start_error(&e, &[]), false)
-                                .await;
-                        }
-                    }
-                }
-            }
-        }
-
-        // --- stop containers for removed tasks --------------------------------
-        // Every running task came from Raft (a bus Assign only starts a task
-        // Raft holds), so anything Raft no longer assigns here is stopped.
-        let to_stop_containers: Vec<(TaskId, String)> = running
-            .iter()
-            .filter(|(task_id, _)| !my_task_ids.contains(*task_id))
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-        let to_stop_agents: Vec<TaskId> = running_agents
-            .iter()
-            .filter(|task_id| !my_task_ids.contains(*task_id))
-            .cloned()
-            .collect();
-
-        for (task_id, container_id) in to_stop_containers {
-            self.log_offsets.lock().await.remove(&task_id);
-            match self.runtime.stop(&container_id).await {
-                Ok(()) => {
-                    minga_telemetry::METRICS.task_stops_total.inc();
-                    tracing::info!(
-                        task = %task_id,
-                        container = %container_id,
-                        node = self.node_id,
-                        "stopped container for removed task (raft reconcile)"
-                    );
-                    running.remove(&task_id);
-                    actions += 1;
-                }
-                Err(e) => {
-                    tracing::error!(
-                        task = %task_id,
-                        container = %container_id,
-                        error = %e,
-                        "failed to stop container (raft reconcile)"
-                    );
-                }
-            }
-        }
-
-        for task_id in to_stop_agents {
-            self.log_offsets.lock().await.remove(&task_id);
-            if let Some(exec) = &self.agent_executor {
-                match exec.stop(&task_id).await {
-                    Ok(()) => {
-                        minga_telemetry::METRICS.task_stops_total.inc();
-                        tracing::info!(
-                            task = %task_id,
-                            node = self.node_id,
-                            "stopped agent for removed task (raft reconcile)"
-                        );
-                        running_agents.remove(&task_id);
-                        actions += 1;
-                    }
-                    Err(e) => {
-                        tracing::error!(
-                            task = %task_id,
-                            error = %e,
-                            "failed to stop agent (raft reconcile)"
-                        );
-                    }
-                }
-            } else {
-                running_agents.remove(&task_id);
-                actions += 1;
-            }
-        }
-
-        Ok(actions)
-    }
-
-    /// Startup: containers outlive a supervisor restart under their shims, but
-    /// the in-memory `running` map does not. Adopt every running container that
-    /// Raft still assigns here, so a later removal stops it, and stop and remove
-    /// every other container, running or exited: a task deleted or rescheduled
-    /// while this process was down would otherwise keep running untracked, or
-    /// keep its secrets, network and ports. Returns the number removed.
-    async fn recover_running_containers(&self) -> usize {
-        let containers = self.runtime.list().await;
-        if containers.is_empty() {
-            return 0;
-        }
-        let tasks = match self.state.list_tasks().await {
-            Ok(tasks) => tasks,
-            Err(e) => {
-                // Without state we cannot tell keep from stop: leave everything.
-                tracing::error!(error = %e, "cannot read tasks to recover containers");
+    /// Reconciles against the node's assignment KV prefix. A failed read is
+    /// not an empty desired set: preserve all tracked and runtime tasks.
+    async fn assignment_reconcile(&self) -> usize {
+        let assignments = match self.assignments.list().await {
+            Ok(assignments) => assignments,
+            Err(error) => {
+                tracing::warn!(node = self.node_id, %error, "cannot read assignments; preserving running tasks");
                 return 0;
             }
         };
-        let assigned: HashSet<&TaskId> = tasks
-            .iter()
-            .filter(|t| {
-                t.node_id == self.node_id
-                    && !matches!(t.state, TaskState::Stopped | TaskState::Failed)
-            })
-            .map(|t| &t.id)
+        let current: HashMap<TaskId, TaskAssignment> = assignments
+            .into_iter()
+            .map(|assignment| (assignment.task_id.clone(), assignment))
             .collect();
-        let mut stopped = 0;
-        for c in containers {
-            if assigned.contains(&c.task_id) {
-                // A stopped one is left for reconcile, which restarts or replaces it.
-                if c.status == ContainerStatus::Running {
-                    tracing::info!(task = %c.task_id, container = %c.id, "adopted running container");
-                    self.running.lock().await.insert(c.task_id, c.id);
+        *self.task_assignments.lock().await = current.clone();
+        self.finished
+            .lock()
+            .await
+            .retain(|task_id| current.contains_key(task_id));
+        if let Some(bus) = &self.bus {
+            let now = unix_now();
+            for task_id in current.keys() {
+                let Some(status) = self.read_task_status(bus, task_id).await else {
+                    continue;
+                };
+                let settled = status.state == TaskActualState::Running
+                    && status
+                        .running_since_unix
+                        .is_some_and(|since| since + failure::CLEAR_AFTER_SECS <= now);
+                if settled && status.last_error.is_some() {
+                    self.update_task_status(
+                        bus,
+                        task_id,
+                        TaskStatusUpdate {
+                            clear_failure: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await;
                 }
+            }
+        }
+        let desired: HashSet<TaskId> = current.keys().cloned().collect();
+        let backing_off: HashSet<TaskId> = {
+            let now = std::time::Instant::now();
+            self.restart_states
+                .lock()
+                .await
+                .iter()
+                .filter(|(_, state)| now < state.next_retry)
+                .map(|(id, _)| id.clone())
+                .collect()
+        };
+        let mut actions = 0;
+        let mut running = self.running.lock().await;
+        let mut agents = self.running_agents.lock().await;
+        if running.is_empty() && agents.is_empty() {
+            for container in self.runtime.list().await {
+                if desired.contains(&container.task_id)
+                    && container.status == ContainerStatus::Running
+                {
+                    running.insert(container.task_id, container.id);
+                } else if self.runtime.stop(&container.id).await.is_ok() {
+                    actions += 1;
+                    minga_telemetry::METRICS.task_stops_total.inc();
+                }
+            }
+        }
+        for assignment in current.values() {
+            let task_id = &assignment.task_id;
+            if self.finished.lock().await.contains(task_id) {
                 continue;
             }
-            // Stopped leftovers too: `stop` also removes their netns, DNAT
-            // rules, snapshot and staged secrets.
-            match self.runtime.stop(&c.id).await {
-                Ok(()) => {
-                    stopped += 1;
+            if running.contains_key(task_id)
+                || agents.contains(task_id)
+                || backing_off.contains(task_id)
+            {
+                continue;
+            }
+            match &assignment.spec.kind {
+                WorkloadKind::Container => {
+                    match self
+                        .runtime
+                        .start_assigned(task_id, &assignment.spec, &assignment.networks)
+                        .await
+                    {
+                        Ok(container_id) => {
+                            minga_telemetry::METRICS.task_starts_total.inc();
+                            running.insert(task_id.clone(), container_id.clone());
+                            actions += 1;
+                            self.container_started(task_id, &assignment.spec).await;
+                        }
+                        Err(error) => {
+                            self.record_failure(
+                                task_id,
+                                failure::start_error(
+                                    &error,
+                                    &failure::registry_secrets(&assignment.spec.image),
+                                ),
+                                true,
+                            )
+                            .await;
+                        }
+                    }
+                }
+                WorkloadKind::Agent(agent_spec) => {
+                    let Some(exec) = &self.agent_executor else {
+                        tracing::error!(task = %task_id, "agent assignment without agent executor");
+                        continue;
+                    };
+                    match exec.start(task_id, agent_spec).await {
+                        Ok(_) => {
+                            minga_telemetry::METRICS.task_starts_total.inc();
+                            agents.insert(task_id.clone());
+                            actions += 1;
+                            self.mark_task_state(task_id, TaskState::Running).await;
+                        }
+                        Err(error) => {
+                            self.record_failure(task_id, failure::start_error(&error, &[]), false)
+                                .await
+                        }
+                    }
+                }
+            }
+        }
+        let removed: Vec<TaskId> = running
+            .keys()
+            .chain(agents.iter())
+            .filter(|task_id| !desired.contains(*task_id))
+            .cloned()
+            .collect();
+        for task_id in removed {
+            self.log_offsets.lock().await.remove(&task_id);
+            if let Some(container) = running.get(&task_id).cloned() {
+                if self.runtime.stop(&container).await.is_ok() {
+                    running.remove(&task_id);
+                    actions += 1;
                     minga_telemetry::METRICS.task_stops_total.inc();
-                    tracing::info!(
-                        task = %c.task_id,
-                        container = %c.id,
-                        "stopped a container Raft no longer assigns to this node"
-                    );
                 }
-                Err(e) => {
-                    tracing::error!(task = %c.task_id, container = %c.id, error = %e, "cannot stop leftover container");
+            } else if agents.contains(&task_id) {
+                if let Some(exec) = &self.agent_executor {
+                    if exec.stop(&task_id).await.is_err() {
+                        continue;
+                    }
                 }
+                agents.remove(&task_id);
+                actions += 1;
+                minga_telemetry::METRICS.task_stops_total.inc();
+            }
+        }
+        actions
+    }
+
+    /// Adopt existing containers present in a successful assignment snapshot;
+    /// without that snapshot leave every container untouched.
+    async fn recover_running_containers(&self) -> usize {
+        let assignments = match self.assignments.list().await {
+            Ok(assignments) => assignments,
+            Err(error) => {
+                tracing::warn!(node = self.node_id, %error, "cannot read assignments for startup recovery");
+                return 0;
+            }
+        };
+        let assigned: HashMap<TaskId, TaskAssignment> = assignments
+            .into_iter()
+            .map(|assignment| (assignment.task_id.clone(), assignment))
+            .collect();
+        *self.task_assignments.lock().await = assigned.clone();
+        let containers = self.runtime.list().await;
+        let mut stopped = 0;
+        for container in containers {
+            if let Some(assignment) = assigned.get(&container.task_id) {
+                if container.status == ContainerStatus::Running {
+                    tracing::info!(task = %container.task_id, container = %container.id, "adopted running container");
+                    self.running
+                        .lock()
+                        .await
+                        .insert(container.task_id, container.id);
+                } else {
+                    // Reconcile will start its current assignment after cleanup.
+                    let _ = self.runtime.stop(&container.id).await;
+                }
+                let _ = assignment;
+                continue;
+            }
+            if self.runtime.stop(&container.id).await.is_ok() {
+                stopped += 1;
+                minga_telemetry::METRICS.task_stops_total.inc();
             }
         }
         stopped
@@ -1661,1151 +1328,487 @@ fn now_millis() -> u64 {
 }
 
 #[cfg(test)]
-mod tests {
+mod assignment_tests {
     use super::*;
     use crate::runtime::MockRuntime;
-    use futures::StreamExt;
-    use minga_bus::{subjects, EventBus, MemoryBus, TaskActualState, TaskStatusReport};
-    use minga_state::types::{PortMapping, ResourceSpec, TaskSpec, TaskState};
-    use std::collections::BTreeMap;
+    use minga_bus::MemoryBus;
 
-    fn make_task(id: &str, node_id: u64) -> Task {
-        Task {
-            id: id.to_string(),
-            service_id: "svc".to_string(),
+    fn assignment(task_id: &str) -> TaskAssignment {
+        assignment_on(task_id, 7)
+    }
+
+    fn assignment_on(task_id: &str, node_id: NodeId) -> TaskAssignment {
+        TaskAssignment {
+            task_id: task_id.to_string(),
             node_id,
-            state: TaskState::Pending,
+            service_id: "stack.service".to_string(),
+            service_name: "service".to_string(),
+            stack: "stack".to_string(),
             spec: TaskSpec {
                 image: "nginx:latest".to_string(),
-                env: HashMap::new(),
-                ports: vec![PortMapping {
-                    target: 80,
-                    published: None,
-                    protocol: "tcp".to_string(),
-                }],
-                resources: ResourceSpec::default(),
                 ..Default::default()
             },
-            restarts: 0,
-            running_since_unix: None,
-            last_error: None,
-            last_exit_code: None,
+            networks: Vec::new(),
         }
     }
 
-    fn make_spec() -> TaskSpec {
-        TaskSpec {
-            image: "nginx:latest".to_string(),
-            env: HashMap::new(),
-            ports: vec![],
-            resources: ResourceSpec::default(),
-            ..Default::default()
-        }
+    async fn write_assignment(bus: &MemoryBus, assignment: &TaskAssignment) {
+        let bytes = minga_state::codec::encode_wire(assignment).unwrap();
+        bus.put_assignment(
+            &format!("node.{}.task.{}", assignment.node_id, assignment.task_id),
+            &bytes,
+        )
+        .await
+        .unwrap();
     }
 
-    #[test]
-    fn dns_store_maps_service_and_task_names_to_ips() {
-        use minga_state::types::ServiceMode;
-
-        let services = vec![minga_state::types::Service {
-            id: "shop.web".to_string(),
-            name: "web".to_string(),
-            image: "nginx:1.27".to_string(),
-            replicas: 2,
-            mode: ServiceMode::Replicated,
-            constraints: vec![],
-            env: HashMap::from([("MINGA_STACK".to_string(), "shop".to_string())]),
-            ports: vec![],
-            networks: vec!["shop_default".to_string()],
-            resources: ResourceSpec::default(),
-            agent: None,
-            restart_policy: Default::default(),
-            secrets: vec![],
-            command: vec![],
-            entrypoint: vec![],
-            labels: HashMap::new(),
-            healthcheck: None,
-            mounts: vec![],
-            user: None,
-            extra_hosts: vec![],
-            update: Default::default(),
-            rollback: None,
-            previous: None,
-        }];
-
-        let mut t1 = make_task("shop.web.1", 1);
-        t1.service_id = "shop.web".to_string();
-        t1.state = TaskState::Running;
-        t1.spec
-            .ips
-            .insert("shop_default".to_string(), "10.100.0.2".to_string());
-        let mut t2 = make_task("shop.web.2", 1);
-        t2.service_id = "shop.web".to_string();
-        t2.state = TaskState::Running;
-        t2.spec
-            .ips
-            .insert("shop_default".to_string(), "10.100.0.3".to_string());
-        // A stopped task must not answer.
-        let mut t3 = make_task("shop.web.3", 1);
-        t3.service_id = "shop.web".to_string();
-        t3.state = TaskState::Stopped;
-        t3.spec
-            .ips
-            .insert("shop_default".to_string(), "10.100.0.4".to_string());
-
-        let store = build_dns_store(&services, &[t1.clone(), t2.clone(), t3.clone()]);
-
-        let svc_ips = store.resolve("web.shop.minga.local");
-        assert_eq!(svc_ips.len(), 2);
-        assert!(svc_ips.contains(&"10.100.0.2".parse().unwrap()));
-        assert!(svc_ips.contains(&"10.100.0.3".parse().unwrap()));
-
-        // Bare names resolve directly (musl has no search domains).
-        assert_eq!(store.resolve("web").len(), 2);
-        assert_eq!(store.resolve("tasks.web").len(), 2);
-
-        let task_ips = store.resolve("shop.web.1.web.shop.minga.local");
-        assert_eq!(
-            task_ips,
-            vec!["10.100.0.2".parse::<std::net::Ipv4Addr>().unwrap()]
-        );
-
-        assert!(store.resolve("other.shop.minga.local").is_empty());
-
-        // The API path re-derives `name` as the full ID; DNS must still
-        // use the short name.
-        let mut api_svc = services[0].clone();
-        api_svc.name = "shop.web".to_string();
-        let store = build_dns_store(&[api_svc], &[t1, t2, t3]);
-        let svc_ips = store.resolve("web.shop.minga.local");
-        assert_eq!(
-            svc_ips.len(),
-            2,
-            "API-form name must derive the short DNS name"
-        );
-    }
-
-    fn spec_to_payload(spec: &TaskSpec) -> Vec<u8> {
-        minga_state::codec::encode_wire(spec).unwrap()
-    }
-
-    /// Puts `task_id` with `spec` on node 1 in Raft, as the scheduler does
-    /// before it publishes, and returns the bus Assign for it.
-    async fn assign_cmd(store: &StateStore, task_id: &str, spec: TaskSpec) -> Command {
-        let mut task = make_task(task_id, 1);
-        task.spec = spec.clone();
-        store.upsert_task(task).await.unwrap();
-        Command::Assign {
-            task_id: task_id.to_string(),
-            payload: spec_to_payload(&spec),
-        }
-    }
-
-    #[tokio::test]
-    async fn bus_assign_for_a_task_missing_from_raft_is_ignored() {
-        let (supervisor, runtime, _store, bus) = setup_with_bus(1).await;
-        let cmd = Command::Assign {
-            task_id: "forged".to_string(),
-            payload: spec_to_payload(&make_spec()),
-        };
-        bus.send_command(1, &cmd).await.unwrap();
-        assert_eq!(supervisor.reconcile_once().await.unwrap(), 0);
-        assert_eq!(runtime.container_count(), 0);
-    }
-
-    #[tokio::test]
-    async fn bus_assign_starts_the_raft_spec_not_the_payload() {
-        let (supervisor, runtime, store, bus) = setup_with_bus(1).await;
-        let mut cmd = assign_cmd(&store, "t1", make_spec()).await;
-        let forged = TaskSpec {
-            image: "evil:latest".to_string(),
-            ..make_spec()
-        };
-        if let Command::Assign { payload, .. } = &mut cmd {
-            *payload = spec_to_payload(&forged);
-        }
-        bus.send_command(1, &cmd).await.unwrap();
-        supervisor.reconcile_once().await.unwrap();
-        let images: Vec<String> = runtime.list().await.into_iter().map(|c| c.image).collect();
-        assert_eq!(images, ["nginx:latest"]);
-    }
-
-    #[tokio::test]
-    async fn startup_adopts_assigned_containers_and_stops_the_rest() {
-        let (supervisor, runtime, store) = setup(1).await;
-        // Containers left running by a previous supervisor process.
-        runtime
-            .start(&"kept".to_string(), &make_spec())
-            .await
-            .unwrap();
-        runtime
-            .start(&"orphan".to_string(), &make_spec())
-            .await
-            .unwrap();
-        // An exited container whose netns and secrets were never torn down.
-        runtime
-            .start(&"dead-orphan".to_string(), &make_spec())
-            .await
-            .unwrap();
-        runtime.mark_failed("dead-orphan");
-        // While it was down, the orphans were removed from Raft; "kept" still runs here.
-        store.upsert_task(make_task("kept", 1)).await.unwrap();
-
-        assert_eq!(supervisor.recover_running_containers().await, 2);
-        assert_eq!(runtime.container_count(), 1);
-        assert_eq!(supervisor.running_tasks().await, ["kept".to_string()]);
-        // Adopted, so the next pass neither restarts it nor leaves it alone
-        // once Raft drops it.
-        assert_eq!(supervisor.reconcile_once().await.unwrap(), 0);
-        store.remove_task("kept".to_string()).await.unwrap();
-        assert_eq!(supervisor.reconcile_once().await.unwrap(), 1);
-        assert_eq!(runtime.container_count(), 0);
-    }
-
-    async fn setup(node_id: u64) -> (Supervisor, Arc<MockRuntime>, Arc<StateStore>) {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Arc::new(
-            StateStore::open(node_id, "127.0.0.1:0", dir.path(), BTreeMap::new())
-                .await
-                .unwrap(),
-        );
-        std::mem::forget(dir);
-        let runtime = Arc::new(MockRuntime::new());
-        let supervisor = Supervisor::new(store.clone(), runtime.clone(), node_id);
-        (supervisor, runtime, store)
-    }
-
-    async fn setup_with_bus(
-        node_id: u64,
-    ) -> (
-        Supervisor,
-        Arc<MockRuntime>,
-        Arc<StateStore>,
-        Arc<MemoryBus>,
-    ) {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Arc::new(
-            StateStore::open(node_id, "127.0.0.1:0", dir.path(), BTreeMap::new())
-                .await
-                .unwrap(),
-        );
-        std::mem::forget(dir);
-
+    async fn setup(node_id: NodeId) -> (Supervisor, Arc<MockRuntime>, Arc<MemoryBus>) {
         let runtime = Arc::new(MockRuntime::new());
         let bus = MemoryBus::new();
-        let supervisor = Supervisor::with_bus(store.clone(), runtime.clone(), bus.clone(), node_id);
-        (supervisor, runtime, store, bus)
+        let supervisor = Supervisor::with_bus(runtime.clone(), bus.clone(), node_id);
+        (supervisor, runtime, bus)
     }
-
-    async fn actual_task(sup: &Supervisor, store: &StateStore, id: &str) -> Task {
-        let mut task = store.get_task(&id.to_string()).await.unwrap().unwrap();
-        let Some(bus) = &sup.bus else {
-            return task;
-        };
-        let key = subjects::kv_task_status(id);
-        let Some(bytes) = bus.get_status(&key).await.unwrap() else {
-            return task;
-        };
-        let report = TaskStatusReport::from_bytes(&bytes).unwrap();
-        task.state = match report.state {
-            TaskActualState::Starting => TaskState::Starting,
-            TaskActualState::Running => TaskState::Running,
-            TaskActualState::Stopped => TaskState::Stopped,
-            TaskActualState::Failed => TaskState::Failed,
-        };
-        task.restarts = report.restarts;
-        task.last_error = report.last_error;
-        task.last_exit_code = report.last_exit_code;
-        task.running_since_unix = report.running_since_unix;
-        task
-    }
-
-    async fn actual_status(sup: &Supervisor, id: &str) -> TaskStatusReport {
-        let bus = sup.bus.as_ref().unwrap();
+    async fn actual_status(bus: &MemoryBus, node_id: NodeId, task_id: &str) -> TaskStatusReport {
         let bytes = bus
-            .get_status(&subjects::kv_task_status(id))
+            .get_status(&subjects::kv_node_task_status(node_id, task_id))
             .await
             .unwrap()
             .unwrap();
         TaskStatusReport::from_bytes(&bytes).unwrap()
     }
+    fn agent_assignment(task_id: &str) -> TaskAssignment {
+        let mut assignment = assignment(task_id);
+        assignment.spec.kind = WorkloadKind::Agent(minga_state::types::AgentSpec {
+            module_ref: "./agent.wasm".to_string(),
+            ..Default::default()
+        });
+        assignment
+    }
+    async fn setup_with_agent(
+        node_id: NodeId,
+    ) -> (
+        Supervisor,
+        Arc<MockRuntime>,
+        Arc<crate::agent::MockAgentExecutor>,
+        Arc<MemoryBus>,
+    ) {
+        let runtime = Arc::new(MockRuntime::new());
+        let executor = Arc::new(crate::agent::MockAgentExecutor::new());
+        let bus = MemoryBus::new();
+        let supervisor = Supervisor::with_agent_executor(
+            runtime.clone(),
+            bus.clone(),
+            executor.clone(),
+            node_id,
+        );
+        (supervisor, runtime, executor, bus)
+    }
 
-    // --- Existing Raft-based tests -------------------------------------------
+    struct ToggleBus {
+        inner: Arc<MemoryBus>,
+        assignments_offline: std::sync::atomic::AtomicBool,
+    }
 
-    fn with_healthcheck(mut task: Task) -> Task {
-        task.spec.restart_policy = minga_state::types::RestartPolicy {
+    #[async_trait::async_trait]
+    impl EventBus for ToggleBus {
+        async fn publish_event(&self, subject: &str, payload: &[u8]) -> minga_bus::Result<()> {
+            self.inner.publish_event(subject, payload).await
+        }
+
+        async fn subscribe_events(
+            &self,
+            patterns: &[&str],
+        ) -> minga_bus::Result<minga_bus::EventStream> {
+            self.inner.subscribe_events(patterns).await
+        }
+
+        async fn put_assignment(&self, key: &str, value: &[u8]) -> minga_bus::Result<()> {
+            self.inner.put_assignment(key, value).await
+        }
+
+        async fn get_assignment(&self, key: &str) -> minga_bus::Result<Option<Vec<u8>>> {
+            self.inner.get_assignment(key).await
+        }
+
+        async fn list_assignments(
+            &self,
+            prefix: &str,
+        ) -> minga_bus::Result<Vec<(String, Vec<u8>)>> {
+            if self
+                .assignments_offline
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(minga_bus::BusError::Connection("offline".into()));
+            }
+            self.inner.list_assignments(prefix).await
+        }
+
+        async fn delete_assignment(&self, key: &str) -> minga_bus::Result<()> {
+            self.inner.delete_assignment(key).await
+        }
+
+        async fn watch_assignments(&self, prefix: &str) -> minga_bus::Result<KvStream> {
+            self.inner.watch_assignments(prefix).await
+        }
+
+        async fn put_status(&self, key: &str, value: &[u8]) -> minga_bus::Result<()> {
+            self.inner.put_status(key, value).await
+        }
+
+        async fn get_status(&self, key: &str) -> minga_bus::Result<Option<Vec<u8>>> {
+            self.inner.get_status(key).await
+        }
+
+        async fn list_status(&self) -> minga_bus::Result<Vec<(String, Vec<u8>)>> {
+            self.inner.list_status().await
+        }
+
+        async fn watch_status(&self) -> minga_bus::Result<KvStream> {
+            self.inner.watch_status().await
+        }
+
+        async fn refresh_lease(&self, node_id: u64, registration: &[u8]) -> minga_bus::Result<()> {
+            self.inner.refresh_lease(node_id, registration).await
+        }
+
+        async fn is_alive(&self, node_id: u64) -> minga_bus::Result<bool> {
+            self.inner.is_alive(node_id).await
+        }
+
+        async fn list_alive_nodes(&self) -> minga_bus::Result<HashSet<u64>> {
+            self.inner.list_alive_nodes().await
+        }
+
+        async fn watch_leases(&self) -> minga_bus::Result<KvStream> {
+            self.inner.watch_leases().await
+        }
+
+        async fn request(
+            &self,
+            subject: &str,
+            payload: &[u8],
+            timeout: Duration,
+        ) -> minga_bus::Result<Vec<u8>> {
+            self.inner.request(subject, payload, timeout).await
+        }
+
+        async fn subscribe_requests(
+            &self,
+            subject: &str,
+        ) -> minga_bus::Result<minga_bus::RequestStream> {
+            self.inner.subscribe_requests(subject).await
+        }
+
+        async fn reply(&self, subject: &str, payload: &[u8]) -> minga_bus::Result<()> {
+            self.inner.reply(subject, payload).await
+        }
+
+        async fn publish_log(&self, task_id: &str, entry: &LogEntry) -> minga_bus::Result<()> {
+            self.inner.publish_log(task_id, entry).await
+        }
+
+        async fn publish_node_log(
+            &self,
+            node_id: u64,
+            task_id: &str,
+            entry: &LogEntry,
+        ) -> minga_bus::Result<()> {
+            self.inner.publish_node_log(node_id, task_id, entry).await
+        }
+
+        async fn subscribe_logs(
+            &self,
+            task_id: &str,
+        ) -> minga_bus::Result<minga_bus::LogEventStream> {
+            self.inner.subscribe_logs(task_id).await
+        }
+
+        async fn log_history(
+            &self,
+            task_id: &str,
+            tail: usize,
+        ) -> minga_bus::Result<Vec<LogEntry>> {
+            self.inner.log_history(task_id, tail).await
+        }
+    }
+
+    #[tokio::test]
+    async fn assignments_are_node_scoped_idempotent_and_stop_removed_tasks() {
+        let (supervisor, runtime, bus) = setup(7).await;
+        write_assignment(&bus, &assignment("first")).await;
+        write_assignment(&bus, &assignment("second")).await;
+        write_assignment(&bus, &assignment_on("other-node", 8)).await;
+
+        assert_eq!(supervisor.reconcile_once().await.unwrap(), 2);
+        assert_eq!(runtime.container_count(), 2);
+        assert_eq!(supervisor.reconcile_once().await.unwrap(), 0);
+        bus.delete_assignment("node.7.task.first").await.unwrap();
+        assert_eq!(supervisor.reconcile_once().await.unwrap(), 1);
+        assert_eq!(runtime.container_count(), 1);
+        assert_eq!(supervisor.running_tasks().await, vec!["second".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn start_failure_does_not_crash_and_retries_assignment() {
+        let (supervisor, runtime, bus) = setup(7).await;
+        *runtime.fail_starts.lock().unwrap() = true;
+        write_assignment(&bus, &assignment("task-1")).await;
+        assert_eq!(supervisor.reconcile_once().await.unwrap(), 0);
+        assert_eq!(supervisor.running_count().await, 0);
+
+        *runtime.fail_starts.lock().unwrap() = false;
+        assert_eq!(supervisor.reconcile_once().await.unwrap(), 1);
+        assert_eq!(runtime.container_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn supervisor_starts_from_assignment_kv() {
+        let bus = MemoryBus::new();
+        let assignment = assignment("task-1");
+        let bytes = minga_state::codec::encode_wire(&assignment).unwrap();
+        bus.put_assignment("node.7.task.task-1", &bytes)
+            .await
+            .unwrap();
+        let supervisor =
+            Supervisor::with_bus(Arc::new(MockRuntime::new()), bus, assignment.node_id);
+
+        assert_eq!(supervisor.reconcile_once().await.unwrap(), 1);
+        assert_eq!(supervisor.running_tasks().await, vec!["task-1".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn startup_adopts_assigned_containers_and_stops_the_rest() {
+        let (supervisor, runtime, bus) = setup(7).await;
+        runtime
+            .start(&"kept".to_string(), &TaskSpec::default())
+            .await
+            .unwrap();
+        runtime
+            .start(&"orphan".to_string(), &TaskSpec::default())
+            .await
+            .unwrap();
+        runtime
+            .start(&"dead-orphan".to_string(), &TaskSpec::default())
+            .await
+            .unwrap();
+        runtime.mark_failed("mock-0003");
+        write_assignment(&bus, &assignment("kept")).await;
+
+        assert_eq!(supervisor.recover_running_containers().await, 2);
+        assert_eq!(runtime.container_count(), 1);
+        assert_eq!(supervisor.running_tasks().await, vec!["kept".to_string()]);
+        assert_eq!(supervisor.reconcile_once().await.unwrap(), 0);
+
+        bus.delete_assignment("node.7.task.kept").await.unwrap();
+        assert_eq!(supervisor.reconcile_once().await.unwrap(), 1);
+        assert_eq!(runtime.container_count(), 0);
+    }
+    #[tokio::test]
+    async fn assignment_from_older_format_version_is_refused_loudly() {
+        let bus = MemoryBus::new();
+        let mut bytes = minga_state::codec::encode_wire(&assignment("task-1")).unwrap();
+        bytes[0] = bytes[0].wrapping_add(1);
+        bus.put_assignment("node.7.task.task-1", &bytes)
+            .await
+            .unwrap();
+        let source = Assignments::new(bus, Some(7));
+
+        assert!(source.list().await.is_err());
+    }
+    #[tokio::test]
+    async fn bus_unreachable_preserves_tasks_then_stops_only_removed_assignments() {
+        let inner = MemoryBus::new();
+        let bus = Arc::new(ToggleBus {
+            inner: inner.clone(),
+            assignments_offline: std::sync::atomic::AtomicBool::new(false),
+        });
+        write_assignment(&inner, &assignment("keep")).await;
+        write_assignment(&inner, &assignment("move")).await;
+        let runtime = Arc::new(MockRuntime::new());
+        let supervisor = Supervisor::with_bus(runtime.clone(), bus.clone(), 7);
+        assert_eq!(supervisor.reconcile_once().await.unwrap(), 2);
+        assert_eq!(runtime.container_count(), 2);
+
+        bus.assignments_offline
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        inner.delete_assignment("node.7.task.move").await.unwrap();
+        assert_eq!(supervisor.reconcile_once().await.unwrap(), 0);
+        assert_eq!(runtime.container_count(), 2);
+
+        bus.assignments_offline
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(supervisor.reconcile_once().await.unwrap(), 1);
+        assert_eq!(runtime.container_count(), 1);
+        assert_eq!(supervisor.running_tasks().await, vec!["keep".to_string()]);
+    }
+    #[tokio::test]
+    async fn status_logs_and_restart_follow_assignment() {
+        let bus = MemoryBus::new();
+        let mut desired = assignment("task-1");
+        desired.spec.restart_policy = minga_state::types::RestartPolicy {
             condition: RestartCondition::Any,
             delay_secs: 0,
             max_attempts: None,
         };
-        task.spec.healthcheck = Some(minga_state::types::Healthcheck {
+        let bytes = minga_state::codec::encode_wire(&desired).unwrap();
+        bus.put_assignment("node.7.task.task-1", &bytes)
+            .await
+            .unwrap();
+        let runtime = Arc::new(MockRuntime::new());
+        let supervisor = Supervisor::with_bus(runtime.clone(), bus.clone(), 7);
+        supervisor.reconcile_once().await.unwrap();
+
+        let status = bus
+            .get_status(&subjects::kv_node_task_status(7, "task-1"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            TaskStatusReport::from_bytes(&status).unwrap().state,
+            TaskActualState::Running
+        );
+        assert!(!bus.log_history("task-1", 0).await.unwrap().is_empty());
+
+        let failed_container = runtime.list().await[0].id.clone();
+        runtime.mark_failed(&failed_container);
+        assert_eq!(supervisor.reconcile_once().await.unwrap(), 1);
+        assert_eq!(runtime.list().await.len(), 1);
+    }
+    #[tokio::test]
+    async fn healthcheck_gates_running_then_an_unhealthy_task_restarts() {
+        let bus = MemoryBus::new();
+        let mut desired = assignment("task-1");
+        desired.spec.restart_policy = minga_state::types::RestartPolicy {
+            condition: RestartCondition::Any,
+            delay_secs: 0,
+            max_attempts: None,
+        };
+        desired.spec.healthcheck = Some(minga_state::types::Healthcheck {
             test: vec!["CMD".to_string(), "true".to_string()],
             interval_secs: Some(0),
             timeout_secs: Some(1),
             start_period_secs: Some(0),
             retries: Some(1),
         });
-        task
-    }
-
-    /// Runs supervisor passes until `done` holds for the task.
-    async fn pass_until(
-        sup: &Supervisor,
-        store: &StateStore,
-        id: &str,
-        done: impl Fn(&Task) -> bool,
-    ) -> Task {
+        write_assignment(&bus, &desired).await;
+        let runtime = Arc::new(MockRuntime::new());
+        let supervisor = Supervisor::with_bus(runtime.clone(), bus.clone(), desired.node_id);
         for _ in 0..100 {
-            sup.reconcile_once().await.unwrap();
-            let task = actual_task(sup, store, id).await;
-            if done(&task) {
-                return task;
+            supervisor.reconcile_once().await.unwrap();
+            if actual_status(&bus, 7, "task-1").await.state == TaskActualState::Running {
+                break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        panic!("task {id} never reached the expected state");
-    }
-
-    #[tokio::test]
-    async fn healthcheck_gates_running_then_an_unhealthy_task_restarts() {
-        let (sup, rt, store, _bus) = setup_with_bus(1).await;
-        store
-            .upsert_task(with_healthcheck(make_task("t1", 1)))
-            .await
-            .unwrap();
-
-        let task = pass_until(&sup, &store, "t1", |t| t.state == TaskState::Running).await;
-        assert!(task.running_since_unix.is_some());
-        assert_eq!(task.restarts, 0);
-
-        let container = rt.list().await[0].id.clone();
-        rt.exec_codes.lock().unwrap().insert(container, 1);
-        let task = pass_until(&sup, &store, "t1", |t| t.restarts > 0).await;
-        assert_eq!(task.restarts, 1);
-    }
-
-    #[tokio::test]
-    async fn a_task_that_never_passes_stays_starting() {
-        let (sup, rt, store, _bus) = setup_with_bus(1).await;
-        let mut task = with_healthcheck(make_task("t1", 1));
-        task.spec.healthcheck.as_mut().unwrap().start_period_secs = Some(3600);
-        store.upsert_task(task).await.unwrap();
-
-        sup.reconcile_once().await.unwrap();
-        let container = rt.list().await[0].id.clone();
-        rt.exec_codes.lock().unwrap().insert(container, 1);
-        for _ in 0..5 {
-            sup.reconcile_once().await.unwrap();
+        assert_eq!(
+            actual_status(&bus, 7, "task-1").await.state,
+            TaskActualState::Running
+        );
+        let container = runtime.list().await[0].id.clone();
+        runtime.exec_codes.lock().unwrap().insert(container, 1);
+        for _ in 0..100 {
+            supervisor.reconcile_once().await.unwrap();
+            if actual_status(&bus, 7, "task-1").await.restarts > 0 {
+                break;
+            }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        let task = actual_task(&sup, &store, "t1").await;
-        assert_eq!(task.state, TaskState::Starting);
+        assert_eq!(actual_status(&bus, 7, "task-1").await.restarts, 1);
+    }
+    #[tokio::test]
+    async fn agent_assignments_start_stop() {
+        let (supervisor, runtime, executor, bus) = setup_with_agent(7).await;
+        write_assignment(&bus, &agent_assignment("agent-1")).await;
+        assert_eq!(supervisor.reconcile_once().await.unwrap(), 1);
+        assert_eq!(runtime.container_count(), 0);
+        assert_eq!(executor.agent_count(), 1);
+
+        bus.delete_assignment("node.7.task.agent-1").await.unwrap();
+        assert_eq!(supervisor.reconcile_once().await.unwrap(), 1);
+        assert_eq!(executor.agent_count(), 0);
     }
 
     #[tokio::test]
-    async fn exhausted_or_finished_tasks_are_not_started_again() {
-        let (sup, rt, store) = setup(1).await;
-        let mut failed = make_task("t1", 1);
-        failed.state = TaskState::Failed;
-        let mut stopped = make_task("t2", 1);
-        stopped.state = TaskState::Stopped;
-        store.upsert_task(failed).await.unwrap();
-        store.upsert_task(stopped).await.unwrap();
+    async fn agent_assignment_without_executor_is_not_started() {
+        let (supervisor, runtime, bus) = setup(7).await;
+        write_assignment(&bus, &agent_assignment("agent-1")).await;
 
-        sup.reconcile_once().await.unwrap();
-        assert_eq!(rt.container_count(), 0);
-    }
-
-    #[tokio::test]
-    async fn starts_container_for_assigned_task() {
-        let (supervisor, runtime, store) = setup(1).await;
-
-        store.upsert_task(make_task("t1", 1)).await.unwrap();
-        let actions = supervisor.reconcile_once().await.unwrap();
-        assert_eq!(actions, 1);
-        assert_eq!(runtime.container_count(), 1);
-        assert_eq!(supervisor.running_count().await, 1);
-    }
-
-    #[tokio::test]
-    async fn ignores_tasks_for_other_nodes() {
-        let (supervisor, runtime, store) = setup(1).await;
-
-        store.upsert_task(make_task("t1", 2)).await.unwrap();
-        let actions = supervisor.reconcile_once().await.unwrap();
-        assert_eq!(actions, 0);
+        assert_eq!(supervisor.reconcile_once().await.unwrap(), 0);
         assert_eq!(runtime.container_count(), 0);
     }
 
     #[tokio::test]
-    async fn stops_container_when_task_removed() {
-        let (supervisor, runtime, store) = setup(1).await;
-
-        store.upsert_task(make_task("t1", 1)).await.unwrap();
+    async fn terminal_container_is_not_restarted_while_assignment_remains() {
+        let (supervisor, runtime, bus) = setup(7).await;
+        let mut desired = assignment("task-1");
+        desired.spec.restart_policy.condition = RestartCondition::None;
+        write_assignment(&bus, &desired).await;
         supervisor.reconcile_once().await.unwrap();
-        assert_eq!(runtime.container_count(), 1);
+        let container = runtime.list().await[0].id.clone();
+        runtime.mark_failed(&container);
 
-        store.remove_task("t1".to_string()).await.unwrap();
-        let actions = supervisor.reconcile_once().await.unwrap();
-        assert_eq!(actions, 1);
+        supervisor.reconcile_once().await.unwrap();
         assert_eq!(runtime.container_count(), 0);
-        assert_eq!(supervisor.running_count().await, 0);
-    }
-
-    #[tokio::test]
-    async fn idempotent_no_changes() {
-        let (supervisor, runtime, store) = setup(1).await;
-
-        store.upsert_task(make_task("t1", 1)).await.unwrap();
         supervisor.reconcile_once().await.unwrap();
-        assert_eq!(runtime.container_count(), 1);
-
-        // Second pass: no changes.
-        let actions = supervisor.reconcile_once().await.unwrap();
-        assert_eq!(actions, 0);
-        assert_eq!(runtime.container_count(), 1);
-    }
-
-    #[tokio::test]
-    async fn multiple_tasks() {
-        let (supervisor, runtime, store) = setup(1).await;
-
-        store.upsert_task(make_task("t1", 1)).await.unwrap();
-        store.upsert_task(make_task("t2", 1)).await.unwrap();
-        store.upsert_task(make_task("t3", 2)).await.unwrap(); // other node
-
-        let actions = supervisor.reconcile_once().await.unwrap();
-        assert_eq!(actions, 2);
-        assert_eq!(runtime.container_count(), 2);
-
-        let running = supervisor.running_tasks().await;
-        assert!(running.contains(&"t1".to_string()));
-        assert!(running.contains(&"t2".to_string()));
-        assert!(!running.contains(&"t3".to_string()));
-    }
-
-    #[tokio::test]
-    async fn start_failure_does_not_crash() {
-        let (supervisor, runtime, store) = setup(1).await;
-        *runtime.fail_starts.lock().unwrap() = true;
-
-        store.upsert_task(make_task("t1", 1)).await.unwrap();
-        // Should not panic, just log the error.
-        let actions = supervisor.reconcile_once().await.unwrap();
-        assert_eq!(actions, 0);
-        assert_eq!(supervisor.running_count().await, 0);
-
-        // Re-enable starts and retry.
-        *runtime.fail_starts.lock().unwrap() = false;
-        let actions = supervisor.reconcile_once().await.unwrap();
-        assert_eq!(actions, 1);
-    }
-
-    // --- Bus integration tests -----------------------------------------------
-
-    #[tokio::test]
-    async fn bus_assign_command_starts_container() {
-        let (supervisor, runtime, store, bus) = setup_with_bus(1).await;
-
-        // Send an assign command via the bus.
-        let cmd = assign_cmd(&store, "t1", make_spec()).await;
-        bus.send_command(1, &cmd).await.unwrap();
-
-        let actions = supervisor.reconcile_once().await.unwrap();
-        assert_eq!(actions, 1);
-        assert_eq!(runtime.container_count(), 1);
-        assert_eq!(supervisor.running_count().await, 1);
-    }
-
-    #[tokio::test]
-    async fn bus_stop_command_stops_container() {
-        let (supervisor, runtime, store, bus) = setup_with_bus(1).await;
-
-        // Start via bus command.
-        let cmd = assign_cmd(&store, "t1", make_spec()).await;
-        bus.send_command(1, &cmd).await.unwrap();
-        supervisor.reconcile_once().await.unwrap();
-        assert_eq!(runtime.container_count(), 1);
-
-        // Stop via bus command.
-        store.remove_task("t1".to_string()).await.unwrap();
-        let stop = Command::Stop {
-            task_id: "t1".to_string(),
-        };
-        bus.send_command(1, &stop).await.unwrap();
-        let actions = supervisor.reconcile_once().await.unwrap();
-        assert_eq!(actions, 1);
-        assert_eq!(runtime.container_count(), 0);
-        assert_eq!(supervisor.running_count().await, 0);
-    }
-
-    #[tokio::test]
-    async fn bus_command_for_other_node_ignored() {
-        let (supervisor, runtime, _store, bus) = setup_with_bus(1).await;
-
-        // Send command to node 2 — supervisor on node 1 should not receive it.
-        let cmd = Command::Assign {
-            task_id: "t1".to_string(),
-            payload: spec_to_payload(&make_spec()),
-        };
-        bus.send_command(2, &cmd).await.unwrap();
-
-        let actions = supervisor.reconcile_once().await.unwrap();
-        assert_eq!(actions, 0);
         assert_eq!(runtime.container_count(), 0);
     }
 
     #[tokio::test]
-    async fn bus_publishes_task_status() {
-        let (supervisor, _runtime, store, bus) = setup_with_bus(1).await;
-
-        // Start a container via bus command.
-        let cmd = assign_cmd(&store, "t1", make_spec()).await;
-        bus.send_command(1, &cmd).await.unwrap();
+    async fn container_logs_are_not_republished_after_the_cursor_advances() {
+        let (supervisor, _, bus) = setup(7).await;
+        write_assignment(&bus, &assignment("task-1")).await;
         supervisor.reconcile_once().await.unwrap();
-
-        // Status should be published to the KV.
-        let key = subjects::kv_task_status("t1");
-        let status_bytes = bus.get_status(&key).await.unwrap();
-        assert!(status_bytes.is_some(), "task status should be in KV");
-
-        let report = TaskStatusReport::from_bytes(&status_bytes.unwrap()).unwrap();
-        assert_eq!(report.task_id, "t1");
-        assert_eq!(report.node_id, 1);
-        assert_eq!(report.state, TaskActualState::Running);
-    }
-
-    #[tokio::test]
-    async fn bus_and_raft_paths_coexist() {
-        // A task assigned via Raft should be started by the raft reconcile,
-        // and a task assigned via bus should be started by the bus path.
-        // Both should coexist without double-starting.
-        let (supervisor, runtime, store, bus) = setup_with_bus(1).await;
-
-        // Task via Raft.
-        store.upsert_task(make_task("raft-task", 1)).await.unwrap();
-
-        // Task via bus.
-        let cmd = assign_cmd(&store, "bus-task", make_spec()).await;
-        bus.send_command(1, &cmd).await.unwrap();
-
-        let actions = supervisor.reconcile_once().await.unwrap();
-        assert_eq!(actions, 2);
-        assert_eq!(runtime.container_count(), 2);
-
-        // Second pass: no double-start.
-        let actions = supervisor.reconcile_once().await.unwrap();
-        assert_eq!(actions, 0);
-        assert_eq!(runtime.container_count(), 2);
-    }
-
-    #[tokio::test]
-    async fn bus_assign_is_idempotent() {
-        let (supervisor, runtime, store, bus) = setup_with_bus(1).await;
-
-        let cmd = assign_cmd(&store, "t1", make_spec()).await;
-        bus.send_command(1, &cmd).await.unwrap();
-        bus.send_command(1, &cmd).await.unwrap(); // duplicate
+        let first_count = bus.log_history("task-1", 0).await.unwrap().len();
+        assert!(first_count > 0);
 
         supervisor.reconcile_once().await.unwrap();
-        assert_eq!(runtime.container_count(), 1);
-
-        // Second pass: no additional starts.
-        let actions = supervisor.reconcile_once().await.unwrap();
-        assert_eq!(actions, 0);
-        assert_eq!(runtime.container_count(), 1);
+        assert_eq!(
+            bus.log_history("task-1", 0).await.unwrap().len(),
+            first_count
+        );
     }
+    #[tokio::test]
+    async fn completed_agent_result_is_published_as_a_log() {
+        let (supervisor, _, executor, bus) = setup_with_agent(7).await;
+        *executor.auto_complete.lock().unwrap() = true;
+        write_assignment(&bus, &agent_assignment("agent-1")).await;
 
-    // --- Agent dispatch tests --------------------------------------------------
-
-    use crate::agent::MockAgentExecutor;
-    use minga_state::types::{AgentSpec, WorkloadKind};
-
-    fn make_agent_task(id: &str, node_id: u64) -> Task {
-        Task {
-            id: id.to_string(),
-            service_id: "svc".to_string(),
-            node_id,
-            state: TaskState::Pending,
-            spec: TaskSpec {
-                image: String::new(),
-                env: HashMap::new(),
-                ports: vec![],
-                resources: ResourceSpec::default(),
-                kind: WorkloadKind::Agent(AgentSpec {
-                    module_ref: "./agent.wasm".to_string(),
-                    ..Default::default()
-                }),
-                ..Default::default()
+        supervisor.reconcile_once().await.unwrap();
+        assert!(!bus.log_history("agent-1", 0).await.unwrap().is_empty());
+    }
+    #[test]
+    fn dns_records_come_from_network_assignment_entries() {
+        let record = NetworkAssignment {
+            network: minga_state::types::Network {
+                id: "network-1".to_string(),
+                name: "network".to_string(),
+                driver: "bridge".to_string(),
+                attachable: true,
+                subnet: Some("10.0.0.0/24".to_string()),
+                wg_port: None,
             },
-            restarts: 0,
-            running_since_unix: None,
-            last_error: None,
-            last_exit_code: None,
-        }
-    }
-
-    fn make_agent_spec() -> TaskSpec {
-        TaskSpec {
-            image: String::new(),
-            env: HashMap::new(),
-            ports: vec![],
-            resources: ResourceSpec::default(),
-            kind: WorkloadKind::Agent(AgentSpec {
-                module_ref: "./agent.wasm".to_string(),
-                ..Default::default()
-            }),
-            ..Default::default()
-        }
-    }
-
-    async fn setup_with_agent(
-        node_id: u64,
-    ) -> (
-        Supervisor,
-        Arc<MockRuntime>,
-        Arc<MockAgentExecutor>,
-        Arc<StateStore>,
-        Arc<MemoryBus>,
-    ) {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Arc::new(
-            StateStore::open(node_id, "127.0.0.1:0", dir.path(), BTreeMap::new())
-                .await
-                .unwrap(),
-        );
-        std::mem::forget(dir);
-
-        let runtime = Arc::new(MockRuntime::new());
-        let agent_exec = Arc::new(MockAgentExecutor::new());
-        let bus = MemoryBus::new();
-        let supervisor = Supervisor::with_agent_executor(
-            store.clone(),
-            runtime.clone(),
-            bus.clone(),
-            agent_exec.clone(),
-            node_id,
-        );
-        (supervisor, runtime, agent_exec, store, bus)
-    }
-
-    #[tokio::test]
-    async fn bus_assign_agent_starts_agent() {
-        let (supervisor, runtime, agent_exec, store, bus) = setup_with_agent(1).await;
-
-        let cmd = assign_cmd(&store, "agent-1", make_agent_spec()).await;
-        bus.send_command(1, &cmd).await.unwrap();
-
-        let actions = supervisor.reconcile_once().await.unwrap();
-        assert_eq!(actions, 1);
-        assert_eq!(agent_exec.agent_count(), 1);
-        assert_eq!(
-            runtime.container_count(),
-            0,
-            "no container should be started"
-        );
-        assert_eq!(supervisor.running_agent_count().await, 1);
-    }
-
-    #[tokio::test]
-    async fn bus_stop_agent_stops_agent() {
-        let (supervisor, _runtime, agent_exec, store, bus) = setup_with_agent(1).await;
-
-        // Start agent via bus.
-        let cmd = assign_cmd(&store, "agent-1", make_agent_spec()).await;
-        bus.send_command(1, &cmd).await.unwrap();
-        supervisor.reconcile_once().await.unwrap();
-        assert_eq!(agent_exec.agent_count(), 1);
-
-        // Stop via bus, after the scheduler removed the task from Raft.
-        store.remove_task("agent-1".to_string()).await.unwrap();
-        let stop = Command::Stop {
-            task_id: "agent-1".to_string(),
+            tasks: vec![
+                minga_state::types::NetworkDnsTask {
+                    node_id: 7,
+                    task_id: "task-1".to_string(),
+                    service_name: "web".to_string(),
+                    stack: "plant".to_string(),
+                    ip: "10.0.0.10".to_string(),
+                },
+                minga_state::types::NetworkDnsTask {
+                    node_id: 8,
+                    task_id: "task-2".to_string(),
+                    service_name: "web".to_string(),
+                    stack: "plant".to_string(),
+                    ip: "10.0.0.11".to_string(),
+                },
+            ],
         };
-        bus.send_command(1, &stop).await.unwrap();
-        let actions = supervisor.reconcile_once().await.unwrap();
-        assert_eq!(actions, 1);
-        assert_eq!(agent_exec.agent_count(), 0);
-        assert_eq!(supervisor.running_agent_count().await, 0);
-    }
 
-    #[tokio::test]
-    async fn raft_reconcile_starts_agent_task() {
-        let (supervisor, runtime, agent_exec, store, _bus) = setup_with_agent(1).await;
-
-        store
-            .upsert_task(make_agent_task("agent-1", 1))
-            .await
-            .unwrap();
-        let actions = supervisor.reconcile_once().await.unwrap();
-        assert_eq!(actions, 1);
-        assert_eq!(agent_exec.agent_count(), 1);
-        assert_eq!(runtime.container_count(), 0);
-    }
-
-    #[tokio::test]
-    async fn raft_reconcile_stops_agent_when_task_removed() {
-        let (supervisor, _runtime, agent_exec, store, _bus) = setup_with_agent(1).await;
-
-        store
-            .upsert_task(make_agent_task("agent-1", 1))
-            .await
-            .unwrap();
-        supervisor.reconcile_once().await.unwrap();
-        assert_eq!(agent_exec.agent_count(), 1);
-
-        store.remove_task("agent-1".to_string()).await.unwrap();
-        let actions = supervisor.reconcile_once().await.unwrap();
-        assert_eq!(actions, 1);
-        assert_eq!(agent_exec.agent_count(), 0);
-    }
-
-    #[tokio::test]
-    async fn mixed_container_and_agent_tasks() {
-        let (supervisor, runtime, agent_exec, store, bus) = setup_with_agent(1).await;
-
-        // Container task via Raft.
-        store
-            .upsert_task(make_task("container-1", 1))
-            .await
-            .unwrap();
-
-        // Agent task via bus.
-        let cmd = assign_cmd(&store, "agent-1", make_agent_spec()).await;
-        bus.send_command(1, &cmd).await.unwrap();
-
-        let actions = supervisor.reconcile_once().await.unwrap();
-        assert_eq!(actions, 2);
-        assert_eq!(runtime.container_count(), 1);
-        assert_eq!(agent_exec.agent_count(), 1);
-        assert_eq!(supervisor.running_count().await, 2);
-    }
-
-    #[tokio::test]
-    async fn agent_task_without_executor_is_skipped() {
-        // Supervisor without agent executor should skip agent tasks.
-        let dir = tempfile::tempdir().unwrap();
-        let store = Arc::new(
-            StateStore::open(1, "127.0.0.1:0", dir.path(), BTreeMap::new())
-                .await
-                .unwrap(),
-        );
-        std::mem::forget(dir);
-
-        let runtime = Arc::new(MockRuntime::new());
-        let bus = MemoryBus::new();
-        let supervisor = Supervisor::with_bus(store.clone(), runtime.clone(), bus, 1);
-
-        store
-            .upsert_task(make_agent_task("agent-1", 1))
-            .await
-            .unwrap();
-        let actions = supervisor.reconcile_once().await.unwrap();
-        assert_eq!(actions, 0, "agent task should be skipped without executor");
-        assert_eq!(runtime.container_count(), 0);
-    }
-
-    #[tokio::test]
-    async fn agent_status_published_to_bus() {
-        let (supervisor, _runtime, agent_exec, store, bus) = setup_with_agent(1).await;
-        *agent_exec.auto_complete.lock().unwrap() = true;
-
-        let cmd = assign_cmd(&store, "agent-1", make_agent_spec()).await;
-        bus.send_command(1, &cmd).await.unwrap();
-        supervisor.reconcile_once().await.unwrap();
-
-        // Status should be published to KV.
-        let key = subjects::kv_task_status("agent-1");
-        let status_bytes = bus.get_status(&key).await.unwrap();
-        assert!(status_bytes.is_some(), "agent status should be in KV");
-
-        let report = TaskStatusReport::from_bytes(&status_bytes.unwrap()).unwrap();
-        assert_eq!(report.task_id, "agent-1");
-        assert_eq!(report.node_id, 1);
-    }
-
-    #[tokio::test]
-    async fn running_tasks_includes_agents() {
-        let (supervisor, _runtime, _agent_exec, store, bus) = setup_with_agent(1).await;
-
-        let cmd = assign_cmd(&store, "agent-1", make_agent_spec()).await;
-        bus.send_command(1, &cmd).await.unwrap();
-        supervisor.reconcile_once().await.unwrap();
-
-        let tasks = supervisor.running_tasks().await;
-        assert!(tasks.contains(&"agent-1".to_string()));
-    }
-
-    #[tokio::test]
-    async fn agent_assign_is_idempotent() {
-        let (supervisor, _runtime, agent_exec, store, bus) = setup_with_agent(1).await;
-
-        let cmd = assign_cmd(&store, "agent-1", make_agent_spec()).await;
-        bus.send_command(1, &cmd).await.unwrap();
-        bus.send_command(1, &cmd).await.unwrap(); // duplicate
-
-        supervisor.reconcile_once().await.unwrap();
-        assert_eq!(agent_exec.agent_count(), 1);
-
-        let actions = supervisor.reconcile_once().await.unwrap();
-        assert_eq!(actions, 0);
-        assert_eq!(agent_exec.agent_count(), 1);
-    }
-
-    // --- Log streaming tests ---------------------------------------------------
-
-    #[tokio::test]
-    async fn container_logs_streamed_to_bus() {
-        let (supervisor, _runtime, store, bus) = setup_with_bus(1).await;
-
-        // Subscribe to logs before starting.
-        let mut log_stream = bus.subscribe_logs("t1").await.unwrap();
-
-        // Start a container via bus command.
-        let cmd = assign_cmd(&store, "t1", make_spec()).await;
-        bus.send_command(1, &cmd).await.unwrap();
-        supervisor.reconcile_once().await.unwrap();
-
-        // Logs should be published to the bus.
-        let entry = tokio::time::timeout(std::time::Duration::from_secs(1), log_stream.next())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(entry.task_id, "t1");
-        assert!(String::from_utf8_lossy(&entry.data).contains("starting"));
-    }
-
-    #[tokio::test]
-    async fn container_logs_not_duplicated() {
-        let (supervisor, _runtime, store, bus) = setup_with_bus(1).await;
-
-        let mut log_stream = bus.subscribe_logs("t1").await.unwrap();
-
-        let cmd = assign_cmd(&store, "t1", make_spec()).await;
-        bus.send_command(1, &cmd).await.unwrap();
-
-        // First pass: logs are published (mock returns 3 lines).
-        supervisor.reconcile_once().await.unwrap();
-
-        // Drain all log entries from the first pass.
-        for _ in 0..3 {
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(1), log_stream.next())
-                .await
-                .unwrap()
-                .unwrap();
-        }
-
-        // Second pass: no duplicate logs (offset tracking).
-        // The mock runtime always returns the same 3 lines, but the offset
-        // should prevent re-publishing.
-        supervisor.reconcile_once().await.unwrap();
-
-        // Should timeout — no new logs.
-        let result =
-            tokio::time::timeout(std::time::Duration::from_millis(200), log_stream.next()).await;
-        assert!(result.is_err(), "no duplicate logs should be published");
-    }
-
-    #[tokio::test]
-    async fn agent_result_published_as_log() {
-        let (supervisor, _runtime, agent_exec, store, bus) = setup_with_agent(1).await;
-        *agent_exec.auto_complete.lock().unwrap() = true;
-
-        let mut log_stream = bus.subscribe_logs("agent-1").await.unwrap();
-
-        let cmd = assign_cmd(&store, "agent-1", make_agent_spec()).await;
-        bus.send_command(1, &cmd).await.unwrap();
-        supervisor.reconcile_once().await.unwrap();
-
-        // Agent result should be published as a log entry.
-        let entry = tokio::time::timeout(std::time::Duration::from_secs(1), log_stream.next())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(entry.task_id, "agent-1");
-    }
-
-    #[tokio::test]
-    async fn log_offsets_cleaned_up_on_stop() {
-        let (supervisor, _runtime, store, bus) = setup_with_bus(1).await;
-
-        let cmd = assign_cmd(&store, "t1", make_spec()).await;
-        bus.send_command(1, &cmd).await.unwrap();
-        supervisor.reconcile_once().await.unwrap();
-
-        // Log offset should exist.
-        assert!(supervisor.log_offsets.lock().await.contains_key("t1"));
-
-        // Stop the task.
-        let stop = Command::Stop {
-            task_id: "t1".to_string(),
-        };
-        bus.send_command(1, &stop).await.unwrap();
-        supervisor.reconcile_once().await.unwrap();
-
-        // Log offset should be cleaned up.
-        assert!(!supervisor.log_offsets.lock().await.contains_key("t1"));
-    }
-
-    // --- Restart policy tests --------------------------------------------------
-
-    fn make_spec_with_restart(
-        condition: minga_state::types::RestartCondition,
-        delay_secs: u64,
-        max_attempts: Option<u32>,
-    ) -> TaskSpec {
-        TaskSpec {
-            image: "nginx:latest".to_string(),
-            env: HashMap::new(),
-            ports: vec![],
-            resources: ResourceSpec::default(),
-            restart_policy: minga_state::types::RestartPolicy {
-                condition,
-                delay_secs,
-                max_attempts,
-            },
-            ..Default::default()
-        }
-    }
-
-    #[tokio::test]
-    async fn failed_container_restarted_with_policy_any() {
-        let (supervisor, runtime, store, _bus) = setup_with_bus(1).await;
-
-        // Create a task with restart policy "any".
-        let spec = make_spec_with_restart(minga_state::types::RestartCondition::Any, 0, None);
-        let task = Task {
-            id: "t1".to_string(),
-            service_id: "svc".to_string(),
-            node_id: 1,
-            state: TaskState::Pending,
-            spec,
-            restarts: 0,
-            running_since_unix: None,
-            last_error: None,
-            last_exit_code: None,
-        };
-        store.upsert_task(task).await.unwrap();
-
-        // Start the container.
-        supervisor.reconcile_once().await.unwrap();
-        assert_eq!(runtime.container_count(), 1);
-
-        // Mark the container as failed.
-        let running = supervisor.running.lock().await;
-        let container_id = running.get("t1").unwrap().clone();
-        drop(running);
-        runtime.mark_failed(&container_id);
-
-        // Next reconcile should detect the failure and restart.
-        let actions = supervisor.reconcile_once().await.unwrap();
-        assert!(actions >= 1, "failed container should be restarted");
+        let dns = build_dns_store(&[record], 7);
         assert_eq!(
-            runtime.container_count(),
-            1,
-            "container should be running again"
+            dns.resolve(&minga_net::dns::service_fqdn("web", "plant")),
+            vec![std::net::Ipv4Addr::new(10, 0, 0, 10)]
         );
-    }
-
-    #[tokio::test]
-    async fn failed_container_not_restarted_with_policy_none() {
-        let (supervisor, runtime, store, _bus) = setup_with_bus(1).await;
-
-        let spec = make_spec_with_restart(minga_state::types::RestartCondition::None, 0, None);
-        let task = Task {
-            id: "t1".to_string(),
-            service_id: "svc".to_string(),
-            node_id: 1,
-            state: TaskState::Pending,
-            spec,
-            restarts: 0,
-            running_since_unix: None,
-            last_error: None,
-            last_exit_code: None,
-        };
-        store.upsert_task(task).await.unwrap();
-
-        supervisor.reconcile_once().await.unwrap();
-        assert_eq!(runtime.container_count(), 1);
-
-        let running = supervisor.running.lock().await;
-        let container_id = running.get("t1").unwrap().clone();
-        drop(running);
-        runtime.mark_failed(&container_id);
-
-        let actions = supervisor.reconcile_once().await.unwrap();
-        assert_eq!(
-            actions, 0,
-            "container with policy=none should not be restarted"
-        );
-        assert_eq!(
-            runtime.container_count(),
-            0,
-            "failed container should be removed"
-        );
-    }
-
-    #[tokio::test]
-    async fn restart_respects_max_attempts() {
-        let (supervisor, runtime, store, _bus) = setup_with_bus(1).await;
-
-        let spec = make_spec_with_restart(
-            minga_state::types::RestartCondition::Any,
-            0,
-            Some(1), // max 1 attempt
-        );
-        let task = Task {
-            id: "t1".to_string(),
-            service_id: "svc".to_string(),
-            node_id: 1,
-            state: TaskState::Pending,
-            spec,
-            restarts: 0,
-            running_since_unix: None,
-            last_error: None,
-            last_exit_code: None,
-        };
-        store.upsert_task(task).await.unwrap();
-
-        // Start.
-        supervisor.reconcile_once().await.unwrap();
-        assert_eq!(runtime.container_count(), 1);
-
-        // Fail and restart (attempt 1).
-        {
-            let running = supervisor.running.lock().await;
-            let cid = running.get("t1").unwrap().clone();
-            runtime.mark_failed(&cid);
-        }
-        supervisor.reconcile_once().await.unwrap();
-        assert_eq!(runtime.container_count(), 1, "should restart (attempt 1)");
-
-        // Fail again — should NOT restart (max attempts reached).
-        {
-            let running = supervisor.running.lock().await;
-            if let Some(cid) = running.get("t1") {
-                runtime.mark_failed(cid);
-            }
-        }
-        supervisor.reconcile_once().await.unwrap();
-        assert_eq!(
-            runtime.container_count(),
-            0,
-            "should not restart beyond max_attempts"
-        );
-    }
-
-    // --- Why a task ended ----------------------------------------------------
-
-    fn restarting(mut task: Task, condition: RestartCondition) -> Task {
-        task.spec.restart_policy = minga_state::types::RestartPolicy {
-            condition,
-            delay_secs: 0,
-            max_attempts: None,
-        };
-        task
-    }
-
-    async fn crash(rt: &MockRuntime, sup: &Supervisor, code: i32) {
-        let container = rt.list().await[0].id.clone();
-        rt.mark_failed_with_code(&container, code);
-        sup.reconcile_once().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn a_restarted_task_keeps_the_reason_it_exited() {
-        let (sup, rt, store, _bus) = setup_with_bus(1).await;
-        let task = restarting(make_task("t1", 1), RestartCondition::Any);
-        store.upsert_task(task).await.unwrap();
-        sup.reconcile_once().await.unwrap();
-
-        crash(&rt, &sup, 3).await;
-        let task = actual_task(&sup, &store, "t1").await;
-        assert_eq!(task.restarts, 1);
-        assert_eq!(task.last_error.as_deref(), Some("exited with code 3"));
-        assert_eq!(task.last_exit_code, Some(3));
-
-        // The new container starts; the reason stays until it has run a while.
-        sup.reconcile_once().await.unwrap();
-        let task = actual_task(&sup, &store, "t1").await;
-        assert_eq!(task.state, TaskState::Running);
-        assert_eq!(task.last_error.as_deref(), Some("exited with code 3"));
-    }
-
-    #[tokio::test]
-    async fn a_task_that_ends_failed_says_why() {
-        let (sup, rt, store, _bus) = setup_with_bus(1).await;
-        let task = restarting(make_task("t1", 1), RestartCondition::None);
-        store.upsert_task(task).await.unwrap();
-        sup.reconcile_once().await.unwrap();
-
-        crash(&rt, &sup, 137).await;
-        let task = actual_task(&sup, &store, "t1").await;
-        assert_eq!(task.state, TaskState::Failed);
-        assert_eq!(task.last_exit_code, Some(137));
-        let error = task.last_error.unwrap();
-        assert!(error.starts_with("exited with code 137"), "{error}");
-        assert!(error.contains("signal 9"), "{error}");
-        assert!(!error.to_lowercase().contains("oom"), "{error}");
-    }
-
-    #[tokio::test]
-    async fn a_failed_start_is_recorded_once_and_cleared_when_the_task_settles() {
-        let (sup, rt, store, _bus) = setup_with_bus(1).await;
-        *rt.fail_starts.lock().unwrap() = true;
-        store.upsert_task(make_task("t1", 1)).await.unwrap();
-
-        sup.reconcile_once().await.unwrap();
-        let task = actual_task(&sup, &store, "t1").await;
-        assert_eq!(task.restarts, 1);
-        assert_eq!(task.last_exit_code, None);
-        assert_eq!(
-            task.last_error.as_deref(),
-            Some("failed to start container: mock runtime: starts disabled")
-        );
-        let raft_task = store.get_task(&"t1".to_string()).await.unwrap().unwrap();
-        assert_eq!(raft_task.restarts, 0);
-        assert_eq!(raft_task.last_error, None);
-
-        // The same failure on the next pass is not written again.
-        let before = actual_task(&sup, &store, "t1").await;
-        sup.reconcile_once().await.unwrap();
-        assert_eq!(actual_task(&sup, &store, "t1").await, before);
-
-        // It starts, but has not run long enough to forget the reason...
-        *rt.fail_starts.lock().unwrap() = false;
-        let task = pass_until(&sup, &store, "t1", |t| t.state == TaskState::Running).await;
-        assert!(task.last_error.is_some());
-        sup.reconcile_once().await.unwrap();
-        let task = actual_task(&sup, &store, "t1").await;
-        assert!(task.last_error.is_some());
-
-        // ...until it has.
-        let mut status = actual_status(&sup, "t1").await;
-        status.running_since_unix = Some(unix_now() - failure::CLEAR_AFTER_SECS - 1);
-        let bus = sup.bus.as_ref().unwrap();
-        bus.put_status(&subjects::kv_task_status("t1"), &status.to_bytes().unwrap())
-            .await
-            .unwrap();
-        sup.reconcile_once().await.unwrap();
-        let task = actual_task(&sup, &store, "t1").await;
-        assert_eq!((task.last_error, task.last_exit_code), (None, None));
-    }
-
-    #[tokio::test]
-    async fn an_unhealthy_task_says_the_healthcheck_killed_it() {
-        let (sup, rt, store, _bus) = setup_with_bus(1).await;
-        store
-            .upsert_task(with_healthcheck(make_task("t1", 1)))
-            .await
-            .unwrap();
-        pass_until(&sup, &store, "t1", |t| t.state == TaskState::Running).await;
-
-        let container = rt.list().await[0].id.clone();
-        rt.exec_codes.lock().unwrap().insert(container, 1);
-        let task = pass_until(&sup, &store, "t1", |t| t.restarts > 0).await;
-        let error = task.last_error.unwrap();
-        assert!(error.starts_with(failure::HEALTHCHECK_KILL), "{error}");
-        assert!(task.last_exit_code.is_some());
     }
 }

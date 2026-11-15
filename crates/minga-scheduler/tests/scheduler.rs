@@ -8,9 +8,11 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
-use minga_bus::EventBus;
+use minga_bus::{subjects, EventBus, MemoryBus, TaskActualState, TaskStatusReport};
 use minga_scheduler::Scheduler;
-use minga_state::types::{ClusterNode, NodeStatus, ResourceSpec, Service, ServiceMode};
+use minga_state::types::{
+    ClusterNode, FailureAction, NodeStatus, ResourceSpec, Service, ServiceMode,
+};
 use minga_state::StateStore;
 
 fn make_node(id: u64, cpus: f64, mem: u64) -> ClusterNode {
@@ -74,6 +76,9 @@ async fn bus_lease_controls_node_eligibility() {
         .await
         .unwrap();
     let bus = minga_bus::MemoryBus::new();
+    bus.put_assignment("node.99.task.stale", b"stale")
+        .await
+        .unwrap();
     let scheduler = Scheduler::with_bus(store.clone(), bus.clone());
 
     assert!(
@@ -86,6 +91,77 @@ async fn bus_lease_controls_node_eligibility() {
     let actions = scheduler.reconcile_once().await.unwrap();
     assert_eq!(actions.len(), 1);
     assert_eq!(store.list_tasks().await.unwrap()[0].node_id, 1);
+    let assignments = bus.list_assignments("").await.unwrap();
+    assert!(!assignments
+        .iter()
+        .any(|(key, _)| key == "node.99.task.stale"));
+    let task_entry = assignments
+        .iter()
+        .find(|(key, _)| key.starts_with("node.1.task.app.web.1."))
+        .expect("leader publishes the placed task assignment");
+    let assignment: minga_state::types::TaskAssignment =
+        minga_state::codec::decode_wire(&task_entry.1).unwrap();
+    assert_eq!(assignment.node_id, 1);
+
+    drop(scheduler);
+    Arc::try_unwrap(store)
+        .ok()
+        .expect("scheduler dropped")
+        .shutdown()
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn rollout_uses_failed_status_from_bus_kv() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(
+        StateStore::open(1, "127.0.0.1:0", dir.path(), BTreeMap::new())
+            .await
+            .unwrap(),
+    );
+    let node = make_node(1, 8.0, 1 << 34);
+    store.upsert_node(node.clone()).await.unwrap();
+
+    let previous = make_service("app.web", 1);
+    let mut service = make_service("app.web", 1);
+    service.image = "nginx:2".to_string();
+    service.update.failure_action = FailureAction::Rollback;
+    service.previous = Some(Box::new(previous.clone()));
+    let task = minga_scheduler::place_service(&service, &[node], &[], &[], 0).remove(0);
+    store.upsert_service(service).await.unwrap();
+    store.upsert_task(task.clone()).await.unwrap();
+
+    let bus = MemoryBus::new();
+    bus.refresh_lease(1, b"registration").await.unwrap();
+    let status = TaskStatusReport {
+        task_id: task.id.clone(),
+        node_id: 1,
+        state: TaskActualState::Failed,
+        container_id: None,
+        observed_at: 1,
+        restarts: 0,
+        last_error: Some("image pull failed".to_string()),
+        last_exit_code: None,
+        running_since_unix: None,
+    };
+    bus.put_status(
+        &subjects::kv_node_task_status(task.node_id, &task.id),
+        &status.to_bytes().unwrap(),
+    )
+    .await
+    .unwrap();
+
+    let scheduler = Scheduler::with_bus(store.clone(), bus);
+    let actions = scheduler.reconcile_once().await.unwrap();
+    assert!(matches!(
+        actions.as_slice(),
+        [minga_scheduler::ReconcileAction::RollbackService(id)] if id == "app.web"
+    ));
+    assert_eq!(
+        store.list_services().await.unwrap()[0].image,
+        previous.image
+    );
 
     drop(scheduler);
     Arc::try_unwrap(store)

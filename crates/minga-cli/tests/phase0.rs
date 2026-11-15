@@ -263,9 +263,9 @@ async fn phase0_gate_10_services_3_nodes() {
     let runtime2 = Arc::new(MockRuntime::new());
     let runtime3 = Arc::new(MockRuntime::new());
 
-    let sup1 = Supervisor::with_bus(store1.clone(), runtime1.clone(), bus.clone(), 1);
-    let sup2 = Supervisor::with_bus(store2.clone(), runtime2.clone(), bus.clone(), 2);
-    let sup3 = Supervisor::with_bus(store3.clone(), runtime3.clone(), bus.clone(), 3);
+    let sup1 = Supervisor::with_bus(runtime1.clone(), bus.clone(), 1);
+    let sup2 = Supervisor::with_bus(runtime2.clone(), bus.clone(), 2);
+    let sup3 = Supervisor::with_bus(runtime3.clone(), bus.clone(), 3);
 
     let (a1, a2, a3) = tokio::join!(
         sup1.reconcile_once(),
@@ -334,7 +334,7 @@ async fn phase0_gate_10_services_3_nodes() {
 
     // Every task should have a status report in the bus KV.
     for task in &all_tasks {
-        let key = subjects::kv_task_status(&task.id);
+        let key = subjects::kv_node_task_status(task.node_id, &task.id);
         let status_bytes = bus
             .get_status(&key)
             .await

@@ -185,12 +185,8 @@ async fn a_registered_node_lets_the_service_run_end_to_end() {
 
     // The supervisor then starts them.
     let runtime = Arc::new(minga_node::MockRuntime::new());
-    let supervisor = minga_node::Supervisor::with_bus(
-        store.clone(),
-        runtime.clone() as Arc<dyn minga_node::Runtime>,
-        bus,
-        1,
-    );
+    let supervisor =
+        minga_node::Supervisor::with_bus(runtime.clone() as Arc<dyn minga_node::Runtime>, bus, 1);
     let supervisor_actions = supervisor.reconcile_once().await.unwrap();
     assert_eq!(supervisor_actions, 2);
     assert_eq!(

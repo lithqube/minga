@@ -9,26 +9,16 @@
 //!
 //! | Stream | Subjects | Retention | Purpose |
 //! |---|---|---|---|
-//! | `MINGA_EVENTS` | `minga.node.>`, `minga.task.>`, `minga.egress.>` | Limits (72h) | Status reports, lifecycle events |
-//! | `MINGA_COMMANDS` | `minga.ctl.node.>` | WorkQueue (24h) | Task assign/stop commands |
+//! | `MINGA_EVENTS` | `minga.node.>`, `minga.task.>`, `minga.egress.>` | Limits (72h) | Lifecycle events |
 //! | `MINGA_LOGS` | `minga.log.>` | Limits (512 MiB, 24h) | Container log chunks |
-//! | `MINGA_DEAD_LETTERS` | `$JS.EVENT.ADVISORY.CONSUMER.{MAX_DELIVERIES,MSG_TERMINATED}.>` | Limits (64 MiB, 7d) | Record of failed deliveries |
-//!
-//! # Failed deliveries
-//!
-//! JetStream has no dead-letter queue. Every explicit-ack consumer is
-//! bounded to [`MAX_DELIVER`] deliveries with [`REDELIVERY_BACKOFF`]; after
-//! that, or after a `+TERM`, the server stops redelivering and publishes an
-//! advisory, which `MINGA_DEAD_LETTERS` keeps. The advisory names the stream
-//! sequence, not the payload: the body is recoverable only while the source
-//! stream still retains it, and the work-queue `MINGA_COMMANDS` drops a
-//! terminated message at once.
 //!
 //! # KV buckets
 //!
 //! | Bucket | Keys | Purpose |
 //! |---|---|---|
+//! | `MINGA_ASSIGN` | `node.{id}.task.{id}`, `net.{id}` | Manager-authored desired task assignments and network/DNS projection |
 //! | `MINGA_LEASES` | `lease.node.{id}` | Liveness (server-expiring registration lease) |
+//! | `MINGA_STATUS` | `node.{id}.task.{id}` | Actual task status reports |
 //!
 //! # High availability
 //!
@@ -39,8 +29,8 @@
 //! buckets are created with one replica; [`NatsBus::ensure_replicas`]
 //! raises the ones in [`REPLICATED`] on a NATS cluster.
 
-use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::{Arc, Mutex};
+use std::collections::{HashSet, VecDeque};
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_nats::jetstream::consumer::pull::Config as PullConsumerConfig;
@@ -55,8 +45,8 @@ use bytes::Bytes;
 use futures::StreamExt;
 
 use crate::{
-    subjects, BusError, BusEvent, BusRequest, Command, EventBus, EventStream, KvEvent, KvOp,
-    KvStream, LogEntry, LogEventStream, RequestStream, Result,
+    subjects, BusError, BusEvent, BusRequest, EventBus, EventStream, KvEvent, KvOp, KvStream,
+    LogEntry, LogEventStream, RequestStream, Result,
 };
 
 /// Default lease TTL: 30 seconds.
@@ -78,18 +68,14 @@ const REDELIVERY_BACKOFF: [Duration; 4] = [
 /// Redelivery delay for a message nak'd after a transient failure.
 const NAK_DELAY: Duration = Duration::from_secs(5);
 
-/// Stream that keeps the advisories JetStream publishes for failed deliveries.
-const DEAD_LETTER_STREAM: &str = "MINGA_DEAD_LETTERS";
-
 /// Streams (KV buckets are `KV_`-prefixed streams) that losing one NATS
 /// server must not lose. `MINGA_LOGS` stays at one replica: it is the
 /// largest stream, best effort, and edge disks are small.
-const REPLICATED: [&str; 5] = [
+const REPLICATED: [&str; 4] = [
     "MINGA_EVENTS",
-    "MINGA_COMMANDS",
-    DEAD_LETTER_STREAM,
     "KV_MINGA_STATUS",
     "KV_MINGA_LEASES",
+    "KV_MINGA_ASSIGN",
 ];
 
 // ---------------------------------------------------------------------------
@@ -101,9 +87,9 @@ pub struct NatsBus {
     client: Client,
     js: JetStream,
     status_kv: jetstream::kv::Store,
+    assignments_kv: jetstream::kv::Store,
     leases_kv: jetstream::kv::Store,
-    /// Cached command consumers per node.
-    consumers: Mutex<HashMap<u64, jetstream::consumer::PullConsumer>>,
+    worker_node_id: Option<u64>,
 }
 
 impl NatsBus {
@@ -126,6 +112,11 @@ impl NatsBus {
     /// server has joined JetStream, so this retries for up to 10 seconds,
     /// like stream setup does.
     pub async fn ensure_replicas(&self, replicas: usize) -> Result<()> {
+        if self.worker_node_id.is_some() {
+            return Err(BusError::Other(
+                "workers cannot change JetStream replica counts".to_string(),
+            ));
+        }
         const MAX_ATTEMPTS: u32 = 20; // 20 × 500ms = 10s
         for attempt in 1..=MAX_ATTEMPTS {
             match self.raise_replicas(replicas).await {
@@ -166,6 +157,37 @@ impl NatsBus {
         Ok(())
     }
 
+    fn require_manager(&self, operation: &str) -> Result<()> {
+        if self.worker_node_id.is_some() {
+            return Err(BusError::Kv(format!("worker identity cannot {operation}")));
+        }
+        Ok(())
+    }
+
+    fn check_worker_key(&self, key: &str) -> Result<()> {
+        if let Some(node_id) = self.worker_node_id {
+            let prefix = format!("node.{node_id}.task.");
+            if !key.starts_with(&prefix) {
+                return Err(BusError::Kv(format!(
+                    "worker {node_id} cannot access assignment/status key {key}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn check_worker_prefix(&self, prefix: &str) -> Result<()> {
+        if let Some(node_id) = self.worker_node_id {
+            let allowed = format!("node.{node_id}.task.");
+            if prefix != allowed && prefix != "net." {
+                return Err(BusError::Kv(format!(
+                    "worker {node_id} may list its own assignments or shared network metadata"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Connect to a NATS server and set up streams/KV buckets.
     ///
     /// This is the **plaintext** constructor. It exists for localhost and
@@ -186,6 +208,41 @@ impl NatsBus {
     /// not be sufficient in production: pair with TLS.
     pub async fn connect_with_token(url: &str, token: &str) -> Result<Arc<Self>> {
         Self::connect_inner(url, DEFAULT_LEASE_TTL, Some(token)).await
+    }
+
+    /// Connect as a worker without creating streams or buckets.
+    ///
+    /// Plaintext worker connections are intended only for local development;
+    /// production workers should use [`Self::connect_worker_secure`].
+    pub async fn connect_worker(url: &str, node_id: u64) -> Result<Arc<Self>> {
+        Self::connect_worker_with_token_inner(url, node_id, None).await
+    }
+
+    /// Connect a development worker with token authentication, without
+    /// creating streams or buckets.
+    pub async fn connect_worker_with_token(
+        url: &str,
+        token: &str,
+        node_id: u64,
+    ) -> Result<Arc<Self>> {
+        Self::connect_worker_with_token_inner(url, node_id, Some(token)).await
+    }
+
+    async fn connect_worker_with_token_inner(
+        url: &str,
+        node_id: u64,
+        token: Option<&str>,
+    ) -> Result<Arc<Self>> {
+        Self::ensure_crypto_provider();
+        let mut options = async_nats::ConnectOptions::new().ignore_discovered_servers();
+        if let Some(token) = token {
+            options = options.token(token.to_string());
+        }
+        let client = options
+            .connect(seed_list(url))
+            .await
+            .map_err(|error| BusError::Connection(error.to_string()))?;
+        Self::from_worker_client(client, node_id).await
     }
 
     /// This workspace links rustls with both ring and aws-lc-rs enabled
@@ -212,14 +269,15 @@ impl NatsBus {
             .map_err(|e| BusError::Connection(e.to_string()))?;
         let js = jetstream::new(client.clone());
 
-        let (status_kv, leases_kv) = Self::setup_when_ready(&js, lease_ttl).await?;
+        let (status_kv, assignments_kv, leases_kv) = Self::setup_when_ready(&js, lease_ttl).await?;
 
         Ok(Arc::new(Self {
             client,
             js,
             status_kv,
+            assignments_kv,
             leases_kv,
-            consumers: Mutex::new(HashMap::new()),
+            worker_node_id: None,
         }))
     }
 
@@ -258,14 +316,16 @@ impl NatsBus {
 
         let js = jetstream::new(client.clone());
 
-        let (status_kv, leases_kv) = Self::setup_when_ready(&js, DEFAULT_LEASE_TTL).await?;
+        let (status_kv, assignments_kv, leases_kv) =
+            Self::setup_when_ready(&js, DEFAULT_LEASE_TTL).await?;
 
         Ok(Arc::new(Self {
             client,
             js,
             status_kv,
+            assignments_kv,
             leases_kv,
-            consumers: Mutex::new(HashMap::new()),
+            worker_node_id: None,
         }))
     }
 
@@ -295,14 +355,62 @@ impl NatsBus {
 
         let js = jetstream::new(client.clone());
 
-        let (status_kv, leases_kv) = Self::setup_when_ready(&js, lease_ttl).await?;
+        let (status_kv, assignments_kv, leases_kv) = Self::setup_when_ready(&js, lease_ttl).await?;
 
         Ok(Arc::new(Self {
             client,
             js,
             status_kv,
+            assignments_kv,
             leases_kv,
-            consumers: Mutex::new(HashMap::new()),
+            worker_node_id: None,
+        }))
+    }
+
+    /// Connect a worker over mTLS and open only already-created buckets.
+    pub async fn connect_worker_secure(
+        url: &str,
+        config: &crate::tls::NatsTlsConfig,
+        node_id: u64,
+    ) -> Result<Arc<Self>> {
+        config
+            .preflight()
+            .map_err(|error| BusError::Connection(format!("TLS preflight failed: {error}")))?;
+        config
+            .validate_url(url)
+            .map_err(|error| BusError::Connection(format!("TLS URL rejected: {error}")))?;
+        let options = config
+            .connect_options()
+            .map_err(|error| BusError::Connection(format!("TLS configuration failed: {error}")))?;
+        Self::ensure_crypto_provider();
+        let client =
+            async_nats::connect_with_options(seed_list(url), options.ignore_discovered_servers())
+                .await
+                .map_err(|error| BusError::Connection(format!("TLS connection failed: {error}")))?;
+        Self::from_worker_client(client, node_id).await
+    }
+
+    async fn from_worker_client(client: Client, node_id: u64) -> Result<Arc<Self>> {
+        let js = jetstream::new(client.clone());
+        let status_kv = js
+            .get_key_value("MINGA_STATUS")
+            .await
+            .map_err(|error| BusError::Kv(format!("open MINGA_STATUS: {error}")))?;
+        let assignments_kv = js
+            .get_key_value("MINGA_ASSIGN")
+            .await
+            .map_err(|error| BusError::Kv(format!("open MINGA_ASSIGN: {error}")))?;
+        let leases_kv = js
+            .get_key_value("MINGA_LEASES")
+            .await
+            .map_err(|error| BusError::Kv(format!("open MINGA_LEASES: {error}")))?;
+        Ok(Arc::new(Self {
+            client,
+            js,
+            status_kv,
+            assignments_kv,
+            leases_kv,
+            worker_node_id: Some(node_id),
         }))
     }
 
@@ -316,33 +424,37 @@ impl NatsBus {
     async fn setup_when_ready(
         js: &JetStream,
         lease_ttl: Duration,
-    ) -> Result<(jetstream::kv::Store, jetstream::kv::Store)> {
-        const MAX_ATTEMPTS: u32 = 20; // 20 × 500ms = 10s
+    ) -> Result<(
+        jetstream::kv::Store,
+        jetstream::kv::Store,
+        jetstream::kv::Store,
+    )> {
+        const MAX_ATTEMPTS: u32 = 20;
         for attempt in 1..=MAX_ATTEMPTS {
             match Self::setup_all(js, lease_ttl).await {
-                Ok(pair) => return Ok(pair),
-                Err(e) if attempt < MAX_ATTEMPTS => {
-                    tracing::debug!(
-                        attempt,
-                        error = %e,
-                        "JetStream not ready yet; retrying"
-                    );
+                Ok(stores) => return Ok(stores),
+                Err(error) if attempt < MAX_ATTEMPTS => {
+                    tracing::debug!(attempt, error = %error, "JetStream not ready yet; retrying");
                     tokio::time::sleep(Duration::from_millis(500)).await;
                 }
-                Err(e) => return Err(e),
+                Err(error) => return Err(error),
             }
         }
         unreachable!("loop returns on success or final failure")
     }
-
     async fn setup_all(
         js: &JetStream,
         lease_ttl: Duration,
-    ) -> Result<(jetstream::kv::Store, jetstream::kv::Store)> {
+    ) -> Result<(
+        jetstream::kv::Store,
+        jetstream::kv::Store,
+        jetstream::kv::Store,
+    )> {
         Self::setup_streams(js).await?;
         let status_kv = Self::setup_kv(js, "MINGA_STATUS", Duration::ZERO).await?;
+        let assignments_kv = Self::setup_kv(js, "MINGA_ASSIGN", Duration::ZERO).await?;
         let leases_kv = Self::setup_kv(js, "MINGA_LEASES", lease_ttl).await?;
-        Ok((status_kv, leases_kv))
+        Ok((status_kv, assignments_kv, leases_kv))
     }
 
     async fn setup_streams(js: &JetStream) -> Result<()> {
@@ -362,18 +474,6 @@ impl NatsBus {
             .await
             .map_err(|e| BusError::Other(format!("MINGA_EVENTS: {e}")))?;
 
-        // MINGA_COMMANDS — work queue for task assign/stop.
-        let commands = StreamConfig {
-            name: "MINGA_COMMANDS".to_string(),
-            subjects: vec!["minga.ctl.node.>".to_string()],
-            retention: RetentionPolicy::WorkQueue,
-            max_age: Duration::from_secs(24 * 3600),
-            ..Default::default()
-        };
-        js.get_or_create_stream(commands)
-            .await
-            .map_err(|e| BusError::Other(format!("MINGA_COMMANDS: {e}")))?;
-
         // MINGA_LOGS — container log chunks.
         // Note: log subjects live under `minga.log.>`, not `minga.task.>`.
         // JetStream rejects streams with overlapping subject filters, and
@@ -389,10 +489,6 @@ impl NatsBus {
         js.get_or_create_stream(logs)
             .await
             .map_err(|e| BusError::Other(format!("MINGA_LOGS: {e}")))?;
-
-        js.get_or_create_stream(dead_letter_stream_config())
-            .await
-            .map_err(|e| BusError::Other(format!("{DEAD_LETTER_STREAM}: {e}")))?;
 
         Ok(())
     }
@@ -432,46 +528,6 @@ impl NatsBus {
             .await
             .map_err(|e| BusError::Kv(format!("{bucket}: {e}")))
     }
-
-    async fn get_command_consumer(
-        &self,
-        node_id: u64,
-    ) -> Result<jetstream::consumer::PullConsumer> {
-        // Check cache first.
-        {
-            let consumers = self.consumers.lock().unwrap();
-            if let Some(c) = consumers.get(&node_id) {
-                return Ok(c.clone());
-            }
-        }
-
-        let stream = self
-            .js
-            .get_stream("MINGA_COMMANDS")
-            .await
-            .map_err(|e| BusError::Command(format!("get stream: {e}")))?;
-
-        let consumer_name = format!("node-{node_id}");
-        let config = bounded(PullConsumerConfig {
-            durable_name: Some(consumer_name),
-            filter_subject: subjects::ctl_node_wildcard(node_id),
-            ..Default::default()
-        });
-
-        // Create-or-update, so a durable consumer created before the
-        // delivery bounds existed picks them up.
-        let consumer = stream
-            .create_consumer(config)
-            .await
-            .map_err(|e| BusError::Command(format!("get consumer: {e}")))?;
-
-        self.consumers
-            .lock()
-            .unwrap()
-            .insert(node_id, consumer.clone());
-
-        Ok(consumer)
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -481,6 +537,7 @@ impl NatsBus {
 #[async_trait]
 impl EventBus for NatsBus {
     async fn publish_event(&self, subject: &str, payload: &[u8]) -> Result<()> {
+        self.require_manager("publish events")?;
         let _timer = minga_telemetry::METRICS
             .bus_publish_latency_seconds
             .with_label_values(&["events"])
@@ -495,6 +552,7 @@ impl EventBus for NatsBus {
     }
 
     async fn subscribe_events(&self, patterns: &[&str]) -> Result<EventStream> {
+        self.require_manager("subscribe to events")?;
         let stream = self
             .js
             .get_stream("MINGA_EVENTS")
@@ -540,58 +598,93 @@ impl EventBus for NatsBus {
         Ok(Box::pin(event_stream))
     }
 
-    async fn send_command(&self, node_id: u64, cmd: &Command) -> Result<()> {
-        let _timer = minga_telemetry::METRICS
-            .bus_publish_latency_seconds
-            .with_label_values(&["commands"])
-            .start_timer();
-        let subject = match cmd {
-            Command::Assign { .. } => subjects::ctl_assign(node_id),
-            Command::Stop { .. } => subjects::ctl_stop(node_id),
-        };
-        let payload = cmd.to_bytes()?;
-        self.js
-            .publish(subject, Bytes::from(payload))
+    async fn put_assignment(&self, key: &str, value: &[u8]) -> Result<()> {
+        self.require_manager("write assignments")?;
+        self.assignments_kv
+            .put(key.to_string(), Bytes::copy_from_slice(value))
             .await
-            .map_err(|e| BusError::Command(format!("publish: {e}")))?
-            .await
-            .map_err(|e| BusError::Command(format!("publish ack: {e}")))?;
+            .map_err(|error| BusError::Kv(format!("put assignment {key}: {error}")))?;
         Ok(())
     }
 
-    async fn next_command(&self, node_id: u64) -> Result<Command> {
-        let consumer = self.get_command_consumer(node_id).await?;
-
-        // Fetch one message with a 30s timeout.
-        let mut batch = consumer
-            .fetch()
-            .max_messages(1)
-            .expires(Duration::from_secs(30))
-            .messages()
+    async fn get_assignment(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        self.check_worker_key(key)?;
+        self.assignments_kv
+            .get(key.to_string())
             .await
-            .map_err(|e| BusError::Command(format!("fetch: {e}")))?;
-
-        let msg = batch
-            .next()
-            .await
-            .ok_or_else(|| BusError::Command("fetch returned no messages".to_string()))?
-            .map_err(|e| BusError::Command(format!("message error: {e}")))?;
-
-        let cmd = match Command::from_bytes(&msg.payload) {
-            Ok(cmd) => cmd,
-            Err(e) => {
-                reject(&self.client, &msg, "commands", &e).await;
-                return Err(e);
-            }
-        };
-        msg.ack()
-            .await
-            .map_err(|e| BusError::Command(format!("ack: {e}")))?;
-
-        Ok(cmd)
+            .map(|value| value.map(|bytes| bytes.to_vec()))
+            .map_err(|error| BusError::Kv(format!("get assignment {key}: {error}")))
     }
 
+    async fn list_assignments(&self, prefix: &str) -> Result<Vec<(String, Vec<u8>)>> {
+        self.check_worker_prefix(prefix)?;
+        let mut keys = self
+            .assignments_kv
+            .keys()
+            .await
+            .map_err(|error| BusError::Kv(format!("list assignments: {error}")))?;
+        let mut entries = Vec::new();
+        while let Some(key) = keys.next().await {
+            let key = key.map_err(|error| BusError::Kv(format!("assignment key: {error}")))?;
+            if !key.starts_with(prefix) {
+                continue;
+            }
+            if let Some(value) = self
+                .assignments_kv
+                .get(key.clone())
+                .await
+                .map_err(|error| BusError::Kv(format!("get assignment {key}: {error}")))?
+            {
+                entries.push((key, value.to_vec()));
+            }
+        }
+        Ok(entries)
+    }
+
+    async fn delete_assignment(&self, key: &str) -> Result<()> {
+        self.require_manager("delete assignments")?;
+        self.assignments_kv
+            .delete(key.to_string())
+            .await
+            .map_err(|error| BusError::Kv(format!("delete assignment {key}: {error}")))
+    }
+
+    async fn watch_assignments(&self, prefix: &str) -> Result<KvStream> {
+        self.check_worker_prefix(prefix)?;
+        let watcher = self
+            .assignments_kv
+            .watch_from_revision(format!("{prefix}>"), 1)
+            .await
+            .map_err(|error| BusError::Kv(format!("watch assignments: {error}")))?;
+        let prefix = prefix.to_string();
+        let stream = watcher.filter_map(move |entry_result| {
+            let prefix = prefix.clone();
+            async move {
+                match entry_result {
+                    Ok(entry) if entry.key.starts_with(&prefix) => {
+                        let op = match entry.operation {
+                            KvOperation::Put => KvOp::Put,
+                            KvOperation::Delete | KvOperation::Purge => KvOp::Delete,
+                        };
+                        let value = (op == KvOp::Put).then(|| entry.value.to_vec());
+                        Some(KvEvent {
+                            key: entry.key,
+                            value,
+                            op,
+                        })
+                    }
+                    Ok(_) => None,
+                    Err(error) => {
+                        tracing::warn!(error = %error, "assignment watch error");
+                        None
+                    }
+                }
+            }
+        });
+        Ok(Box::pin(stream))
+    }
     async fn put_status(&self, key: &str, value: &[u8]) -> Result<()> {
+        self.check_worker_key(key)?;
         self.status_kv
             .put(key.to_string(), Bytes::copy_from_slice(value))
             .await
@@ -600,6 +693,7 @@ impl EventBus for NatsBus {
     }
 
     async fn get_status(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        self.check_worker_key(key)?;
         match self
             .status_kv
             .get(key.to_string())
@@ -612,6 +706,7 @@ impl EventBus for NatsBus {
     }
 
     async fn list_status(&self) -> Result<Vec<(String, Vec<u8>)>> {
+        self.require_manager("list statuses")?;
         use futures::StreamExt;
 
         let mut keys = self
@@ -637,6 +732,7 @@ impl EventBus for NatsBus {
     }
 
     async fn watch_status(&self) -> Result<KvStream> {
+        self.require_manager("watch statuses")?;
         // `watch_all()` uses DeliverPolicy::New — it only yields *future*
         // writes and never replays the current bucket contents. A status
         // watcher must see existing task statuses too, so start from the
@@ -677,6 +773,14 @@ impl EventBus for NatsBus {
     }
 
     async fn refresh_lease(&self, node_id: u64, registration: &[u8]) -> Result<()> {
+        if self
+            .worker_node_id
+            .is_some_and(|worker_id| worker_id != node_id)
+        {
+            return Err(BusError::Lease(format!(
+                "worker cannot refresh node {node_id}'s lease"
+            )));
+        }
         let key = subjects::kv_lease(node_id);
         self.leases_kv
             .put(key, Bytes::copy_from_slice(registration))
@@ -686,6 +790,14 @@ impl EventBus for NatsBus {
     }
 
     async fn is_alive(&self, node_id: u64) -> Result<bool> {
+        if self
+            .worker_node_id
+            .is_some_and(|worker_id| worker_id != node_id)
+        {
+            return Err(BusError::Lease(format!(
+                "worker cannot query node {node_id}'s lease"
+            )));
+        }
         let key = subjects::kv_lease(node_id);
         Ok(self
             .leases_kv
@@ -696,6 +808,7 @@ impl EventBus for NatsBus {
     }
 
     async fn list_alive_nodes(&self) -> Result<HashSet<u64>> {
+        self.require_manager("list leases")?;
         let mut keys = self
             .leases_kv
             .keys()
@@ -715,6 +828,7 @@ impl EventBus for NatsBus {
     }
 
     async fn watch_leases(&self) -> Result<KvStream> {
+        self.require_manager("watch leases")?;
         // Lease entries have history=1, so replay the current snapshot before
         // streaming new leases. Managers can start or regain leadership after
         // nodes have already joined.
@@ -748,6 +862,7 @@ impl EventBus for NatsBus {
     }
 
     async fn request(&self, subject: &str, payload: &[u8], _timeout: Duration) -> Result<Vec<u8>> {
+        self.require_manager("send requests")?;
         // async-nats handles timeout internally via its own configuration.
         let msg = self
             .client
@@ -758,6 +873,7 @@ impl EventBus for NatsBus {
     }
 
     async fn subscribe_requests(&self, subject: &str) -> Result<RequestStream> {
+        self.require_manager("subscribe to requests")?;
         let subscriber = self
             .client
             .subscribe(subject.to_string())
@@ -773,6 +889,7 @@ impl EventBus for NatsBus {
     }
 
     async fn reply(&self, reply_subject: &str, payload: &[u8]) -> Result<()> {
+        self.require_manager("send replies")?;
         self.client
             .publish(reply_subject.to_string(), Bytes::copy_from_slice(payload))
             .await
@@ -781,11 +898,29 @@ impl EventBus for NatsBus {
     }
 
     async fn publish_log(&self, task_id: &str, entry: &LogEntry) -> Result<()> {
+        let node_id = self.worker_node_id.unwrap_or(0);
+        self.publish_node_log(node_id, task_id, entry).await
+    }
+
+    async fn publish_node_log(&self, node_id: u64, task_id: &str, entry: &LogEntry) -> Result<()> {
+        if self
+            .worker_node_id
+            .is_some_and(|worker_id| worker_id != node_id)
+        {
+            return Err(BusError::Publish(format!(
+                "worker cannot publish logs for node {node_id}"
+            )));
+        }
+        if entry.task_id != task_id {
+            return Err(BusError::Publish(
+                "log subject task ID does not match entry".to_string(),
+            ));
+        }
         let _timer = minga_telemetry::METRICS
             .bus_publish_latency_seconds
             .with_label_values(&["logs"])
             .start_timer();
-        let subject = subjects::task_log(task_id);
+        let subject = subjects::node_task_log(node_id, task_id);
         let payload = entry.to_bytes()?;
         // Double await: the first yields a PublishAckFuture (message sent),
         // the second the server's acknowledgment (message stored). Without
@@ -800,6 +935,7 @@ impl EventBus for NatsBus {
     }
 
     async fn subscribe_logs(&self, task_id: &str) -> Result<LogEventStream> {
+        self.require_manager("subscribe to logs")?;
         let stream = self
             .js
             .get_stream("MINGA_LOGS")
@@ -833,8 +969,10 @@ impl EventBus for NatsBus {
             .map_err(|e| BusError::Subscribe(format!("log messages: {e}")))?;
 
         let client = self.client.clone();
+        let task_id = task_id.to_string();
         let log_stream = messages.filter_map(move |msg| {
             let client = client.clone();
+            let task_id = task_id.clone();
             async move {
                 match msg {
                     Ok(m) => match LogEntry::from_bytes(&m.payload) {
@@ -842,7 +980,7 @@ impl EventBus for NatsBus {
                             if let Err(e) = m.ack().await {
                                 tracing::warn!(error = %e, subject = %m.subject, "log ack failed; JetStream will redeliver");
                             }
-                            Some(entry)
+                            (task_id == "*" || entry.task_id == task_id).then_some(entry)
                         }
                         Err(e) => {
                             tracing::warn!(error = %e, "failed to deserialize log entry");
@@ -862,6 +1000,7 @@ impl EventBus for NatsBus {
     }
 
     async fn log_history(&self, task_id: &str, tail: usize) -> Result<Vec<LogEntry>> {
+        self.require_manager("read log history")?;
         let stream = self
             .js
             .get_stream("MINGA_LOGS")
@@ -919,10 +1058,12 @@ impl EventBus for NatsBus {
                 let msg = msg.map_err(|e| BusError::Subscribe(format!("log history: {e}")))?;
                 received += 1;
                 if let Ok(entry) = LogEntry::from_bytes(&msg.payload) {
-                    if wanted > 0 && entries.len() == wanted {
-                        entries.pop_front();
+                    if task_id == "*" || entry.task_id == task_id {
+                        if wanted > 0 && entries.len() == wanted {
+                            entries.pop_front();
+                        }
+                        entries.push_back(entry);
                     }
-                    entries.push_back(entry);
                 }
             }
             if received == 0 {
@@ -964,22 +1105,6 @@ fn bounded(config: PullConsumerConfig) -> PullConsumerConfig {
     }
 }
 
-/// Limits-retention stream that captures the advisories JetStream publishes
-/// when it gives up on a message (max deliveries reached, or `+TERM`).
-fn dead_letter_stream_config() -> StreamConfig {
-    StreamConfig {
-        name: DEAD_LETTER_STREAM.to_string(),
-        subjects: vec![
-            "$JS.EVENT.ADVISORY.CONSUMER.MAX_DELIVERIES.>".to_string(),
-            "$JS.EVENT.ADVISORY.CONSUMER.MSG_TERMINATED.>".to_string(),
-        ],
-        retention: RetentionPolicy::Limits,
-        max_bytes: 64 * 1024 * 1024,
-        max_age: Duration::from_secs(7 * 24 * 3600),
-        ..Default::default()
-    }
-}
-
 /// How a message whose handling failed is settled.
 #[derive(Debug, PartialEq)]
 enum Rejection {
@@ -996,42 +1121,31 @@ fn rejection_for(err: &BusError) -> Rejection {
     }
 }
 
-/// Terms (poison) or naks (transient) a message whose handling failed,
-/// counting it as dead-lettered when JetStream will not redeliver it.
+/// Terms poison messages and delays transient failures without retaining a
+/// separate dead-letter stream.
 async fn reject(client: &Client, msg: &jetstream::Message, topic: &str, err: &BusError) {
-    let delivered = msg.info().map(|i| i.delivered).unwrap_or(0);
-    let (result, dead_letter) = match rejection_for(err) {
-        Rejection::Term(reason) => {
-            // async-nats' AckKind::Term carries no reason; the raw `+TERM
-            // <reason>` puts it into the MSG_TERMINATED advisory.
-            let result = match &msg.reply {
-                Some(reply) => client
-                    .publish(reply.clone(), Bytes::from(format!("+TERM {reason}")))
-                    .await
-                    .map_err(|e| e.to_string()),
-                None => Err("no reply subject".to_string()),
-            };
-            (result, Some("terminated"))
-        }
-        Rejection::Nak(delay) => (
-            msg.ack_with(AckKind::Nak(Some(delay)))
+    let delivered = msg.info().map(|info| info.delivered).unwrap_or(0);
+    let result = match rejection_for(err) {
+        Rejection::Term(reason) => match &msg.reply {
+            Some(reply) => client
+                .publish(reply.clone(), Bytes::from(format!("+TERM {reason}")))
                 .await
-                .map_err(|e| e.to_string()),
-            (delivered >= MAX_DELIVER).then_some("max_deliveries"),
-        ),
+                .map(|_| ())
+                .map_err(|error| error.to_string()),
+            None => Err("no reply subject".to_string()),
+        },
+        Rejection::Nak(delay) => msg
+            .ack_with(AckKind::Nak(Some(delay)))
+            .await
+            .map_err(|error| error.to_string()),
     };
     match result {
-        Ok(()) => {
-            if let Some(reason) = dead_letter {
-                tracing::warn!(topic, subject = %msg.subject, delivered, reason, error = %err, "message dead-lettered");
-                minga_telemetry::METRICS
-                    .bus_dead_letters_total
-                    .with_label_values(&[topic, reason])
-                    .inc();
-            }
+        Ok(()) if delivered >= MAX_DELIVER => {
+            tracing::warn!(topic, subject = %msg.subject, delivered, error = %err, "message delivery limit reached");
         }
-        Err(e) => {
-            tracing::warn!(topic, subject = %msg.subject, error = %e, "reject failed; JetStream will redeliver after the ack wait");
+        Ok(()) => {}
+        Err(error) => {
+            tracing::warn!(topic, subject = %msg.subject, error, "reject failed; JetStream will redeliver after the ack wait");
         }
     }
 }
@@ -1055,22 +1169,13 @@ mod tests {
     }
 
     #[test]
-    fn dead_letter_stream_captures_both_advisories() {
-        let config = dead_letter_stream_config();
-        assert_eq!(config.retention, RetentionPolicy::Limits);
-        assert!(config.max_age > Duration::ZERO && config.max_bytes > 0);
-        assert!(config.subjects.iter().any(|s| s.contains("MAX_DELIVERIES")));
-        assert!(config.subjects.iter().any(|s| s.contains("MSG_TERMINATED")));
-    }
-
-    #[test]
     fn decode_errors_are_poison_others_are_transient() {
         assert_eq!(
             rejection_for(&BusError::Serialization("bad".into())),
             Rejection::Term("bad".into())
         );
         assert_eq!(
-            rejection_for(&BusError::Command("handler busy".into())),
+            rejection_for(&BusError::Other("handler busy".into())),
             Rejection::Nak(NAK_DELAY)
         );
     }

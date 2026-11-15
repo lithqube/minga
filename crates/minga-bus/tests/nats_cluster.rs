@@ -7,7 +7,7 @@
 
 use std::time::Duration;
 
-use minga_bus::{Command, EventBus, NatsBus};
+use minga_bus::{EventBus, NatsBus};
 use testcontainers::{
     core::{logs::LogFrame, WaitFor},
     runners::AsyncRunner,
@@ -163,10 +163,9 @@ async fn replicated_bus_survives_losing_one_server() {
     eventually("raise replicas", || bus.ensure_replicas(3)).await;
     for stream in [
         "MINGA_EVENTS",
-        "MINGA_COMMANDS",
-        "MINGA_DEAD_LETTERS",
         "KV_MINGA_STATUS",
         "KV_MINGA_LEASES",
+        "KV_MINGA_ASSIGN",
     ] {
         assert_eq!(replicas(&bus, stream).await, 3, "{stream}");
     }
@@ -176,26 +175,13 @@ async fn replicated_bus_survives_losing_one_server() {
     let worker = NatsBus::connect(&seeds).await.expect("second connect");
     worker.ensure_replicas(1).await.expect("ensure 1");
     assert_eq!(replicas(&bus, "KV_MINGA_STATUS").await, 3);
-    assert_eq!(replicas(&bus, "MINGA_COMMANDS").await, 3);
+    assert_eq!(replicas(&bus, "KV_MINGA_ASSIGN").await, 3);
 
     // New copies catch up for a moment after scaling; writes can time out.
-    eventually("put", || bus.put_status("task.ha", b"running")).await;
-    let before = Command::Stop {
-        task_id: "before-failover".to_string(),
-    };
-    eventually("send", || bus.send_command(77, &before)).await;
+    eventually("put", || bus.put_status("node.77.task.ha", b"running")).await;
 
     containers[0].stop().await.expect("stop one server");
 
-    let status = eventually("get_status", || bus.get_status("task.ha")).await;
+    let status = eventually("get_status", || bus.get_status("node.77.task.ha")).await;
     assert_eq!(status.as_deref(), Some(&b"running"[..]));
-    let received = eventually("next_command", || bus.next_command(77)).await;
-    assert_eq!(received, before);
-
-    let after = Command::Stop {
-        task_id: "after-failover".to_string(),
-    };
-    eventually("send after failover", || bus.send_command(77, &after)).await;
-    let received = eventually("next_command after failover", || bus.next_command(77)).await;
-    assert_eq!(received, after);
 }

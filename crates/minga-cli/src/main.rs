@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand};
 use minga_compose::{DeployMode, LoadOptions, Loaded};
-use sidecar::{NatsSidecar, SidecarOptions};
+use sidecar::{NatsSidecar, ServerTls, SidecarOptions};
 
 /// Minga: single-binary orchestrator for edge, on-prem and air-gapped sites.
 #[derive(Parser)]
@@ -175,6 +175,12 @@ enum ImageCommand {
     },
 }
 
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum NodeCertificateRole {
+    Manager,
+    Worker,
+}
+
 #[derive(Subcommand)]
 enum TlsCommand {
     /// Create a cluster CA: writes ca.pem and ca-key.pem.
@@ -186,8 +192,7 @@ enum TlsCommand {
         #[arg(long)]
         dir: String,
     },
-    /// Issue a node certificate signed by the cluster CA:
-    /// writes node.pem and node-key.pem (SAN `minga-node`).
+    /// Issue a node certificate with the Raft SAN and a NATS user identity.
     IssueNode {
         /// Directory containing ca.pem and ca-key.pem.
         #[arg(long)]
@@ -195,6 +200,12 @@ enum TlsCommand {
         /// Directory to write node.pem and node-key.pem into.
         #[arg(long)]
         out_dir: String,
+        /// Node ID bound to the certificate's NATS identity.
+        #[arg(long)]
+        node_id: u64,
+        /// NATS role authorized by the certificate.
+        #[arg(long, value_enum)]
+        role: NodeCertificateRole,
     },
 }
 
@@ -251,7 +262,7 @@ struct NodeArgs {
     node_id: u64,
     /// Address to bind the Raft RPC server (e.g. 0.0.0.0:50051).
     #[arg(long)]
-    bind: String,
+    bind: Option<String>,
     /// Data directory for Raft state (raft_log.redb, state.redb).
     #[arg(long, default_value = "/var/lib/minga")]
     data_dir: String,
@@ -277,23 +288,35 @@ struct NodeArgs {
     interval: u64,
     /// NATS server URL (e.g. nats://localhost:4222, or tls://… with the
     /// MINGA_NATS_TLS_* variables). If not set, a manager spawns its own
-    /// `nats-server` sidecar on 127.0.0.1:4222; workers must set it. Can
+    /// sidecar; workers must set it. Can
     /// also be set via the MINGA_NATS_URL environment variable.
     #[arg(long, env = "MINGA_NATS_URL")]
     nats_url: Option<String>,
-    /// NATS client token. The sidecar config requires the same token;
-    /// workers must present it when connecting to the manager's NATS.
-    /// Can also be set via MINGA_NATS_TOKEN.
+    /// NATS token for development token-authenticated connections. Set the
+    /// same token on manager and worker; certificate mapping replaces tokens.
     #[arg(long, env = "MINGA_NATS_TOKEN")]
     nats_token: Option<String>,
-    /// Copies kept of the commands, events, dead-letter and KV streams.
+    /// Client-facing TLS files for the built-in NATS sidecar. Set all three
+    /// to require client certificates and map them to per-node permissions.
+    #[arg(long)]
+    nats_server_cert: Option<String>,
+    #[arg(long)]
+    nats_server_key: Option<String>,
+    #[arg(long)]
+    nats_client_ca: Option<String>,
+    /// Address for the built-in sidecar listener (non-loopback requires TLS).
+    #[arg(long)]
+    nats_listen_addr: Option<String>,
+    /// Worker node IDs authorized by this manager's built-in sidecar.
+    #[arg(long = "nats-worker-id")]
+    nats_worker_ids: Vec<u64>,
+    /// Copies kept of event, status, lease, and assignment streams/buckets.
     /// Set 3 (or 5) on a NATS cluster of at least that many servers so
     /// losing one server loses no bus state; logs stay at one copy. Only
     /// raises: a node left at 1 never shrinks what another node raised.
     /// Needs --nats-url; the built-in sidecar is a single server.
-    #[arg(long, env = "MINGA_NATS_REPLICAS", default_value_t = 1,
-          value_parser = clap::value_parser!(u8).range(1..=5))]
-    nats_replicas: u8,
+    #[arg(long, env = "MINGA_NATS_REPLICAS", value_parser = clap::value_parser!(u8).range(1..=5))]
+    nats_replicas: Option<u8>,
     /// Directory holding the node-local secret store. Secrets are
     /// provisioned there by the operator; values never travel through
     /// Raft or the event bus.
@@ -826,7 +849,12 @@ fn run_tls(cmd: TlsCommand) -> ExitCode {
                 ca_key_pem.display()
             );
         }
-        TlsCommand::IssueNode { ca_dir, out_dir } => {
+        TlsCommand::IssueNode {
+            ca_dir,
+            out_dir,
+            node_id,
+            role,
+        } => {
             let ca_dir = PathBuf::from(&ca_dir);
             let out_dir = PathBuf::from(&out_dir);
             let read = |name: &str| -> Result<Vec<u8>, String> {
@@ -873,15 +901,15 @@ fn run_tls(cmd: TlsCommand) -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
-            let mut params = rcgen::CertificateParams::new(vec![
+            let nats_identity = match role {
+                NodeCertificateRole::Manager => format!("minga-manager-{node_id}"),
+                NodeCertificateRole::Worker => format!("minga-worker-{node_id}"),
+            };
+            let params = rcgen::CertificateParams::new(vec![
                 minga_state::network::MINGA_NODE_NAME.to_string(),
+                nats_identity,
             ])
             .expect("node params");
-            params.subject_alt_names = vec![rcgen::SanType::DnsName(
-                minga_state::network::MINGA_NODE_NAME
-                    .try_into()
-                    .expect("san"),
-            )];
             let cert = match params.signed_by(&key, &ca, &ca_key) {
                 Ok(c) => c,
                 Err(e) => {
@@ -911,9 +939,51 @@ fn run_tls(cmd: TlsCommand) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// Runs a node (manager or worker): opens the state store, starts the
-/// supervisor, and (for managers) the scheduler.
+/// Returns true when a worker was given a Raft-only flag.
+fn worker_has_manager_only_flags(args: &NodeArgs) -> bool {
+    args.bind.is_some()
+        || !args.peers.is_empty()
+        || args.raft_tls_ca.is_some()
+        || args.raft_tls_cert.is_some()
+        || args.raft_tls_key.is_some()
+        || args.nats_replicas.is_some()
+}
+
+/// Runs a node (manager or worker): managers open Raft state, while workers
+/// run only the supervisor against their bus assignments.
 async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
+    if is_manager && args.bind.is_none() {
+        eprintln!("error: managers require --bind for the Raft listener");
+        return ExitCode::FAILURE;
+    }
+    if !is_manager && worker_has_manager_only_flags(&args) {
+        eprintln!("error: Raft bind, peer, TLS, and replica flags are manager-only");
+        return ExitCode::FAILURE;
+    }
+
+    let sidecar_configured = args.nats_server_cert.is_some()
+        || args.nats_server_key.is_some()
+        || args.nats_client_ca.is_some()
+        || args.nats_listen_addr.is_some()
+        || !args.nats_worker_ids.is_empty();
+    let tls_parts = [
+        args.nats_server_cert.is_some(),
+        args.nats_server_key.is_some(),
+        args.nats_client_ca.is_some(),
+    ];
+    let tls_count = tls_parts.into_iter().filter(|set| *set).count();
+    if tls_count != 0 && tls_count != tls_parts.len() {
+        eprintln!("error: --nats-server-cert, --nats-server-key, and --nats-client-ca must be set together");
+        return ExitCode::FAILURE;
+    }
+    if !args.nats_worker_ids.is_empty() && tls_count != tls_parts.len() {
+        eprintln!("error: --nats-worker-id requires client TLS and certificate identity mapping");
+        return ExitCode::FAILURE;
+    }
+    if sidecar_configured && (!is_manager || args.nats_url.is_some()) {
+        eprintln!("error: built-in sidecar TLS, listener, and worker identity flags require a manager without --nats-url");
+        return ExitCode::FAILURE;
+    }
     let supernet = match overlay_supernet(&args.overlay_supernet) {
         Ok(c) => c,
         Err(e) => {
@@ -921,39 +991,49 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let peers = match parse_peers(&args.peers) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("error: {e}");
-            return ExitCode::FAILURE;
+    let peers = if is_manager {
+        match parse_peers(&args.peers) {
+            Ok(peers) => peers,
+            Err(error) => {
+                eprintln!("error: {error}");
+                return ExitCode::FAILURE;
+            }
         }
+    } else {
+        std::collections::BTreeMap::new()
     };
+    let manager_node_ids: Vec<_> = peers.keys().copied().collect();
 
     tracing::info!(
         node_id = args.node_id,
-        bind = %args.bind,
+        bind = ?args.bind,
         data_dir = %args.data_dir,
         peers = ?peers,
         role = if is_manager { "manager" } else { "worker" },
         "starting minga node"
     );
 
-    let state = match open_store(
-        args.node_id,
-        &args.bind,
-        &args.data_dir,
-        peers,
-        &args.raft_tls_ca,
-        &args.raft_tls_cert,
-        &args.raft_tls_key,
-    )
-    .await
-    {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("error: {e}");
-            return ExitCode::FAILURE;
+    let state = if is_manager {
+        let bind = args.bind.as_deref().expect("manager bind was validated");
+        match open_store(
+            args.node_id,
+            bind,
+            &args.data_dir,
+            peers,
+            &args.raft_tls_ca,
+            &args.raft_tls_cert,
+            &args.raft_tls_key,
+        )
+        .await
+        {
+            Ok(store) => Some(store),
+            Err(error) => {
+                eprintln!("error: {error}");
+                return ExitCode::FAILURE;
+            }
         }
+    } else {
+        None
     };
 
     // Announce this node to the cluster and keep the membership lease
@@ -968,7 +1048,7 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
     };
     let identity = minga_node::NodeIdentity {
         node_id: args.node_id,
-        address: args.bind.clone(),
+        address: args.bind.clone().unwrap_or_default(),
         labels,
         capacity: minga_node::host_capacity(),
         role: if is_manager {
@@ -986,11 +1066,20 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
     let bus: Arc<dyn minga_bus::EventBus> = match &args.nats_url {
         Some(url) => {
             _sidecar = None;
-            match bus::connect_bus(url, args.nats_token.as_deref(), args.nats_replicas.into()).await
-            {
-                Ok(b) => b,
-                Err(e) => {
-                    eprintln!("error: cannot connect to NATS at {url}: {e}");
+            let connection = if is_manager {
+                bus::connect_bus(
+                    url,
+                    args.nats_token.as_deref(),
+                    args.nats_replicas.unwrap_or(1).into(),
+                )
+                .await
+            } else {
+                bus::connect_worker_bus(url, args.nats_token.as_deref(), args.node_id).await
+            };
+            match connection {
+                Ok(bus) => bus,
+                Err(error) => {
+                    eprintln!("error: cannot connect to NATS at {url}: {error}");
                     return ExitCode::FAILURE;
                 }
             }
@@ -1003,19 +1092,41 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
                 );
                 return ExitCode::FAILURE;
             }
-            if args.nats_replicas > 1 {
+            if args.nats_replicas.unwrap_or(1) > 1 {
                 eprintln!(
                     "error: --nats-replicas {} needs a NATS cluster; set --nats-url \
                      (the built-in sidecar is a single server)",
-                    args.nats_replicas
+                    args.nats_replicas.unwrap_or(1)
                 );
                 return ExitCode::FAILURE;
             }
             // Manager: spawn the NATS sidecar.
+            let tls = args.nats_server_cert.as_ref().map(|cert| ServerTls {
+                cert_file: PathBuf::from(cert),
+                key_file: PathBuf::from(
+                    args.nats_server_key
+                        .as_deref()
+                        .expect("TLS fields validated"),
+                ),
+                ca_file: PathBuf::from(
+                    args.nats_client_ca
+                        .as_deref()
+                        .expect("TLS fields validated"),
+                ),
+                verify: true,
+                verify_and_map: true,
+            });
             let opts = SidecarOptions {
                 data_dir: PathBuf::from(&args.data_dir),
                 node_id: args.node_id,
+                manager_node_ids,
+                worker_node_ids: args.nats_worker_ids.clone(),
                 client_token: args.nats_token.clone(),
+                listen_addr: args
+                    .nats_listen_addr
+                    .clone()
+                    .unwrap_or_else(|| "127.0.0.1".to_string()),
+                tls,
                 ..SidecarOptions::default()
             };
             let sidecar = match NatsSidecar::start(&opts).await {
@@ -1027,10 +1138,7 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
             };
             let url = sidecar.client_url().to_string();
             tracing::info!(url = %url, "NATS sidecar ready");
-            let connect = match &args.nats_token {
-                Some(token) => minga_bus::NatsBus::connect_with_token(&url, token).await,
-                None => minga_bus::NatsBus::connect(&url).await,
-            };
+            let connect = bus::connect_bus(&url, args.nats_token.as_deref(), 1).await;
             match connect {
                 Ok(b) => {
                     _sidecar = Some(sidecar);
@@ -1052,11 +1160,9 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
         }
     };
 
-    // Readiness: Raft knows a leader and the bus answers.
     let ready = minga_telemetry::ReadyState::new();
-    {
-        let (state, bus, ready, node_id) =
-            (state.clone(), bus.clone(), ready.clone(), args.node_id);
+    if let Some(state) = state.clone() {
+        let (bus, ready, node_id) = (bus.clone(), ready.clone(), args.node_id);
         tokio::spawn(async move {
             loop {
                 ready.set_raft_ready(state.current_leader().await.is_some());
@@ -1064,6 +1170,15 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
                 minga_telemetry::METRICS
                     .raft_leader
                     .set(if state.is_leader().await { 1.0 } else { 0.0 });
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        });
+    } else {
+        let (bus, ready, node_id) = (bus.clone(), ready.clone(), args.node_id);
+        tokio::spawn(async move {
+            ready.set_raft_ready(true);
+            loop {
+                ready.set_bus_connected(bus.is_alive(node_id).await.is_ok());
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
         });
@@ -1086,7 +1201,7 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
         // A task may not publish a port this process serves: its DNAT rule
         // would capture the node's own clients and their tokens.
         let mut reserved: Vec<(u16, String)> = [
-            (Some(args.bind.as_str()), "Raft"),
+            (args.bind.as_deref(), "Raft"),
             (args.metrics_bind.as_deref(), "metrics"),
             (args.egress_bind.as_deref(), "egress proxy"),
         ]
@@ -1129,7 +1244,6 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
                         networking
                             .clone()
                             .expect("containerd runtime has networking"),
-                        state.clone(),
                     );
                     let rt = rt
                         .with_volume_dir(format!("{}/volumes", args.data_dir))
@@ -1223,13 +1337,12 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
     #[allow(unused_mut)]
     let supervisor = match &agent_executor {
         Some(exec) => minga_node::Supervisor::with_agent_executor(
-            state.clone(),
             runtime,
             bus.clone(),
             exec.clone(),
             args.node_id,
         ),
-        None => minga_node::Supervisor::with_bus(state.clone(), runtime, bus.clone(), args.node_id),
+        None => minga_node::Supervisor::with_bus(runtime, bus.clone(), args.node_id),
     };
     #[cfg(target_os = "linux")]
     let supervisor = match networking {
@@ -1244,6 +1357,7 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
     let interval = Duration::from_secs(args.interval);
 
     if is_manager {
+        let state = state.expect("manager StateStore initialized");
         let scheduler = minga_scheduler::Scheduler::with_bus(state.clone(), bus.clone())
             .with_supernet(supernet);
         tracing::info!(
@@ -1252,7 +1366,7 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
         );
         tokio::select! {
             _ = scheduler.run(interval) => {},
-            _ = minga_node::run_node_registration(state, bus) => {},
+            _ = minga_node::run_node_registration(state.clone(), bus.clone()) => {},
             _ = supervisor.run(interval) => {},
             _ = tokio::signal::ctrl_c() => {
                 tracing::info!(node_id = args.node_id, "shutting down manager");
@@ -1763,7 +1877,7 @@ async fn run_agent(cmd: AgentCommand) -> ExitCode {
 
             let mut reports: Vec<minga_bus::TaskStatusReport> = statuses
                 .iter()
-                .filter(|(key, _)| key.starts_with("task."))
+                .filter(|(key, _)| key.starts_with("node.") && key.contains(".task."))
                 .filter_map(|(_, bytes)| minga_bus::TaskStatusReport::from_bytes(bytes).ok())
                 // Agent tasks run in a sandbox and report no container_id.
                 .filter(|report| report.container_id.is_none())
@@ -1949,7 +2063,27 @@ fn port_of(addr: &str) -> Option<u16> {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_loopback_bind, port_of, project_dir};
+    use super::{
+        is_loopback_bind, port_of, project_dir, worker_has_manager_only_flags, Cli, Command,
+    };
+    use clap::Parser;
+
+    #[test]
+    fn worker_rejects_peer_flag() {
+        let cli = Cli::try_parse_from([
+            "minga",
+            "worker",
+            "--node-id",
+            "7",
+            "--peer",
+            "2=127.0.0.1:50051",
+        ])
+        .unwrap();
+        let Command::Worker(args) = cli.command else {
+            panic!("expected worker command");
+        };
+        assert!(worker_has_manager_only_flags(&args));
+    }
 
     #[test]
     fn loopback_binds_are_recognised() {

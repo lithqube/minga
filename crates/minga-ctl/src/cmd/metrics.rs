@@ -145,11 +145,6 @@ pub fn summary(samples: &[Sample]) -> Vec<(String, String)> {
     for (s, avg) in averages(samples, "minga_bus_publish_latency_seconds") {
         rows.push((format!("bus publish avg {}", label(s, "topic")), ms(avg)));
     }
-    let dead: Vec<_> = named(samples, "minga_bus_dead_letters_total").collect();
-    if !dead.is_empty() {
-        let total: f64 = dead.iter().map(|s| s.value).sum();
-        rows.push(("bus dead letters".to_string(), total.to_string()));
-    }
     if let (Some(idle), Some(busy), Some(total)) = (
         first(samples, "minga_agent_pool_idle"),
         first(samples, "minga_agent_pool_busy"),
@@ -220,8 +215,6 @@ minga_task_starts_total 48
 minga_raft_leader 1
 minga_scheduler_reconcile_duration_seconds_sum 0.0062
 minga_scheduler_reconcile_duration_seconds_count 2
-minga_bus_dead_letters_total{topic="a",reason="x"} 2
-minga_bus_dead_letters_total{topic="b",reason="y"} 3
 minga_agent_pool_idle 2
 minga_agent_pool_busy 1
 minga_agent_pool_total 3
@@ -232,7 +225,7 @@ minga_containerd_grpc_latency_seconds_count{method="Create"} 2
     #[test]
     fn parses_names_labels_and_values() {
         let samples = parse(TEXT);
-        assert_eq!(samples.len(), 13);
+        assert_eq!(samples.len(), 11);
         assert_eq!(samples[0].name, "minga_tasks_total");
         assert_eq!(samples[0].labels["state"], "running");
         assert_eq!(samples[0].value, 12.0);
@@ -273,7 +266,6 @@ minga_containerd_grpc_latency_seconds_count{method="Create"} 2
         assert_eq!(get("task stops"), None);
         assert_eq!(get("raft leader"), Some("yes"));
         assert_eq!(get("reconcile avg"), Some("3.1 ms"));
-        assert_eq!(get("bus dead letters"), Some("5"));
         assert_eq!(get("agent pool"), Some("2 idle / 1 busy / 3 total"));
         assert_eq!(get("containerd Create avg"), Some("18.4 ms"));
     }

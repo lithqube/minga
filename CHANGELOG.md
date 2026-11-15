@@ -5,6 +5,9 @@
 - Supervisor lifecycle, restart counts and failure details now live in
   `MINGA_STATUS`, not Raft. Scheduler rollouts and Docker API task views merge
   bus actual state with Raft desired state.
+- Leaders project task and network assignments into replicated `MINGA_ASSIGN`
+  KV. Workers consume those assignments and no longer open a Raft state store;
+  node status and lease writes are scoped to each worker identity.
 
 
 ## [1.2.0] — 2026-11-13

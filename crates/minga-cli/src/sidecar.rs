@@ -28,6 +28,8 @@ pub enum SidecarError {
 
     #[error("plaintext NATS sidecar may only listen on loopback")]
     InsecureListener,
+    #[error("NATS token authentication cannot be combined with certificate identity mapping")]
+    ConflictingAuth,
     #[error("failed to spawn nats-server: {0}")]
     Spawn(String),
 
@@ -87,6 +89,10 @@ pub struct SidecarOptions {
     pub data_dir: PathBuf,
     /// Node ID (used in server_name).
     pub node_id: u64,
+    /// Other manager identities in the NATS cluster.
+    pub manager_node_ids: Vec<u64>,
+    /// Worker node identities allowed to connect with scoped KV permissions.
+    pub worker_node_ids: Vec<u64>,
     /// Client port (default 4222).
     pub client_port: u16,
     /// Monitor port (default 8222, localhost only).
@@ -115,6 +121,8 @@ impl Default for SidecarOptions {
             data_dir: PathBuf::from("/var/lib/minga"),
             node_id: 1,
             client_port: 4222,
+            worker_node_ids: Vec::new(),
+            manager_node_ids: Vec::new(),
             monitor_port: 8222,
             max_memory_store: "64MB".to_string(),
             max_file_store: "1GB".to_string(),
@@ -137,6 +145,9 @@ impl NatsSidecar {
     pub async fn start(opts: &SidecarOptions) -> Result<Self, SidecarError> {
         if opts.tls.is_none() && opts.listen_addr != "127.0.0.1" && opts.listen_addr != "::1" {
             return Err(SidecarError::InsecureListener);
+        }
+        if opts.tls.as_ref().is_some_and(|tls| tls.verify_and_map) && opts.client_token.is_some() {
+            return Err(SidecarError::ConflictingAuth);
         }
         // Create data directories.
         let nats_dir = opts.data_dir.join("nats");
@@ -174,7 +185,13 @@ impl NatsSidecar {
         let pid = child.id().unwrap_or(0);
         tracing::info!(pid, port = opts.client_port, "spawned nats-server sidecar");
 
-        let client_url = format!("nats://127.0.0.1:{}", opts.client_port);
+        let scheme = if opts.tls.is_some() { "tls" } else { "nats" };
+        let host = if opts.tls.is_some() {
+            "localhost"
+        } else {
+            "127.0.0.1"
+        };
+        let client_url = format!("{scheme}://{host}:{}", opts.client_port);
 
         let mut sidecar = Self { child, client_url };
 
@@ -242,8 +259,11 @@ fn generate_config(opts: &SidecarOptions, jetstream_dir: &Path) -> String {
         opts.listen_addr, opts.client_port
     ));
     out.push_str(&format!("server_name: minga-{}\n", opts.node_id));
-    if let Some(token) = &opts.client_token {
-        out.push_str(&format!("authorization: {{ token: \"{token}\" }}\n"));
+    let verify_and_map = opts.tls.as_ref().is_some_and(|tls| tls.verify_and_map);
+    if !verify_and_map {
+        if let Some(token) = &opts.client_token {
+            out.push_str(&format!("authorization: {{ token: \"{token}\" }}\n"));
+        }
     }
     out.push('\n');
 
@@ -268,6 +288,59 @@ fn generate_config(opts: &SidecarOptions, jetstream_dir: &Path) -> String {
         out.push_str("}\n\n");
     }
 
+    if verify_and_map {
+        out.push_str("authorization {\n  users = [\n");
+        let mut manager_ids = opts.manager_node_ids.clone();
+        manager_ids.push(opts.node_id);
+        manager_ids.sort_unstable();
+        manager_ids.dedup();
+        for node_id in manager_ids {
+            append_user(
+                &mut out,
+                &format!("minga-manager-{node_id}"),
+                &["$JS.API.>".into(), "$KV.>".into(), "minga.>".into()],
+                &[
+                    "$JS.API.>".into(),
+                    "$KV.>".into(),
+                    "minga.>".into(),
+                    "_INBOX.>".into(),
+                ],
+            );
+        }
+        let mut worker_ids = opts.worker_node_ids.clone();
+        worker_ids.sort_unstable();
+        worker_ids.dedup();
+        for node_id in worker_ids {
+            append_user(
+                &mut out,
+                &format!("minga-worker-{node_id}"),
+                &[
+                    format!("$KV.MINGA_LEASES.lease.node.{node_id}"),
+                    format!("$KV.MINGA_STATUS.node.{node_id}.task.>"),
+                    format!("minga.log.node.{node_id}.>"),
+                    "$JS.API.STREAM.INFO.KV_MINGA_ASSIGN".into(),
+                    "$JS.API.STREAM.INFO.KV_MINGA_STATUS".into(),
+                    "$JS.API.STREAM.INFO.KV_MINGA_LEASES".into(),
+                    format!("$JS.API.KV.GET.KV_MINGA_ASSIGN.node.{node_id}.task.>"),
+                    "$JS.API.KV.GET.KV_MINGA_ASSIGN.net.>".into(),
+                    "$JS.API.KV.LIST.KV_MINGA_ASSIGN".into(),
+                    "$JS.API.CONSUMER.CREATE.KV_MINGA_ASSIGN".into(),
+                    "$JS.API.CONSUMER.CREATE.KV_MINGA_ASSIGN.>".into(),
+                    "$JS.API.CONSUMER.INFO.KV_MINGA_ASSIGN".into(),
+                    "$JS.API.CONSUMER.INFO.KV_MINGA_ASSIGN.>".into(),
+                    "$JS.API.CONSUMER.MSG.NEXT.KV_MINGA_ASSIGN.>".into(),
+                ],
+                &[
+                    format!("$KV.MINGA_ASSIGN.node.{node_id}.task.>"),
+                    "$KV.MINGA_ASSIGN.net.>".into(),
+                    format!("$KV.MINGA_LEASES.lease.node.{node_id}"),
+                    format!("$KV.MINGA_STATUS.node.{node_id}.task.>"),
+                    "_INBOX.>".into(),
+                ],
+            );
+        }
+        out.push_str("  ]\n}\n\n");
+    }
     // Cluster routes - a separate trust relationship from client TLS.
     if let Some(cluster) = &opts.cluster {
         out.push_str("cluster {\n");
@@ -311,6 +384,26 @@ fn generate_config(opts: &SidecarOptions, jetstream_dir: &Path) -> String {
     out.push_str("}\n");
 
     out
+}
+
+fn append_user(out: &mut String, identity: &str, publish: &[String], subscribe: &[String]) {
+    out.push_str(&format!(
+        "    {{\n      user: \"{identity}\"\n      permissions: {{\n"
+    ));
+    append_permission(out, "publish", publish);
+    append_permission(out, "subscribe", subscribe);
+    out.push_str("      }\n    },\n");
+}
+
+fn append_permission(out: &mut String, direction: &str, subjects: &[String]) {
+    out.push_str(&format!("        {direction}: {{ allow: ["));
+    for (index, subject) in subjects.iter().enumerate() {
+        if index > 0 {
+            out.push_str(", ");
+        }
+        out.push_str(&format!("\"{subject}\""));
+    }
+    out.push_str("] }\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -443,6 +536,31 @@ mod tests {
         assert!(config.contains("ca_file: \"/etc/minga/tls/ca.pem\""));
         assert!(config.contains("verify: true"));
         assert!(config.contains("verify_and_map: true"));
+    }
+
+    #[test]
+    fn worker_certificate_gets_node_scoped_key_value_permissions() {
+        let opts = SidecarOptions {
+            node_id: 1,
+            manager_node_ids: vec![2],
+            worker_node_ids: vec![7],
+            tls: Some(ServerTls {
+                cert_file: PathBuf::from("/etc/minga/tls/server-cert.pem"),
+                key_file: PathBuf::from("/etc/minga/tls/server-key.pem"),
+                ca_file: PathBuf::from("/etc/minga/tls/ca.pem"),
+                verify: true,
+                verify_and_map: true,
+            }),
+            ..SidecarOptions::default()
+        };
+        let config = generate_config(&opts, Path::new("/var/lib/minga/nats/jetstream"));
+
+        assert!(config.contains("user: \"minga-manager-2\""));
+        assert!(config.contains("user: \"minga-worker-7\""));
+        assert!(config.contains("\"$KV.MINGA_STATUS.node.7.task.>\""));
+        assert!(config.contains("\"$KV.MINGA_ASSIGN.node.7.task.>\""));
+        assert!(!config.contains("\"$KV.MINGA_ASSIGN.node.8"));
+        assert!(!config.contains("\"$KV.MINGA_STATUS.node.8"));
     }
 
     #[test]

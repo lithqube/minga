@@ -471,6 +471,38 @@ pub struct Network {
     pub wg_port: Option<u16>,
 }
 
+/// A task's desired runtime assignment, projected into MINGA_ASSIGN.
+///
+/// Actual lifecycle state remains in MINGA_STATUS; this value contains only
+/// the desired spec and the network data needed to run it locally.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TaskAssignment {
+    pub task_id: TaskId,
+    pub node_id: NodeId,
+    pub service_id: ServiceId,
+    pub service_name: String,
+    pub stack: String,
+    pub spec: TaskSpec,
+    pub networks: Vec<Network>,
+}
+
+/// Network metadata and the DNS records needed by local supervisors.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct NetworkAssignment {
+    pub network: Network,
+    pub tasks: Vec<NetworkDnsTask>,
+}
+
+/// One task's DNS contribution to a network assignment.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct NetworkDnsTask {
+    pub node_id: NodeId,
+    pub task_id: TaskId,
+    pub service_name: String,
+    pub stack: String,
+    pub ip: String,
+}
+
 /// A named volume.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Volume {
