@@ -113,6 +113,103 @@ async fn bus_lease_controls_node_eligibility() {
 }
 
 #[tokio::test]
+async fn empty_lease_set_does_not_remove_tasks() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(
+        StateStore::open(1, "127.0.0.1:0", dir.path(), BTreeMap::new())
+            .await
+            .unwrap(),
+    );
+    store.upsert_node(make_node(1, 8.0, 1 << 34)).await.unwrap();
+    store
+        .upsert_service(make_service("app.web", 2))
+        .await
+        .unwrap();
+    let bus = MemoryBus::with_lease_ttl(Duration::from_millis(50));
+    bus.refresh_lease(1, b"registration").await.unwrap();
+    let scheduler = Scheduler::with_bus(store.clone(), bus.clone());
+    scheduler.reconcile_once().await.unwrap();
+    assert_eq!(store.list_tasks().await.unwrap().len(), 2);
+
+    // Every lease expires, as after a bus outage longer than the TTL.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(scheduler.reconcile_once().await.unwrap().is_empty());
+    // A live lease for a node Raft does not know about does not count.
+    bus.refresh_lease(99, b"unregistered").await.unwrap();
+    assert!(scheduler.reconcile_once().await.unwrap().is_empty());
+    assert_eq!(
+        store.list_tasks().await.unwrap().len(),
+        2,
+        "an empty lease set must not stop every task"
+    );
+
+    drop(scheduler);
+    Arc::try_unwrap(store)
+        .ok()
+        .expect("scheduler dropped")
+        .shutdown()
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn partial_lease_set_after_an_empty_one_does_not_remove_tasks() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(
+        StateStore::open(1, "127.0.0.1:0", dir.path(), BTreeMap::new())
+            .await
+            .unwrap(),
+    );
+    for id in [1, 2] {
+        store
+            .upsert_node(make_node(id, 8.0, 1 << 34))
+            .await
+            .unwrap();
+    }
+    // Global tasks are keyed by node, so a missing lease would remove one.
+    let mut service = make_service("app.agent", 1);
+    service.mode = ServiceMode::Global;
+    store.upsert_service(service).await.unwrap();
+    let bus = MemoryBus::with_lease_ttl(Duration::from_millis(50));
+    for id in [1, 2] {
+        bus.refresh_lease(id, b"registration").await.unwrap();
+    }
+    let scheduler = Scheduler::with_bus(store.clone(), bus.clone());
+    scheduler.reconcile_once().await.unwrap();
+    assert_eq!(store.list_tasks().await.unwrap().len(), 2);
+
+    // Every lease expires, then only node 1 has renewed so far.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(scheduler.reconcile_once().await.unwrap().is_empty());
+    bus.refresh_lease(1, b"registration").await.unwrap();
+    assert!(scheduler.reconcile_once().await.unwrap().is_empty());
+    assert_eq!(
+        store.list_tasks().await.unwrap().len(),
+        2,
+        "node 2 has not renewed yet; its task must stay"
+    );
+
+    // Node 2 renews: recovery is complete and the grace window ends.
+    bus.refresh_lease(2, b"registration").await.unwrap();
+    scheduler.reconcile_once().await.unwrap();
+    // A later lost lease is a real node failure, acted on right away.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    bus.refresh_lease(1, b"registration").await.unwrap();
+    assert!(
+        !scheduler.reconcile_once().await.unwrap().is_empty(),
+        "a finished grace window must not delay removing node 2's task"
+    );
+
+    drop(scheduler);
+    Arc::try_unwrap(store)
+        .ok()
+        .expect("scheduler dropped")
+        .shutdown()
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
 async fn rollout_uses_failed_status_from_bus_kv() {
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(

@@ -423,6 +423,8 @@ fn start_worker_acl_server(pki: &Pki) -> TlsServer {
     write_file(&ca_path, &pki.ca_pem, false);
     write_file(&cert_path, &pki.server_cert_pem, false);
     write_file(&key_path, &pki.server_key_pem, true);
+    // The production worker ACL, so this test cannot drift from the sidecar.
+    let (worker_publish, worker_subscribe) = minga_bus::subjects::worker_acl(7);
     let config = format!(
         r#"listen: 127.0.0.1:-1
 server_name: minga-worker-acl-test
@@ -439,30 +441,15 @@ authorization {{
         {{
             user: "minga-manager-1"
             permissions: {{
-                publish: {{ allow: ["$JS.API.>", "$KV.>", "minga.>"] }}
+                publish: {{ allow: ["$JS.API.>", "$JS.FC.>", "$KV.>", "minga.>"] }}
                 subscribe: {{ allow: ["$JS.API.>", "$KV.>", "minga.>", "_INBOX.>"] }}
             }}
         }},
         {{
             user: "minga-worker-7"
             permissions: {{
-                publish: {{ allow: [
-                    "$JS.API.STREAM.INFO.KV_MINGA_STATUS",
-                    "$JS.API.STREAM.INFO.KV_MINGA_ASSIGN",
-                    "$JS.API.STREAM.INFO.KV_MINGA_LEASES",
-                    "$JS.API.DIRECT.GET.KV_MINGA_ASSIGN.$KV.MINGA_ASSIGN.node.7.task.>",
-                    "$JS.API.DIRECT.GET.KV_MINGA_ASSIGN.$KV.MINGA_ASSIGN.net.>",
-                    "$JS.API.DIRECT.GET.KV_MINGA_LEASES.$KV.MINGA_LEASES.lease.node.7",
-                    "$JS.API.DIRECT.GET.KV_MINGA_STATUS.$KV.MINGA_STATUS.node.7.task.>",
-                    "$JS.API.CONSUMER.CREATE.KV_MINGA_ASSIGN",
-                    "$JS.API.CONSUMER.CREATE.KV_MINGA_ASSIGN.>",
-                    "$JS.API.CONSUMER.INFO.KV_MINGA_ASSIGN",
-                    "$JS.API.CONSUMER.INFO.KV_MINGA_ASSIGN.>",
-                    "$JS.API.CONSUMER.MSG.NEXT.KV_MINGA_ASSIGN.>",
-                    "$KV.MINGA_LEASES.lease.node.7",
-                    "$KV.MINGA_STATUS.node.7.task.>"
-                ] }}
-                subscribe: {{ allow: ["_INBOX.>"] }}
+                publish: {{ allow: {worker_publish} }}
+                subscribe: {{ allow: {worker_subscribe} }}
             }}
         }}
     ]
@@ -475,10 +462,17 @@ jetstream {{
         key = key_path.display(),
         ca = ca_path.display(),
         store = dir.path().join("jetstream").display(),
+        worker_publish = nats_list(&worker_publish),
+        worker_subscribe = nats_list(&worker_subscribe),
     );
     let mut server = start_server(&config, dir).expect("nats-server binary not found");
     adopt_allocated_ports(&mut server);
     server
+}
+
+fn nats_list(subjects: &[String]) -> String {
+    let quoted: Vec<String> = subjects.iter().map(|s| format!("{s:?}")).collect();
+    format!("[{}]", quoted.join(", "))
 }
 
 // ---------------------------------------------------------------------------
@@ -553,6 +547,10 @@ async fn worker_certificate_cannot_write_assignments_or_other_nodes_status_and_l
         .put_assignment("net.test", b"network")
         .await
         .unwrap();
+    manager
+        .put_status("node.7.task.allowed", b"starting")
+        .await
+        .unwrap();
 
     let worker_config = worker_client_config(dir.path(), &pki);
     let worker_bus = NatsBus::connect_worker_secure(&url, &worker_config, 7)
@@ -609,6 +607,73 @@ async fn worker_certificate_cannot_write_assignments_or_other_nodes_status_and_l
             .collect::<Vec<_>>(),
         ["net.test"]
     );
+
+    // Enough data to cross several flow-control windows: the worker must be
+    // allowed to answer the server's flow-control requests.
+    let big = vec![7u8; 512 * 1024];
+    for i in 0..64 {
+        manager
+            .put_assignment(&format!("node.7.task.big-{i:02}"), &big)
+            .await
+            .unwrap();
+    }
+    let listed = tokio::time::timeout(
+        Duration::from_secs(20),
+        worker_bus.list_assignments("node.7.task."),
+    )
+    .await
+    .expect("listing stalled: flow-control replies denied?")
+    .unwrap();
+    assert_eq!(listed.len(), 65);
+    // The scheduler lists every assignment as the manager.
+    let listed = tokio::time::timeout(Duration::from_secs(20), manager.list_assignments(""))
+        .await
+        .expect("manager listing stalled: flow-control replies denied?")
+        .unwrap();
+    assert_eq!(listed.len(), 70);
+    for i in 0..64 {
+        manager
+            .delete_assignment(&format!("node.7.task.big-{i:02}"))
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        worker_bus.list_assignments("node.7.task.").await.unwrap(),
+        vec![("node.7.task.allowed".to_string(), b"assignment".to_vec())],
+        "deleted keys are not listed"
+    );
+
+    // The supervisor reads its status before each write (direct get).
+    assert_eq!(
+        worker_bus.get_status("node.7.task.allowed").await.unwrap(),
+        Some(b"starting".to_vec())
+    );
+
+    // A consumer whose filter covers another node's keys is refused, whether
+    // the filter rides in the payload or in the subject.
+    let raw = async_nats::connect_with_options(&url, worker_config.connect_options().unwrap())
+        .await
+        .expect("worker certificate connects");
+    let stream = async_nats::jetstream::new(raw)
+        .get_stream("KV_MINGA_ASSIGN")
+        .await
+        .expect("worker may read stream info");
+    for name in [None, Some("peek".to_string())] {
+        let created = tokio::time::timeout(
+            Duration::from_secs(2),
+            stream.create_consumer(async_nats::jetstream::consumer::push::OrderedConfig {
+                name: name.clone(),
+                deliver_subject: "_INBOX.peek".to_string(),
+                filter_subject: "$KV.MINGA_ASSIGN.>".to_string(),
+                ..Default::default()
+            }),
+        )
+        .await;
+        assert!(
+            !matches!(created, Ok(Ok(_))),
+            "worker 7 created a consumer over every node's assignments (name {name:?})"
+        );
+    }
 
     let worker = async_nats::connect_with_options(&url, worker_config.connect_options().unwrap())
         .await
