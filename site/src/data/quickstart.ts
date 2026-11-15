@@ -14,7 +14,7 @@ export const prerequisites = [
   'Install from the v1.2.0 release archive; it includes minga, nats-server and ctr.',
   'containerd running (1.7 or newer for private registries)',
   'iproute2, iptables and procps (any standard server install)',
-  'Free loopback ports 7001, 7002, 2375 and 9100',
+  'Free loopback ports 7001, 2375 and 9100',
 ];
 
 export const steps: Step[] = [
@@ -39,15 +39,10 @@ export const steps: Step[] = [
       - "8080:80"`,
   },
   {
-    title: 'Terminal 1: start the manager',
-    code: `sudo minga manager --node-id 1 --bind 127.0.0.1:7001 --peer 2=127.0.0.1:7002 \\
+    title: 'Start the manager, API and NATS sidecar',
+    code: `sudo MINGA_API_TOKEN=change-me minga manager --node-id 1 \\
+  --bind 127.0.0.1:7001 --api-bind 127.0.0.1:2375 \\
   --data-dir /var/lib/minga --runtime containerd --metrics-bind 127.0.0.1:9100`,
-  },
-  {
-    title: 'Terminal 2: start the Docker Engine API',
-    note: 'Today minga api is its own Raft voter, so one host runs two processes that peer with each other.',
-    code: `sudo MINGA_API_TOKEN=change-me minga api --node-id 2 --bind 127.0.0.1:7002 \\
-  --peer 1=127.0.0.1:7001 --data-dir /var/lib/minga-api --api-bind 127.0.0.1:2375`,
   },
   {
     title: 'Deploy the stack and check readiness',
