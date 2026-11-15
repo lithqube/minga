@@ -101,6 +101,25 @@ fn check<T: Serialize + DeserializeOwned>(name: &str, value: &T) {
     );
 }
 
+#[test]
+fn old_cluster_node_without_wireguard_fields_decodes() {
+    let value = serde_json::json!({
+        "id": 3,
+        "address": "10.0.0.3:7001",
+        "labels": {},
+        "status": "Active",
+        "capacity": {
+            "cpus": 4.0,
+            "memory_bytes": 8589934592u64,
+            "gpus": 0
+        }
+    });
+    let node: ClusterNode = serde_json::from_value(value).unwrap();
+    assert_eq!(node.wg_public_key, None);
+    assert_eq!(node.wg_endpoint, None);
+    assert_eq!(node.overlay_ip, None);
+}
+
 fn map(pairs: &[(&str, &str)]) -> HashMap<String, String> {
     pairs
         .iter()

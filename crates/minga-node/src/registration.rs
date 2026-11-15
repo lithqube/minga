@@ -25,6 +25,12 @@ pub struct NodeIdentity {
     /// Compute capacity, e.g. from [`host_capacity`].
     pub capacity: ResourceSpec,
     pub role: NodeRole,
+    /// WireGuard public key. The private key is never registered.
+    #[serde(default)]
+    pub wg_public_key: Option<String>,
+    /// Reachable host:port; `None` means this node is behind NAT.
+    #[serde(default)]
+    pub wg_endpoint: Option<String>,
 }
 
 impl NodeIdentity {
@@ -36,8 +42,8 @@ impl NodeIdentity {
             labels: self.labels.clone(),
             status: NodeStatus::Active,
             capacity: self.capacity.clone(),
-            wg_public_key: None,
-            wg_endpoint: None,
+            wg_public_key: self.wg_public_key.clone(),
+            wg_endpoint: self.wg_endpoint.clone(),
             overlay_ip: None,
             last_seen_unix: None,
             role: self.role,
@@ -234,9 +240,6 @@ async fn queue_node_registration(
         pending.remove(&node_id);
         return;
     }
-    if registered.contains(&node_id) {
-        return;
-    }
     let Some(payload) = event.value else {
         return;
     };
@@ -257,9 +260,17 @@ async fn queue_node_registration(
     }
 
     match store.get_node(node_id).await {
-        Ok(Some(_)) => {
+        Ok(Some(node)) => {
             registered.insert(node_id);
+            let key_changed = identity.wg_public_key.as_ref().is_some_and(|public_key| {
+                node.wg_public_key.as_ref() != Some(public_key)
+                    || node.wg_endpoint != identity.wg_endpoint
+            });
+            if key_changed {
+                pending.insert(node_id, identity);
+            }
         }
+        Ok(None) if registered.contains(&node_id) => {}
         Ok(None) => {
             pending.insert(node_id, identity);
         }
@@ -292,7 +303,21 @@ async fn register_pending_nodes(
             }
         }
         match store.get_node(node_id).await {
-            Ok(Some(_)) => {
+            Ok(Some(mut node)) => {
+                if let Some(identity) = pending.get(&node_id) {
+                    if let Some(public_key) = &identity.wg_public_key {
+                        if node.wg_public_key.as_ref() != Some(public_key)
+                            || node.wg_endpoint != identity.wg_endpoint
+                        {
+                            node.wg_public_key = Some(public_key.clone());
+                            node.wg_endpoint = identity.wg_endpoint.clone();
+                            if let Err(error) = store.upsert_node(node).await {
+                                tracing::warn!(node_id, error = %error, "cannot update node WireGuard registration");
+                                continue;
+                            }
+                        }
+                    }
+                }
                 if let Err(error) = bus
                     .put_status(&registration_status_key(node_id), REGISTERED_STATUS)
                     .await
@@ -349,6 +374,8 @@ mod tests {
                 gpus: 0,
             },
             role: NodeRole::Worker,
+            wg_public_key: Some("test-public-key".into()),
+            wg_endpoint: None,
         }
     }
 
@@ -404,6 +431,8 @@ mod tests {
 
         let stored = store.get_node(1).await.unwrap().unwrap();
         assert_eq!(stored.status, NodeStatus::Active);
+        assert_eq!(stored.wg_public_key.as_deref(), Some("test-public-key"));
+        assert_eq!(stored.wg_endpoint, None);
         assert_eq!(stored.labels.get("zone").unwrap(), "a");
         assert_eq!(stored.last_seen_unix, None);
         assert!(bus.is_alive(1).await.unwrap());
@@ -506,6 +535,58 @@ mod tests {
             store.get_node(1).await.unwrap().unwrap().status,
             NodeStatus::Draining
         );
+        membership.leave().await;
+    }
+
+    #[tokio::test]
+    async fn renewal_updates_wireguard_identity_without_overwriting_status() {
+        let (store, _dir) = store().await;
+        wait_for_leader(&store).await;
+        let bus = minga_bus::MemoryBus::with_lease_ttl(Duration::from_secs(1));
+        let mut stream = bus.watch_leases().await.unwrap();
+        let mut initial = identity(1);
+        initial.wg_public_key = Some("old-public-key".into());
+        initial.wg_endpoint = Some("edge.example:51820".into());
+        let membership = NodeMembership::start_with_interval(
+            bus.clone(),
+            initial.clone(),
+            Duration::from_secs(10),
+        )
+        .await
+        .unwrap();
+        let mut registered = load_registered_nodes(&store, bus.as_ref()).await.unwrap();
+        let mut pending = HashMap::new();
+        queue_node_registration(
+            &store,
+            next_lease(&mut stream).await,
+            &mut registered,
+            &mut pending,
+        )
+        .await;
+        register_pending_nodes(&store, bus.as_ref(), &mut registered, &mut pending).await;
+
+        let mut node = store.get_node(1).await.unwrap().unwrap();
+        node.status = NodeStatus::Draining;
+        store.upsert_node(node).await.unwrap();
+
+        let mut renewed = initial;
+        renewed.wg_public_key = Some("new-public-key".into());
+        renewed.wg_endpoint = None;
+        let payload = minga_state::codec::encode_wire(&renewed).unwrap();
+        bus.refresh_lease(1, &payload).await.unwrap();
+        queue_node_registration(
+            &store,
+            next_lease(&mut stream).await,
+            &mut registered,
+            &mut pending,
+        )
+        .await;
+        register_pending_nodes(&store, bus.as_ref(), &mut registered, &mut pending).await;
+
+        let stored = store.get_node(1).await.unwrap().unwrap();
+        assert_eq!(stored.status, NodeStatus::Draining);
+        assert_eq!(stored.wg_public_key.as_deref(), Some("new-public-key"));
+        assert_eq!(stored.wg_endpoint, None);
         membership.leave().await;
     }
 

@@ -28,6 +28,7 @@ pub mod registration;
 pub mod runtime;
 pub mod secrets;
 pub mod supervisor;
+pub mod wireguard;
 
 pub use agent::{
     shared_executor, AgentError, AgentExecutor, AgentInfo, AgentRunResult, AgentStatus,
@@ -43,3 +44,7 @@ pub use runtime::{
 #[cfg(target_os = "linux")]
 pub use supervisor::SupervisorNetworking;
 pub use supervisor::{Assignments, Supervisor, SupervisorError};
+pub use wireguard::{
+    ensure_interface as ensure_wireguard_interface, load_or_generate_keypair,
+    run_wireguard_assignments, WireGuardError,
+};

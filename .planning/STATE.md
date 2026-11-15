@@ -1,6 +1,6 @@
 # Planning state
 
-**Current:** Phase 13 — WireGuard mesh and routing mesh, 13-02 unique subnets in progress. ADR 0007 (13-01) merged as PR #77 on 2026-11-15. Phase 12 Managers-only Raft is complete (PR #76; live evidence below).
+**Current:** Phase 13 — WireGuard mesh and routing mesh, 13-03 node keys and interface in progress. ADR 0007 (13-01, PR #77) and unique subnets (13-02, PR #78) are merged. Phase 12 Managers-only Raft is complete (PR #76; live evidence below).
 
 **Phase 12 live evidence (12-07, 2026-11-15):**
 
@@ -21,6 +21,12 @@
 - **Explicit IPAM and strict options:** `handlers::tests::overlapping_ipam_subnet_is_refused_with_both_names` proves the API returns a conflict naming both networks. Compose translation and API network creation accept only `encrypted` and reject unsupported driver options.
 - **Host routes:** `minga manager` and `minga worker` parse `--overlay-supernet` / `MINGA_OVERLAY_SUPERNET` before startup; `cidr::tests::supernet_refused_when_it_overlaps_a_host_route` verifies overlaps are refused and the default route and Minga bridges are ignored.
 - **Compose compatibility:** Workspace tests passed, including existing Compose fixtures and translation tests. The full verification ran `cargo fmt --all`, `cargo clippy --all-targets -- -D warnings`, and `cargo test`.
+
+**Phase 13 13-03 in progress:**
+
+- Node startup creates or loads `<data_dir>/wg.key` (0600) using the existing `KeyPair`; the registration lease contains only the public key and optional endpoint.
+- A node-local kernel helper prepares `minga-wg0` only for non-empty peer sets. Peer assignment and runtime reconciliation remain 13-04.
+- `ClusterNode` already has defaulted WireGuard metadata fields; the existing v2 fixture remains frozen. A test covers decoding a historical row without those fields.
 
 
 ---
@@ -62,4 +68,4 @@ Waves 1–9 predate this GSD planning workspace and their claims were **not** in
 
 **10-01 host gate remains BLOCKED** by user choice: Talos staging is out of scope for `v0.1.0` and no hcloud provisioning is authorized. OrbStack Ubuntu is Linux evidence only. Do not advance Talos-dependent claims or compliance qualification — FIPS, SOC 2, VS-NfD and NATO are **not assessed**, which is different from not applicable.
 
-**Immediate next action:** Finish and merge Phase 13 13-02. Then follow `.planning/phases/13-wireguard-mesh/13-PLAN.md`: 13-03 → 13-04; then 13-05 and 13-06 (13-06 depends on 13-04); 13-07 comes last. Cross-node networking remains unsupported until those implementation plans land. Talos/hcloud staging stays blocked pending authorization; compliance is not assessed.
+**Immediate next action:** Finish and merge Phase 13 13-03, then implement 13-04 peer sets and routes. 13-05 and 13-06 follow (13-06 depends on 13-04); 13-07 comes last. Cross-node networking remains unsupported until the peer and routing plans land. Talos/hcloud staging stays blocked pending authorization; compliance is not assessed.

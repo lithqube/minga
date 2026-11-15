@@ -342,6 +342,7 @@ fn generate_config(opts: &SidecarOptions, jetstream_dir: &Path) -> String {
                 ],
                 &[
                     format!("$KV.MINGA_ASSIGN.node.{node_id}.task.>"),
+                    format!("$KV.MINGA_ASSIGN.node.{node_id}.wg"),
                     "$KV.MINGA_ASSIGN.net.>".into(),
                     format!("$KV.MINGA_LEASES.lease.node.{node_id}"),
                     format!("$KV.MINGA_STATUS.node.{node_id}.task.>"),
@@ -569,6 +570,11 @@ mod tests {
         assert!(config.contains("user: \"minga-worker-7\""));
         assert!(config.contains("\"$KV.MINGA_STATUS.node.7.task.>\""));
         assert!(config.contains("\"$KV.MINGA_ASSIGN.node.7.task.>\""));
+        assert!(config.contains("\"$KV.MINGA_ASSIGN.node.7.wg\""));
+        assert!(!config.contains("\"$JS.API.KV.GET.KV_MINGA_ASSIGN.node.7.wg\""));
+        assert!(
+            !config.contains("\"$JS.API.DIRECT.GET.KV_MINGA_ASSIGN.$KV.MINGA_ASSIGN.node.7.wg\"")
+        );
         assert!(config
             .contains("\"$JS.API.DIRECT.GET.KV_MINGA_ASSIGN.$KV.MINGA_ASSIGN.node.7.task.>\""));
         assert!(config
@@ -576,6 +582,7 @@ mod tests {
         assert!(!config.contains("\"$JS.API.DIRECT.GET.KV_MINGA_STATUS.$KV.MINGA_STATUS.node.8"));
         assert!(!config.contains("\"$JS.API.DIRECT.GET.KV_MINGA_ASSIGN.$KV.MINGA_ASSIGN.node.8"));
         assert!(!config.contains("\"$KV.MINGA_ASSIGN.node.8"));
+        assert!(!config.contains("\"$KV.MINGA_ASSIGN.node.8.wg\""));
         assert!(!config.contains("\"$KV.MINGA_STATUS.node.8"));
     }
 

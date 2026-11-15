@@ -166,8 +166,8 @@ impl NatsBus {
 
     fn check_worker_key(&self, key: &str) -> Result<()> {
         if let Some(node_id) = self.worker_node_id {
-            let prefix = format!("node.{node_id}.task.");
-            if !key.starts_with(&prefix) {
+            let task_prefix = format!("node.{node_id}.task.");
+            if !key.starts_with(&task_prefix) {
                 return Err(BusError::Kv(format!(
                     "worker {node_id} cannot access assignment/status key {key}"
                 )));
@@ -178,10 +178,23 @@ impl NatsBus {
 
     fn check_worker_prefix(&self, prefix: &str) -> Result<()> {
         if let Some(node_id) = self.worker_node_id {
-            let allowed = format!("node.{node_id}.task.");
-            if prefix != allowed && prefix != "net." {
+            let task_prefix = format!("node.{node_id}.task.");
+            if prefix != task_prefix && prefix != "net." {
                 return Err(BusError::Kv(format!(
                     "worker {node_id} may list its own assignments or shared network metadata"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn check_worker_watch(&self, prefix: &str) -> Result<()> {
+        if let Some(node_id) = self.worker_node_id {
+            let task_prefix = format!("node.{node_id}.task.");
+            let wireguard_key = format!("node.{node_id}.wg");
+            if prefix != task_prefix && prefix != wireguard_key && prefix != "net." {
+                return Err(BusError::Kv(format!(
+                    "worker {node_id} may watch its own assignments or shared network metadata"
                 )));
             }
         }
@@ -626,7 +639,7 @@ impl EventBus for NatsBus {
         let mut entries = Vec::new();
         while let Some(key) = keys.next().await {
             let key = key.map_err(|error| BusError::Kv(format!("assignment key: {error}")))?;
-            if !key.starts_with(prefix) {
+            if !crate::assignment_prefix_matches(prefix, &key) {
                 continue;
             }
             if let Some(value) = self
@@ -650,10 +663,11 @@ impl EventBus for NatsBus {
     }
 
     async fn watch_assignments(&self, prefix: &str) -> Result<KvStream> {
-        self.check_worker_prefix(prefix)?;
+        self.check_worker_watch(prefix)?;
+        let filter = crate::assignment_watch_filter(prefix);
         let watcher = self
             .assignments_kv
-            .watch_from_revision(format!("{prefix}>"), 1)
+            .watch_from_revision(filter, 1)
             .await
             .map_err(|error| BusError::Kv(format!("watch assignments: {error}")))?;
         let prefix = prefix.to_string();
@@ -661,7 +675,7 @@ impl EventBus for NatsBus {
             let prefix = prefix.clone();
             async move {
                 match entry_result {
-                    Ok(entry) if entry.key.starts_with(&prefix) => {
+                    Ok(entry) if crate::assignment_prefix_matches(&prefix, &entry.key) => {
                         let op = match entry.operation {
                             KvOperation::Put => KvOp::Put,
                             KvOperation::Delete | KvOperation::Purge => KvOp::Delete,

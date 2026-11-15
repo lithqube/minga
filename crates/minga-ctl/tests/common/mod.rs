@@ -43,6 +43,8 @@ pub async fn cluster() -> Cluster {
             gpus: 0,
         },
         role: Default::default(),
+        wg_public_key: None,
+        wg_endpoint: None,
     };
     store.upsert_node(identity.cluster_node()).await.unwrap();
     let bus = MemoryBus::new();

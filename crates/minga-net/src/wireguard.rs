@@ -11,10 +11,9 @@
 //! layer, not this module.
 
 use base64::Engine;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use x25519_dalek::{PublicKey, StaticSecret};
-
-use crate::cidr::DEFAULT_WG_PORT;
 
 #[derive(Debug, Error)]
 pub enum WgError {
@@ -64,7 +63,7 @@ impl KeyPair {
 }
 
 /// A WireGuard peer configuration.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Peer {
     /// Base64-encoded public key.
     pub public_key: String,
@@ -74,6 +73,11 @@ pub struct Peer {
     pub endpoint: Option<String>,
     /// Persistent keepalive in seconds (0 = disabled).
     pub keepalive: u16,
+}
+/// Node-scoped peer assignment stored at `node.{id}.wg` in MINGA_ASSIGN.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WireGuardPeerSet {
+    pub peers: Vec<Peer>,
 }
 
 /// Configuration for a local WireGuard interface.
@@ -166,25 +170,8 @@ fn parse_host_port(s: &str) -> Option<(String, u16)> {
     Some((host.to_string(), port))
 }
 
-/// Default WireGuard interface name prefix.
-pub const WG_INTERFACE_PREFIX: &str = "minga";
-
-/// Generate an interface name for a network.
-pub fn interface_name(network_id: &str) -> String {
-    // Sanitize: keep alphanumeric, replace others with '-'.
-    let sanitized: String = network_id
-        .chars()
-        .map(|c| if c.is_alphanumeric() { c } else { '-' })
-        .collect();
-    // Truncate to fit IFNAMSIZ (15 chars): "minga-" + 9 chars of network_id.
-    let suffix: String = sanitized.chars().take(9).collect();
-    format!("{WG_INTERFACE_PREFIX}-{suffix}")
-}
-
-/// Default listen port for a network.
-pub fn default_listen_port(network_wg_port: Option<u16>) -> u16 {
-    network_wg_port.unwrap_or(DEFAULT_WG_PORT)
-}
+/// The single WireGuard interface on each node.
+pub const WG_INTERFACE_NAME: &str = "minga-wg0";
 
 #[cfg(test)]
 mod tests {
@@ -293,9 +280,9 @@ mod tests {
             endpoint: Some("10.0.0.2:51820".to_string()),
             keepalive: 25,
         };
-        let args = peer.to_wg_set_args("minga-abc");
+        let args = peer.to_wg_set_args(WG_INTERFACE_NAME);
         assert_eq!(args[0], "set");
-        assert_eq!(args[1], "minga-abc");
+        assert_eq!(args[1], WG_INTERFACE_NAME);
         assert_eq!(args[2], "peer");
         assert_eq!(args[3], "PUBKEY=");
         assert!(args.contains(&"endpoint".to_string()));
@@ -307,20 +294,7 @@ mod tests {
     }
 
     #[test]
-    fn interface_name_sanitized() {
-        // "minga-" (6) + up to 9 chars of sanitized name = max 15 chars
-        assert_eq!(interface_name("my-network"), "minga-my-networ");
-        assert_eq!(interface_name("plant-7.frontend"), "minga-plant-7-f");
-        assert_eq!(interface_name("a"), "minga-a");
-        // Max length: "minga-" (6) + 9 = 15 chars (IFNAMSIZ-1)
-        let long = interface_name("very-long-network-name-here");
-        assert!(long.len() <= 15);
-        assert_eq!(long, "minga-very-long");
-    }
-
-    #[test]
-    fn default_listen_port_values() {
-        assert_eq!(default_listen_port(None), 51820);
-        assert_eq!(default_listen_port(Some(52000)), 52000);
+    fn node_interface_name_is_fixed() {
+        assert_eq!(WG_INTERFACE_NAME, "minga-wg0");
     }
 }

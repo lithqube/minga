@@ -21,8 +21,7 @@
 //! minga.task.{id}.status      JetStream   task lifecycle events
 //! minga.task.{id}.event       JetStream   task lifecycle events
 //! minga.log.node.{id}.{task}  JetStream   container log chunks
-//! KV_MINGA_ASSIGN             KV          manager-authored task/network assignments
-//! KV_MINGA_STATUS             KV          actual task status reports
+//! KV_MINGA_ASSIGN             KV          manager-authored task/WireGuard assignments and network metadata
 //! KV_MINGA_LEASES             KV          node liveness leases
 //! minga.ctl.node.{id}.ping    core NATS   synchronous health probe [req/reply]
 //! minga.ctl.node.{id}.drain   core NATS   synchronous drain [req/reply]
@@ -128,6 +127,22 @@ pub type KvStream = Pin<Box<dyn Stream<Item = KvEvent> + Send>>;
 
 /// Stream of incoming requests.
 pub type RequestStream = Pin<Box<dyn Stream<Item = BusRequest> + Send>>;
+
+pub(crate) fn assignment_prefix_matches(prefix: &str, key: &str) -> bool {
+    if prefix.is_empty() || prefix.ends_with('.') {
+        key.starts_with(prefix)
+    } else {
+        key == prefix
+    }
+}
+
+pub(crate) fn assignment_watch_filter(prefix: &str) -> String {
+    if prefix.is_empty() || prefix.ends_with('.') {
+        format!("{prefix}>")
+    } else {
+        prefix.to_string()
+    }
+}
 
 /// Stream of log entries.
 pub type LogEventStream = Pin<Box<dyn Stream<Item = LogEntry> + Send>>;
@@ -314,6 +329,7 @@ pub trait EventBus: Send + Sync {
     async fn get_assignment(&self, key: &str) -> Result<Option<Vec<u8>>>;
     async fn list_assignments(&self, prefix: &str) -> Result<Vec<(String, Vec<u8>)>>;
     async fn delete_assignment(&self, key: &str) -> Result<()>;
+    /// Watch current and future assignments matching a prefix ending in `.`; otherwise the exact key.
     async fn watch_assignments(&self, prefix: &str) -> Result<KvStream>;
 
     // -- Status (latest-value KV) -------------------------------------------
@@ -417,5 +433,17 @@ mod tests {
         assert_eq!(report.last_error, None);
         assert_eq!(report.last_exit_code, None);
         assert_eq!(report.running_since_unix, Some(123));
+    }
+    #[test]
+    fn assignment_watch_uses_exact_keys_or_dot_terminated_prefixes() {
+        assert!(assignment_prefix_matches("node.7.task.", "node.7.task.api"));
+        assert!(!assignment_prefix_matches(
+            "node.7.task.",
+            "node.8.task.api"
+        ));
+        assert!(assignment_prefix_matches("node.7.wg", "node.7.wg"));
+        assert!(!assignment_prefix_matches("node.7.wg", "node.7.wg.extra"));
+        assert_eq!(assignment_watch_filter("node.7.task."), "node.7.task.>");
+        assert_eq!(assignment_watch_filter("node.7.wg"), "node.7.wg");
     }
 }

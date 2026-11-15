@@ -57,6 +57,8 @@ async fn cluster() -> (Arc<StateStore>, String, tempfile::TempDir) {
                     gpus: 0,
                 },
                 role: Default::default(),
+                wg_public_key: None,
+                wg_endpoint: None,
             }
             .cluster_node(),
         )
