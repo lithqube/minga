@@ -54,6 +54,9 @@ limits remain:
    DNAT are per host. WireGuard configuration is generated but not applied;
    communicating services must stay on one node.
 
+The target mesh design, including NAT relay trust and ingress publishing, is in
+[ADR 0007: WireGuard Mesh and Routing Mesh](adr/0007-wireguard-mesh.md).
+
 The T4 target of roughly 5,000 workers has not had a load test. The functional
 architecture has no per-worker Raft replication or heartbeat writes.
 

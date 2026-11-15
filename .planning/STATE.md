@@ -1,6 +1,6 @@
 # Planning state
 
-**Current:** Phase 12 — Managers-only Raft, 12-07 live proof recorded; final verification and PR merge pending. Plan: `.planning/phases/12-managers-only-raft/12-PLAN.md`. Phase 13 (WireGuard mesh and routing mesh) is next after Phase 12 closes; its 13-02 (unique subnets) can land independently. Shipped since Phase 11: v1.0.1, v1.0.2, v1.1.0, v1.1.1, v1.2.0 (see `CHANGELOG.md`).
+**Current:** Phase 13 — WireGuard mesh and routing mesh, 13-01 ADR 0007 in progress. Phase 12 Managers-only Raft is complete (PR #76 merged 2026-11-15; live evidence below). Phase 13 starts with 13-01; 13-02 unique subnets is independent.
 
 **Phase 12 live evidence (12-07, 2026-11-15):**
 
@@ -12,6 +12,7 @@
 - **Bus authorization:** Live TLS NATS test `worker_certificate_cannot_write_assignments_or_other_nodes_status_and_leases` verifies own-assignment reads and denies foreign assignment writes, foreign status/lease writes and foreign-key reads.
 - **v1.2.0 migration:** Built and ran the actual v1.2.0 Linux binary with managers 1/2 and worker 99, then deployed `phase12-v120-live.legacy`. Current manager migration dry-run identified `{1,2,99}` → `{1}`; apply committed `[1]`. Service remained listed and its container task `phase12-v120-live.legacy.1.03948649` stayed RUNNING at containerd PID 1599. Replaced the old worker with the current JetStream worker using the same data directory; it adopted the existing container at PID 1599.
 - **T4 scope:** The live topology exercised managers-only Raft with two workers and a separate third-worker join. No 5,000-worker load test was run; cross-node container networking remains unsupported pending Phase 13.
+- **Phase 12 delivery:** PR #76 merged to `main` after its Rust, site, daemon-backed and real-kernel CI checks passed.
 
 ---
 
@@ -52,4 +53,4 @@ Waves 1–9 predate this GSD planning workspace and their claims were **not** in
 
 **10-01 host gate remains BLOCKED** by user choice: Talos staging is out of scope for `v0.1.0` and no hcloud provisioning is authorized. OrbStack Ubuntu is Linux evidence only. Do not advance Talos-dependent claims or compliance qualification — FIPS, SOC 2, VS-NfD and NATO are **not assessed**, which is different from not applicable.
 
-**Immediate next action:** Phase 12 — Managers-only Raft is in final verification/PR review. After it lands, proceed with Phase 13 (WireGuard mesh and routing mesh); its 13-02 (unique subnets) can land independently. Cross-node container networking remains unsupported until that work. Talos/hcloud staging stays blocked pending authorization; compliance is not assessed.
+**Immediate next action:** Phase 13 — Write and merge ADR 0007 first. Then follow the dependency order in `.planning/phases/13-wireguard-mesh/13-PLAN.md`; 13-02 unique subnets can proceed independently. Cross-node networking remains unsupported until the mesh implementation lands. Talos/hcloud staging stays blocked pending authorization; compliance is not assessed.
