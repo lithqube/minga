@@ -4,6 +4,8 @@
 //! parameters, calls into the [`StateStore`](minga_state::StateStore),
 //! and returns a Docker-compatible JSON response.
 
+use std::borrow::Cow;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::{
@@ -11,13 +13,15 @@ use axum::{
     http::StatusCode,
     Json,
 };
+use minga_bus::{subjects, EventBus, TaskActualState, TaskStatusReport};
 use minga_state::types::{
     unix_now, ClusterNode, NodeStatus as MingaNodeStatus, ResourceSpec, Service as StateService,
+    Task,
 };
 use minga_state::StateStore;
 
 use crate::{
-    error::{bad_request, conflict, not_found, ok_message, ApiError, ApiResult},
+    error::{bad_request, conflict, internal, not_found, ok_message, ApiError, ApiResult},
     models::{self, Filters},
     translate,
 };
@@ -25,12 +29,72 @@ use crate::{
 /// Shared state for all handlers.
 pub struct AppState {
     pub store: Arc<StateStore>,
+    pub bus: Option<Arc<dyn EventBus>>,
 }
 
 impl AppState {
     pub fn new(store: Arc<StateStore>) -> Self {
-        Self { store }
+        Self { store, bus: None }
     }
+
+    pub fn with_bus(store: Arc<StateStore>, bus: Arc<dyn EventBus>) -> Self {
+        Self {
+            store,
+            bus: Some(bus),
+        }
+    }
+
+    async fn task_statuses(&self) -> ApiResult<HashMap<String, TaskStatusReport>> {
+        let Some(bus) = &self.bus else {
+            return Ok(HashMap::new());
+        };
+        let mut statuses = HashMap::new();
+        for (key, bytes) in bus
+            .list_status()
+            .await
+            .map_err(|error| internal(error.to_string()))?
+        {
+            if !key.starts_with("task.") {
+                continue;
+            }
+            match TaskStatusReport::from_bytes(&bytes) {
+                Ok(report) if key == subjects::kv_task_status(&report.task_id) => {
+                    statuses.insert(report.task_id.clone(), report);
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(key, error = %error, "cannot decode task status");
+                }
+            }
+        }
+        Ok(statuses)
+    }
+}
+
+fn task_status_for_api<'a>(
+    app: &AppState,
+    task: &Task,
+    statuses: &'a HashMap<String, TaskStatusReport>,
+) -> Option<Cow<'a, TaskStatusReport>> {
+    if let Some(report) = statuses
+        .get(&task.id)
+        .filter(|report| report.task_id == task.id && report.node_id == task.node_id)
+    {
+        return Some(Cow::Borrowed(report));
+    }
+    app.bus.as_ref().map(|_| {
+        Cow::Owned(TaskStatusReport {
+            task_id: task.id.clone(),
+            node_id: task.node_id,
+            state: TaskActualState::Starting,
+            container_id: None,
+            observed_at: 0,
+            restarts: 0,
+            last_error: None,
+            last_exit_code: None,
+            running_since_unix: None,
+        })
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -106,7 +170,17 @@ async fn ensure_placeable(
     updating: Option<&str>,
 ) -> ApiResult<()> {
     let nodes = app.store.list_nodes().await?;
-    let all_tasks = app.store.list_tasks().await?;
+    let statuses = app.task_statuses().await?;
+    let all_tasks: Vec<_> = app
+        .store
+        .list_tasks()
+        .await?
+        .into_iter()
+        .map(|task| {
+            let status = statuses.get(&task.id);
+            minga_scheduler::task_with_actual_status(task, status)
+        })
+        .collect();
     let networks = app.store.list_networks().await?;
     let tasks: Vec<_> = match updating {
         Some(id) => all_tasks
@@ -141,10 +215,16 @@ pub async fn get_info(State(app): State<Arc<AppState>>) -> ApiResult<Json<models
     let nodes = app.store.list_nodes().await?;
     let services = app.store.list_services().await?;
     let tasks = app.store.list_tasks().await?;
+    let statuses = app.task_statuses().await?;
 
     let running = tasks
         .iter()
-        .filter(|t| t.state == minga_state::types::TaskState::Running)
+        .filter(|task| {
+            statuses.get(&task.id).is_some_and(|status| {
+                status.node_id == task.node_id
+                    && status.state == minga_bus::TaskActualState::Running
+            })
+        })
         .count();
 
     let manager_count = if is_leader { 1 } else { 0 };
@@ -335,6 +415,7 @@ pub async fn list_services(
 
     let services = app.store.list_services().await?;
     let tasks = app.store.list_tasks().await?;
+    let statuses = app.task_statuses().await?;
     let networks = app.store.list_networks().await?;
 
     let result: Vec<models::Service> = services
@@ -360,11 +441,13 @@ pub async fn list_services(
         })
         .map(|s| {
             let mut docker_svc = translate::service_to_docker(s);
-            // Attach tasks for this service.
             docker_svc.TaskList = tasks
                 .iter()
-                .filter(|t| t.service_id == s.id)
-                .map(|t| translate::task_to_docker(t, &networks))
+                .filter(|task| task.service_id == s.id)
+                .map(|task| {
+                    let actual = task_status_for_api(&app, task, &statuses);
+                    translate::task_to_docker(task, actual.as_deref(), &networks)
+                })
                 .collect();
             docker_svc
         })
@@ -418,6 +501,7 @@ pub async fn get_service(
 ) -> ApiResult<Json<models::Service>> {
     let services = app.store.list_services().await?;
     let tasks = app.store.list_tasks().await?;
+    let statuses = app.task_statuses().await?;
     let networks = app.store.list_networks().await?;
 
     let svc = services
@@ -428,8 +512,11 @@ pub async fn get_service(
     let mut docker_svc = translate::service_to_docker(svc);
     docker_svc.TaskList = tasks
         .iter()
-        .filter(|t| t.service_id == svc.id)
-        .map(|t| translate::task_to_docker(t, &networks))
+        .filter(|task| task.service_id == svc.id)
+        .map(|task| {
+            let actual = task_status_for_api(&app, task, &statuses);
+            translate::task_to_docker(task, actual.as_deref(), &networks)
+        })
         .collect();
 
     Ok(Json(docker_svc))
@@ -528,8 +615,8 @@ pub async fn list_tasks(
 
     let tasks = app.store.list_tasks().await?;
     let services = app.store.list_services().await?;
+    let statuses = app.task_statuses().await?;
     let networks = app.store.list_networks().await?;
-
     let result: Vec<models::Task> = tasks
         .iter()
         .filter(|t| {
@@ -578,7 +665,10 @@ pub async fn list_tasks(
             }
             true
         })
-        .map(|t| translate::task_to_docker(t, &networks))
+        .map(|task| {
+            let actual = task_status_for_api(&app, task, &statuses);
+            translate::task_to_docker(task, actual.as_deref(), &networks)
+        })
         .collect();
 
     Ok(Json(result))
@@ -594,9 +684,16 @@ pub async fn get_task(
         .get_task(&id)
         .await?
         .ok_or_else(|| not_found("task", &id))?;
+    let statuses = app.task_statuses().await?;
     let networks = app.store.list_networks().await?;
 
-    Ok(Json(translate::task_to_docker(&task, &networks)))
+    let actual = task_status_for_api(&app, &task, &statuses);
+
+    Ok(Json(translate::task_to_docker(
+        &task,
+        actual.as_deref(),
+        &networks,
+    )))
 }
 
 // ---------------------------------------------------------------------------

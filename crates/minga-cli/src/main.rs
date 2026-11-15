@@ -704,16 +704,20 @@ async fn run_api(args: ApiArgs) -> ExitCode {
              is cluster admin. Set --api-token or MINGA_API_TOKEN"
         );
     }
-    let server =
-        match minga_api::ApiServer::start_with_auth(state.clone(), &args.api_bind, args.api_token)
-            .await
-        {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("error: cannot start API server: {e}");
-                return ExitCode::FAILURE;
-            }
-        };
+    let server = match minga_api::ApiServer::start_with_bus_and_auth(
+        state.clone(),
+        bus.clone(),
+        &args.api_bind,
+        args.api_token,
+    )
+    .await
+    {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("error: cannot start API server: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
 
     // The reconcile loop must exist on every Raft voter: the scheduler is
     // leadership-gated, and an API-only node can be elected leader. Without

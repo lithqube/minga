@@ -92,6 +92,9 @@ impl Health {
         std::mem::take(&mut self.newly_healthy)
     }
 
+    pub(crate) fn is_healthy(&self) -> bool {
+        self.healthy
+    }
     pub(crate) fn is_unhealthy(&self) -> bool {
         self.failures >= self.retries
     }

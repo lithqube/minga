@@ -13,6 +13,7 @@
 use std::collections::HashMap;
 
 use chrono::Utc;
+use minga_bus::{TaskActualState, TaskStatusReport};
 use minga_state::types::{
     AgentSpec, ClusterNode, Config as MingaConfig, FailureAction, Network, NetworkId, NodeId,
     NodeStatus as MingaNodeStatus, PortMapping, ResourceSpec, RestartCondition, RestartPolicy,
@@ -715,8 +716,8 @@ pub fn node_to_docker(node: &ClusterNode, is_leader: bool) -> models::Node {
 }
 
 /// The short `TaskStatus.Message`: what the task is doing, or how it ended.
-fn task_message(task: &Task) -> String {
-    match (task.state, task.last_exit_code) {
+fn task_message(state: TaskState, last_exit_code: Option<i32>) -> String {
+    match (state, last_exit_code) {
         (TaskState::Stopped | TaskState::Failed, Some(code)) => format!("exited with code {code}"),
         (TaskState::Pending, _) => "pending".into(),
         (TaskState::Assigned, _) => "assigned".into(),
@@ -728,13 +729,8 @@ fn task_message(task: &Task) -> String {
     }
 }
 
-/// Translates a Minga `Task` into a Docker `Task` API response.
-///
-/// `networks` (the cluster network list) resolves attachment names and
-/// subnet prefixes for `NetworksAttachments` — the field Traefik's swarm
-/// provider reads to discover a task's IP.
-pub fn task_to_docker(task: &Task, networks: &[Network]) -> models::Task {
-    let (state, desired_state) = match task.state {
+fn docker_task_state(state: TaskState) -> (&'static str, &'static str) {
+    match state {
         TaskState::Pending => ("pending", "running"),
         TaskState::Assigned => ("assigned", "running"),
         TaskState::Starting => ("preparing", "running"),
@@ -742,7 +738,35 @@ pub fn task_to_docker(task: &Task, networks: &[Network]) -> models::Task {
         TaskState::Stopping => ("shutdown", "shutdown"),
         TaskState::Stopped => ("complete", "shutdown"),
         TaskState::Failed => ("failed", "shutdown"),
-    };
+    }
+}
+
+/// Translates a Raft desired task and optional MINGA_STATUS actual state into
+/// a Docker `Task` API response.
+///
+/// `networks` (the cluster network list) resolves attachment names and
+/// subnet prefixes for `NetworksAttachments` — the field Traefik's swarm
+/// provider reads to discover a task's IP.
+pub fn task_to_docker(
+    task: &Task,
+    actual: Option<&TaskStatusReport>,
+    networks: &[Network],
+) -> models::Task {
+    let actual =
+        actual.filter(|report| report.task_id == task.id && report.node_id == task.node_id);
+    let actual_state = actual.map_or(task.state, |report| match report.state {
+        TaskActualState::Starting => TaskState::Starting,
+        TaskActualState::Running => TaskState::Running,
+        TaskActualState::Stopped => TaskState::Stopped,
+        TaskActualState::Failed => TaskState::Failed,
+    });
+    let (state, _) = docker_task_state(actual_state);
+    let (_, desired_state) = docker_task_state(task.state);
+    let last_exit_code = actual.map_or(task.last_exit_code, |report| report.last_exit_code);
+    let last_error = actual.map_or(task.last_error.as_ref(), |report| {
+        report.last_error.as_ref()
+    });
+    let restarts = actual.map_or(task.restarts, |report| report.restarts);
 
     // Task IDs are `{service}.{slot}.{revision}`.
     let slot = task
@@ -820,17 +844,17 @@ pub fn task_to_docker(task: &Task, networks: &[Network]) -> models::Task {
         Status: models::TaskStatus {
             Timestamp: Some(Utc::now()),
             State: state.to_string(),
-            Message: Some(task_message(task)),
-            Err: task.last_error.clone(),
-            ContainerStatus: task.last_exit_code.map(|code| models::ContainerStatus {
-                ContainerID: None,
+            Message: Some(task_message(actual_state, last_exit_code)),
+            Err: last_error.cloned(),
+            ContainerStatus: last_exit_code.map(|code| models::ContainerStatus {
+                ContainerID: actual.and_then(|report| report.container_id.clone()),
                 PID: None,
                 ExitCode: Some(code),
             }),
         },
         DesiredState: desired_state.to_string(),
         NetworksAttachments: attachments,
-        MingaRestarts: Some(task.restarts),
+        MingaRestarts: Some(restarts),
     }
 }
 
@@ -1471,7 +1495,7 @@ mod tests {
             last_error: None,
             last_exit_code: None,
         };
-        let docker = task_to_docker(&task, &[]);
+        let docker = task_to_docker(&task, None, &[]);
         assert_eq!(docker.ID, "svc1.1.abcd1234");
         assert_eq!(docker.ServiceID, "svc1");
         assert_eq!(docker.NodeID, "1");
@@ -1499,7 +1523,7 @@ mod tests {
             last_error: None,
             last_exit_code: None,
         };
-        let docker = task_to_docker(&task, &[]);
+        let docker = task_to_docker(&task, None, &[]);
         assert_eq!(docker.Status.State, "pending");
         assert_eq!(docker.DesiredState, "running");
     }
@@ -1523,7 +1547,7 @@ mod tests {
             last_error: None,
             last_exit_code: None,
         };
-        let docker = task_to_docker(&task, &[]);
+        let docker = task_to_docker(&task, None, &[]);
         assert_eq!(docker.Status.State, "failed");
         assert_eq!(docker.DesiredState, "shutdown");
     }
@@ -1544,20 +1568,33 @@ mod tests {
 
     #[test]
     fn a_failed_task_reports_its_reason_and_exit_code() {
-        let task = task_in(TaskState::Failed, Some("exited with code 1"), Some(1));
-        let status = task_to_docker(&task, &[]).Status;
+        let task = task_in(TaskState::Assigned, None, None);
+        let actual = TaskStatusReport {
+            task_id: task.id.clone(),
+            node_id: task.node_id,
+            state: TaskActualState::Failed,
+            container_id: None,
+            observed_at: 1,
+            restarts: 1,
+            last_error: Some("exited with code 1".to_string()),
+            last_exit_code: Some(1),
+            running_since_unix: None,
+        };
+        let docker = task_to_docker(&task, Some(&actual), &[]);
+        let status = docker.Status;
         assert_eq!(status.State, "failed");
         assert_eq!(status.Message.as_deref(), Some("exited with code 1"));
         assert_eq!(status.Err.as_deref(), Some("exited with code 1"));
         assert_eq!(status.ContainerStatus.unwrap().ExitCode, Some(1));
-        assert_eq!(task_to_docker(&task, &[]).MingaRestarts, Some(1));
+        assert_eq!(docker.MingaRestarts, Some(1));
+        assert_eq!(docker.DesiredState, "running");
     }
 
     #[test]
     fn a_task_that_failed_to_start_has_an_error_but_no_exit_code() {
         let error = "failed to start container: image pull failed";
         let task = task_in(TaskState::Starting, Some(error), None);
-        let status = task_to_docker(&task, &[]).Status;
+        let status = task_to_docker(&task, None, &[]).Status;
         assert_eq!(status.Message.as_deref(), Some("starting"));
         assert_eq!(status.Err.as_deref(), Some(error));
         assert!(status.ContainerStatus.is_none());
@@ -1566,7 +1603,7 @@ mod tests {
     #[test]
     fn a_healthy_task_has_a_message_and_no_error_on_the_wire() {
         let task = task_in(TaskState::Running, None, None);
-        let json = serde_json::to_value(task_to_docker(&task, &[]).Status).unwrap();
+        let json = serde_json::to_value(task_to_docker(&task, None, &[]).Status).unwrap();
         assert_eq!(json["Message"], "started");
         assert!(json.get("Err").is_none() && json.get("ContainerStatus").is_none());
     }

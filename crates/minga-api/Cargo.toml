@@ -8,6 +8,7 @@ license.workspace = true
 
 [dependencies]
 axum.workspace = true
+minga-bus = { path = "../minga-bus" }
 base64.workspace = true
 chrono.workspace = true
 minga-net = { path = "../minga-net" }
@@ -22,7 +23,6 @@ tower.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
-minga-bus = { path = "../minga-bus" }
 reqwest.workspace = true
 tempfile.workspace = true
 testcontainers.workspace = true

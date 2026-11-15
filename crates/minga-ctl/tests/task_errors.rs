@@ -4,7 +4,7 @@
 mod common;
 
 use common::{ctl, service, Cluster};
-use minga_state::types::TaskState;
+use minga_bus::{subjects, EventBus, TaskActualState, TaskStatusReport};
 use serde_json::{json, Value};
 
 const LONG_ERROR: &str = "failed to start container: ctr pull registry.example.com/shop/web:2 failed (exit status: 1): not found";
@@ -41,18 +41,45 @@ async fn cluster_with_failed_tasks() -> (Cluster, String, String) {
 
     let mut tasks = cluster.store.list_tasks().await.unwrap();
     tasks.sort_by(|a, b| a.id.cmp(&b.id));
-    let mut exited = tasks[0].clone();
-    exited.state = TaskState::Failed;
-    exited.restarts = 3;
-    exited.last_error = Some("exited with code 1".into());
-    exited.last_exit_code = Some(1);
-    let mut retrying = tasks[1].clone();
-    retrying.state = TaskState::Starting;
-    retrying.restarts = 1;
-    retrying.last_error = Some(LONG_ERROR.into());
-    cluster.store.upsert_task(exited.clone()).await.unwrap();
-    cluster.store.upsert_task(retrying.clone()).await.unwrap();
-    (cluster, exited.id, retrying.id)
+    let exited = &tasks[0];
+    let retrying = &tasks[1];
+    for (task, state, restarts, error, exit_code) in [
+        (
+            exited,
+            TaskActualState::Failed,
+            3,
+            Some("exited with code 1"),
+            Some(1),
+        ),
+        (
+            retrying,
+            TaskActualState::Starting,
+            1,
+            Some(LONG_ERROR),
+            None,
+        ),
+    ] {
+        let report = TaskStatusReport {
+            task_id: task.id.clone(),
+            node_id: task.node_id,
+            state,
+            container_id: None,
+            observed_at: 0,
+            restarts,
+            last_error: error.map(str::to_string),
+            last_exit_code: exit_code,
+            running_since_unix: None,
+        };
+        cluster
+            .bus
+            .put_status(
+                &subjects::kv_task_status(&task.id),
+                &report.to_bytes().unwrap(),
+            )
+            .await
+            .unwrap();
+    }
+    (cluster, exited.id.clone(), retrying.id.clone())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -121,9 +148,26 @@ async fn a_healthy_service_has_no_error_and_no_hint() {
         )
         .await;
     cluster.wait_for_tasks(1).await;
-    let mut task = cluster.store.list_tasks().await.unwrap().remove(0);
-    task.state = TaskState::Running;
-    cluster.store.upsert_task(task).await.unwrap();
+    let task = cluster.store.list_tasks().await.unwrap().remove(0);
+    let report = TaskStatusReport {
+        task_id: task.id.clone(),
+        node_id: task.node_id,
+        state: TaskActualState::Running,
+        container_id: None,
+        observed_at: 0,
+        restarts: 0,
+        last_error: None,
+        last_exit_code: None,
+        running_since_unix: Some(1),
+    };
+    cluster
+        .bus
+        .put_status(
+            &subjects::kv_task_status(&task.id),
+            &report.to_bytes().unwrap(),
+        )
+        .await
+        .unwrap();
 
     let (code, out, err) = run(&cluster, &["service", "ps", "shop.db"]).await;
     assert_eq!(code, 0, "{err}");
