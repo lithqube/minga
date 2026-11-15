@@ -454,7 +454,8 @@ fn interface_is_up() -> Result<bool, WireGuardError> {
     if !output.status.success() {
         return Ok(false);
     }
-    let flags = String::from_utf8_lossy(&output.stdout)
+    let output = String::from_utf8_lossy(&output.stdout);
+    let flags = output
         .split_once('<')
         .and_then(|(_, rest)| rest.split_once('>'))
         .map(|(flags, _)| flags)
