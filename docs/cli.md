@@ -77,6 +77,7 @@ The API waits for catch-up before promotion. Remove it with
 | `--nats-cluster-cert`, `--nats-cluster-key`, `--nats-cluster-ca` | none | Route certificate, key, and peer CA for the built-in sidecar; required together and separate from client-facing TLS. `--nats-cluster-port` defaults to `6222`. |
 | `--nats-worker-id <ID>` | none | Worker IDs authorized by this sidecar's client-certificate mapping. |
 | `--label <KEY=VALUE>` | none | Advertised to the cluster; matched by `node.labels.KEY` placement constraints. |
+| `--overlay-supernet <CIDR>`, `MINGA_OVERLAY_SUPERNET` | `10.100.0.0/16` | Manager subnet-allocation range; must contain `/24`s and avoid host routes. Use the same range on every cluster node. |
 | `--metrics-bind <ADDR>`, `MINGA_METRICS_BIND` | not served | `/metrics`, `/healthz` and `/readyz`. |
 | `--secret-store <DIR>` | `/var/lib/minga/secrets` | Secret values on this node. They never go through Raft or the bus. |
 | `--interval <SECS>` | `2` | Reconcile interval. |
