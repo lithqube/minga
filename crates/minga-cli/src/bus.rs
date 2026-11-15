@@ -45,6 +45,36 @@ pub async fn connect_bus(
     token: Option<&str>,
     replicas: usize,
 ) -> Result<Arc<dyn EventBus>, ConnectError> {
+    connect_nats_bus(url, token, replicas)
+        .await
+        .map(|bus| bus as Arc<dyn EventBus>)
+}
+
+/// Connects a manager sidecar now and keeps retrying the requested replica
+/// count while its NATS route cluster forms.
+pub async fn connect_bus_with_replica_retry(
+    url: &str,
+    token: Option<&str>,
+    replicas: usize,
+) -> Result<Arc<dyn EventBus>, ConnectError> {
+    let bus = connect_nats_bus(url, token, 1).await?;
+    let replica_bus = bus.clone();
+    tokio::spawn(async move {
+        loop {
+            if let Err(error) = replica_bus.ensure_replicas(replicas).await {
+                tracing::debug!(%error, replicas, "NATS cluster replicas not ready yet");
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        }
+    });
+    Ok(bus)
+}
+
+async fn connect_nats_bus(
+    url: &str,
+    token: Option<&str>,
+    replicas: usize,
+) -> Result<Arc<minga_bus::NatsBus>, ConnectError> {
     let tls = NatsTlsConfig::from_env().map_err(|e| ConnectError::TlsConfig(e.to_string()))?;
     // Explicit flag wins; MINGA_NATS_TOKEN is the fallback.
     let token: Option<String> = token
@@ -60,11 +90,8 @@ pub async fn connect_bus(
             .await
             .map_err(connect_error)?,
         None => {
-            // Plaintext is a loopback-only development mode. A remote
-            // worker or manager must provision TLS material instead of
-            // accidentally sending bus traffic across the network in clear.
-            // A token adds credential-checking but does not make plaintext
-            // routable.
+            // Plaintext is a loopback-only development mode. A token adds
+            // credential-checking but does not make plaintext routable.
             let authority = url.strip_prefix("nats://").and_then(|rest| {
                 if rest.contains(['/', '?', '@', ',']) {
                     return None;

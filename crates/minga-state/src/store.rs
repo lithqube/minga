@@ -1,7 +1,7 @@
 //! The public state store API: wraps a Raft instance and provides
 //! high-level methods for reading and writing cluster state.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -51,6 +51,8 @@ pub struct StateStore {
     rpc_server: tokio::task::JoinHandle<()>,
     /// Client TLS config for forwarded writes (mTLS), when enabled.
     tls_client: Option<std::sync::Arc<rustls::ClientConfig>>,
+    /// Serializes membership changes initiated through this store.
+    membership_change: tokio::sync::Mutex<()>,
 }
 
 impl StateStore {
@@ -67,7 +69,19 @@ impl StateStore {
         data_dir: impl AsRef<Path>,
         peers: BTreeMap<NodeId, String>,
     ) -> Result<Self, StateError> {
-        Self::open_inner(node_id, bind_addr, data_dir, peers, None).await
+        Self::open_inner(node_id, bind_addr, data_dir, peers, None, true).await
+    }
+
+    /// Opens a store without initializing a pristine Raft node.
+    ///
+    /// A fresh node remains available for `add_learner` to populate it. It
+    /// waits for a leader only when the local store is already initialized.
+    pub async fn open_join(
+        node_id: NodeId,
+        bind_addr: impl Into<String>,
+        data_dir: impl AsRef<Path>,
+    ) -> Result<Self, StateError> {
+        Self::open_inner(node_id, bind_addr, data_dir, BTreeMap::new(), None, false).await
     }
 
     /// Opens or creates a state store with mTLS on the Raft transport.
@@ -82,7 +96,25 @@ impl StateStore {
         peers: BTreeMap<NodeId, String>,
         tls: RaftTlsConfig,
     ) -> Result<Self, StateError> {
-        Self::open_inner(node_id, bind_addr, data_dir, peers, Some(tls)).await
+        Self::open_inner(node_id, bind_addr, data_dir, peers, Some(tls), true).await
+    }
+
+    /// Opens a store with mTLS without initializing a pristine Raft node.
+    pub async fn open_join_secure(
+        node_id: NodeId,
+        bind_addr: impl Into<String>,
+        data_dir: impl AsRef<Path>,
+        tls: RaftTlsConfig,
+    ) -> Result<Self, StateError> {
+        Self::open_inner(
+            node_id,
+            bind_addr,
+            data_dir,
+            BTreeMap::new(),
+            Some(tls),
+            false,
+        )
+        .await
     }
 
     async fn open_inner(
@@ -91,6 +123,7 @@ impl StateStore {
         data_dir: impl AsRef<Path>,
         peers: BTreeMap<NodeId, String>,
         tls: Option<RaftTlsConfig>,
+        initialize_if_pristine: bool,
     ) -> Result<Self, StateError> {
         let data_dir = data_dir.as_ref();
         let log_path = data_dir.join("raft_log.redb");
@@ -146,13 +179,13 @@ impl StateStore {
             .await
             .map_err(|e| StateError::storage(format!("rpc server bind {bind_addr}: {e}")))?;
 
-        // Initialize the cluster if it's pristine.
-        let initialized = raft
+        // A joining node must never bootstrap a separate cluster.
+        let mut initialized = raft
             .is_initialized()
             .await
             .map_err(|e| StateError::Fatal(e.to_string()))?;
 
-        if !initialized {
+        if !initialized && initialize_if_pristine {
             let mut members: BTreeMap<NodeId, BasicNode> = BTreeMap::new();
             members.insert(node_id, BasicNode::new(bind_addr.clone()));
             for (id, addr) in &peers {
@@ -161,36 +194,40 @@ impl StateStore {
             if let Err(e) = raft.initialize(members).await {
                 // Another node may have initialized concurrently.
                 tokio::time::sleep(Duration::from_millis(200)).await;
-                let now = raft
+                initialized = raft
                     .is_initialized()
                     .await
                     .map_err(|e| StateError::Fatal(e.to_string()))?;
-                if !now {
+                if !initialized {
                     return Err(StateError::Raft(format!("initialize: {e}")));
                 }
+            } else {
+                initialized = true;
             }
         }
 
-        // Wait for a leader to be elected (any node, not just us). A node
-        // whose peers are down must not die: a 2-voter cluster can only
-        // recover from a restart if the surviving node waits. Log loudly
-        // every interval so a misconfigured cluster is still visible.
-        loop {
-            let wait = raft.wait(Some(DEFAULT_TIMEOUT));
-            let result = wait
-                .metrics(
-                    |m| m.current_leader.is_some(),
-                    "waiting for leader election",
-                )
-                .await;
-            match result {
-                Ok(_) => break,
-                Err(e) => {
-                    tracing::warn!(
-                        node_id,
-                        error = %e,
-                        "no cluster leader yet; waiting for peers"
-                    );
+        if initialized {
+            // Wait for a leader to be elected (any node, not just us). A node
+            // whose peers are down must not die: a 2-voter cluster can only
+            // recover from a restart if the surviving node waits. Log loudly
+            // every interval so a misconfigured cluster is still visible.
+            loop {
+                let wait = raft.wait(Some(DEFAULT_TIMEOUT));
+                let result = wait
+                    .metrics(
+                        |m| m.current_leader.is_some(),
+                        "waiting for leader election",
+                    )
+                    .await;
+                match result {
+                    Ok(_) => break,
+                    Err(e) => {
+                        tracing::warn!(
+                            node_id,
+                            error = %e,
+                            "no cluster leader yet; waiting for peers"
+                        );
+                    }
                 }
             }
         }
@@ -201,12 +238,144 @@ impl StateStore {
             node_id,
             rpc_server,
             tls_client: client_tls,
+            membership_change: tokio::sync::Mutex::new(()),
         })
     }
 
     /// This node's Raft ID.
     pub fn node_id(&self) -> NodeId {
         self.node_id
+    }
+    /// Returns the current Raft voters.
+    pub async fn manager_voters(&self) -> Vec<NodeId> {
+        self.raft
+            .metrics()
+            .borrow()
+            .membership_config
+            .voter_ids()
+            .collect()
+    }
+
+    /// Adds a manager as a learner, waits for it to catch up, then promotes it.
+    pub async fn add_manager(&self, id: NodeId, raft_addr: String) -> Result<(), StateError> {
+        let _guard = self.membership_change.lock().await;
+        if id == self.node_id {
+            return Err(StateError::Membership(format!(
+                "manager {id} is already this node"
+            )));
+        }
+
+        let current = self.raft.metrics().borrow().membership_config.clone();
+        let voters = current.voter_ids().collect::<BTreeSet<_>>();
+        let existing_addr = current
+            .nodes()
+            .find(|(node_id, _)| **node_id == id)
+            .map(|(_, node)| node.addr.clone());
+        if voters.contains(&id) {
+            return Err(StateError::Membership(format!(
+                "manager {id} is already a voter"
+            )));
+        }
+        if existing_addr
+            .as_deref()
+            .is_some_and(|addr| addr != raft_addr)
+        {
+            return Err(StateError::Membership(format!(
+                "manager {id} already has a different Raft address"
+            )));
+        }
+
+        if existing_addr.is_none() {
+            timeout(
+                Duration::from_secs(60),
+                self.raft.add_learner(id, BasicNode::new(raft_addr), true),
+            )
+            .await
+            .map_err(|_| StateError::Raft(format!("manager {id} did not catch up in 60 seconds")))?
+            .map_err(|e| StateError::Raft(e.to_string()))?;
+        }
+
+        let mut voters = self
+            .manager_voters()
+            .await
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        voters.insert(id);
+        timeout(DEFAULT_TIMEOUT, self.raft.change_membership(voters, false))
+            .await
+            .map_err(|_| StateError::Raft("manager promotion timed out".into()))?
+            .map_err(|e| StateError::Raft(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Removes a manager, refusing to remove the last voter.
+    pub async fn remove_manager(&self, id: NodeId) -> Result<(), StateError> {
+        let _guard = self.membership_change.lock().await;
+        let mut voters = self
+            .manager_voters()
+            .await
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        if !voters.contains(&id) {
+            return Err(StateError::Membership(format!(
+                "manager {id} is not a voter"
+            )));
+        }
+        if voters.len() == 1 {
+            return Err(StateError::Membership(
+                "cannot remove the last manager; cluster would lose quorum".into(),
+            ));
+        }
+        voters.remove(&id);
+        timeout(DEFAULT_TIMEOUT, self.raft.change_membership(voters, false))
+            .await
+            .map_err(|_| StateError::Raft("manager removal timed out".into()))?
+            .map_err(|e| StateError::Raft(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Replaces v1.2.0 voter membership with an explicitly supplied manager set.
+    ///
+    /// The requested voters must all be current voters; this migration only
+    /// removes worker and API voters and commits the transition in one Raft
+    /// membership change.
+    pub async fn migrate_manager_voters(
+        &self,
+        manager_ids: Vec<NodeId>,
+    ) -> Result<Vec<NodeId>, StateError> {
+        let _guard = self.membership_change.lock().await;
+        let current = self
+            .manager_voters()
+            .await
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        let requested = manager_ids.iter().copied().collect::<BTreeSet<_>>();
+        if manager_ids.len() != requested.len() {
+            return Err(StateError::Membership(
+                "manager IDs must not contain duplicates".into(),
+            ));
+        }
+        if requested.is_empty() {
+            return Err(StateError::Membership(
+                "migration must retain at least one manager".into(),
+            ));
+        }
+        if !requested.is_subset(&current) {
+            return Err(StateError::Membership(
+                "migration can only retain current voters".into(),
+            ));
+        }
+        let removed = current.difference(&requested).copied().collect::<Vec<_>>();
+        if !removed.is_empty() {
+            timeout(
+                DEFAULT_TIMEOUT,
+                self.raft.change_membership(requested, false),
+            )
+            .await
+            .map_err(|_| StateError::Raft("manager migration timed out".into()))?
+            .map_err(|e| StateError::Raft(e.to_string()))?;
+        }
+        Ok(removed)
     }
 
     /// Whether this node is the current leader.

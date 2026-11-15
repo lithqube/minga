@@ -19,6 +19,7 @@ use minga_state::types::{
     Task,
 };
 use minga_state::StateStore;
+use serde::Deserialize;
 
 use crate::{
     error::{bad_request, conflict, internal, not_found, ok_message, ApiError, ApiResult},
@@ -71,6 +72,54 @@ impl AppState {
         }
         Ok(statuses)
     }
+}
+#[derive(Debug, Deserialize)]
+pub struct AddManagerRequest {
+    id: u64,
+    raft_addr: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ManagerMigrationRequest {
+    manager_ids: Vec<u64>,
+}
+
+/// Lists the current Raft voters.
+pub async fn list_managers(State(app): State<Arc<AppState>>) -> ApiResult<Json<Vec<u64>>> {
+    Ok(Json(app.store.manager_voters().await))
+}
+
+/// Adds a manager as a learner, catches it up, and promotes it to a voter.
+pub async fn add_manager(
+    State(app): State<Arc<AppState>>,
+    Json(request): Json<AddManagerRequest>,
+) -> ApiResult<(StatusCode, Json<serde_json::Value>)> {
+    app.store.add_manager(request.id, request.raft_addr).await?;
+    Ok((
+        StatusCode::CREATED,
+        Json(serde_json::json!({"id": request.id})),
+    ))
+}
+
+/// Removes a manager from the Raft voter set.
+pub async fn remove_manager(
+    State(app): State<Arc<AppState>>,
+    Path(id): Path<u64>,
+) -> ApiResult<StatusCode> {
+    app.store.remove_manager(id).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Replaces the v1.2.0 voter set with the explicitly selected managers.
+pub async fn migrate_manager_voters(
+    State(app): State<Arc<AppState>>,
+    Json(request): Json<ManagerMigrationRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let removed = app
+        .store
+        .migrate_manager_voters(request.manager_ids)
+        .await?;
+    Ok(Json(serde_json::json!({"removed_voters": removed})))
 }
 
 fn task_status_for_api<'a>(

@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand};
 use minga_compose::{DeployMode, LoadOptions, Loaded};
-use sidecar::{NatsSidecar, ServerTls, SidecarOptions};
+use sidecar::{ClusterTls, NatsSidecar, ServerTls, SidecarOptions};
 
 /// Minga: single-binary orchestrator for edge, on-prem and air-gapped sites.
 #[derive(Parser)]
@@ -73,6 +73,8 @@ enum Command {
     },
     /// Run the Docker Engine API server (Swarm-compatible REST API).
     Api(ApiArgs),
+    /// Dry-run or apply the v1.2.0 worker-voter migration.
+    MigrateV1(MigrateV1Args),
     /// Agent sandbox management.
     Sandbox {
         #[command(subcommand)]
@@ -139,6 +141,22 @@ struct StateApiArgs {
     /// Bearer token when the API requires one (MINGA_API_TOKEN).
     #[arg(long, env = "MINGA_API_TOKEN")]
     api_token: Option<String>,
+}
+
+#[derive(Args)]
+struct MigrateV1Args {
+    /// Manager voter ID to retain (repeat for each manager).
+    #[arg(long = "manager-id", required = true)]
+    manager_ids: Vec<u64>,
+    /// Manager API URL.
+    #[arg(long, env = "MINGA_API_URL", default_value = "http://127.0.0.1:2375")]
+    api_url: String,
+    /// Admin bearer token (MINGA_API_TOKEN).
+    #[arg(long, env = "MINGA_API_TOKEN")]
+    api_token: Option<String>,
+    /// Apply the membership change; without this flag, only print the plan.
+    #[arg(long)]
+    apply: bool,
 }
 
 impl From<StateApiArgs> for state::ApiOptions {
@@ -269,6 +287,9 @@ struct NodeArgs {
     /// Peer node as id=address (repeatable). Include all other nodes.
     #[arg(long = "peer")]
     peers: Vec<String>,
+    /// Start as an uninitialized manager and wait to be added to a cluster.
+    #[arg(long)]
+    join: bool,
     /// PEM file with the cluster CA certificate. Enables mTLS on the Raft
     /// transport; all three raft-tls flags are required together.
     #[arg(long)]
@@ -310,11 +331,24 @@ struct NodeArgs {
     /// Worker node IDs authorized by this manager's built-in sidecar.
     #[arg(long = "nats-worker-id")]
     nats_worker_ids: Vec<u64>,
+    /// Existing NATS cluster route to join (repeatable, `nats://host:6222`).
+    #[arg(long = "nats-cluster-route")]
+    nats_cluster_routes: Vec<String>,
+    /// Route TLS certificate, private key, and peer CA (all required together).
+    #[arg(long)]
+    nats_cluster_cert: Option<String>,
+    #[arg(long)]
+    nats_cluster_key: Option<String>,
+    #[arg(long)]
+    nats_cluster_ca: Option<String>,
+    /// NATS cluster route listener port (requires route TLS).
+    #[arg(long)]
+    nats_cluster_port: Option<u16>,
     /// Copies kept of event, status, lease, and assignment streams/buckets.
     /// Set 3 (or 5) on a NATS cluster of at least that many servers so
     /// losing one server loses no bus state; logs stay at one copy. Only
     /// raises: a node left at 1 never shrinks what another node raised.
-    /// Needs --nats-url; the built-in sidecar is a single server.
+    /// Needs an external or sidecar NATS cluster.
     #[arg(long, env = "MINGA_NATS_REPLICAS", value_parser = clap::value_parser!(u8).range(1..=5))]
     nats_replicas: Option<u8>,
     /// Directory holding the node-local secret store. Secrets are
@@ -512,6 +546,7 @@ async fn open_store(
     ca: &Option<String>,
     cert: &Option<String>,
     key: &Option<String>,
+    join: bool,
 ) -> Result<Arc<minga_state::StateStore>, String> {
     let store = match (ca, cert, key) {
         (Some(ca), Some(cert), Some(key)) => {
@@ -520,7 +555,11 @@ async fn open_store(
                 cert: cert.into(),
                 key: key.into(),
             };
-            minga_state::StateStore::open_secure(node_id, bind, data_dir, peers, tls).await
+            if join {
+                minga_state::StateStore::open_join_secure(node_id, bind, data_dir, tls).await
+            } else {
+                minga_state::StateStore::open_secure(node_id, bind, data_dir, peers, tls).await
+            }
         }
         (None, None, None) => {
             if !is_loopback_bind(bind) {
@@ -531,7 +570,11 @@ async fn open_store(
                      --raft-tls-cert and --raft-tls-key (`minga tls init-ca` / `issue-node`)"
                 );
             }
-            minga_state::StateStore::open(node_id, bind, data_dir, peers).await
+            if join {
+                minga_state::StateStore::open_join(node_id, bind, data_dir).await
+            } else {
+                minga_state::StateStore::open(node_id, bind, data_dir, peers).await
+            }
         }
         _ => {
             return Err(
@@ -642,6 +685,7 @@ async fn main() -> ExitCode {
         Command::Api(args) => return run_api(args).await,
         Command::Sandbox { cmd } => return run_sandbox(cmd).await,
         Command::Egress(args) => return run_egress(args).await,
+        Command::MigrateV1(args) => return run_migrate_v1(args).await,
         Command::Agent { cmd } => return run_agent(cmd).await,
         Command::Logs {
             task_id,
@@ -663,6 +707,82 @@ fn overlay_supernet(raw: &str) -> Result<minga_net::Cidr, String> {
     let routes = std::fs::read_to_string("/proc/net/route").unwrap_or_default();
     minga_net::cidr::check_supernet(&cidr, &routes)?;
     Ok(cidr)
+}
+
+async fn run_migrate_v1(args: MigrateV1Args) -> ExitCode {
+    let selected = args
+        .manager_ids
+        .iter()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    if selected.len() != args.manager_ids.len() {
+        eprintln!("error: --manager-id values must be unique");
+        return ExitCode::FAILURE;
+    }
+
+    let url = format!("{}/minga/managers", args.api_url.trim_end_matches('/'));
+    let client = reqwest::Client::new();
+    let mut request = client.get(&url);
+    if let Some(token) = &args.api_token {
+        request = request.bearer_auth(token);
+    }
+    let response = match request.send().await {
+        Ok(response) => response,
+        Err(error) => {
+            eprintln!("error: cannot list manager voters at {url}: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if !response.status().is_success() {
+        let status = response.status();
+        let detail = response.text().await.unwrap_or_default();
+        eprintln!("error: manager voter query failed ({status}): {detail}");
+        return ExitCode::FAILURE;
+    }
+    let current = match response.json::<Vec<u64>>().await {
+        Ok(voters) => voters
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>(),
+        Err(error) => {
+            eprintln!("error: invalid manager voter response: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if selected.is_empty() || !selected.is_subset(&current) {
+        eprintln!("error: --manager-id must name one or more current voters");
+        return ExitCode::FAILURE;
+    }
+    let removed = current.difference(&selected).copied().collect::<Vec<_>>();
+    println!("Current voters: {current:?}");
+    println!("Managers to retain: {selected:?}");
+    println!("Voters to remove: {removed:?}");
+    if !args.apply {
+        println!("Dry run only; pass --apply to commit this membership change.");
+        return ExitCode::SUCCESS;
+    }
+
+    let mut request = client
+        .post(format!("{url}/migrate-v1"))
+        .json(&serde_json::json!({"manager_ids": args.manager_ids}));
+    if let Some(token) = &args.api_token {
+        request = request.bearer_auth(token);
+    }
+    match request.send().await {
+        Ok(response) if response.status().is_success() => {
+            println!("Manager voter migration committed.");
+            ExitCode::SUCCESS
+        }
+        Ok(response) => {
+            let status = response.status();
+            let detail = response.text().await.unwrap_or_default();
+            eprintln!("error: manager voter migration failed ({status}): {detail}");
+            ExitCode::FAILURE
+        }
+        Err(error) => {
+            eprintln!("error: manager voter migration request failed: {error}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 /// Runs the Docker Engine API server: opens the state store and starts
@@ -700,6 +820,7 @@ async fn run_api(args: ApiArgs) -> ExitCode {
         &args.raft_tls_ca,
         &args.raft_tls_cert,
         &args.raft_tls_key,
+        false,
     )
     .await
     {
@@ -947,6 +1068,8 @@ fn worker_has_manager_only_flags(args: &NodeArgs) -> bool {
         || args.raft_tls_cert.is_some()
         || args.raft_tls_key.is_some()
         || args.nats_replicas.is_some()
+        || args.join
+        || args.nats_cluster_port.is_some()
 }
 
 /// Runs a node (manager or worker): managers open Raft state, while workers
@@ -960,12 +1083,46 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
         eprintln!("error: Raft bind, peer, TLS, and replica flags are manager-only");
         return ExitCode::FAILURE;
     }
+    if is_manager && args.join && !args.peers.is_empty() {
+        eprintln!("error: --join cannot be combined with --peer; add this manager through the API");
+        return ExitCode::FAILURE;
+    }
 
+    let cluster_tls_parts = [
+        args.nats_cluster_cert.is_some(),
+        args.nats_cluster_key.is_some(),
+        args.nats_cluster_ca.is_some(),
+    ];
+    let cluster_tls_count = cluster_tls_parts.iter().filter(|set| **set).count();
+    if cluster_tls_count != 0 && cluster_tls_count != cluster_tls_parts.len() {
+        eprintln!(
+            "error: --nats-cluster-cert, --nats-cluster-key, and --nats-cluster-ca must be set together"
+        );
+        return ExitCode::FAILURE;
+    }
+    if !args.nats_cluster_routes.is_empty() && cluster_tls_count != cluster_tls_parts.len() {
+        eprintln!("error: --nats-cluster-route requires route TLS");
+        return ExitCode::FAILURE;
+    }
+    let cluster = (cluster_tls_count == cluster_tls_parts.len()).then(|| ClusterTls {
+        name: "minga".into(),
+        cert_file: PathBuf::from(args.nats_cluster_cert.as_deref().unwrap()),
+        key_file: PathBuf::from(args.nats_cluster_key.as_deref().unwrap()),
+        ca_file: PathBuf::from(args.nats_cluster_ca.as_deref().unwrap()),
+        port: args.nats_cluster_port.unwrap_or(6222),
+        routes: args.nats_cluster_routes.clone(),
+    });
+    if args.nats_cluster_port.is_some() && cluster.is_none() {
+        eprintln!("error: --nats-cluster-port requires route TLS");
+        return ExitCode::FAILURE;
+    }
     let sidecar_configured = args.nats_server_cert.is_some()
         || args.nats_server_key.is_some()
         || args.nats_client_ca.is_some()
         || args.nats_listen_addr.is_some()
-        || !args.nats_worker_ids.is_empty();
+        || !args.nats_worker_ids.is_empty()
+        || cluster.is_some()
+        || args.nats_cluster_port.is_some();
     let tls_parts = [
         args.nats_server_cert.is_some(),
         args.nats_server_key.is_some(),
@@ -981,7 +1138,7 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
         return ExitCode::FAILURE;
     }
     if sidecar_configured && (!is_manager || args.nats_url.is_some()) {
-        eprintln!("error: built-in sidecar TLS, listener, and worker identity flags require a manager without --nats-url");
+        eprintln!("error: built-in sidecar TLS, listener, identity, and route flags require a manager without --nats-url");
         return ExitCode::FAILURE;
     }
     let supernet = match overlay_supernet(&args.overlay_supernet) {
@@ -1023,6 +1180,7 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
             &args.raft_tls_ca,
             &args.raft_tls_cert,
             &args.raft_tls_key,
+            args.join,
         )
         .await
         {
@@ -1092,10 +1250,9 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
                 );
                 return ExitCode::FAILURE;
             }
-            if args.nats_replicas.unwrap_or(1) > 1 {
+            if args.nats_replicas.unwrap_or(1) > 1 && cluster.is_none() {
                 eprintln!(
-                    "error: --nats-replicas {} needs a NATS cluster; set --nats-url \
-                     (the built-in sidecar is a single server)",
+                    "error: --nats-replicas {} needs an external cluster or route-TLS sidecars",
                     args.nats_replicas.unwrap_or(1)
                 );
                 return ExitCode::FAILURE;
@@ -1127,6 +1284,7 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
                     .clone()
                     .unwrap_or_else(|| "127.0.0.1".to_string()),
                 tls,
+                cluster: cluster.clone(),
                 ..SidecarOptions::default()
             };
             let sidecar = match NatsSidecar::start(&opts).await {
@@ -1138,7 +1296,18 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
             };
             let url = sidecar.client_url().to_string();
             tracing::info!(url = %url, "NATS sidecar ready");
-            let connect = bus::connect_bus(&url, args.nats_token.as_deref(), 1).await;
+            let replicas = args.nats_replicas.unwrap_or(1).into();
+            let connect = if cluster.is_some() && replicas > 1 {
+                bus::connect_bus_with_replica_retry(&url, args.nats_token.as_deref(), replicas)
+                    .await
+            } else {
+                bus::connect_bus(
+                    &url,
+                    args.nats_token.as_deref(),
+                    if cluster.is_some() { 1 } else { replicas },
+                )
+                .await
+            };
             match connect {
                 Ok(b) => {
                     _sidecar = Some(sidecar);
@@ -1212,6 +1381,9 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
             let sidecar = sidecar::SidecarOptions::default();
             reserved.push((sidecar.client_port, "NATS sidecar".into()));
             reserved.push((sidecar.monitor_port, "NATS sidecar monitor".into()));
+            if let Some(cluster) = &cluster {
+                reserved.push((cluster.port, "NATS cluster route".into()));
+            }
         }
         Some(Arc::new(
             minga_node::NetworkSetup::new(format!("{}/net", args.data_dir))
@@ -2064,7 +2236,8 @@ fn port_of(addr: &str) -> Option<u16> {
 #[cfg(test)]
 mod tests {
     use super::{
-        is_loopback_bind, port_of, project_dir, worker_has_manager_only_flags, Cli, Command,
+        is_loopback_bind, port_of, project_dir, run_node, worker_has_manager_only_flags, Cli,
+        Command,
     };
     use clap::Parser;
 
@@ -2083,6 +2256,79 @@ mod tests {
             panic!("expected worker command");
         };
         assert!(worker_has_manager_only_flags(&args));
+    }
+
+    #[test]
+    fn worker_rejects_nats_cluster_port_flag() {
+        let cli = Cli::try_parse_from([
+            "minga",
+            "worker",
+            "--node-id",
+            "7",
+            "--nats-cluster-port",
+            "6223",
+        ])
+        .unwrap();
+        let Command::Worker(args) = cli.command else {
+            panic!("expected worker command");
+        };
+        assert!(worker_has_manager_only_flags(&args));
+    }
+
+    #[tokio::test]
+    async fn manager_rejects_route_port_without_route_tls() {
+        let cli = Cli::try_parse_from([
+            "minga",
+            "manager",
+            "--node-id",
+            "1",
+            "--bind",
+            "127.0.0.1:7001",
+            "--nats-cluster-port",
+            "6223",
+        ])
+        .unwrap();
+        let Command::Manager(args) = cli.command else {
+            panic!("expected manager command");
+        };
+        assert_eq!(run_node(args, true).await, std::process::ExitCode::FAILURE);
+    }
+    #[test]
+    fn manager_join_and_route_tls_flags_parse() {
+        let cli = Cli::try_parse_from([
+            "minga",
+            "manager",
+            "--node-id",
+            "4",
+            "--bind",
+            "127.0.0.1:7004",
+            "--join",
+            "--nats-cluster-route",
+            "nats://manager-1:6222",
+            "--nats-cluster-cert",
+            "route.pem",
+            "--nats-cluster-key",
+            "route-key.pem",
+            "--nats-cluster-ca",
+            "ca.pem",
+        ])
+        .unwrap();
+        let Command::Manager(args) = cli.command else {
+            panic!("expected manager command");
+        };
+        assert!(args.join);
+        assert_eq!(args.nats_cluster_routes, ["nats://manager-1:6222"]);
+    }
+
+    #[test]
+    fn migration_command_defaults_to_dry_run_and_requires_manager_ids() {
+        let cli = Cli::try_parse_from(["minga", "migrate-v1", "--manager-id", "1"]).unwrap();
+        let Command::MigrateV1(args) = cli.command else {
+            panic!("expected migration command");
+        };
+        assert!(!args.apply);
+        assert_eq!(args.manager_ids, [1]);
+        assert!(Cli::try_parse_from(["minga", "migrate-v1"]).is_err());
     }
 
     #[test]

@@ -126,6 +126,32 @@ fn rebinding_risk(headers: &axum::http::HeaderMap) -> Option<&'static str> {
         Some("Host is a DNS name")
     }
 }
+/// Manager membership changes require a configured admin token even when the
+/// rest of the API is intentionally left tokenless.
+async fn require_admin_token(
+    axum::extract::State(state): axum::extract::State<ApiState>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let authorized = state.auth_token.as_deref().is_some_and(|expected| {
+        req.headers()
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(presented_token)
+            .is_some_and(|presented| constant_time_eq(&presented, expected))
+    });
+    if authorized {
+        next.run(req).await
+    } else {
+        (
+            axum::http::StatusCode::UNAUTHORIZED,
+            axum::Json(serde_json::json!({
+                "message": "manager administration requires a valid --api-token"
+            })),
+        )
+            .into_response()
+    }
+}
 
 /// Builds the axum router with all Docker Engine API routes.
 pub fn build_router(store: Arc<StateStore>, ready_state: Arc<ReadyState>) -> Router {
@@ -168,6 +194,29 @@ fn build_router_with_app_state(
     Router::new()
         // Unversioned endpoints.
         .route("/_ping", get(handlers::ping))
+        .route(
+            "/minga/managers",
+            get(handlers::list_managers)
+                .post(handlers::add_manager)
+                .layer(axum::middleware::from_fn_with_state(
+                    api_state.clone(),
+                    require_admin_token,
+                )),
+        )
+        .route(
+            "/minga/managers/:id",
+            delete(handlers::remove_manager).layer(axum::middleware::from_fn_with_state(
+                api_state.clone(),
+                require_admin_token,
+            )),
+        )
+        .route(
+            "/minga/managers/migrate-v1",
+            post(handlers::migrate_manager_voters).layer(axum::middleware::from_fn_with_state(
+                api_state.clone(),
+                require_admin_token,
+            )),
+        )
         // Versioned endpoints: /{version}/...
         .route("/:version/version", get(handlers::get_version))
         .route("/:version/info", get(handlers::get_info))
@@ -1239,6 +1288,86 @@ mod tests {
             let (status, _) = send_request(router.clone(), req).await;
             assert_eq!(status, expected, "Basic {credentials}");
         }
+    }
+    #[tokio::test]
+    async fn manager_membership_routes_require_admin_auth_and_change_membership() {
+        let dir1 = tempfile::tempdir().unwrap();
+        let dir2 = tempfile::tempdir().unwrap();
+        let store1 = Arc::new(
+            StateStore::open(1, "127.0.0.1:0", dir1.path(), BTreeMap::new())
+                .await
+                .unwrap(),
+        );
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr2 = listener.local_addr().unwrap().to_string();
+        drop(listener);
+        let store2 = Arc::new(StateStore::open_join(2, &addr2, dir2.path()).await.unwrap());
+        let router = build_router_with_auth(
+            store1.clone(),
+            Arc::new(ReadyState::new()),
+            Some("manager-secret".into()),
+        );
+
+        let req = Request::builder()
+            .uri("/minga/managers")
+            .body(Body::from(r#"{"id":2,"raft_addr":"127.0.0.1:1"}"#))
+            .unwrap();
+        let (status, _) = send_request(router.clone(), req).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/minga/managers")
+            .header("Authorization", "Bearer manager-secret")
+            .header("Content-Type", "application/json")
+            .body(Body::from(format!(r#"{{"id":2,"raft_addr":"{addr2}"}}"#)))
+            .unwrap();
+        let (status, body) = send_request(router.clone(), req).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        assert_eq!(body["id"], 2);
+
+        let req = Request::builder()
+            .method("DELETE")
+            .uri("/minga/managers/2")
+            .header("Authorization", "Bearer manager-secret")
+            .body(Body::empty())
+            .unwrap();
+        let (status, _) = send_request(router.clone(), req).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/minga/managers/migrate-v1")
+            .header("Authorization", "Bearer manager-secret")
+            .header("Content-Type", "application/json")
+            .body(Body::from(r#"{"manager_ids":[1]}"#))
+            .unwrap();
+        let (status, body) = send_request(router.clone(), req).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["removed_voters"], serde_json::json!([]));
+
+        let req = Request::builder()
+            .method("DELETE")
+            .uri("/minga/managers/1")
+            .header("Authorization", "Bearer manager-secret")
+            .body(Body::empty())
+            .unwrap();
+        let (status, body) = send_request(router, req).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(body["message"].as_str().unwrap().contains("last manager"));
+
+        Arc::try_unwrap(store1)
+            .ok()
+            .unwrap()
+            .shutdown()
+            .await
+            .unwrap();
+        Arc::try_unwrap(store2)
+            .ok()
+            .unwrap()
+            .shutdown()
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
