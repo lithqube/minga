@@ -1,6 +1,6 @@
 # Planning state
 
-**Current:** Phase 13 — WireGuard mesh and routing mesh, 13-01 ADR 0007 in progress. Phase 12 Managers-only Raft is complete (PR #76 merged 2026-11-15; live evidence below). Phase 13 starts with 13-01; 13-02 unique subnets is independent.
+**Current:** Phase 13 — WireGuard mesh and routing mesh, 13-02 unique subnets in progress. ADR 0007 (13-01) merged as PR #77 on 2026-11-15. Phase 12 Managers-only Raft is complete (PR #76; live evidence below).
 
 **Phase 12 live evidence (12-07, 2026-11-15):**
 
@@ -13,6 +13,15 @@
 - **v1.2.0 migration:** Built and ran the actual v1.2.0 Linux binary with managers 1/2 and worker 99, then deployed `phase12-v120-live.legacy`. Current manager migration dry-run identified `{1,2,99}` → `{1}`; apply committed `[1]`. Service remained listed and its container task `phase12-v120-live.legacy.1.03948649` stayed RUNNING at containerd PID 1599. Replaced the old worker with the current JetStream worker using the same data directory; it adopted the existing container at PID 1599.
 - **T4 scope:** The live topology exercised managers-only Raft with two workers and a separate third-worker join. No 5,000-worker load test was run; cross-node container networking remains unsupported pending Phase 13.
 - **Phase 12 delivery:** PR #76 merged to `main` after its Rust, site, daemon-backed and real-kernel CI checks passed.
+
+**Phase 13 13-02 evidence (2026-11-15):**
+
+- **Allocation:** The leader-only scheduler fills missing `Network.subnet` values from the configured supernet before placement and persists them through Raft. Nodes and task IP assignment reject missing stored subnets; the netns path no longer hashes network IDs into `/24`s.
+- **Exhaustion and legacy state:** `netassign::tests::three_hundred_networks_get_256_distinct_subnets_then_exhaust` proves 256 distinct `/24`s and clear failure for 44 more. Live legacy task IPs retain their prior `/24`; collisions are reported with a remediation.
+- **Explicit IPAM and strict options:** `handlers::tests::overlapping_ipam_subnet_is_refused_with_both_names` proves the API returns a conflict naming both networks. Compose translation and API network creation accept only `encrypted` and reject unsupported driver options.
+- **Host routes:** `minga manager` and `minga worker` parse `--overlay-supernet` / `MINGA_OVERLAY_SUPERNET` before startup; `cidr::tests::supernet_refused_when_it_overlaps_a_host_route` verifies overlaps are refused and the default route and Minga bridges are ignored.
+- **Compose compatibility:** Workspace tests passed, including existing Compose fixtures and translation tests. The full verification ran `cargo fmt --all`, `cargo clippy --all-targets -- -D warnings`, and `cargo test`.
+
 
 ---
 
@@ -53,4 +62,4 @@ Waves 1–9 predate this GSD planning workspace and their claims were **not** in
 
 **10-01 host gate remains BLOCKED** by user choice: Talos staging is out of scope for `v0.1.0` and no hcloud provisioning is authorized. OrbStack Ubuntu is Linux evidence only. Do not advance Talos-dependent claims or compliance qualification — FIPS, SOC 2, VS-NfD and NATO are **not assessed**, which is different from not applicable.
 
-**Immediate next action:** Phase 13 — Write and merge ADR 0007 first. Then follow the dependency order in `.planning/phases/13-wireguard-mesh/13-PLAN.md`; 13-02 unique subnets can proceed independently. Cross-node networking remains unsupported until the mesh implementation lands. Talos/hcloud staging stays blocked pending authorization; compliance is not assessed.
+**Immediate next action:** Finish and merge Phase 13 13-02. Then follow `.planning/phases/13-wireguard-mesh/13-PLAN.md`: 13-03 → 13-04; then 13-05 and 13-06 (13-06 depends on 13-04); 13-07 comes last. Cross-node networking remains unsupported until those implementation plans land. Talos/hcloud staging stays blocked pending authorization; compliance is not assessed.

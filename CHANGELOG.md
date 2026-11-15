@@ -22,6 +22,9 @@
 - Known limits: cross-node container networking still needs the WireGuard
   mesh; T4’s roughly 5,000-worker scale has not been load-tested; `MINGA_LOGS`
   remains single-replica and is unavailable while its hosting server is down.
+- Network subnets are allocated by the Raft leader from the configurable
+  `--overlay-supernet`; overlapping explicit IPAM ranges and unsupported
+  network `driver_opts` fail loudly (`encrypted` remains a no-op).
 
 
 ## [1.2.0] — 2026-11-13
