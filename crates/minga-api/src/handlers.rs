@@ -54,11 +54,13 @@ impl AppState {
             .await
             .map_err(|error| internal(error.to_string()))?
         {
-            if !key.starts_with("task.") {
+            if !key.starts_with("node.") || !key.contains(".task.") {
                 continue;
             }
             match TaskStatusReport::from_bytes(&bytes) {
-                Ok(report) if key == subjects::kv_task_status(&report.task_id) => {
+                Ok(report)
+                    if key == subjects::kv_node_task_status(report.node_id, &report.task_id) =>
+                {
                     statuses.insert(report.task_id.clone(), report);
                 }
                 Ok(_) => {}

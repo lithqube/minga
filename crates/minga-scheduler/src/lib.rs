@@ -40,12 +40,14 @@ pub mod reconcile;
 pub mod secrets;
 pub mod translate;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use minga_bus::{subjects, Command, EventBus, TaskActualState, TaskStatusReport};
-use minga_state::types::{Service, Task, TaskState};
+use minga_bus::{subjects, EventBus, TaskActualState, TaskStatusReport};
+use minga_state::types::{
+    Network, NetworkAssignment, NetworkDnsTask, Service, Task, TaskAssignment, TaskState,
+};
 use minga_state::{StateError, StateStore};
 use thiserror::Error;
 
@@ -116,7 +118,7 @@ impl Scheduler {
         self
     }
 
-    /// Create a scheduler that publishes commands to the event bus.
+    /// Create a scheduler that publishes assignments to the event bus.
     pub fn with_bus(state: Arc<StateStore>, bus: Arc<dyn EventBus>) -> Self {
         Self {
             bus: Some(bus),
@@ -159,11 +161,14 @@ impl Scheduler {
             };
             let mut statuses = HashMap::new();
             for (key, bytes) in status_entries {
-                if !key.starts_with("task.") {
+                if !key.starts_with("node.") || !key.contains(".task.") {
                     continue;
                 }
                 match TaskStatusReport::from_bytes(&bytes) {
-                    Ok(report) if key == subjects::kv_task_status(&report.task_id) => {
+                    Ok(report)
+                        if key
+                            == subjects::kv_node_task_status(report.node_id, &report.task_id) =>
+                    {
                         statuses.insert(report.task_id.clone(), report);
                     }
                     Ok(_) => {}
@@ -203,24 +208,6 @@ impl Scheduler {
                         .scheduler_placement_decisions_total
                         .with_label_values(&["placed"])
                         .inc();
-
-                    // Publish assign command to the bus.
-                    if let Some(bus) = &self.bus {
-                        let payload = minga_state::codec::encode_wire(&task.spec)
-                            .map_err(|e| SchedulerError::Serialization(e.to_string()))?;
-                        let cmd = Command::Assign {
-                            task_id: task.id.clone(),
-                            payload,
-                        };
-                        if let Err(e) = bus.send_command(task.node_id, &cmd).await {
-                            tracing::error!(
-                                task = %task.id,
-                                node = task.node_id,
-                                error = %e,
-                                "failed to publish assign command"
-                            );
-                        }
-                    }
                 }
                 ReconcileAction::RollbackService(service_id) => {
                     let Some(current) = services.iter().find(|s| &s.id == service_id) else {
@@ -249,29 +236,106 @@ impl Scheduler {
                         })
                         .await?;
                 }
-                ReconcileAction::RemoveTask { task_id, node_id } => {
+                ReconcileAction::RemoveTask { task_id, .. } => {
                     tracing::info!(task = %task_id, "removing task");
                     self.state.remove_task(task_id.clone()).await?;
-
-                    // Publish stop command to the bus.
-                    if let Some(bus) = &self.bus {
-                        let cmd = Command::Stop {
-                            task_id: task_id.clone(),
-                        };
-                        if let Err(e) = bus.send_command(*node_id, &cmd).await {
-                            tracing::error!(
-                                task = %task_id,
-                                node = node_id,
-                                error = %e,
-                                "failed to publish stop command"
-                            );
-                        }
-                    }
                 }
             }
         }
 
+        self.publish_projection().await?;
         Ok(actions)
+    }
+
+    async fn publish_projection(&self) -> Result<(), SchedulerError> {
+        let Some(bus) = &self.bus else {
+            return Ok(());
+        };
+        let services = self.state.list_services().await?;
+        let tasks = self.state.list_tasks().await?;
+        let networks = self.state.list_networks().await?;
+        let service_by_id: HashMap<_, _> = services
+            .iter()
+            .map(|service| (service.id.as_str(), service))
+            .collect();
+        let network_by_id: HashMap<_, _> = networks
+            .iter()
+            .map(|network| (network.id.as_str(), network))
+            .collect();
+        let mut network_tasks: HashMap<&str, Vec<NetworkDnsTask>> = HashMap::new();
+        let mut desired = HashSet::new();
+        for task in &tasks {
+            let Some(service) = service_by_id.get(task.service_id.as_str()) else {
+                continue;
+            };
+            let task_networks: Vec<Network> = task
+                .spec
+                .ips
+                .keys()
+                .filter_map(|id| {
+                    network_by_id
+                        .get(id.as_str())
+                        .map(|network| (*network).clone())
+                })
+                .collect();
+            let assignment = TaskAssignment {
+                task_id: task.id.clone(),
+                node_id: task.node_id,
+                service_id: task.service_id.clone(),
+                service_name: service.name.clone(),
+                stack: service.env.get("MINGA_STACK").cloned().unwrap_or_default(),
+                spec: task.spec.clone(),
+                networks: task_networks,
+            };
+            let key = subjects::kv_assignment_task(task.node_id, &task.id);
+            let value = minga_state::codec::encode_wire(&assignment)
+                .map_err(|error| SchedulerError::Serialization(error.to_string()))?;
+            bus.put_assignment(&key, &value)
+                .await
+                .map_err(|error| SchedulerError::Bus(error.to_string()))?;
+            desired.insert(key);
+            for (network_id, ip) in &task.spec.ips {
+                if network_by_id.contains_key(network_id.as_str()) {
+                    network_tasks
+                        .entry(network_id)
+                        .or_default()
+                        .push(NetworkDnsTask {
+                            node_id: task.node_id,
+                            task_id: task.id.clone(),
+                            service_name: service.name.clone(),
+                            stack: assignment.stack.clone(),
+                            ip: ip.clone(),
+                        });
+                }
+            }
+        }
+        for network in networks {
+            let value = NetworkAssignment {
+                tasks: network_tasks
+                    .remove(network.id.as_str())
+                    .unwrap_or_default(),
+                network: network.clone(),
+            };
+            let value = minga_state::codec::encode_wire(&value)
+                .map_err(|error| SchedulerError::Serialization(error.to_string()))?;
+            let key = subjects::kv_assignment_network(&network.id);
+            desired.insert(key.clone());
+            bus.put_assignment(&key, &value)
+                .await
+                .map_err(|error| SchedulerError::Bus(error.to_string()))?;
+        }
+        for (key, _) in bus
+            .list_assignments("")
+            .await
+            .map_err(|error| SchedulerError::Bus(error.to_string()))?
+        {
+            if !desired.contains(&key) {
+                bus.delete_assignment(&key)
+                    .await
+                    .map_err(|error| SchedulerError::Bus(error.to_string()))?;
+            }
+        }
+        Ok(())
     }
 
     /// Stores a subnet for every network that has none (Raft serializes

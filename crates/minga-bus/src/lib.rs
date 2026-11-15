@@ -1,8 +1,9 @@
 //! Event bus abstraction for Minga.
 //!
-//! The bus is the channel for **actual state** — task status reports, node
-//! heartbeats, lifecycle events, logs — and for **commands** (assign/stop tasks).
-//! Desired state stays in Raft (`minga-state`); the bus carries everything else.
+//! The bus is the channel for actual state: task status reports, node
+//! heartbeats, lifecycle events, logs, and desired task assignments.
+//! Desired state stays in Raft (`minga-state`); the bus carries actual state
+//! and the manager-authored assignment projection.
 //!
 //! Two implementations:
 //!
@@ -15,16 +16,18 @@
 //! # Subject namespace
 //!
 //! ```text
-//! minga.node.{id}.status     JetStream   node status reports
-//! minga.node.{id}.event      JetStream   node lifecycle events
-//! minga.task.{id}.status     JetStream   task status reports
-//! minga.task.{id}.event      JetStream   task lifecycle events
-//! minga.log.{id}             JetStream   container log chunks
-//! minga.ctl.node.{id}.assign JetStream   task assignment command  [work queue]
-//! minga.ctl.node.{id}.stop   JetStream   stop/remove command       [work queue]
-//! minga.ctl.node.{id}.ping   core NATS   synchronous health probe [req/reply]
-//! minga.ctl.node.{id}.drain  core NATS   synchronous drain         [req/reply]
+//! minga.node.{id}.status      JetStream   node status events
+//! minga.node.{id}.event       JetStream   node lifecycle events
+//! minga.task.{id}.status      JetStream   task lifecycle events
+//! minga.task.{id}.event       JetStream   task lifecycle events
+//! minga.log.node.{id}.{task}  JetStream   container log chunks
+//! KV_MINGA_ASSIGN             KV          manager-authored task/network assignments
+//! KV_MINGA_STATUS             KV          actual task status reports
+//! KV_MINGA_LEASES             KV          node liveness leases
+//! minga.ctl.node.{id}.ping    core NATS   synchronous health probe [req/reply]
+//! minga.ctl.node.{id}.drain   core NATS   synchronous drain [req/reply]
 //! ```
+//!
 //!
 //! Use the [`subjects`] module helpers to build subject strings.
 
@@ -60,9 +63,6 @@ pub enum BusError {
     #[error("subscribe error: {0}")]
     Subscribe(String),
 
-    #[error("command error: {0}")]
-    Command(String),
-
     #[error("kv error: {0}")]
     Kv(String),
 
@@ -87,30 +87,6 @@ pub type Result<T> = std::result::Result<T, BusError>;
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
-
-/// A command sent from the manager to a node (work-queue semantics).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub enum Command {
-    /// Start a task. `payload` is the serialized `TaskSpec` (bincode).
-    Assign { task_id: String, payload: Vec<u8> },
-    /// Stop and remove a task.
-    Stop { task_id: String },
-}
-
-impl Command {
-    /// Serialize to bytes for transport.
-    pub fn to_bytes(&self) -> Result<Vec<u8>> {
-        bincode::serde::encode_to_vec(self, bincode::config::standard())
-            .map_err(|e| BusError::Serialization(e.to_string()))
-    }
-
-    /// Deserialize from bytes.
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        let (cmd, _) = bincode::serde::decode_from_slice(bytes, bincode::config::standard())
-            .map_err(|e| BusError::Serialization(e.to_string()))?;
-        Ok(cmd)
-    }
-}
 
 /// An event on the bus (append-only fact).
 #[derive(Debug, Clone)]
@@ -321,7 +297,7 @@ impl NodeStatusReport {
 // Trait
 // ---------------------------------------------------------------------------
 
-/// The event bus: commands, events, status, liveness, and request/reply.
+/// The event bus: events, assignments, status, liveness, and request/reply.
 ///
 /// All methods are async and the trait is dyn-compatible (`Arc<dyn EventBus>`).
 #[async_trait]
@@ -334,15 +310,11 @@ pub trait EventBus: Send + Sync {
     /// Subscribe to events matching any of the given subject patterns.
     /// Patterns support `*` (one token) and `>` (many tokens) wildcards.
     async fn subscribe_events(&self, patterns: &[&str]) -> Result<EventStream>;
-
-    // -- Commands (work queue, store-and-forward) ----------------------------
-
-    /// Send a command to a specific node. Survives node disconnects.
-    async fn send_command(&self, node_id: u64, cmd: &Command) -> Result<()>;
-
-    /// Pull the next command for `node_id`. Blocks until one is available
-    /// or the bus is shut down.
-    async fn next_command(&self, node_id: u64) -> Result<Command>;
+    async fn put_assignment(&self, key: &str, value: &[u8]) -> Result<()>;
+    async fn get_assignment(&self, key: &str) -> Result<Option<Vec<u8>>>;
+    async fn list_assignments(&self, prefix: &str) -> Result<Vec<(String, Vec<u8>)>>;
+    async fn delete_assignment(&self, key: &str) -> Result<()>;
+    async fn watch_assignments(&self, prefix: &str) -> Result<KvStream>;
 
     // -- Status (latest-value KV) -------------------------------------------
 
@@ -387,8 +359,11 @@ pub trait EventBus: Send + Sync {
 
     // -- Logs (append-only, per-task) ----------------------------------------
 
-    /// Publish a log entry for a task. Goes to the `MINGA_LOGS` stream.
     async fn publish_log(&self, task_id: &str, entry: &LogEntry) -> Result<()>;
+
+    /// Publish a log entry with its originating node ID. Worker clients are
+    /// restricted to their own node; managers publish on behalf of workers.
+    async fn publish_node_log(&self, node_id: u64, task_id: &str, entry: &LogEntry) -> Result<()>;
 
     /// Subscribe to log entries published **after** this call.
     ///
@@ -412,26 +387,6 @@ pub trait EventBus: Send + Sync {
 mod tests {
     use super::*;
 
-    #[test]
-    fn command_roundtrip() {
-        let cmd = Command::Assign {
-            task_id: "plant-7.inference.1".to_string(),
-            payload: vec![1, 2, 3],
-        };
-        let bytes = cmd.to_bytes().unwrap();
-        let decoded = Command::from_bytes(&bytes).unwrap();
-        assert_eq!(cmd, decoded);
-    }
-
-    #[test]
-    fn command_stop_roundtrip() {
-        let cmd = Command::Stop {
-            task_id: "plant-7.worker.0".to_string(),
-        };
-        let bytes = cmd.to_bytes().unwrap();
-        let decoded = Command::from_bytes(&bytes).unwrap();
-        assert_eq!(cmd, decoded);
-    }
     #[test]
     fn task_status_decodes_pre_extension_reports() {
         #[derive(Serialize)]

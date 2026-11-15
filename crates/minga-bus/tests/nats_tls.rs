@@ -24,6 +24,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use futures::StreamExt;
 use minga_bus::tls::NatsTlsConfig;
 use minga_bus::{EventBus, LogEntry, NatsBus};
 
@@ -43,6 +44,10 @@ struct Pki {
     server_key_pem: String,
     client_cert_pem: String,
     client_key_pem: String,
+    manager_cert_pem: String,
+    manager_key_pem: String,
+    worker_cert_pem: String,
+    worker_key_pem: String,
     other_ca_pem: String,
 }
 
@@ -102,6 +107,9 @@ fn make_pki() -> Pki {
     let (server_cert_pem, server_key_pem) = make_leaf(&ca, &ca_key, "localhost", false, true);
     // Client leaf, valid for `minga-client`.
     let (client_cert_pem, client_key_pem) = make_leaf(&ca, &ca_key, "minga-client", false, false);
+    let (manager_cert_pem, manager_key_pem) =
+        make_leaf(&ca, &ca_key, "minga-manager-1", false, false);
+    let (worker_cert_pem, worker_key_pem) = make_leaf(&ca, &ca_key, "minga-worker-7", false, false);
 
     Pki {
         ca_pem: ca.pem(),
@@ -109,6 +117,10 @@ fn make_pki() -> Pki {
         server_key_pem,
         client_cert_pem,
         client_key_pem,
+        worker_cert_pem,
+        manager_cert_pem,
+        manager_key_pem,
+        worker_key_pem,
         other_ca_pem: other_ca.pem(),
     }
 }
@@ -369,6 +381,101 @@ fn client_config(dir: &Path, pki: &Pki, ca_pem: &str) -> NatsTlsConfig {
     NatsTlsConfig::new(&ca_path, &cert_path, &key_path, "localhost")
 }
 
+fn worker_client_config(dir: &Path, pki: &Pki) -> NatsTlsConfig {
+    let ca_path = dir.join("worker-ca.pem");
+    let cert_path = dir.join("worker-cert.pem");
+    let key_path = dir.join("worker-key.pem");
+    write_file(&ca_path, &pki.ca_pem, false);
+    write_file(&cert_path, &pki.worker_cert_pem, false);
+    write_file(&key_path, &pki.worker_key_pem, true);
+    NatsTlsConfig::new(&ca_path, &cert_path, &key_path, "localhost")
+}
+
+fn manager_client_config(dir: &Path, pki: &Pki) -> NatsTlsConfig {
+    let ca_path = dir.join("manager-ca.pem");
+    let cert_path = dir.join("manager-cert.pem");
+    let key_path = dir.join("manager-key.pem");
+    write_file(&ca_path, &pki.ca_pem, false);
+    write_file(&cert_path, &pki.manager_cert_pem, false);
+    write_file(&key_path, &pki.manager_key_pem, true);
+    NatsTlsConfig::new(&ca_path, &cert_path, &key_path, "localhost")
+}
+
+async fn publish_jetstream_message(
+    client: &async_nats::Client,
+    subject: &str,
+    payload: &[u8],
+) -> Result<(), String> {
+    let js = async_nats::jetstream::new(client.clone());
+    let ack = js
+        .publish(subject.to_string(), payload.to_vec().into())
+        .await
+        .map_err(|error| error.to_string())?;
+    ack.await.map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn start_worker_acl_server(pki: &Pki) -> TlsServer {
+    let dir = tempfile::tempdir().unwrap();
+    let ca_path = dir.path().join("ca.pem");
+    let cert_path = dir.path().join("server-cert.pem");
+    let key_path = dir.path().join("server-key.pem");
+    write_file(&ca_path, &pki.ca_pem, false);
+    write_file(&cert_path, &pki.server_cert_pem, false);
+    write_file(&key_path, &pki.server_key_pem, true);
+    let config = format!(
+        r#"listen: 127.0.0.1:-1
+server_name: minga-worker-acl-test
+http: "127.0.0.1:-1"
+tls {{
+    cert_file: "{cert}"
+    key_file: "{key}"
+    ca_file: "{ca}"
+    verify: true
+    verify_and_map: true
+}}
+authorization {{
+    users = [
+        {{
+            user: "minga-manager-1"
+            permissions: {{
+                publish: {{ allow: ["$JS.API.>", "$KV.>", "minga.>"] }}
+                subscribe: {{ allow: ["$JS.API.>", "$KV.>", "minga.>", "_INBOX.>"] }}
+            }}
+        }},
+        {{
+            user: "minga-worker-7"
+            permissions: {{
+                publish: {{ allow: [
+                    "$JS.API.STREAM.INFO.KV_MINGA_STATUS",
+                    "$JS.API.STREAM.INFO.KV_MINGA_ASSIGN",
+                    "$JS.API.STREAM.INFO.KV_MINGA_LEASES",
+                    "$JS.API.CONSUMER.CREATE.KV_MINGA_ASSIGN",
+                    "$JS.API.CONSUMER.CREATE.KV_MINGA_ASSIGN.>",
+                    "$JS.API.CONSUMER.INFO.KV_MINGA_ASSIGN",
+                    "$JS.API.CONSUMER.INFO.KV_MINGA_ASSIGN.>",
+                    "$KV.MINGA_LEASES.lease.node.7",
+                    "$KV.MINGA_STATUS.node.7.task.>"
+                ] }}
+                subscribe: {{ allow: ["_INBOX.>"] }}
+            }}
+        }}
+    ]
+}}
+jetstream {{
+    store_dir: "{store}"
+}}
+"#,
+        cert = cert_path.display(),
+        key = key_path.display(),
+        ca = ca_path.display(),
+        store = dir.path().join("jetstream").display(),
+    );
+    let mut server = start_server(&config, dir).expect("nats-server binary not found");
+    adopt_allocated_ports(&mut server);
+    server
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -399,6 +506,94 @@ async fn tls_client_with_valid_certificate_connects() {
         bus.get_status("task.tls-ok").await.unwrap(),
         Some(b"running".to_vec())
     );
+}
+
+#[tokio::test]
+async fn worker_certificate_cannot_write_assignments_or_other_nodes_status_and_leases() {
+    let _guard = NATS_TEST_LOCK.lock().await;
+    if nats_server_bin().is_none() {
+        panic!("nats-server binary not found - install it to run the TLS suite");
+    }
+
+    let pki = make_pki();
+    let server = start_worker_acl_server(&pki);
+    wait_ready(&server);
+    let dir = tempfile::tempdir().unwrap();
+    let manager_config = manager_client_config(dir.path(), &pki);
+    let url = format!("tls://localhost:{}", server.port);
+    let manager = NatsBus::connect_secure(&url, &manager_config)
+        .await
+        .expect("manager certificate can create the KV buckets");
+    manager
+        .put_assignment("node.7.task.allowed", b"assignment")
+        .await
+        .unwrap();
+
+    let worker_config = worker_client_config(dir.path(), &pki);
+    let worker_bus = NatsBus::connect_worker_secure(&url, &worker_config, 7)
+        .await
+        .expect("worker can open existing KV buckets");
+    let mut assignments = worker_bus
+        .watch_assignments("node.7.task.")
+        .await
+        .expect("worker can watch its own assignment prefix");
+    let event = tokio::time::timeout(Duration::from_secs(2), assignments.next())
+        .await
+        .expect("worker receives the existing scoped assignment before timeout")
+        .expect("watch remains open");
+    assert_eq!(event.key, "node.7.task.allowed");
+    assert_eq!(event.value.as_deref(), Some(&b"assignment"[..]));
+
+    let worker = async_nats::connect_with_options(&url, worker_config.connect_options().unwrap())
+        .await
+        .expect("worker certificate maps to the restricted NATS identity");
+    let own_status = tokio::time::timeout(
+        Duration::from_secs(2),
+        publish_jetstream_message(&worker, "$KV.MINGA_STATUS.node.7.task.allowed", b"running"),
+    )
+    .await;
+    assert!(
+        matches!(own_status, Ok(Ok(()))),
+        "worker's own status write should be authorized: {own_status:?}"
+    );
+    assert_eq!(
+        manager
+            .get_status("node.7.task.allowed")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(&b"running"[..])
+    );
+    let own_lease = tokio::time::timeout(
+        Duration::from_secs(2),
+        publish_jetstream_message(&worker, "$KV.MINGA_LEASES.lease.node.7", b"alive"),
+    )
+    .await;
+    assert!(
+        matches!(own_lease, Ok(Ok(()))),
+        "worker's own lease write should be authorized: {own_lease:?}"
+    );
+    assert!(manager.is_alive(7).await.unwrap());
+
+    for subject in [
+        "$KV.MINGA_ASSIGN.node.7.task.forbidden",
+        "$KV.MINGA_LEASES.lease.node.8",
+        "$KV.MINGA_STATUS.node.8.task.forbidden",
+    ] {
+        let worker =
+            async_nats::connect_with_options(&url, worker_config.connect_options().unwrap())
+                .await
+                .expect("worker certificate reconnects");
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            publish_jetstream_message(&worker, subject, b"forbidden"),
+        )
+        .await;
+        assert!(
+            !matches!(result, Ok(Ok(()))),
+            "worker unexpectedly wrote through {subject}: {result:?}"
+        );
+    }
 }
 
 /// A client presenting a certificate from an untrusted CA is rejected.

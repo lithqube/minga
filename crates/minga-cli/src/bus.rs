@@ -92,6 +92,56 @@ pub async fn connect_bus(
     Ok(bus)
 }
 
+/// Connect a worker with read-only assignment access and owner-scoped writes.
+///
+/// Unlike [`connect_bus`], this never creates buckets or raises replicas.
+pub async fn connect_worker_bus(
+    url: &str,
+    token: Option<&str>,
+    node_id: u64,
+) -> Result<Arc<dyn EventBus>, ConnectError> {
+    let tls =
+        NatsTlsConfig::from_env().map_err(|error| ConnectError::TlsConfig(error.to_string()))?;
+    let token = token
+        .map(String::from)
+        .or_else(|| std::env::var("MINGA_NATS_TOKEN").ok());
+    let connect_error = |error: minga_bus::BusError| ConnectError::Connect {
+        url: url.to_string(),
+        reason: error.to_string(),
+    };
+    let bus = match tls {
+        Some(config) => minga_bus::NatsBus::connect_worker_secure(url, &config, node_id)
+            .await
+            .map_err(connect_error)?,
+        None => {
+            let authority = url.strip_prefix("nats://").and_then(|rest| {
+                if rest.contains(['/', '?', '@', ',']) {
+                    return None;
+                }
+                rest.rsplit_once(':')
+            });
+            let loopback = authority.is_some_and(|(host, port)| {
+                matches!(host, "127.0.0.1" | "localhost" | "[::1]")
+                    && port.parse::<u16>().is_ok_and(|port| port != 0)
+            });
+            if !loopback {
+                return Err(ConnectError::TlsConfig(
+                    "plaintext NATS is restricted to loopback; configure TLS for remote access"
+                        .to_string(),
+                ));
+            }
+            match token {
+                Some(token) => {
+                    minga_bus::NatsBus::connect_worker_with_token(url, &token, node_id).await
+                }
+                None => minga_bus::NatsBus::connect_worker(url, node_id).await,
+            }
+            .map_err(connect_error)?
+        }
+    };
+    Ok(bus)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

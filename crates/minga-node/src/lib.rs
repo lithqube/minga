@@ -1,17 +1,14 @@
 //! Node supervisor: runs tasks assigned to this node.
 //!
-//! The supervisor is the worker-side component of Minga. It runs on every
-//! node and reconciles the local container state with the tasks assigned
-//! to this node in the Raft state store.
+//! Every node reconciles local containers with MINGA_ASSIGN records projected
+//! from Raft by the scheduler.
 //!
 //! # Architecture
 //!
-//! - **Desired state** (which tasks should run where) lives in Raft —
-//!   written by the scheduler on the leader.
+//! - **Desired state** is stored in Raft and projected to assignment KV
+//!   for worker consumption.
 //! - **Actual state** (which containers are running, their status) is
-//!   tracked locally by the supervisor. It does NOT go through Raft.
-//!   Per the architecture principle: heartbeats and task status go
-//!   through JetStream, not the consensus log.
+//!   observed locally and published through JetStream, not Raft.
 //!
 //! # Runtime abstraction
 //!
@@ -20,22 +17,6 @@
 //! - [`MockRuntime`] — in-memory simulation for testing
 //! - [`ContainerdRuntime`] — real containers via containerd's gRPC API
 //!
-//! # Example
-//!
-//! ```no_run
-//! use std::sync::Arc;
-//! use std::time::Duration;
-//! use minga_node::{MockRuntime, Supervisor};
-//! use minga_state::StateStore;
-//!
-//! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-//! let state = Arc::new(StateStore::open(1, "10.0.0.1:50051", "/var/lib/minga", Default::default()).await?);
-//! let runtime = Arc::new(MockRuntime::new());
-//! let supervisor = Supervisor::new(state, runtime, 1);
-//! supervisor.run(Duration::from_secs(2)).await;
-//! # Ok(())
-//! # }
-//! ```
 
 pub mod agent;
 pub mod containerd;
@@ -61,4 +42,4 @@ pub use runtime::{
 };
 #[cfg(target_os = "linux")]
 pub use supervisor::SupervisorNetworking;
-pub use supervisor::{Supervisor, SupervisorError};
+pub use supervisor::{Assignments, Supervisor, SupervisorError};

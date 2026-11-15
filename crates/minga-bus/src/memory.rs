@@ -16,14 +16,14 @@ use futures::Stream;
 use tokio::sync::{broadcast, mpsc, oneshot};
 
 use crate::{
-    subjects, BusError, BusEvent, BusRequest, Command, EventBus, EventStream, KvEvent, KvOp,
-    KvStream, LogEntry, LogEventStream, RequestStream, Result,
+    subjects, BusError, BusEvent, BusRequest, EventBus, EventStream, KvEvent, KvOp, KvStream,
+    LogEntry, LogEventStream, RequestStream, Result,
 };
 
 /// Default lease TTL: 30 seconds.
 const DEFAULT_LEASE_TTL: Duration = Duration::from_secs(30);
 
-/// Channel capacity for events, commands, and KV notifications.
+/// Channel capacity for events and KV notifications.
 const CHANNEL_CAPACITY: usize = 1024;
 
 /// How many log entries the in-memory bus retains per task.
@@ -37,8 +37,10 @@ const LOG_HISTORY_CAPACITY: usize = 1000;
 pub struct MemoryBus {
     /// Broadcast channel for events.
     events_tx: broadcast::Sender<BusEvent>,
-    /// Per-node command channels.
-    commands: Mutex<HashMap<u64, Arc<CommandChannel>>>,
+    /// Assignment KV store: key → latest manager-authored value.
+    assignments: Mutex<HashMap<String, Vec<u8>>>,
+    /// Broadcast channel for assignment KV notifications.
+    assignment_tx: broadcast::Sender<KvEvent>,
     /// KV store: key → latest value.
     kv: Mutex<HashMap<String, Vec<u8>>>,
     /// Broadcast channel for KV change notifications.
@@ -65,11 +67,6 @@ struct Lease {
     registration: Vec<u8>,
 }
 
-struct CommandChannel {
-    tx: mpsc::Sender<Command>,
-    rx: tokio::sync::Mutex<mpsc::Receiver<Command>>,
-}
-
 impl MemoryBus {
     /// Create a new in-memory bus with the default lease TTL (30s).
     pub fn new() -> Arc<Self> {
@@ -80,11 +77,13 @@ impl MemoryBus {
     pub fn with_lease_ttl(lease_ttl: Duration) -> Arc<Self> {
         let (events_tx, _) = broadcast::channel(CHANNEL_CAPACITY);
         let (kv_tx, _) = broadcast::channel(CHANNEL_CAPACITY);
+        let (assignment_tx, _) = broadcast::channel(CHANNEL_CAPACITY);
         let (lease_tx, _) = broadcast::channel(CHANNEL_CAPACITY);
         let (logs_tx, _) = broadcast::channel(CHANNEL_CAPACITY);
         Arc::new(Self {
             events_tx,
-            commands: Mutex::new(HashMap::new()),
+            assignments: Mutex::new(HashMap::new()),
+            assignment_tx,
             kv: Mutex::new(HashMap::new()),
             kv_tx,
             leases: Mutex::new(HashMap::new()),
@@ -96,17 +95,6 @@ impl MemoryBus {
             logs_tx,
             log_history: Mutex::new(HashMap::new()),
         })
-    }
-
-    fn get_or_create_channel(&self, node_id: u64) -> Arc<CommandChannel> {
-        let mut commands = self.commands.lock().unwrap();
-        Arc::clone(commands.entry(node_id).or_insert_with(|| {
-            let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
-            Arc::new(CommandChannel {
-                tx,
-                rx: tokio::sync::Mutex::new(rx),
-            })
-        }))
     }
 }
 
@@ -153,23 +141,65 @@ impl EventBus for MemoryBus {
 
         Ok(Box::pin(ReceiverStream { rx: mpsc_rx }))
     }
-
-    async fn send_command(&self, node_id: u64, cmd: &Command) -> Result<()> {
-        let channel = self.get_or_create_channel(node_id);
-        channel
-            .tx
-            .send(cmd.clone())
-            .await
-            .map_err(|_| BusError::Command(format!("node {node_id} command channel closed")))?;
+    async fn put_assignment(&self, key: &str, value: &[u8]) -> Result<()> {
+        self.assignments
+            .lock()
+            .unwrap()
+            .insert(key.to_string(), value.to_vec());
+        let _ = self.assignment_tx.send(KvEvent {
+            key: key.to_string(),
+            value: Some(value.to_vec()),
+            op: KvOp::Put,
+        });
         Ok(())
     }
 
-    async fn next_command(&self, node_id: u64) -> Result<Command> {
-        let channel = self.get_or_create_channel(node_id);
-        let mut rx = channel.rx.lock().await;
-        rx.recv()
-            .await
-            .ok_or_else(|| BusError::Command(format!("node {node_id} command channel closed")))
+    async fn get_assignment(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        Ok(self.assignments.lock().unwrap().get(key).cloned())
+    }
+
+    async fn list_assignments(&self, prefix: &str) -> Result<Vec<(String, Vec<u8>)>> {
+        Ok(self
+            .assignments
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(key, _)| key.starts_with(prefix))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect())
+    }
+
+    async fn delete_assignment(&self, key: &str) -> Result<()> {
+        let removed = self.assignments.lock().unwrap().remove(key);
+        if removed.is_some() {
+            let _ = self.assignment_tx.send(KvEvent {
+                key: key.to_string(),
+                value: None,
+                op: KvOp::Delete,
+            });
+        }
+        Ok(())
+    }
+
+    async fn watch_assignments(&self, prefix: &str) -> Result<KvStream> {
+        let mut rx = self.assignment_tx.subscribe();
+        let prefix = prefix.to_string();
+        let (tx, mpsc_rx) = mpsc::channel(CHANNEL_CAPACITY);
+        tokio::spawn(async move {
+            loop {
+                match rx.recv().await {
+                    Ok(event) if event.key.starts_with(&prefix) => {
+                        if tx.send(event).await.is_err() {
+                            break;
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
+        Ok(Box::pin(ReceiverStream { rx: mpsc_rx }))
     }
 
     async fn put_status(&self, key: &str, value: &[u8]) -> Result<()> {
@@ -354,6 +384,11 @@ impl EventBus for MemoryBus {
     }
 
     async fn publish_log(&self, task_id: &str, entry: &LogEntry) -> Result<()> {
+        if entry.task_id != task_id {
+            return Err(BusError::Publish(
+                "log subject task ID does not match entry".to_string(),
+            ));
+        }
         // Retain a bounded history per task so `log_history` can serve the
         // backlog the way the JetStream-backed bus does.
         {
@@ -364,9 +399,11 @@ impl EventBus for MemoryBus {
                 entries.pop_front();
             }
         }
-        let _ = task_id;
         let _ = self.logs_tx.send(entry.clone());
         Ok(())
+    }
+    async fn publish_node_log(&self, _node_id: u64, task_id: &str, entry: &LogEntry) -> Result<()> {
+        self.publish_log(task_id, entry).await
     }
 
     async fn subscribe_logs(&self, task_id: &str) -> Result<LogEventStream> {
@@ -574,95 +611,37 @@ mod tests {
         assert_eq!(e2.payload, b"node-event");
     }
 
-    // -- Commands ------------------------------------------------------------
-
     #[tokio::test]
-    async fn test_send_and_receive_command() {
+    async fn assignments_are_prefix_scoped_and_deletable() {
         let bus = MemoryBus::new();
-        let cmd = Command::Assign {
-            task_id: "task-1".to_string(),
-            payload: vec![1, 2, 3],
-        };
+        let prefix = "node.7.task.";
+        let mut watch = bus.watch_assignments(prefix).await.unwrap();
 
-        bus.send_command(1, &cmd).await.unwrap();
+        bus.put_assignment("node.8.task.other", b"other")
+            .await
+            .unwrap();
+        bus.put_assignment("node.7.task.one", b"assignment")
+            .await
+            .unwrap();
 
-        let received = tokio::time::timeout(Duration::from_secs(1), bus.next_command(1))
+        assert_eq!(
+            bus.list_assignments(prefix).await.unwrap(),
+            vec![("node.7.task.one".to_string(), b"assignment".to_vec())]
+        );
+        let event = tokio::time::timeout(Duration::from_secs(1), watch.next())
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(received, cmd);
-    }
+        assert_eq!(event.key, "node.7.task.one");
+        assert_eq!(event.value, Some(b"assignment".to_vec()));
 
-    #[tokio::test]
-    async fn test_commands_are_per_node() {
-        let bus = MemoryBus::new();
-        let cmd1 = Command::Stop {
-            task_id: "task-a".to_string(),
-        };
-        let cmd2 = Command::Stop {
-            task_id: "task-b".to_string(),
-        };
-
-        bus.send_command(1, &cmd1).await.unwrap();
-        bus.send_command(2, &cmd2).await.unwrap();
-
-        let r1 = tokio::time::timeout(Duration::from_secs(1), bus.next_command(1))
+        bus.delete_assignment("node.7.task.one").await.unwrap();
+        assert_eq!(bus.get_assignment("node.7.task.one").await.unwrap(), None);
+        let removed = tokio::time::timeout(Duration::from_secs(1), watch.next())
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(r1, cmd1);
-
-        let r2 = tokio::time::timeout(Duration::from_secs(1), bus.next_command(2))
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(r2, cmd2);
-    }
-
-    #[tokio::test]
-    async fn test_command_store_and_forward() {
-        // Command sent before receiver calls next_command should be buffered.
-        let bus = MemoryBus::new();
-        let cmd = Command::Assign {
-            task_id: "early".to_string(),
-            payload: vec![],
-        };
-        bus.send_command(1, &cmd).await.unwrap();
-
-        // Wait a bit, then receive.
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        let received = tokio::time::timeout(Duration::from_secs(1), bus.next_command(1))
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(received, cmd);
-    }
-
-    #[tokio::test]
-    async fn test_multiple_commands_fifo() {
-        let bus = MemoryBus::new();
-        for i in 0..3 {
-            bus.send_command(
-                1,
-                &Command::Stop {
-                    task_id: format!("t{i}"),
-                },
-            )
-            .await
-            .unwrap();
-        }
-        for i in 0..3 {
-            let cmd = tokio::time::timeout(Duration::from_secs(1), bus.next_command(1))
-                .await
-                .unwrap()
-                .unwrap();
-            assert_eq!(
-                cmd,
-                Command::Stop {
-                    task_id: format!("t{i}")
-                }
-            );
-        }
+        assert_eq!(removed.op, KvOp::Delete);
     }
 
     // -- KV Status -----------------------------------------------------------

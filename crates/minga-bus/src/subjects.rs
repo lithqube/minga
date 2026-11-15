@@ -35,26 +35,14 @@ pub fn task_event(task_id: &str) -> String {
     format!("{PREFIX}.task.{task_id}.event")
 }
 
-/// `minga.log.{id}` — container log chunks (JetStream).
-///
-/// Log subjects live under their own top-level namespace rather than under
-/// `minga.task.`. JetStream rejects two streams whose subject filters
-/// overlap, and `minga.task.>` (the MINGA_EVENTS filter) would otherwise
-/// swallow every log subject.
+/// `minga.log.node.{node_id}.{task_id}` — worker-owned log chunks.
+pub fn node_task_log(node_id: u64, task_id: &str) -> String {
+    format!("{PREFIX}.log.node.{node_id}.{task_id}")
+}
+
+/// Log subject filter for a task across nodes.
 pub fn task_log(task_id: &str) -> String {
-    format!("{PREFIX}.log.{task_id}")
-}
-
-// -- Control subjects (commands + request/reply) ----------------------------
-
-/// `minga.ctl.node.{id}.assign` — task assignment command (JetStream, work queue).
-pub fn ctl_assign(node_id: u64) -> String {
-    format!("{PREFIX}.ctl.node.{node_id}.assign")
-}
-
-/// `minga.ctl.node.{id}.stop` — stop/remove command (JetStream, work queue).
-pub fn ctl_stop(node_id: u64) -> String {
-    format!("{PREFIX}.ctl.node.{node_id}.stop")
+    format!("{PREFIX}.log.node.*.{task_id}")
 }
 
 /// `minga.ctl.node.{id}.ping` — synchronous health probe (core NATS, req/reply).
@@ -68,11 +56,6 @@ pub fn ctl_drain(node_id: u64) -> String {
 }
 
 // -- Wildcard patterns ------------------------------------------------------
-
-/// All command subjects for a node: `minga.ctl.node.{id}.>`
-pub fn ctl_node_wildcard(node_id: u64) -> String {
-    format!("{PREFIX}.ctl.node.{node_id}.>")
-}
 
 /// All task events: `minga.task.>`
 pub fn task_events_wildcard() -> String {
@@ -100,14 +83,29 @@ pub fn all_events_wildcards() -> Vec<String> {
 
 // -- KV keys ----------------------------------------------------------------
 
-/// KV key for a task's latest status.
-pub fn kv_task_status(task_id: &str) -> String {
-    format!("task.{task_id}")
+/// KV key for a task's latest status, scoped to its owning node.
+pub fn kv_node_task_status(node_id: u64, task_id: &str) -> String {
+    format!("node.{node_id}.task.{task_id}")
 }
 
 /// KV key for a node's latest status.
 pub fn kv_node_status(node_id: u64) -> String {
     format!("node.{node_id}")
+}
+
+/// KV key prefix for a node's task assignments.
+pub fn kv_assignment_node_prefix(node_id: u64) -> String {
+    format!("node.{node_id}.task.")
+}
+
+/// KV key for a task assignment.
+pub fn kv_assignment_task(node_id: u64, task_id: &str) -> String {
+    format!("{}{task_id}", kv_assignment_node_prefix(node_id))
+}
+
+/// KV key for network metadata and DNS assignments.
+pub fn kv_assignment_network(network_id: &str) -> String {
+    format!("net.{network_id}")
 }
 
 /// KV key for a node's liveness lease.
@@ -136,16 +134,14 @@ mod tests {
             task_event("plant-7.worker.0"),
             "minga.task.plant-7.worker.0.event"
         );
-        assert_eq!(task_log("abc"), "minga.log.abc");
-        assert_eq!(ctl_assign(1), "minga.ctl.node.1.assign");
-        assert_eq!(ctl_stop(1), "minga.ctl.node.1.stop");
+        assert_eq!(task_log("abc"), "minga.log.node.*.abc");
+        assert_eq!(node_task_log(7, "abc"), "minga.log.node.7.abc");
         assert_eq!(ctl_ping(1), "minga.ctl.node.1.ping");
         assert_eq!(ctl_drain(1), "minga.ctl.node.1.drain");
     }
 
     #[test]
     fn wildcard_formats() {
-        assert_eq!(ctl_node_wildcard(1), "minga.ctl.node.1.>");
         assert_eq!(task_events_wildcard(), "minga.task.>");
         assert_eq!(node_events_wildcard(), "minga.node.>");
         assert_eq!(log_events_wildcard(), "minga.log.>");
@@ -153,8 +149,17 @@ mod tests {
 
     #[test]
     fn kv_key_formats() {
-        assert_eq!(kv_task_status("plant-7.db.0"), "task.plant-7.db.0");
+        assert_eq!(
+            kv_node_task_status(4, "plant-7.db.0"),
+            "node.4.task.plant-7.db.0"
+        );
         assert_eq!(kv_node_status(1), "node.1");
         assert_eq!(kv_lease(2), "lease.node.2");
+        assert_eq!(kv_assignment_node_prefix(4), "node.4.task.");
+        assert_eq!(
+            kv_assignment_task(4, "plant-7.db.0"),
+            "node.4.task.plant-7.db.0"
+        );
+        assert_eq!(kv_assignment_network("shop_default"), "net.shop_default");
     }
 }

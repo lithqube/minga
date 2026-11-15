@@ -73,7 +73,7 @@ async fn cluster_with_failed_tasks() -> (Cluster, String, String) {
         cluster
             .bus
             .put_status(
-                &subjects::kv_task_status(&task.id),
+                &subjects::kv_node_task_status(task.node_id, &task.id),
                 &report.to_bytes().unwrap(),
             )
             .await
@@ -163,7 +163,7 @@ async fn a_healthy_service_has_no_error_and_no_hint() {
     cluster
         .bus
         .put_status(
-            &subjects::kv_task_status(&task.id),
+            &subjects::kv_node_task_status(task.node_id, &task.id),
             &report.to_bytes().unwrap(),
         )
         .await
