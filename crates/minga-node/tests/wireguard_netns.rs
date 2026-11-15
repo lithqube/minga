@@ -645,8 +645,19 @@ async fn wireguard_routes_shared_tasks_and_isolates_other_networks() -> Result<(
     ping(&task_b, "10.242.0.1", None)?;
     ping(&task_c, "10.243.0.1", None)?;
     // Prove the underlay path exists before the overlay's cross-network drop.
-    ping(&task_a, "10.243.0.30", None)
-        .map_err(|error| format!("cross-network underlay path was not reachable: {error}"))?;
+    ping(&task_a, "10.243.0.30", None).map_err(|error| {
+        let node_a_routes =
+            ip_ns(&node_a, &["-4", "route", "show"]).unwrap_or_else(|route_error| route_error);
+        let node_c_routes =
+            ip_ns(&node_c, &["-4", "route", "show"]).unwrap_or_else(|route_error| route_error);
+        let task_a_routes =
+            ip_ns(&task_a, &["-4", "route", "show"]).unwrap_or_else(|route_error| route_error);
+        let task_c_routes =
+            ip_ns(&task_c, &["-4", "route", "show"]).unwrap_or_else(|route_error| route_error);
+        format!(
+            "cross-network underlay path was not reachable: {error}; node A routes: {node_a_routes}; node C routes: {node_c_routes}; task A routes: {task_a_routes}; task C routes: {task_c_routes}"
+        )
+    })?;
     install_mesh_rules(&node_a, &bridge_a, "10.242.0.0/24", "10.243.0.0/24")?;
     install_mesh_rules(&node_b, &bridge_b, "10.242.0.0/24", "10.243.0.0/24")?;
     install_mesh_rules(&node_c, &bridge_c, "10.243.0.0/24", "10.242.0.0/24")?;
