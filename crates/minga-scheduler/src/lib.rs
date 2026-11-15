@@ -99,7 +99,14 @@ pub struct Scheduler {
     supernet: minga_net::Cidr,
     /// Subnet collisions already logged, so each is reported once.
     reported: std::sync::Mutex<std::collections::HashSet<(String, String)>>,
+    /// Until this instant the lease set may be incomplete after a failed
+    /// lease read, so the pass is skipped instead of removing tasks.
+    lease_grace_until: std::sync::Mutex<Option<std::time::Instant>>,
 }
+
+/// Leases that expired during a bus outage come back within one renew
+/// interval; wait two before trusting a missing lease.
+const LEASE_GRACE: Duration = Duration::from_secs(2 * minga_state::types::NODE_RENEW_INTERVAL_SECS);
 
 impl Scheduler {
     pub fn new(state: Arc<StateStore>) -> Self {
@@ -109,6 +116,7 @@ impl Scheduler {
             supernet: minga_net::Cidr::parse(minga_net::DEFAULT_SUPERNET)
                 .expect("default supernet parses"),
             reported: Default::default(),
+            lease_grace_until: Default::default(),
         }
     }
 
@@ -144,9 +152,26 @@ impl Scheduler {
                 Ok(nodes) => nodes,
                 Err(error) => {
                     tracing::warn!(error = %error, "cannot read node leases; skipping placement");
+                    *self.lease_grace_until.lock().unwrap() =
+                        Some(std::time::Instant::now() + LEASE_GRACE);
                     return Ok(Vec::new());
                 }
             };
+            // A missing lease removes that node's tasks. After a bus outage,
+            // or with no lease at all, that would stop every task.
+            let in_grace = self
+                .lease_grace_until
+                .lock()
+                .unwrap()
+                .is_some_and(|until| std::time::Instant::now() < until);
+            if in_grace || (live_nodes.is_empty() && !nodes.is_empty()) {
+                tracing::warn!(
+                    live = live_nodes.len(),
+                    registered = nodes.len(),
+                    "node leases may be incomplete; skipping reconciliation"
+                );
+                return Ok(Vec::new());
+            }
             nodes.retain(|node| live_nodes.contains(&node.id));
         }
         let services = self.state.list_services().await?;

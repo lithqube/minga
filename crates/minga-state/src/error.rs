@@ -13,7 +13,7 @@ pub enum StateError {
     #[error("storage error: {0}")]
     Storage(String),
 
-    #[error("not the leader (current leader: {0:?})")]
+    #[error("this manager is not the Raft leader; retry against {}", leader_hint(*.0))]
     NotLeader(Option<u64>),
 
     #[error("io error: {0}")]
@@ -31,6 +31,13 @@ pub enum StateError {
     /// An import file this build cannot read.
     #[error("{0}")]
     BadSnapshot(String),
+}
+
+fn leader_hint(leader: Option<u64>) -> String {
+    match leader {
+        Some(id) => format!("manager {id}"),
+        None => "the leader once one is elected".into(),
+    }
 }
 
 impl StateError {

@@ -311,32 +311,12 @@ fn generate_config(opts: &SidecarOptions, jetstream_dir: &Path) -> String {
         worker_ids.sort_unstable();
         worker_ids.dedup();
         for node_id in worker_ids {
+            let (publish, subscribe) = minga_bus::subjects::worker_acl(node_id);
             append_user(
                 &mut out,
                 &format!("minga-worker-{node_id}"),
-                &[
-                    format!("$KV.MINGA_LEASES.lease.node.{node_id}"),
-                    format!("$KV.MINGA_STATUS.node.{node_id}.task.>"),
-                    format!("minga.log.node.{node_id}.>"),
-                    "$JS.API.STREAM.INFO.KV_MINGA_ASSIGN".into(),
-                    "$JS.API.STREAM.INFO.KV_MINGA_STATUS".into(),
-                    "$JS.API.STREAM.INFO.KV_MINGA_LEASES".into(),
-                    format!("$JS.API.KV.GET.KV_MINGA_ASSIGN.node.{node_id}.task.>"),
-                    "$JS.API.KV.GET.KV_MINGA_ASSIGN.net.>".into(),
-                    "$JS.API.KV.LIST.KV_MINGA_ASSIGN".into(),
-                    "$JS.API.CONSUMER.CREATE.KV_MINGA_ASSIGN".into(),
-                    "$JS.API.CONSUMER.CREATE.KV_MINGA_ASSIGN.>".into(),
-                    "$JS.API.CONSUMER.INFO.KV_MINGA_ASSIGN".into(),
-                    "$JS.API.CONSUMER.INFO.KV_MINGA_ASSIGN.>".into(),
-                    "$JS.API.CONSUMER.MSG.NEXT.KV_MINGA_ASSIGN.>".into(),
-                ],
-                &[
-                    format!("$KV.MINGA_ASSIGN.node.{node_id}.task.>"),
-                    "$KV.MINGA_ASSIGN.net.>".into(),
-                    format!("$KV.MINGA_LEASES.lease.node.{node_id}"),
-                    format!("$KV.MINGA_STATUS.node.{node_id}.task.>"),
-                    "_INBOX.>".into(),
-                ],
+                &publish,
+                &subscribe,
             );
         }
         out.push_str("  ]\n}\n\n");

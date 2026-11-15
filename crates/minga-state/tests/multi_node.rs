@@ -179,6 +179,33 @@ async fn follower_writes_forward_to_the_leader() {
 }
 
 #[tokio::test]
+async fn membership_changes_on_a_follower_name_the_leader() {
+    let (store1, store2, store3, _, _, _) = open_cluster().await;
+    let stores = [&store1, &store2, &store3];
+    let leader_id = leader(&stores).await.node_id();
+    let mut follower = None;
+    for store in stores {
+        if !store.is_leader().await {
+            follower = Some(store);
+        }
+    }
+    let follower = follower.expect("a 3-node cluster has followers");
+
+    // Any manager serves the API, so a follower must say who leads rather
+    // than fail with an opaque Raft error (HTTP 500).
+    for result in [
+        follower.remove_manager(leader_id).await,
+        follower.add_manager(9, "127.0.0.1:1".into()).await,
+    ] {
+        match result {
+            Err(minga_state::StateError::NotLeader(Some(id))) => assert_eq!(id, leader_id),
+            other => panic!("expected NotLeader(Some({leader_id})), got {other:?}"),
+        }
+    }
+    assert_eq!(leader(&stores).await.manager_voters().await.len(), 3);
+}
+
+#[tokio::test]
 async fn three_nodes_elect_leader() {
     let (store1, store2, store3, _, _, _) = open_cluster().await;
     leader(&[&store1, &store2, &store3]).await;
