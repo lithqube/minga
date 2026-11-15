@@ -45,6 +45,8 @@ fn identity(id: u64) -> NodeIdentity {
             gpus: 0,
         },
         role: Default::default(),
+        wg_public_key: None,
+        wg_endpoint: None,
     }
 }
 

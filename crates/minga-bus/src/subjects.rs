@@ -122,6 +122,7 @@ pub fn kv_lease(node_id: u64) -> String {
 /// refused.
 pub fn worker_acl(node_id: u64) -> (Vec<String>, Vec<String>) {
     let own_tasks = format!("$KV.MINGA_ASSIGN.{}>", kv_assignment_node_prefix(node_id));
+    let own_wireguard = format!("$KV.MINGA_ASSIGN.node.{node_id}.wg");
     let networks = "$KV.MINGA_ASSIGN.net.>".to_string();
     let own_status = format!("$KV.MINGA_STATUS.node.{node_id}.task.>");
     let own_lease = format!("$KV.MINGA_LEASES.{}", kv_lease(node_id));
@@ -138,6 +139,7 @@ pub fn worker_acl(node_id: u64) -> (Vec<String>, Vec<String>) {
         // payload filter that differs from the one in the subject.
         format!("$JS.API.CONSUMER.CREATE.KV_MINGA_ASSIGN.*.{own_tasks}"),
         format!("$JS.API.CONSUMER.CREATE.KV_MINGA_ASSIGN.*.{networks}"),
+        format!("$JS.API.CONSUMER.CREATE.KV_MINGA_ASSIGN.*.{own_wireguard}"),
         "$JS.API.CONSUMER.INFO.KV_MINGA_ASSIGN.>".into(),
         format!("$JS.API.DIRECT.GET.KV_MINGA_ASSIGN.{own_tasks}"),
         format!("$JS.API.DIRECT.GET.KV_MINGA_ASSIGN.{networks}"),
@@ -146,6 +148,7 @@ pub fn worker_acl(node_id: u64) -> (Vec<String>, Vec<String>) {
     ];
     let subscribe = vec![
         own_tasks,
+        own_wireguard,
         networks,
         own_lease,
         own_status,
@@ -202,5 +205,17 @@ mod tests {
             "node.4.task.plant-7.db.0"
         );
         assert_eq!(kv_assignment_network("shop_default"), "net.shop_default");
+    }
+    #[test]
+    fn worker_wireguard_acl_is_exactly_node_scoped() {
+        let (publish, subscribe) = worker_acl(7);
+        assert!(publish.contains(
+            &"$JS.API.CONSUMER.CREATE.KV_MINGA_ASSIGN.*.$KV.MINGA_ASSIGN.node.7.wg".to_string()
+        ));
+        assert!(subscribe.contains(&"$KV.MINGA_ASSIGN.node.7.wg".to_string()));
+        assert!(!publish.iter().any(|subject| subject.contains("node.8.wg")));
+        assert!(!subscribe
+            .iter()
+            .any(|subject| subject.contains("node.8.wg")));
     }
 }

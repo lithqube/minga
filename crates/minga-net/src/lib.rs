@@ -27,7 +27,7 @@
 //! use std::net::Ipv4Addr;
 //!
 //! let mut mgr = OverlayManager::new(1);
-//! mgr.create_network_auto("frontend", "frontend", None).unwrap();
+//! mgr.create_network_auto("frontend", "frontend").unwrap();
 //! let ip = mgr.allocate_ip("frontend", "web.1").unwrap();
 //! mgr.register_service("web", "plant-7", vec![ip]);
 //! let resolved = mgr.resolve_service("web", "plant-7");

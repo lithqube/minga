@@ -164,7 +164,7 @@ impl EventBus for MemoryBus {
             .lock()
             .unwrap()
             .iter()
-            .filter(|(key, _)| key.starts_with(prefix))
+            .filter(|(key, _)| crate::assignment_prefix_matches(prefix, key))
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect())
     }
@@ -184,11 +184,32 @@ impl EventBus for MemoryBus {
     async fn watch_assignments(&self, prefix: &str) -> Result<KvStream> {
         let mut rx = self.assignment_tx.subscribe();
         let prefix = prefix.to_string();
+        let initial = self
+            .assignments
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(key, _)| crate::assignment_prefix_matches(&prefix, key))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect::<Vec<_>>();
         let (tx, mpsc_rx) = mpsc::channel(CHANNEL_CAPACITY);
         tokio::spawn(async move {
+            for (key, value) in initial {
+                if tx
+                    .send(KvEvent {
+                        key,
+                        value: Some(value),
+                        op: KvOp::Put,
+                    })
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
             loop {
                 match rx.recv().await {
-                    Ok(event) if event.key.starts_with(&prefix) => {
+                    Ok(event) if crate::assignment_prefix_matches(&prefix, &event.key) => {
                         if tx.send(event).await.is_err() {
                             break;
                         }
@@ -642,6 +663,19 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(removed.op, KvOp::Delete);
+    }
+    #[tokio::test]
+    async fn assignment_watch_includes_existing_values() {
+        let bus = MemoryBus::new();
+        bus.put_assignment("node.7.wg", b"peer-set").await.unwrap();
+
+        let mut watch = bus.watch_assignments("node.7.wg").await.unwrap();
+        let event = tokio::time::timeout(Duration::from_secs(1), watch.next())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(event.key, "node.7.wg");
+        assert_eq!(event.value, Some(b"peer-set".to_vec()));
     }
 
     // -- KV Status -----------------------------------------------------------

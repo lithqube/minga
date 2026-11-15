@@ -78,11 +78,18 @@ The API waits for catch-up before promotion. Remove it with
 | `--nats-worker-id <ID>` | none | Worker IDs authorized by this sidecar's client-certificate mapping. |
 | `--label <KEY=VALUE>` | none | Advertised to the cluster; matched by `node.labels.KEY` placement constraints. |
 | `--overlay-supernet <CIDR>`, `MINGA_OVERLAY_SUPERNET` | `10.100.0.0/16` | Manager subnet-allocation range; must contain `/24`s and avoid host routes. Use the same range on every cluster node. |
+| `--wg-listen <PORT>` | `51820` | UDP listen port for this node's WireGuard interface. |
+| `--wg-endpoint <HOST:PORT>` | none | Advertises a reachable endpoint; omit for a node behind NAT. |
+| `--wg-mtu <BYTES>` | `1420` | Interface MTU when this node has WireGuard peers. Single-host nodes keep their existing MTU. |
 | `--metrics-bind <ADDR>`, `MINGA_METRICS_BIND` | not served | `/metrics`, `/healthz` and `/readyz`. |
 | `--secret-store <DIR>` | `/var/lib/minga/secrets` | Secret values on this node. They never go through Raft or the bus. |
 | `--interval <SECS>` | `2` | Reconcile interval. |
 | `--sandbox-runtime <mock\|wasmtime>`, `--module-dir <DIR>` | none, `/var/lib/minga/modules` | `wasmtime` enables `x-minga-agent` tasks on this node. |
 | `--egress-bind`, `--egress-upstream`, `--egress-credential`, `--egress-credential-header` | none, `https://api.openai.com`, none, `authorization` | Starts the LLM egress proxy for agent tasks. The credential is a secret ID in `--secret-store`; agents never see the key. |
+Each node generates `<data_dir>/wg.key` once with mode `0600`; the private key
+stays local. Registration advertises only its public key and optional endpoint.
+Delete `wg.key` and restart the node to rotate its key; its next lease updates
+the registered public key and endpoint.
 
 **Joining a worker**
 
@@ -132,11 +139,12 @@ certificate flags, or previous Raft data directory is needed.
 
 ### Planning utilities
 
-`minga net create` and `net inspect`, and `minga wg
-keygen`, `wg pubkey` and `wg config`, compute and print subnets, WireGuard keys
-and a sample interface config. **They change nothing**: they do not create a
+`minga net create` and `net inspect`, and `minga wg keygen`, `wg pubkey` and
+`wg config`, compute and print subnets, WireGuard keys and a sample interface
+config. **These commands change nothing**: they do not create a cluster
 network, configure an interface or write to Raft. Compose networks are created
-by `minga deploy`, and there is no cross-node mesh yet.
+by `minga deploy`; cross-node networking becomes active when the peer-set plan
+lands.
 
 ## `minga-ctl`
 

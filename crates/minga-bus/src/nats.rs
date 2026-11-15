@@ -127,6 +127,7 @@ impl NatsBus {
     ) -> Result<(u64, jetstream::consumer::push::Ordered)> {
         let inbox = self.client.new_inbox();
         let name = inbox.rsplit('.').next().unwrap_or_default().to_string();
+        let filter = crate::assignment_watch_filter(prefix);
         let consumer = self
             .assignments_kv
             .stream
@@ -134,7 +135,7 @@ impl NatsBus {
                 name: Some(name),
                 deliver_subject: inbox,
                 description: Some("assignment consumer".to_string()),
-                filter_subject: format!("{}{prefix}>", self.assignments_kv.prefix),
+                filter_subject: format!("{}{filter}", self.assignments_kv.prefix),
                 replay_policy: jetstream::consumer::ReplayPolicy::Instant,
                 deliver_policy,
                 ..Default::default()
@@ -218,8 +219,8 @@ impl NatsBus {
 
     fn check_worker_key(&self, key: &str) -> Result<()> {
         if let Some(node_id) = self.worker_node_id {
-            let prefix = format!("node.{node_id}.task.");
-            if !key.starts_with(&prefix) {
+            let task_prefix = format!("node.{node_id}.task.");
+            if !key.starts_with(&task_prefix) {
                 return Err(BusError::Kv(format!(
                     "worker {node_id} cannot access assignment/status key {key}"
                 )));
@@ -230,10 +231,23 @@ impl NatsBus {
 
     fn check_worker_prefix(&self, prefix: &str) -> Result<()> {
         if let Some(node_id) = self.worker_node_id {
-            let allowed = format!("node.{node_id}.task.");
-            if prefix != allowed && prefix != "net." {
+            let task_prefix = format!("node.{node_id}.task.");
+            if prefix != task_prefix && prefix != "net." {
                 return Err(BusError::Kv(format!(
                     "worker {node_id} may list its own assignments or shared network metadata"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn check_worker_watch(&self, prefix: &str) -> Result<()> {
+        if let Some(node_id) = self.worker_node_id {
+            let task_prefix = format!("node.{node_id}.task.");
+            let wireguard_key = format!("node.{node_id}.wg");
+            if prefix != task_prefix && prefix != wireguard_key && prefix != "net." {
+                return Err(BusError::Kv(format!(
+                    "worker {node_id} may watch its own assignments or shared network metadata"
                 )));
             }
         }
@@ -707,14 +721,17 @@ impl EventBus for NatsBus {
     }
 
     async fn watch_assignments(&self, prefix: &str) -> Result<KvStream> {
-        self.check_worker_prefix(prefix)?;
+        self.check_worker_watch(prefix)?;
         let (_, messages) = self.assignment_consumer(prefix, DeliverPolicy::All).await?;
         let prefix_subject = self.assignments_kv.prefix.clone();
+        let prefix = prefix.to_string();
         let stream = messages.filter_map(move |message| {
             let prefix_subject = prefix_subject.clone();
+            let prefix = prefix.clone();
             async move {
                 match message {
-                    Ok(message) => kv_event(&prefix_subject, &message),
+                    Ok(message) => kv_event(&prefix_subject, &message)
+                        .filter(|event| crate::assignment_prefix_matches(&prefix, &event.key)),
                     Err(error) => {
                         tracing::warn!(error = %error, "assignment watch error");
                         None

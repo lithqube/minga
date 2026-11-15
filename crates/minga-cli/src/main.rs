@@ -237,9 +237,6 @@ enum NetCommand {
         /// Subnet CIDR (e.g. 10.100.0.0/24). If omitted, the first /24 of 10.100.0.0/16.
         #[arg(long)]
         subnet: Option<String>,
-        /// WireGuard listen port (default 51820).
-        #[arg(long)]
-        wg_port: Option<u16>,
     },
     /// Show CIDR information for a subnet.
     Inspect {
@@ -399,6 +396,19 @@ struct NodeArgs {
     /// Refused when it overlaps one of this host's routes.
     #[arg(long, env = "MINGA_OVERLAY_SUPERNET", default_value = minga_net::DEFAULT_SUPERNET)]
     overlay_supernet: String,
+    /// WireGuard UDP listen port on this node.
+    #[arg(
+        long,
+        default_value_t = minga_net::DEFAULT_WG_PORT,
+        value_parser = clap::value_parser!(u16).range(1..)
+    )]
+    wg_listen: u16,
+    /// Reachable WireGuard endpoint; omit when this node is behind NAT.
+    #[arg(long)]
+    wg_endpoint: Option<String>,
+    /// WireGuard interface MTU when the mesh is active.
+    #[arg(long, default_value_t = 1420, value_parser = clap::value_parser!(u16).range(1..))]
+    wg_mtu: u16,
 }
 
 #[derive(Args)]
@@ -1039,6 +1049,12 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
         eprintln!("error: built-in sidecar TLS, listener, identity, and route flags require a manager without --nats-url");
         return ExitCode::FAILURE;
     }
+    if let Some(endpoint) = &args.wg_endpoint {
+        if !minga_net::wireguard::validate_endpoint(endpoint) {
+            eprintln!("error: invalid --wg-endpoint '{endpoint}' (expected host:port)");
+            return ExitCode::FAILURE;
+        }
+    }
     let supernet = match overlay_supernet(&args.overlay_supernet) {
         Ok(c) => c,
         Err(e) => {
@@ -1064,6 +1080,9 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
         bind = ?args.bind,
         data_dir = %args.data_dir,
         peers = ?peers,
+        wg_listen = args.wg_listen,
+        wg_endpoint = ?args.wg_endpoint,
+        wg_mtu = args.wg_mtu,
         role = if is_manager { "manager" } else { "worker" },
         "starting minga node"
     );
@@ -1091,6 +1110,16 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
     } else {
         None
     };
+    let keypair = match minga_node::load_or_generate_keypair(&PathBuf::from(&args.data_dir)) {
+        Ok(keypair) => keypair,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let wg_key_path = PathBuf::from(&args.data_dir).join("wg.key");
+    let wg_public_key = keypair.public_key;
+    drop(keypair.private_key);
 
     // Announce this node to the cluster and keep the membership lease
     // renewed. Without this the scheduler cannot see the node and every
@@ -1112,6 +1141,8 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
         } else {
             minga_state::types::NodeRole::Worker
         },
+        wg_public_key: Some(wg_public_key),
+        wg_endpoint: args.wg_endpoint.clone(),
     };
 
     // Create the event bus.
@@ -1476,6 +1507,13 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
             _ = scheduler.run(interval) => {},
             _ = minga_node::run_node_registration(state.clone(), bus.clone()) => {},
             _ = supervisor.run(interval) => {},
+            _ = minga_node::run_wireguard_assignments(
+                bus.clone(),
+                args.node_id,
+                wg_key_path.clone(),
+                args.wg_listen,
+                args.wg_mtu,
+            ) => {},
             _ = wait_for_node_shutdown() => {
                 tracing::info!(node_id = args.node_id, "shutting down manager");
             },
@@ -1487,6 +1525,13 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
         );
         tokio::select! {
             _ = supervisor.run(interval) => {},
+            _ = minga_node::run_wireguard_assignments(
+                bus.clone(),
+                args.node_id,
+                wg_key_path,
+                args.wg_listen,
+                args.wg_mtu,
+            ) => {},
             _ = wait_for_node_shutdown() => {
                 tracing::info!(node_id = args.node_id, "shutting down worker");
             },
@@ -1662,15 +1707,11 @@ fn print_translated(t: &minga_scheduler::TranslatedStack) {
 
 fn run_net(cmd: NetCommand) -> ExitCode {
     match cmd {
-        NetCommand::Create {
-            name,
-            subnet,
-            wg_port,
-        } => {
+        NetCommand::Create { name, subnet } => {
             let mut mgr = minga_net::OverlayManager::new(1);
             let result = match &subnet {
-                Some(s) => mgr.create_network(&name, &name, s, wg_port),
-                None => mgr.create_network_auto(&name, &name, wg_port),
+                Some(s) => mgr.create_network(&name, &name, s),
+                None => mgr.create_network_auto(&name, &name),
             };
             match result {
                 Ok(()) => {
@@ -1679,8 +1720,6 @@ fn run_net(cmd: NetCommand) -> ExitCode {
                     println!("  id:       {}", net.id);
                     println!("  name:     {}", net.name);
                     println!("  subnet:   {}", net.subnet);
-                    println!("  wg_port:  {}", net.wg_port);
-                    println!("  wg_iface: {}", mgr.wg_interface_name(&name));
                     println!("  usable:   {} hosts", net.subnet.usable_hosts());
                 }
                 Err(e) => {
@@ -2197,6 +2236,35 @@ mod tests {
         assert!(worker_has_manager_only_flags(&args));
     }
 
+    #[test]
+    fn wireguard_node_options_parse() {
+        let cli = Cli::try_parse_from([
+            "minga",
+            "worker",
+            "--node-id",
+            "7",
+            "--wg-listen",
+            "51821",
+            "--wg-endpoint",
+            "edge.example:51821",
+            "--wg-mtu",
+            "1280",
+        ])
+        .unwrap();
+        let Command::Worker(args) = cli.command else {
+            panic!("expected worker command");
+        };
+        assert_eq!(args.wg_listen, 51821);
+        assert_eq!(args.wg_endpoint.as_deref(), Some("edge.example:51821"));
+        assert_eq!(args.wg_mtu, 1280);
+    }
+    #[test]
+    fn net_create_rejects_per_network_wg_port() {
+        assert!(
+            Cli::try_parse_from(["minga", "net", "create", "frontend", "--wg-port", "52000",])
+                .is_err()
+        );
+    }
     #[test]
     fn worker_rejects_nats_cluster_port_flag() {
         let cli = Cli::try_parse_from([

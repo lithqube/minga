@@ -532,6 +532,18 @@ async fn worker_certificate_cannot_write_assignments_or_other_nodes_status_and_l
         .await
         .unwrap();
     manager
+        .put_assignment("node.7.wg", b"peer-set")
+        .await
+        .unwrap();
+    manager
+        .put_assignment("node.7.wg.extra", b"not-the-peer-set")
+        .await
+        .unwrap();
+    manager
+        .put_assignment("node.8.wg", b"foreign-peer-set")
+        .await
+        .unwrap();
+    manager
         .put_assignment("net.test", b"network")
         .await
         .unwrap();
@@ -570,6 +582,23 @@ async fn worker_certificate_cannot_write_assignments_or_other_nodes_status_and_l
             .collect::<Vec<_>>(),
         ["node.7.task.allowed"]
     );
+    let mut wireguard = worker_bus
+        .watch_assignments("node.7.wg")
+        .await
+        .expect("worker can watch its own WireGuard peer set");
+    let event = tokio::time::timeout(Duration::from_secs(2), wireguard.next())
+        .await
+        .expect("worker receives its existing WireGuard peer set before timeout")
+        .expect("WireGuard watch remains open");
+    assert_eq!(event.key, "node.7.wg");
+    assert_eq!(event.value.as_deref(), Some(&b"peer-set"[..]));
+    assert!(worker_bus.get_assignment("node.7.wg").await.is_err());
+    assert!(worker_bus.list_assignments("node.7.wg").await.is_err());
+    assert!(worker_bus
+        .watch_assignments("node.7.wg.extra")
+        .await
+        .is_err());
+    assert!(worker_bus.watch_assignments("node.8.wg").await.is_err());
     let networks = worker_bus.list_assignments("net.").await.unwrap();
     assert_eq!(
         networks
@@ -601,7 +630,7 @@ async fn worker_certificate_cannot_write_assignments_or_other_nodes_status_and_l
         .await
         .expect("manager listing stalled: flow-control replies denied?")
         .unwrap();
-    assert_eq!(listed.len(), 67);
+    assert_eq!(listed.len(), 70);
     for i in 0..64 {
         manager
             .delete_assignment(&format!("node.7.task.big-{i:02}"))
@@ -688,6 +717,7 @@ async fn worker_certificate_cannot_write_assignments_or_other_nodes_status_and_l
 
     for subject in [
         "$KV.MINGA_ASSIGN.node.7.task.forbidden",
+        "$KV.MINGA_ASSIGN.node.7.wg",
         "$KV.MINGA_LEASES.lease.node.8",
         "$KV.MINGA_STATUS.node.8.task.forbidden",
     ] {

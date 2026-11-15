@@ -25,6 +25,12 @@
 - Network subnets are allocated by the Raft leader from the configurable
   `--overlay-supernet`; overlapping explicit IPAM ranges and unsupported
   network `driver_opts` fail loudly (`encrypted` remains a no-op).
+- Node registration now advertises a node-local WireGuard public key and
+  optional reachable endpoint. Each node persists its private key at
+  `<data_dir>/wg.key` with mode `0600`; `--wg-listen`, `--wg-endpoint` and
+  `--wg-mtu` provide per-node interface settings. The interface helper leaves
+  `minga-wg0` absent when the peer set is empty; `minga net` no longer accepts
+  or prints per-network WireGuard ports.
 
 
 ## [1.2.0] — 2026-11-13
