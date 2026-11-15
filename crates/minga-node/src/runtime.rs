@@ -95,6 +95,11 @@ pub trait Runtime: Send + Sync {
     /// Lists all containers known to this runtime.
     async fn list(&self) -> Vec<ContainerInfo>;
 
+    /// Establish runtime safeguards before startup cleanup or task recovery.
+    async fn prepare_startup(&self) -> Result<(), RuntimeError> {
+        Ok(())
+    }
+
     /// Kill and delete all stopped/orphan tasks in the runtime namespace.
     /// Called once on supervisor startup to prevent AlreadyExists errors.
     async fn purge_stopped_tasks(&self);

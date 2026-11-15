@@ -94,10 +94,38 @@ pub struct Peer {
     /// Persistent keepalive in seconds (0 = disabled).
     pub keepalive: u16,
 }
-/// Node-scoped peer assignment stored at `node.{id}.wg` in MINGA_ASSIGN.
+/// A node-scoped peer assignment stored at `node.{id}.wg` in MINGA_ASSIGN.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WireGuardPeerAssignment {
+    pub node_id: u64,
+    pub public_key: String,
+    pub allowed_ips: Vec<String>,
+    pub endpoint: Option<String>,
+    pub keepalive: u16,
+    pub path: WireGuardPeerPath,
+}
+
+/// How this peer is reached; relayed paths are populated by the relay planner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WireGuardPeerPath {
+    Direct,
+    Relay,
+}
+
+/// A network subnet relevant to this node's overlay routing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WireGuardNetworkAssignment {
+    pub network_id: String,
+    pub subnet: String,
+    /// This node hosts at least one task on the network.
+    pub local: bool,
+}
+
+/// Node-scoped peer and network-route assignment stored in MINGA_ASSIGN.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WireGuardPeerSet {
-    pub peers: Vec<Peer>,
+    pub peers: Vec<WireGuardPeerAssignment>,
+    pub networks: Vec<WireGuardNetworkAssignment>,
 }
 
 /// Configuration for a local WireGuard interface. `Debug` redacts the private key.

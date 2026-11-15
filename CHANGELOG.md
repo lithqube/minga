@@ -19,9 +19,10 @@
   real v1.2.0 cluster migrated with its service and running container intact;
   the upgraded worker adopted the same task after joining as a bus client.
   See [supported topologies](docs/topologies.md) for evidence and limits.
-- Known limits: cross-node container networking still needs the WireGuard
-  mesh; T4’s roughly 5,000-worker scale has not been load-tested; `MINGA_LOGS`
-  remains single-replica and is unavailable while its hosting server is down.
+- Cross-node task networking now uses leader-projected WireGuard peer sets,
+  per-task `/32` routes and network isolation. Known limits: T4’s roughly
+  5,000-worker scale has not been load-tested; `MINGA_LOGS` remains
+  single-replica and is unavailable while its hosting server is down.
 - Network subnets are allocated by the Raft leader from the configurable
   `--overlay-supernet`; overlapping explicit IPAM ranges and unsupported
   network `driver_opts` fail loudly (`encrypted` remains a no-op).

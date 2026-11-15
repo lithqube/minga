@@ -45,8 +45,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use minga_bus::{subjects, EventBus, TaskActualState, TaskStatusReport};
+use minga_net::wireguard::{
+    WireGuardNetworkAssignment, WireGuardPeerAssignment, WireGuardPeerPath, WireGuardPeerSet,
+};
 use minga_state::types::{
-    Network, NetworkAssignment, NetworkDnsTask, Service, Task, TaskAssignment, TaskState,
+    ClusterNode, Network, NetworkAssignment, NetworkDnsTask, NodeRole, Service, Task,
+    TaskAssignment, TaskState,
 };
 use minga_state::{StateError, StateStore};
 use thiserror::Error;
@@ -282,11 +286,11 @@ impl Scheduler {
             }
         }
 
-        self.publish_projection().await?;
+        self.publish_projection(&nodes).await?;
         Ok(actions)
     }
 
-    async fn publish_projection(&self) -> Result<(), SchedulerError> {
+    async fn publish_projection(&self, nodes: &[ClusterNode]) -> Result<(), SchedulerError> {
         let Some(bus) = &self.bus else {
             return Ok(());
         };
@@ -348,7 +352,7 @@ impl Scheduler {
                 }
             }
         }
-        for network in networks {
+        for network in &networks {
             let value = NetworkAssignment {
                 tasks: network_tasks
                     .remove(network.id.as_str())
@@ -363,6 +367,86 @@ impl Scheduler {
                 .await
                 .map_err(|error| SchedulerError::Bus(error.to_string()))?;
         }
+        for node in nodes {
+            let key = format!("node.{}.wg", node.id);
+            let local_network_ids: HashSet<&str> = tasks
+                .iter()
+                .filter(|task| task.node_id == node.id)
+                .flat_map(|task| task.spec.ips.keys().map(String::as_str))
+                .filter(|id| network_by_id.contains_key(id))
+                .collect();
+            let mut node_networks: Vec<WireGuardNetworkAssignment> = networks
+                .iter()
+                .filter_map(|network| {
+                    network
+                        .subnet
+                        .as_ref()
+                        .map(|subnet| WireGuardNetworkAssignment {
+                            network_id: network.id.clone(),
+                            subnet: subnet.clone(),
+                            local: local_network_ids.contains(network.id.as_str()),
+                        })
+                })
+                .collect();
+            node_networks.sort_by(|a, b| a.network_id.cmp(&b.network_id));
+
+            let mut peers = Vec::new();
+            for peer in nodes {
+                if peer.id == node.id {
+                    continue;
+                }
+                let peer_is_manager = peer.role == NodeRole::Manager;
+                if node.role != NodeRole::Manager
+                    && !peer_is_manager
+                    && !local_network_ids.iter().any(|id| {
+                        tasks
+                            .iter()
+                            .any(|task| task.node_id == peer.id && task.spec.ips.contains_key(*id))
+                    })
+                {
+                    continue;
+                }
+                let Some(public_key) = &peer.wg_public_key else {
+                    continue;
+                };
+                let mut allowed_ips: Vec<String> = tasks
+                    .iter()
+                    .filter(|task| task.node_id == peer.id)
+                    .flat_map(|task| {
+                        task.spec
+                            .ips
+                            .iter()
+                            .filter(|(network_id, ip)| {
+                                local_network_ids.contains(network_id.as_str())
+                                    && ip.parse::<std::net::Ipv4Addr>().is_ok()
+                            })
+                            .map(|(_, ip)| format!("{ip}/32"))
+                    })
+                    .collect();
+                allowed_ips.sort();
+                allowed_ips.dedup();
+                peers.push(WireGuardPeerAssignment {
+                    node_id: peer.id,
+                    public_key: public_key.clone(),
+                    allowed_ips,
+                    endpoint: peer.wg_endpoint.clone(),
+                    keepalive: 25,
+                    path: WireGuardPeerPath::Direct,
+                });
+            }
+            peers.sort_by_key(|peer| peer.node_id);
+            let value = WireGuardPeerSet {
+                peers,
+                networks: node_networks,
+            };
+            let value = minga_state::codec::encode_wire(&value)
+                .map_err(|error| SchedulerError::Serialization(error.to_string()))?;
+            bus.put_assignment(&key, &value)
+                .await
+                .map_err(|error| SchedulerError::Bus(error.to_string()))?;
+            desired.insert(key);
+        }
+
         for (key, _) in bus
             .list_assignments("")
             .await

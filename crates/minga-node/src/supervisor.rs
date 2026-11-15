@@ -160,14 +160,10 @@ impl SupervisorNetworking {
 
 /// Builds DNS records from MINGA_ASSIGN network/DNS entries.
 #[cfg(any(target_os = "linux", test))]
-fn build_dns_store(assignments: &[NetworkAssignment], node_id: NodeId) -> minga_net::DnsStore {
+fn build_dns_store(assignments: &[NetworkAssignment]) -> minga_net::DnsStore {
     let mut store = minga_net::DnsStore::new();
     for assignment in assignments {
-        for task in assignment
-            .tasks
-            .iter()
-            .filter(|task| task.node_id == node_id)
-        {
+        for task in &assignment.tasks {
             let Ok(ip) = task.ip.parse::<std::net::Ipv4Addr>() else {
                 continue;
             };
@@ -338,10 +334,16 @@ impl Supervisor {
                 return;
             }
         };
-        let store = build_dns_store(&assignments, self.node_id);
+        let store = build_dns_store(&assignments);
         *net.dns_store.write().unwrap() = store;
         let mut binds: Vec<std::net::SocketAddr> = assignments
             .iter()
+            .filter(|assignment| {
+                assignment
+                    .tasks
+                    .iter()
+                    .any(|task| task.node_id == self.node_id)
+            })
             .filter_map(|assignment| {
                 net.setup
                     .gateway_for(&assignment.network.id, assignment.network.subnet.as_deref())
@@ -1294,6 +1296,18 @@ impl Supervisor {
     /// Runs the supervisor loop forever, sleeping `interval` between passes.
     pub async fn run(self, interval: Duration) -> ! {
         tracing::info!(node = self.node_id, ?interval, "supervisor loop starting");
+        loop {
+            match self.runtime.prepare_startup().await {
+                Ok(()) => break,
+                Err(error) => {
+                    tracing::error!(
+                        %error,
+                        "runtime startup safeguards failed; retrying before task cleanup"
+                    );
+                    tokio::time::sleep(interval).await;
+                }
+            }
+        }
         // Startup reconciliation: kill and delete any STOPPED or orphan tasks
         // left over from a previous run. Uses list_tasks (not list_containers)
         // so it also catches tasks whose container entry is already gone.
@@ -1805,10 +1819,13 @@ mod assignment_tests {
             ],
         };
 
-        let dns = build_dns_store(&[record], 7);
+        let dns = build_dns_store(&[record]);
         assert_eq!(
             dns.resolve(&minga_net::dns::service_fqdn("web", "plant")),
-            vec![std::net::Ipv4Addr::new(10, 0, 0, 10)]
+            vec![
+                std::net::Ipv4Addr::new(10, 0, 0, 10),
+                std::net::Ipv4Addr::new(10, 0, 0, 11)
+            ]
         );
     }
 }

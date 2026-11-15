@@ -23,6 +23,7 @@
 //!
 //! Requires root (CAP_NET_ADMIN). iproute2 and iptables must be installed.
 
+use std::collections::HashSet;
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
 
@@ -69,6 +70,266 @@ async fn run(program: &str, args: &[&str]) -> Result<(), NetError> {
         cmd: format!("{program} {}", args.join(" ")),
         stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
     })
+}
+async fn output(program: &str, args: &[&str]) -> Result<String, NetError> {
+    let result = tokio::process::Command::new(program)
+        .args(args)
+        .output()
+        .await
+        .map_err(|e| NetError::Command {
+            cmd: format!("{program} {}", args.join(" ")),
+            stderr: e.to_string(),
+        })?;
+    if !result.status.success() {
+        return Err(NetError::Command {
+            cmd: format!("{program} {}", args.join(" ")),
+            stderr: String::from_utf8_lossy(&result.stderr).trim().to_string(),
+        });
+    }
+    Ok(String::from_utf8_lossy(&result.stdout).into_owned())
+}
+
+async fn minga_bridges() -> Result<Vec<String>, NetError> {
+    Ok(output("ip", &["-o", "link", "show", "type", "bridge"])
+        .await?
+        .lines()
+        .filter_map(|line| line.split_whitespace().nth(1))
+        .map(|name| name.trim_end_matches(':'))
+        .filter(|name| name.starts_with("minga-"))
+        .map(str::to_owned)
+        .collect())
+}
+
+const WG_FORWARD_CHAIN: &str = "MINGA_WG_FORWARD";
+const TASK_SOURCE_CHAIN: &str = "MINGA_TASK_SOURCE";
+const TASK_FAIL_CLOSED_IN_CHAIN: &str = "MINGA_TASK_FAIL_CLOSED_IN";
+const TASK_FAIL_CLOSED_OUT_CHAIN: &str = "MINGA_TASK_FAIL_CLOSED_OUT";
+const TASK_MASQUERADE_CHAIN: &str = "MINGA_MASQUERADE";
+
+async fn remove_wireguard_rules() {
+    run_tolerated(
+        "iptables",
+        &[
+            "-w",
+            "5",
+            "-t",
+            "filter",
+            "-D",
+            "FORWARD",
+            "-j",
+            WG_FORWARD_CHAIN,
+        ],
+    )
+    .await;
+    run_tolerated(
+        "iptables",
+        &["-w", "5", "-t", "filter", "-F", WG_FORWARD_CHAIN],
+    )
+    .await;
+    run_tolerated(
+        "iptables",
+        &["-w", "5", "-t", "filter", "-X", WG_FORWARD_CHAIN],
+    )
+    .await;
+    run_tolerated(
+        "iptables",
+        &[
+            "-w",
+            "5",
+            "-t",
+            "filter",
+            "-D",
+            "INPUT",
+            "-i",
+            minga_net::wireguard::WG_INTERFACE_NAME,
+            "-j",
+            "DROP",
+        ],
+    )
+    .await;
+    run_tolerated(
+        "iptables",
+        &[
+            "-w",
+            "5",
+            "-t",
+            "mangle",
+            "-D",
+            "FORWARD",
+            "-o",
+            minga_net::wireguard::WG_INTERFACE_NAME,
+            "-p",
+            "tcp",
+            "--tcp-flags",
+            "SYN,RST",
+            "SYN",
+            "-j",
+            "TCPMSS",
+            "--clamp-mss-to-pmtu",
+        ],
+    )
+    .await;
+}
+/// Keeps source validation, emergency drops and mesh filtering ahead of
+/// broad bridge accepts, including when a bridge is created later.
+async fn keep_wireguard_forward_first() -> Result<(), NetError> {
+    move_filter_jump_first("FORWARD", WG_FORWARD_CHAIN).await?;
+    // Source validation runs before the mesh accept rules.
+    move_filter_jump_first("FORWARD", TASK_SOURCE_CHAIN).await?;
+    move_filter_jump_first("INPUT", TASK_SOURCE_CHAIN).await?;
+    // Emergency drops stay ahead of both normal chains.
+    move_filter_jump_first("FORWARD", TASK_FAIL_CLOSED_IN_CHAIN).await?;
+    move_filter_jump_first("FORWARD", TASK_FAIL_CLOSED_OUT_CHAIN).await?;
+    move_filter_jump_first("INPUT", TASK_FAIL_CLOSED_IN_CHAIN).await
+}
+
+async fn move_filter_jump_first(hook: &str, chain: &str) -> Result<(), NetError> {
+    let args = ["-w", "5", "-t", "filter", "-S", chain];
+    let result = tokio::process::Command::new("iptables")
+        .args(args)
+        .output()
+        .await
+        .map_err(|error| NetError::Command {
+            cmd: format!("iptables {}", args.join(" ")),
+            stderr: error.to_string(),
+        })?;
+    if !result.status.success() {
+        let stderr = String::from_utf8_lossy(&result.stderr).trim().to_string();
+        if stderr.contains("No chain/target/match by that name") {
+            return Ok(());
+        }
+        return Err(NetError::Command {
+            cmd: format!("iptables {}", args.join(" ")),
+            stderr,
+        });
+    }
+    run_tolerated(
+        "iptables",
+        &["-w", "5", "-t", "filter", "-D", hook, "-j", chain],
+    )
+    .await;
+    run(
+        "iptables",
+        &["-w", "5", "-t", "filter", "-I", hook, "1", "-j", chain],
+    )
+    .await
+}
+
+async fn ensure_task_source_chain() -> Result<(), NetError> {
+    run_tolerated("modprobe", &["br_netfilter"]).await;
+    run("sysctl", &["-w", "net.bridge.bridge-nf-call-iptables=1"]).await?;
+    run_tolerated(
+        "iptables",
+        &["-w", "5", "-t", "filter", "-N", TASK_SOURCE_CHAIN],
+    )
+    .await;
+    for hook in ["FORWARD", "INPUT"] {
+        let exists = tokio::process::Command::new("iptables")
+            .args([
+                "-w",
+                "5",
+                "-t",
+                "filter",
+                "-C",
+                hook,
+                "-j",
+                TASK_SOURCE_CHAIN,
+            ])
+            .output()
+            .await
+            .map_err(|error| NetError::Command {
+                cmd: format!("iptables -w 5 -t filter -C {hook} -j {TASK_SOURCE_CHAIN}"),
+                stderr: error.to_string(),
+            })?;
+        if !exists.status.success() {
+            run(
+                "iptables",
+                &[
+                    "-w",
+                    "5",
+                    "-t",
+                    "filter",
+                    "-I",
+                    hook,
+                    "1",
+                    "-j",
+                    TASK_SOURCE_CHAIN,
+                ],
+            )
+            .await?;
+        }
+    }
+    keep_wireguard_forward_first().await
+}
+
+// ensure_rule inserts at the chain head; install DROP first, then the
+// source-specific RETURN, so only the assigned address passes.
+async fn ensure_task_source_rules(veth: &str, ip: Ipv4Addr) -> Result<(), NetError> {
+    ensure_task_source_chain().await?;
+    let address = format!("{ip}/32");
+    ensure_rule(
+        "filter",
+        TASK_SOURCE_CHAIN,
+        &["-m", "physdev", "--physdev-in", veth, "-j", "DROP"],
+    )
+    .await?;
+    ensure_rule(
+        "filter",
+        TASK_SOURCE_CHAIN,
+        &[
+            "-m",
+            "physdev",
+            "--physdev-in",
+            veth,
+            "-s",
+            &address,
+            "-j",
+            "RETURN",
+        ],
+    )
+    .await
+}
+
+async fn remove_task_source_rules(veth: &str, ip: Ipv4Addr) {
+    let address = format!("{ip}/32");
+    run_tolerated(
+        "iptables",
+        &[
+            "-w",
+            "5",
+            "-t",
+            "filter",
+            "-D",
+            TASK_SOURCE_CHAIN,
+            "-m",
+            "physdev",
+            "--physdev-in",
+            veth,
+            "-s",
+            &address,
+            "-j",
+            "RETURN",
+        ],
+    )
+    .await;
+    run_tolerated(
+        "iptables",
+        &[
+            "-w",
+            "5",
+            "-t",
+            "filter",
+            "-D",
+            TASK_SOURCE_CHAIN,
+            "-m",
+            "physdev",
+            "--physdev-in",
+            veth,
+            "-j",
+            "DROP",
+        ],
+    )
+    .await;
 }
 
 /// Runs a command that is allowed to fail (idempotent teardown).
@@ -244,11 +505,55 @@ pub struct TaskNetns {
     pub resolv_conf: PathBuf,
 }
 
+const TASK_NET_STATE_FORMAT_VERSION: u8 = 1;
+
 /// Recorded per-task state, so teardown removes exactly what setup made.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct TaskNetState {
+    #[serde(default)]
+    format_version: u8,
     ips: Vec<Ipv4Addr>,
     ports: Vec<PortMapping>,
+    #[serde(default)]
+    veths: Vec<String>,
+}
+fn task_veth_for_ip(
+    task_links: &str,
+    task_addresses: &str,
+    host_links: &str,
+    ip: Ipv4Addr,
+) -> Option<String> {
+    let task_name = task_addresses.lines().find_map(|line| {
+        let mut fields = line.split_whitespace();
+        fields.next()?;
+        let name = fields.next()?.split('@').next()?.trim_end_matches(':');
+        fields.next()?;
+        let address = fields.next()?.split('/').next()?.parse::<Ipv4Addr>().ok()?;
+        (address == ip).then_some(name)
+    })?;
+    let host_index = task_links.lines().find_map(|line| {
+        let mut fields = line.split_whitespace();
+        fields.next()?;
+        let name = fields.next()?.trim_end_matches(':');
+        if name.split('@').next()? != task_name {
+            return None;
+        }
+        name.rsplit_once("@if")?.1.parse::<u32>().ok()
+    })?;
+    host_links.lines().find_map(|line| {
+        let mut fields = line.split_whitespace();
+        let index = fields.next()?.trim_end_matches(':').parse::<u32>().ok()?;
+        if index != host_index {
+            return None;
+        }
+        fields.next().map(|name| {
+            name.split('@')
+                .next()
+                .unwrap_or(name)
+                .trim_end_matches(':')
+                .to_owned()
+        })
+    })
 }
 
 /// The node-level network setup. One instance per node.
@@ -355,6 +660,8 @@ impl NetworkSetup {
         // Forwarding between bridges and the outside world. Set once;
         // failures surface on the first container start.
         run_tolerated("sysctl", &["-w", "net.ipv4.ip_forward=1"]).await;
+        run_tolerated("modprobe", &["br_netfilter"]).await;
+        run("sysctl", &["-w", "net.bridge.bridge-nf-call-iptables=1"]).await?;
 
         // Lets the host reach published ports at 127.0.0.1: the DNAT'd
         // packet still carries a loopback source, which the kernel drops on
@@ -365,13 +672,45 @@ impl NetworkSetup {
         )
         .await;
 
-        // Task IPs are private to this host: without SNAT, replies from
-        // anything off this bridge have no route back.
+        // Task IPs are private to this host, so external egress needs SNAT.
         let cidr = subnet.to_string();
+        // Remove legacy direct rules; task egress now passes through one chain
+        // so bridge and WireGuard exclusions don't require duplicate -o flags.
+        for rule in [
+            vec!["-s", &cidr, "!", "-o", &br, "-j", "MASQUERADE"],
+            vec![
+                "-s",
+                &cidr,
+                "!",
+                "-o",
+                &br,
+                "!",
+                "-o",
+                minga_net::wireguard::WG_INTERFACE_NAME,
+                "-j",
+                "MASQUERADE",
+            ],
+        ] {
+            let mut args = vec!["-w", "5", "-t", "nat", "-D", "POSTROUTING"];
+            args.extend(rule);
+            run_tolerated("iptables", &args).await;
+        }
+        run_tolerated(
+            "iptables",
+            &["-w", "5", "-t", "nat", "-N", TASK_MASQUERADE_CHAIN],
+        )
+        .await;
+        ensure_rule(
+            "nat",
+            TASK_MASQUERADE_CHAIN,
+            &["-o", "minga-+", "-j", "RETURN"],
+        )
+        .await?;
+        ensure_rule("nat", TASK_MASQUERADE_CHAIN, &["-j", "MASQUERADE"]).await?;
         ensure_rule(
             "nat",
             "POSTROUTING",
-            &["-s", &cidr, "!", "-o", &br, "-j", "MASQUERADE"],
+            &["-s", &cidr, "-j", TASK_MASQUERADE_CHAIN],
         )
         .await?;
         // Host-originated traffic into the bridge (127.0.0.1 or the node's
@@ -434,6 +773,129 @@ impl NetworkSetup {
         for rule in isolation_rules(&br) {
             ensure_rule("filter", "FORWARD", &as_strs(&rule)).await?;
         }
+        keep_wireguard_forward_first().await?;
+        Ok(())
+    }
+    /// Configures bridge proxy ARP and source-checked forwarding for the
+    /// WireGuard mesh. The dedicated chain stays ahead of the broad bridge
+    /// accepts installed by `ensure_bridge`.
+    pub async fn setup_wireguard_mesh(
+        &self,
+        networks: &[minga_net::wireguard::WireGuardNetworkAssignment],
+    ) -> Result<(), NetError> {
+        let wg = minga_net::wireguard::WG_INTERFACE_NAME;
+        for bridge in minga_bridges().await? {
+            run_tolerated(
+                "sysctl",
+                &["-w", &format!("net.ipv4.conf.{bridge}.proxy_arp=0")],
+            )
+            .await;
+        }
+
+        let mut local_bridges = Vec::new();
+        let mut remote_subnets = Vec::new();
+        let mut rules = Vec::with_capacity(networks.len() * 2 + 2);
+        for network in networks {
+            let subnet = subnet_for(&network.network_id, Some(&network.subnet))?;
+            if !network.local {
+                remote_subnets.push(subnet.to_string());
+                continue;
+            }
+            let bridge = bridge_name(&network.network_id);
+            self.ensure_bridge(&network.network_id, &subnet).await?;
+            run(
+                "sysctl",
+                &["-w", &format!("net.ipv4.conf.{bridge}.proxy_arp=1")],
+            )
+            .await?;
+            let cidr = subnet.to_string();
+            local_bridges.push(bridge.clone());
+            rules.push(vec![
+                "-i".to_string(),
+                bridge.clone(),
+                "-o".to_string(),
+                wg.to_string(),
+                "-s".to_string(),
+                cidr.clone(),
+                "-j".to_string(),
+                "ACCEPT".to_string(),
+            ]);
+            rules.push(vec![
+                "-i".to_string(),
+                wg.to_string(),
+                "-o".to_string(),
+                bridge,
+                "-s".to_string(),
+                cidr,
+                "-j".to_string(),
+                "ACCEPT".to_string(),
+            ]);
+        }
+        // No route or peer exists for these subnets; drop at the task bridge
+        // instead of blackholing host traffic in the node's routing table.
+        for bridge in &local_bridges {
+            for subnet in &remote_subnets {
+                rules.push(vec![
+                    "-i".to_string(),
+                    bridge.clone(),
+                    "-d".to_string(),
+                    subnet.clone(),
+                    "-j".to_string(),
+                    "DROP".to_string(),
+                ]);
+            }
+        }
+        rules.push(["-o", wg, "-j", "DROP"].map(str::to_owned).to_vec());
+        rules.push(["-i", wg, "-j", "DROP"].map(str::to_owned).to_vec());
+
+        run_tolerated(
+            "iptables",
+            &["-w", "5", "-t", "filter", "-N", WG_FORWARD_CHAIN],
+        )
+        .await;
+        run(
+            "iptables",
+            &["-w", "5", "-t", "filter", "-F", WG_FORWARD_CHAIN],
+        )
+        .await?;
+        keep_wireguard_forward_first().await?;
+        for rule in rules {
+            let mut args = vec!["-w", "5", "-t", "filter", "-A", WG_FORWARD_CHAIN];
+            args.extend(rule.iter().map(String::as_str));
+            run("iptables", &args).await?;
+        }
+        ensure_rule("filter", "INPUT", &["-i", wg, "-j", "DROP"]).await?;
+        ensure_rule(
+            "mangle",
+            "FORWARD",
+            &[
+                "-o",
+                wg,
+                "-p",
+                "tcp",
+                "--tcp-flags",
+                "SYN,RST",
+                "SYN",
+                "-j",
+                "TCPMSS",
+                "--clamp-mss-to-pmtu",
+            ],
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Removes mesh firewall and proxy-ARP state. The WireGuard link owns
+    /// its routes, which the kernel removes with that link.
+    pub async fn teardown_wireguard_mesh(&self) -> Result<(), NetError> {
+        for bridge in minga_bridges().await? {
+            run_tolerated(
+                "sysctl",
+                &["-w", &format!("net.ipv4.conf.{bridge}.proxy_arp=0")],
+            )
+            .await;
+        }
+        remove_wireguard_rules().await;
         Ok(())
     }
 
@@ -493,6 +955,7 @@ impl NetworkSetup {
         run("ip", &["-n", ns, "link", "set", "lo", "up"]).await?;
 
         let mut first = true;
+        let mut task_veths = Vec::with_capacity(attachments.len());
         for att in attachments {
             if !att.subnet.contains(att.ip) {
                 return Err(NetError::IpOutsideSubnet(
@@ -506,6 +969,7 @@ impl NetworkSetup {
             let gw = gateway_of(&att.subnet).expect("bridge ensured => gateway exists");
             let prefix = att.subnet.prefix_len();
             let (vh, vc) = veth_names(task_id, &att.network_id);
+            task_veths.push(vh.clone());
 
             // A stale pair from a crashed run must not fail setup.
             run_tolerated("ip", &["link", "del", &vh]).await;
@@ -582,14 +1046,19 @@ impl NetworkSetup {
         let resolv_conf = self.resolv_conf_path(ns);
         tokio::fs::write(&resolv_conf, resolv).await?;
 
-        // Record what to tear down.
+        // Record what to tear down before installing source filters so a
+        // partial iptables failure can still be rolled back.
         let state = TaskNetState {
+            format_version: TASK_NET_STATE_FORMAT_VERSION,
             ips: attachments.iter().map(|a| a.ip).collect(),
             ports: ports.to_vec(),
+            veths: task_veths,
         };
         let raw = serde_json::to_vec(&state)?;
         tokio::fs::write(self.state_dir.join(format!("{ns}.json")), raw).await?;
-
+        for (veth, attachment) in state.veths.iter().zip(attachments) {
+            ensure_task_source_rules(veth, attachment.ip).await?;
+        }
         Ok(TaskNetns {
             netns_path: ns_path,
             resolv_conf,
@@ -603,6 +1072,9 @@ impl NetworkSetup {
 
         if let Ok(raw) = tokio::fs::read(&state_path).await {
             if let Ok(state) = serde_json::from_slice::<TaskNetState>(&raw) {
+                for (veth, ip) in state.veths.iter().zip(&state.ips) {
+                    remove_task_source_rules(veth, *ip).await;
+                }
                 if let Some(ip) = state.ips.first() {
                     for port in &state.ports {
                         let Some(published) = port.published else {
@@ -627,6 +1099,174 @@ impl NetworkSetup {
         let _ = tokio::fs::remove_file(resolv_conf.with_extension("hosts")).await;
         let _ = tokio::fs::remove_file(resolv_conf).await;
         let _ = tokio::fs::remove_file(&state_path).await;
+        Ok(())
+    }
+    /// Reinstalls source-IP guards for tasks that survived a node restart.
+    pub async fn reconcile_task_source_filters(&self) -> Result<(), NetError> {
+        let mut entries = match tokio::fs::read_dir(&self.state_dir).await {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let namespaces = output("ip", &["netns", "list"]).await?;
+                if namespaces.lines().any(|line| {
+                    line.split_whitespace()
+                        .next()
+                        .is_some_and(|namespace| namespace.starts_with("minga-"))
+                }) {
+                    return Err(NetError::Command {
+                        cmd: format!("read task network state {}", self.state_dir.display()),
+                        stderr: "active task namespaces exist without state files".into(),
+                    });
+                }
+                self.unblock_task_networking().await?;
+                return Ok(());
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let namespaces = output("ip", &["netns", "list"]).await?;
+        let mut untracked_namespaces: HashSet<String> = namespaces
+            .lines()
+            .filter_map(|line| line.split_whitespace().next())
+            .filter(|namespace| namespace.starts_with("minga-"))
+            .map(str::to_owned)
+            .collect();
+        let host_links = output("ip", &["-o", "link", "show"]).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+                continue;
+            }
+            let Some(namespace) = path.file_stem().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            if !untracked_namespaces.remove(namespace) {
+                continue;
+            }
+            let raw = tokio::fs::read(&path).await?;
+            let mut state: TaskNetState = serde_json::from_slice(&raw)?;
+            if state.format_version > TASK_NET_STATE_FORMAT_VERSION {
+                return Err(NetError::Command {
+                    cmd: format!("read task state {}", path.display()),
+                    stderr: format!(
+                        "unsupported task network state version {}",
+                        state.format_version
+                    ),
+                });
+            }
+            if state.veths.len() != state.ips.len() {
+                let task_links = output("ip", &["-n", namespace, "-o", "link", "show"]).await?;
+                let task_addresses =
+                    output("ip", &["-n", namespace, "-o", "-4", "addr", "show"]).await?;
+                state.veths = state
+                    .ips
+                    .iter()
+                    .map(|ip| task_veth_for_ip(&task_links, &task_addresses, &host_links, *ip))
+                    .collect::<Option<Vec<_>>>()
+                    .ok_or_else(|| NetError::Command {
+                        cmd: format!("ip -n {namespace} -o -4 addr show"),
+                        stderr: "could not map a task IP to its host veth".into(),
+                    })?;
+            }
+            if state.format_version != TASK_NET_STATE_FORMAT_VERSION {
+                state.format_version = TASK_NET_STATE_FORMAT_VERSION;
+            }
+            tokio::fs::write(&path, serde_json::to_vec(&state)?).await?;
+            for (veth, ip) in state.veths.iter().zip(&state.ips) {
+                ensure_task_source_rules(veth, *ip).await?;
+            }
+        }
+        if let Some(namespace) = untracked_namespaces.into_iter().next() {
+            return Err(NetError::Command {
+                cmd: format!("read task network state {}", self.state_dir.display()),
+                stderr: format!("active task namespace {namespace} has no state file"),
+            });
+        }
+        self.unblock_task_networking().await?;
+        Ok(())
+    }
+
+    /// Blocks all task bridge ingress and egress while source guards are
+    /// being recovered or repaired.
+    pub async fn block_task_networking(&self) -> Result<(), NetError> {
+        run_tolerated(
+            "iptables",
+            &["-w", "5", "-t", "filter", "-N", TASK_FAIL_CLOSED_IN_CHAIN],
+        )
+        .await;
+        run(
+            "iptables",
+            &["-w", "5", "-t", "filter", "-F", TASK_FAIL_CLOSED_IN_CHAIN],
+        )
+        .await?;
+        run(
+            "iptables",
+            &[
+                "-w",
+                "5",
+                "-t",
+                "filter",
+                "-A",
+                TASK_FAIL_CLOSED_IN_CHAIN,
+                "-i",
+                "minga-+",
+                "-j",
+                "DROP",
+            ],
+        )
+        .await?;
+        run_tolerated(
+            "iptables",
+            &["-w", "5", "-t", "filter", "-N", TASK_FAIL_CLOSED_OUT_CHAIN],
+        )
+        .await;
+        run(
+            "iptables",
+            &["-w", "5", "-t", "filter", "-F", TASK_FAIL_CLOSED_OUT_CHAIN],
+        )
+        .await?;
+        run(
+            "iptables",
+            &[
+                "-w",
+                "5",
+                "-t",
+                "filter",
+                "-A",
+                TASK_FAIL_CLOSED_OUT_CHAIN,
+                "-o",
+                "minga-+",
+                "-j",
+                "DROP",
+            ],
+        )
+        .await?;
+        keep_wireguard_forward_first().await
+    }
+
+    async fn unblock_task_networking(&self) -> Result<(), NetError> {
+        // Keep the empty chains and their hooks installed. A later fail-closed
+        // transition can populate them without a window before the jump exists.
+        for chain in [TASK_FAIL_CLOSED_IN_CHAIN, TASK_FAIL_CLOSED_OUT_CHAIN] {
+            let args = ["-w", "5", "-t", "filter", "-S", chain];
+            let result = tokio::process::Command::new("iptables")
+                .args(args)
+                .output()
+                .await
+                .map_err(|error| NetError::Command {
+                    cmd: format!("iptables {}", args.join(" ")),
+                    stderr: error.to_string(),
+                })?;
+            if result.status.success() {
+                run("iptables", &["-w", "5", "-t", "filter", "-F", chain]).await?;
+            } else {
+                let stderr = String::from_utf8_lossy(&result.stderr);
+                if !stderr.contains("No chain/target/match by that name") {
+                    return Err(NetError::Command {
+                        cmd: format!("iptables {}", args.join(" ")),
+                        stderr: stderr.trim().to_string(),
+                    });
+                }
+            }
+        }
         Ok(())
     }
 }
@@ -660,6 +1300,28 @@ mod tests {
         assert!(vh.len() <= 15 && vc.len() <= 15);
         assert_eq!(vh, veth_names("shop.web.1", "shop_default").0);
         assert_ne!(vh, veth_names("shop.web.2", "shop_default").0);
+    }
+    #[test]
+    fn task_ip_maps_to_host_veth_after_restart() {
+        let task_links = "2: at0@if41: <BROADCAST,UP> mtu 1500";
+        let task_addresses = "2: at0    inet 10.242.0.10/24 scope global at0";
+        let host_links = "41: ta0@if2: <BROADCAST,UP> mtu 1500";
+        assert_eq!(
+            task_veth_for_ip(
+                task_links,
+                task_addresses,
+                host_links,
+                Ipv4Addr::new(10, 242, 0, 10),
+            ),
+            Some("ta0".into())
+        );
+    }
+    #[test]
+    fn task_state_v0_defaults_veths_for_migration() {
+        let state: TaskNetState =
+            serde_json::from_str(r#"{"ips":["10.242.0.10"],"ports":[]}"#).unwrap();
+        assert_eq!(state.format_version, 0);
+        assert!(state.veths.is_empty());
     }
 
     #[test]
