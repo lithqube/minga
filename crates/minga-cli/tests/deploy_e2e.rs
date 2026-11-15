@@ -10,6 +10,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
+use minga_bus::EventBus;
 use minga_node::NodeIdentity;
 use minga_state::types::ResourceSpec;
 use minga_state::StateStore;
@@ -44,25 +45,28 @@ async fn cluster() -> (Arc<StateStore>, String, tempfile::TempDir) {
             .unwrap(),
     );
 
-    minga_node::register_self(
-        &store,
-        &NodeIdentity {
-            node_id: 1,
-            address: "127.0.0.1:50051".to_string(),
-            labels: Default::default(),
-            capacity: ResourceSpec {
-                cpus: 8.0,
-                memory_bytes: 32 * 1024 * 1024 * 1024,
-                gpus: 0,
-            },
-            role: Default::default(),
-        },
-    )
-    .await
-    .unwrap();
+    store
+        .upsert_node(
+            NodeIdentity {
+                node_id: 1,
+                address: "127.0.0.1:50051".to_string(),
+                labels: Default::default(),
+                capacity: ResourceSpec {
+                    cpus: 8.0,
+                    memory_bytes: 32 * 1024 * 1024 * 1024,
+                    gpus: 0,
+                },
+                role: Default::default(),
+            }
+            .cluster_node(),
+        )
+        .await
+        .unwrap();
 
-    // The scheduler the deploy waits on: place every 200ms.
-    let scheduler = minga_scheduler::Scheduler::new(store.clone());
+    let bus = minga_bus::MemoryBus::new();
+    bus.refresh_lease(1, b"registration").await.unwrap();
+
+    let scheduler = minga_scheduler::Scheduler::with_bus(store.clone(), bus);
     tokio::spawn(async move { scheduler.run(Duration::from_millis(200)).await });
 
     let server = minga_api::ApiServer::start(store.clone(), "127.0.0.1:0")

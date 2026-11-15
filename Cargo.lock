@@ -2155,6 +2155,7 @@ dependencies = [
  "clap",
  "libc",
  "minga-api",
+ "minga-bus",
  "minga-node",
  "minga-scheduler",
  "minga-state",

@@ -55,7 +55,7 @@ pub use agent::{
 pub use containerd::ContainerdRuntime;
 #[cfg(target_os = "linux")]
 pub use netns::{system_upstream_resolver, NetworkSetup, TaskNetAttachment};
-pub use registration::{host_capacity, register_self, NodeIdentity, NodeMembership};
+pub use registration::{host_capacity, run_node_registration, NodeIdentity, NodeMembership};
 pub use runtime::{
     shared_runtime, ContainerInfo, ContainerStatus, MockRuntime, Runtime, RuntimeError,
 };

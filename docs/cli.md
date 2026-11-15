@@ -44,8 +44,9 @@ minga api     --node-id <ID> --bind <ADDR> [flags]   # Docker Engine API (v1.41 
 ```
 
 Every role is a Raft voter with its own `--node-id` and `--data-dir`, including
-`minga api`. `manager` and `worker` take the same flags; `api` takes only the
-Raft flags plus `--api-bind` and `--api-token`.
+`minga api`. `manager` and `worker` take the same flags; `api` takes the Raft
+flags, `--api-bind` and `--api-token`, plus NATS connection flags for lease-aware
+placement.
 
 **Raft flags (all roles)**
 
@@ -79,6 +80,8 @@ Raft flags plus `--api-bind` and `--api-token`.
 | --- | --- | --- |
 | `--api-bind <ADDR>` | `0.0.0.0:2375` | Every interface by default. Bind `127.0.0.1:2375` unless containers (Traefik) must reach it, and then set a token. |
 | `--api-token`, `MINGA_API_TOKEN` | none | Required as `Authorization: Bearer <token>`, or as the Basic-auth password for Traefik's Swarm provider. Set it through the environment (an `EnvironmentFile`), not the flag, so it stays out of process listings. Without a token the API is unauthenticated; from 1.2.0 it also refuses requests with an `Origin` header or a `Host` that is a DNS name other than `localhost` or `*.localhost`, and warns at start when bound off loopback. |
+| `--nats-url <URL>`, `MINGA_NATS_URL` | `nats://127.0.0.1:4222` | NATS used by the API node's placement scheduler to check server-expiring node leases. |
+| `--nats-token`, `MINGA_NATS_TOKEN` | none | NATS client token, when required. |
 
 ### Client commands
 
@@ -193,8 +196,8 @@ stack or context does not exist.
 | --- | --- | --- |
 | `MINGA_API_URL` | `minga deploy`, `minga state` | API URL (default `http://127.0.0.1:2375`). |
 | `MINGA_API_TOKEN` | `minga api`; `minga deploy`, `minga state` | The API token, server and client side. |
-| `MINGA_NATS_URL` | Node roles, `minga logs`, `minga agent ls` | NATS URL. |
-| `MINGA_NATS_TOKEN` | Node roles | NATS token (not used over TLS). |
+| `MINGA_NATS_URL` | Node roles, `minga api`, `minga logs`, `minga agent ls` | NATS URL. |
+| `MINGA_NATS_TOKEN` | Node roles, `minga api` | NATS token (not used over TLS). |
 | `MINGA_NATS_TLS_CA`, `MINGA_NATS_TLS_CERT`, `MINGA_NATS_TLS_KEY`, `MINGA_NATS_TLS_SERVER_NAME` | Everything that connects to NATS | Client certificate settings for a `tls://` URL. |
 | `MINGA_NATS_REPLICAS` | Node roles | Same as `--nats-replicas`. |
 | `MINGA_NATS_SERVER_BIN` | `minga manager` | The `nats-server` the sidecar runs, instead of the one next to `minga` or on `PATH`. |

@@ -30,6 +30,7 @@ thiserror.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
+minga-bus = { path = "../minga-bus" }
 minga-api = { path = "../minga-api" }
 minga-node = { path = "../minga-node" }
 minga-scheduler = { path = "../minga-scheduler" }
