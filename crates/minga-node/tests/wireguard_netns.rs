@@ -646,16 +646,16 @@ async fn wireguard_routes_shared_tasks_and_isolates_other_networks() -> Result<(
     ping(&task_c, "10.243.0.1", None)?;
     // Prove the underlay path exists before the overlay's cross-network drop.
     ping(&task_a, "10.243.0.30", None).map_err(|error| {
-        let node_underlay_ping = ping(&node_a, "198.18.0.3", None)
-            .unwrap_or_else(|ping_error| ping_error);
+        let node_underlay_ping =
+            ping(&node_a, "198.18.0.3", None).map_or_else(|error| error, |_| "ok".into());
         let node_a_neighbor =
             ip_ns(&node_a, &["neigh", "show"]).unwrap_or_else(|route_error| route_error);
         let node_a_forward =
             in_ns(&node_a, "iptables", &["-S", "FORWARD"]).unwrap_or_else(|rule_error| rule_error);
         let node_c_forward =
             in_ns(&node_c, "iptables", &["-S", "FORWARD"]).unwrap_or_else(|rule_error| rule_error);
-        let bridge_ping = ping(&node_a, "10.243.0.1", Some("10.242.0.1"))
-            .unwrap_or_else(|ping_error| ping_error);
+        let bridge_ping =
+            ping(&node_a, "10.243.0.1", Some("10.242.0.1")).map_or_else(|error| error, |_| "ok".into());
         let node_a_routes =
             ip_ns(&node_a, &["-4", "route", "show"]).unwrap_or_else(|route_error| route_error);
         let node_c_routes =
