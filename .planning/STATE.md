@@ -1,6 +1,6 @@
 # Planning state
 
-**Current:** Phase 12 — Managers-only Raft, **planned** 2026-11-15 (`.planning/phases/12-managers-only-raft/12-PLAN.md`). Next action: 12-01, write ADR 0006. Shipped since Phase 11, outside this workspace: v1.0.1, v1.0.2, v1.1.0, v1.1.1, v1.2.0 (see `CHANGELOG.md`).
+**Current:** Phase 12 — Managers-only Raft, **planned** 2026-11-15 (`.planning/phases/12-managers-only-raft/12-PLAN.md`). Next action: 12-01, write ADR 0006. Phase 13 (WireGuard mesh and routing mesh) is planned after it (`.planning/phases/13-wireguard-mesh/13-PLAN.md`); its 13-02 (unique subnets) can land any time. Shipped since Phase 11, outside this workspace: v1.0.1, v1.0.2, v1.1.0, v1.1.1, v1.2.0 (see `CHANGELOG.md`).
 
 ---
 

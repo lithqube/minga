@@ -20,3 +20,14 @@ The controls below are engineering targets, **not** an assertion of certificatio
 - [ ] **MOR-NATS** With 3 or 5 managers, their sidecars form one NATS cluster over route TLS, and workers connect as clients. Losing one manager keeps the bus. External NATS stays supported.
 - [ ] **MOR-PART** A worker cut off from the bus keeps running its tasks. The leader reschedules them after the lease expires, and the worker stops the moved copies when the link heals. The docs state the at-least-once window.
 - [ ] **MOR-PROOF** A live 3-manager plus 2-worker cluster with mTLS demonstrates each item above. Docs, CHANGELOG and the site roadmap are updated.
+
+# Phase 13 requirements (WireGuard mesh and routing mesh)
+
+- [ ] **WG-ADR** ADR 0007 records the routed /32 design, the NAT relay with its trust statement, the routing mesh, and the rejected options (VXLAN over WireGuard, a full mesh, IPVS, a userspace data path), before code moves.
+- [ ] **WG-SUBNET** No two networks can share a subnet. The leader allocates subnets and stores them in Raft, and overlaps fail loudly. Network `driver_opts` accepts `encrypted` and rejects anything else.
+- [ ] **WG-KEYS** One kernel WireGuard interface and keypair per node. The private key stays in the data directory (0600) and never appears in Raft, on the bus, in logs or on a command line. Single-host clusters are unchanged.
+- [ ] **WG-PEERS** Each node gets its peer set from the leader through `MINGA_ASSIGN`: peers only for shared networks plus the managers, applied as a diff.
+- [ ] **WG-NAT** Workers behind NAT with no inbound port reach every other node: directly when one side is reachable, otherwise relayed through a home manager that fails over when its lease expires.
+- [ ] **WG-ISOL** Network isolation and anti-spoofing hold across nodes. A task can't reach another network on another node, or send as another node's task.
+- [ ] **WG-INGRESS** `mode: ingress` (the default) answers on every node and load-balances to tasks anywhere. `mode: host` keeps per-node publishing and the client IP. Port conflicts fail cluster-wide with a 409.
+- [ ] **WG-PROOF** Separate VMs with one worker behind NAT demonstrate each item above, with iperf3 numbers for direct and relayed paths. Docs, CHANGELOG and the site roadmap are updated.
