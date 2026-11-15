@@ -11,6 +11,17 @@
 - Managers can join and leave Raft at runtime through admin-token-protected
   membership endpoints. Manager sidecars can form a route-TLS NATS cluster;
   `minga migrate-v1` previews the voter set before applying the conversion.
+- Phase 12 is live: only managers vote in Raft; workers receive assignments,
+  leases and task status over identity-scoped JetStream mTLS. Managers can join
+  and leave through the authenticated API, which now runs in `minga manager`.
+- T1–T3 live proofs covered manager restart, worker partition/rejoin, zero
+  workers, runtime worker join, manager failover and membership changes. A
+  real v1.2.0 cluster migrated with its service and running container intact;
+  the upgraded worker adopted the same task after joining as a bus client.
+  See [supported topologies](docs/topologies.md) for evidence and limits.
+- Known limits: cross-node container networking still needs the WireGuard
+  mesh; T4’s roughly 5,000-worker scale has not been load-tested; `MINGA_LOGS`
+  remains single-replica and is unavailable while its hosting server is down.
 
 
 ## [1.2.0] — 2026-11-13

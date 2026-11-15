@@ -142,6 +142,7 @@ pub fn worker_acl(node_id: u64) -> (Vec<String>, Vec<String>) {
         format!("$JS.API.DIRECT.GET.KV_MINGA_ASSIGN.{own_tasks}"),
         format!("$JS.API.DIRECT.GET.KV_MINGA_ASSIGN.{networks}"),
         format!("$JS.API.DIRECT.GET.KV_MINGA_STATUS.{own_status}"),
+        format!("$JS.API.DIRECT.GET.KV_MINGA_LEASES.{own_lease}"),
     ];
     let subscribe = vec![
         own_tasks,

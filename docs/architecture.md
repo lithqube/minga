@@ -1,32 +1,35 @@
 # Architecture notes
 
-How Minga fits together **as of `v1.1.0`**, the structural limits that come with it, and the plan to remove them. Settled decisions live in the [ADRs](adr/); this page describes the code as it is.
+How Minga fits together **as of v1.2.0**, after Phase 12. Settled design decisions live in the [ADRs](adr/); this page describes the current code and the structural limits that remain.
 
 ## Processes and state
 
 ```mermaid
 flowchart LR
-  subgraph voters["Raft voters (static membership, set at first start)"]
-    M["minga manager<br/>scheduler + supervisor"]
-    A["minga api<br/>Docker API + scheduler"]
-    W["minga worker<br/>supervisor"]
+  subgraph managers["Managers: the only Raft voters"]
+    API["Docker Engine API"] --> R[("Raft<br/>desired state + placement")]
+    S["Scheduler"] --> R
+    S -- per-node assignments --> A[("MINGA_ASSIGN KV")]
   end
-  R[("openraft + redb<br/>services, tasks, nodes,<br/>networks, secrets refs")]
-  N[("NATS JetStream<br/>MINGA_COMMANDS · MINGA_EVENTS<br/>MINGA_LOGS · MINGA_DEAD_LETTERS<br/>MINGA_STATUS · MINGA_LEASES")]
-  M & A & W <--> R
-  M -- sidecar child process --> N
-  M & W -- commands, status, logs --> N
+  J[("NATS JetStream<br/>MINGA_EVENTS · MINGA_LOGS<br/>MINGA_STATUS · MINGA_LEASES")]
+  M["Manager supervisor"] --> J
+  M -- route TLS --> J
+  A --> J
+  subgraph workers["Workers: no Raft"]
+    W["Supervisor"] --> C["containerd / wasmtime"]
+    W -- assignments, status, lease --> J
+  end
 ```
 
 | Concern | Where it lives | Notes |
 | --- | --- | --- |
-| Desired state (services, networks, secret refs, configs) | Raft | Written through the Docker API (`minga deploy` uses it too). Writes are forwarded to the leader. |
-| Placement (tasks with node and IPs) | Raft | The scheduler acts only on the leader, and only managers and `minga api` run one. A worker leader means no placement (limit 1). |
-| Task lifecycle (`running`/`stopped`) | Raft | Written by the supervisor so Docker API consumers (Traefik) see live state. |
-| Node membership lease | Raft | `RenewNodeLease` every 10s, 30s TTL. One atomic command, so it can't undo a drain or recreate a removed node. |
-| Assign/stop commands | JetStream work queue | Plus the supervisor's polling fallback against its local Raft replica (below). |
-| Task status, logs, agent results | JetStream | `minga logs` reads the retained backlog. |
-| Readiness | In-process | `/readyz`: a Raft leader is known, and on nodes the bus answers. |
+| Desired state (services, networks, volumes, secret/config refs) | Raft | Written through the Docker Engine API; `minga deploy` uses the same path. Writes are forwarded to the leader. |
+| Placement (tasks with node and IPs) | Raft | Only the elected manager leader schedules. |
+| Task lifecycle and failure details | `MINGA_STATUS` JetStream KV | Supervisors write actual state; rollouts and Docker API task views combine it with Raft desired state. |
+| Node liveness and registration | `MINGA_LEASES` JetStream KV | Server-stamped leases expire after 30 seconds. The leader registers first sightings in Raft without overwriting operator labels or availability. |
+| Per-node task and network assignments | `MINGA_ASSIGN` JetStream KV | The leader projects placement; workers read only their own assignment keys. It is rebuilt from Raft after election. |
+| Lifecycle events, logs and agent results | JetStream | `minga logs` reads the retained log backlog. `MINGA_LOGS` is single-replica; it is not HA storage. |
+| Readiness | In-process | `/readyz` requires a known Raft leader and a responding bus. |
 
 ## Persisted format
 
@@ -36,51 +39,63 @@ The wire frame carries the format version but no schema revision, so nodes of on
 
 ## The deploy path
 
-`minga deploy` translates Compose to state types, re-encodes them as Docker `ServiceSpec`s and posts them to `minga api`, which translates them back. Two translators (`minga-scheduler/src/translate.rs` and `minga-api/src/translate.rs`) must agree. Fields with no Docker equivalent ride in labels; for example, the agent spec travels as `minga.agent`. `deploy_e2e::deploy_keeps_restart_policy_and_agent_spec` guards the round trip.
+`minga deploy` translates Compose to Docker `ServiceSpec`s and posts them to the Docker Engine API served by `minga manager`. The manager writes desired state through Raft; its scheduler projects per-node assignments into JetStream. Supervisors report actual task state to `MINGA_STATUS`. The Compose and Docker API translators must agree; `deploy_e2e::deploy_keeps_restart_policy_and_agent_spec` guards the round trip.
 
-## Known structural limits
+## Remaining structural limits
 
-These are deliberate `v1.1.0` trade-offs, listed so nobody builds on them by accident.
+Phase 12 removes the worker-voter, Raft-liveness and dual-dispatch limits. Two
+limits remain:
 
-1. **Every node is a Raft voter.** Workers and `minga api` open a full `StateStore`, and membership is the `--peer` list at first start. Consequences:
-   - Quorum depends on the number of workers, so flaky edge workers can stall deploys.
-   - No node can join a running cluster.
-   - A node started without `--peer` bootstraps its own one-node cluster.
-   - Workers run no scheduler, and schedulers only act when their own process is leader. If a worker wins an election, placement stops until leadership moves to a manager or `minga api`.
+4. **Agent sandboxes have no host capabilities.** Modules are instantiated
+   with zero imports: no WASI, network, env or clock. `memory_limit` and
+   `token_budget` are not enforced. The egress proxy injects provider
+   credentials itself (ADR 0003).
+5. **No container networking across nodes.** Bridges, network namespaces and
+   DNAT are per host. WireGuard configuration is generated but not applied;
+   communicating services must stay on one node.
 
-   The 5,000-node target in ADR 0001 can't be reached this way.
-2. **Liveness goes through Raft.** This breaks the "only desired state through Raft" rule, though the lease is now an atomic command. The lease is the node's wall clock compared with the leader's, so clock skew over 30s misjudges liveness. The bus lease (`refresh_lease`/`is_alive`) is maintained but placement doesn't use it.
-3. **Two dispatch paths, one source of truth.** Workers start tasks from bus commands and by reconciling against their Raft replica. A bus Assign is only a hint: the node starts the task only if its Raft replica assigns it to this node, and always from the Raft spec, never the bus payload, so anyone able to publish on the bus cannot start their own spec. Every running task is therefore a Raft task, and anything Raft stops assigning here is stopped, whether or not a Stop command arrives. On start the supervisor adopts running containers Raft still assigns to it and stops the rest, so tasks removed while it was down do not keep running. `minga api`'s scheduler publishes no bus commands, so its tasks rely on the Raft path alone.
-4. **Agent sandboxes have no host capabilities.** Modules are instantiated with zero imports: no WASI, network, env or clock. `memory_limit` and `token_budget` aren't enforced. The egress proxy is ready for them: it identifies callers by a per-run token the node mints, and it injects the provider key itself (ADR 0003).
-5. **No container networking across nodes.** Bridges, netns and DNAT are per host. WireGuard config is generated but never applied.
+The T4 target of roughly 5,000 workers has not had a load test. The functional
+architecture has no per-worker Raft replication or heartbeat writes.
 
-## Target shape
+## Managers-only Raft
 
 ```mermaid
 flowchart LR
-  subgraph managers["Managers: the only Raft voters (3 or 5)"]
-    API["Docker API"] --> R[("Raft<br/>desired state")]
+  subgraph managers["Managers: 3 or 5 Raft voters"]
+    API["Docker Engine API"] --> R[("Raft<br/>desired state + placement")]
     S["Scheduler"] --> R
-    S -- desired tasks per node --> KV
+    S -- per-node tasks --> A[("MINGA_ASSIGN")]
   end
-  KV[("JetStream KV<br/>assignments · MINGA_STATUS · MINGA_LEASES")]
-  subgraph workers["Workers: no Raft"]
-    SUP["Supervisor"] -- watch assignments --> KV
-    SUP -- status + lease --> KV
-    SUP --> RT["containerd / wasmtime"]
+  J[("Clustered JetStream<br/>route TLS")]
+  subgraph workers["Workers: plain bus clients"]
+    W["Supervisor"] --> C["containerd / wasmtime"]
+    W -- own assignment keys --> A
+    W -- status + lease --> J
   end
-  API -- actual state --> KV
+  A --> J
+  M["Manager sidecars"] <-->|route TLS| J
 ```
 
-- Workers stop opening a `StateStore`. They watch a per-node assignment KV, report status, and keep a lease stamped by the server (not the node's clock).
-- There's one dispatch path, and `minga api` folds into the manager process.
-- Joining is a managers-only operation (`change_membership`). Existing clusters migrate by shrinking membership down to the managers.
+- Only managers vote. Desired state, placement and manager membership go
+  through Raft; task status, node leases and worker assignments go through
+  JetStream.
+- Workers have no Raft data directory or peer list. They watch only their own
+  assignment keys and report status and server-expiring leases over mTLS.
+- The manager process serves the Docker Engine API; there is no separate
+  `minga api` process.
+- Managers join and leave at runtime through the admin-token-protected
+  membership API. A v1.2.0 migration removes worker voters while retaining
+  services and desired state.
 
-See [ADR 0006: Workers Leave Raft](adr/0006-workers-leave-raft.md) for the decisions behind this target shape. It must be merged before code moves.
+See [ADR 0006: Workers Leave Raft](adr/0006-workers-leave-raft.md) for the
+settled decisions and [supported topologies](topologies.md) for T1–T4.
 
-## Order of work
+## Next work
 
-1. Managers-only Raft and worker join (limits 1–3).
-2. WireGuard mesh (limit 5).
-3. In-process image pull with registry credentials, honoring `--containerd-socket`. Done: the pull goes through containerd's Transfer service (containerd 1.7 or newer), reads inline `auths`, `credsStore` and `credHelpers`, and hands the login to the daemon over a stream, so it is never on a command line. On containerd older than 1.7 an anonymous pull falls back to `ctr --address`, and a pull that needs a login fails.
-4. Sandbox host capabilities: WASI with explicit grants, outbound HTTP only to the local egress proxy, host-injected workload identity, enforced memory limits (limit 4).
+1. WireGuard mesh and cross-node container networking.
+2. Sandbox host capabilities: WASI with explicit grants, outbound HTTP only
+   through the local egress proxy, host-injected workload identity and
+   enforced memory limits.
+
+Image pulls already use containerd’s Transfer service, read inline auth,
+`credsStore` and `credHelpers`, and keep credentials off command lines.

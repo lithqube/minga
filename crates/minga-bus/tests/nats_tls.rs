@@ -528,7 +528,11 @@ async fn worker_certificate_cannot_write_assignments_or_other_nodes_status_and_l
         .await
         .unwrap();
     manager
-        .put_assignment("node.8.task.secret", b"other node")
+        .put_assignment("node.8.task.foreign", b"foreign")
+        .await
+        .unwrap();
+    manager
+        .put_assignment("net.test", b"network")
         .await
         .unwrap();
     manager
@@ -550,14 +554,31 @@ async fn worker_certificate_cannot_write_assignments_or_other_nodes_status_and_l
         .expect("watch remains open");
     assert_eq!(event.key, "node.7.task.allowed");
     assert_eq!(event.value.as_deref(), Some(&b"assignment"[..]));
-
     assert_eq!(
         worker_bus
             .get_assignment("node.7.task.allowed")
             .await
-            .unwrap(),
-        Some(b"assignment".to_vec())
+            .unwrap()
+            .as_deref(),
+        Some(&b"assignment"[..])
     );
+    let assignments = worker_bus.list_assignments("node.7.task.").await.unwrap();
+    assert_eq!(
+        assignments
+            .iter()
+            .map(|(key, _)| key.as_str())
+            .collect::<Vec<_>>(),
+        ["node.7.task.allowed"]
+    );
+    let networks = worker_bus.list_assignments("net.").await.unwrap();
+    assert_eq!(
+        networks
+            .iter()
+            .map(|(key, _)| key.as_str())
+            .collect::<Vec<_>>(),
+        ["net.test"]
+    );
+
     // Enough data to cross several flow-control windows: the worker must be
     // allowed to answer the server's flow-control requests.
     let big = vec![7u8; 512 * 1024];
@@ -639,6 +660,14 @@ async fn worker_certificate_cannot_write_assignments_or_other_nodes_status_and_l
             .as_deref(),
         Some(&b"running"[..])
     );
+    assert_eq!(
+        worker_bus
+            .get_status("node.7.task.allowed")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(&b"running"[..])
+    );
     let own_lease = tokio::time::timeout(
         Duration::from_secs(2),
         publish_jetstream_message(&worker, "$KV.MINGA_LEASES.lease.node.7", b"alive"),
@@ -649,6 +678,7 @@ async fn worker_certificate_cannot_write_assignments_or_other_nodes_status_and_l
         "worker's own lease write should be authorized: {own_lease:?}"
     );
     assert!(manager.is_alive(7).await.unwrap());
+    assert!(worker_bus.is_alive(7).await.unwrap());
 
     for subject in [
         "$KV.MINGA_ASSIGN.node.7.task.forbidden",

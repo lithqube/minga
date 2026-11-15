@@ -86,12 +86,16 @@ The API waits for catch-up before promotion. Remove it with
 **Joining a worker**
 
 Issue a worker identity certificate with `minga tls issue-node --ca-dir DIR
---out-dir DIR --node-id ID --role worker`. On the worker, set
-`MINGA_NATS_TLS_CA`, `MINGA_NATS_TLS_CERT`, `MINGA_NATS_TLS_KEY`, and
-`MINGA_NATS_TLS_SERVER_NAME`, then run:
+--out-dir DIR --node-id ID --role worker`. Manager certificates issued with
+`--role manager` also carry the `localhost` SAN for the built-in sidecar's
+local TLS client and `minga-manager-ID` for remote clients. Set
+`MINGA_NATS_TLS_SERVER_NAME=localhost` on a manager using its built-in sidecar;
+on workers, use the manager hostname from the URL (for example,
+`minga-manager-1`) so it matches the manager certificate SAN. Set
+`MINGA_NATS_TLS_CA`, `MINGA_NATS_TLS_CERT` and `MINGA_NATS_TLS_KEY`, then run:
 
 ```bash
-minga worker --node-id ID --nats-url tls://manager-1:4222,tls://manager-2:4222
+minga worker --node-id ID --nats-url tls://minga-manager-1:4222,tls://minga-manager-2:4222
 ```
 
 The node ID must match the certificate identity. No Raft bind, peer list, Raft
@@ -117,7 +121,7 @@ certificate flags, or previous Raft data directory is needed.
 | `minga image pull IMAGE` | Pulls into the `minga` containerd namespace. Credentials come from `$DOCKER_CONFIG/config.json`, else `~/.docker/config.json`, and go to containerd over its API. | On the node |
 | `minga secret put ID < value` | Writes or rotates a secret value in the node's store, read from stdin. `ID` is `<stack>_<compose secret key>`. | On every node that runs the service |
 | `minga tls init-ca --dir DIR` | Creates the cluster CA (`ca.pem`, `ca-key.pem`). | Anywhere; keep `ca-key.pem` off the nodes |
-| `minga tls issue-node --ca-dir DIR --out-dir DIR --node-id ID --role worker\|manager` | Issues a node certificate with the Raft SAN and a role-bound NATS identity. Keys are written 0600. | Anywhere; copy one pair to each node |
+| `minga tls issue-node --ca-dir DIR --out-dir DIR --node-id ID --role worker\|manager` | Issues a node certificate with the Raft SAN and role-bound NATS identity; manager certificates also include `localhost` for the manager's local sidecar TLS client. Keys are written 0600. | Anywhere; copy one pair to each node |
 | `minga agent ls` | Lists running agent tasks from the bus. | Anywhere that reaches NATS |
 | `minga sandbox run --module FILE [--input DATA] [--fuel N] [--timeout SECS]`, `minga sandbox info` | Runs a WASM module once; lists the sandbox runtimes. | Anywhere |
 | `minga egress [--bind ADDR] ...` | A standalone egress proxy. `--bind` defaults to `0.0.0.0:8080`. | Anywhere |
