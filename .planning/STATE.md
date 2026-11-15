@@ -1,5 +1,9 @@
 # Planning state
 
+**Current:** Phase 12 — Managers-only Raft, **planned** 2026-11-15 (`.planning/phases/12-managers-only-raft/12-PLAN.md`). Next action: 12-01, write ADR 0006. Shipped since Phase 11, outside this workspace: v1.0.1, v1.0.2, v1.1.0, v1.1.1, v1.2.0 (see `CHANGELOG.md`).
+
+---
+
 **Phase:** 11 — First production release (`v0.1.0`)
 **Status:** **Phase 11 complete — all 7 gates landed.** `v0.1.0` is shippable: CI on every push (including daemon-backed tests that fail closed without the daemon), linux/amd64 + linux/arm64 release artifacts, `install.sh`, changelog, corrected docs.
 
