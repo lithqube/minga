@@ -29,22 +29,18 @@ async fn cluster() -> Cluster {
             .unwrap(),
     );
     // A node so services are placeable; no scheduler, so they get no tasks.
-    minga_node::register_self(
-        &store,
-        &NodeIdentity {
-            node_id: 1,
-            address: "127.0.0.1:50051".to_string(),
-            labels: Default::default(),
-            capacity: ResourceSpec {
-                cpus: 8.0,
-                memory_bytes: 32 * 1024 * 1024 * 1024,
-                gpus: 0,
-            },
-            role: Default::default(),
+    let identity = NodeIdentity {
+        node_id: 1,
+        address: "127.0.0.1:50051".to_string(),
+        labels: Default::default(),
+        capacity: ResourceSpec {
+            cpus: 8.0,
+            memory_bytes: 32 * 1024 * 1024 * 1024,
+            gpus: 0,
         },
-    )
-    .await
-    .unwrap();
+        role: Default::default(),
+    };
+    store.upsert_node(identity.cluster_node()).await.unwrap();
     let server =
         minga_api::ApiServer::start_with_auth(store, "127.0.0.1:0", Some(TOKEN.to_string()))
             .await
