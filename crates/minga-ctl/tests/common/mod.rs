@@ -8,7 +8,7 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
-use minga_bus::EventBus;
+use minga_bus::{EventBus, MemoryBus};
 use minga_node::NodeIdentity;
 use minga_state::types::{ResourceSpec, Service};
 use minga_state::StateStore;
@@ -19,6 +19,7 @@ pub const TOKEN: &str = "test-token-1234";
 pub struct Cluster {
     pub url: String,
     pub store: Arc<StateStore>,
+    pub bus: Arc<MemoryBus>,
     http: reqwest::Client,
     _dir: tempfile::TempDir,
     _server: minga_api::ApiServer,
@@ -44,13 +45,14 @@ pub async fn cluster() -> Cluster {
         role: Default::default(),
     };
     store.upsert_node(identity.cluster_node()).await.unwrap();
-    let bus = minga_bus::MemoryBus::new();
+    let bus = MemoryBus::new();
     bus.refresh_lease(1, b"registration").await.unwrap();
-    let scheduler = minga_scheduler::Scheduler::with_bus(store.clone(), bus);
+    let scheduler = minga_scheduler::Scheduler::with_bus(store.clone(), bus.clone());
     tokio::spawn(async move { scheduler.run(Duration::from_millis(100)).await });
 
-    let server = minga_api::ApiServer::start_with_auth(
+    let server = minga_api::ApiServer::start_with_bus_and_auth(
         store.clone(),
+        bus.clone(),
         "127.0.0.1:0",
         Some(TOKEN.to_string()),
     )
@@ -59,6 +61,7 @@ pub async fn cluster() -> Cluster {
     Cluster {
         url: format!("http://{}", server.addr()),
         store,
+        bus,
         http: reqwest::Client::new(),
         _dir: dir,
         _server: server,

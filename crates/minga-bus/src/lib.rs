@@ -238,6 +238,20 @@ pub struct TaskStatusReport {
     pub container_id: Option<String>,
     /// Unix timestamp in milliseconds.
     pub observed_at: u64,
+    pub restarts: u32,
+    pub last_error: Option<String>,
+    pub last_exit_code: Option<i32>,
+    /// Unix timestamp in seconds.
+    pub running_since_unix: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct LegacyTaskStatusReport {
+    task_id: String,
+    node_id: u64,
+    state: TaskActualState,
+    container_id: Option<String>,
+    observed_at: u64,
 }
 
 impl TaskStatusReport {
@@ -247,9 +261,28 @@ impl TaskStatusReport {
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        let (report, _) = bincode::serde::decode_from_slice(bytes, bincode::config::standard())
-            .map_err(|e| BusError::Serialization(e.to_string()))?;
-        Ok(report)
+        if let Ok((report, _)) =
+            bincode::serde::decode_from_slice::<Self, _>(bytes, bincode::config::standard())
+        {
+            return Ok(report);
+        }
+        let (legacy, _) = bincode::serde::decode_from_slice::<LegacyTaskStatusReport, _>(
+            bytes,
+            bincode::config::standard(),
+        )
+        .map_err(|e| BusError::Serialization(e.to_string()))?;
+        Ok(Self {
+            task_id: legacy.task_id,
+            node_id: legacy.node_id,
+            state: legacy.state,
+            container_id: legacy.container_id,
+            observed_at: legacy.observed_at,
+            restarts: 0,
+            last_error: None,
+            last_exit_code: None,
+            running_since_unix: (legacy.state == TaskActualState::Running)
+                .then_some(legacy.observed_at / 1_000),
+        })
     }
 }
 
@@ -398,5 +431,36 @@ mod tests {
         let bytes = cmd.to_bytes().unwrap();
         let decoded = Command::from_bytes(&bytes).unwrap();
         assert_eq!(cmd, decoded);
+    }
+    #[test]
+    fn task_status_decodes_pre_extension_reports() {
+        #[derive(Serialize)]
+        struct PriorTaskStatusReport {
+            task_id: String,
+            node_id: u64,
+            state: TaskActualState,
+            container_id: Option<String>,
+            observed_at: u64,
+        }
+
+        let prior = PriorTaskStatusReport {
+            task_id: "svc.1".into(),
+            node_id: 7,
+            state: TaskActualState::Running,
+            container_id: Some("container-1".into()),
+            observed_at: 123_000,
+        };
+        let bytes = bincode::serde::encode_to_vec(&prior, bincode::config::standard()).unwrap();
+        let report = TaskStatusReport::from_bytes(&bytes).unwrap();
+
+        assert_eq!(report.task_id, "svc.1");
+        assert_eq!(report.node_id, 7);
+        assert_eq!(report.state, TaskActualState::Running);
+        assert_eq!(report.container_id.as_deref(), Some("container-1"));
+        assert_eq!(report.observed_at, 123_000);
+        assert_eq!(report.restarts, 0);
+        assert_eq!(report.last_error, None);
+        assert_eq!(report.last_exit_code, None);
+        assert_eq!(report.running_since_unix, Some(123));
     }
 }

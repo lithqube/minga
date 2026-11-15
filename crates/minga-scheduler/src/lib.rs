@@ -40,11 +40,12 @@ pub mod reconcile;
 pub mod secrets;
 pub mod translate;
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use minga_bus::{Command, EventBus};
-use minga_state::types::Service;
+use minga_bus::{subjects, Command, EventBus, TaskActualState, TaskStatusReport};
+use minga_state::types::{Service, Task, TaskState};
 use minga_state::{StateError, StateStore};
 use thiserror::Error;
 
@@ -63,14 +64,33 @@ pub enum SchedulerError {
     Serialization(String),
 }
 
+/// Merges current task status from MINGA_STATUS with Raft's desired task record.
+pub fn task_with_actual_status(mut task: Task, report: Option<&TaskStatusReport>) -> Task {
+    if let Some(report) = report.filter(|report| report.node_id == task.node_id) {
+        task.state = match report.state {
+            TaskActualState::Starting => TaskState::Starting,
+            TaskActualState::Running => TaskState::Running,
+            TaskActualState::Stopped => TaskState::Stopped,
+            TaskActualState::Failed => TaskState::Failed,
+        };
+        task.restarts = report.restarts;
+        task.last_error.clone_from(&report.last_error);
+        task.last_exit_code = report.last_exit_code;
+        task.running_since_unix = report.running_since_unix;
+    } else {
+        task.state = TaskState::Starting;
+        task.running_since_unix = None;
+        task.restarts = 0;
+        task.last_error = None;
+        task.last_exit_code = None;
+    }
+    task
+}
+
 /// The scheduler: runs the reconcile loop on the Raft leader.
 ///
 /// Only the leader reconciles. Followers stay idle — if leadership
 /// changes, the new leader picks up the loop.
-///
-/// When constructed with [`Scheduler::with_bus`], the scheduler uses current
-/// bus leases to filter placement candidates and publishes task assign/stop
-/// commands to the event bus, which node supervisors consume.
 pub struct Scheduler {
     state: Arc<StateStore>,
     bus: Option<Arc<dyn EventBus>>,
@@ -128,7 +148,36 @@ impl Scheduler {
             nodes.retain(|node| live_nodes.contains(&node.id));
         }
         let services = self.state.list_services().await?;
-        let tasks = self.state.list_tasks().await?;
+        let mut tasks = self.state.list_tasks().await?;
+        if let Some(bus) = &self.bus {
+            let status_entries = match bus.list_status().await {
+                Ok(entries) => entries,
+                Err(error) => {
+                    tracing::warn!(error = %error, "cannot read task status; skipping reconciliation");
+                    return Ok(Vec::new());
+                }
+            };
+            let mut statuses = HashMap::new();
+            for (key, bytes) in status_entries {
+                if !key.starts_with("task.") {
+                    continue;
+                }
+                match TaskStatusReport::from_bytes(&bytes) {
+                    Ok(report) if key == subjects::kv_task_status(&report.task_id) => {
+                        statuses.insert(report.task_id.clone(), report);
+                    }
+                    Ok(_) => {}
+                    Err(error) => tracing::warn!(key, error = %error, "cannot decode task status"),
+                }
+            }
+            tasks = tasks
+                .into_iter()
+                .map(|task| {
+                    let status = statuses.get(&task.id);
+                    task_with_actual_status(task, status)
+                })
+                .collect();
+        }
         let mut networks = self.state.list_networks().await?;
         self.fill_subnets(&mut networks, &tasks).await?;
 

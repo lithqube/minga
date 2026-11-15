@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Supervisor lifecycle, restart counts and failure details now live in
+  `MINGA_STATUS`, not Raft. Scheduler rollouts and Docker API task views merge
+  bus actual state with Raft desired state.
+
+
 ## [1.2.0] — 2026-11-13
 
 Security fixes from a source audit of 1.1.1: the twelve P1 leads (eleven fixed

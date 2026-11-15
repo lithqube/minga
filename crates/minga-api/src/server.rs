@@ -11,6 +11,7 @@ use axum::{
     routing::{delete, get, post},
     Router,
 };
+use minga_bus::EventBus;
 use minga_state::StateStore;
 use minga_telemetry::{ReadyState, METRICS};
 use tokio::net::TcpListener;
@@ -137,8 +138,28 @@ pub fn build_router_with_auth(
     ready_state: Arc<ReadyState>,
     auth_token: Option<String>,
 ) -> Router {
-    let app_state = Arc::new(AppState::new(store));
+    build_router_with_app_state(Arc::new(AppState::new(store)), ready_state, auth_token)
+}
 
+/// Builds the router with bus-backed task actual state.
+pub fn build_router_with_bus_and_auth(
+    store: Arc<StateStore>,
+    bus: Arc<dyn EventBus>,
+    ready_state: Arc<ReadyState>,
+    auth_token: Option<String>,
+) -> Router {
+    build_router_with_app_state(
+        Arc::new(AppState::with_bus(store, bus)),
+        ready_state,
+        auth_token,
+    )
+}
+
+fn build_router_with_app_state(
+    app_state: Arc<AppState>,
+    ready_state: Arc<ReadyState>,
+    auth_token: Option<String>,
+) -> Router {
     let api_state = ApiState {
         app_state,
         auth_token: auth_token.map(Arc::from),
@@ -224,6 +245,25 @@ impl ApiServer {
         bind: &str,
         auth_token: Option<String>,
     ) -> Result<Self, ApiServerError> {
+        Self::start_inner(store, None, bind, auth_token).await
+    }
+
+    /// Starts the API server with actual task state read from the event bus.
+    pub async fn start_with_bus_and_auth(
+        store: Arc<StateStore>,
+        bus: Arc<dyn EventBus>,
+        bind: &str,
+        auth_token: Option<String>,
+    ) -> Result<Self, ApiServerError> {
+        Self::start_inner(store, Some(bus), bind, auth_token).await
+    }
+
+    async fn start_inner(
+        store: Arc<StateStore>,
+        bus: Option<Arc<dyn EventBus>>,
+        bind: &str,
+        auth_token: Option<String>,
+    ) -> Result<Self, ApiServerError> {
         let listener = TcpListener::bind(bind)
             .await
             .map_err(|e| ApiServerError::Bind(format!("cannot bind {bind}: {e}")))?;
@@ -233,8 +273,7 @@ impl ApiServer {
             .map_err(|e| ApiServerError::Bind(format!("cannot get local addr: {e}")))?
             .to_string();
 
-        // `minga api` has no bus: ready means Raft knows a leader. Spawned
-        // only once startup can no longer fail, so a failed bind leaks no task.
+        // Spawned only once startup can no longer fail, so a failed bind leaks no task.
         let ready_state = ReadyState::without_bus();
         let probe = {
             let (store, ready) = (store.clone(), ready_state.clone());
@@ -248,7 +287,11 @@ impl ApiServer {
                 }
             })
         };
-        let router = build_router_with_auth(store, Arc::new(ready_state), auth_token);
+        let ready_state = Arc::new(ready_state);
+        let router = match bus {
+            Some(bus) => build_router_with_bus_and_auth(store, bus, ready_state, auth_token),
+            None => build_router_with_auth(store, ready_state, auth_token),
+        };
 
         let handle = tokio::spawn(minga_telemetry::serve::serve_bounded(
             listener,
@@ -290,6 +333,8 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
+    use minga_bus::{subjects, EventBus, MemoryBus, TaskActualState, TaskStatusReport};
+    use minga_state::types::{Network, Task, TaskSpec, TaskState};
     use std::collections::BTreeMap;
     use tower::ServiceExt;
 
@@ -787,6 +832,119 @@ mod tests {
         assert!(json.as_array().unwrap().is_empty());
     }
 
+    #[tokio::test]
+    async fn task_view_uses_bus_actual_state_and_keeps_traefik_attachments() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            StateStore::open(1, "127.0.0.1:0", dir.path(), BTreeMap::new())
+                .await
+                .unwrap(),
+        );
+        let mut task = Task {
+            id: "svc.1".into(),
+            service_id: "svc".into(),
+            node_id: 1,
+            state: TaskState::Assigned,
+            spec: TaskSpec {
+                image: "nginx:latest".into(),
+                ..Default::default()
+            },
+            restarts: 99,
+            running_since_unix: Some(1),
+            last_error: Some("stale Raft error".into()),
+            last_exit_code: Some(99),
+        };
+        task.spec.ips.insert("front".into(), "10.20.0.7".into());
+        store.upsert_task(task).await.unwrap();
+        store
+            .upsert_network(Network {
+                id: "front".into(),
+                name: "front".into(),
+                driver: "overlay".into(),
+                attachable: true,
+                subnet: Some("10.20.0.0/24".into()),
+                wg_port: None,
+            })
+            .await
+            .unwrap();
+
+        let bus = MemoryBus::new();
+        let report = TaskStatusReport {
+            task_id: "svc.1".into(),
+            node_id: 1,
+            state: TaskActualState::Running,
+            container_id: Some("container-1".into()),
+            observed_at: 1_000,
+            restarts: 2,
+            last_error: None,
+            last_exit_code: None,
+            running_since_unix: Some(999),
+        };
+        bus.put_status(
+            &subjects::kv_task_status("svc.1"),
+            &report.to_bytes().unwrap(),
+        )
+        .await
+        .unwrap();
+        let router = build_router_with_bus_and_auth(store, bus, Arc::new(ReadyState::new()), None);
+        let req = Request::builder()
+            .uri("/v1.41/tasks/svc.1")
+            .body(Body::empty())
+            .unwrap();
+
+        let (status, json) = send_request(router, req).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["Status"]["State"], "running");
+        assert_eq!(json["Status"]["Message"], "started");
+        assert_eq!(json["DesiredState"], "running");
+        assert_eq!(json["MingaRestarts"], 2);
+        assert_eq!(
+            json["NetworksAttachments"][0]["Addresses"][0],
+            "10.20.0.7/24"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_status_does_not_replay_raft_actual_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            StateStore::open(1, "127.0.0.1:0", dir.path(), BTreeMap::new())
+                .await
+                .unwrap(),
+        );
+        store
+            .upsert_task(Task {
+                id: "svc.1".into(),
+                service_id: "svc".into(),
+                node_id: 1,
+                state: TaskState::Assigned,
+                spec: TaskSpec::default(),
+                restarts: 9,
+                running_since_unix: Some(1),
+                last_error: Some("stale Raft error".into()),
+                last_exit_code: Some(9),
+            })
+            .await
+            .unwrap();
+        let router = build_router_with_bus_and_auth(
+            store,
+            MemoryBus::new(),
+            Arc::new(ReadyState::new()),
+            None,
+        );
+        let req = Request::builder()
+            .uri("/v1.41/tasks/svc.1")
+            .body(Body::empty())
+            .unwrap();
+
+        let (status, json) = send_request(router, req).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["Status"]["State"], "preparing");
+        assert_eq!(json["Status"]["Err"], serde_json::Value::Null);
+        assert_eq!(json["Status"]["ContainerStatus"], serde_json::Value::Null);
+        assert_eq!(json["DesiredState"], "running");
+        assert_eq!(json["MingaRestarts"], 0);
+    }
     #[tokio::test]
     async fn api_server_start_and_shutdown() {
         let dir = tempfile::tempdir().unwrap();

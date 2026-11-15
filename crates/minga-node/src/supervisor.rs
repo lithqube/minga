@@ -189,6 +189,16 @@ pub struct Supervisor {
     networking: Option<SupervisorNetworking>,
 }
 
+#[derive(Default)]
+struct TaskStatusUpdate {
+    state: Option<TaskActualState>,
+    container_id: Option<String>,
+    failure: Option<Failure>,
+    restart: bool,
+    clear_failure: bool,
+    refresh: bool,
+}
+
 impl Supervisor {
     pub fn new(state: Arc<StateStore>, runtime: Arc<dyn Runtime>, node_id: NodeId) -> Self {
         Self {
@@ -347,11 +357,51 @@ impl Supervisor {
         // Only this node's tasks answer from this node's listener — the
         // records are the same cluster-wide, but only local tasks are
         // reachable through this node's bridges.
-        let my_tasks: Vec<_> = tasks
+        let mut my_tasks: Vec<_> = tasks
             .iter()
-            .filter(|t| t.node_id == self.node_id)
+            .filter(|task| task.node_id == self.node_id)
             .cloned()
             .collect();
+        for task in &mut my_tasks {
+            task.state = TaskState::Starting;
+        }
+        if let Some(bus) = &self.bus {
+            match bus.list_status().await {
+                Ok(entries) => {
+                    for (key, bytes) in entries {
+                        if !key.starts_with("task.") {
+                            continue;
+                        }
+                        let report = match TaskStatusReport::from_bytes(&bytes) {
+                            Ok(report) if key == subjects::kv_task_status(&report.task_id) => {
+                                report
+                            }
+                            Ok(_) => continue,
+                            Err(error) => {
+                                tracing::warn!(key, error = %error, "dns sync: invalid task status");
+                                continue;
+                            }
+                        };
+                        if report.node_id != self.node_id {
+                            continue;
+                        }
+                        if let Some(task) =
+                            my_tasks.iter_mut().find(|task| task.id == report.task_id)
+                        {
+                            task.state = match report.state {
+                                TaskActualState::Starting => TaskState::Starting,
+                                TaskActualState::Running => TaskState::Running,
+                                TaskActualState::Stopped => TaskState::Stopped,
+                                TaskActualState::Failed => TaskState::Failed,
+                            };
+                        }
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(error = %error, "dns sync: cannot read task status");
+                }
+            }
+        }
         let store = build_dns_store(&services, &my_tasks);
         tracing::debug!(
             records = store.len(),
@@ -554,10 +604,14 @@ impl Supervisor {
 
             // Look up the task spec from Raft to get the restart policy.
             let record = self.state.get_task(&task_id).await.ok().flatten();
-            let failure = failure::exit(
-                exit_code,
-                record.as_ref().and_then(|t| t.last_error.as_deref()),
-            );
+            let prior_error = match &self.bus {
+                Some(bus) => self
+                    .read_task_status(bus, &task_id)
+                    .await
+                    .and_then(|status| status.last_error),
+                None => record.as_ref().and_then(|task| task.last_error.clone()),
+            };
+            let failure = failure::exit(exit_code, prior_error.as_deref());
             let spec = match record {
                 Some(t) => t.spec,
                 None => {
@@ -828,52 +882,173 @@ impl Supervisor {
         }
     }
 
-    /// Records a lifecycle transition on the task record in Raft. Docker
-    /// API consumers (Traefik included) read task state from the API,
-    /// which reads this record — without it every task looks `pending`
-    /// forever. High-frequency status still goes through the bus;
-    /// lifecycle transitions are rare and belong on the record the
-    /// scheduler owns.
-    async fn mark_task_state(&self, task_id: &TaskId, state: minga_state::types::TaskState) {
-        self.mark_task(task_id, state, None).await;
+    /// Writes a lifecycle transition to the status KV, not the Raft task record.
+    async fn mark_task_state(&self, task_id: &TaskId, state: TaskState) {
+        let Some(bus) = &self.bus else {
+            return;
+        };
+        let state = match state {
+            TaskState::Pending | TaskState::Assigned | TaskState::Starting => {
+                TaskActualState::Starting
+            }
+            TaskState::Running => TaskActualState::Running,
+            TaskState::Stopping | TaskState::Stopped => TaskActualState::Stopped,
+            TaskState::Failed => TaskActualState::Failed,
+        };
+        self.update_task_status(
+            bus,
+            task_id,
+            TaskStatusUpdate {
+                state: Some(state),
+                ..Default::default()
+            },
+        )
+        .await;
     }
 
-    /// [`Self::mark_task_state`] plus the reason the task ended, in the
-    /// same Raft write.
-    async fn mark_task(
+    async fn read_task_status(
         &self,
+        bus: &Arc<dyn EventBus>,
         task_id: &TaskId,
-        state: minga_state::types::TaskState,
-        failure: Option<Failure>,
-    ) {
-        match self.state.get_task(task_id).await {
-            Ok(Some(mut task)) => {
-                let mut changed = task.state != state;
-                if changed {
-                    task.running_since_unix = (state == TaskState::Running).then(unix_now);
-                    task.state = state;
+    ) -> Option<TaskStatusReport> {
+        let key = subjects::kv_task_status(task_id);
+        match bus.get_status(&key).await {
+            Ok(Some(bytes)) => match TaskStatusReport::from_bytes(&bytes) {
+                Ok(report) if report.node_id == self.node_id => Some(report),
+                Ok(_) => None,
+                Err(error) => {
+                    tracing::warn!(task = %task_id, error = %error, "cannot decode task status");
+                    None
                 }
-                if let Some(f) = failure {
-                    if task.last_error.as_ref() != Some(&f.error)
-                        || task.last_exit_code != f.exit_code
-                    {
-                        task.last_error = Some(f.error);
-                        task.last_exit_code = f.exit_code;
-                        changed = true;
-                    }
-                }
-                if changed {
-                    if let Err(e) = self.state.upsert_task(task).await {
-                        tracing::warn!(task = %task_id, error = %e, "failed to record task state");
-                    }
-                }
-            }
-            // Bus-assigned tasks can exist without a Raft record.
-            Ok(None) => {}
-            Err(e) => {
-                tracing::warn!(task = %task_id, error = %e, "failed to read task for state mark")
+            },
+            Ok(None) => None,
+            Err(error) => {
+                tracing::warn!(task = %task_id, error = %error, "cannot read task status");
+                None
             }
         }
+    }
+
+    async fn update_task_status(
+        &self,
+        bus: &Arc<dyn EventBus>,
+        task_id: &TaskId,
+        update: TaskStatusUpdate,
+    ) {
+        let key = subjects::kv_task_status(task_id);
+        let current = match bus.get_status(&key).await {
+            Ok(Some(bytes)) => match TaskStatusReport::from_bytes(&bytes) {
+                Ok(report) if report.node_id == self.node_id => Some(report),
+                Ok(_) => None,
+                Err(error) => {
+                    tracing::warn!(task = %task_id, error = %error, "cannot decode task status");
+                    return;
+                }
+            },
+            Ok(None) => None,
+            Err(error) => {
+                tracing::warn!(task = %task_id, error = %error, "cannot read task status");
+                return;
+            }
+        };
+        let (mut report, mut changed) = match current {
+            Some(report) => (report, false),
+            None => (
+                TaskStatusReport {
+                    task_id: task_id.clone(),
+                    node_id: self.node_id,
+                    state: if update.failure.is_some() {
+                        TaskActualState::Failed
+                    } else {
+                        TaskActualState::Starting
+                    },
+                    container_id: None,
+                    observed_at: now_millis(),
+                    restarts: 0,
+                    last_error: None,
+                    last_exit_code: None,
+                    running_since_unix: None,
+                },
+                true,
+            ),
+        };
+        let previous_state = report.state;
+        if let Some(state) = update.state {
+            changed |= report.state != state;
+            report.state = state;
+            if state == TaskActualState::Running && previous_state != TaskActualState::Running {
+                report.running_since_unix = Some(unix_now());
+                changed = true;
+            } else if state != TaskActualState::Running {
+                changed |= report.running_since_unix.take().is_some();
+            }
+        }
+        if let Some(container_id) = update.container_id {
+            if report.container_id.as_ref() != Some(&container_id) {
+                report.container_id = Some(container_id);
+                changed = true;
+            }
+        }
+        if let Some(failure) = update.failure.as_ref() {
+            if report.last_error.as_ref() != Some(&failure.error)
+                || report.last_exit_code != failure.exit_code
+            {
+                report.last_error = Some(failure.error.clone());
+                report.last_exit_code = failure.exit_code;
+                changed = true;
+            }
+        }
+        if update.restart {
+            report.state = TaskActualState::Starting;
+            report.running_since_unix = None;
+            report.restarts = report.restarts.saturating_add(1);
+            changed = true;
+        }
+        if update.clear_failure && (report.last_error.is_some() || report.last_exit_code.is_some())
+        {
+            report.last_error = None;
+            report.last_exit_code = None;
+            changed = true;
+        }
+        if !changed && !update.refresh {
+            return;
+        }
+        report.observed_at = now_millis();
+        match report.to_bytes() {
+            Ok(bytes) => {
+                if let Err(error) = bus.put_status(&key, &bytes).await {
+                    tracing::warn!(task = %task_id, error = %error, "failed to publish task status");
+                }
+            }
+            Err(error) => {
+                tracing::warn!(task = %task_id, error = %error, "failed to serialize task status");
+            }
+        }
+    }
+
+    /// Records a lifecycle transition and optional failure detail in MINGA_STATUS.
+    async fn mark_task(&self, task_id: &TaskId, state: TaskState, failure: Option<Failure>) {
+        let Some(bus) = &self.bus else {
+            return;
+        };
+        let state = match state {
+            TaskState::Pending | TaskState::Assigned | TaskState::Starting => {
+                TaskActualState::Starting
+            }
+            TaskState::Running => TaskActualState::Running,
+            TaskState::Stopping | TaskState::Stopped => TaskActualState::Stopped,
+            TaskState::Failed => TaskActualState::Failed,
+        };
+        self.update_task_status(
+            bus,
+            task_id,
+            TaskStatusUpdate {
+                state: Some(state),
+                failure,
+                ..Default::default()
+            },
+        )
+        .await;
     }
 
     /// Records a container that just started. With a healthcheck, the task
@@ -889,49 +1064,47 @@ impl Supervisor {
         }
     }
 
-    /// Records why a task exited or failed to start, in one Raft write.
-    /// With `restart` it also counts a retry and goes back to `Starting`;
-    /// a rollout treats that as a failure of the new revision. Without it,
-    /// nothing is written when the reason is already on the record (a start
-    /// that fails every pass would otherwise write every pass).
+    /// Records a failure and optional retry count in MINGA_STATUS only.
     async fn record_failure(&self, task_id: &TaskId, failure: Failure, restart: bool) {
-        let Ok(Some(mut task)) = self.state.get_task(task_id).await else {
+        let Some(bus) = &self.bus else {
             return;
         };
-        let same = task.last_error.as_ref() == Some(&failure.error)
-            && task.last_exit_code == failure.exit_code;
-        if same && !restart {
-            return;
-        }
-        task.last_error = Some(failure.error);
-        task.last_exit_code = failure.exit_code;
-        if restart {
-            task.state = TaskState::Starting;
-            task.running_since_unix = None;
-            task.restarts += 1;
-        }
-        if let Err(e) = self.state.upsert_task(task).await {
-            tracing::warn!(task = %task_id, error = %e, "failed to record task failure");
-        }
+        self.update_task_status(
+            bus,
+            task_id,
+            TaskStatusUpdate {
+                failure: Some(failure),
+                restart,
+                ..Default::default()
+            },
+        )
+        .await;
     }
 
-    /// Forgets the last error of a task that has been `Running` for a while.
+    /// Forgets a failure once its running task has settled.
     async fn clear_settled_failures(&self, tasks: &[&Task]) {
+        let Some(bus) = &self.bus else {
+            return;
+        };
         let now = unix_now();
         for task in tasks {
-            let settled = task.state == TaskState::Running
-                && task
+            let Some(status) = self.read_task_status(bus, &task.id).await else {
+                continue;
+            };
+            let settled = status.state == TaskActualState::Running
+                && status
                     .running_since_unix
                     .is_some_and(|since| since + failure::CLEAR_AFTER_SECS <= now);
-            if !(settled && task.last_error.is_some()) {
-                continue;
-            }
-            if let Ok(Some(mut task)) = self.state.get_task(&task.id).await {
-                task.last_error = None;
-                task.last_exit_code = None;
-                if let Err(e) = self.state.upsert_task(task).await {
-                    tracing::warn!(error = %e, "failed to clear task failure");
-                }
+            if settled && status.last_error.is_some() {
+                self.update_task_status(
+                    bus,
+                    &task.id,
+                    TaskStatusUpdate {
+                        clear_failure: true,
+                        ..Default::default()
+                    },
+                )
+                .await;
             }
         }
     }
@@ -1157,25 +1330,37 @@ impl Supervisor {
         }
     }
 
-    /// Publish status reports for all running tasks (containers + agents) to the bus KV.
+    /// Refreshes current task status in MINGA_STATUS.
     async fn publish_status(&self, bus: &Arc<dyn EventBus>) {
         let running = self.running.lock().await;
         for (task_id, container_id) in running.iter() {
-            let report = TaskStatusReport {
-                task_id: task_id.clone(),
-                node_id: self.node_id,
-                state: TaskActualState::Running,
-                container_id: Some(container_id.clone()),
-                observed_at: now_millis(),
+            let state = {
+                let health = self.health.lock().await;
+                if health
+                    .get(task_id)
+                    .is_some_and(|health| !health.is_healthy())
+                {
+                    TaskActualState::Starting
+                } else {
+                    TaskActualState::Running
+                }
             };
-            self.publish_report(bus, &report).await;
+            self.update_task_status(
+                bus,
+                task_id,
+                TaskStatusUpdate {
+                    state: Some(state),
+                    container_id: Some(container_id.clone()),
+                    refresh: true,
+                    ..Default::default()
+                },
+            )
+            .await;
         }
         drop(running);
 
-        // Publish agent status.
         let agents = self.running_agents.lock().await;
         for task_id in agents.iter() {
-            // Check if the agent has completed.
             let state = if let Some(exec) = &self.agent_executor {
                 match exec.status(task_id).await {
                     Some(AgentStatus::Completed) => TaskActualState::Stopped,
@@ -1185,38 +1370,16 @@ impl Supervisor {
             } else {
                 TaskActualState::Running
             };
-
-            let report = TaskStatusReport {
-                task_id: task_id.clone(),
-                node_id: self.node_id,
-                state,
-                container_id: None,
-                observed_at: now_millis(),
-            };
-            self.publish_report(bus, &report).await;
-
-            // Remove completed/failed agents from the running set.
-            if state != TaskActualState::Running {
-                // Will be cleaned up on next reconcile pass.
-            }
-        }
-    }
-
-    async fn publish_report(&self, bus: &Arc<dyn EventBus>, report: &TaskStatusReport) {
-        match report.to_bytes() {
-            Ok(bytes) => {
-                let key = subjects::kv_task_status(&report.task_id);
-                if let Err(e) = bus.put_status(&key, &bytes).await {
-                    tracing::warn!(
-                        task = %report.task_id,
-                        error = %e,
-                        "failed to publish task status"
-                    );
-                }
-            }
-            Err(e) => {
-                tracing::warn!(task = %report.task_id, error = %e, "failed to serialize status");
-            }
+            self.update_task_status(
+                bus,
+                task_id,
+                TaskStatusUpdate {
+                    state: Some(state),
+                    refresh: true,
+                    ..Default::default()
+                },
+            )
+            .await;
         }
     }
 
@@ -1286,12 +1449,17 @@ impl Supervisor {
                             error = %e,
                             "failed to start container (raft reconcile)"
                         );
-                        // Counting the retry once is enough for a rollout to
-                        // see it; this path retries every pass.
                         let failure =
                             failure::start_error(&e, &failure::registry_secrets(&task.spec.image));
-                        self.record_failure(&task.id, failure, task.restarts == 0)
-                            .await;
+                        // Desired-state records no longer carry restart counts.
+                        let restarts = match &self.bus {
+                            Some(bus) => self
+                                .read_task_status(bus, &task.id)
+                                .await
+                                .map_or(0, |status| status.restarts),
+                            None => task.restarts,
+                        };
+                        self.record_failure(&task.id, failure, restarts == 0).await;
                     }
                 },
                 WorkloadKind::Agent(agent_spec) => {
@@ -1497,7 +1665,7 @@ mod tests {
     use super::*;
     use crate::runtime::MockRuntime;
     use futures::StreamExt;
-    use minga_bus::MemoryBus;
+    use minga_bus::{subjects, EventBus, MemoryBus, TaskActualState, TaskStatusReport};
     use minga_state::types::{PortMapping, ResourceSpec, TaskSpec, TaskState};
     use std::collections::BTreeMap;
 
@@ -1701,9 +1869,7 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        // Leak tempdir — store needs it for the test duration.
         std::mem::forget(dir);
-
         let runtime = Arc::new(MockRuntime::new());
         let supervisor = Supervisor::new(store.clone(), runtime.clone(), node_id);
         (supervisor, runtime, store)
@@ -1729,6 +1895,39 @@ mod tests {
         let bus = MemoryBus::new();
         let supervisor = Supervisor::with_bus(store.clone(), runtime.clone(), bus.clone(), node_id);
         (supervisor, runtime, store, bus)
+    }
+
+    async fn actual_task(sup: &Supervisor, store: &StateStore, id: &str) -> Task {
+        let mut task = store.get_task(&id.to_string()).await.unwrap().unwrap();
+        let Some(bus) = &sup.bus else {
+            return task;
+        };
+        let key = subjects::kv_task_status(id);
+        let Some(bytes) = bus.get_status(&key).await.unwrap() else {
+            return task;
+        };
+        let report = TaskStatusReport::from_bytes(&bytes).unwrap();
+        task.state = match report.state {
+            TaskActualState::Starting => TaskState::Starting,
+            TaskActualState::Running => TaskState::Running,
+            TaskActualState::Stopped => TaskState::Stopped,
+            TaskActualState::Failed => TaskState::Failed,
+        };
+        task.restarts = report.restarts;
+        task.last_error = report.last_error;
+        task.last_exit_code = report.last_exit_code;
+        task.running_since_unix = report.running_since_unix;
+        task
+    }
+
+    async fn actual_status(sup: &Supervisor, id: &str) -> TaskStatusReport {
+        let bus = sup.bus.as_ref().unwrap();
+        let bytes = bus
+            .get_status(&subjects::kv_task_status(id))
+            .await
+            .unwrap()
+            .unwrap();
+        TaskStatusReport::from_bytes(&bytes).unwrap()
     }
 
     // --- Existing Raft-based tests -------------------------------------------
@@ -1758,7 +1957,7 @@ mod tests {
     ) -> Task {
         for _ in 0..100 {
             sup.reconcile_once().await.unwrap();
-            let task = store.get_task(&id.to_string()).await.unwrap().unwrap();
+            let task = actual_task(sup, store, id).await;
             if done(&task) {
                 return task;
             }
@@ -1769,7 +1968,7 @@ mod tests {
 
     #[tokio::test]
     async fn healthcheck_gates_running_then_an_unhealthy_task_restarts() {
-        let (sup, rt, store) = setup(1).await;
+        let (sup, rt, store, _bus) = setup_with_bus(1).await;
         store
             .upsert_task(with_healthcheck(make_task("t1", 1)))
             .await
@@ -1787,7 +1986,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_task_that_never_passes_stays_starting() {
-        let (sup, rt, store) = setup(1).await;
+        let (sup, rt, store, _bus) = setup_with_bus(1).await;
         let mut task = with_healthcheck(make_task("t1", 1));
         task.spec.healthcheck.as_mut().unwrap().start_period_secs = Some(3600);
         store.upsert_task(task).await.unwrap();
@@ -1799,7 +1998,7 @@ mod tests {
             sup.reconcile_once().await.unwrap();
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        let task = store.get_task(&"t1".to_string()).await.unwrap().unwrap();
+        let task = actual_task(&sup, &store, "t1").await;
         assert_eq!(task.state, TaskState::Starting);
     }
 
@@ -1929,6 +2128,7 @@ mod tests {
         assert_eq!(runtime.container_count(), 1);
 
         // Stop via bus command.
+        store.remove_task("t1".to_string()).await.unwrap();
         let stop = Command::Stop {
             task_id: "t1".to_string(),
         };
@@ -2514,33 +2714,33 @@ mod tests {
 
     #[tokio::test]
     async fn a_restarted_task_keeps_the_reason_it_exited() {
-        let (sup, rt, store) = setup(1).await;
+        let (sup, rt, store, _bus) = setup_with_bus(1).await;
         let task = restarting(make_task("t1", 1), RestartCondition::Any);
         store.upsert_task(task).await.unwrap();
         sup.reconcile_once().await.unwrap();
 
         crash(&rt, &sup, 3).await;
-        let task = store.get_task(&"t1".to_string()).await.unwrap().unwrap();
+        let task = actual_task(&sup, &store, "t1").await;
         assert_eq!(task.restarts, 1);
         assert_eq!(task.last_error.as_deref(), Some("exited with code 3"));
         assert_eq!(task.last_exit_code, Some(3));
 
         // The new container starts; the reason stays until it has run a while.
         sup.reconcile_once().await.unwrap();
-        let task = store.get_task(&"t1".to_string()).await.unwrap().unwrap();
+        let task = actual_task(&sup, &store, "t1").await;
         assert_eq!(task.state, TaskState::Running);
         assert_eq!(task.last_error.as_deref(), Some("exited with code 3"));
     }
 
     #[tokio::test]
     async fn a_task_that_ends_failed_says_why() {
-        let (sup, rt, store) = setup(1).await;
+        let (sup, rt, store, _bus) = setup_with_bus(1).await;
         let task = restarting(make_task("t1", 1), RestartCondition::None);
         store.upsert_task(task).await.unwrap();
         sup.reconcile_once().await.unwrap();
 
         crash(&rt, &sup, 137).await;
-        let task = store.get_task(&"t1".to_string()).await.unwrap().unwrap();
+        let task = actual_task(&sup, &store, "t1").await;
         assert_eq!(task.state, TaskState::Failed);
         assert_eq!(task.last_exit_code, Some(137));
         let error = task.last_error.unwrap();
@@ -2551,47 +2751,50 @@ mod tests {
 
     #[tokio::test]
     async fn a_failed_start_is_recorded_once_and_cleared_when_the_task_settles() {
-        let (sup, rt, store) = setup(1).await;
+        let (sup, rt, store, _bus) = setup_with_bus(1).await;
         *rt.fail_starts.lock().unwrap() = true;
         store.upsert_task(make_task("t1", 1)).await.unwrap();
 
         sup.reconcile_once().await.unwrap();
-        let task = store.get_task(&"t1".to_string()).await.unwrap().unwrap();
+        let task = actual_task(&sup, &store, "t1").await;
         assert_eq!(task.restarts, 1);
         assert_eq!(task.last_exit_code, None);
         assert_eq!(
             task.last_error.as_deref(),
             Some("failed to start container: mock runtime: starts disabled")
         );
+        let raft_task = store.get_task(&"t1".to_string()).await.unwrap().unwrap();
+        assert_eq!(raft_task.restarts, 0);
+        assert_eq!(raft_task.last_error, None);
 
         // The same failure on the next pass is not written again.
-        let before = store.get_task(&"t1".to_string()).await.unwrap().unwrap();
+        let before = actual_task(&sup, &store, "t1").await;
         sup.reconcile_once().await.unwrap();
-        assert_eq!(
-            store.get_task(&"t1".to_string()).await.unwrap().unwrap(),
-            before
-        );
+        assert_eq!(actual_task(&sup, &store, "t1").await, before);
 
         // It starts, but has not run long enough to forget the reason...
         *rt.fail_starts.lock().unwrap() = false;
         let task = pass_until(&sup, &store, "t1", |t| t.state == TaskState::Running).await;
         assert!(task.last_error.is_some());
         sup.reconcile_once().await.unwrap();
-        let task = store.get_task(&"t1".to_string()).await.unwrap().unwrap();
+        let task = actual_task(&sup, &store, "t1").await;
         assert!(task.last_error.is_some());
 
         // ...until it has.
-        let mut task = task;
-        task.running_since_unix = Some(unix_now() - failure::CLEAR_AFTER_SECS - 1);
-        store.upsert_task(task).await.unwrap();
+        let mut status = actual_status(&sup, "t1").await;
+        status.running_since_unix = Some(unix_now() - failure::CLEAR_AFTER_SECS - 1);
+        let bus = sup.bus.as_ref().unwrap();
+        bus.put_status(&subjects::kv_task_status("t1"), &status.to_bytes().unwrap())
+            .await
+            .unwrap();
         sup.reconcile_once().await.unwrap();
-        let task = store.get_task(&"t1".to_string()).await.unwrap().unwrap();
+        let task = actual_task(&sup, &store, "t1").await;
         assert_eq!((task.last_error, task.last_exit_code), (None, None));
     }
 
     #[tokio::test]
     async fn an_unhealthy_task_says_the_healthcheck_killed_it() {
-        let (sup, rt, store) = setup(1).await;
+        let (sup, rt, store, _bus) = setup_with_bus(1).await;
         store
             .upsert_task(with_healthcheck(make_task("t1", 1)))
             .await

@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 use common::{cluster, ctl_with, service, Cluster, TOKEN};
-use minga_state::types::TaskState;
+use minga_bus::{subjects, EventBus, TaskActualState, TaskStatusReport};
 use serde_json::{json, Value};
 
 /// Stub `minga`: records each call; `logs` prints a line on each stream.
@@ -356,14 +356,33 @@ async fn with_a_failed_task() -> (Cluster, String, String) {
     cluster.wait_for_tasks(2).await;
     let mut tasks = cluster.store.list_tasks().await.unwrap();
     tasks.sort_by(|a, b| a.id.cmp(&b.id));
-    let mut running = tasks[0].clone();
-    running.state = TaskState::Running;
-    let mut failed = tasks[1].clone();
-    failed.state = TaskState::Failed;
-    failed.last_error = Some("exited with code 1".into());
-    cluster.store.upsert_task(running.clone()).await.unwrap();
-    cluster.store.upsert_task(failed.clone()).await.unwrap();
-    (cluster, running.id, failed.id)
+    let running = &tasks[0];
+    let failed = &tasks[1];
+    for (task, state, error) in [
+        (running, TaskActualState::Running, None),
+        (failed, TaskActualState::Failed, Some("exited with code 1")),
+    ] {
+        let report = TaskStatusReport {
+            task_id: task.id.clone(),
+            node_id: task.node_id,
+            state,
+            container_id: None,
+            observed_at: 0,
+            restarts: 0,
+            last_error: error.map(str::to_string),
+            last_exit_code: None,
+            running_since_unix: None,
+        };
+        cluster
+            .bus
+            .put_status(
+                &subjects::kv_task_status(&task.id),
+                &report.to_bytes().unwrap(),
+            )
+            .await
+            .unwrap();
+    }
+    (cluster, running.id.clone(), failed.id.clone())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
