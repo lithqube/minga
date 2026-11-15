@@ -127,7 +127,7 @@ jobs:
         run: sudo -E env "PATH=$PATH" MINGA_REQUIRE_CONTAINERD=1 cargo test -p minga-node --test containerd --test containerd_client --test containerd_pull
 
   netns:
-    name: Published-port paths on a real kernel (never silently skipped)
+    name: Overlay network paths on a real kernel (never silently skipped)
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -140,5 +140,11 @@ jobs:
 
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
 
+      - name: Install WireGuard test tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y wireguard-tools iputils-ping kmod
+          sudo modprobe wireguard
+          sudo modprobe br_netfilter
       - name: Network-namespace suite (fails closed when it cannot run)
-        run: sudo -E env "PATH=$PATH" MINGA_REQUIRE_NETNS=1 cargo test -p minga-node --test netns -- --nocapture
+        run: sudo -E env "PATH=$PATH" MINGA_REQUIRE_NETNS=1 cargo test -p minga-node --test netns --test wireguard_netns -- --nocapture

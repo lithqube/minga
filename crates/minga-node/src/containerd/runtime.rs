@@ -23,6 +23,8 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+#[cfg(target_os = "linux")]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -333,6 +335,8 @@ pub struct ContainerdRuntime {
     /// Network setup; assignment records carry the subnet metadata.
     #[cfg(target_os = "linux")]
     networking: Option<Arc<crate::netns::NetworkSetup>>,
+    #[cfg(target_os = "linux")]
+    networking_blocked: AtomicBool,
 }
 
 impl ContainerdRuntime {
@@ -358,6 +362,8 @@ impl ContainerdRuntime {
             log_readers: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(target_os = "linux")]
             networking: None,
+            #[cfg(target_os = "linux")]
+            networking_blocked: AtomicBool::new(false),
         }
     }
 
@@ -426,6 +432,7 @@ impl ContainerdRuntime {
     #[cfg(target_os = "linux")]
     pub fn with_networking(mut self, setup: Arc<crate::netns::NetworkSetup>) -> Self {
         self.networking = Some(setup);
+        self.networking_blocked.store(true, Ordering::Release);
         self
     }
 
@@ -610,6 +617,44 @@ impl ContainerdRuntime {
         let client = self.client.lock().await.clone();
         pull_image(&client, image_ref, &self.snapshotter).await
     }
+    #[cfg(target_os = "linux")]
+    async fn stop_all_task_containers(&self) -> Result<(), RuntimeError> {
+        let containers = {
+            let mut client = self.client.lock().await;
+            client
+                .list_containers(vec!["labels.minga.task_id!=empty".to_string()])
+                .await
+                .map_err(|error| {
+                    RuntimeError::Stop(format!(
+                        "list task containers while blocking networking: {error}"
+                    ))
+                })?
+        };
+        let mut errors = Vec::new();
+        for container in containers {
+            {
+                let mut client = self.client.lock().await;
+                if let Err(error) = client.kill_task(&container.id, 9).await {
+                    tracing::warn!(
+                        container = %container.id,
+                        %error,
+                        "emergency SIGKILL failed; normal stop will retry"
+                    );
+                }
+            }
+            if let Err(error) = self.stop(&container.id).await {
+                errors.push(format!("{}: {error}", container.id));
+            }
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(RuntimeError::Stop(format!(
+                "could not stop all task containers: {}",
+                errors.join("; ")
+            )))
+        }
+    }
 
     /// Clear leftovers from a previous attempt at the same task ID.
     ///
@@ -730,6 +775,25 @@ impl ContainerdRuntime {
 
 #[async_trait]
 impl Runtime for ContainerdRuntime {
+    async fn prepare_startup(&self) -> Result<(), RuntimeError> {
+        #[cfg(target_os = "linux")]
+        if let Some(networking) = &self.networking {
+            self.networking_blocked.store(true, Ordering::Release);
+            if let Err(error) = networking.block_task_networking().await {
+                if let Err(stop_error) = self.stop_all_task_containers().await {
+                    tracing::error!(
+                        %stop_error,
+                        "failed to stop running tasks after firewall setup failed"
+                    );
+                }
+                return Err(RuntimeError::Start(format!(
+                    "block task networking: {error}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     async fn start(&self, task_id: &TaskId, spec: &TaskSpec) -> Result<String, RuntimeError> {
         self.start_assigned(task_id, spec, &[]).await
     }
@@ -740,6 +804,12 @@ impl Runtime for ContainerdRuntime {
         spec: &TaskSpec,
         networks: &[minga_state::types::Network],
     ) -> Result<String, RuntimeError> {
+        #[cfg(target_os = "linux")]
+        if self.networking_blocked.load(Ordering::Acquire) {
+            return Err(RuntimeError::Start(
+                "task networking is blocked while source filters are being recovered".into(),
+            ));
+        }
         let container_id = task_id.clone();
         let secret_mounts = self.resolve_secrets(&container_id, spec)?;
         let spec = &self.resolve_mounts(spec).await?;
@@ -1033,6 +1103,54 @@ impl Runtime for ContainerdRuntime {
     }
 
     async fn list(&self) -> Vec<ContainerInfo> {
+        #[cfg(target_os = "linux")]
+        let source_filter_error = if let Some(networking) = &self.networking {
+            if self.networking_blocked.load(Ordering::Acquire) {
+                if let Err(error) = networking.block_task_networking().await {
+                    tracing::error!(
+                        %error,
+                        "failed to block task networking before source-filter recovery"
+                    );
+                    self.networking_blocked.store(true, Ordering::Release);
+                    if let Err(stop_error) = self.stop_all_task_containers().await {
+                        tracing::error!(
+                            %stop_error,
+                            "failed to stop running tasks after firewall setup failed"
+                        );
+                    }
+                    return Vec::new();
+                }
+                match networking.reconcile_task_source_filters().await {
+                    Ok(()) => {
+                        self.networking_blocked.store(false, Ordering::Release);
+                        None
+                    }
+                    Err(error) => {
+                        tracing::error!(%error, "failed to reconcile task source filters");
+                        if let Err(block_error) = networking.block_task_networking().await {
+                            tracing::error!(
+                                %block_error,
+                                "failed to restore task networking block after source-filter failure"
+                            );
+                            if let Err(stop_error) = self.stop_all_task_containers().await {
+                                tracing::error!(
+                                    %stop_error,
+                                    "failed to stop running tasks after firewall setup failed"
+                                );
+                            }
+                            return Vec::new();
+                        }
+                        Some(error.to_string())
+                    }
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        #[cfg(not(target_os = "linux"))]
+        let source_filter_error: Option<String> = None;
         let mut client = self.client.lock().await;
         let containers = match client
             .list_containers(vec!["labels.minga.task_id!=empty".to_string()])
@@ -1056,13 +1174,29 @@ impl Runtime for ContainerdRuntime {
                         let ps = ProcessStatus::try_from(process.status)
                             .unwrap_or(ProcessStatus::Unknown);
                         match ps {
-                            ProcessStatus::Running => ContainerStatus::Running,
-                            ProcessStatus::Created => ContainerStatus::Running,
+                            ProcessStatus::Running | ProcessStatus::Created => {
+                                ContainerStatus::Running
+                            }
                             _ => ContainerStatus::Stopped,
                         }
                     }
                     Err(_) => ContainerStatus::Stopped,
                 }
+            };
+            let status = if status == ContainerStatus::Running && source_filter_error.is_some() {
+                match self.stop(&c.id).await {
+                    Ok(()) => ContainerStatus::Stopped,
+                    Err(error) => {
+                        tracing::error!(
+                            container = %c.id,
+                            %error,
+                            "startup: could not stop container after source filter failure"
+                        );
+                        status
+                    }
+                }
+            } else {
+                status
             };
 
             let task_id = c
