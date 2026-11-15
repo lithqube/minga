@@ -87,6 +87,8 @@ async fn start_cluster() -> Option<(Vec<ContainerAsync<GenericImage>>, String)> 
 async fn wait_for_meta_group(monitors: &[String]) {
     let http = reqwest::Client::builder()
         .no_proxy()
+        // Covers send and body: a stalled monitor counts as not formed.
+        .timeout(Duration::from_secs(2))
         .build()
         .expect("http client");
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
