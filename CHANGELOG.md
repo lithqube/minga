@@ -8,6 +8,9 @@
 - Leaders project task and network assignments into replicated `MINGA_ASSIGN`
   KV. Workers consume those assignments and no longer open a Raft state store;
   node status and lease writes are scoped to each worker identity.
+- Managers can join and leave Raft at runtime through admin-token-protected
+  membership endpoints. Manager sidecars can form a route-TLS NATS cluster;
+  `minga migrate-v1` previews the voter set before applying the conversion.
 
 
 ## [1.2.0] — 2026-11-13

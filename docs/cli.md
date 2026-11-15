@@ -39,24 +39,30 @@ Compose file keeps running with either command.
 
 ```bash
 minga manager --node-id <ID> --bind <ADDR> [flags]   # scheduler + supervisor (+ NATS sidecar)
-minga worker  --node-id <ID> --bind <ADDR> [flags]   # supervisor only
+minga worker  --node-id <ID> --nats-url <URL> [flags] # supervisor only
 minga api     --node-id <ID> --bind <ADDR> [flags]   # Docker Engine API (v1.41 subset)
 ```
 
-Every role is a Raft voter with its own `--node-id` and `--data-dir`, including
-`minga api`. `manager` and `worker` take the same flags; `api` takes the Raft
-flags, `--api-bind` and `--api-token`, plus NATS connection flags for lease-aware
-placement.
+Only managers vote in Raft. Workers are JetStream clients and do not open a
+`StateStore`; `minga api` remains a voter until the API-folding plan. A new
+manager uses `--join` to open without bootstrapping and wait for an administrator
+to add it through the authenticated API.
 
-**Raft flags (all roles)**
+With the manager API token configured, add a running joiner with
+`POST /minga/managers` and `{ "id": ID, "raft_addr": "HOST:PORT" }`.
+The API waits for catch-up before promotion. Remove it with
+`DELETE /minga/managers/ID`; the last manager cannot be removed.
+
+**Raft flags (manager and API; not workers)**
 
 | Flag | Default | Notes |
 | --- | --- | --- |
-| `--node-id <ID>` | required | Unique per process. |
+| `--node-id <ID>` | required | Unique, stable ID for this Raft node. |
 | `--bind <ADDR>` | required | Address the Raft RPC server listens on and peers dial, for example `127.0.0.1:7001`. |
-| `--peer <ID=ADDR>` | none | Repeat for every other voter. Membership is fixed at first start: list all of them, and start them together. |
-| `--data-dir <DIR>` | `/var/lib/minga` | Holds `raft_log.redb` and `state.redb`, and with default paths also `secrets/`, `volumes/` and `modules/`. Give `minga api` its own directory on a shared host. Tightened to 0700 at start. |
-| `--raft-tls-ca`, `--raft-tls-cert`, `--raft-tls-key` | none | All three together enable mTLS. Required off loopback (without them a node only logs a warning). The key must not be readable by group or others. |
+| `--peer <ID=ADDR>` | none | Initial cluster membership only. Repeat for the other voters when bootstrapping; `--join` cannot be combined with `--peer`. |
+| `--join` | off | Manager-only. Never initializes a pristine store; waits for a manager to add this node. |
+| `--data-dir <DIR>` | `/var/lib/minga` | Manager/API Raft data (`raft_log.redb`, `state.redb`), plus node-local `secrets/`, `volumes/` and `modules/`. Workers never open Raft files. Tightened to 0700 at start. |
+| `--raft-tls-ca`, `--raft-tls-cert`, `--raft-tls-key` | none | All three together enable Raft mTLS. Required off loopback (otherwise a warning). The key must not be readable by group or others. |
 
 **Manager and worker flags**
 
@@ -64,9 +70,12 @@ placement.
 | --- | --- | --- |
 | `--runtime <mock\|containerd>` | `mock` | **Set `containerd` for real containers.** `mock` is in-memory and meant for tests. `scripts/minga.service` passes `containerd`. |
 | `--containerd-socket <PATH>` | `/run/containerd/containerd.sock` | A filesystem path, not a `unix://` URL. |
-| `--nats-url <URL>`, `MINGA_NATS_URL` | none | Unset on a manager: it starts a `nats-server` sidecar on 127.0.0.1:4222 (monitor on 127.0.0.1:8222). Workers must set it. With more than one node, every manager and worker points at the same external `tls://` server or cluster. |
-| `--nats-token`, `MINGA_NATS_TOKEN` | none | Token for the sidecar or a plain NATS server. Ignored over TLS, where the connection is certificate-only. |
-| `--nats-replicas <N>` | `1` | Copies of the command, event, dead-letter and KV streams. Set 3 or 5 on a NATS cluster of at least that many servers. Needs `--nats-url`. |
+| `--nats-url <URL>`, `MINGA_NATS_URL` | none | Unset on a manager: it starts the NATS sidecar. Workers must set it; use a comma-separated TLS seed list for clustered managers. |
+| `--nats-token`, `MINGA_NATS_TOKEN` | none | Development-only token authentication. Token mode provides no isolation between workers. |
+| `--nats-replicas <N>` | `1` | Copies of the event, status, lease, and assignment streams/buckets. Set 3 or 5 on a cluster with at least that many servers. Works with external NATS or route-TLS sidecars. |
+| `--nats-cluster-route <URL>` | none | Repeat for existing sidecar routes, e.g. `nats://manager-1:6222`. Requires route TLS. |
+| `--nats-cluster-cert`, `--nats-cluster-key`, `--nats-cluster-ca` | none | Route certificate, key, and peer CA for the built-in sidecar; required together and separate from client-facing TLS. `--nats-cluster-port` defaults to `6222`. |
+| `--nats-worker-id <ID>` | none | Worker IDs authorized by this sidecar's client-certificate mapping. |
 | `--label <KEY=VALUE>` | none | Advertised to the cluster; matched by `node.labels.KEY` placement constraints. |
 | `--metrics-bind <ADDR>`, `MINGA_METRICS_BIND` | not served | `/metrics`, `/healthz` and `/readyz`. |
 | `--secret-store <DIR>` | `/var/lib/minga/secrets` | Secret values on this node. They never go through Raft or the bus. |
@@ -74,12 +83,26 @@ placement.
 | `--sandbox-runtime <mock\|wasmtime>`, `--module-dir <DIR>` | none, `/var/lib/minga/modules` | `wasmtime` enables `x-minga-agent` tasks on this node. |
 | `--egress-bind`, `--egress-upstream`, `--egress-credential`, `--egress-credential-header` | none, `https://api.openai.com`, none, `authorization` | Starts the LLM egress proxy for agent tasks. The credential is a secret ID in `--secret-store`; agents never see the key. |
 
+**Joining a worker**
+
+Issue a worker identity certificate with `minga tls issue-node --ca-dir DIR
+--out-dir DIR --node-id ID --role worker`. On the worker, set
+`MINGA_NATS_TLS_CA`, `MINGA_NATS_TLS_CERT`, `MINGA_NATS_TLS_KEY`, and
+`MINGA_NATS_TLS_SERVER_NAME`, then run:
+
+```bash
+minga worker --node-id ID --nats-url tls://manager-1:4222,tls://manager-2:4222
+```
+
+The node ID must match the certificate identity. No Raft bind, peer list, Raft
+certificate flags, or previous Raft data directory is needed.
+
 **API flags**
 
 | Flag | Default | Notes |
 | --- | --- | --- |
 | `--api-bind <ADDR>` | `0.0.0.0:2375` | Every interface by default. Bind `127.0.0.1:2375` unless containers (Traefik) must reach it, and then set a token. |
-| `--api-token`, `MINGA_API_TOKEN` | none | Required as `Authorization: Bearer <token>`, or as the Basic-auth password for Traefik's Swarm provider. Set it through the environment (an `EnvironmentFile`), not the flag, so it stays out of process listings. Without a token the API is unauthenticated; from 1.2.0 it also refuses requests with an `Origin` header or a `Host` that is a DNS name other than `localhost` or `*.localhost`, and warns at start when bound off loopback. |
+| `--api-token`, `MINGA_API_TOKEN` | none | Required as `Authorization: Bearer <token>`, or as the Basic-auth password for Traefik's Swarm provider. Set it through the environment (an `EnvironmentFile`), not the flag, so it stays out of process listings. Manager membership endpoints require a configured token even when other API routes are tokenless. |
 | `--nats-url <URL>`, `MINGA_NATS_URL` | `nats://127.0.0.1:4222` | NATS used by the API node's placement scheduler to check server-expiring node leases. |
 | `--nats-token`, `MINGA_NATS_TOKEN` | none | NATS client token, when required. |
 
@@ -91,11 +114,12 @@ placement.
 | `minga deploy [-c FILE] [-p PROFILE] [--wait SECS] STACK` | Deploys the file as a stack and waits for placement (30 s by default). | Anywhere that reaches the API |
 | `minga state export [-o FILE] [--force]` | Writes desired state (services, networks, volumes, secret and config references) to stdout or a 0600 file. Not secret values, volume data or TLS material; see [backup.md](backup.md). | Anywhere that reaches the API |
 | `minga state import FILE [--overwrite]` | Restores an export. Fails on an existing service unless `--overwrite`. | Anywhere that reaches the API |
+| `minga migrate-v1 --manager-id ID [--manager-id ID ...] [--apply]` | Lists the current voters and those to remove when migrating from v1.2.0. Dry-run by default; `--apply` commits one membership change. Requires the admin API token. | Anywhere that reaches the API |
 | `minga logs [-f] [--tail N] TASK_ID` | Prints a task's output from JetStream (`--nats-url`); `TASK_ID` is `<stack>.<service>.<n>`. | Anywhere that reaches NATS |
 | `minga image pull IMAGE` | Pulls into the `minga` containerd namespace. Credentials come from `$DOCKER_CONFIG/config.json`, else `~/.docker/config.json`, and go to containerd over its API. | On the node |
 | `minga secret put ID < value` | Writes or rotates a secret value in the node's store, read from stdin. `ID` is `<stack>_<compose secret key>`. | On every node that runs the service |
 | `minga tls init-ca --dir DIR` | Creates the cluster CA (`ca.pem`, `ca-key.pem`). | Anywhere; keep `ca-key.pem` off the nodes |
-| `minga tls issue-node --ca-dir DIR --out-dir DIR` | Issues a node certificate (`node.pem`, `node-key.pem`, SAN `minga-node`). Keys are written 0600. | Anywhere; copy one pair to each node |
+| `minga tls issue-node --ca-dir DIR --out-dir DIR --node-id ID --role worker\|manager` | Issues a node certificate with the Raft SAN and a role-bound NATS identity. Keys are written 0600. | Anywhere; copy one pair to each node |
 | `minga agent ls` | Lists running agent tasks from the bus. | Anywhere that reaches NATS |
 | `minga sandbox run --module FILE [--input DATA] [--fuel N] [--timeout SECS]`, `minga sandbox info` | Runs a WASM module once; lists the sandbox runtimes. | Anywhere |
 | `minga egress [--bind ADDR] ...` | A standalone egress proxy. `--bind` defaults to `0.0.0.0:8080`. | Anywhere |

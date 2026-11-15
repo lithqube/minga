@@ -382,3 +382,139 @@ async fn two_node_cluster() {
     store1.shutdown().await.unwrap();
     store2.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn cluster_grows_to_five_and_shrinks_without_restart() {
+    let (store1, store2, store3, _, _, _) = open_cluster().await;
+    let [addr4, addr5] = free_addrs();
+    let dir4 = tempfile::tempdir().unwrap();
+    let dir5 = tempfile::tempdir().unwrap();
+    let store4 = tokio::time::timeout(WAIT, StateStore::open_join(4, &addr4, dir4.path()))
+        .await
+        .expect("fourth manager must open without waiting for a leader")
+        .unwrap();
+    let store5 = tokio::time::timeout(WAIT, StateStore::open_join(5, &addr5, dir5.path()))
+        .await
+        .expect("fifth manager must open without waiting for a leader")
+        .unwrap();
+
+    assert!(store4.current_leader().await.is_none());
+    assert!(store4.manager_voters().await.is_empty());
+    assert!(store5.current_leader().await.is_none());
+    assert!(store5.manager_voters().await.is_empty());
+
+    let cluster3 = [&store1, &store2, &store3];
+    leader(&cluster3)
+        .await
+        .upsert_service(sample_service("before-join"))
+        .await
+        .unwrap();
+    leader(&cluster3).await.add_manager(4, addr4).await.unwrap();
+
+    eventually("the fourth manager catches up", || async {
+        store4.get_service("before-join").await.unwrap().is_some()
+    })
+    .await;
+    let cluster4 = [&store1, &store2, &store3, &store4];
+    leader(&cluster4).await.add_manager(5, addr5).await.unwrap();
+    eventually("the fifth manager catches up", || async {
+        store5.get_service("before-join").await.unwrap().is_some()
+    })
+    .await;
+
+    let cluster5 = [&store1, &store2, &store3, &store4, &store5];
+    eventually(
+        "all five voters observe the expanded configuration",
+        || async {
+            let (v1, v2, v3, v4, v5) = tokio::join!(
+                store1.manager_voters(),
+                store2.manager_voters(),
+                store3.manager_voters(),
+                store4.manager_voters(),
+                store5.manager_voters(),
+            );
+            [v1.len(), v2.len(), v3.len(), v4.len(), v5.len()]
+                .into_iter()
+                .all(|count| count == 5)
+        },
+    )
+    .await;
+
+    leader(&cluster5).await.remove_manager(5).await.unwrap();
+    eventually("four voters remain after removing manager five", || async {
+        let (v1, v2, v3, v4) = tokio::join!(
+            store1.manager_voters(),
+            store2.manager_voters(),
+            store3.manager_voters(),
+            store4.manager_voters(),
+        );
+        [v1.len(), v2.len(), v3.len(), v4.len()]
+            .into_iter()
+            .all(|count| count == 4)
+    })
+    .await;
+
+    leader(&cluster4).await.remove_manager(4).await.unwrap();
+    eventually("the original three voters remain", || async {
+        let (v1, v2, v3) = tokio::join!(
+            store1.manager_voters(),
+            store2.manager_voters(),
+            store3.manager_voters(),
+        );
+        [v1.len(), v2.len(), v3.len()]
+            .into_iter()
+            .all(|count| count == 3)
+    })
+    .await;
+
+    store1.shutdown().await.unwrap();
+    store2.shutdown().await.unwrap();
+    store3.shutdown().await.unwrap();
+    store4.shutdown().await.unwrap();
+    store5.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn removing_the_last_manager_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = StateStore::open(1, "127.0.0.1:0", dir.path(), BTreeMap::new())
+        .await
+        .unwrap();
+    let error = store.remove_manager(1).await.unwrap_err().to_string();
+    assert!(error.contains("last manager"));
+    store.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn v1_migration_removes_workers_in_one_membership_change() {
+    let (store1, store2, store3, addr1, addr2, addr3) = open_cluster().await;
+    let cluster = [&store1, &store2, &store3];
+    let leader = leader(&cluster).await;
+    for (id, addr, role) in [
+        (1, addr1.as_str(), minga_state::types::NodeRole::Manager),
+        (2, addr2.as_str(), minga_state::types::NodeRole::Manager),
+        (3, addr3.as_str(), minga_state::types::NodeRole::Worker),
+    ] {
+        let mut node = sample_node(id, addr);
+        node.role = role;
+        leader.upsert_node(node).await.unwrap();
+    }
+
+    let removed = leader.migrate_manager_voters(vec![1, 2]).await.unwrap();
+    assert_eq!(removed, vec![3]);
+    eventually("workers leave the voter configuration", || async {
+        let (v1, v2, v3) = tokio::join!(
+            store1.manager_voters(),
+            store2.manager_voters(),
+            store3.manager_voters(),
+        );
+        [v1, v2, v3]
+            .iter()
+            .all(|voters| voters.len() == 2 && !voters.contains(&3))
+    })
+    .await;
+
+    store1.shutdown().await.unwrap();
+    store2.shutdown().await.unwrap();
+    store3.shutdown().await.unwrap();
+}

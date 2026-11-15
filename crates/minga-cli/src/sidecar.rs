@@ -649,4 +649,247 @@ mod tests {
 
         assert_eq!(result, fake_bin);
     }
+
+    #[tokio::test]
+    async fn clustered_sidecars_keep_jetstream_available_after_one_manager_stops() {
+        use minga_bus::{EventBus, NatsBus};
+        use minga_state::{
+            types::{ResourceSpec, Service, ServiceMode},
+            StateStore,
+        };
+        use std::collections::{BTreeMap, HashMap};
+        use std::net::{IpAddr, Ipv4Addr};
+
+        let listeners: Vec<_> = (0..9)
+            .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
+            .collect();
+        let ports: Vec<u16> = listeners
+            .iter()
+            .map(|listener| listener.local_addr().unwrap().port())
+            .collect();
+        drop(listeners);
+
+        let raft_listeners: Vec<_> = (0..3)
+            .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
+            .collect();
+        let raft_addrs: Vec<String> = raft_listeners
+            .iter()
+            .map(|listener| listener.local_addr().unwrap().to_string())
+            .collect();
+        drop(raft_listeners);
+        let raft_dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+        let raft_peers = [
+            BTreeMap::from([(2, raft_addrs[1].clone()), (3, raft_addrs[2].clone())]),
+            BTreeMap::from([(1, raft_addrs[0].clone()), (3, raft_addrs[2].clone())]),
+            BTreeMap::from([(1, raft_addrs[0].clone()), (2, raft_addrs[1].clone())]),
+        ];
+        let (raft1, raft2, raft3) = tokio::try_join!(
+            StateStore::open(
+                1,
+                &raft_addrs[0],
+                raft_dirs[0].path(),
+                raft_peers[0].clone()
+            ),
+            StateStore::open(
+                2,
+                &raft_addrs[1],
+                raft_dirs[1].path(),
+                raft_peers[1].clone()
+            ),
+            StateStore::open(
+                3,
+                &raft_addrs[2],
+                raft_dirs[2].path(),
+                raft_peers[2].clone()
+            ),
+        )
+        .unwrap();
+        let mut raft_stores = vec![raft1, raft2, raft3];
+        let sample_service = |id: &str| Service {
+            id: id.to_string(),
+            name: id.to_string(),
+            image: "registry.local/test:1".to_string(),
+            replicas: 1,
+            mode: ServiceMode::Replicated,
+            constraints: Vec::new(),
+            env: HashMap::new(),
+            ports: Vec::new(),
+            networks: Vec::new(),
+            resources: ResourceSpec::default(),
+            agent: None,
+            restart_policy: Default::default(),
+            secrets: Vec::new(),
+            command: Vec::new(),
+            entrypoint: Vec::new(),
+            labels: HashMap::new(),
+            healthcheck: None,
+            mounts: Vec::new(),
+            user: None,
+            extra_hosts: Vec::new(),
+            update: Default::default(),
+            rollback: None,
+            previous: None,
+        };
+
+        let ca_key = rcgen::KeyPair::generate().unwrap();
+        let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let ca = ca_params.self_signed(&ca_key).unwrap();
+        let mut tempdirs = Vec::new();
+        let mut sides = Vec::new();
+        let routes: Vec<String> = (0..3)
+            .map(|i| format!("nats://127.0.0.1:{}", ports[6 + i]))
+            .collect();
+
+        for i in 0..3 {
+            let key = rcgen::KeyPair::generate().unwrap();
+            let mut params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+            params
+                .subject_alt_names
+                .push(rcgen::SanType::IpAddress(IpAddr::V4(Ipv4Addr::LOCALHOST)));
+            let cert = params.signed_by(&key, &ca, &ca_key).unwrap();
+
+            let dir = tempfile::tempdir().unwrap();
+            let cert_path = dir.path().join("route-cert.pem");
+            let key_path = dir.path().join("route-key.pem");
+            let ca_path = dir.path().join("route-ca.pem");
+            std::fs::write(&cert_path, cert.pem()).unwrap();
+            std::fs::write(&key_path, key.serialize_pem()).unwrap();
+            std::fs::write(&ca_path, ca.pem()).unwrap();
+
+            let cluster = ClusterTls {
+                name: "minga-test".to_string(),
+                cert_file: cert_path,
+                key_file: key_path,
+                ca_file: ca_path,
+                port: ports[6 + i],
+                routes: routes
+                    .iter()
+                    .enumerate()
+                    .filter(|(peer, _)| *peer != i)
+                    .map(|(_, route)| route.clone())
+                    .collect(),
+            };
+            let side = NatsSidecar::start(&SidecarOptions {
+                data_dir: dir.path().to_path_buf(),
+                node_id: i as u64 + 1,
+                client_port: ports[i],
+                monitor_port: ports[3 + i],
+                cluster: Some(cluster),
+                ..SidecarOptions::default()
+            })
+            .await
+            .expect("start route-TLS sidecar");
+            sides.push(side);
+            tempdirs.push(dir);
+        }
+
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let seeds = sides
+            .iter()
+            .map(|side| side.client_url())
+            .collect::<Vec<_>>()
+            .join(",");
+        let bus = NatsBus::connect(&seeds).await.expect("connect to sidecars");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            if bus.ensure_replicas(3).await.is_ok() {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "three route-TLS sidecars did not form a JetStream cluster"
+            );
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        // Stream creation and replica placement are separate from the
+        // metadata quorum forming; let JetStream finish both before failure.
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        bus.put_status("node.1.task.clustered", b"before")
+            .await
+            .unwrap();
+        raft_stores[0]
+            .upsert_service(sample_service("before"))
+            .await
+            .unwrap();
+
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let mut stopped = sides.pop().unwrap();
+        stopped.child.start_kill().unwrap();
+        stopped.child.wait().await.unwrap();
+        raft_stores.pop().unwrap().shutdown().await.unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let status = bus.get_status("node.1.task.clustered").await;
+            if status
+                .as_ref()
+                .is_ok_and(|value| value.as_deref() == Some(&b"before"[..]))
+            {
+                break;
+            }
+            let last_status = match status {
+                Ok(value) => format!("unexpected value {value:?}"),
+                Err(error) => error.to_string(),
+            };
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "status read did not recover after a manager sidecar stopped: {last_status}"
+            );
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            if bus
+                .put_status("node.1.task.clustered", b"after")
+                .await
+                .is_ok()
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "status write did not recover after a manager sidecar stopped"
+            );
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        assert_eq!(
+            bus.get_status("node.1.task.clustered")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(&b"after"[..])
+        );
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            if raft_stores[0]
+                .upsert_service(sample_service("after"))
+                .await
+                .is_ok()
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "Raft write did not recover after one manager stopped"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        for store in &raft_stores {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+            loop {
+                if store.get_service("after").await.unwrap().is_some() {
+                    break;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "post-failure Raft write did not replicate"
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+        for store in raft_stores {
+            store.shutdown().await.unwrap();
+        }
+    }
 }
