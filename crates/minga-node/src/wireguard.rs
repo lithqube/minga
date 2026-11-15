@@ -271,8 +271,7 @@ pub async fn run_wireguard_assignments(
                 continue;
             }
             // `ip` and `wg` block; keep them off the runtime the scheduler
-            // and supervisor share. Preserve the old assignment on failure so
-            // the next watch pass can retry the same diff.
+            // and supervisor share.
             let key_path = key_path.clone();
             let runtime = tokio::runtime::Handle::current();
             let mut current_state = current.clone();
@@ -294,10 +293,14 @@ pub async fn run_wireguard_assignments(
                 Ok(Ok(updated)) => current = updated,
                 Ok(Err(error)) => {
                     tracing::warn!(node_id, error = %error, "cannot apply WireGuard peer assignment");
+                    // A failed apply may have changed the kernel partway; forget
+                    // the cached set so the retry re-applies every peer.
+                    current = None;
                     break;
                 }
                 Err(error) => {
                     tracing::warn!(node_id, error = %error, "WireGuard peer assignment task failed");
+                    current = None;
                     break;
                 }
             }
@@ -337,15 +340,11 @@ async fn apply_peer_assignment(
     if set.as_ref() == current.as_ref() {
         match set.as_ref() {
             Some(set) if set.peers.is_empty() => return Ok(()),
-            Some(_) => {
-                #[cfg(target_os = "linux")]
-                if interface_is_up()? {
-                    return Ok(());
-                }
-                #[cfg(not(target_os = "linux"))]
-                return Ok(());
-            }
-            None => {}
+            #[cfg(target_os = "linux")]
+            Some(_) if interface_is_up()? => return Ok(()),
+            #[cfg(not(target_os = "linux"))]
+            Some(_) => return Ok(()),
+            _ => {}
         }
     }
 
@@ -517,9 +516,10 @@ fn apply_peer_diff(
         let Some((key, ips)) = line.split_once('\t') else {
             continue;
         };
+        // `wg show <if> allowed-ips` separates addresses with spaces.
         let mut ips: Vec<_> = ips
-            .split(',')
-            .filter(|ip| !ip.is_empty() && *ip != "(none)")
+            .split_whitespace()
+            .filter(|ip| *ip != "(none)")
             .map(str::to_owned)
             .collect();
         ips.sort();

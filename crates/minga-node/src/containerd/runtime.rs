@@ -806,9 +806,30 @@ impl Runtime for ContainerdRuntime {
     ) -> Result<String, RuntimeError> {
         #[cfg(target_os = "linux")]
         if self.networking_blocked.load(Ordering::Acquire) {
-            return Err(RuntimeError::Start(
-                "task networking is blocked while source filters are being recovered".into(),
-            ));
+            // Retry recovery here too: `list()` may not run again once the
+            // supervisor has adopted containers.
+            let recovered = match &self.networking {
+                Some(networking) => match networking.reconcile_task_source_filters().await {
+                    Ok(()) => true,
+                    Err(error) => {
+                        tracing::warn!(%error, "task source filters are still not recovered");
+                        if let Err(block_error) = networking.block_task_networking().await {
+                            tracing::error!(
+                                %block_error,
+                                "failed to restore task networking block after source-filter failure"
+                            );
+                        }
+                        false
+                    }
+                },
+                None => false,
+            };
+            if !recovered {
+                return Err(RuntimeError::Start(
+                    "task networking is blocked while source filters are being recovered".into(),
+                ));
+            }
+            self.networking_blocked.store(false, Ordering::Release);
         }
         let container_id = task_id.clone();
         let secret_mounts = self.resolve_secrets(&container_id, spec)?;

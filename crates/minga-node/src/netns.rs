@@ -203,16 +203,54 @@ async fn move_filter_jump_first(hook: &str, chain: &str) -> Result<(), NetError>
             stderr,
         });
     }
-    run_tolerated(
-        "iptables",
-        &["-w", "5", "-t", "filter", "-D", hook, "-j", chain],
-    )
-    .await;
-    run(
-        "iptables",
-        &["-w", "5", "-t", "filter", "-I", hook, "1", "-j", chain],
-    )
-    .await
+    let hooked = tokio::process::Command::new("iptables")
+        .args(["-w", "5", "-t", "filter", "-C", hook, "-j", chain])
+        .output()
+        .await
+        .is_ok_and(|o| o.status.success());
+    // Delete and re-insert in one transaction so the jump (source
+    // validation among them) is never missing from the hook.
+    let mut batch = String::from("*filter\n");
+    if hooked {
+        batch.push_str(&format!("-D {hook} -j {chain}\n"));
+    }
+    batch.push_str(&format!("-I {hook} 1 -j {chain}\nCOMMIT\n"));
+    iptables_restore(&batch).await
+}
+
+/// Applies `iptables-restore --noflush` input as one atomic commit.
+async fn iptables_restore(input: &str) -> Result<(), NetError> {
+    use tokio::io::AsyncWriteExt;
+    let command_error = |stderr: String| NetError::Command {
+        cmd: format!("iptables-restore -w 5 --noflush <<< {input:?}"),
+        stderr,
+    };
+    let mut child = tokio::process::Command::new("iptables-restore")
+        .args(["-w", "5", "--noflush"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|error| command_error(error.to_string()))?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| command_error("stdin was not piped".into()))?;
+    stdin
+        .write_all(input.as_bytes())
+        .await
+        .map_err(|error| command_error(error.to_string()))?;
+    drop(stdin);
+    let output = child
+        .wait_with_output()
+        .await
+        .map_err(|error| command_error(error.to_string()))?;
+    if !output.status.success() {
+        return Err(command_error(
+            String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        ));
+    }
+    Ok(())
 }
 
 async fn ensure_task_source_chain() -> Result<(), NetError> {
@@ -340,8 +378,22 @@ async fn run_tolerated(program: &str, args: &[&str]) {
         .await;
 }
 
-/// Inserts an iptables rule unless it is already present.
+/// Inserts an iptables rule at the chain head unless it is already present.
 async fn ensure_rule(table: &str, chain: &str, rule: &[&str]) -> Result<(), NetError> {
+    ensure_rule_at(table, chain, "-I", rule).await
+}
+
+/// Appends an iptables rule unless it is already present.
+async fn ensure_rule_last(table: &str, chain: &str, rule: &[&str]) -> Result<(), NetError> {
+    ensure_rule_at(table, chain, "-A", rule).await
+}
+
+async fn ensure_rule_at(
+    table: &str,
+    chain: &str,
+    position: &str,
+    rule: &[&str],
+) -> Result<(), NetError> {
     let exists = tokio::process::Command::new("iptables")
         .args(["-w", "5", "-t", table, "-C", chain])
         .args(rule)
@@ -351,7 +403,7 @@ async fn ensure_rule(table: &str, chain: &str, rule: &[&str]) -> Result<(), NetE
     if exists {
         return Ok(());
     }
-    let args = [&["-w", "5", "-t", table, "-I", chain], rule].concat();
+    let args = [&["-w", "5", "-t", table, position, chain], rule].concat();
     run("iptables", &args).await
 }
 
@@ -706,7 +758,9 @@ impl NetworkSetup {
             &["-o", "minga-+", "-j", "RETURN"],
         )
         .await?;
-        ensure_rule("nat", TASK_MASQUERADE_CHAIN, &["-j", "MASQUERADE"]).await?;
+        // The fallback must sit after the overlay RETURN, which ensure_rule
+        // put at the head.
+        ensure_rule_last("nat", TASK_MASQUERADE_CHAIN, &["-j", "MASQUERADE"]).await?;
         ensure_rule(
             "nat",
             "POSTROUTING",
@@ -848,22 +902,15 @@ impl NetworkSetup {
         rules.push(["-o", wg, "-j", "DROP"].map(str::to_owned).to_vec());
         rules.push(["-i", wg, "-j", "DROP"].map(str::to_owned).to_vec());
 
-        run_tolerated(
-            "iptables",
-            &["-w", "5", "-t", "filter", "-N", WG_FORWARD_CHAIN],
-        )
-        .await;
-        run(
-            "iptables",
-            &["-w", "5", "-t", "filter", "-F", WG_FORWARD_CHAIN],
-        )
-        .await?;
-        keep_wireguard_forward_first().await?;
+        // Declaring the chain in a --noflush restore creates or flushes it in
+        // the same commit as the new rules: the mesh policy is never empty.
+        let mut batch = format!("*filter\n:{WG_FORWARD_CHAIN} - [0:0]\n");
         for rule in rules {
-            let mut args = vec!["-w", "5", "-t", "filter", "-A", WG_FORWARD_CHAIN];
-            args.extend(rule.iter().map(String::as_str));
-            run("iptables", &args).await?;
+            batch.push_str(&format!("-A {WG_FORWARD_CHAIN} {}\n", rule.join(" ")));
         }
+        batch.push_str("COMMIT\n");
+        iptables_restore(&batch).await?;
+        keep_wireguard_forward_first().await?;
         ensure_rule("filter", "INPUT", &["-i", wg, "-j", "DROP"]).await?;
         ensure_rule(
             "mangle",
