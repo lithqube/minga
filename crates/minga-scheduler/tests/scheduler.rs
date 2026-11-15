@@ -134,6 +134,9 @@ async fn empty_lease_set_does_not_remove_tasks() {
     // Every lease expires, as after a bus outage longer than the TTL.
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert!(scheduler.reconcile_once().await.unwrap().is_empty());
+    // A live lease for a node Raft does not know about does not count.
+    bus.refresh_lease(99, b"unregistered").await.unwrap();
+    assert!(scheduler.reconcile_once().await.unwrap().is_empty());
     assert_eq!(
         store.list_tasks().await.unwrap().len(),
         2,

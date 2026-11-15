@@ -164,7 +164,8 @@ impl Scheduler {
                 .lock()
                 .unwrap()
                 .is_some_and(|until| std::time::Instant::now() < until);
-            if in_grace || (live_nodes.is_empty() && !nodes.is_empty()) {
+            let any_registered_live = nodes.iter().any(|node| live_nodes.contains(&node.id));
+            if in_grace || (!any_registered_live && !nodes.is_empty()) {
                 tracing::warn!(
                     live = live_nodes.len(),
                     registered = nodes.len(),

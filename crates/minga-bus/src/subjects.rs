@@ -132,6 +132,8 @@ pub fn worker_acl(node_id: u64) -> (Vec<String>, Vec<String>) {
         "$JS.API.STREAM.INFO.KV_MINGA_ASSIGN".into(),
         "$JS.API.STREAM.INFO.KV_MINGA_STATUS".into(),
         "$JS.API.STREAM.INFO.KV_MINGA_LEASES".into(),
+        // Flow-control replies; without them an ordered consumer stalls.
+        "$JS.FC.KV_MINGA_ASSIGN.>".into(),
         // CONSUMER.CREATE.<stream>.<name>.<filter>: the server rejects a
         // payload filter that differs from the one in the subject.
         format!("$JS.API.CONSUMER.CREATE.KV_MINGA_ASSIGN.*.{own_tasks}"),

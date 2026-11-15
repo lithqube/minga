@@ -550,10 +550,7 @@ async fn worker_certificate_cannot_write_assignments_or_other_nodes_status_and_l
         .expect("watch remains open");
     assert_eq!(event.key, "node.7.task.allowed");
     assert_eq!(event.value.as_deref(), Some(&b"assignment"[..]));
-    assert_eq!(
-        worker_bus.list_assignments("node.7.task.").await.unwrap(),
-        vec![("node.7.task.allowed".to_string(), b"assignment".to_vec())]
-    );
+
     assert_eq!(
         worker_bus
             .get_assignment("node.7.task.allowed")
@@ -561,6 +558,35 @@ async fn worker_certificate_cannot_write_assignments_or_other_nodes_status_and_l
             .unwrap(),
         Some(b"assignment".to_vec())
     );
+    // Enough data to cross several flow-control windows: the worker must be
+    // allowed to answer the server's flow-control requests.
+    let big = vec![7u8; 512 * 1024];
+    for i in 0..64 {
+        manager
+            .put_assignment(&format!("node.7.task.big-{i:02}"), &big)
+            .await
+            .unwrap();
+    }
+    let listed = tokio::time::timeout(
+        Duration::from_secs(20),
+        worker_bus.list_assignments("node.7.task."),
+    )
+    .await
+    .expect("listing stalled: flow-control replies denied?")
+    .unwrap();
+    assert_eq!(listed.len(), 65);
+    for i in 0..64 {
+        manager
+            .delete_assignment(&format!("node.7.task.big-{i:02}"))
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        worker_bus.list_assignments("node.7.task.").await.unwrap(),
+        vec![("node.7.task.allowed".to_string(), b"assignment".to_vec())],
+        "deleted keys are not listed"
+    );
+
     // The supervisor reads its status before each write (direct get).
     assert_eq!(
         worker_bus.get_status("node.7.task.allowed").await.unwrap(),

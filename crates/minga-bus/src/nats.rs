@@ -673,9 +673,10 @@ impl EventBus for NatsBus {
         let (pending, mut messages) = self
             .assignment_consumer(prefix, DeliverPolicy::LastPerSubject)
             .await?;
-        let mut entries = Vec::new();
+        // Keyed, so a key updated mid-listing yields its latest value once.
+        let mut entries = std::collections::BTreeMap::new();
         if pending == 0 {
-            return Ok(entries);
+            return Ok(Vec::new());
         }
         while let Some(message) = messages.next().await {
             let message =
@@ -685,15 +686,16 @@ impl EventBus for NatsBus {
                 .map_err(|error| BusError::Kv(format!("assignment info: {error}")))?
                 .pending;
             if let Some(event) = self.assignment_event(&message) {
-                if let Some(value) = event.value {
-                    entries.push((event.key, value));
-                }
+                match event.value {
+                    Some(value) => entries.insert(event.key, value),
+                    None => entries.remove(&event.key),
+                };
             }
             if left == 0 {
                 break;
             }
         }
-        Ok(entries)
+        Ok(entries.into_iter().collect())
     }
 
     async fn delete_assignment(&self, key: &str) -> Result<()> {
