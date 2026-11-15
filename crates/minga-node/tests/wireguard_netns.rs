@@ -524,6 +524,7 @@ async fn wireguard_routes_shared_tasks_and_isolates_other_networks() -> Result<(
         &["route", "replace", "default", "via", "198.18.0.1"],
     )?;
     for namespace in [node_a.as_str(), node_c.as_str()] {
+        in_ns(namespace, "sysctl", &["-w", "net.ipv4.ip_forward=1"])?;
         in_ns(
             namespace,
             "iptables",
