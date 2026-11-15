@@ -209,17 +209,27 @@ fn enable_proxy_arp(namespace: &str, bridge: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn create_task(
-    cleanup: &mut Cleanup,
-    node: &str,
-    network_bridge: &str,
-    task_name: String,
-    host_veth: &str,
-    task_veth: &str,
-    address: &str,
-    gateway: &str,
-) -> Result<String, String> {
-    let task = add_namespace(cleanup, task_name)?;
+struct TaskNetwork<'a> {
+    namespace_name: String,
+    node: &'a str,
+    bridge: &'a str,
+    host_veth: &'a str,
+    task_veth: &'a str,
+    address: &'a str,
+    gateway: &'a str,
+}
+
+fn create_task(cleanup: &mut Cleanup, network: TaskNetwork<'_>) -> Result<String, String> {
+    let TaskNetwork {
+        namespace_name,
+        node,
+        bridge,
+        host_veth,
+        task_veth,
+        address,
+        gateway,
+    } = network;
+    let task = add_namespace(cleanup, namespace_name)?;
     sh(
         "ip",
         &[
@@ -228,7 +238,7 @@ fn create_task(
     )?;
     sh("ip", &["link", "set", host_veth, "netns", node])?;
     sh("ip", &["link", "set", task_veth, "netns", &task])?;
-    ip_ns(node, &["link", "set", host_veth, "master", network_bridge])?;
+    ip_ns(node, &["link", "set", host_veth, "master", bridge])?;
     ip_ns(node, &["link", "set", host_veth, "up"])?;
     ip_ns(&task, &["addr", "add", address, "dev", task_veth])?;
     ip_ns(&task, &["link", "set", "lo", "up"])?;
@@ -529,33 +539,39 @@ async fn wireguard_routes_shared_tasks_and_isolates_other_networks() -> Result<(
     enable_proxy_arp(&node_c, &bridge_c)?;
     let task_a = create_task(
         &mut cleanup,
-        &node_a,
-        &bridge_a,
-        format!("mwt{pid}a"),
-        "ta0",
-        "at0",
-        "10.242.0.10/24",
-        "10.242.0.1",
+        TaskNetwork {
+            namespace_name: format!("mwt{pid}a"),
+            node: &node_a,
+            bridge: &bridge_a,
+            host_veth: "ta0",
+            task_veth: "at0",
+            address: "10.242.0.10/24",
+            gateway: "10.242.0.1",
+        },
     )?;
     let task_b = create_task(
         &mut cleanup,
-        &node_b,
-        &bridge_b,
-        format!("mwt{pid}b"),
-        "tb0",
-        "bt0",
-        "10.242.0.20/24",
-        "10.242.0.1",
+        TaskNetwork {
+            namespace_name: format!("mwt{pid}b"),
+            node: &node_b,
+            bridge: &bridge_b,
+            host_veth: "tb0",
+            task_veth: "bt0",
+            address: "10.242.0.20/24",
+            gateway: "10.242.0.1",
+        },
     )?;
     let task_c = create_task(
         &mut cleanup,
-        &node_c,
-        &bridge_c,
-        format!("mwt{pid}c"),
-        "tc0",
-        "ct0",
-        "10.243.0.30/24",
-        "10.243.0.1",
+        TaskNetwork {
+            namespace_name: format!("mwt{pid}c"),
+            node: &node_c,
+            bridge: &bridge_c,
+            host_veth: "tc0",
+            task_veth: "ct0",
+            address: "10.243.0.30/24",
+            gateway: "10.243.0.1",
+        },
     )?;
 
     let keys = TempDir::new().map_err(|error| error.to_string())?;
