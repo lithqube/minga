@@ -638,7 +638,25 @@ pub async fn create_network(
         )));
     }
 
+    minga_net::overlay::check_driver_opts(&req.Name, req.Options.keys().map(String::as_str))
+        .map_err(bad_request)?;
     let net = translate::network_create_to_state(&req);
+    // An explicit subnet must not overlap another network's. Networks
+    // without one get theirs from the leader's next reconcile pass.
+    if let Some(raw) = &net.subnet {
+        let subnet = minga_net::Cidr::parse(raw).map_err(|e| bad_request(e.to_string()))?;
+        for other in app.store.list_networks().await? {
+            let Some(theirs) = other.subnet.as_deref() else {
+                continue;
+            };
+            if minga_net::Cidr::parse(theirs).is_ok_and(|t| t.overlaps(&subnet)) {
+                return Err(conflict(format!(
+                    "network {} subnet {raw} overlaps network {} subnet {theirs}",
+                    net.name, other.name
+                )));
+            }
+        }
+    }
     app.store.upsert_network(net.clone()).await?;
 
     tracing::info!(network = %net.id, driver = %net.driver, "network created via API");
@@ -909,6 +927,54 @@ mod tests {
             "Mode": {"Replicated": {"Replicas": 1}}
         }))
         .unwrap()
+    }
+
+    fn net_req(name: &str, body: serde_json::Value) -> Json<models::NetworkCreateRequest> {
+        let mut v = serde_json::json!({"Name": name});
+        v.as_object_mut()
+            .unwrap()
+            .extend(body.as_object().unwrap().clone());
+        Json(serde_json::from_value(v).unwrap())
+    }
+
+    #[tokio::test]
+    async fn overlapping_ipam_subnet_is_refused_with_both_names() {
+        let (app, _dir) = app_with_node(1.0).await;
+        let ipam = |s: &str| serde_json::json!({"IPAM": {"Config": [{"Subnet": s}]}});
+        let _ = create_network(State(app.clone()), net_req("a", ipam("10.100.5.0/24")))
+            .await
+            .expect("first subnet is free");
+        let err = create_network(State(app.clone()), net_req("b", ipam("10.100.5.128/25")))
+            .await
+            .unwrap_err();
+        let ApiError::Conflict(msg) = err else {
+            panic!("want 409, got {err:?}");
+        };
+        assert!(
+            msg.contains("network b") && msg.contains("network a"),
+            "{msg}"
+        );
+        // Not stored, and a free subnet still works.
+        assert!(app.store.get_network("b").await.unwrap().is_none());
+        let _ = create_network(State(app.clone()), net_req("c", ipam("10.100.6.0/24")))
+            .await
+            .expect("non-overlapping subnet");
+    }
+
+    #[tokio::test]
+    async fn unknown_network_driver_option_is_refused() {
+        let (app, _dir) = app_with_node(1.0).await;
+        let opts = |k: &str| serde_json::json!({"Options": {k: "1"}});
+        let _ = create_network(State(app.clone()), net_req("a", opts("encrypted")))
+            .await
+            .expect("encrypted is accepted");
+        let err = create_network(
+            State(app.clone()),
+            net_req("b", opts("com.docker.network.mtu")),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, ApiError::BadRequest(_)), "{err:?}");
     }
 
     #[tokio::test]

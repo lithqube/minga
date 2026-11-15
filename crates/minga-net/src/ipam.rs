@@ -13,9 +13,10 @@
 //!
 //! # Subnet allocation from a supernet
 //!
-//! When a network is created without an explicit subnet, one is allocated
-//! from the default supernet (10.100.0.0/16) as a /24. The allocation is
-//! deterministic based on the network ID hash.
+//! When a network is created without an explicit subnet, the Raft leader
+//! gives it the first /24 of the overlay supernet (default 10.100.0.0/16)
+//! that no other network overlaps, and stores it in state. Nodes only
+//! ever read the stored subnet.
 
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
@@ -24,7 +25,7 @@ use std::net::Ipv4Addr;
 
 use thiserror::Error;
 
-use crate::cidr::{Cidr, CidrError, DEFAULT_SUPERNET};
+use crate::cidr::{Cidr, CidrError};
 
 #[derive(Debug, Error)]
 pub enum IpamError {
@@ -38,6 +39,11 @@ pub enum IpamError {
     NotAllocated(String, String),
     #[error("invalid subnet: {0}")]
     InvalidSubnet(String),
+    #[error(
+        "supernet exhausted: every /24 in {0} is taken; remove unused networks \
+         or pass a larger --overlay-supernet"
+    )]
+    SupernetExhausted(String),
 }
 
 /// Manages IP allocations for a single overlay network.
@@ -174,14 +180,13 @@ impl Ipam {
     }
 }
 
-/// Allocate a /24 subnet from the default supernet for a network.
-/// Deterministic: the same network_id always gets the same subnet.
-pub fn allocate_subnet(network_id: &str) -> Result<Cidr, IpamError> {
-    let supernet = Cidr::parse(DEFAULT_SUPERNET)?;
-    let hash = hash_task_id(network_id);
-    let max_subnets = supernet.size() / 256; // /24 subnets in a /16
-    let idx = hash % max_subnets;
-    Ok(supernet.nth_subnet(24, idx)?)
+/// The first /24 of `supernet` that overlaps none of `taken`.
+pub fn allocate_subnet(supernet: &Cidr, taken: &[Cidr]) -> Result<Cidr, IpamError> {
+    let count = 1u64 << 24u8.saturating_sub(supernet.prefix_len());
+    (0..count)
+        .filter_map(|n| supernet.nth_subnet(24, n).ok())
+        .find(|s| !taken.iter().any(|t| t.overlaps(s)))
+        .ok_or_else(|| IpamError::SupernetExhausted(supernet.to_cidr_string()))
 }
 
 /// Hash a string to a u64 (deterministic across runs).
@@ -306,21 +311,27 @@ mod tests {
     }
 
     #[test]
-    fn allocate_subnet_from_supernet() {
-        let subnet1 = allocate_subnet("net-a").unwrap();
-        let subnet2 = allocate_subnet("net-b").unwrap();
-        // Both should be /24s in 10.100.0.0/16
-        assert_eq!(subnet1.prefix_len(), 24);
-        assert_eq!(subnet2.prefix_len(), 24);
-        // Different networks get different subnets (with high probability)
-        assert_ne!(subnet1.to_cidr_string(), subnet2.to_cidr_string());
-    }
-
-    #[test]
-    fn allocate_subnet_is_deterministic() {
-        let s1 = allocate_subnet("my-network").unwrap();
-        let s2 = allocate_subnet("my-network").unwrap();
-        assert_eq!(s1.to_cidr_string(), s2.to_cidr_string());
+    fn allocate_subnet_skips_taken_until_exhausted() {
+        let supernet = Cidr::parse(crate::cidr::DEFAULT_SUPERNET).unwrap();
+        let mut taken = vec![Cidr::parse("10.100.0.0/23").unwrap()];
+        let mut errors = Vec::new();
+        for _ in 0..300 {
+            match allocate_subnet(&supernet, &taken) {
+                Ok(s) => taken.push(s),
+                Err(e) => errors.push(e.to_string()),
+            }
+        }
+        // The /23 holds two /24s: 254 fresh ones, all distinct and inside.
+        let fresh = &taken[1..];
+        assert_eq!(fresh.len(), 254);
+        assert_eq!(fresh[0].to_cidr_string(), "10.100.2.0/24");
+        let distinct: std::collections::HashSet<_> = fresh.iter().collect();
+        assert_eq!(distinct.len(), 254);
+        assert!(fresh
+            .iter()
+            .all(|s| supernet.overlaps(s) && s.prefix_len() == 24));
+        assert_eq!(errors.len(), 46);
+        assert!(errors[0].contains("supernet exhausted"), "{}", errors[0]);
     }
 
     #[test]

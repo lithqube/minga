@@ -22,7 +22,7 @@ pub enum CidrError {
 }
 
 /// A parsed IPv4 CIDR with helper methods.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Cidr {
     net: Ipv4Net,
 }
@@ -116,6 +116,11 @@ impl Cidr {
         Ok(Cidr { net: subnet })
     }
 
+    /// Whether the two ranges share any address.
+    pub fn overlaps(&self, other: &Cidr) -> bool {
+        self.net.contains(&other.net.network()) || other.net.contains(&self.net.network())
+    }
+
     /// String representation (e.g. "10.100.0.0/24").
     pub fn to_cidr_string(&self) -> String {
         self.net.to_string()
@@ -164,12 +169,75 @@ pub fn usable_hosts_iter(net: Ipv4Net) -> impl Iterator<Item = Ipv4Addr> {
 /// Default overlay supernet: 10.100.0.0/16 (65,534 usable hosts, 256 /24 subnets).
 pub const DEFAULT_SUPERNET: &str = "10.100.0.0/16";
 
+/// Refuses an overlay supernet that can't hold a /24 or that overlaps a
+/// host route in `proc_net_route` (the text of `/proc/net/route`). The
+/// default route and Minga's own `minga-*` bridges are ignored.
+pub fn check_supernet(supernet: &Cidr, proc_net_route: &str) -> Result<(), String> {
+    if supernet.prefix_len() >= 24 {
+        return Err(format!(
+            "overlay supernet {supernet} must be larger than /24: each network gets a /24"
+        ));
+    }
+    for line in proc_net_route.lines().skip(1) {
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        let [iface, dest, _, _, _, _, _, mask, ..] = cols[..] else {
+            continue;
+        };
+        let (Ok(dest), Ok(mask)) = (u32::from_str_radix(dest, 16), u32::from_str_radix(mask, 16))
+        else {
+            continue;
+        };
+        if mask == 0 || iface.starts_with("minga") {
+            continue;
+        }
+        // The kernel prints the network-order address as a host-order word.
+        let dest = Ipv4Addr::from(dest.to_ne_bytes());
+        let Ok(net) = Ipv4Net::new(dest, mask.count_ones() as u8) else {
+            continue;
+        };
+        if supernet.overlaps(&Cidr { net }) {
+            return Err(format!(
+                "overlay supernet {supernet} overlaps host route {net} on {iface}; \
+                 pass --overlay-supernet with a range this host doesn't use"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Default WireGuard listen port.
 pub const DEFAULT_WG_PORT: u16 = 51820;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const ROUTES: &str =
+        "Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWindow\tIRTT
+eth0\t00000000\t0101A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0
+eth0\t0001A8C0\t00000000\t0001\t0\t0\t100\t00FFFFFF\t0\t0\t0
+minga-1a2b3c4d\t0005640A\t00000000\t0001\t0\t0\t0\t00FFFFFF\t0\t0\t0
+";
+
+    #[test]
+    fn supernet_refused_when_it_overlaps_a_host_route() {
+        let lan = Cidr::parse("192.168.0.0/16").unwrap();
+        let err = check_supernet(&lan, ROUTES).unwrap_err();
+        assert!(err.contains("192.168.1.0/24 on eth0"), "{err}");
+        // Default route and our own bridges don't count.
+        check_supernet(&Cidr::parse(DEFAULT_SUPERNET).unwrap(), ROUTES).unwrap();
+        // A supernet must hold at least two /24s.
+        assert!(check_supernet(&Cidr::parse("10.1.0.0/24").unwrap(), "").is_err());
+    }
+
+    #[test]
+    fn overlaps_is_symmetric_and_exact() {
+        let a = Cidr::parse("10.100.0.0/16").unwrap();
+        let b = Cidr::parse("10.100.7.0/24").unwrap();
+        let c = Cidr::parse("10.101.0.0/24").unwrap();
+        assert!(a.overlaps(&b) && b.overlaps(&a));
+        assert!(!a.overlaps(&c) && !c.overlaps(&a));
+    }
 
     #[test]
     fn parse_valid_cidr() {

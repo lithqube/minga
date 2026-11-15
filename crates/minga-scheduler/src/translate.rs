@@ -27,6 +27,8 @@ pub enum TranslateError {
     Service(String, String),
     #[error("invalid memory value {0:?} in service `{1}`: {2}")]
     Memory(String, String, String),
+    #[error("{0}")]
+    Network(String),
 }
 
 /// The full set of state entities translated from a Compose project.
@@ -57,7 +59,7 @@ pub fn translate_project(
             .push(translate_service(name, svc, stack, project, project_dir)?);
     }
 
-    out.networks = translate_networks(project, stack);
+    out.networks = translate_networks(project, stack)?;
     out.volumes = translate_volumes(project, stack);
     out.secrets = translate_secrets(project, stack);
     out.configs = translate_configs(project, stack);
@@ -485,7 +487,11 @@ fn parse_ipam_subnet(ipam: &Option<serde_yaml::Value>) -> Option<String> {
     first.get("subnet")?.as_str().map(String::from)
 }
 
-fn translate_networks(project: &Project, stack: &str) -> Vec<Network> {
+fn translate_networks(project: &Project, stack: &str) -> Result<Vec<Network>, TranslateError> {
+    for (name, net) in &project.networks {
+        minga_net::overlay::check_driver_opts(name, net.driver_opts.keys().map(String::as_str))
+            .map_err(TranslateError::Network)?;
+    }
     let mut networks: Vec<Network> = project
         .networks
         .iter()
@@ -513,7 +519,7 @@ fn translate_networks(project: &Project, stack: &str) -> Vec<Network> {
         });
     }
 
-    networks
+    Ok(networks)
 }
 
 fn translate_volumes(project: &Project, stack: &str) -> Vec<Volume> {
@@ -1041,6 +1047,22 @@ volumes:
             .expect("compose should load")
             .project;
         translate_project(&project, "shop", None).map(|mut s| s.services.remove(0))
+    }
+
+    #[test]
+    fn network_driver_opts_accept_only_encrypted() {
+        let compose = |opt: &str| {
+            format!(
+                "services:\n  web:\n    image: nginx\n    networks: [front]\n\
+                 networks:\n  front:\n    driver: overlay\n    driver_opts:\n      {opt}: \"1\"\n"
+            )
+        };
+        translate_one(&compose("encrypted")).unwrap();
+        let err = translate_one(&compose("com.docker.network.mtu")).unwrap_err();
+        assert!(
+            err.to_string().contains("`com.docker.network.mtu`"),
+            "{err}"
+        );
     }
 
     #[test]

@@ -770,21 +770,17 @@ pub fn task_to_docker(task: &Task, networks: &[Network]) -> models::Task {
 
     // Real IP assignments, in the shape service-discovery consumers read.
     // Addresses must carry the subnet prefix — Traefik's swarm provider
-    // fails to parse a bare IP and yields a nil server URL. Auto-allocated
-    // networks have no subnet in state; the prefix comes from the same
-    // deterministic rule the scheduler and the node use.
+    // fails to parse a bare IP and yields a nil server URL. Every network
+    // with task IPs has a stored subnet (the leader stores it first).
     let attachments: Vec<models::NetworkAttachment> = task
         .spec
         .ips
         .iter()
         .map(|(net_id, ip)| {
             let net = networks.iter().find(|n| &n.id == net_id);
-            let prefix: Option<u8> = match net.and_then(|n| n.subnet.as_deref()) {
-                Some(s) => s.rsplit('/').next().and_then(|p| p.parse().ok()),
-                None => minga_net::ipam::allocate_subnet(net_id)
-                    .ok()
-                    .map(|c| c.prefix_len()),
-            };
+            let prefix: Option<u8> = net
+                .and_then(|n| n.subnet.as_deref())
+                .and_then(|s| s.rsplit('/').next()?.parse().ok());
             let address = match prefix {
                 Some(p) => format!("{ip}/{p}"),
                 None => ip.clone(),
