@@ -42,9 +42,22 @@ pub fn load_or_generate_keypair(data_dir: &Path) -> Result<KeyPair, WireGuardErr
         path: data_dir.to_path_buf(),
         source,
     })?;
+    let key_file_error = |path: &Path| {
+        let path = path.to_path_buf();
+        move |source| WireGuardError::KeyFile { path, source }
+    };
+    // Persist the `wg.key` directory entry before the key is used: a concurrent
+    // creator may have linked it without syncing the directory yet.
+    let sync_dir = || {
+        fs::File::open(data_dir)
+            .and_then(|dir| dir.sync_all())
+            .map_err(key_file_error(data_dir))
+    };
     let path = data_dir.join("wg.key");
     if path.symlink_metadata().is_ok() {
-        return read_keypair(&path);
+        let keypair = read_keypair(&path)?;
+        sync_dir()?;
+        return Ok(keypair);
     }
 
     // Write the key to a private temp file, then link it into place: `wg.key`
@@ -55,10 +68,6 @@ pub fn load_or_generate_keypair(data_dir: &Path) -> Result<KeyPair, WireGuardErr
         std::process::id(),
         NEXT_TMP.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
-    let key_file_error = |path: &Path| {
-        let path = path.to_path_buf();
-        move |source| WireGuardError::KeyFile { path, source }
-    };
     let keypair = KeyPair::generate();
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
@@ -77,17 +86,13 @@ pub fn load_or_generate_keypair(data_dir: &Path) -> Result<KeyPair, WireGuardErr
         .map(|()| fs::hard_link(&tmp, &path));
     drop(file);
     let _ = fs::remove_file(&tmp);
-    match linked? {
-        Ok(()) => {
-            // Persist the new directory entry before the key is registered.
-            fs::File::open(data_dir)
-                .and_then(|dir| dir.sync_all())
-                .map_err(key_file_error(data_dir))?;
-            Ok(keypair)
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => read_keypair(&path),
-        Err(source) => Err(key_file_error(&path)(source)),
-    }
+    let keypair = match linked? {
+        Ok(()) => keypair,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => read_keypair(&path)?,
+        Err(source) => return Err(key_file_error(&path)(source)),
+    };
+    sync_dir()?;
+    Ok(keypair)
 }
 
 fn read_keypair(path: &Path) -> Result<KeyPair, WireGuardError> {
