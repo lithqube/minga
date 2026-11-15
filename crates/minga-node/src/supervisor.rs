@@ -13,8 +13,7 @@
 //!
 //! ```text
 //! loop {
-//!     // Bus path: pull commands, refresh lease, publish status
-//!     bus.refresh_lease(node_id)
+//!     // Bus path: pull commands and publish status
 //!     while let Some(cmd) = bus.next_command(node_id) {
 //!         match cmd {
 //!             Assign { task_id, spec } => runtime.start(task_id, spec),
@@ -709,14 +708,9 @@ impl Supervisor {
         actions
     }
 
-    /// Bus reconcile: refresh lease, pull commands, publish status.
+    /// Bus reconcile: pull commands and publish status.
     async fn bus_reconcile(&self, bus: &Arc<dyn EventBus>) -> usize {
         let mut actions = 0;
-
-        // Refresh liveness lease.
-        if let Err(e) = bus.refresh_lease(self.node_id).await {
-            tracing::warn!(node = self.node_id, error = %e, "failed to refresh lease");
-        }
 
         // Pull commands (non-blocking, 100ms timeout per pull).
         loop {
@@ -1959,15 +1953,6 @@ mod tests {
         let actions = supervisor.reconcile_once().await.unwrap();
         assert_eq!(actions, 0);
         assert_eq!(runtime.container_count(), 0);
-    }
-
-    #[tokio::test]
-    async fn bus_refreshes_lease() {
-        let (supervisor, _runtime, _store, bus) = setup_with_bus(1).await;
-
-        assert!(!bus.is_alive(1).await.unwrap());
-        supervisor.reconcile_once().await.unwrap();
-        assert!(bus.is_alive(1).await.unwrap());
     }
 
     #[tokio::test]

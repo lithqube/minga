@@ -68,9 +68,9 @@ pub enum SchedulerError {
 /// Only the leader reconciles. Followers stay idle — if leadership
 /// changes, the new leader picks up the loop.
 ///
-/// When constructed with [`Scheduler::with_bus`], the scheduler also
-/// publishes task assign/stop commands to the event bus, which the
-/// node supervisors consume.
+/// When constructed with [`Scheduler::with_bus`], the scheduler uses current
+/// bus leases to filter placement candidates and publishes task assign/stop
+/// commands to the event bus, which node supervisors consume.
 pub struct Scheduler {
     state: Arc<StateStore>,
     bus: Option<Arc<dyn EventBus>>,
@@ -116,7 +116,17 @@ impl Scheduler {
             .scheduler_reconcile_duration_seconds
             .start_timer();
 
-        let nodes = self.state.list_nodes().await?;
+        let mut nodes = self.state.list_nodes().await?;
+        if let Some(bus) = &self.bus {
+            let live_nodes = match bus.list_alive_nodes().await {
+                Ok(nodes) => nodes,
+                Err(error) => {
+                    tracing::warn!(error = %error, "cannot read node leases; skipping placement");
+                    return Ok(Vec::new());
+                }
+            };
+            nodes.retain(|node| live_nodes.contains(&node.id));
+        }
         let services = self.state.list_services().await?;
         let tasks = self.state.list_tasks().await?;
         let mut networks = self.state.list_networks().await?;

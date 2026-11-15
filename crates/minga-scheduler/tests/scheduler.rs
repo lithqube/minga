@@ -8,6 +8,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
+use minga_bus::EventBus;
 use minga_scheduler::Scheduler;
 use minga_state::types::{ClusterNode, NodeStatus, ResourceSpec, Service, ServiceMode};
 use minga_state::StateStore;
@@ -57,6 +58,42 @@ fn make_service(id: &str, replicas: u32) -> Service {
         previous: None,
         extra_hosts: vec![],
     }
+}
+
+#[tokio::test]
+async fn bus_lease_controls_node_eligibility() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(
+        StateStore::open(1, "127.0.0.1:0", dir.path(), BTreeMap::new())
+            .await
+            .unwrap(),
+    );
+    store.upsert_node(make_node(1, 8.0, 1 << 34)).await.unwrap();
+    store
+        .upsert_service(make_service("app.web", 1))
+        .await
+        .unwrap();
+    let bus = minga_bus::MemoryBus::new();
+    let scheduler = Scheduler::with_bus(store.clone(), bus.clone());
+
+    assert!(
+        scheduler.reconcile_once().await.unwrap().is_empty(),
+        "a Raft node record without a live bus lease must not be placed"
+    );
+    assert!(store.list_tasks().await.unwrap().is_empty());
+
+    bus.refresh_lease(1, b"registration").await.unwrap();
+    let actions = scheduler.reconcile_once().await.unwrap();
+    assert_eq!(actions.len(), 1);
+    assert_eq!(store.list_tasks().await.unwrap()[0].node_id, 1);
+
+    drop(scheduler);
+    Arc::try_unwrap(store)
+        .ok()
+        .expect("scheduler dropped")
+        .shutdown()
+        .await
+        .unwrap();
 }
 
 #[tokio::test]

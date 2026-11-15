@@ -198,7 +198,10 @@ async fn phase0_gate_10_services_3_nodes() {
     }
 
     // --- 6. Run the scheduler (places tasks across 3 nodes, publishes commands) --
-    let bus = MemoryBus::new();
+    let bus = MemoryBus::with_lease_ttl(Duration::from_secs(300));
+    for node_id in [1, 2, 3] {
+        bus.refresh_lease(node_id, b"registration").await.unwrap();
+    }
     let scheduler = Scheduler::with_bus(leader.clone(), bus.clone());
     let actions = scheduler.reconcile_once().await.unwrap();
     assert!(!actions.is_empty(), "scheduler should create tasks");

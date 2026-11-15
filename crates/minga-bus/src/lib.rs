@@ -33,6 +33,7 @@ pub mod nats;
 pub mod subjects;
 pub mod tls;
 
+use std::collections::HashSet;
 use std::pin::Pin;
 use std::time::Duration;
 
@@ -326,13 +327,19 @@ pub trait EventBus: Send + Sync {
     /// Watch for changes to any status key.
     async fn watch_status(&self) -> Result<KvStream>;
 
-    // -- Liveness (TTL leases) ----------------------------------------------
+    // -- Liveness (server-expiring leases) -----------------------------------
 
-    /// Refresh the liveness lease for `node_id`. Call periodically (e.g. every 5s).
-    async fn refresh_lease(&self, node_id: u64) -> Result<()>;
+    /// Refresh a node lease, carrying the node's registration payload.
+    async fn refresh_lease(&self, node_id: u64, registration: &[u8]) -> Result<()>;
 
-    /// Check if `node_id`'s lease is still alive.
+    /// Check whether a node's lease key exists.
     async fn is_alive(&self, node_id: u64) -> Result<bool>;
+
+    /// Return the node IDs whose lease keys currently exist.
+    async fn list_alive_nodes(&self) -> Result<HashSet<u64>>;
+
+    /// Watch lease changes, including the current lease entries.
+    async fn watch_leases(&self) -> Result<KvStream>;
 
     // -- Request / Reply (synchronous control) -------------------------------
 

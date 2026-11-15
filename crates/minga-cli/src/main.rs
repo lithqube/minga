@@ -371,6 +371,12 @@ struct ApiArgs {
     /// PEM file with this node's Raft private key.
     #[arg(long)]
     raft_tls_key: Option<String>,
+    /// NATS server URL for lease-aware placement (defaults to the local manager sidecar).
+    #[arg(long, env = "MINGA_NATS_URL", default_value = "nats://127.0.0.1:4222")]
+    nats_url: String,
+    /// NATS client token, when the server requires one.
+    #[arg(long, env = "MINGA_NATS_TOKEN")]
+    nats_token: Option<String>,
     /// Address to bind the Docker Engine API server (e.g. 0.0.0.0:2375).
     #[arg(long, default_value = "0.0.0.0:2375")]
     api_bind: String,
@@ -680,6 +686,16 @@ async fn run_api(args: ApiArgs) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    let bus = match bus::connect_bus(&args.nats_url, args.nats_token.as_deref(), 1).await {
+        Ok(bus) => bus,
+        Err(error) => {
+            eprintln!(
+                "error: cannot connect to NATS at {}: {error}",
+                args.nats_url
+            );
+            return ExitCode::FAILURE;
+        }
+    };
 
     if args.api_token.is_none() && !is_loopback_bind(&args.api_bind) {
         tracing::warn!(
@@ -702,7 +718,7 @@ async fn run_api(args: ApiArgs) -> ExitCode {
     // The reconcile loop must exist on every Raft voter: the scheduler is
     // leadership-gated, and an API-only node can be elected leader. Without
     // this, a cluster whose leader is an API node places no tasks.
-    let scheduler = minga_scheduler::Scheduler::new(state).with_supernet(supernet);
+    let scheduler = minga_scheduler::Scheduler::with_bus(state, bus).with_supernet(supernet);
     let reconcile = scheduler.run(Duration::from_secs(2));
     tokio::pin!(reconcile);
 
@@ -957,13 +973,6 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
             minga_state::types::NodeRole::Worker
         },
     };
-    let membership = match minga_node::NodeMembership::start(state.clone(), identity).await {
-        Ok(m) => m,
-        Err(e) => {
-            eprintln!("error: cannot register node in cluster: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
 
     // Create the event bus.
     // - If --nats-url is set: connect to external NATS.
@@ -1028,6 +1037,14 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             }
+        }
+    };
+    // The node announces itself only after its bus connection is ready.
+    let _membership = match minga_node::NodeMembership::start(bus.clone(), identity).await {
+        Ok(membership) => membership,
+        Err(error) => {
+            eprintln!("error: cannot publish node lease: {error}");
+            return ExitCode::FAILURE;
         }
     };
 
@@ -1223,13 +1240,15 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
     let interval = Duration::from_secs(args.interval);
 
     if is_manager {
-        let scheduler = minga_scheduler::Scheduler::with_bus(state, bus).with_supernet(supernet);
+        let scheduler = minga_scheduler::Scheduler::with_bus(state.clone(), bus.clone())
+            .with_supernet(supernet);
         tracing::info!(
             node_id = args.node_id,
-            "starting manager loops (scheduler + supervisor)"
+            "starting manager loops (scheduler + supervisor + node registration)"
         );
         tokio::select! {
             _ = scheduler.run(interval) => {},
+            _ = minga_node::run_node_registration(state, bus) => {},
             _ = supervisor.run(interval) => {},
             _ = tokio::signal::ctrl_c() => {
                 tracing::info!(node_id = args.node_id, "shutting down manager");
@@ -1246,13 +1265,6 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
                 tracing::info!(node_id = args.node_id, "shutting down worker");
             },
         }
-    }
-
-    // Mark the node as left so the scheduler stops placing tasks on it
-    // immediately instead of waiting for the lease to expire.
-    if let Err(e) = membership.leave().await {
-        tracing::error!(node_id = args.node_id, error = %e, "failed to leave the cluster");
-        return ExitCode::FAILURE;
     }
 
     ExitCode::SUCCESS

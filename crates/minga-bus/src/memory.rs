@@ -4,7 +4,7 @@
 //! process memory — nothing survives a restart. The semantics mirror the
 //! NATS/JetStream implementation so tests exercise the same code paths.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -20,8 +20,8 @@ use crate::{
     KvStream, LogEntry, LogEventStream, RequestStream, Result,
 };
 
-/// Default lease TTL: 15 seconds (3 × 5s heartbeat interval).
-const DEFAULT_LEASE_TTL: Duration = Duration::from_secs(15);
+/// Default lease TTL: 30 seconds.
+const DEFAULT_LEASE_TTL: Duration = Duration::from_secs(30);
 
 /// Channel capacity for events, commands, and KV notifications.
 const CHANNEL_CAPACITY: usize = 1024;
@@ -43,8 +43,10 @@ pub struct MemoryBus {
     kv: Mutex<HashMap<String, Vec<u8>>>,
     /// Broadcast channel for KV change notifications.
     kv_tx: broadcast::Sender<KvEvent>,
-    /// Liveness leases: node_id → last refresh time.
-    leases: Mutex<HashMap<u64, Instant>>,
+    /// Liveness leases: node_id → last refresh and registration payload.
+    leases: Mutex<HashMap<u64, Lease>>,
+    /// Broadcast channel for lease changes.
+    lease_tx: broadcast::Sender<KvEvent>,
     /// Lease TTL.
     lease_ttl: Duration,
     /// Request handlers: subject → sender for incoming requests.
@@ -58,6 +60,10 @@ pub struct MemoryBus {
     /// Retained log entries per task, oldest first.
     log_history: Mutex<HashMap<String, VecDeque<LogEntry>>>,
 }
+struct Lease {
+    refreshed_at: Instant,
+    registration: Vec<u8>,
+}
 
 struct CommandChannel {
     tx: mpsc::Sender<Command>,
@@ -65,7 +71,7 @@ struct CommandChannel {
 }
 
 impl MemoryBus {
-    /// Create a new in-memory bus with the default lease TTL (15s).
+    /// Create a new in-memory bus with the default lease TTL (30s).
     pub fn new() -> Arc<Self> {
         Self::with_lease_ttl(DEFAULT_LEASE_TTL)
     }
@@ -74,6 +80,7 @@ impl MemoryBus {
     pub fn with_lease_ttl(lease_ttl: Duration) -> Arc<Self> {
         let (events_tx, _) = broadcast::channel(CHANNEL_CAPACITY);
         let (kv_tx, _) = broadcast::channel(CHANNEL_CAPACITY);
+        let (lease_tx, _) = broadcast::channel(CHANNEL_CAPACITY);
         let (logs_tx, _) = broadcast::channel(CHANNEL_CAPACITY);
         Arc::new(Self {
             events_tx,
@@ -81,6 +88,7 @@ impl MemoryBus {
             kv: Mutex::new(HashMap::new()),
             kv_tx,
             leases: Mutex::new(HashMap::new()),
+            lease_tx,
             lease_ttl,
             request_handlers: Mutex::new(HashMap::new()),
             pending_replies: Mutex::new(HashMap::new()),
@@ -208,24 +216,73 @@ impl EventBus for MemoryBus {
         Ok(Box::pin(ReceiverStream { rx: mpsc_rx }))
     }
 
-    async fn refresh_lease(&self, node_id: u64) -> Result<()> {
-        self.leases.lock().unwrap().insert(node_id, Instant::now());
-        // Also publish a KV event so watchers see the heartbeat.
+    async fn refresh_lease(&self, node_id: u64, registration: &[u8]) -> Result<()> {
+        self.leases.lock().unwrap().insert(
+            node_id,
+            Lease {
+                refreshed_at: Instant::now(),
+                registration: registration.to_vec(),
+            },
+        );
         let event = KvEvent {
             key: subjects::kv_lease(node_id),
-            value: Some(now_millis().to_le_bytes().to_vec()),
+            value: Some(registration.to_vec()),
             op: KvOp::Put,
         };
-        let _ = self.kv_tx.send(event);
+        let _ = self.lease_tx.send(event);
         Ok(())
     }
 
     async fn is_alive(&self, node_id: u64) -> Result<bool> {
         let leases = self.leases.lock().unwrap();
-        match leases.get(&node_id) {
-            Some(last_refresh) => Ok(last_refresh.elapsed() < self.lease_ttl),
-            None => Ok(false),
-        }
+        Ok(leases
+            .get(&node_id)
+            .is_some_and(|lease| lease.refreshed_at.elapsed() < self.lease_ttl))
+    }
+
+    async fn list_alive_nodes(&self) -> Result<HashSet<u64>> {
+        let leases = self.leases.lock().unwrap();
+        Ok(leases
+            .iter()
+            .filter(|(_, lease)| lease.refreshed_at.elapsed() < self.lease_ttl)
+            .map(|(node_id, _)| *node_id)
+            .collect())
+    }
+
+    async fn watch_leases(&self) -> Result<KvStream> {
+        let mut updates = self.lease_tx.subscribe();
+        let current = {
+            let leases = self.leases.lock().unwrap();
+            leases
+                .iter()
+                .filter(|(_, lease)| lease.refreshed_at.elapsed() < self.lease_ttl)
+                .map(|(node_id, lease)| KvEvent {
+                    key: subjects::kv_lease(*node_id),
+                    value: Some(lease.registration.clone()),
+                    op: KvOp::Put,
+                })
+                .collect::<Vec<_>>()
+        };
+        let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
+        tokio::spawn(async move {
+            for event in current {
+                if tx.send(event).await.is_err() {
+                    return;
+                }
+            }
+            loop {
+                match updates.recv().await {
+                    Ok(event) => {
+                        if tx.send(event).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
+        Ok(Box::pin(ReceiverStream { rx }))
     }
 
     async fn request(&self, subject: &str, payload: &[u8], timeout: Duration) -> Result<Vec<u8>> {
@@ -676,7 +733,7 @@ mod tests {
         assert!(!bus.is_alive(1).await.unwrap());
 
         // Refresh → alive.
-        bus.refresh_lease(1).await.unwrap();
+        bus.refresh_lease(1, b"registration").await.unwrap();
         assert!(bus.is_alive(1).await.unwrap());
 
         // Wait for expiry.
@@ -688,9 +745,9 @@ mod tests {
     async fn test_lease_refresh_extends() {
         let bus = MemoryBus::with_lease_ttl(Duration::from_millis(200));
 
-        bus.refresh_lease(1).await.unwrap();
+        bus.refresh_lease(1, b"registration").await.unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
-        bus.refresh_lease(1).await.unwrap();
+        bus.refresh_lease(1, b"registration").await.unwrap();
         tokio::time::sleep(Duration::from_millis(150)).await;
         // 250ms since first refresh, but only 150ms since second.
         assert!(bus.is_alive(1).await.unwrap());
@@ -700,7 +757,7 @@ mod tests {
     async fn test_lease_per_node() {
         let bus = MemoryBus::with_lease_ttl(Duration::from_millis(100));
 
-        bus.refresh_lease(1).await.unwrap();
+        bus.refresh_lease(1, b"registration").await.unwrap();
         assert!(bus.is_alive(1).await.unwrap());
         assert!(!bus.is_alive(2).await.unwrap());
     }

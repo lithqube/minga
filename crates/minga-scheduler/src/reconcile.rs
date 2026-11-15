@@ -59,9 +59,9 @@ fn remove_action(task: &Task) -> ReconcileAction {
 ///
 /// - `services`: the desired services (from Raft state).
 /// - `tasks`: the current tasks (from Raft state).
-/// - `nodes`: the current cluster nodes (from Raft state).
-/// - `networks`: the cluster networks (from Raft state), for task IPs.
-/// - `now_unix`: current unix time, for node-lease liveness.
+/// - `nodes`: nodes already filtered to those with current bus leases.
+/// - `networks`: the cluster networks (from Raft), for task IPs.
+/// - `now_unix`: current unix time, for rollout monitor windows.
 pub fn plan(
     services: &[Service],
     tasks: &[Task],

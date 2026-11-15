@@ -2,8 +2,8 @@
 //!
 //! This test pins the *shape* of the deployment path:
 //!
-//!   1. a node registers itself through the production registration path
-//!      ([`minga_node::register_self`]), not through test scaffolding,
+//!   1. a node publishes its identity in a JetStream lease and the leader
+//!      registers it from that bus payload,
 //!   2. a service created through the Docker-compatible API lands in Raft,
 //!   3. the scheduler places tasks and the supervisor starts them,
 //!   4. with no registered node, service creation fails loudly (409)
@@ -14,6 +14,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use minga_bus::MemoryBus;
 use minga_node::NodeIdentity;
@@ -45,6 +46,25 @@ fn identity(id: u64) -> NodeIdentity {
         },
         role: Default::default(),
     }
+}
+
+async fn register_node(
+    store: Arc<StateStore>,
+    bus: Arc<MemoryBus>,
+    identity: NodeIdentity,
+) -> (minga_node::NodeMembership, tokio::task::JoinHandle<()>) {
+    let membership = minga_node::NodeMembership::start(bus.clone(), identity)
+        .await
+        .unwrap();
+    let registration = tokio::spawn(minga_node::run_node_registration(store.clone(), bus));
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while store.get_node(1).await.unwrap().is_none() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("node was not registered from its bus lease");
+    (membership, registration)
 }
 
 /// A service spec equivalent to what `docker stack deploy` POSTs.
@@ -88,10 +108,8 @@ async fn post_service(router: axum::Router, spec: serde_json::Value) -> u16 {
 async fn docker_api_service_creation_lands_in_raft() {
     let (store, _dir) = store().await;
 
-    // The node registers itself, exactly as `minga manager` does at startup.
-    minga_node::register_self(&store, &identity(1))
-        .await
-        .unwrap();
+    let bus = MemoryBus::new();
+    let (membership, registration) = register_node(store.clone(), bus.clone(), identity(1)).await;
 
     let ready_state = Arc::new(minga_telemetry::ReadyState::new());
     let router = minga_api::build_router(store.clone(), ready_state);
@@ -112,6 +130,8 @@ async fn docker_api_service_creation_lands_in_raft() {
         Some("probe"),
         "the stack namespace label must be carried into the environment"
     );
+    registration.abort();
+    membership.leave().await;
 }
 
 #[tokio::test]
@@ -139,11 +159,8 @@ async fn service_creation_fails_loudly_when_no_node_is_registered() {
 async fn a_registered_node_lets_the_service_run_end_to_end() {
     let (store, _dir) = store().await;
 
-    // Register the node through the production path — the same call
-    // `minga manager`/`minga worker` makes at startup.
-    minga_node::register_self(&store, &identity(1))
-        .await
-        .unwrap();
+    let bus = MemoryBus::new();
+    let (membership, registration) = register_node(store.clone(), bus.clone(), identity(1)).await;
     assert_eq!(store.list_nodes().await.unwrap().len(), 1);
 
     let ready_state = Arc::new(minga_telemetry::ReadyState::new());
@@ -151,7 +168,6 @@ async fn a_registered_node_lets_the_service_run_end_to_end() {
     let status = post_service(router, service_spec("probe_web", "nginx:1.27", 2)).await;
     assert_eq!(status, 201);
 
-    let bus = MemoryBus::new();
     let scheduler = Scheduler::with_bus(store.clone(), bus.clone());
     let actions = scheduler.reconcile_once().await.unwrap();
     assert_eq!(
@@ -182,4 +198,6 @@ async fn a_registered_node_lets_the_service_run_end_to_end() {
         2,
         "both tasks must be running under the runtime"
     );
+    registration.abort();
+    membership.leave().await;
 }

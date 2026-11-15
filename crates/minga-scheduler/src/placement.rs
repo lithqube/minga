@@ -2,10 +2,9 @@
 //!
 //! Phase 0 uses a **spread** strategy — replicas are distributed as evenly
 //! as possible across eligible nodes (round-robin), with resource-capacity
-//! checking. A node is eligible if it is active, its membership lease is
-//! valid at `now_unix` (or it carries no lease), it passes all of the
-//! service's placement constraints, and it has enough remaining CPU, memory
-//! and GPUs.
+//! checking. A node is eligible if it is active, its server-expiring bus
+//! lease exists, it passes all of the service's placement constraints, and it
+//! has enough remaining CPU, memory and GPUs.
 //!
 //! Task IDs are deterministic: `{service_id}.{slot}.{revision}` for
 //! replicated services (slot = 1..=replicas) and
@@ -20,16 +19,16 @@ use sha2::{Digest, Sha256};
 
 use minga_state::types::{
     ClusterNode, Network, NetworkId, NodeId, NodeStatus, ResourceSpec, Service, ServiceMode, Task,
-    TaskSpec, TaskState, WorkloadKind, NODE_LEASE_TTL_SECS,
+    TaskSpec, TaskState, WorkloadKind,
 };
 
 use crate::{constraints, netassign};
 
-/// A node counts for placement if it is active, its lease is valid at
-/// `now_unix`, and it matches all of the service's constraints.
-fn is_eligible(n: &ClusterNode, service: &Service, now_unix: u64) -> bool {
+/// A node counts for placement if it is active, currently has a bus lease,
+/// and matches all of the service's constraints. Callers filter expired
+/// leases before handing nodes to this pure planner.
+fn is_eligible(n: &ClusterNode, service: &Service) -> bool {
     n.status == NodeStatus::Active
-        && n.is_live_at(now_unix, NODE_LEASE_TTL_SECS)
         && service
             .constraints
             .iter()
@@ -42,9 +41,9 @@ fn is_eligible(n: &ClusterNode, service: &Service, now_unix: u64) -> bool {
 /// the reconcile loop keeps placement best-effort and retries.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum PlacementError {
-    /// No node is active, live and constraint-compatible.
+    /// No node is active and constraint-compatible.
     #[error(
-        "no eligible nodes for service {service}: 0 of {nodes} registered node(s) are active, live and match constraints {constraints:?}"
+        "no eligible nodes for service {service}: 0 of {nodes} registered node(s) are active and match constraints {constraints:?}"
     )]
     NoEligibleNodes {
         service: String,
@@ -68,7 +67,7 @@ pub fn check_placeable(
     nodes: &[ClusterNode],
     existing_tasks: &[Task],
     networks: &[Network],
-    now_unix: u64,
+    _now_unix: u64,
 ) -> Result<(), PlacementError> {
     let wants_tasks = match service.mode {
         ServiceMode::Replicated => service.replicas > 0,
@@ -78,10 +77,7 @@ pub fn check_placeable(
         return Ok(());
     }
 
-    let eligible = nodes
-        .iter()
-        .filter(|n| is_eligible(n, service, now_unix))
-        .count();
+    let eligible = nodes.iter().filter(|n| is_eligible(n, service)).count();
     if eligible == 0 {
         return Err(PlacementError::NoEligibleNodes {
             service: service.id.clone(),
@@ -89,7 +85,7 @@ pub fn check_placeable(
             constraints: service.constraints.clone(),
         });
     }
-    if place_service(service, nodes, existing_tasks, networks, now_unix).is_empty() {
+    if place_service(service, nodes, existing_tasks, networks, _now_unix).is_empty() {
         return Err(PlacementError::InsufficientCapacity {
             service: service.id.clone(),
             eligible,
@@ -105,8 +101,8 @@ pub fn check_placeable(
 /// reconcile loop will retry on the next pass when the cluster changes.
 ///
 /// `existing_tasks` should be all tasks in the cluster (not just this
-/// service's), so that resource accounting is cross-service. `now_unix` is
-/// the current unix time, used to exclude nodes with expired leases.
+/// service's), so that resource accounting is cross-service. `nodes` must
+/// already be filtered by the current bus lease set.
 /// `networks` is the full cluster network list, used to assign a
 /// deterministic IP per task and network ([`crate::netassign`]).
 pub fn place_service(
@@ -114,13 +110,9 @@ pub fn place_service(
     nodes: &[ClusterNode],
     existing_tasks: &[Task],
     networks: &[Network],
-    now_unix: u64,
+    _now_unix: u64,
 ) -> Vec<Task> {
-    // --- filter eligible nodes ------------------------------------------------
-    let eligible: Vec<&ClusterNode> = nodes
-        .iter()
-        .filter(|n| is_eligible(n, service, now_unix))
-        .collect();
+    let eligible: Vec<&ClusterNode> = nodes.iter().filter(|n| is_eligible(n, service)).collect();
 
     if eligible.is_empty() {
         tracing::warn!(
@@ -639,34 +631,16 @@ mod tests {
     }
 
     #[test]
-    fn expired_lease_makes_node_ineligible() {
+    fn raft_last_seen_does_not_determine_node_liveness() {
         let mut stale = node(1, 4.0, 1 << 30, 0, &[]);
-        stale.last_seen_unix = Some(1_000);
-        let fresh = node(2, 4.0, 1 << 30, 0, &[]);
-        let mut leased = fresh.clone();
-        leased.last_seen_unix = Some(1_000 + NODE_LEASE_TTL_SECS);
-
+        stale.last_seen_unix = Some(1);
         let service = svc("web", 1, ServiceMode::Replicated);
-        // One second past the TTL boundary: node 1's lease is expired,
-        // node 2's is still valid.
-        let now = 1_000 + NODE_LEASE_TTL_SECS + 1;
-        let tasks = place_service(&service, &[stale, leased], &[], &[], now);
-        assert_eq!(tasks.len(), 1);
-        assert_eq!(tasks[0].node_id, 2);
-    }
 
-    #[test]
-    fn node_without_lease_is_always_live() {
-        let service = svc("web", 1, ServiceMode::Replicated);
-        // `node()` builds lease-less (operator-registered) nodes.
-        let tasks = place_service(
-            &service,
-            &[node(1, 4.0, 1 << 30, 0, &[])],
-            &[],
-            &[],
-            u64::MAX,
-        );
+        // The planner is clock-independent. Callers filter nodes by the
+        // server-expiring bus lease before passing them here.
+        let tasks = place_service(&service, &[stale], &[], &[], u64::MAX);
         assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].node_id, 1);
     }
 
     #[test]

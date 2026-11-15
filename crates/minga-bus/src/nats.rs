@@ -28,8 +28,7 @@
 //!
 //! | Bucket | Keys | Purpose |
 //! |---|---|---|
-//! | `MINGA_STATUS` | `task.{id}`, `node.{id}` | Latest actual state |
-//! | `MINGA_LEASES` | `lease.node.{id}` | Liveness (timestamp-based) |
+//! | `MINGA_LEASES` | `lease.node.{id}` | Liveness (server-expiring registration lease) |
 //!
 //! # High availability
 //!
@@ -40,7 +39,7 @@
 //! buckets are created with one replica; [`NatsBus::ensure_replicas`]
 //! raises the ones in [`REPLICATED`] on a NATS cluster.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -60,8 +59,8 @@ use crate::{
     KvStream, LogEntry, LogEventStream, RequestStream, Result,
 };
 
-/// Default lease TTL: 15 seconds.
-const DEFAULT_LEASE_TTL: Duration = Duration::from_secs(15);
+/// Default lease TTL: 30 seconds.
+const DEFAULT_LEASE_TTL: Duration = Duration::from_secs(30);
 
 /// Deliveries before JetStream stops redelivering a message and publishes a
 /// `MAX_DELIVERIES` advisory.
@@ -103,7 +102,6 @@ pub struct NatsBus {
     js: JetStream,
     status_kv: jetstream::kv::Store,
     leases_kv: jetstream::kv::Store,
-    lease_ttl: Duration,
     /// Cached command consumers per node.
     consumers: Mutex<HashMap<u64, jetstream::consumer::PullConsumer>>,
 }
@@ -214,14 +212,13 @@ impl NatsBus {
             .map_err(|e| BusError::Connection(e.to_string()))?;
         let js = jetstream::new(client.clone());
 
-        let (status_kv, leases_kv) = Self::setup_when_ready(&js).await?;
+        let (status_kv, leases_kv) = Self::setup_when_ready(&js, lease_ttl).await?;
 
         Ok(Arc::new(Self {
             client,
             js,
             status_kv,
             leases_kv,
-            lease_ttl,
             consumers: Mutex::new(HashMap::new()),
         }))
     }
@@ -261,14 +258,13 @@ impl NatsBus {
 
         let js = jetstream::new(client.clone());
 
-        let (status_kv, leases_kv) = Self::setup_when_ready(&js).await?;
+        let (status_kv, leases_kv) = Self::setup_when_ready(&js, DEFAULT_LEASE_TTL).await?;
 
         Ok(Arc::new(Self {
             client,
             js,
             status_kv,
             leases_kv,
-            lease_ttl: DEFAULT_LEASE_TTL,
             consumers: Mutex::new(HashMap::new()),
         }))
     }
@@ -299,14 +295,13 @@ impl NatsBus {
 
         let js = jetstream::new(client.clone());
 
-        let (status_kv, leases_kv) = Self::setup_when_ready(&js).await?;
+        let (status_kv, leases_kv) = Self::setup_when_ready(&js, lease_ttl).await?;
 
         Ok(Arc::new(Self {
             client,
             js,
             status_kv,
             leases_kv,
-            lease_ttl,
             consumers: Mutex::new(HashMap::new()),
         }))
     }
@@ -320,10 +315,11 @@ impl NatsBus {
     /// whole node startup on a lost race.
     async fn setup_when_ready(
         js: &JetStream,
+        lease_ttl: Duration,
     ) -> Result<(jetstream::kv::Store, jetstream::kv::Store)> {
         const MAX_ATTEMPTS: u32 = 20; // 20 × 500ms = 10s
         for attempt in 1..=MAX_ATTEMPTS {
-            match Self::setup_all(js).await {
+            match Self::setup_all(js, lease_ttl).await {
                 Ok(pair) => return Ok(pair),
                 Err(e) if attempt < MAX_ATTEMPTS => {
                     tracing::debug!(
@@ -339,10 +335,13 @@ impl NatsBus {
         unreachable!("loop returns on success or final failure")
     }
 
-    async fn setup_all(js: &JetStream) -> Result<(jetstream::kv::Store, jetstream::kv::Store)> {
+    async fn setup_all(
+        js: &JetStream,
+        lease_ttl: Duration,
+    ) -> Result<(jetstream::kv::Store, jetstream::kv::Store)> {
         Self::setup_streams(js).await?;
-        let status_kv = Self::setup_kv(js, "MINGA_STATUS").await?;
-        let leases_kv = Self::setup_kv(js, "MINGA_LEASES").await?;
+        let status_kv = Self::setup_kv(js, "MINGA_STATUS", Duration::ZERO).await?;
+        let leases_kv = Self::setup_kv(js, "MINGA_LEASES", lease_ttl).await?;
         Ok((status_kv, leases_kv))
     }
 
@@ -398,15 +397,35 @@ impl NatsBus {
         Ok(())
     }
 
-    async fn setup_kv(js: &JetStream, bucket: &str) -> Result<jetstream::kv::Store> {
+    async fn setup_kv(
+        js: &JetStream,
+        bucket: &str,
+        max_age: Duration,
+    ) -> Result<jetstream::kv::Store> {
         // Get before create: an update would reset replicas raised by
         // `ensure_replicas` back to one.
-        if let Ok(store) = js.get_key_value(bucket).await {
+        if let Ok(mut store) = js.get_key_value(bucket).await {
+            if max_age > Duration::ZERO {
+                let mut config = store
+                    .stream
+                    .info()
+                    .await
+                    .map_err(|e| BusError::Kv(format!("{bucket} info: {e}")))?
+                    .config
+                    .clone();
+                if config.max_age != max_age {
+                    config.max_age = max_age;
+                    js.update_stream(config)
+                        .await
+                        .map_err(|e| BusError::Kv(format!("{bucket} max age: {e}")))?;
+                }
+            }
             return Ok(store);
         }
         let config = KvConfig {
             bucket: bucket.to_string(),
             history: 1,
+            max_age,
             ..Default::default()
         };
         js.create_key_value(config)
@@ -657,11 +676,10 @@ impl EventBus for NatsBus {
         Ok(Box::pin(kv_stream))
     }
 
-    async fn refresh_lease(&self, node_id: u64) -> Result<()> {
+    async fn refresh_lease(&self, node_id: u64, registration: &[u8]) -> Result<()> {
         let key = subjects::kv_lease(node_id);
-        let value = now_millis().to_le_bytes().to_vec();
         self.leases_kv
-            .put(key, Bytes::from(value))
+            .put(key, Bytes::copy_from_slice(registration))
             .await
             .map_err(|e| BusError::Lease(format!("refresh {node_id}: {e}")))?;
         Ok(())
@@ -669,23 +687,64 @@ impl EventBus for NatsBus {
 
     async fn is_alive(&self, node_id: u64) -> Result<bool> {
         let key = subjects::kv_lease(node_id);
-        match self
+        Ok(self
             .leases_kv
             .get(key)
             .await
             .map_err(|e| BusError::Lease(format!("get {node_id}: {e}")))?
-        {
-            Some(bytes) => {
-                let arr: [u8; 8] = bytes
-                    .as_ref()
-                    .try_into()
-                    .map_err(|_| BusError::Lease("invalid lease value".to_string()))?;
-                let last_refresh = u64::from_le_bytes(arr);
-                let age_ms = now_millis().saturating_sub(last_refresh);
-                Ok(Duration::from_millis(age_ms) < self.lease_ttl)
+            .is_some())
+    }
+
+    async fn list_alive_nodes(&self) -> Result<HashSet<u64>> {
+        let mut keys = self
+            .leases_kv
+            .keys()
+            .await
+            .map_err(|e| BusError::Lease(format!("list: {e}")))?;
+        let mut nodes = HashSet::new();
+        while let Some(key) = keys.next().await {
+            let key = key.map_err(|e| BusError::Lease(format!("list key: {e}")))?;
+            if let Some(node_id) = key
+                .strip_prefix("lease.node.")
+                .and_then(|id| id.parse().ok())
+            {
+                nodes.insert(node_id);
             }
-            None => Ok(false),
         }
+        Ok(nodes)
+    }
+
+    async fn watch_leases(&self) -> Result<KvStream> {
+        // Lease entries have history=1, so replay the current snapshot before
+        // streaming new leases. Managers can start or regain leadership after
+        // nodes have already joined.
+        let watcher = self
+            .leases_kv
+            .watch_all_from_revision(1)
+            .await
+            .map_err(|e| BusError::Lease(format!("watch: {e}")))?;
+
+        let stream = watcher.filter_map(|entry_result| async move {
+            match entry_result {
+                Ok(entry) => {
+                    let op = match entry.operation {
+                        KvOperation::Put => KvOp::Put,
+                        KvOperation::Delete | KvOperation::Purge => KvOp::Delete,
+                    };
+                    let value = (op == KvOp::Put).then(|| entry.value.to_vec());
+                    Some(KvEvent {
+                        key: entry.key,
+                        value,
+                        op,
+                    })
+                }
+                Err(error) => {
+                    tracing::warn!(error = %error, "lease watch error");
+                    None
+                }
+            }
+        });
+        Ok(Box::pin(stream))
     }
 
     async fn request(&self, subject: &str, payload: &[u8], _timeout: Duration) -> Result<Vec<u8>> {
