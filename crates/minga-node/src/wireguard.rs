@@ -414,7 +414,7 @@ fn minga_node_network_setup(key_path: &Path) -> crate::netns::NetworkSetup {
 #[cfg(any(target_os = "linux", test))]
 fn validate_peer_set(set: &minga_net::wireguard::WireGuardPeerSet) -> Result<(), WireGuardError> {
     let mut network_ids = HashSet::new();
-    let mut local_subnets = Vec::new();
+    let mut allowed_subnets = Vec::new();
     for network in &set.networks {
         if !network_ids.insert(&network.network_id) {
             return Err(WireGuardError::InvalidAssignment(format!(
@@ -428,8 +428,8 @@ fn validate_peer_set(set: &minga_net::wireguard::WireGuardPeerSet) -> Result<(),
                 network.network_id
             ))
         })?;
-        if network.local {
-            local_subnets.push(subnet);
+        if network.local || network.relay {
+            allowed_subnets.push(subnet);
         }
     }
 
@@ -461,9 +461,9 @@ fn validate_peer_set(set: &minga_net::wireguard::WireGuardPeerSet) -> Result<(),
                     "AllowedIP must be an IPv4 /32: {allowed_ip:?}"
                 )));
             }
-            if !local_subnets.iter().any(|subnet| subnet.contains(ip)) {
+            if !allowed_subnets.iter().any(|subnet| subnet.contains(ip)) {
                 return Err(WireGuardError::InvalidAssignment(format!(
-                    "AllowedIP {allowed_ip:?} is outside local networks"
+                    "AllowedIP {allowed_ip:?} is outside assigned networks"
                 )));
             }
         }
@@ -755,8 +755,19 @@ mod tests {
                 network_id: "shared".into(),
                 subnet: "10.242.0.0/24".into(),
                 local: true,
+                relay: false,
             }],
         };
+        let mut relayed = set.clone();
+        relayed
+            .networks
+            .push(minga_net::wireguard::WireGuardNetworkAssignment {
+                network_id: "relay".into(),
+                subnet: "10.243.0.0/24".into(),
+                local: false,
+                relay: true,
+            });
+        assert!(validate_peer_set(&relayed).is_ok());
         assert!(validate_peer_set(&set).is_err());
     }
 }

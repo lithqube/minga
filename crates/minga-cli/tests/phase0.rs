@@ -22,7 +22,7 @@ use std::time::Duration;
 use minga_bus::{subjects, EventBus, MemoryBus, TaskActualState, TaskStatusReport};
 use minga_node::{MockRuntime, Supervisor};
 use minga_scheduler::Scheduler;
-use minga_state::types::{ClusterNode, NodeStatus, ResourceSpec};
+use minga_state::types::{ClusterNode, NodeRole, NodeStatus, ResourceSpec};
 use minga_state::StateStore;
 
 static PORT: AtomicU16 = AtomicU16::new(53000);
@@ -44,10 +44,14 @@ fn cluster_node(id: u64, addr: &str) -> ClusterNode {
             gpus: 0,
         },
         wg_public_key: None,
-        wg_endpoint: None,
+        wg_endpoint: Some(format!("192.0.2.{}:51820", id)),
         overlay_ip: None,
         last_seen_unix: None,
-        role: Default::default(),
+        role: if id == 1 {
+            NodeRole::Manager
+        } else {
+            NodeRole::Worker
+        },
     }
 }
 

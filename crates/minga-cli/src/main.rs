@@ -403,7 +403,8 @@ struct NodeArgs {
         value_parser = clap::value_parser!(u16).range(1..)
     )]
     wg_listen: u16,
-    /// Reachable WireGuard endpoint; omit when this node is behind NAT.
+    /// Reachable WireGuard endpoint; managers require it in multi-node clusters,
+    /// while workers omit it when behind NAT.
     #[arg(long)]
     wg_endpoint: Option<String>,
     /// WireGuard interface MTU when the mesh is active.
@@ -950,6 +951,14 @@ fn worker_has_manager_only_flags(args: &NodeArgs) -> bool {
         || args.api_token.is_some()
 }
 
+fn manager_requires_wg_endpoint(
+    is_manager: bool,
+    joining_cluster: bool,
+    has_other_nodes: bool,
+) -> bool {
+    is_manager && (joining_cluster || has_other_nodes)
+}
+
 async fn wait_for_node_shutdown() {
     #[cfg(unix)]
     {
@@ -1055,6 +1064,12 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
             return ExitCode::FAILURE;
         }
     }
+    if args.wg_endpoint.is_none()
+        && manager_requires_wg_endpoint(is_manager, args.join || !args.peers.is_empty(), false)
+    {
+        eprintln!("error: managers in a multi-node cluster require --wg-endpoint");
+        return ExitCode::FAILURE;
+    }
     let supernet = match overlay_supernet(&args.overlay_supernet) {
         Ok(c) => c,
         Err(e) => {
@@ -1110,6 +1125,24 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
     } else {
         None
     };
+    if is_manager && args.wg_endpoint.is_none() {
+        let has_other_nodes = match state
+            .as_ref()
+            .expect("manager StateStore initialized")
+            .list_nodes()
+            .await
+        {
+            Ok(nodes) => nodes.iter().any(|node| node.id != args.node_id),
+            Err(error) => {
+                eprintln!("error: cannot inspect cluster nodes: {error}");
+                return ExitCode::FAILURE;
+            }
+        };
+        if manager_requires_wg_endpoint(is_manager, false, has_other_nodes) {
+            eprintln!("error: managers in a multi-node cluster require --wg-endpoint");
+            return ExitCode::FAILURE;
+        }
+    }
     let keypair = match minga_node::load_or_generate_keypair(&PathBuf::from(&args.data_dir)) {
         Ok(keypair) => keypair,
         Err(error) => {
@@ -2214,8 +2247,8 @@ fn port_of(addr: &str) -> Option<u16> {
 #[cfg(test)]
 mod tests {
     use super::{
-        is_loopback_bind, node_certificate_names, port_of, project_dir, run_node,
-        worker_has_manager_only_flags, Cli, Command, NodeCertificateRole,
+        is_loopback_bind, manager_requires_wg_endpoint, node_certificate_names, port_of,
+        project_dir, run_node, worker_has_manager_only_flags, Cli, Command, NodeCertificateRole,
     };
     use clap::Parser;
 
@@ -2234,6 +2267,14 @@ mod tests {
             panic!("expected worker command");
         };
         assert!(worker_has_manager_only_flags(&args));
+    }
+
+    #[test]
+    fn managers_require_wireguard_endpoint_when_joining_or_multi_node() {
+        assert!(manager_requires_wg_endpoint(true, true, false));
+        assert!(manager_requires_wg_endpoint(true, false, true));
+        assert!(!manager_requires_wg_endpoint(true, false, false));
+        assert!(!manager_requires_wg_endpoint(false, true, true));
     }
 
     #[test]
