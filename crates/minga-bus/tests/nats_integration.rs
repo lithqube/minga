@@ -1,7 +1,7 @@
 //! Integration tests for [`NatsBus`] against a real NATS server.
 //!
-//! A server is shared across tests in this binary. Each test uses unique task
-//! IDs so tests do not interfere with one another.
+//! A server is shared across tests in this binary. Tests are serialized because
+//! concurrent stream setup against that server can time out under CI load.
 //!
 //! To run: `cargo test -p minga-bus --test nats_integration -- --nocapture`
 
@@ -12,14 +12,28 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use minga_bus::{EventBus, LogEntry, LogStream, NatsBus};
+static NATS_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-async fn connect() -> Option<Arc<NatsBus>> {
+struct NatsTestBus {
+    bus: Arc<NatsBus>,
+    _lock: tokio::sync::MutexGuard<'static, ()>,
+}
+
+impl std::ops::Deref for NatsTestBus {
+    type Target = NatsBus;
+
+    fn deref(&self) -> &Self::Target {
+        &self.bus
+    }
+}
+
+async fn connect() -> Option<NatsTestBus> {
+    let lock = NATS_TEST_LOCK.lock().await;
     let url = common::nats_url().await?;
-    Some(
-        NatsBus::connect(&url)
-            .await
-            .unwrap_or_else(|e| panic!("failed to connect to NATS at {url}: {e}")),
-    )
+    let bus = NatsBus::connect(&url)
+        .await
+        .unwrap_or_else(|e| panic!("failed to connect to NATS at {url}: {e}"));
+    Some(NatsTestBus { bus, _lock: lock })
 }
 
 /// Waits for a stream to yield one item, or fails the test on timeout.
