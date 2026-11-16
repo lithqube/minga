@@ -202,36 +202,14 @@ impl Scheduler {
         let services = self.state.list_services().await?;
         let mut tasks = self.state.list_tasks().await?;
         if let Some(bus) = &self.bus {
-            let status_entries = match bus.list_status().await {
-                Ok(entries) => entries,
+            let statuses = match read_task_statuses(bus.as_ref()).await {
+                Ok(statuses) => statuses,
                 Err(error) => {
                     tracing::warn!(error = %error, "cannot read task status; skipping reconciliation");
                     return Ok(Vec::new());
                 }
             };
-            let mut statuses = HashMap::new();
-            for (key, bytes) in status_entries {
-                if !key.starts_with("node.") || !key.contains(".task.") {
-                    continue;
-                }
-                match TaskStatusReport::from_bytes(&bytes) {
-                    Ok(report)
-                        if key
-                            == subjects::kv_node_task_status(report.node_id, &report.task_id) =>
-                    {
-                        statuses.insert(report.task_id.clone(), report);
-                    }
-                    Ok(_) => {}
-                    Err(error) => tracing::warn!(key, error = %error, "cannot decode task status"),
-                }
-            }
-            tasks = tasks
-                .into_iter()
-                .map(|task| {
-                    let status = statuses.get(&task.id);
-                    task_with_actual_status(task, status)
-                })
-                .collect();
+            tasks = overlay_task_statuses(tasks, &statuses);
         }
         let mut networks = self.state.list_networks().await?;
         self.fill_subnets(&mut networks, &tasks).await?;
@@ -302,7 +280,16 @@ impl Scheduler {
             return Ok(());
         };
         let services = self.state.list_services().await?;
-        let tasks = self.state.list_tasks().await?;
+        // Stored task state lags the nodes' reports; without the overlay a
+        // replica reported Failed would stay an ingress backend.
+        let statuses = match read_task_statuses(bus.as_ref()).await {
+            Ok(statuses) => statuses,
+            Err(error) => {
+                tracing::warn!(error = %error, "cannot read task status; skipping projection");
+                return Ok(());
+            }
+        };
+        let tasks = overlay_task_statuses(self.state.list_tasks().await?, &statuses);
         let networks = self.state.list_networks().await?;
         let live_node_ids: HashSet<_> = nodes.iter().map(|node| node.id).collect();
         let service_by_id: HashMap<_, _> = services
@@ -535,6 +522,40 @@ fn validate_manager_endpoints(nodes: &[ClusterNode]) -> Result<(), SchedulerErro
     Ok(())
 }
 
+/// Reads the nodes' task reports from MINGA_STATUS, keyed by task ID. A report
+/// whose key does not match its own node and task is ignored.
+async fn read_task_statuses(
+    bus: &dyn EventBus,
+) -> minga_bus::Result<HashMap<String, TaskStatusReport>> {
+    let mut statuses = HashMap::new();
+    for (key, bytes) in bus.list_status().await? {
+        if !key.starts_with("node.") || !key.contains(".task.") {
+            continue;
+        }
+        match TaskStatusReport::from_bytes(&bytes) {
+            Ok(report) if key == subjects::kv_node_task_status(report.node_id, &report.task_id) => {
+                statuses.insert(report.task_id.clone(), report);
+            }
+            Ok(_) => {}
+            Err(error) => tracing::warn!(key, error = %error, "cannot decode task status"),
+        }
+    }
+    Ok(statuses)
+}
+
+fn overlay_task_statuses(
+    tasks: Vec<Task>,
+    statuses: &HashMap<String, TaskStatusReport>,
+) -> Vec<Task> {
+    tasks
+        .into_iter()
+        .map(|task| {
+            let status = statuses.get(&task.id);
+            task_with_actual_status(task, status)
+        })
+        .collect()
+}
+
 /// Matches `prepare_network`'s sorted attachment order for published-port backends.
 fn primary_task_ip(ips: &HashMap<String, String>) -> Option<(&str, &str)> {
     ips.iter()
@@ -692,16 +713,14 @@ fn build_wireguard_peer_sets(
             if peer.id == node.id {
                 continue;
             }
-            let peer_has_local_network =
-                task_ips.get(&peer.id).is_some_and(|peer_networks| {
-                    local_network_ids
-                        .iter()
-                        .any(|network_id| peer_networks.contains_key(*network_id))
-                }) || ingress_task_ips.get(&peer.id).is_some_and(|peer_networks| {
-                    ingress_network_ids
-                        .iter()
-                        .any(|network_id| peer_networks.contains_key(*network_id))
-                });
+            let peer_has_local_network = task_ips.get(&peer.id).is_some_and(|peer_networks| {
+                local_network_ids
+                    .iter()
+                    .any(|network_id| peer_networks.contains_key(*network_id))
+                // Every node fronts ingress, so a backend's node and every
+                // other node must list each other: either side qualifies.
+            }) || ingress_task_ips.contains_key(&node.id)
+                || ingress_task_ips.contains_key(&peer.id);
             let peer_is_manager = peer.role == NodeRole::Manager;
             if node.role != NodeRole::Manager && !peer_is_manager && !peer_has_local_network {
                 continue;

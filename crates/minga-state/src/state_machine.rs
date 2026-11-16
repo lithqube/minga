@@ -252,6 +252,28 @@ impl RedbStateMachine {
             }
             StateCommand::UpsertService(svc) => {
                 let mut t = tx.open_table(SERVICES_TABLE).map_err(sm_io_err)?;
+                // Two API writes can both pass admission before either
+                // commits; this check, inside the write, decides exclusivity.
+                let mut stored = None;
+                let mut others = Vec::new();
+                for row in t.iter().map_err(sm_io_err)? {
+                    let (key, value) = row.map_err(sm_io_err)?;
+                    let other: Service = crate::codec::decode(value.value())
+                        .map_err(|e| sm_storage_err(ErrorSubject::Store, ErrorVerb::Read, e))?;
+                    if key.value() == svc.id {
+                        stored = Some(other);
+                    } else {
+                        others.push(other);
+                    }
+                }
+                // A write that keeps the stored ports (a rollout or rollback
+                // step) passes, so state from before this rule never wedges.
+                let ports_unchanged = stored.is_some_and(|stored| stored.ports == svc.ports);
+                if !ports_unchanged {
+                    if let Some(conflict) = published_port_conflict(svc, &others) {
+                        return Ok(StateResponse::Error(conflict));
+                    }
+                }
                 let bytes = crate::codec::encode(svc)
                     .map_err(|e| sm_storage_err(ErrorSubject::Store, ErrorVerb::Write, e))?;
                 t.insert(svc.id.as_str(), bytes.as_slice())

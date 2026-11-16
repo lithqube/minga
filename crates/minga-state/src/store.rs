@@ -493,8 +493,10 @@ impl StateStore {
     }
 
     pub async fn upsert_service(&self, service: Service) -> Result<(), StateError> {
-        self.propose(StateCommand::UpsertService(service)).await?;
-        Ok(())
+        match self.propose(StateCommand::UpsertService(service)).await? {
+            StateResponse::Error(conflict) => Err(StateError::PortConflict(conflict)),
+            _ => Ok(()),
+        }
     }
 
     pub async fn remove_service(&self, id: ServiceId) -> Result<(), StateError> {

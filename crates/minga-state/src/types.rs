@@ -327,6 +327,51 @@ pub struct PortMapping {
     pub mode: PortMode,
 }
 
+/// Why `service`'s published ports collide, if they do. A published
+/// port/protocol may appear once per service, and once per cluster when
+/// either side publishes it through ingress. Two host-mode services may
+/// share one, since placement keeps them on different nodes.
+pub fn published_port_conflict<'a>(
+    service: &Service,
+    others: impl IntoIterator<Item = &'a Service>,
+) -> Option<String> {
+    let published = |port: &PortMapping| {
+        port.published
+            .map(|published| (published, port.protocol.to_ascii_lowercase()))
+    };
+    for (index, port) in service.ports.iter().enumerate() {
+        let Some(tuple) = published(port) else {
+            continue;
+        };
+        if service.ports[..index]
+            .iter()
+            .any(|other| published(other).as_ref() == Some(&tuple))
+        {
+            return Some(format!(
+                "port {}/{} is published more than once",
+                tuple.0, tuple.1
+            ));
+        }
+    }
+    for other in others.into_iter().filter(|other| other.id != service.id) {
+        for port in &service.ports {
+            let Some(tuple) = published(port) else {
+                continue;
+            };
+            if other.ports.iter().any(|other_port| {
+                published(other_port).as_ref() == Some(&tuple)
+                    && (port.mode == PortMode::Ingress || other_port.mode == PortMode::Ingress)
+            }) {
+                return Some(format!(
+                    "ingress port {}/{} is already used by service {}",
+                    tuple.0, tuple.1, other.id
+                ));
+            }
+        }
+    }
+    None
+}
+
 /// A task: one replica of a service placed on a node.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Task {

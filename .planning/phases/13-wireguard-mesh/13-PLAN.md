@@ -117,6 +117,14 @@ Order: 13-01 first. 13-02 is independent of Phase 12 and can start any time. 13-
   - [x] A port conflict returns a 409.
   - [x] Backends update when a task moves.
 - [x] The CHANGELOG states the behaviour change plainly: existing stacks with short-syntax ports now publish on every node.
+- **Tenancy checklist (ADR 0008).** Tenants do not exist in code yet, so every object here belongs to the default tenant, and an upgraded cluster maps all existing services and ports to it. The answers below say what the routing mesh does today and what tenancy work must change.
+  1. **Owner.** An ingress assignment is derived from the service that publishes the port; the service's tenant owns it. A published port/protocol is owned cluster-wide by the first service that publishes it through ingress. The keys `node.{id}.ingress.{port}.{proto}` carry no tenant yet; they need a tenant segment when tenants land.
+  2. **Access.** Only the leader writes assignments; a worker reads its own node's keys. Admission goes through the service API, which has no roles yet. The 409 for a taken port names the holding service, so under tenancy it must become a generic conflict that does not reveal another tenant's service.
+  3. **Bus.** The worker ACL grants `node.{id}.ingress.>` for its own node only, and workers never write ingress keys. Per-tenant subjects are not applicable until tenant identity exists in the bus templates.
+  4. **Node.** Not met. Every node opens every ingress port and receives every backend set, including other services' task addresses, and every node peers with every node that runs a backend. Mesh-sourced traffic reaches only backend address, protocol and port (`MINGA_INGRESS_FWD`), never the rest of a network. Under tenancy, ingress must open, and peer, only on the owning tenant's nodes. This blocks running tenants on a shared cluster with the routing mesh on.
+  5. **Shared plane.** Writes are bounded by the number of published ingress ports (one assignment per node and port). There is no per-tenant port quota yet, so one tenant could claim the shared port space; tenancy needs a quota. A node's registered reserved ports are capped at 32 and validated.
+  6. **Audit.** Not applicable yet: there is no tenant identity to log. Assignment writes come from the leader's reconcile loop, not from a user request.
+  7. **Test.** No two-tenant test yet, because tenants do not exist. The isolation the mesh does enforce is tested: a mesh peer reaches only backend ports (unit test on `ingress_forward_batch`, real-kernel test), and a relay peer may carry only relayed workers' mesh addresses (`validate_peer_set`).
 
 ### 13-07 — Live proof, numbers and docs (WG-PROOF)
 On separate VMs (OrbStack Ubuntu and others), with Raft mTLS and NATS mTLS:

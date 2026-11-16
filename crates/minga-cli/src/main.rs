@@ -1408,7 +1408,8 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
     let networking: Option<Arc<minga_node::NetworkSetup>> = if args.runtime == "containerd" {
         Some(Arc::new(
             minga_node::NetworkSetup::new(format!("{}/net", args.data_dir))
-                .with_reserved_tcp_ports(node_tcp_reserved.clone()),
+                .with_reserved_tcp_ports(node_tcp_reserved.clone())
+                .with_reserved_udp_ports([(args.wg_listen, "WireGuard".to_string())]),
         ))
     } else {
         None

@@ -253,61 +253,27 @@ fn validate_ingress_ports(
     services: &[StateService],
     nodes: &[ClusterNode],
 ) -> Result<(), String> {
-    for (index, port) in service.ports.iter().enumerate() {
+    // The state machine applies the same rule at commit; this is the early,
+    // readable rejection. Host-mode clashes on one node are placement's job.
+    if let Some(conflict) = minga_state::types::published_port_conflict(service, services) {
+        return Err(conflict);
+    }
+    // An ingress port opens on every node, so no node's listener may own it.
+    for port in &service.ports {
         let Some(published) = port.published else {
             continue;
         };
-        let is_ingress = port.mode == minga_state::types::PortMode::Ingress;
-        let same_port = |other: &minga_state::types::PortMapping| {
-            other.published == Some(published)
-                && other.protocol.eq_ignore_ascii_case(&port.protocol)
-        };
-        let ingress_conflict = is_ingress
-            || service.ports[..index].iter().any(|other| {
-                same_port(other) && other.mode == minga_state::types::PortMode::Ingress
-            })
-            || services
-                .iter()
-                .filter(|other| other.id != service.id)
-                .any(|other| {
-                    other.ports.iter().any(|other_port| {
-                        same_port(other_port)
-                            && other_port.mode == minga_state::types::PortMode::Ingress
-                    })
-                });
-        if !ingress_conflict {
+        if port.mode != minga_state::types::PortMode::Ingress {
             continue;
         }
-        if service.ports[..index].iter().any(|other| {
-            same_port(other) && (is_ingress || other.mode == minga_state::types::PortMode::Ingress)
-        }) {
-            return Err(format!(
-                "ingress port {published}/{} is declared more than once",
-                port.protocol
-            ));
-        }
-        for other in services.iter().filter(|other| other.id != service.id) {
-            if other.ports.iter().any(|other_port| {
-                same_port(other_port)
-                    && (is_ingress || other_port.mode == minga_state::types::PortMode::Ingress)
+        for node in nodes {
+            if node.reserved_ports.iter().any(|reserved| {
+                reserved.port == published && reserved.protocol.eq_ignore_ascii_case(&port.protocol)
             }) {
                 return Err(format!(
-                    "ingress port {published}/{} is already used by service {}",
-                    port.protocol, other.id
+                    "ingress port {published}/{} is reserved on node {}",
+                    port.protocol, node.id
                 ));
-            }
-        }
-        if is_ingress {
-            for node in nodes {
-                if node.reserved_ports.iter().any(|reserved| {
-                    reserved.port == published
-                        && reserved.protocol.eq_ignore_ascii_case(&port.protocol)
-                }) {
-                    return Err(format!(
-                        "ingress port {published}/{} is reserved on node {}",
-                        port.protocol, node.id
-                    ));
-                }
             }
         }
     }

@@ -193,10 +193,18 @@ pub fn service_spec_to_state(spec: &models::ServiceSpec) -> Result<Service, Stri
                         "host" => minga_state::types::PortMode::Host,
                         other => return Err(format!("unsupported port publish mode {other:?}")),
                     };
+                    // Nodes match protocols exactly, so store the lowercase
+                    // form; Docker treats an empty protocol as tcp.
+                    let protocol = match p.Protocol.to_ascii_lowercase().as_str() {
+                        "" | "tcp" => "tcp",
+                        "udp" => "udp",
+                        "sctp" => "sctp",
+                        _ => return Err(format!("unsupported port protocol {:?}", p.Protocol)),
+                    };
                     Ok(p.TargetPort.map(|target| PortMapping {
                         target: target as u16,
                         published: p.PublishedPort.map(|pp| pp as u16),
-                        protocol: p.Protocol.clone(),
+                        protocol: protocol.to_string(),
                         mode,
                     }))
                 })
@@ -1129,6 +1137,15 @@ mod tests {
         );
 
         spec.EndpointSpec.as_mut().unwrap().Ports[0].PublishMode = Some("unrecognized".into());
+        assert!(service_spec_to_state(&spec).is_err());
+
+        spec.EndpointSpec.as_mut().unwrap().Ports[0].PublishMode = None;
+        spec.EndpointSpec.as_mut().unwrap().Ports[0].Protocol = "UDP".into();
+        assert_eq!(
+            service_spec_to_state(&spec).unwrap().ports[0].protocol,
+            "udp"
+        );
+        spec.EndpointSpec.as_mut().unwrap().Ports[0].Protocol = "icmp".into();
         assert!(service_spec_to_state(&spec).is_err());
     }
 

@@ -162,6 +162,36 @@ async fn write_and_read_service() {
 }
 
 #[tokio::test]
+async fn commit_rejects_a_second_service_on_an_ingress_port() {
+    let (store, _dir) = test_store("commit_rejects_ingress_port").await;
+    let first = sample_service("first");
+    store.upsert_service(first.clone()).await.unwrap();
+
+    // Admission can race; the write itself refuses the duplicate.
+    let error = store
+        .upsert_service(sample_service("second"))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&error, minga_state::StateError::PortConflict(message) if message.contains("first")),
+        "{error}"
+    );
+    assert!(store.get_service("second").await.unwrap().is_none());
+
+    // Re-writing the holder, or host-mode services sharing a port, is fine.
+    store.upsert_service(first).await.unwrap();
+    let mut host = sample_service("host");
+    host.ports[0].published = Some(8443);
+    host.ports[0].mode = minga_state::types::PortMode::Host;
+    store.upsert_service(host.clone()).await.unwrap();
+    let mut second_host = host;
+    second_host.id = "host-2".into();
+    store.upsert_service(second_host).await.unwrap();
+
+    store.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn write_and_read_task() {
     let (store, _dir) = test_store("write_and_read_task").await;
 
@@ -227,10 +257,10 @@ async fn multiple_writes_in_sequence() {
     assert_eq!(store.list_nodes().await.unwrap().len(), 5);
 
     for i in 1..=3 {
-        store
-            .upsert_service(sample_service(&format!("svc-{i}")))
-            .await
-            .unwrap();
+        // Each service needs its own ingress port.
+        let mut service = sample_service(&format!("svc-{i}"));
+        service.ports[0].published = Some(8440 + i);
+        store.upsert_service(service).await.unwrap();
     }
     assert_eq!(store.list_services().await.unwrap().len(), 3);
 

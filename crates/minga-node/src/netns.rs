@@ -688,6 +688,20 @@ impl NetworkSetup {
         self
     }
 
+    /// Adds node-owned UDP ports, such as the WireGuard listen port, which is
+    /// reserved before the interface binds its socket.
+    pub fn with_reserved_udp_ports(
+        mut self,
+        ports: impl IntoIterator<Item = (u16, String)>,
+    ) -> Self {
+        self.reserved.extend(
+            ports
+                .into_iter()
+                .map(|(port, by)| ("udp".to_string(), port, by)),
+        );
+        self
+    }
+
     /// Refuses a published port the node uses: a reserved one, or one a host
     /// process listens on (Docker fails the same way, "port is already allocated").
     fn check_port_free(&self, proto: &str, port: u16) -> Result<(), NetError> {

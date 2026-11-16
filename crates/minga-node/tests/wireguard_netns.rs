@@ -708,17 +708,22 @@ fn install_ingress_mesh_rules(ingress_node: &str, backend_node: &str) -> Result<
 
 fn install_task_source_rules(namespace: &str, veth: &str, address: &str) -> Result<(), String> {
     const CHAIN: &str = "MINGA_TASK_SOURCE";
-    in_ns(
+    // A node with several tasks calls this once per task: create the chain
+    // and its hooks only on the first call, then append each task's rules.
+    if in_ns(
         namespace,
         "iptables",
         &["-w", "5", "-t", "filter", "-N", CHAIN],
-    )?;
-    for hook in ["FORWARD", "INPUT"] {
-        in_ns(
-            namespace,
-            "iptables",
-            &["-w", "5", "-t", "filter", "-I", hook, "1", "-j", CHAIN],
-        )?;
+    )
+    .is_ok()
+    {
+        for hook in ["FORWARD", "INPUT"] {
+            in_ns(
+                namespace,
+                "iptables",
+                &["-w", "5", "-t", "filter", "-I", hook, "1", "-j", CHAIN],
+            )?;
+        }
     }
     in_ns(
         namespace,

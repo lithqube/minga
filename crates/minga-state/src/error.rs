@@ -28,6 +28,9 @@ pub enum StateError {
     /// An import would replace services that already exist.
     #[error("services already exist: {0} (import with overwrite to replace them)")]
     Conflict(String),
+    /// A service publishes a port that it or another service already holds.
+    #[error("{0}")]
+    PortConflict(String),
     /// An import file this build cannot read.
     #[error("{0}")]
     BadSnapshot(String),

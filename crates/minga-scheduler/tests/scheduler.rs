@@ -606,10 +606,102 @@ async fn reconcile_creates_tasks_for_service() {
 }
 
 #[tokio::test]
+async fn ingress_backend_and_backendless_workers_peer_both_ways() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(
+        StateStore::open(1, "127.0.0.1:0", dir.path(), BTreeMap::new())
+            .await
+            .unwrap(),
+    );
+    let mut manager = make_node(1, 8.0, 1 << 34);
+    manager.role = NodeRole::Manager;
+    manager.wg_public_key = Some("manager-key".into());
+    manager.wg_endpoint = Some("192.0.2.1:51820".into());
+    // Node 2 hosts the only backend; node 3 runs nothing but fronts ingress.
+    let mut backend = make_node(2, 8.0, 1 << 34);
+    backend.wg_public_key = Some("backend-key".into());
+    backend.wg_endpoint = Some("192.0.2.2:51820".into());
+    let mut frontend = make_node(3, 8.0, 1 << 34);
+    frontend.wg_public_key = Some("frontend-key".into());
+    frontend.wg_endpoint = Some("192.0.2.3:51820".into());
+    for node in [&manager, &backend, &frontend] {
+        store.upsert_node((*node).clone()).await.unwrap();
+    }
+    store
+        .upsert_network(Network {
+            id: "web".into(),
+            name: "web".into(),
+            driver: "overlay".into(),
+            attachable: false,
+            subnet: Some("10.3.0.0/24".into()),
+            wg_port: None,
+        })
+        .await
+        .unwrap();
+    let mut service = make_service("app.web", 1);
+    service.networks = vec!["web".into()];
+    service.ports = vec![PortMapping {
+        target: 80,
+        published: Some(18080),
+        protocol: "tcp".into(),
+        mode: PortMode::Ingress,
+    }];
+    store.upsert_service(service.clone()).await.unwrap();
+    let mut task = minga_scheduler::place_service(&service, &[backend], &[], &[], 0).remove(0);
+    task.spec.ips.insert("web".into(), "10.3.0.20".into());
+    store.upsert_task(task).await.unwrap();
+    let bus = MemoryBus::new();
+    for id in [1, 2, 3] {
+        bus.refresh_lease(id, b"registration").await.unwrap();
+    }
+    let scheduler = Scheduler::with_bus(store.clone(), bus.clone());
+    scheduler.reconcile_once().await.unwrap();
+
+    let peer_set = |id: u64| {
+        let bus = bus.clone();
+        async move {
+            let value = bus
+                .get_assignment(&format!("node.{id}.wg"))
+                .await
+                .unwrap()
+                .expect("peer set published");
+            minga_state::codec::decode_wire::<minga_net::wireguard::WireGuardPeerSet>(&value)
+                .unwrap()
+        }
+    };
+    let backend_set = peer_set(2).await;
+    let frontend_peer = backend_set
+        .peers
+        .iter()
+        .find(|peer| peer.node_id == 3)
+        .expect("backend node must accept SNAT traffic from the frontend");
+    assert!(frontend_peer
+        .allowed_ips
+        .contains(&"10.200.0.3/32".to_string()));
+    let frontend_set = peer_set(3).await;
+    let backend_peer = frontend_set
+        .peers
+        .iter()
+        .find(|peer| peer.node_id == 2)
+        .expect("frontend node must route to the backend");
+    assert!(backend_peer
+        .allowed_ips
+        .contains(&"10.3.0.20/32".to_string()));
+
+    drop(scheduler);
+    Arc::try_unwrap(store)
+        .ok()
+        .expect("scheduler dropped")
+        .shutdown()
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
 async fn ingress_backend_projection_tracks_task_movement() {
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(
-        StateStore::open(1, "127.0.0.1:50061", dir.path(), BTreeMap::new())
+        StateStore::open(1, "127.0.0.1:0", dir.path(), BTreeMap::new())
             .await
             .unwrap(),
     );
