@@ -41,6 +41,50 @@ jobs:
 
       - name: Workspace tests
         run: cargo test --workspace
+  nats:
+    name: NATS suites (never silently skipped)
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        nats-version: [v2.14.10, v2.15.3]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+
+      - name: Install nats-server ${{ matrix.nats-version }}
+        env:
+          NATS_VERSION: ${{ matrix.nats-version }}
+        run: |
+          curl -fsSL "https://github.com/nats-io/nats-server/releases/download/${NATS_VERSION}/nats-server-${NATS_VERSION}-linux-amd64.tar.gz" \
+            | sudo tar -xz -C /usr/local/bin --strip-components=1 --wildcards '*/nats-server'
+          nats-server --version
+
+      - name: Start single-node JetStream server
+        run: |
+          nohup nats-server -js -p 4222 -m 8222 > "$RUNNER_TEMP/nats-server.log" 2>&1 &
+          for _ in $(seq 1 30); do
+            if curl -fsS "http://127.0.0.1:8222/healthz?js-enabled-only=true" >/dev/null; then
+              break
+            fi
+            sleep 1
+          done
+          curl -fsS "http://127.0.0.1:8222/healthz?js-enabled-only=true"
+          {
+            echo "MINGA_TEST_NATS_URL=nats://127.0.0.1:4222"
+            echo "MINGA_REQUIRE_NATS=1"
+            echo "MINGA_NATS_SERVER_BIN=/usr/local/bin/nats-server"
+          } >> "$GITHUB_ENV"
+
+      - name: NATS integration suites (fail closed)
+        run: cargo test -p minga-bus
 
   nats-upgrade:
     name: NATS store upgrade 2.10.22 to 2.15.3 (plan 14-04)

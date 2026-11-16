@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- The bundled NATS server moves from v2.10.22 to v2.15.3. External NATS is
+  tested on v2.14.10 and v2.15.3; managers warn when JetStream `api.level` is
+  below 4. A 2.10.22 store was verified through a direct upgrade to 2.15.3
+  and back to 2.10.22, preserving the tested assignment, status, lease and
+  log data. A three-server rolling upgrade also kept KV reads and log tails
+  working after each replacement.
+- The 50,000-consumer KV limit is applied only on API level 4 or newer.
+  During mixed-version NATS rollouts, rejected updates are logged and retried
+  when managers reconnect after the server upgrade.
+
 - Existing Compose stacks with short-syntax ports now publish on every node
   by default. Managers project live backends through node-scoped bus
   assignments, and workers balance traffic with iptables DNAT/SNAT.

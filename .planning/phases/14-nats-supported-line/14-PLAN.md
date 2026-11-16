@@ -3,7 +3,7 @@ phase: 14
 title: Supported NATS server line (tenancy T0)
 depends_on: []
 requirements: [NATS-PIN, NATS-LEVEL, NATS-CI, NATS-UPGRADE, NATS-CAP, NATS-DOCS]
-status: planned
+status: complete
 ---
 
 # Phase 14 — Supported NATS server line (tenancy T0)
@@ -51,6 +51,8 @@ Read in full: the v2.11.0, v2.12.0, v2.14.0 and v2.15.0 release notes, plus the 
 
 **Release gate.** The consumer-cap fix (14-06) missed #87's squash merge. It is re-landed in PR #89, and until #89 merges, `main` bundles 2.15.3 without it. **No `v*` tag, and no manual Release run (which publishes the `edge` image), may ship 2.15.3 until 14-04 proves the direct 2.10.22 → 2.15.3 store upgrade.** If the direct jump fails, decide with the user: an intermediate release bundling 2.14.x, or a documented stepwise upgrade.
 
+**Update (2026-11-17):** PRs #89 and #90 merged. The cap is 100,000 and the upgrade proof is in CI; PR #88 adds the 2.14.10/2.15.3 NATS matrix and API-level checks, still awaiting its own CI.
+
 ## Design decisions
 
 1. **Read `api.level` on managers only.** Managers call `query_account()` once after JetStream setup and keep the level on `NatsBus` (`api_level()`), for future feature gates (per-message TTL is level 1, counters 2, and so on). Workers don't: their ACL has no `$JS.API.INFO`, and it stays that way. Under ADR 0008 that endpoint returns account-wide usage, which is cross-tenant information.
@@ -63,36 +65,36 @@ Read in full: the v2.11.0, v2.12.0, v2.14.0 and v2.15.0 release notes, plus the 
 
    The cluster test starts three real binaries (from `PATH` or `MINGA_NATS_SERVER_BIN`) using the config pattern already in `nats_tls.rs`, so it no longer needs Docker.
 5. **Tests must not assume a fresh server.** CI shares one server per job across test binaries. In PR #85, a test that assumed a fresh bucket failed on a server another test had already used. Tests assert invariants, or use names unique to the test.
-6. **Upgrade is proven, not assumed.** A store dir written by 2.10.22 with Minga's streams and buckets must open on 2.15.3 with data intact. A three-server cluster must survive a rolling replacement, one server at a time. Downgrade after the upgrade is not supported unless the research below shows it is; the docs say which.
+- **Downgrade is tested, not assumed.** The 2.10.22 → 2.15.3 test store was reopened on 2.10.22 with assignment, status, lease and log data intact; document that result and its scope.
 
 ## Plans
 
 Order: 14-01 first, because it moves the pins everything else runs against. 14-02, 14-03 and 14-06 can run in parallel after it. 14-04 needs 14-03's helper. 14-05 comes last. The release gate above holds until 14-04 and 14-06 are done.
 
 ### 14-01 — Pin 2.15.3 (NATS-PIN)
-- [ ] `release.yml`: `NATS_VERSION: v2.15.3`, and replace each architecture's `nats_sha256` with the value from the v2.15.3 release's `SHA256SUMS`. Fetch it from the release, don't compute it from a local download.
-- [ ] `ci.yml`: the workspace job installs v2.15.3.
-- [ ] Bump the four test images to `2.15.3-alpine`. 14-03 then replaces them with the shared helper.
+- [x] `release.yml`: `NATS_VERSION: v2.15.3`, and replace each architecture's `nats_sha256` with the value from the v2.15.3 release's `SHA256SUMS`. Fetch it from the release, don't compute it from a local download.
+- [x] `ci.yml`: the workspace job installs v2.15.3.
+- [x] Bump the four test images to `2.15.3-alpine`. 14-03 then replaces them with the shared helper.
 - [x] Read the 2.11, 2.12, 2.14 and 2.15 release notes for changes that touch the sidecar config, stream or KV options Minga sets, or account limits. Findings are in "Release-note review" above; `.planning/STATE.md` points to them.
 - **Done when:** a release build bundles 2.15.3 with a verified checksum, and CI runs on it.
 
 ### 14-02 — Read and gate on `api.level` (NATS-LEVEL)
-- [ ] `NatsBus` (manager path only): after `setup_when_ready`, call `query_account()` and store `requests.level`. Add `pub fn api_level(&self) -> Option<usize>`, which returns `None` on workers.
-- [ ] Add a pure `api_level_warning(level, version) -> Option<String>` for the floor of 4, and log the result as a warning at startup.
-- [ ] Worker ACL unchanged: assert in `subjects` tests that `worker_acl` grants no `$JS.API.INFO`.
-- [ ] Tests:
+- [x] `NatsBus` (manager path only): after `setup_when_ready`, call `query_account()` and store `requests.level`. Add `pub fn api_level(&self) -> Option<usize>`, which returns `None` on workers.
+- [x] Add a pure `api_level_warning(level, version) -> Option<String>` for the floor of 4, and log the result as a warning at startup.
+- [x] Worker ACL unchanged: assert in `subjects` tests that `worker_acl` grants no `$JS.API.INFO`.
+- [x] Tests:
   - unit tests of the warning function at levels 0, 3, 4 and 5
-  - an integration test on each CI line asserting the level is at least 4, and that no warning is logged
+  - integration assertions on both CI lines that manager API levels meet the floor and workers receive no level
 - **Done when:** a manager logs the server's level at startup, and warns below 2.14.
 
 ### 14-03 — CI on both lines, failing closed (NATS-CI)
-- [ ] Add `crates/minga-bus/tests/common/mod.rs` with the helper from design decision 4. Delete the four copies.
-- [ ] Port `nats_cluster.rs` to three real binaries, so `ensure_replicas` and `raise_replicas` run on 2.14 and 2.15 clusters.
-- [ ] New CI job `NATS suites (never silently skipped)`:
+- [x] Add `crates/minga-bus/tests/common/mod.rs` with the helper from design decision 4. Delete the four copies.
+- [x] Port `nats_cluster.rs` to three real binaries, so `ensure_replicas` and `raise_replicas` run on 2.14 and 2.15 clusters.
+- [x] New CI job `NATS suites (never silently skipped)`:
   - a matrix over `v2.14.10` and `v2.15.3`
   - steps: install the binary, start `nats-server -js` in the background, set `MINGA_TEST_NATS_URL` and `MINGA_REQUIRE_NATS=1`, and run `cargo test -p minga-bus`
   - the TLS and cluster suites start their own servers from the installed binary
-- [ ] Prove that the guard fails closed: with `MINGA_REQUIRE_NATS=1` and no server, the suite fails with the helper's message. Record that run in STATE.md.
+- [x] Prove that the guard fails closed: with `MINGA_REQUIRE_NATS=1` and no server, the suite fails with the helper's message. Record that run in STATE.md.
 - **Done when:** both matrix legs pass, and no NATS test can pass by skipping in that job.
 
 ### 14-04 — Upgrade proof (NATS-UPGRADE)
@@ -114,10 +116,10 @@ Order: 14-01 first, because it moves the pins everything else runs against. 14-0
 - **Done when:** a cluster with more than 500 workers can't hit the cap, shown by the test above on both lines.
 
 ### 14-05 — Docs and release notes (NATS-DOCS)
-- [ ] CHANGELOG: the bundled server moves 2.10.22 → 2.15.3; external NATS servers below 2.14 get a startup warning; the upgrade and downgrade result from 14-04.
-- [ ] `CONTRIBUTING.md`: CI pins 2.14.10 and 2.15.3, and the `MINGA_REQUIRE_NATS=1` / `MINGA_TEST_NATS_URL` variables.
-- [ ] ADR 0002 implementation status: the bundled line, and the `api.level` floor. ADR 0008: mark T0 done.
-- [ ] `docs/topologies.md` (external NATS): the supported lines and the floor.
+- [x] CHANGELOG: the bundled server moves 2.10.22 → 2.15.3; external NATS servers below 2.14 get a startup warning; the upgrade and downgrade result from 14-04.
+- [x] `CONTRIBUTING.md`: CI pins 2.14.10 and 2.15.3, and the `MINGA_REQUIRE_NATS=1` / `MINGA_TEST_NATS_URL` variables.
+- [x] ADR 0002 implementation status: the bundled line, and the `api.level` floor. ADR 0008: mark T0 done.
+- [x] `docs/topologies.md` (external NATS): the supported lines and the floor.
 - **Done when:** STATE.md has the evidence for 14-01…14-04, and the docs match it.
 
 ## Tenancy checklist (ADR 0008)

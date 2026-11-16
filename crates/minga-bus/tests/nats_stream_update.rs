@@ -3,17 +3,15 @@
 //! request fields), and a shorter TTL must shrink the duplicate window,
 //! which the server refuses to keep longer than max age.
 //!
-//! Set MINGA_TEST_NATS_URL to run against a local JetStream server of the
-//! version under test; otherwise a Docker image is used.
+mod common;
 
 use minga_bus::NatsBus;
 use std::time::Duration;
-use testcontainers::{core::WaitFor, runners::AsyncRunner, GenericImage, ImageExt};
 
 #[tokio::test]
 async fn reconnecting_with_a_new_lease_ttl_updates_the_bucket() {
     // Raise, then lower, the TTL. Lowering is the case that used to fail.
-    let Some((url, _container)) = nats_url().await else {
+    let Some(url) = common::nats_url().await else {
         return;
     };
     for ttl in [3, 7, 2] {
@@ -36,29 +34,4 @@ async fn lease_stream_config(url: &str) -> async_nats::jetstream::stream::Config
         .await
         .expect("lease stream");
     stream.info().await.expect("stream info").config.clone()
-}
-
-/// The URL of a JetStream server, plus the container keeping it alive, or
-/// `None` (skip) when neither MINGA_TEST_NATS_URL nor Docker is available.
-async fn nats_url() -> Option<(String, Option<testcontainers::ContainerAsync<GenericImage>>)> {
-    if let Ok(url) = std::env::var("MINGA_TEST_NATS_URL") {
-        Some((url, None))
-    } else {
-        let image = GenericImage::new("nats", "2.15.3-alpine")
-            .with_exposed_port(4222.into())
-            .with_wait_for(WaitFor::message_on_stderr("Server is ready"))
-            .with_cmd(vec!["-js"]);
-        let container = match image.start().await {
-            Ok(container) => container,
-            Err(error) => {
-                eprintln!("skipping: cannot start NATS container: {error}");
-                return None;
-            }
-        };
-        let port = container
-            .get_host_port_ipv4(4222)
-            .await
-            .expect("resolve NATS client port");
-        Some((format!("nats://127.0.0.1:{port}"), Some(container)))
-    }
 }

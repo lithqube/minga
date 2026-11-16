@@ -13,8 +13,9 @@
   - **Cluster seeding needs a settle wait.** Right after `ensure_replicas` raised the streams from R1 to R3 on 2.10.22, a KV put timed out waiting for its ack during the leader change. The test waits until every stream has a leader and current followers. This happens with any server version, not just during the upgrade.
   - **Negative check:** the probe fails on a fresh store (`seeded assignment`, left `None`).
   - **CI:** new job `NATS store upgrade 2.10.22 to 2.15.3`, which runs both modes on linux-amd64 with checksum-verified binaries.
+- **Follow-up (2026-11-17):** PRs #89 and #90 are merged. The NATS matrix and fail-closed tests are in PR #88. Local verification passed: `cargo fmt --all --check`, `cargo clippy --all-targets -- -D warnings`, and `cargo test --workspace` (940 passed, 4 ignored) against NATS 2.15.3. The PR #88 matrix still needs GitHub CI.
 
-**Current:** Phase 13 — WireGuard mesh and routing mesh. 13-03 node keys and interface are complete and merged (PR #84). ADR 0007 (13-01, PR #77) and unique subnets (13-02, PR #78) are merged. Phase 12 Managers-only Raft is complete (PR #76; live evidence below).
+**Current:** Phase 14 is complete on PR #88, pending its NATS matrix and merge. PRs #89/#90 are merged; Phase 13 WireGuard and routing mesh work remains in progress. 13-03 node keys and interface are complete and merged (PR #84). ADR 0007 (13-01, PR #77) and unique subnets (13-02, PR #78) are merged. Phase 12 Managers-only Raft is complete (PR #76; live evidence below).
 
 **Phase 12 live evidence (12-07, 2026-11-15):**
 

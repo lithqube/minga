@@ -253,6 +253,13 @@ mod tests {
     #[test]
     fn worker_wireguard_acl_is_exactly_node_scoped() {
         let (publish, subscribe) = worker_acl(7);
+        assert!(
+            !publish
+                .iter()
+                .chain(&subscribe)
+                .any(|subject| subject == "$JS.API.INFO"),
+            "worker ACL must not expose account-wide JetStream information"
+        );
         assert!(publish.contains(
             &"$JS.API.CONSUMER.CREATE.KV_MINGA_ASSIGN.*.$KV.MINGA_ASSIGN.node.7.wg".to_string()
         ));
