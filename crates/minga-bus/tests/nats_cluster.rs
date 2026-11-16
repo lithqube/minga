@@ -204,13 +204,25 @@ async fn replicated_bus_survives_losing_one_server() {
         .get_stream("KV_MINGA_STATUS")
         .await
         .expect("get status stream before failover");
-    let status_info = status_stream.info().await.expect("status stream info");
-    let status_leader = status_info
-        .cluster
-        .as_ref()
-        .and_then(|cluster| cluster.leader.as_deref())
-        .expect("status stream leader")
-        .to_owned();
+    let status_leader = {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let status_info = status_stream.info().await.expect("status stream info");
+            if let Some(leader) = status_info
+                .cluster
+                .as_ref()
+                .and_then(|cluster| cluster.leader.as_deref())
+                .filter(|leader| !leader.is_empty())
+            {
+                break leader.to_owned();
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "status stream leader was not reported"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    };
     let leader_index = names
         .iter()
         .position(|name| name == &status_leader)
