@@ -7,7 +7,7 @@
 //! - [`ipam`] — Deterministic IP address allocation per network
 //! - [`wireguard`] — X25519 keypair generation, `wg-quick` config generation
 //! - [`dns`] — Service discovery: A records, FQDN resolution
-//! - [`overlay`] — [`OverlayManager`]: coordinates IPAM + WireGuard + DNS
+//! - [`overlay`] — [`OverlayManager`]: coordinates IPAM + DNS
 //!
 //! # Architecture
 //!
@@ -26,7 +26,7 @@
 //! use minga_net::OverlayManager;
 //! use std::net::Ipv4Addr;
 //!
-//! let mut mgr = OverlayManager::new(1);
+//! let mut mgr = OverlayManager::new();
 //! mgr.create_network_auto("frontend", "frontend").unwrap();
 //! let ip = mgr.allocate_ip("frontend", "web.1").unwrap();
 //! mgr.register_service("web", "plant-7", vec![ip]);
@@ -45,5 +45,5 @@ pub use cidr::{Cidr, CidrError, DEFAULT_SUPERNET, DEFAULT_WG_PORT};
 pub use dns::{DnsStore, MINGA_DOMAIN};
 pub use dns_server::DnsServer;
 pub use ipam::{Ipam, IpamError};
-pub use overlay::{OverlayError, OverlayManager, PeerInfo};
+pub use overlay::{OverlayError, OverlayManager};
 pub use wireguard::{InterfaceConfig, KeyPair, Peer, WgError};

@@ -67,11 +67,11 @@ Sequential implementation for one developer: B (NATS TLS/transport boundary) →
 **Requirements:** WG-ADR, WG-SUBNET, WG-KEYS, WG-PEERS, WG-NAT, WG-ISOL, WG-INGRESS, WG-PROOF
 **Plans:** `.planning/phases/13-wireguard-mesh/13-PLAN.md`
 **Mode:** standard
-**Status:** Planned
+**Status:** In progress
 
-- [ ] 13-01 — ADR 0007: WireGuard mesh and routing mesh (no code)
-- [ ] 13-02 — Unique subnets and strict network `driver_opts` (independent of Phase 12)
-- [ ] 13-03 — Node keys and the `minga-wg0` interface
+- [x] 13-01 — ADR 0007: WireGuard mesh and routing mesh (no code)
+- [x] 13-02 — Unique subnets and strict network `driver_opts` (independent of Phase 12)
+- [x] 13-03 — Node keys and the `minga-wg0` interface
 - [ ] 13-04 — Peer sets, /32 routes, proxy ARP, cross-node isolation
 - [ ] 13-05 — NAT traversal by relay through managers
 - [ ] 13-06 — Routing mesh (`mode: ingress` as in Swarm, cluster-wide port reservation)

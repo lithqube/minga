@@ -1741,7 +1741,7 @@ fn print_translated(t: &minga_scheduler::TranslatedStack) {
 fn run_net(cmd: NetCommand) -> ExitCode {
     match cmd {
         NetCommand::Create { name, subnet } => {
-            let mut mgr = minga_net::OverlayManager::new(1);
+            let mut mgr = minga_net::OverlayManager::new();
             let result = match &subnet {
                 Some(s) => mgr.create_network(&name, &name, s),
                 None => mgr.create_network_auto(&name, &name),
