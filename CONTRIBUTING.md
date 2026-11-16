@@ -18,7 +18,7 @@ Be direct, be kind, assume good intent. Disagree with ideas, not people. Harassm
   ```
 
 - A C linker (the default toolchain on your platform is fine).
-- **`nats-server`** on `PATH`: the `minga-bus` integration suites start a real server. CI pins v2.10.22.
+- **`nats-server`** on `PATH`: the `minga-bus` integration suites start a real server. CI pins v2.15.3, the line release archives bundle.
 - **Linux + containerd** (optional) for the daemon-backed suites:
 
   ```bash

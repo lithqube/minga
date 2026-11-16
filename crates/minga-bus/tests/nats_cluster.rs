@@ -30,7 +30,7 @@ async fn start_cluster() -> Option<(Vec<ContainerAsync<GenericImage>>, String)> 
 
     let starts = names.iter().map(|name| {
         let prefix = name.clone();
-        GenericImage::new("nats", "2.10-alpine")
+        GenericImage::new("nats", "2.15.3-alpine")
             .with_exposed_port(NATS_PORT.into())
             .with_exposed_port(MONITOR_PORT.into())
             .with_wait_for(WaitFor::message_on_stderr("Server is ready"))

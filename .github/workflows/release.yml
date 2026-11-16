@@ -19,7 +19,7 @@ env:
   RUSTUP_TOOLCHAIN: "1.99.0"
   RUSTUP_VERSION: "1.29.3"
   # Bundled next to `minga`; the manager's NATS sidecar looks there first.
-  NATS_VERSION: v2.10.22
+  NATS_VERSION: v2.15.3
   # Bundled as `ctr`: workload images are preloaded into the `minga`
   # containerd namespace with it (there is no registry pull yet).
   CONTAINERD_VERSION: v2.1.4
@@ -38,14 +38,14 @@ jobs:
             target: x86_64-unknown-linux-gnu
             rustup_sha256: b1c8cb14e30889e7e2999e6b69e62d9e9b9ffc0f4df8180564d306d9680e6c55
             nats_arch: amd64
-            nats_sha256: db0b3ccbe4cbdd3872ae7486ec4f6b0f85824632a0789f4da2e0a8518390483e
+            nats_sha256: 32e18c1e78d7ef4f86e483070eef3abb2647c3d4d67e29668077c7ad81da0797
             ctr_arch: amd64
             ctr_sha256: 50e53500800f4f74d0d8b2e57e939297eab68b0fe11a0957b771d5faa61fae5b
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             rustup_sha256: 9f608c142e0e38a78957d0661ba1dfaf0b6fb37184cfaa4b9a0aa57af6184282
             nats_arch: arm64
-            nats_sha256: b4da77b2b194dc5fcf13a1df0dad59ba7e87ae4423f254c50534015b7c8a2369
+            nats_sha256: 4a2088b3ec7103bf79d6484f55e80ab5d10204811d9ae6f7a33e8544d98dd45d
             ctr_arch: arm64
             ctr_sha256: c5f0957064e6ed5a67905ea3f8e451dadd16530334b86baaad678dd357205c30
     runs-on: ${{ matrix.os }}

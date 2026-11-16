@@ -13,7 +13,7 @@ async fn jetstream_expiry_makes_a_node_ineligible() {
     let (url, _container) = if let Ok(url) = std::env::var("MINGA_TEST_NATS_URL") {
         (url, None)
     } else {
-        let image = GenericImage::new("nats", "2.10-alpine")
+        let image = GenericImage::new("nats", "2.15.3-alpine")
             .with_exposed_port(4222.into())
             .with_wait_for(WaitFor::message_on_stderr("Server is ready"))
             .with_cmd(vec!["-js"]);
