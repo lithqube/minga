@@ -1209,9 +1209,11 @@ async fn nat_workers_relay_through_manager_and_use_direct_path_to_reachable_work
     ping(&task_b, "10.242.0.40", None)?;
     ping(&task_a, "10.242.0.20", None)
         .map_err(|error| format!("NAT workers could not relay through manager: {error}"))?;
-    ping(&task_a, "10.242.0.50", None).map_err(|error| {
-        format!("NAT worker could not reach reachable worker directly: {error}")
-    })?;
+    in_ns(&task_a, "ping", &["-c", "3", "-W", "2", "10.242.0.50"])
+        .map(|_| ())
+        .map_err(|error| {
+            format!("NAT worker could not reach reachable worker directly: {error}")
+        })?;
     let direct_endpoint = in_ns(&worker_a, "wg", &["show", WG_INTERFACE_NAME, "endpoints"])?;
     assert!(
         direct_endpoint.contains("198.18.0.5:51825"),
