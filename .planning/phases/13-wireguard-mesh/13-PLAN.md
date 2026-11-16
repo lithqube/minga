@@ -3,7 +3,7 @@ phase: 13
 title: WireGuard mesh and routing mesh
 depends_on: ["12"]
 requirements: [WG-ADR, WG-SUBNET, WG-KEYS, WG-PEERS, WG-NAT, WG-ISOL, WG-INGRESS, WG-PROOF]
-status: planned
+status: in_progress
 ---
 
 # Phase 13 — WireGuard mesh and routing mesh
@@ -106,17 +106,25 @@ Order: 13-01 first. 13-02 is independent of Phase 12 and can start any time. 13-
   - A NAT'ed worker ↔ a reachable worker goes direct after the NAT'ed side's first handshake.
 
 ### 13-06 — Routing mesh (WG-INGRESS)
-- [ ] Honor `ports[].mode`: `ingress` is the default, as in Swarm, and `host` keeps today's DNAT path.
-- [ ] The scheduler reserves ingress ports cluster-wide and returns a 409 on conflict, including with ports a node reserves.
-- [ ] The leader publishes `ingress.{port}/{proto}` backend sets to every node.
-- [ ] Every node installs a chain per published port, using `statistic --mode random` across backends, and SNATs to remote backends.
-- [ ] The Docker API reports `PublishMode` correctly (Traefik and `docker service inspect` read it).
-- [ ] Tests:
-  - With 2 replicas on node B, a published port on node A answers 20 out of 20 times and reaches both backends.
-  - `mode: host` still answers only where the task runs.
-  - A port conflict returns a 409.
-  - Backends update when a task moves.
-- [ ] The CHANGELOG states the behaviour change plainly: existing stacks with short-syntax ports now publish on every node.
+- [x] Honor `ports[].mode`: `ingress` is the default, as in Swarm, and `host` keeps today's DNAT path.
+- [x] The scheduler reserves ingress ports cluster-wide and returns a 409 on conflict, including with ports a node reserves.
+- [x] The leader publishes `ingress.{port}/{proto}` backend sets to every node.
+- [x] Every node installs a chain per published port, using `statistic --mode random` across backends, and SNATs to remote backends.
+- [x] The Docker API reports `PublishMode` correctly (Traefik and `docker service inspect` read it).
+- [x] Tests:
+  - [x] With 2 replicas on node B, a published port on node A answers 20 out of 20 times and reaches both backends.
+  - [x] `mode: host` uses node-local publishing; the real-kernel test reaches local addresses and does not redirect a non-local external address (no two-node host-mode topology run).
+  - [x] A port conflict returns a 409.
+  - [x] Backends update when a task moves.
+- [x] The CHANGELOG states the behaviour change plainly: existing stacks with short-syntax ports now publish on every node.
+- **Tenancy checklist (ADR 0008).** Tenants do not exist in code yet, so every object here belongs to the default tenant, and an upgraded cluster maps all existing services and ports to it. The answers below say what the routing mesh does today and what tenancy work must change.
+  1. **Owner.** An ingress assignment is derived from the service that publishes the port; the service's tenant owns it. A published port/protocol is owned cluster-wide by the first service that publishes it through ingress. The keys `node.{id}.ingress.{port}.{proto}` carry no tenant yet; they need a tenant segment when tenants land.
+  2. **Access.** Only the leader writes assignments; a worker reads its own node's keys. Admission goes through the service API, which has no roles yet. The 409 for a taken port names the holding service, so under tenancy it must become a generic conflict that does not reveal another tenant's service.
+  3. **Bus.** The worker ACL grants `node.{id}.ingress.>` for its own node only, and workers never write ingress keys. Per-tenant subjects are not applicable until tenant identity exists in the bus templates.
+  4. **Node.** Not met. Every node opens every ingress port and receives every backend set, including other services' task addresses, and every node peers with every node that runs a backend. Mesh-sourced traffic reaches only backend address, protocol and port (`MINGA_INGRESS_FWD`), never the rest of a network. Under tenancy, ingress must open, and peer, only on the owning tenant's nodes. This blocks running tenants on a shared cluster with the routing mesh on.
+  5. **Shared plane.** Writes are bounded by the number of published ingress ports (one assignment per node and port). There is no per-tenant port quota yet, so one tenant could claim the shared port space; tenancy needs a quota. A node's registered reserved ports are capped at 32 and validated.
+  6. **Audit.** Not applicable yet: there is no tenant identity to log. Assignment writes come from the leader's reconcile loop, not from a user request.
+  7. **Test.** No two-tenant test yet, because tenants do not exist. The isolation the mesh does enforce is tested: a mesh peer reaches only backend ports (unit test on `ingress_forward_batch`, real-kernel test), and a relay peer may carry only relayed workers' mesh addresses (`validate_peer_set`).
 
 ### 13-07 — Live proof, numbers and docs (WG-PROOF)
 On separate VMs (OrbStack Ubuntu and others), with Raft mTLS and NATS mTLS:

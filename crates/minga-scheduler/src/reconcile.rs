@@ -132,8 +132,13 @@ pub fn plan(
             continue;
         }
 
-        // A published port can't be held by two tasks at once.
-        let order = if service.ports.iter().any(|p| p.published.is_some()) {
+        // A host-mode port can't be held by two tasks on one node at once.
+        // Ingress ports are shared backends, so start-first keeps one serving.
+        let order = if service
+            .ports
+            .iter()
+            .any(|p| p.published.is_some() && p.mode == minga_state::types::PortMode::Host)
+        {
             UpdateOrder::StopFirst
         } else {
             service.update.order
@@ -247,6 +252,7 @@ mod tests {
             overlay_ip: None,
             last_seen_unix: None,
             role: Default::default(),
+            reserved_ports: Vec::new(),
         }
     }
 
@@ -263,6 +269,7 @@ mod tests {
                 target: 80,
                 published: None,
                 protocol: "tcp".to_string(),
+                mode: minga_state::types::PortMode::Ingress,
             }],
             networks: vec!["default".to_string()],
             resources: ResourceSpec::default(),
@@ -493,25 +500,37 @@ mod tests {
     }
 
     #[test]
-    fn published_port_forces_stop_first() {
+    fn host_port_forces_stop_first_but_ingress_keeps_start_first() {
         let nodes = vec![node(1)];
-        let published = vec![PortMapping {
-            target: 80,
-            published: Some(80),
-            protocol: "tcp".to_string(),
-        }];
-        let old = Service {
-            ports: published.clone(),
-            ..svc("web", 1)
+        let actions_for = |mode| {
+            let published = vec![PortMapping {
+                target: 80,
+                published: Some(80),
+                protocol: "tcp".to_string(),
+                mode,
+            }];
+            let old = Service {
+                ports: published.clone(),
+                ..svc("web", 1)
+            };
+            let tasks = running(&old, &nodes);
+            let services = vec![Service {
+                ports: published,
+                ..updated(UpdateOrder::StartFirst, 1, 1)
+            }];
+            task_ids(&plan(&services, &tasks, &nodes, &[], 0))
         };
-        let tasks = running(&old, &nodes);
-        let services = vec![Service {
-            ports: published,
-            ..updated(UpdateOrder::StartFirst, 1, 1)
-        }];
 
-        let actions = plan(&services, &tasks, &nodes, &[], 0);
-        assert_eq!(task_ids(&actions), vec!["-web.1"]);
+        assert_eq!(
+            actions_for(minga_state::types::PortMode::Host),
+            vec!["-web.1"]
+        );
+        let ingress = actions_for(minga_state::types::PortMode::Ingress);
+        assert!(
+            ingress.iter().all(|id| !id.starts_with('-')),
+            "ingress update must start the replacement first: {ingress:?}"
+        );
+        assert!(!ingress.is_empty());
     }
 
     #[test]

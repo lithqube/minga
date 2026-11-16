@@ -122,6 +122,9 @@ pub struct WireGuardNetworkAssignment {
     /// This manager forwards packets between peers on this overlay network.
     #[serde(default)]
     pub relay: bool,
+    /// The node routes ingress-published services on this network.
+    #[serde(default)]
+    pub ingress: bool,
 }
 
 /// Node-scoped peer and network-route assignment stored in MINGA_ASSIGN.

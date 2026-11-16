@@ -181,24 +181,38 @@ pub fn service_spec_to_state(spec: &models::ServiceSpec) -> Result<Service, Stri
         .filter_map(|n| n.Target.clone())
         .collect();
 
-    // Ports from EndpointSpec.
     let ports: Vec<PortMapping> = spec
         .EndpointSpec
         .as_ref()
         .map(|ep| {
             ep.Ports
                 .iter()
-                .filter_map(|p| {
-                    p.TargetPort.map(|target| PortMapping {
+                .map(|p| {
+                    let mode = match p.PublishMode.as_deref().unwrap_or("ingress") {
+                        "ingress" => minga_state::types::PortMode::Ingress,
+                        "host" => minga_state::types::PortMode::Host,
+                        other => return Err(format!("unsupported port publish mode {other:?}")),
+                    };
+                    // Nodes match protocols exactly, so store the lowercase
+                    // form; Docker treats an empty protocol as tcp.
+                    let protocol = match p.Protocol.to_ascii_lowercase().as_str() {
+                        "" | "tcp" => "tcp",
+                        "udp" => "udp",
+                        "sctp" => "sctp",
+                        _ => return Err(format!("unsupported port protocol {:?}", p.Protocol)),
+                    };
+                    Ok(p.TargetPort.map(|target| PortMapping {
                         target: target as u16,
                         published: p.PublishedPort.map(|pp| pp as u16),
-                        protocol: p.Protocol.clone(),
-                    })
+                        protocol: protocol.to_string(),
+                        mode,
+                    }))
                 })
-                .collect()
+                .collect::<Result<Vec<_>, String>>()
+                .map(|ports| ports.into_iter().flatten().collect())
         })
+        .transpose()?
         .unwrap_or_default();
-
     // Mode and replicas.
     let (replicas, mode) = match &spec.Mode {
         Some(models::ServiceMode::Replicated { Replicas }) => {
@@ -540,7 +554,13 @@ pub fn service_to_docker(svc: &Service) -> models::Service {
             Protocol: p.protocol.clone(),
             TargetPort: Some(p.target as u32),
             PublishedPort: p.published.map(|pp| pp as u32),
-            PublishMode: Some("ingress".to_string()),
+            PublishMode: Some(
+                match p.mode {
+                    minga_state::types::PortMode::Ingress => "ingress",
+                    minga_state::types::PortMode::Host => "host",
+                }
+                .to_string(),
+            ),
         })
         .collect();
 
@@ -1093,6 +1113,43 @@ mod tests {
     }
 
     #[test]
+    fn docker_port_publish_mode_defaults_and_round_trips() {
+        let mut spec = sample_docker_spec();
+        spec.EndpointSpec.as_mut().unwrap().Ports[0].PublishMode = None;
+        let ingress = service_spec_to_state(&spec).unwrap();
+        assert_eq!(ingress.ports[0].mode, minga_state::types::PortMode::Ingress);
+        let docker = service_to_docker(&ingress);
+        assert_eq!(
+            docker.Spec.EndpointSpec.unwrap().Ports[0]
+                .PublishMode
+                .as_deref(),
+            Some("ingress")
+        );
+
+        spec.EndpointSpec.as_mut().unwrap().Ports[0].PublishMode = Some("host".into());
+        let host = service_spec_to_state(&spec).unwrap();
+        assert_eq!(host.ports[0].mode, minga_state::types::PortMode::Host);
+        assert_eq!(
+            service_to_docker(&host).Spec.EndpointSpec.unwrap().Ports[0]
+                .PublishMode
+                .as_deref(),
+            Some("host")
+        );
+
+        spec.EndpointSpec.as_mut().unwrap().Ports[0].PublishMode = Some("unrecognized".into());
+        assert!(service_spec_to_state(&spec).is_err());
+
+        spec.EndpointSpec.as_mut().unwrap().Ports[0].PublishMode = None;
+        spec.EndpointSpec.as_mut().unwrap().Ports[0].Protocol = "UDP".into();
+        assert_eq!(
+            service_spec_to_state(&spec).unwrap().ports[0].protocol,
+            "udp"
+        );
+        spec.EndpointSpec.as_mut().unwrap().Ports[0].Protocol = "icmp".into();
+        assert!(service_spec_to_state(&spec).is_err());
+    }
+
+    #[test]
     fn service_secret_references_reject_unsafe_targets_and_options() {
         let reference = |name: &str, mode: u32| models::SecretReference {
             SecretID: "declared".into(),
@@ -1430,6 +1487,7 @@ mod tests {
             overlay_ip: None,
             last_seen_unix: None,
             role: Default::default(),
+            reserved_ports: Vec::new(),
         };
         let docker = node_to_docker(&node, true);
         assert_eq!(docker.ID, "1");
@@ -1452,6 +1510,7 @@ mod tests {
             overlay_ip: None,
             last_seen_unix: None,
             role: Default::default(),
+            reserved_ports: Vec::new(),
         };
         let docker = node_to_docker(&node, false);
         assert_eq!(docker.Spec.Role, "worker");
@@ -1471,6 +1530,7 @@ mod tests {
             overlay_ip: None,
             last_seen_unix: None,
             role: Default::default(),
+            reserved_ports: Vec::new(),
         };
         let docker = node_to_docker(&node, false);
         assert_eq!(docker.Status.State, "down");

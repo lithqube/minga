@@ -37,6 +37,7 @@ const PUBLISHED: u16 = 18080;
 const TARGET: u16 = 8080;
 const NODE_ADDR: &str = "198.51.100.7";
 const EXT_HOST: &str = "203.0.113.1";
+const INGRESS_MESH_ADDR: &str = "10.200.0.1";
 const EXT_ADDR: &str = "203.0.113.9";
 const NETWORK: &str = "netns_test_default";
 const NETWORK2: &str = "netns_test_other";
@@ -162,6 +163,7 @@ async fn scenario(setup: &NetworkSetup) -> Result<(), String> {
         target: TARGET,
         published: Some(PUBLISHED),
         protocol: "tcp".into(),
+        mode: minga_state::types::PortMode::Host,
     }];
 
     // The node's own address, and an "external" host behind a veth.
@@ -282,6 +284,7 @@ async fn scenario(setup: &NetworkSetup) -> Result<(), String> {
         target: 5353,
         published: Some(53),
         protocol: "udp".into(),
+        mode: minga_state::types::PortMode::Host,
     }];
     match setup
         .setup_task("nstest-dns", &attach("10.231.7.12"), &dns, &[])
@@ -334,4 +337,239 @@ async fn published_ports_reach_the_task_and_only_node_addresses() {
         .any(|l| l.contains("DNAT") && l.contains(&format!("--dport {PUBLISHED}")));
     result.expect("published-port paths");
     assert!(!leaked, "DNAT rules left after teardown:\n{nat}");
+}
+
+const INGRESS_PUBLISHED: u16 = 18081;
+const INGRESS_NODE_ADDR: &str = "198.51.100.8";
+const INGRESS_NETWORK: &str = "netns_test_ingress";
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ingress_port_reaches_each_backend_on_another_node() {
+    if let Some(why) = unavailable() {
+        assert!(
+            std::env::var_os("MINGA_REQUIRE_NETNS").is_none(),
+            "required netns test cannot run: {why}"
+        );
+        eprintln!("SKIP: {why}");
+        return;
+    }
+
+    let state = tempfile::tempdir().unwrap();
+    let setup = NetworkSetup::new(state.path());
+    let subnet = Cidr::parse("10.232.7.0/24").unwrap();
+    let attach = |ip: &str| {
+        vec![TaskNetAttachment {
+            network_id: INGRESS_NETWORK.into(),
+            ip: ip.parse().unwrap(),
+            subnet,
+        }]
+    };
+    let ingress_ports = [PortMapping {
+        target: TARGET,
+        published: Some(INGRESS_PUBLISHED),
+        protocol: "tcp".into(),
+        mode: minga_state::types::PortMode::Ingress,
+    }];
+    let result = async {
+        sh(
+            "ip",
+            &[
+                "addr",
+                "add",
+                &format!("{INGRESS_NODE_ADDR}/32"),
+                "dev",
+                "lo",
+            ],
+        )?;
+        sh(
+            "ip",
+            &[
+                "addr",
+                "add",
+                &format!("{INGRESS_MESH_ADDR}/32"),
+                "dev",
+                "lo",
+            ],
+        )?;
+        setup
+            .setup_task(
+                "nsingress-web-1",
+                &attach("10.232.7.10"),
+                &ingress_ports,
+                &[],
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        setup
+            .setup_task(
+                "nsingress-web-2",
+                &attach("10.232.7.11"),
+                &ingress_ports,
+                &[],
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        let assignment = minga_state::types::IngressAssignment {
+            published: INGRESS_PUBLISHED,
+            protocol: "tcp".into(),
+            backends: vec![
+                minga_state::types::IngressBackend {
+                    node_id: 2,
+                    ip: "10.232.7.10".into(),
+                    target_port: TARGET,
+                },
+                minga_state::types::IngressBackend {
+                    node_id: 2,
+                    ip: "10.232.7.11".into(),
+                    target_port: TARGET,
+                },
+            ],
+            source_overlay_ip: Some(INGRESS_MESH_ADDR.into()),
+        };
+        setup
+            .setup_ingress(&[assignment], 1)
+            .await
+            .map_err(|error| error.to_string())?;
+
+        let _first = Server::start("minga-nsingress-web-1", TARGET, "replica-1");
+        let _second = Server::start("minga-nsingress-web-2", TARGET, "replica-2");
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..20 {
+            seen.insert(fetch(None, INGRESS_NODE_ADDR, INGRESS_PUBLISHED)?);
+        }
+        if seen.len() != 2 || !seen.contains("replica-1") || !seen.contains("replica-2") {
+            return Err(format!(
+                "20 ingress requests did not reach both backends: {seen:?}"
+            ));
+        }
+        Ok::<_, String>(())
+    }
+    .await;
+
+    for task in ["nsingress-web-1", "nsingress-web-2"] {
+        let _ = setup.teardown_task(task).await;
+    }
+    let _ = setup.setup_ingress(&[], 1).await;
+    let _ = sh(
+        "iptables",
+        &[
+            "-w",
+            "5",
+            "-t",
+            "mangle",
+            "-D",
+            "PREROUTING",
+            "-m",
+            "addrtype",
+            "--dst-type",
+            "LOCAL",
+            "-j",
+            "MINGA_INGRESS_MARK",
+        ],
+    );
+    let _ = sh(
+        "iptables",
+        &[
+            "-w",
+            "5",
+            "-t",
+            "mangle",
+            "-D",
+            "OUTPUT",
+            "-o",
+            "lo",
+            "-j",
+            "MINGA_INGRESS_MARK",
+        ],
+    );
+    let _ = sh(
+        "iptables",
+        &["-w", "5", "-t", "mangle", "-F", "MINGA_INGRESS_MARK"],
+    );
+    let _ = sh(
+        "iptables",
+        &["-w", "5", "-t", "mangle", "-X", "MINGA_INGRESS_MARK"],
+    );
+    let _ = sh(
+        "iptables",
+        &[
+            "-w",
+            "5",
+            "-t",
+            "nat",
+            "-D",
+            "PREROUTING",
+            "-m",
+            "addrtype",
+            "--dst-type",
+            "LOCAL",
+            "-j",
+            "MINGA_INGRESS",
+        ],
+    );
+    let _ = sh(
+        "iptables",
+        &[
+            "-w",
+            "5",
+            "-t",
+            "nat",
+            "-D",
+            "OUTPUT",
+            "-o",
+            "lo",
+            "-j",
+            "MINGA_INGRESS",
+        ],
+    );
+    let _ = sh(
+        "iptables",
+        &[
+            "-w",
+            "5",
+            "-t",
+            "nat",
+            "-D",
+            "POSTROUTING",
+            "-j",
+            "MINGA_INGRESS_SNAT",
+        ],
+    );
+    let _ = sh("iptables", &["-w", "5", "-t", "nat", "-F", "MINGA_INGRESS"]);
+    let _ = sh(
+        "iptables",
+        &["-w", "5", "-t", "nat", "-F", "MINGA_INGRESS_SNAT"],
+    );
+    let _ = sh("iptables", &["-w", "5", "-t", "nat", "-X", "MINGA_INGRESS"]);
+    let _ = sh(
+        "iptables",
+        &["-w", "5", "-t", "filter", "-X", "MINGA_INGRESS_FWD"],
+    );
+    let _ = sh(
+        "iptables",
+        &["-w", "5", "-t", "nat", "-X", "MINGA_INGRESS_SNAT"],
+    );
+    let _ = sh(
+        "ip",
+        &[
+            "addr",
+            "del",
+            &format!("{INGRESS_NODE_ADDR}/32"),
+            "dev",
+            "lo",
+        ],
+    );
+    let _ = sh(
+        "ip",
+        &[
+            "addr",
+            "del",
+            &format!("{INGRESS_MESH_ADDR}/32"),
+            "dev",
+            "lo",
+        ],
+    );
+    let _ = sh("ip", &["link", "del", &bridge_name(INGRESS_NETWORK)]);
+
+    result.expect("ingress backend routing");
 }

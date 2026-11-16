@@ -133,6 +133,7 @@ mod tests {
             overlay_ip: None,
             last_seen_unix: None,
             role: Default::default(),
+            reserved_ports: Vec::new(),
         }
     }
 

@@ -70,6 +70,7 @@ fn sample_node(id: u64, addr: &str) -> ClusterNode {
         overlay_ip: None,
         last_seen_unix: None,
         role: Default::default(),
+        reserved_ports: Vec::new(),
     }
 }
 
@@ -516,7 +517,7 @@ async fn removing_the_last_manager_is_refused() {
 async fn v1_migration_removes_workers_in_one_membership_change() {
     let (store1, store2, store3, addr1, addr2, addr3) = open_cluster().await;
     let cluster = [&store1, &store2, &store3];
-    let leader = leader(&cluster).await;
+    let initial_leader = leader(&cluster).await;
     for (id, addr, role) in [
         (1, addr1.as_str(), minga_state::types::NodeRole::Manager),
         (2, addr2.as_str(), minga_state::types::NodeRole::Manager),
@@ -524,9 +525,10 @@ async fn v1_migration_removes_workers_in_one_membership_change() {
     ] {
         let mut node = sample_node(id, addr);
         node.role = role;
-        leader.upsert_node(node).await.unwrap();
+        initial_leader.upsert_node(node).await.unwrap();
     }
 
+    let leader = leader(&cluster).await;
     let removed = leader.migrate_manager_voters(vec![1, 2]).await.unwrap();
     assert_eq!(removed, vec![3]);
     eventually("workers leave the voter configuration", || async {

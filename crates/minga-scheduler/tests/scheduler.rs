@@ -11,7 +11,8 @@ use std::time::Duration;
 use minga_bus::{subjects, EventBus, MemoryBus, TaskActualState, TaskStatusReport};
 use minga_scheduler::Scheduler;
 use minga_state::types::{
-    ClusterNode, FailureAction, Network, NodeRole, NodeStatus, ResourceSpec, Service, ServiceMode,
+    ClusterNode, FailureAction, Network, NodeRole, NodeStatus, PortMapping, PortMode, ResourceSpec,
+    Service, ServiceMode,
 };
 use minga_state::StateStore;
 
@@ -31,6 +32,7 @@ fn make_node(id: u64, cpus: f64, mem: u64) -> ClusterNode {
         overlay_ip: None,
         last_seen_unix: None,
         role: Default::default(),
+        reserved_ports: Vec::new(),
     }
 }
 
@@ -344,7 +346,13 @@ async fn reconcile_projects_wireguard_peer_sets_from_live_placement() {
     let mut manager_service = make_service("app.manager", 1);
     manager_service.networks = vec!["shared".into()];
     let mut worker_service = make_service("app.worker", 1);
-    worker_service.networks = vec!["shared".into()];
+    worker_service.networks = vec!["shared".into(), "other".into()];
+    worker_service.ports = vec![PortMapping {
+        target: 80,
+        published: Some(18080),
+        protocol: "tcp".into(),
+        mode: PortMode::Ingress,
+    }];
     store.upsert_service(manager_service.clone()).await.unwrap();
     store.upsert_service(worker_service.clone()).await.unwrap();
 
@@ -361,6 +369,10 @@ async fn reconcile_projects_wireguard_peer_sets_from_live_placement() {
         .spec
         .ips
         .insert("shared".into(), "10.1.0.20".into());
+    worker_task
+        .spec
+        .ips
+        .insert("other".into(), "10.2.0.20".into());
     store.upsert_task(worker_task).await.unwrap();
     let bus = MemoryBus::new();
     for id in [1, 2, 3] {
@@ -399,9 +411,12 @@ async fn reconcile_projects_wireguard_peer_sets_from_live_placement() {
     assert_eq!(manager_peer.keepalive, 0);
     assert_eq!(
         manager_peer.path,
-        minga_net::wireguard::WireGuardPeerPath::Direct
+        minga_net::wireguard::WireGuardPeerPath::Relay
     );
-    assert_eq!(manager_peer.allowed_ips, ["10.1.0.20/32"]);
+    assert_eq!(
+        manager_peer.allowed_ips,
+        ["10.1.0.20/32", "10.2.0.20/32", "10.200.0.2/32"]
+    );
     assert!(manager_set.peers.iter().any(|peer| peer.node_id == 3));
 
     let worker_set = decode(2);
@@ -417,7 +432,10 @@ async fn reconcile_projects_wireguard_peer_sets_from_live_placement() {
         .iter()
         .find(|peer| peer.node_id == 1)
         .unwrap();
-    assert_eq!(manager_peer.allowed_ips, ["10.1.0.10/32"]);
+    assert_eq!(
+        manager_peer.allowed_ips,
+        ["10.1.0.10/32", "10.200.0.1/32", "10.200.0.3/32"]
+    );
     assert_eq!(manager_peer.keepalive, 25);
     // Nodes 1 and 2 run tasks on `shared`; node 3 does not, so it gets none.
     assert!(entries
@@ -426,6 +444,36 @@ async fn reconcile_projects_wireguard_peer_sets_from_live_placement() {
     assert!(!entries
         .iter()
         .any(|(key, _)| key == &subjects::kv_assignment_network(3, "shared")));
+
+    let ingress_only_set = decode(3);
+    assert!(ingress_only_set
+        .networks
+        .iter()
+        .any(|network| network.network_id == "shared" && !network.local));
+    assert!(ingress_only_set
+        .networks
+        .iter()
+        .any(|network| network.network_id == "other" && network.ingress));
+    let relay_manager = ingress_only_set
+        .peers
+        .iter()
+        .find(|peer| peer.node_id == 1)
+        .unwrap();
+    assert_eq!(
+        relay_manager.path,
+        minga_net::wireguard::WireGuardPeerPath::Relay
+    );
+    assert_eq!(
+        relay_manager.allowed_ips,
+        ["10.2.0.20/32", "10.200.0.1/32", "10.200.0.2/32"]
+    );
+    let ingress = entries
+        .iter()
+        .find(|(key, _)| key == &subjects::kv_assignment_ingress(3, 18080, "tcp"))
+        .expect("ingress-only node receives a backend assignment");
+    let ingress: minga_state::types::IngressAssignment =
+        minga_state::codec::decode_wire(&ingress.1).unwrap();
+    assert_eq!(ingress.backends[0].node_id, 2);
     let network_entry = entries
         .iter()
         .find(|(key, _)| key == &subjects::kv_assignment_network(2, "shared"))
@@ -547,6 +595,180 @@ async fn reconcile_creates_tasks_for_service() {
     let node_ids: Vec<u64> = tasks.iter().map(|t| t.node_id).collect();
     assert!(node_ids.contains(&1));
     assert!(node_ids.contains(&2));
+
+    drop(scheduler);
+    Arc::try_unwrap(store)
+        .ok()
+        .expect("scheduler dropped")
+        .shutdown()
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn ingress_backend_and_backendless_workers_peer_both_ways() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(
+        StateStore::open(1, "127.0.0.1:0", dir.path(), BTreeMap::new())
+            .await
+            .unwrap(),
+    );
+    let mut manager = make_node(1, 8.0, 1 << 34);
+    manager.role = NodeRole::Manager;
+    manager.wg_public_key = Some("manager-key".into());
+    manager.wg_endpoint = Some("192.0.2.1:51820".into());
+    // Node 2 hosts the only backend; node 3 runs nothing but fronts ingress.
+    let mut backend = make_node(2, 8.0, 1 << 34);
+    backend.wg_public_key = Some("backend-key".into());
+    backend.wg_endpoint = Some("192.0.2.2:51820".into());
+    let mut frontend = make_node(3, 8.0, 1 << 34);
+    frontend.wg_public_key = Some("frontend-key".into());
+    frontend.wg_endpoint = Some("192.0.2.3:51820".into());
+    for node in [&manager, &backend, &frontend] {
+        store.upsert_node((*node).clone()).await.unwrap();
+    }
+    store
+        .upsert_network(Network {
+            id: "web".into(),
+            name: "web".into(),
+            driver: "overlay".into(),
+            attachable: false,
+            subnet: Some("10.3.0.0/24".into()),
+            wg_port: None,
+        })
+        .await
+        .unwrap();
+    let mut service = make_service("app.web", 1);
+    service.networks = vec!["web".into()];
+    service.ports = vec![PortMapping {
+        target: 80,
+        published: Some(18080),
+        protocol: "tcp".into(),
+        mode: PortMode::Ingress,
+    }];
+    store.upsert_service(service.clone()).await.unwrap();
+    let mut task = minga_scheduler::place_service(&service, &[backend], &[], &[], 0).remove(0);
+    task.spec.ips.insert("web".into(), "10.3.0.20".into());
+    store.upsert_task(task).await.unwrap();
+    let bus = MemoryBus::new();
+    for id in [1, 2, 3] {
+        bus.refresh_lease(id, b"registration").await.unwrap();
+    }
+    let scheduler = Scheduler::with_bus(store.clone(), bus.clone());
+    scheduler.reconcile_once().await.unwrap();
+
+    let peer_set = |id: u64| {
+        let bus = bus.clone();
+        async move {
+            let value = bus
+                .get_assignment(&format!("node.{id}.wg"))
+                .await
+                .unwrap()
+                .expect("peer set published");
+            minga_state::codec::decode_wire::<minga_net::wireguard::WireGuardPeerSet>(&value)
+                .unwrap()
+        }
+    };
+    let backend_set = peer_set(2).await;
+    let frontend_peer = backend_set
+        .peers
+        .iter()
+        .find(|peer| peer.node_id == 3)
+        .expect("backend node must accept SNAT traffic from the frontend");
+    assert!(frontend_peer
+        .allowed_ips
+        .contains(&"10.200.0.3/32".to_string()));
+    let frontend_set = peer_set(3).await;
+    let backend_peer = frontend_set
+        .peers
+        .iter()
+        .find(|peer| peer.node_id == 2)
+        .expect("frontend node must route to the backend");
+    assert!(backend_peer
+        .allowed_ips
+        .contains(&"10.3.0.20/32".to_string()));
+
+    drop(scheduler);
+    Arc::try_unwrap(store)
+        .ok()
+        .expect("scheduler dropped")
+        .shutdown()
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn ingress_backend_projection_tracks_task_movement() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(
+        StateStore::open(1, "127.0.0.1:0", dir.path(), BTreeMap::new())
+            .await
+            .unwrap(),
+    );
+    store.upsert_node(make_node(1, 8.0, 1 << 34)).await.unwrap();
+    let mut node2 = make_node(2, 8.0, 1 << 34);
+    node2.wg_endpoint = Some("192.0.2.2:51820".into());
+    store.upsert_node(node2).await.unwrap();
+    store
+        .upsert_network(Network {
+            id: "default".into(),
+            name: "default".into(),
+            driver: "overlay".into(),
+            attachable: false,
+            subnet: Some("10.9.0.0/24".into()),
+            wg_port: None,
+        })
+        .await
+        .unwrap();
+    let mut service = make_service("app.web", 1);
+    service.ports = vec![PortMapping {
+        target: 80,
+        published: Some(18080),
+        protocol: "tcp".into(),
+        mode: PortMode::Ingress,
+    }];
+    store.upsert_service(service).await.unwrap();
+
+    let bus = MemoryBus::with_lease_ttl(Duration::from_millis(100));
+    bus.refresh_lease(1, b"registration").await.unwrap();
+    bus.refresh_lease(2, b"registration").await.unwrap();
+    let scheduler = Scheduler::with_bus(store.clone(), bus.clone());
+    scheduler.reconcile_once().await.unwrap();
+    let key = subjects::kv_assignment_ingress(1, 18080, "tcp");
+    let initial: minga_state::types::IngressAssignment =
+        minga_state::codec::decode_wire(&bus.get_assignment(&key).await.unwrap().unwrap()).unwrap();
+    assert_eq!(initial.backends.len(), 1);
+    assert_eq!(initial.backends[0].node_id, 1);
+    assert_eq!(initial.source_overlay_ip.as_deref(), Some("10.200.0.1"));
+
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    bus.refresh_lease(2, b"registration").await.unwrap();
+    scheduler.reconcile_once().await.unwrap();
+    let key = subjects::kv_assignment_ingress(2, 18080, "tcp");
+    let moved: minga_state::types::IngressAssignment =
+        minga_state::codec::decode_wire(&bus.get_assignment(&key).await.unwrap().unwrap()).unwrap();
+    assert_eq!(moved.backends.len(), 1);
+    assert_eq!(moved.backends[0].node_id, 2);
+    assert_eq!(moved.source_overlay_ip.as_deref(), Some("10.200.0.2"));
+
+    let mut host_service = make_service("app.host", 1);
+    host_service.ports = vec![PortMapping {
+        target: 80,
+        published: Some(18081),
+        protocol: "tcp".into(),
+        mode: PortMode::Host,
+    }];
+    store.upsert_service(host_service).await.unwrap();
+    scheduler.reconcile_once().await.unwrap();
+    for node_id in [1, 2] {
+        assert!(
+            bus.get_assignment(&subjects::kv_assignment_ingress(node_id, 18081, "tcp"))
+                .await
+                .unwrap()
+                .is_none(),
+            "host-mode ports must remain node-local, not enter the ingress mesh"
+        );
+    }
 
     drop(scheduler);
     Arc::try_unwrap(store)
@@ -870,7 +1092,7 @@ async fn nat_workers_relay_through_the_lowest_manager_and_fail_over_after_lease_
             .find(|peer| peer.node_id == 2)
             .unwrap()
             .allowed_ips,
-        ["10.1.0.20/32"]
+        ["10.1.0.20/32", "10.200.0.2/32"]
     );
     assert_eq!(
         relay
@@ -887,7 +1109,10 @@ async fn nat_workers_relay_through_the_lowest_manager_and_fail_over_after_lease_
         manager_peer.path,
         minga_net::wireguard::WireGuardPeerPath::Relay
     );
-    assert_eq!(manager_peer.allowed_ips, ["10.1.0.30/32"]);
+    assert_eq!(
+        manager_peer.allowed_ips,
+        ["10.1.0.30/32", "10.200.0.1/32", "10.200.0.3/32"]
+    );
     assert!(!worker.peers.iter().any(|peer| peer.node_id == 3));
     let direct_peer = worker.peers.iter().find(|peer| peer.node_id == 5).unwrap();
     assert_eq!(
@@ -895,7 +1120,7 @@ async fn nat_workers_relay_through_the_lowest_manager_and_fail_over_after_lease_
         minga_net::wireguard::WireGuardPeerPath::Direct
     );
     assert_eq!(direct_peer.endpoint.as_deref(), Some("192.0.2.5:51820"));
-    assert_eq!(direct_peer.allowed_ips, ["10.1.0.40/32"]);
+    assert_eq!(direct_peer.allowed_ips, ["10.1.0.40/32", "10.200.0.5/32"]);
 
     tokio::time::sleep(Duration::from_millis(1_100)).await;
     for id in [2, 3, 4, 5] {
@@ -914,7 +1139,10 @@ async fn nat_workers_relay_through_the_lowest_manager_and_fail_over_after_lease_
         manager_peer.path,
         minga_net::wireguard::WireGuardPeerPath::Relay
     );
-    assert_eq!(manager_peer.allowed_ips, ["10.1.0.30/32"]);
+    assert_eq!(
+        manager_peer.allowed_ips,
+        ["10.1.0.30/32", "10.200.0.3/32", "10.200.0.4/32"]
+    );
     assert!(!worker.peers.iter().any(|peer| peer.node_id == 1));
     assert!(!entries.iter().any(|(key, _)| key == "node.1.wg"));
 

@@ -1,33 +1,41 @@
 //! Serialization for everything `minga-state` persists or sends to a peer.
 //!
-//! JSON, not bincode. Bincode is not self-describing, so adding a field to a
-//! stored type made old data undecodable (the 1.0.1 to 1.0.2 upgrade needed a
-//! cleared `--data-dir`). With JSON a field marked `#[serde(default)]` can be
-//! added without touching existing data.
+//! JSON, not bincode. Bincode is not self-describing and adding fields made
+//! earlier records undecodable. With JSON, serde defaults keep old records
+//! decodable, but a persisted shape change still requires a version bump and
+//! an explicit migration so the stored representation is current.
 //!
 //! # Rules for changing a persisted type
 //!
-//! - New field: give it `#[serde(default)]`. Nothing else is needed.
-//! - Renaming, removing or re-typing a field, or changing what a value means:
-//!   bump [`FORMAT_VERSION`] and add a migration step in [`check_format`].
+//! Every persisted field-shape change requires a [`FORMAT_VERSION`] bump and
+//! an explicit migration, even when `#[serde(default)]` lets the new build
+//! decode old records. The migration must rewrite affected state and Raft log
+//! values, and portable snapshots must be versioned and migrated on import.
+//! Frozen fixtures from old versions are never changed.
 //!
 //! # Format marker
 //!
 //! Each redb file stores [`FORMAT_VERSION`] under [`FORMAT_KEY`] in its
 //! metadata table. A store with data and no marker was written by minga 1.0.2
-//! or older (bincode) and cannot be read.
+//! or older (bincode) and cannot be read. Format v2 is migrated to v3 by the
+//! state and log stores before the marker is advanced.
 //!
 //! # Wire frame
 //!
 //! A Raft message is `[u32 BE length][u8 FORMAT_VERSION][JSON]`, the length
-//! covering the version byte and the JSON.
+//! covering the version byte and the JSON. Since peers reject a different
+//! frame version, v3 requires a coordinated upgrade of every cluster node;
+//! mixed v2/v3 nodes cannot exchange Raft messages.
 
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
-/// Version of the persisted and wire format. Bump it when old data can no
-/// longer be read as is (see the rules above).
-pub const FORMAT_VERSION: u8 = 2;
+/// Version of the persisted and wire format. Bump it for every persisted
+/// field-shape change and add the corresponding migration step.
+pub const FORMAT_VERSION: u8 = 3;
+
+/// The persisted version migrated by the v3 state and log stores.
+pub const V2_FORMAT_VERSION: u8 = 2;
 
 /// Metadata key that holds [`FORMAT_VERSION`] in each redb file.
 pub const FORMAT_KEY: &str = "format_version";
@@ -89,7 +97,8 @@ pub fn decode_wire<T: DeserializeOwned>(frame: &[u8]) -> Result<T, CodecError> {
     }
 }
 
-/// Checks a store's format marker when it is opened.
+/// Checks a store's format marker when it is opened after any applicable
+/// migration has run.
 ///
 /// `stored` is the value under [`FORMAT_KEY`] and `is_empty` says whether the
 /// file holds no data yet. Returns `true` when the caller must write the
@@ -103,8 +112,7 @@ pub fn check_format(stored: Option<&[u8]>, is_empty: bool) -> Result<bool, Codec
             found,
             want: FORMAT_VERSION,
         }),
-        // shortcut: no migration steps exist yet, so an older marker is refused;
-        // add the steps here when FORMAT_VERSION is bumped.
+        // Earlier versions must be migrated explicitly by the store opener.
         Some(&[from]) => Err(CodecError::NoMigration {
             from,
             want: FORMAT_VERSION,
@@ -183,7 +191,7 @@ mod tests {
         assert!(newer.to_string().contains("newer minga"), "{newer}");
 
         assert!(matches!(
-            check_format(Some(&[FORMAT_VERSION - 1]), false).unwrap_err(),
+            check_format(Some(&[1]), false).unwrap_err(),
             CodecError::NoMigration { .. }
         ));
         assert!(matches!(

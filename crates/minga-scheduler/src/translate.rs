@@ -125,14 +125,29 @@ fn translate_service(
     env.entry("MINGA_STACK".to_string())
         .or_insert_with(|| stack.to_string());
 
-    // Ports: take the start of each range (Phase 0 — no port range expansion).
+    // A range such as `80-81:8080-8081` becomes one mapping per port; the
+    // loader has checked both ranges are the same size. A single target with
+    // a published range takes any port from it, as Docker does: the first.
     let ports = svc
         .ports
         .iter()
-        .map(|p| minga_state::types::PortMapping {
-            target: p.target.start,
-            published: p.published.map(|pr| pr.start),
-            protocol: p.protocol.clone(),
+        .flat_map(|p| {
+            (p.target.start..=p.target.end).map(move |target| minga_state::types::PortMapping {
+                target,
+                published: p.published.map(|published| {
+                    if p.target.count() > 1 {
+                        published.start + (target - p.target.start)
+                    } else {
+                        published.start
+                    }
+                }),
+                protocol: p.protocol.clone(),
+                // The loader accepts only `ingress` and `host`.
+                mode: match p.mode.as_deref() {
+                    Some("host") => minga_state::types::PortMode::Host,
+                    _ => minga_state::types::PortMode::Ingress,
+                },
+            })
         })
         .collect();
 
@@ -1047,6 +1062,29 @@ volumes:
             .expect("compose should load")
             .project;
         translate_project(&project, "shop", None).map(|mut s| s.services.remove(0))
+    }
+
+    #[test]
+    fn port_ranges_expand_to_one_mapping_per_port() {
+        let svc = translate_one(
+            "services:\n  web:\n    image: nginx\n    ports:\n      - \"80-81:8080-8081\"\n      \
+             - target: 53\n        published: 5353\n        protocol: udp\n        mode: host\n",
+        )
+        .unwrap();
+        let ports: Vec<_> = svc
+            .ports
+            .iter()
+            .map(|p| (p.published, p.target, p.protocol.as_str(), p.mode))
+            .collect();
+        use minga_state::types::PortMode::{Host, Ingress};
+        assert_eq!(
+            ports,
+            vec![
+                (Some(80), 8080, "tcp", Ingress),
+                (Some(81), 8081, "tcp", Ingress),
+                (Some(5353), 53, "udp", Host),
+            ]
+        );
     }
 
     #[test]

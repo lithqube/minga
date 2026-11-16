@@ -166,6 +166,7 @@ pub fn ensure_interface(
     key_path: &Path,
     listen_port: u16,
     mtu: u16,
+    node_id: u64,
     peer_count: usize,
 ) -> Result<(), WireGuardError> {
     if peer_count == 0 {
@@ -173,7 +174,7 @@ pub fn ensure_interface(
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (key_path, listen_port, mtu);
+        let _ = (key_path, listen_port, mtu, node_id);
         Err(WireGuardError::UnsupportedPlatform)
     }
     #[cfg(target_os = "linux")]
@@ -209,6 +210,15 @@ pub fn ensure_interface(
             "listen-port",
             &listen_port.to_string(),
         ]))?;
+        let mesh_address = minga_net::overlay::mesh_node_ip(node_id)
+            .map_err(|error| WireGuardError::InvalidAssignment(error.to_string()))?;
+        run_ip(&[
+            "addr",
+            "replace",
+            &format!("{mesh_address}/32"),
+            "dev",
+            interface,
+        ])?;
         run_ip(&["link", "set", "dev", interface, "mtu", &mtu.to_string()])?;
         run_ip(&["link", "set", "dev", interface, "up"])?;
         Ok(())
@@ -335,7 +345,7 @@ async fn apply_peer_assignment(
     };
 
     if let Some(set) = &set {
-        validate_peer_set(set)?;
+        validate_peer_set(set, node_id)?;
     }
     if set.as_ref() == current.as_ref() {
         match set.as_ref() {
@@ -371,7 +381,7 @@ async fn apply_peer_assignment(
     }
 
     #[cfg(target_os = "linux")]
-    ensure_interface(key_path, listen_port, mtu, set.peers.len())?;
+    ensure_interface(key_path, listen_port, mtu, node_id, set.peers.len())?;
     #[cfg(target_os = "linux")]
     {
         apply_peer_diff(&set, current.as_ref())?;
@@ -411,7 +421,15 @@ fn minga_node_network_setup(key_path: &Path) -> crate::netns::NetworkSetup {
 }
 
 #[cfg(any(target_os = "linux", test))]
-fn validate_peer_set(set: &minga_net::wireguard::WireGuardPeerSet) -> Result<(), WireGuardError> {
+fn validate_peer_set(
+    set: &minga_net::wireguard::WireGuardPeerSet,
+    node_id: u64,
+) -> Result<(), WireGuardError> {
+    let mesh_error = |error: minga_net::overlay::OverlayError| {
+        WireGuardError::InvalidAssignment(error.to_string())
+    };
+    let mesh_subnet = minga_net::overlay::allocate_mesh_subnet().map_err(mesh_error)?;
+    let own_mesh_ip = minga_net::overlay::mesh_node_ip(node_id).map_err(mesh_error)?;
     let mut network_ids = HashSet::new();
     let mut allowed_subnets = Vec::new();
     for network in &set.networks {
@@ -427,7 +445,7 @@ fn validate_peer_set(set: &minga_net::wireguard::WireGuardPeerSet) -> Result<(),
                 network.network_id
             ))
         })?;
-        if network.local || network.relay {
+        if network.local || network.relay || network.ingress {
             allowed_subnets.push(subnet);
         }
     }
@@ -460,9 +478,25 @@ fn validate_peer_set(set: &minga_net::wireguard::WireGuardPeerSet) -> Result<(),
                     "AllowedIP must be an IPv4 /32: {allowed_ip:?}"
                 )));
             }
-            if !allowed_subnets.iter().any(|subnet| subnet.contains(ip)) {
+            let peer_mesh_ip =
+                minga_net::overlay::mesh_node_ip(peer.node_id).map_err(mesh_error)?;
+            // A peer claiming this node's own mesh address would capture its
+            // replies, so no path may carry it.
+            if ip == own_mesh_ip {
                 return Err(WireGuardError::InvalidAssignment(format!(
-                    "AllowedIP {allowed_ip:?} is outside assigned networks"
+                    "AllowedIP {allowed_ip:?} is this node's mesh address"
+                )));
+            }
+            // A relay manager forwards for the NAT workers behind it, so it
+            // also carries their mesh addresses; a direct peer carries only its own.
+            let relayed_mesh_ip = peer.path == minga_net::wireguard::WireGuardPeerPath::Relay
+                && mesh_subnet.contains(ip);
+            if !allowed_subnets.iter().any(|subnet| subnet.contains(ip))
+                && ip != peer_mesh_ip
+                && !relayed_mesh_ip
+            {
+                return Err(WireGuardError::InvalidAssignment(format!(
+                    "AllowedIP {allowed_ip:?} is outside assigned task and mesh addresses"
                 )));
             }
         }
@@ -737,7 +771,7 @@ mod tests {
 
     #[test]
     fn no_interface_is_created_without_peers() {
-        assert!(ensure_interface(Path::new("/missing/wg.key"), 51820, 1420, 0).is_ok());
+        assert!(ensure_interface(Path::new("/missing/wg.key"), 51820, 1420, 1, 0).is_ok());
     }
     #[test]
     fn peer_allowed_ips_must_belong_to_local_networks() {
@@ -756,8 +790,18 @@ mod tests {
                 subnet: "10.242.0.0/24".into(),
                 local: true,
                 relay: false,
+                ingress: false,
             }],
         };
+        let mut mesh_address = set.clone();
+        mesh_address.networks.clear();
+        mesh_address.peers[0].allowed_ips = vec!["10.200.0.2/32".into()];
+        assert!(validate_peer_set(&mesh_address, 1).is_ok());
+        let mut ingress_route = set.clone();
+        ingress_route.networks[0].local = false;
+        ingress_route.networks[0].ingress = true;
+        ingress_route.networks[0].subnet = "10.243.0.0/24".into();
+        assert!(validate_peer_set(&ingress_route, 1).is_ok());
         let mut relayed = set.clone();
         relayed
             .networks
@@ -766,8 +810,45 @@ mod tests {
                 subnet: "10.243.0.0/24".into(),
                 local: false,
                 relay: true,
+                ingress: false,
             });
-        assert!(validate_peer_set(&relayed).is_ok());
-        assert!(validate_peer_set(&set).is_err());
+        assert!(validate_peer_set(&relayed, 1).is_ok());
+        assert!(validate_peer_set(&set, 1).is_err());
+    }
+
+    #[test]
+    fn relay_manager_may_carry_relayed_workers_mesh_addresses() {
+        // Worker 2's view: manager 1 relays for it and for NAT worker 3, so
+        // the scheduler lists worker 3's mesh address on the manager peer.
+        let relay_set = |path| minga_net::wireguard::WireGuardPeerSet {
+            peers: vec![minga_net::wireguard::WireGuardPeerAssignment {
+                node_id: 1,
+                public_key: KeyPair::generate().public_key,
+                allowed_ips: vec![
+                    "10.242.0.10/32".into(),
+                    "10.200.0.1/32".into(),
+                    "10.200.0.3/32".into(),
+                ],
+                endpoint: Some("192.0.2.1:51820".into()),
+                keepalive: 25,
+                path,
+            }],
+            networks: vec![minga_net::wireguard::WireGuardNetworkAssignment {
+                network_id: "shared".into(),
+                subnet: "10.242.0.0/24".into(),
+                local: true,
+                relay: false,
+                ingress: true,
+            }],
+        };
+        let relay = relay_set(minga_net::wireguard::WireGuardPeerPath::Relay);
+        assert!(validate_peer_set(&relay, 2).is_ok());
+        // A direct peer may carry only its own mesh address.
+        let direct = relay_set(minga_net::wireguard::WireGuardPeerPath::Direct);
+        assert!(validate_peer_set(&direct, 2).is_err());
+        // No peer may claim the receiving node's own mesh address.
+        let mut hijack = relay;
+        hijack.peers[0].allowed_ips.push("10.200.0.2/32".into());
+        assert!(validate_peer_set(&hijack, 2).is_err());
     }
 }

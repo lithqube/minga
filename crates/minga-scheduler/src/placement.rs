@@ -13,13 +13,13 @@
 //! same IDs, so the diff in [`crate::reconcile`] is clean; changing a
 //! service produces new IDs, which is what starts a rollout.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use sha2::{Digest, Sha256};
 
 use minga_state::types::{
-    ClusterNode, Network, NetworkId, NodeId, NodeStatus, ResourceSpec, Service, ServiceMode, Task,
-    TaskSpec, TaskState, WorkloadKind,
+    ClusterNode, Network, NetworkId, NodeId, NodeStatus, PortMapping, PortMode, ResourceSpec,
+    Service, ServiceMode, Task, TaskSpec, TaskState, WorkloadKind,
 };
 
 use crate::{constraints, netassign};
@@ -140,6 +140,42 @@ pub fn place_service(
         entry.gpus += task.spec.resources.gpus;
     }
 
+    // A host-mode port is a node-local DNAT, so one node can serve it for a
+    // single task. Seed each node with the ports its own listeners and other
+    // services' live tasks hold; replicas placed below add theirs.
+    let host_tuples = |ports: &[PortMapping]| -> Vec<(u16, String)> {
+        ports
+            .iter()
+            .filter(|port| port.mode == PortMode::Host)
+            .filter_map(|port| Some((port.published?, port.protocol.to_ascii_lowercase())))
+            .collect()
+    };
+    let wanted_host_ports = host_tuples(&service.ports);
+    let mut held_host_ports: HashMap<NodeId, HashSet<(u16, String)>> = HashMap::new();
+    if !wanted_host_ports.is_empty() {
+        for node in nodes {
+            held_host_ports.entry(node.id).or_default().extend(
+                node.reserved_ports
+                    .iter()
+                    .map(|reserved| (reserved.port, reserved.protocol.to_ascii_lowercase())),
+            );
+        }
+        for task in existing_tasks.iter().filter(|task| {
+            task.service_id != service.id
+                && !matches!(task.state, TaskState::Stopped | TaskState::Failed)
+        }) {
+            held_host_ports
+                .entry(task.node_id)
+                .or_default()
+                .extend(host_tuples(&task.spec.ports));
+        }
+    }
+    let host_ports_free = |held: &HashMap<NodeId, HashSet<(u16, String)>>, node: NodeId| {
+        !held
+            .get(&node)
+            .is_some_and(|held| wanted_host_ports.iter().any(|tuple| held.contains(tuple)))
+    };
+
     // (node, remaining capacity) pairs we mutate as we place tasks.
     let mut candidates: Vec<(&ClusterNode, ResourceSpec)> = eligible
         .iter()
@@ -224,6 +260,14 @@ pub fn place_service(
                     );
                     continue;
                 }
+                if !host_ports_free(&held_host_ports, node.id) {
+                    tracing::warn!(
+                        service = %service.id,
+                        node = node.id,
+                        "host-mode port already in use on node"
+                    );
+                    continue;
+                }
                 let task_id = format!("{}.{}.{revision}", service.id, node.id);
                 let mut spec = spec.clone();
                 spec.ips = allocate_ips(&task_id, &mut ipams);
@@ -250,7 +294,12 @@ pub fn place_service(
                 for i in 0..candidates.len() {
                     let idx = (start + i) % candidates.len();
                     let (node, avail) = &mut candidates[idx];
-                    if fits(avail, &service.resources) {
+                    if fits(avail, &service.resources) && host_ports_free(&held_host_ports, node.id)
+                    {
+                        held_host_ports
+                            .entry(node.id)
+                            .or_default()
+                            .extend(wanted_host_ports.iter().cloned());
                         let task_id = format!("{}.{}.{revision}", service.id, slot);
                         let mut spec = spec.clone();
                         spec.ips = allocate_ips(&task_id, &mut ipams);
@@ -357,6 +406,7 @@ mod tests {
             overlay_ip: None,
             last_seen_unix: None,
             role: Default::default(),
+            reserved_ports: Vec::new(),
         }
     }
 
@@ -373,6 +423,7 @@ mod tests {
                 target: 80,
                 published: Some(8080),
                 protocol: "tcp".to_string(),
+                mode: minga_state::types::PortMode::Ingress,
             }],
             networks: vec!["test_default".to_string()],
             resources: ResourceSpec::default(),
@@ -408,6 +459,38 @@ mod tests {
         assert_eq!(slot_of(&tasks[0].id), "web.1");
         assert_eq!(slot_of(&tasks[1].id), "web.2");
         assert!(tasks.iter().all(|t| t.state == TaskState::Pending));
+    }
+
+    #[test]
+    fn host_mode_ports_hold_one_task_per_node() {
+        let nodes = vec![node(1, 8.0, 1 << 30, 0, &[]), node(2, 8.0, 1 << 30, 0, &[])];
+        let host = |id: &str, replicas| {
+            let mut service = svc(id, replicas, ServiceMode::Replicated);
+            service.ports[0].mode = PortMode::Host;
+            service
+        };
+        // Replicas of one host-mode service never share a node.
+        let tasks = place_service(&host("web", 3), &nodes, &[], &[], 0);
+        let node_ids: Vec<u64> = tasks.iter().map(|t| t.node_id).collect();
+        assert_eq!(node_ids, vec![1, 2]);
+
+        // Another service's live task holds the port on node 1.
+        let holder = place_service(&host("other", 1), &nodes[..1], &[], &[], 0);
+        let tasks = place_service(&host("web", 1), &nodes, &holder, &[], 0);
+        assert_eq!(tasks.iter().map(|t| t.node_id).collect::<Vec<_>>(), vec![2]);
+
+        // The node's own listener reserves the port too.
+        let mut reserved = nodes.clone();
+        reserved[0].reserved_ports = vec![minga_state::types::ReservedPort {
+            port: 8080,
+            protocol: "tcp".into(),
+        }];
+        let tasks = place_service(&host("web", 1), &reserved, &[], &[], 0);
+        assert_eq!(tasks.iter().map(|t| t.node_id).collect::<Vec<_>>(), vec![2]);
+
+        // Ingress ports are routed by the mesh, so replicas may share a node.
+        let tasks = place_service(&svc("web", 3, ServiceMode::Replicated), &nodes, &[], &[], 0);
+        assert_eq!(tasks.len(), 3);
     }
 
     #[test]

@@ -1164,6 +1164,50 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    // Publish every Minga-owned listener with the node lease so ingress
+    // admission can reject ports that are unavailable on any cluster node.
+    let mut node_tcp_reserved: Vec<(u16, String)> = [
+        (args.bind.as_deref(), "Raft"),
+        (args.metrics_bind.as_deref(), "metrics"),
+        (args.egress_bind.as_deref(), "egress proxy"),
+    ]
+    .into_iter()
+    .filter_map(|(addr, by)| Some((port_of(addr?)?, by.to_string())))
+    .collect();
+    if is_manager {
+        let api_bind = args.api_bind.as_deref().unwrap_or("0.0.0.0:2375");
+        if let Some(port) = port_of(api_bind) {
+            node_tcp_reserved.push((port, "Docker API".into()));
+        }
+    }
+    if is_manager && args.nats_url.is_none() {
+        let sidecar = sidecar::SidecarOptions::default();
+        node_tcp_reserved.push((sidecar.client_port, "NATS sidecar".into()));
+        node_tcp_reserved.push((sidecar.monitor_port, "NATS sidecar monitor".into()));
+        if let Some(cluster) = &cluster {
+            node_tcp_reserved.push((cluster.port, "NATS cluster route".into()));
+        }
+    }
+    let mut reserved_ports = vec![
+        minga_state::types::ReservedPort {
+            port: 53,
+            protocol: "tcp".into(),
+        },
+        minga_state::types::ReservedPort {
+            port: 53,
+            protocol: "udp".into(),
+        },
+        minga_state::types::ReservedPort {
+            port: args.wg_listen,
+            protocol: "udp".into(),
+        },
+    ];
+    reserved_ports.extend(node_tcp_reserved.iter().map(|(port, _)| {
+        minga_state::types::ReservedPort {
+            port: *port,
+            protocol: "tcp".into(),
+        }
+    }));
     let identity = minga_node::NodeIdentity {
         node_id: args.node_id,
         address: args.bind.clone().unwrap_or_default(),
@@ -1174,6 +1218,7 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
         } else {
             minga_state::types::NodeRole::Worker
         },
+        reserved_ports,
         wg_public_key: Some(wg_public_key),
         wg_endpoint: args.wg_endpoint.clone(),
     };
@@ -1361,33 +1406,10 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
     // overlay networks, so they need neither.
     #[cfg(target_os = "linux")]
     let networking: Option<Arc<minga_node::NetworkSetup>> = if args.runtime == "containerd" {
-        // A task may not publish a port this process serves: its DNAT rule
-        // would capture the node's own clients and their tokens.
-        let mut reserved: Vec<(u16, String)> = [
-            (args.bind.as_deref(), "Raft"),
-            (args.metrics_bind.as_deref(), "metrics"),
-            (args.egress_bind.as_deref(), "egress proxy"),
-        ]
-        .into_iter()
-        .filter_map(|(addr, by)| Some((port_of(addr?)?, by.to_string())))
-        .collect();
-        if is_manager {
-            let api_bind = args.api_bind.as_deref().unwrap_or("0.0.0.0:2375");
-            if let Some(port) = port_of(api_bind) {
-                reserved.push((port, "Docker API".into()));
-            }
-        }
-        if is_manager && args.nats_url.is_none() {
-            let sidecar = sidecar::SidecarOptions::default();
-            reserved.push((sidecar.client_port, "NATS sidecar".into()));
-            reserved.push((sidecar.monitor_port, "NATS sidecar monitor".into()));
-            if let Some(cluster) = &cluster {
-                reserved.push((cluster.port, "NATS cluster route".into()));
-            }
-        }
         Some(Arc::new(
             minga_node::NetworkSetup::new(format!("{}/net", args.data_dir))
-                .with_reserved_tcp_ports(reserved),
+                .with_reserved_tcp_ports(node_tcp_reserved.clone())
+                .with_reserved_udp_ports([(args.wg_listen, "WireGuard".to_string())]),
         ))
     } else {
         None

@@ -51,8 +51,9 @@ pub enum NetError {
         proto: String,
         by: String,
     },
+    #[error("invalid ingress assignment: {0}")]
+    IngressAssignment(String),
 }
-
 /// Runs a command; on non-zero exit, fails with its stderr.
 async fn run(program: &str, args: &[&str]) -> Result<(), NetError> {
     let output = tokio::process::Command::new(program)
@@ -105,6 +106,10 @@ const TASK_SOURCE_CHAIN: &str = "MINGA_TASK_SOURCE";
 const TASK_FAIL_CLOSED_IN_CHAIN: &str = "MINGA_TASK_FAIL_CLOSED_IN";
 const TASK_FAIL_CLOSED_OUT_CHAIN: &str = "MINGA_TASK_FAIL_CLOSED_OUT";
 const TASK_MASQUERADE_CHAIN: &str = "MINGA_MASQUERADE";
+const INGRESS_CONNMARK: &str = "0x4d494e47";
+/// Mesh-sourced traffic may reach only this node's ingress backends, each on
+/// its target port. `MINGA_WG_FORWARD` jumps here for `-s <mesh subnet>`.
+const INGRESS_FORWARD_CHAIN: &str = "MINGA_INGRESS_FWD";
 
 async fn remove_wireguard_rules() {
     run_tolerated(
@@ -608,15 +613,48 @@ fn task_veth_for_ip(
     })
 }
 
+/// Builds the `iptables-restore` batch that admits mesh-sourced ingress
+/// traffic to this node's own backends only, by address, protocol and port.
+fn ingress_forward_batch(
+    assignments: &[minga_state::types::IngressAssignment],
+    node_id: minga_state::types::NodeId,
+) -> String {
+    let mut batch = format!("*filter\n:{INGRESS_FORWARD_CHAIN} - [0:0]\n");
+    for assignment in assignments {
+        for backend in assignment
+            .backends
+            .iter()
+            .filter(|backend| backend.node_id == node_id)
+        {
+            batch.push_str(&format!(
+                "-A {INGRESS_FORWARD_CHAIN} -d {}/32 -p {} --dport {} -j ACCEPT\n",
+                backend.ip, assignment.protocol, backend.target_port
+            ));
+        }
+    }
+    batch.push_str("COMMIT\n");
+    batch
+}
+
+fn ingress_port_chain(assignment: &minga_state::types::IngressAssignment) -> String {
+    let protocol = match assignment.protocol.as_str() {
+        "tcp" => "T",
+        "udp" => "U",
+        "sctp" => "S",
+        _ => unreachable!("assignment protocol validated before chain creation"),
+    };
+    format!("MINGA_I_{protocol}_{}", assignment.published)
+}
+
 /// The node-level network setup. One instance per node.
 pub struct NetworkSetup {
     /// Node data dir for networking state (`<data_dir>/net`).
     state_dir: PathBuf,
-    /// Ports the node owns even when nothing listens on them yet (a sidecar
-    /// that restarts after a task's rule exists): (protocol, port, owner).
+    /// Ports the node owns even when nothing listens on them yet.
     reserved: Vec<(String, u16, String)>,
+    /// Legacy v2 task DNAT is removed once during the v3 transition.
+    legacy_ingress_cleaned: std::sync::Mutex<bool>,
 }
-
 /// The netns handle path. `/var/run/netns` is the one location every tool
 /// (`ip`, runc, `nsenter`) agrees on; `IPNETNS_DIR` indirection proved
 /// unreliable (the nsfs mount and the OCI spec path diverged).
@@ -633,6 +671,7 @@ impl NetworkSetup {
             reserved: ["tcp", "udp"]
                 .map(|p| (p.to_string(), 53, "embedded DNS".to_string()))
                 .to_vec(),
+            legacy_ingress_cleaned: std::sync::Mutex::new(false),
         }
     }
 
@@ -645,6 +684,20 @@ impl NetworkSetup {
             ports
                 .into_iter()
                 .map(|(port, by)| ("tcp".to_string(), port, by)),
+        );
+        self
+    }
+
+    /// Adds node-owned UDP ports, such as the WireGuard listen port, which is
+    /// reserved before the interface binds its socket.
+    pub fn with_reserved_udp_ports(
+        mut self,
+        ports: impl IntoIterator<Item = (u16, String)>,
+    ) -> Self {
+        self.reserved.extend(
+            ports
+                .into_iter()
+                .map(|(port, by)| ("udp".to_string(), port, by)),
         );
         self
     }
@@ -691,6 +744,217 @@ impl NetworkSetup {
         subnet_for(network_id, state_subnet)
             .ok()
             .and_then(|s| gateway_of(&s))
+    }
+    /// Reconciles the node-local routing mesh with manager-authored backend sets.
+    pub async fn setup_ingress(
+        &self,
+        assignments: &[minga_state::types::IngressAssignment],
+        node_id: minga_state::types::NodeId,
+    ) -> Result<(), NetError> {
+        let mut desired_chains = HashSet::new();
+        for assignment in assignments {
+            if assignment.published == 0
+                || !matches!(assignment.protocol.as_str(), "tcp" | "udp" | "sctp")
+                || assignment.backends.is_empty()
+            {
+                return Err(NetError::IngressAssignment(format!(
+                    "{} / {} has invalid port or no backends",
+                    assignment.published, assignment.protocol
+                )));
+            }
+            self.check_port_free(&assignment.protocol, assignment.published)?;
+            let chain = ingress_port_chain(assignment);
+            if !desired_chains.insert(chain.clone()) {
+                return Err(NetError::IngressAssignment(format!(
+                    "duplicate published port {} / {}",
+                    assignment.published, assignment.protocol
+                )));
+            }
+            for backend in &assignment.backends {
+                backend
+                    .ip
+                    .parse::<Ipv4Addr>()
+                    .map_err(|error| NetError::IngressAssignment(error.to_string()))?;
+                if backend.target_port == 0 {
+                    return Err(NetError::IngressAssignment(
+                        "backend target port is zero".into(),
+                    ));
+                }
+                if backend.node_id != node_id && assignment.source_overlay_ip.is_none() {
+                    return Err(NetError::IngressAssignment(
+                        "remote backend requires this node's overlay address".into(),
+                    ));
+                }
+            }
+            if let Some(source) = &assignment.source_overlay_ip {
+                let source = source
+                    .parse::<Ipv4Addr>()
+                    .map_err(|error| NetError::IngressAssignment(error.to_string()))?;
+                let expected = minga_net::overlay::mesh_node_ip(node_id)
+                    .map_err(|error| NetError::IngressAssignment(error.to_string()))?;
+                if source != expected {
+                    return Err(NetError::IngressAssignment(format!(
+                        "source address {source} does not belong to node {node_id}"
+                    )));
+                }
+            }
+        }
+
+        let clean_legacy = !*self.legacy_ingress_cleaned.lock().unwrap();
+        if clean_legacy {
+            self.remove_legacy_ingress_dnat().await?;
+            *self.legacy_ingress_cleaned.lock().unwrap() = true;
+        }
+
+        run_tolerated("iptables", &["-w", "5", "-t", "nat", "-N", "MINGA_INGRESS"]).await;
+        run_tolerated(
+            "iptables",
+            &["-w", "5", "-t", "nat", "-N", "MINGA_INGRESS_SNAT"],
+        )
+        .await;
+        run_tolerated(
+            "iptables",
+            &["-w", "5", "-t", "mangle", "-N", "MINGA_INGRESS_MARK"],
+        )
+        .await;
+        ensure_rule(
+            "mangle",
+            "PREROUTING",
+            &[
+                "-m",
+                "addrtype",
+                "--dst-type",
+                "LOCAL",
+                "-j",
+                "MINGA_INGRESS_MARK",
+            ],
+        )
+        .await?;
+        ensure_rule(
+            "mangle",
+            "OUTPUT",
+            &["-o", "lo", "-j", "MINGA_INGRESS_MARK"],
+        )
+        .await?;
+        ensure_rule(
+            "nat",
+            "PREROUTING",
+            &[
+                "-m",
+                "addrtype",
+                "--dst-type",
+                "LOCAL",
+                "-j",
+                "MINGA_INGRESS",
+            ],
+        )
+        .await?;
+        ensure_rule("nat", "OUTPUT", &["-o", "lo", "-j", "MINGA_INGRESS"]).await?;
+        ensure_rule("nat", "POSTROUTING", &["-j", "MINGA_INGRESS_SNAT"]).await?;
+
+        let existing = output("iptables", &["-w", "5", "-t", "nat", "-S", "MINGA_INGRESS"]).await?;
+        let old_chains: HashSet<String> = existing
+            .lines()
+            .filter_map(|line| {
+                let fields: Vec<_> = line.split_whitespace().collect();
+                if fields.first() != Some(&"-A") || fields.get(1) != Some(&"MINGA_INGRESS") {
+                    return None;
+                }
+                let target = fields.windows(2).find_map(|pair| {
+                    (pair[0] == "-j" && pair[1].starts_with("MINGA_I_")).then_some(pair[1])
+                })?;
+                Some(target.to_string())
+            })
+            .collect();
+
+        for chain in &desired_chains {
+            run_tolerated("iptables", &["-w", "5", "-t", "nat", "-N", chain.as_str()]).await;
+        }
+        let mut batch = String::from("*nat\n-F MINGA_INGRESS\n-F MINGA_INGRESS_SNAT\n");
+        for chain in old_chains.difference(&desired_chains) {
+            batch.push_str(&format!("-F {chain}\n-X {chain}\n"));
+        }
+        for assignment in assignments {
+            let chain = ingress_port_chain(assignment);
+            batch.push_str(&format!("-F {chain}\n"));
+            batch.push_str(&format!(
+                "-A MINGA_INGRESS -p {} --dport {} -j {chain}\n",
+                assignment.protocol, assignment.published
+            ));
+            for (index, backend) in assignment.backends.iter().enumerate() {
+                let destination = format!("{}:{}", backend.ip, backend.target_port);
+                if index + 1 < assignment.backends.len() {
+                    let probability = 1.0 / (assignment.backends.len() - index) as f64;
+                    batch.push_str(&format!(
+                        "-A {chain} -p {} -m statistic --mode random --probability {probability:.10} \
+                         -j DNAT --to-destination {destination}\n",
+                        assignment.protocol
+                    ));
+                } else {
+                    batch.push_str(&format!(
+                        "-A {chain} -p {} -j DNAT --to-destination {destination}\n",
+                        assignment.protocol
+                    ));
+                }
+                if backend.node_id != node_id {
+                    let source = assignment
+                        .source_overlay_ip
+                        .as_deref()
+                        .expect("remote backend validated with overlay address");
+                    batch.push_str(&format!(
+                        "-A MINGA_INGRESS_SNAT -p {} -d {}/32 --dport {} -m conntrack \
+                         --ctstate DNAT -j SNAT --to-source {source}\n",
+                        assignment.protocol, backend.ip, backend.target_port
+                    ));
+                }
+            }
+        }
+        let mut mark_batch =
+            String::from("*mangle\n:MINGA_INGRESS_MARK - [0:0]\n-F MINGA_INGRESS_MARK\n");
+        for assignment in assignments {
+            mark_batch.push_str(&format!(
+                "-A MINGA_INGRESS_MARK -p {} --dport {} -m conntrack --ctstate NEW \
+                 -j CONNMARK --set-mark {INGRESS_CONNMARK}\n",
+                assignment.protocol, assignment.published
+            ));
+        }
+        mark_batch.push_str("COMMIT\n");
+        iptables_restore(&mark_batch).await?;
+        iptables_restore(&ingress_forward_batch(assignments, node_id)).await?;
+        batch.push_str("COMMIT\n");
+        iptables_restore(&batch).await
+    }
+
+    async fn remove_legacy_ingress_dnat(&self) -> Result<(), NetError> {
+        let mut entries = match tokio::fs::read_dir(&self.state_dir).await {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        while let Some(entry) = entries.next_entry().await? {
+            if !entry.path().extension().is_some_and(|ext| ext == "json") {
+                continue;
+            }
+            let raw = tokio::fs::read(entry.path()).await?;
+            let state: TaskNetState = serde_json::from_slice(&raw)?;
+            let Some(ip) = state.ips.first() else {
+                continue;
+            };
+            for port in state.ports {
+                if port.mode != minga_state::types::PortMode::Ingress {
+                    continue;
+                }
+                let Some(published) = port.published else {
+                    continue;
+                };
+                let destination = format!("{ip}:{}", port.target);
+                for chain in [Chain::PreroutingLocal, Chain::PreroutingAny, Chain::Output] {
+                    let rule = dnat_rule("-D", chain, &port.protocol, published, &destination);
+                    run_tolerated("iptables", &as_strs(&rule)).await;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Ensures the bridge for a network exists with its gateway address.
@@ -838,7 +1102,13 @@ impl NetworkSetup {
         networks: &[minga_net::wireguard::WireGuardNetworkAssignment],
     ) -> Result<(), NetError> {
         let wg = minga_net::wireguard::WG_INTERFACE_NAME;
-        if networks.iter().any(|network| network.relay) {
+        let mesh_subnet = minga_net::overlay::allocate_mesh_subnet()
+            .map_err(|error| NetError::IngressAssignment(error.to_string()))?
+            .to_string();
+        if networks
+            .iter()
+            .any(|network| network.relay || network.ingress)
+        {
             // Linux resets per-interface IPv4 settings when ip_forward changes.
             run("sysctl", &["-w", "net.ipv4.ip_forward=1"]).await?;
         }
@@ -853,11 +1123,52 @@ impl NetworkSetup {
         let mut local_bridges = Vec::new();
         let mut remote_subnets = Vec::new();
         let mut relay_subnets = Vec::new();
-        let mut rules = Vec::with_capacity(networks.len() * 2 + 2);
+        let mut relay_ingress_subnets = Vec::new();
+        let mut rules = vec![
+            vec![
+                "-o".to_string(),
+                wg.to_string(),
+                "-m".to_string(),
+                "connmark".to_string(),
+                "--mark".to_string(),
+                INGRESS_CONNMARK.to_string(),
+                "-j".to_string(),
+                "ACCEPT".to_string(),
+            ],
+            vec![
+                "-i".to_string(),
+                wg.to_string(),
+                "-m".to_string(),
+                "connmark".to_string(),
+                "--mark".to_string(),
+                INGRESS_CONNMARK.to_string(),
+                "-j".to_string(),
+                "ACCEPT".to_string(),
+            ],
+            vec![
+                "-i".to_string(),
+                wg.to_string(),
+                "-s".to_string(),
+                mesh_subnet.clone(),
+                "-j".to_string(),
+                INGRESS_FORWARD_CHAIN.to_string(),
+            ],
+        ];
+        // The jump target must exist before the restore; `setup_ingress` owns
+        // its contents and an empty chain returns to the drops below.
+        run_tolerated(
+            "iptables",
+            &["-w", "5", "-t", "filter", "-N", INGRESS_FORWARD_CHAIN],
+        )
+        .await;
         for network in networks {
             let subnet = subnet_for(&network.network_id, Some(&network.subnet))?;
             if network.relay {
-                relay_subnets.push(subnet.to_string());
+                let subnet = subnet.to_string();
+                relay_subnets.push(subnet.clone());
+                if network.ingress {
+                    relay_ingress_subnets.push(subnet);
+                }
             }
             if !network.local {
                 remote_subnets.push(subnet.to_string());
@@ -917,6 +1228,32 @@ impl NetworkSetup {
                 subnet.clone(),
                 "-d".to_string(),
                 subnet.clone(),
+                "-j".to_string(),
+                "ACCEPT".to_string(),
+            ]);
+        }
+        for subnet in &relay_ingress_subnets {
+            rules.push(vec![
+                "-i".to_string(),
+                wg.to_string(),
+                "-o".to_string(),
+                wg.to_string(),
+                "-s".to_string(),
+                mesh_subnet.clone(),
+                "-d".to_string(),
+                subnet.clone(),
+                "-j".to_string(),
+                "ACCEPT".to_string(),
+            ]);
+            rules.push(vec![
+                "-i".to_string(),
+                wg.to_string(),
+                "-o".to_string(),
+                wg.to_string(),
+                "-s".to_string(),
+                subnet.clone(),
+                "-d".to_string(),
+                mesh_subnet.clone(),
                 "-j".to_string(),
                 "ACCEPT".to_string(),
             ]);
@@ -987,8 +1324,10 @@ impl NetworkSetup {
         }
 
         for port in ports {
-            if let Some(published) = port.published {
-                self.check_port_free(&port.protocol, published)?;
+            if port.mode == minga_state::types::PortMode::Host {
+                if let Some(published) = port.published {
+                    self.check_port_free(&port.protocol, published)?;
+                }
             }
         }
 
@@ -1090,9 +1429,13 @@ impl NetworkSetup {
             }
         }
 
-        // Published ports: DNAT host -> primary task IP (first attachment).
+        // Host-mode ports retain node-local DNAT. Ingress ports are routed
+        // by the supervisor's cluster-wide backend assignment.
         let primary_ip = attachments[0].ip;
         for port in ports {
+            if port.mode != minga_state::types::PortMode::Host {
+                continue;
+            }
             let Some(published) = port.published else {
                 continue;
             };
@@ -1359,6 +1702,32 @@ pub fn system_upstream_resolver() -> Option<std::net::SocketAddr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ingress_forward_admits_only_local_backend_ports() {
+        let backend = |node_id, ip: &str| minga_state::types::IngressBackend {
+            node_id,
+            ip: ip.into(),
+            target_port: 8080,
+        };
+        let assignment = minga_state::types::IngressAssignment {
+            published: 18080,
+            protocol: "tcp".into(),
+            backends: vec![backend(2, "10.242.0.20"), backend(3, "10.242.0.21")],
+            source_overlay_ip: Some("10.200.0.1".into()),
+        };
+        assert_eq!(
+            ingress_forward_batch(&[assignment], 2),
+            "*filter\n:MINGA_INGRESS_FWD - [0:0]\n\
+             -A MINGA_INGRESS_FWD -d 10.242.0.20/32 -p tcp --dport 8080 -j ACCEPT\n\
+             COMMIT\n"
+        );
+        // No assignments leaves an empty chain, so mesh traffic falls to the drops.
+        assert_eq!(
+            ingress_forward_batch(&[], 2),
+            "*filter\n:MINGA_INGRESS_FWD - [0:0]\nCOMMIT\n"
+        );
+    }
 
     #[test]
     fn deterministic_names_fit_ifnamsiz() {

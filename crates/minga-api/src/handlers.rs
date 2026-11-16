@@ -221,6 +221,10 @@ async fn ensure_placeable(
     updating: Option<&str>,
 ) -> ApiResult<()> {
     let nodes = app.store.list_nodes().await?;
+    let services = app.store.list_services().await?;
+    if let Err(error) = validate_ingress_ports(svc, &services, &nodes) {
+        return Err(conflict(error));
+    }
     let statuses = app.task_statuses().await?;
     let all_tasks: Vec<_> = app
         .store
@@ -242,6 +246,38 @@ async fn ensure_placeable(
     };
     minga_scheduler::check_placeable(svc, &nodes, &tasks, &networks, unix_now())
         .map_err(|e| conflict(e.to_string()))
+}
+
+fn validate_ingress_ports(
+    service: &StateService,
+    services: &[StateService],
+    nodes: &[ClusterNode],
+) -> Result<(), String> {
+    // The state machine applies the same rule at commit; this is the early,
+    // readable rejection. Host-mode clashes on one node are placement's job.
+    if let Some(conflict) = minga_state::types::published_port_conflict(service, services) {
+        return Err(conflict);
+    }
+    // An ingress port opens on every node, so no node's listener may own it.
+    for port in &service.ports {
+        let Some(published) = port.published else {
+            continue;
+        };
+        if port.mode != minga_state::types::PortMode::Ingress {
+            continue;
+        }
+        for node in nodes {
+            if node.reserved_ports.iter().any(|reserved| {
+                reserved.port == published && reserved.protocol.eq_ignore_ascii_case(&port.protocol)
+            }) {
+                return Err(format!(
+                    "ingress port {published}/{} is reserved on node {}",
+                    port.protocol, node.id
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -387,6 +423,7 @@ pub async fn create_node(
         // until explicitly removed or drained.
         last_seen_unix: None,
         role: Default::default(),
+        reserved_ports: Vec::new(),
     };
     app.store.upsert_node(node.clone()).await?;
     tracing::info!(node = id, address = %node.address, "node registered via API");
@@ -1059,6 +1096,7 @@ mod tests {
                 overlay_ip: None,
                 last_seen_unix: None,
                 role: Default::default(),
+                reserved_ports: Vec::new(),
             })
             .await
             .unwrap();

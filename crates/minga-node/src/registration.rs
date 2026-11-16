@@ -25,6 +25,9 @@ pub struct NodeIdentity {
     /// Compute capacity, e.g. from [`host_capacity`].
     pub capacity: ResourceSpec,
     pub role: NodeRole,
+    /// TCP/UDP ports owned by this node's Minga services.
+    #[serde(default)]
+    pub reserved_ports: Vec<minga_state::types::ReservedPort>,
     /// WireGuard public key. The private key is never registered.
     #[serde(default)]
     pub wg_public_key: Option<String>,
@@ -47,6 +50,7 @@ impl NodeIdentity {
             overlay_ip: None,
             last_seen_unix: None,
             role: self.role,
+            reserved_ports: self.reserved_ports.clone(),
         }
     }
 }
@@ -222,6 +226,17 @@ async fn load_registered_nodes(
     Ok(registered)
 }
 
+/// A node lists a handful of Minga listeners; more is malformed or abusive.
+const MAX_RESERVED_PORTS: usize = 32;
+
+/// Whether a renewed identity carries registration fields the store lacks.
+fn registration_changed(node: &ClusterNode, identity: &NodeIdentity) -> bool {
+    let wireguard_changed = identity.wg_public_key.as_ref().is_some_and(|key| {
+        node.wg_public_key.as_ref() != Some(key) || node.wg_endpoint != identity.wg_endpoint
+    });
+    wireguard_changed || node.reserved_ports != identity.reserved_ports
+}
+
 async fn queue_node_registration(
     store: &StateStore,
     event: KvEvent,
@@ -274,15 +289,21 @@ async fn queue_node_registration(
         );
         return;
     }
+    // Workers are untrusted and this list is written to Raft and read by
+    // ingress admission, so bound it and accept only real port tuples.
+    let ports_ok = identity.reserved_ports.len() <= MAX_RESERVED_PORTS
+        && identity.reserved_ports.iter().all(|reserved| {
+            reserved.port != 0 && matches!(reserved.protocol.as_str(), "tcp" | "udp")
+        });
+    if !ports_ok {
+        tracing::warn!(node_id, "ignoring registration with invalid reserved ports");
+        return;
+    }
 
     match store.get_node(node_id).await {
         Ok(Some(node)) => {
             registered.insert(node_id);
-            let key_changed = identity.wg_public_key.as_ref().is_some_and(|public_key| {
-                node.wg_public_key.as_ref() != Some(public_key)
-                    || node.wg_endpoint != identity.wg_endpoint
-            });
-            if key_changed {
+            if registration_changed(&node, &identity) {
                 pending.insert(node_id, identity);
             }
         }
@@ -321,16 +342,15 @@ async fn register_pending_nodes(
         match store.get_node(node_id).await {
             Ok(Some(mut node)) => {
                 if let Some(identity) = pending.get(&node_id) {
-                    if let Some(public_key) = &identity.wg_public_key {
-                        if node.wg_public_key.as_ref() != Some(public_key)
-                            || node.wg_endpoint != identity.wg_endpoint
-                        {
+                    if registration_changed(&node, identity) {
+                        if let Some(public_key) = &identity.wg_public_key {
                             node.wg_public_key = Some(public_key.clone());
                             node.wg_endpoint = identity.wg_endpoint.clone();
-                            if let Err(error) = store.upsert_node(node).await {
-                                tracing::warn!(node_id, error = %error, "cannot update node WireGuard registration");
-                                continue;
-                            }
+                        }
+                        node.reserved_ports = identity.reserved_ports.clone();
+                        if let Err(error) = store.upsert_node(node).await {
+                            tracing::warn!(node_id, error = %error, "cannot update node registration");
+                            continue;
                         }
                     }
                 }
@@ -390,6 +410,7 @@ mod tests {
                 gpus: 0,
             },
             role: NodeRole::Worker,
+            reserved_ports: Vec::new(),
             wg_public_key: Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into()),
             wg_endpoint: None,
         }
@@ -642,6 +663,25 @@ mod tests {
             Some("AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=")
         );
         assert_eq!(stored.wg_endpoint, None);
+
+        // A restart that changes only the listener ports still updates them.
+        renewed.reserved_ports = vec![minga_state::types::ReservedPort {
+            port: 9100,
+            protocol: "tcp".into(),
+        }];
+        let payload = minga_state::codec::encode_wire(&renewed).unwrap();
+        bus.refresh_lease(1, &payload).await.unwrap();
+        queue_node_registration(
+            &store,
+            next_lease(&mut stream).await,
+            &mut registered,
+            &mut pending,
+        )
+        .await;
+        register_pending_nodes(&store, bus.as_ref(), &mut registered, &mut pending).await;
+        let stored = store.get_node(1).await.unwrap().unwrap();
+        assert_eq!(stored.reserved_ports, renewed.reserved_ports);
+        assert_eq!(stored.status, NodeStatus::Draining);
         membership.leave().await;
     }
 
