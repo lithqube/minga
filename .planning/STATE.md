@@ -1,5 +1,11 @@
 # Planning state
 
+**Phase 14 — Supported NATS server line (tenancy T0), 14-01 evidence (2026-11-16):**
+
+- **Pins:** release `NATS_VERSION` v2.15.3, with `nats_sha256` for amd64 `32e18c1e…0797` and arm64 `4a2088b3…d45d` taken from the v2.15.3 release's `SHA256SUMS`. The old pins matched v2.10.22's `SHA256SUMS`, which confirms the method. The CI install and the four test images (`nats:2.15.3-alpine`, published for amd64 and arm64) also moved, and CONTRIBUTING was updated. No 2.10 pin remains outside ADR 0008, which 14-05 updates.
+- **Verification:** `cargo fmt --all --check` and `cargo clippy --all-targets -- -D warnings` are clean. `cargo test --workspace` passed 932 tests across 58 binaries, with 0 failures, against a local nats-server v2.15.3 (`MINGA_TEST_NATS_URL`, and `nats_tls` spawning the same binary), with an isolated target dir. Not run here: the Docker-only `nats_cluster` test (no Docker on the host; 14-03 ports it to real binaries).
+- **Release-note review:** the findings are in `phases/14-nats-supported-line/14-PLAN.md` ("Release-note review"). Two block a release: 2.15 caps streams at 1,000 consumers by default, which would break assignment watches somewhere around 500 workers (new plan 14-06), and 2.10 → 2.15 is not a documented single-step upgrade. **Release gate:** no `v*` tag with 2.15.3 until 14-04 and 14-06 are done.
+
 **Current:** Phase 13 — WireGuard mesh and routing mesh. 13-03 node keys and interface are complete and merged (PR #84). ADR 0007 (13-01, PR #77) and unique subnets (13-02, PR #78) are merged. Phase 12 Managers-only Raft is complete (PR #76; live evidence below).
 
 **Phase 12 live evidence (12-07, 2026-11-15):**
