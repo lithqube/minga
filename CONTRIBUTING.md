@@ -18,7 +18,7 @@ Be direct, be kind, assume good intent. Disagree with ideas, not people. Harassm
   ```
 
 - A C linker (the default toolchain on your platform is fine).
-- **`nats-server`** on `PATH`: the `minga-bus` integration suites start a real server. CI pins v2.15.3, the line release archives bundle.
+- **`nats-server`** on `PATH`: the release bundle pins v2.15.3. CI tests the bus against v2.14.10 and v2.15.3.
 - **Linux + containerd** (optional) for the daemon-backed suites:
 
   ```bash
@@ -30,6 +30,13 @@ Be direct, be kind, assume good intent. Disagree with ideas, not people. Harassm
   ```
 
   `MINGA_REQUIRE_CONTAINERD=1` makes a missing daemon a failure instead of a silent skip. CI runs this job on pushes to `main` and on pull requests, with the same images preloaded.
+
+For `minga-bus` integration tests, `MINGA_TEST_NATS_URL` selects an existing
+JetStream server. If unset, the shared helper starts `nats:2.15.3-alpine`
+through testcontainers. Set `MINGA_REQUIRE_NATS=1` when a missing server must
+fail instead of silently skipping; the NATS CI matrix sets both variables.
+[docs/topologies.md](docs/topologies.md#external-nats-compatibility) lists the
+supported external server lines and API floor.
 
 ### Clone and build
 

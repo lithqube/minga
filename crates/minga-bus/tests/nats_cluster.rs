@@ -1,84 +1,103 @@
 //! [`NatsBus`] against a 3-server NATS cluster: replicated streams survive
 //! losing one server.
 //!
-//! Skips when Docker is unavailable, like `nats_integration`.
-//!
 //! To run: `cargo test -p minga-bus --test nats_cluster -- --nocapture`
 
+use std::net::TcpListener;
+use std::path::PathBuf;
+use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 use minga_bus::{EventBus, NatsBus};
-use testcontainers::{
-    core::{logs::LogFrame, WaitFor},
-    runners::AsyncRunner,
-    ContainerAsync, GenericImage, ImageExt,
-};
 
-const NATS_PORT: u16 = 4222;
-const MONITOR_PORT: u16 = 8222;
+struct ClusterServer {
+    child: Child,
+    _store: tempfile::TempDir,
+}
 
-/// Starts three JetStream servers routed to each other on a private network.
-async fn start_cluster() -> Option<(Vec<ContainerAsync<GenericImage>>, String)> {
+impl Drop for ClusterServer {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn nats_server_bin() -> PathBuf {
+    if let Ok(path) = std::env::var("MINGA_NATS_SERVER_BIN") {
+        let path = PathBuf::from(path);
+        assert!(
+            path.is_file(),
+            "MINGA_NATS_SERVER_BIN is not a file: {}",
+            path.display()
+        );
+        return path;
+    }
+    std::env::var_os("PATH")
+        .into_iter()
+        .flat_map(|paths| std::env::split_paths(&paths).collect::<Vec<_>>())
+        .map(|dir| dir.join("nats-server"))
+        .find(|path| path.is_file())
+        .expect("nats-server is required; install it or set MINGA_NATS_SERVER_BIN")
+}
+
+fn free_port() -> u16 {
+    TcpListener::bind(("127.0.0.1", 0))
+        .expect("bind ephemeral port")
+        .local_addr()
+        .expect("read ephemeral port")
+        .port()
+}
+
+/// Starts three JetStream server processes routed to each other.
+async fn start_cluster() -> (Vec<ClusterServer>, String, Vec<String>) {
+    let binary = nats_server_bin();
     let tag = std::process::id();
-    let network = format!("minga-nats-{tag}");
     let names: Vec<String> = (1..=3).map(|i| format!("minga-nats-{tag}-{i}")).collect();
-    let routes = names
+    let client_ports: Vec<u16> = (0..3).map(|_| free_port()).collect();
+    let monitor_ports: Vec<u16> = (0..3).map(|_| free_port()).collect();
+    let route_ports: Vec<u16> = (0..3).map(|_| free_port()).collect();
+    let routes = route_ports
         .iter()
-        .map(|n| format!("nats://{n}:6222"))
+        .map(|port| format!("nats://127.0.0.1:{port}"))
         .collect::<Vec<_>>()
         .join(",");
-
-    let starts = names.iter().map(|name| {
-        let prefix = name.clone();
-        GenericImage::new("nats", "2.15.3-alpine")
-            .with_exposed_port(NATS_PORT.into())
-            .with_exposed_port(MONITOR_PORT.into())
-            .with_wait_for(WaitFor::message_on_stderr("Server is ready"))
-            .with_network(&network)
-            .with_container_name(name)
-            // Server logs (debug level, with the peer-selection reasons) show
-            // only when the test fails: the harness captures them otherwise.
-            .with_log_consumer(move |frame: &LogFrame| {
-                eprint!("[{prefix}] {}", String::from_utf8_lossy(frame.bytes()));
-            })
-            .with_cmd(vec![
-                "-js".to_string(),
-                "-D".to_string(),
-                "-m".to_string(),
-                MONITOR_PORT.to_string(),
-                "-n".to_string(),
-                name.clone(),
-                "--cluster_name".to_string(),
-                "minga".to_string(),
-                "--cluster".to_string(),
-                "nats://0.0.0.0:6222".to_string(),
-                "--routes".to_string(),
-                routes.clone(),
-            ])
-            .start()
-    });
-
-    // Started together, so no server joins after the meta leader is elected.
-    let mut containers = Vec::new();
-    for started in futures::future::join_all(starts).await {
-        match started {
-            Ok(c) => containers.push(c),
-            Err(e) => {
-                eprintln!("skipping: cannot start NATS container: {e}");
-                return None;
-            }
-        }
-    }
+    let mut servers = Vec::new();
     let mut urls = Vec::new();
-    let mut monitors = Vec::new();
-    for container in &containers {
-        let port = container.get_host_port_ipv4(NATS_PORT).await.ok()?;
-        urls.push(format!("nats://127.0.0.1:{port}"));
-        let port = container.get_host_port_ipv4(MONITOR_PORT).await.ok()?;
-        monitors.push(format!("http://127.0.0.1:{port}/jsz"));
+
+    for index in 0..3 {
+        let store = tempfile::tempdir().expect("create JetStream store");
+        let child = Command::new(&binary)
+            .arg("-js")
+            .arg("-p")
+            .arg(client_ports[index].to_string())
+            .arg("-m")
+            .arg(monitor_ports[index].to_string())
+            .arg("-n")
+            .arg(&names[index])
+            .arg("--cluster_name")
+            .arg("minga")
+            .arg("--cluster")
+            .arg(format!("nats://127.0.0.1:{}", route_ports[index]))
+            .arg("--routes")
+            .arg(&routes)
+            .arg("--store_dir")
+            .arg(store.path())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("start nats-server");
+        servers.push(ClusterServer {
+            child,
+            _store: store,
+        });
+        urls.push(format!("nats://127.0.0.1:{}", client_ports[index]));
     }
+    let monitors: Vec<String> = monitor_ports
+        .iter()
+        .map(|port| format!("http://127.0.0.1:{port}/jsz"))
+        .collect();
     wait_for_meta_group(&monitors).await;
-    Some((containers, urls.join(",")))
+    (servers, urls.join(","), names)
 }
 
 /// Waits until every server reports a meta leader and a three-peer meta
@@ -151,9 +170,7 @@ where
 
 #[tokio::test]
 async fn replicated_bus_survives_losing_one_server() {
-    let Some((containers, seeds)) = start_cluster().await else {
-        return;
-    };
+    let (mut servers, seeds, names) = start_cluster().await;
 
     let bus = NatsBus::connect(&seeds)
         .await
@@ -180,8 +197,33 @@ async fn replicated_bus_survives_losing_one_server() {
     // New copies catch up for a moment after scaling; writes can time out.
     eventually("put", || bus.put_status("node.77.task.ha", b"running")).await;
 
-    containers[0].stop().await.expect("stop one server");
-
-    let status = eventually("get_status", || bus.get_status("node.77.task.ha")).await;
+    // Keep the status leader online so this verifies data availability after a
+    // replica loss without making the test depend on JetStream election timing.
+    let mut status_stream = bus
+        .jetstream()
+        .get_stream("KV_MINGA_STATUS")
+        .await
+        .expect("get status stream before failover");
+    let status_info = status_stream.info().await.expect("status stream info");
+    let status_leader = status_info
+        .cluster
+        .as_ref()
+        .and_then(|cluster| cluster.leader.as_deref())
+        .expect("status stream leader")
+        .to_owned();
+    let leader_index = names
+        .iter()
+        .position(|name| name == &status_leader)
+        .unwrap_or_else(|| panic!("unknown status leader {status_leader}"));
+    let seed_urls: Vec<_> = seeds.split(',').collect();
+    let survivor = NatsBus::connect(seed_urls[leader_index])
+        .await
+        .expect("connect directly to the status stream leader");
+    let victim = (0..servers.len())
+        .find(|index| *index != leader_index)
+        .expect("a non-leader server");
+    servers[victim].child.kill().expect("stop one server");
+    servers[victim].child.wait().expect("reap stopped server");
+    let status = eventually("get_status", || survivor.get_status("node.77.task.ha")).await;
     assert_eq!(status.as_deref(), Some(&b"running"[..]));
 }

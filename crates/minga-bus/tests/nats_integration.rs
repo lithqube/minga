@@ -1,75 +1,25 @@
 //! Integration tests for [`NatsBus`] against a real NATS server.
 //!
-//! These tests spin up a NATS server with JetStream enabled via
-//! `testcontainers` and exercise the production transport end to end. They
-//! skip gracefully when Docker is unavailable (e.g. a CI box without a
-//! daemon), matching the pattern used by `minga-api`'s integration tests.
-//!
-//! One container is shared across all tests in this binary: starting NATS
-//! costs seconds, and every test needs a server, so the container is started
-//! once and reused. Each test uses unique task IDs so tests do not interfere
-//! with one another.
+//! A server is shared across tests in this binary. Each test uses unique task
+//! IDs so tests do not interfere with one another.
 //!
 //! To run: `cargo test -p minga-bus --test nats_integration -- --nocapture`
+
+mod common;
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use futures::StreamExt;
 use minga_bus::{EventBus, LogEntry, LogStream, NatsBus};
-use testcontainers::{core::WaitFor, runners::AsyncRunner, GenericImage, ImageExt};
-use tokio::sync::OnceCell;
 
-/// NATS client port inside the container.
-const NATS_PORT: u16 = 4222;
-
-/// Shared NATS container URL, started once per test binary.
-static NATS: OnceCell<Option<String>> = OnceCell::const_new();
-
-/// Starts (once) a NATS server with JetStream enabled.
-///
-/// Returns the client URL (`nats://127.0.0.1:<mapped-port>`), or `None` when
-/// Docker is unavailable.
-async fn nats_url() -> Option<String> {
-    NATS.get_or_init(|| async {
-        let image = GenericImage::new("nats", "2.15.3-alpine")
-            .with_exposed_port(NATS_PORT.into())
-            // nats-server logs its readiness banner to stderr, not stdout.
-            .with_wait_for(WaitFor::message_on_stderr("Server is ready"))
-            .with_cmd(vec!["-js"]);
-
-        let container = match image.start().await {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("skipping: cannot start NATS container: {e}");
-                return None;
-            }
-        };
-
-        let port: u16 = match container.get_host_port_ipv4(NATS_PORT).await {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!("skipping: cannot resolve NATS port: {e}");
-                return None;
-            }
-        };
-
-        // Leak the container handle so it stays alive for the whole run.
-        std::mem::forget(container);
-        Some(format!("nats://127.0.0.1:{port}"))
-    })
-    .await
-    .clone()
-}
-
-/// Connects a fresh [`NatsBus`] to the shared server, or returns `None` if
-/// Docker is unavailable.
 async fn connect() -> Option<Arc<NatsBus>> {
-    let url = nats_url().await?;
-    match NatsBus::connect(&url).await {
-        Ok(bus) => Some(bus),
-        Err(e) => panic!("failed to connect to NATS at {url}: {e}"),
-    }
+    let url = common::nats_url().await?;
+    Some(
+        NatsBus::connect(&url)
+            .await
+            .unwrap_or_else(|e| panic!("failed to connect to NATS at {url}: {e}")),
+    )
 }
 
 /// Waits for a stream to yield one item, or fails the test on timeout.

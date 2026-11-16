@@ -3,7 +3,7 @@ phase: 14
 title: Supported NATS server line (tenancy T0)
 depends_on: []
 requirements: [NATS-PIN, NATS-LEVEL, NATS-CI, NATS-UPGRADE, NATS-CAP, NATS-DOCS]
-status: planned
+status: complete
 ---
 
 # Phase 14 — Supported NATS server line (tenancy T0)
@@ -38,7 +38,7 @@ Read in full: the v2.11.0, v2.12.0, v2.14.0 and v2.15.0 release notes, plus the 
 
 | Finding | Where | Minga impact | Action |
 | --- | --- | --- | --- |
-| **Streams default to at most 1,000 consumers** (v2.15.0; overridable per stream with `max_consumers` or server-wide with `default_max_consumers`) | `KV_MINGA_ASSIGN` | Each worker holds two long-lived ordered consumers on it: the supervisor watch (`supervisor.rs:76`) and the WireGuard peer-set watch (`wireguard.rs:270`), plus transient ones when it lists. **Somewhere around 500 workers, new watches would fail** on 2.15, far below the T4 target of 5,000. | Code fix and test: new plan **14-06**. |
+| **Streams default to at most 1,000 consumers** (v2.15.0; per-stream values `<= 0` inherit the server default in 2.15) | `KV_MINGA_ASSIGN` | Each worker holds two long-lived ordered consumers on it: the supervisor watch (`supervisor.rs:76`) and the WireGuard peer-set watch (`wireguard.rs:270`), plus transient ones when it lists. **Somewhere around 500 workers, new watches would fail** on 2.15, far below the T4 target of 5,000. | Set a positive per-stream limit of 50,000 on all Minga KV buckets (14-06); `-1` still inherits the default. Verified against 2.15.3 source and runtime. |
 | **No supported direct jump 2.10 → 2.15.** Each guide covers only the step from the previous minor. `js_raft_delete_range` became the default in 2.15. | every upgraded cluster | Bundling 2.15.3 means an existing cluster's sidecar jumps four minors at once. | **Release gate** below. 14-04 tests the direct jump first. |
 | Mixed-version clusters: replicated streams stay available, but scale and move operations stall until every server is upgraded | T3 rolling upgrade | `ensure_replicas` changes replica counts | 14-04 and the docs: don't change `--nats-replicas` during a rollout. |
 | Stream updates with replicas > 1 are rejected on a non-clustered server (v2.14.6) | `raise_replicas` | It only raises when the cluster has the servers; it is a no-op on a single node. | Covered by the 14-03 cluster test. |
@@ -63,60 +63,60 @@ Read in full: the v2.11.0, v2.12.0, v2.14.0 and v2.15.0 release notes, plus the 
 
    The cluster test starts three real binaries (from `PATH` or `MINGA_NATS_SERVER_BIN`) using the config pattern already in `nats_tls.rs`, so it no longer needs Docker.
 5. **Tests must not assume a fresh server.** CI shares one server per job across test binaries. In PR #85, a test that assumed a fresh bucket failed on a server another test had already used. Tests assert invariants, or use names unique to the test.
-6. **Upgrade is proven, not assumed.** A store dir written by 2.10.22 with Minga's streams and buckets must open on 2.15.3 with data intact. A three-server cluster must survive a rolling replacement, one server at a time. Downgrade after the upgrade is not supported unless the research below shows it is; the docs say which.
+- **Downgrade is tested, not assumed.** The 2.10.22 → 2.15.3 test store was reopened on 2.10.22 with assignment, status, lease and log data intact; document that result and its scope.
 
 ## Plans
 
 Order: 14-01 first, because it moves the pins everything else runs against. 14-02, 14-03 and 14-06 can run in parallel after it. 14-04 needs 14-03's helper. 14-05 comes last. The release gate above holds until 14-04 and 14-06 are done.
 
 ### 14-01 — Pin 2.15.3 (NATS-PIN)
-- [ ] `release.yml`: `NATS_VERSION: v2.15.3`, and replace each architecture's `nats_sha256` with the value from the v2.15.3 release's `SHA256SUMS`. Fetch it from the release, don't compute it from a local download.
-- [ ] `ci.yml`: the workspace job installs v2.15.3.
-- [ ] Bump the four test images to `2.15.3-alpine`. 14-03 then replaces them with the shared helper.
+- [x] `release.yml`: `NATS_VERSION: v2.15.3`, and replace each architecture's `nats_sha256` with the value from the v2.15.3 release's `SHA256SUMS`. Fetch it from the release, don't compute it from a local download.
+- [x] `ci.yml`: the workspace job installs v2.15.3.
+- [x] Bump the four test images to `2.15.3-alpine`. 14-03 then replaces them with the shared helper.
 - [x] Read the 2.11, 2.12, 2.14 and 2.15 release notes for changes that touch the sidecar config, stream or KV options Minga sets, or account limits. Findings are in "Release-note review" above; `.planning/STATE.md` points to them.
 - **Done when:** a release build bundles 2.15.3 with a verified checksum, and CI runs on it.
 
 ### 14-02 — Read and gate on `api.level` (NATS-LEVEL)
-- [ ] `NatsBus` (manager path only): after `setup_when_ready`, call `query_account()` and store `requests.level`. Add `pub fn api_level(&self) -> Option<usize>`, which returns `None` on workers.
-- [ ] Add a pure `api_level_warning(level, version) -> Option<String>` for the floor of 4, and log the result as a warning at startup.
-- [ ] Worker ACL unchanged: assert in `subjects` tests that `worker_acl` grants no `$JS.API.INFO`.
-- [ ] Tests:
+- [x] `NatsBus` (manager path only): after `setup_when_ready`, call `query_account()` and store `requests.level`. Add `pub fn api_level(&self) -> Option<usize>`, which returns `None` on workers.
+- [x] Add a pure `api_level_warning(level, version) -> Option<String>` for the floor of 4, and log the result as a warning at startup.
+- [x] Worker ACL unchanged: assert in `subjects` tests that `worker_acl` grants no `$JS.API.INFO`.
+- [x] Tests:
   - unit tests of the warning function at levels 0, 3, 4 and 5
-  - an integration test on each CI line asserting the level is at least 4, and that no warning is logged
+  - integration assertions on both CI lines that manager API levels meet the floor and workers receive no level
 - **Done when:** a manager logs the server's level at startup, and warns below 2.14.
 
 ### 14-03 — CI on both lines, failing closed (NATS-CI)
-- [ ] Add `crates/minga-bus/tests/common/mod.rs` with the helper from design decision 4. Delete the four copies.
-- [ ] Port `nats_cluster.rs` to three real binaries, so `ensure_replicas` and `raise_replicas` run on 2.14 and 2.15 clusters.
-- [ ] New CI job `NATS suites (never silently skipped)`:
+- [x] Add `crates/minga-bus/tests/common/mod.rs` with the helper from design decision 4. Delete the four copies.
+- [x] Port `nats_cluster.rs` to three real binaries, so `ensure_replicas` and `raise_replicas` run on 2.14 and 2.15 clusters.
+- [x] New CI job `NATS suites (never silently skipped)`:
   - a matrix over `v2.14.10` and `v2.15.3`
   - steps: install the binary, start `nats-server -js` in the background, set `MINGA_TEST_NATS_URL` and `MINGA_REQUIRE_NATS=1`, and run `cargo test -p minga-bus`
   - the TLS and cluster suites start their own servers from the installed binary
-- [ ] Prove that the guard fails closed: with `MINGA_REQUIRE_NATS=1` and no server, the suite fails with the helper's message. Record that run in STATE.md.
+- [x] Prove that the guard fails closed: with `MINGA_REQUIRE_NATS=1` and no server, the suite fails with the helper's message. Record that run in STATE.md.
 - **Done when:** both matrix legs pass, and no NATS test can pass by skipping in that job.
 
 ### 14-04 — Upgrade proof (NATS-UPGRADE)
-- [ ] **Single server:** a script under `scripts/` does this:
+- [x] **Single server:** `scripts/nats-upgrade-proof.sh` does this:
   1. Start v2.10.22 on a fresh store dir.
   2. Run an `#[ignore]` seeding test that creates every Minga stream and bucket and writes known keys, log entries and a lease.
   3. Stop the server, then start v2.15.3 on the same store dir.
   4. Run an `#[ignore]` verifying test: the keys and log history are intact, `NatsBus` connects (including the lease-TTL update path), and a new lease still expires.
 
-  Run it in CI as a step of the NATS job.
-- [ ] **Rolling cluster:** three servers on v2.10.22 with R3 streams (`--nats-replicas 3`). Replace them one at a time with v2.15.3. After each replacement, publishing, KV reads and a log tail must keep working, and once all three are replaced, `ensure_replicas` must be a no-op. Run it locally first. Add it to CI only if it takes under five minutes.
-- [ ] Downgrade: try opening the upgraded store dir with v2.10.22 again, and record whether it works. The docs state the result.
+  The proof runs in CI with the NATS job.
+- [x] **Rolling cluster:** `scripts/nats-rolling-upgrade-proof.sh` starts three v2.10.22 servers with R3 streams, replaces them one at a time with v2.15.3, and checks KV reads, writes and log history after each replacement. Once all are upgraded, `ensure_replicas(3)` leaves streams at R3. The local run completed in under five minutes, so CI runs it on the 2.15.3 matrix leg.
+- [x] Downgrade: after the direct upgrade, v2.10.22 reopened the tested store and the `downgrade_check` passed for assignments, status, lease and log history. This is proof for the seeded store, not a blanket compatibility guarantee.
 - **Done when:** both proofs are recorded in STATE.md, with the commands and the versions used.
 
 ### 14-06 — Lift the 2.15 consumer cap on the assignment bucket (NATS-CAP)
-- [ ] After `setup_kv` creates or opens `MINGA_ASSIGN`, set `max_consumers: -1` (unlimited) on `KV_MINGA_ASSIGN` with a stream update. Since 2.12.5 the server accepts that change after creation. Do it the same way for `MINGA_STATUS` and `MINGA_LEASES`, which workers read too. Don't use the server-wide `default_max_consumers`: it is unknown to servers before 2.15 and has to be removed before a downgrade.
-- [ ] Test on 2.15.3: open more than 1,000 ordered consumers on `KV_MINGA_ASSIGN` and confirm the next watch still succeeds. On 2.14.10 the same test confirms the update is accepted.
+- [x] After manager setup reads `api.level`, update `KV_MINGA_ASSIGN`, `KV_MINGA_STATUS`, and `KV_MINGA_LEASES` to the positive per-stream limit `max_consumers: 50_000` only when the level is at least 4. NATS 2.15.3 applies `default_max_consumers` (1,000) whenever a stream value is non-positive; a positive per-stream value overrides it and works on 2.14.10. The 50,000 cap gives the 5,000-worker target 5x headroom over two long-lived assignment watches per worker. Below-floor servers warn and skip the update; during mixed-version rollouts, rejected updates warn and retry on the next manager connection, so reconnect managers after all servers are upgraded. Don't use server-wide `default_max_consumers`, which is unavailable before 2.15.
+- [x] Test on 2.15.3: open more than 1,000 ordered consumers on `KV_MINGA_ASSIGN` and confirm the next watch still succeeds. On 2.14.10 the same test confirms the update is accepted.
 - **Done when:** a cluster with more than 500 workers can't hit the cap, shown by the test above on both lines.
 
 ### 14-05 — Docs and release notes (NATS-DOCS)
-- [ ] CHANGELOG: the bundled server moves 2.10.22 → 2.15.3; external NATS servers below 2.14 get a startup warning; the upgrade and downgrade result from 14-04.
-- [ ] `CONTRIBUTING.md`: CI pins 2.14.10 and 2.15.3, and the `MINGA_REQUIRE_NATS=1` / `MINGA_TEST_NATS_URL` variables.
-- [ ] ADR 0002 implementation status: the bundled line, and the `api.level` floor. ADR 0008: mark T0 done.
-- [ ] `docs/topologies.md` (external NATS): the supported lines and the floor.
+- [x] CHANGELOG: the bundled server moves 2.10.22 → 2.15.3; external NATS servers below 2.14 get a startup warning; the upgrade and downgrade result from 14-04.
+- [x] `CONTRIBUTING.md`: CI pins 2.14.10 and 2.15.3, and the `MINGA_REQUIRE_NATS=1` / `MINGA_TEST_NATS_URL` variables.
+- [x] ADR 0002 implementation status: the bundled line, and the `api.level` floor. ADR 0008: mark T0 done.
+- [x] `docs/topologies.md` (external NATS): the supported lines and the floor.
 - **Done when:** STATE.md has the evidence for 14-01…14-04, and the docs match it.
 
 ## Tenancy checklist (ADR 0008)

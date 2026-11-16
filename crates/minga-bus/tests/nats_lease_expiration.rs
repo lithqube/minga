@@ -1,34 +1,16 @@
 //! Verifies that JetStream server-side expiry, not client clock comparison,
 //! determines node liveness.
 
+mod common;
+
 use futures::StreamExt;
 use minga_bus::{EventBus, NatsBus};
 use std::time::Duration;
-use testcontainers::{core::WaitFor, runners::AsyncRunner, GenericImage, ImageExt};
 
 #[tokio::test]
 async fn jetstream_expiry_makes_a_node_ineligible() {
-    // Set MINGA_TEST_NATS_URL to run against a local JetStream server when
-    // Docker is unavailable.
-    let (url, _container) = if let Ok(url) = std::env::var("MINGA_TEST_NATS_URL") {
-        (url, None)
-    } else {
-        let image = GenericImage::new("nats", "2.15.3-alpine")
-            .with_exposed_port(4222.into())
-            .with_wait_for(WaitFor::message_on_stderr("Server is ready"))
-            .with_cmd(vec!["-js"]);
-        let container = match image.start().await {
-            Ok(container) => container,
-            Err(error) => {
-                eprintln!("skipping: cannot start NATS container: {error}");
-                return;
-            }
-        };
-        let port = container
-            .get_host_port_ipv4(4222)
-            .await
-            .expect("resolve NATS client port");
-        (format!("nats://127.0.0.1:{port}"), Some(container))
+    let Some(url) = common::nats_url().await else {
+        return;
     };
     let bus = NatsBus::connect_with_ttl(&url, Duration::from_secs(2))
         .await

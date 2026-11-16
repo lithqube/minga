@@ -45,7 +45,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub use memory::MemoryBus;
-pub use nats::NatsBus;
+pub use nats::{api_level_warning, NatsBus};
 
 // ---------------------------------------------------------------------------
 // Errors

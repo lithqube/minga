@@ -89,6 +89,7 @@ pub struct NatsBus {
     status_kv: jetstream::kv::Store,
     assignments_kv: jetstream::kv::Store,
     leases_kv: jetstream::kv::Store,
+    api_level: Option<usize>,
     worker_node_id: Option<u64>,
 }
 
@@ -108,6 +109,22 @@ fn kv_event(prefix_subject: &str, message: &jetstream::Message) -> Option<KvEven
     Some(KvEvent { key, value, op })
 }
 
+const MIN_SUPPORTED_JS_API_LEVEL: usize = 4;
+// NATS 2.15 applies default_max_consumers when max_consumers <= 0. This
+// positive per-stream cap overrides that fallback with 5x headroom over the
+// two persistent assignment watches per node at the 5,000-worker target.
+const KV_MAX_CONSUMERS: i32 = 50_000;
+
+/// Returns a warning for a JetStream API level below Minga's supported floor.
+pub fn api_level_warning(level: usize, server_version: &str) -> Option<String> {
+    (level < MIN_SUPPORTED_JS_API_LEVEL).then(|| {
+        format!(
+            "NATS server {server_version} reports JetStream API level {level}; \
+             Minga requires API level {MIN_SUPPORTED_JS_API_LEVEL} and is tested only on NATS 2.14 and 2.15"
+        )
+    })
+}
+
 impl NatsBus {
     /// The underlying JetStream context.
     ///
@@ -115,6 +132,88 @@ impl NatsBus {
     /// JetStream access (stream inspection, admin operations).
     pub fn jetstream(&self) -> &JetStream {
         &self.js
+    }
+
+    /// JetStream API level reported by the server at manager startup.
+    ///
+    /// Workers do not query account info and always return `None`.
+    pub fn api_level(&self) -> Option<usize> {
+        self.api_level
+    }
+
+    async fn read_api_level(js: &JetStream, client: &Client) -> Option<usize> {
+        let server_version = client.server_info().version;
+        match js.query_account().await {
+            Ok(account) => {
+                let level = account.requests.level;
+                tracing::info!(
+                    api_level = level,
+                    server_version = %server_version,
+                    "JetStream API level"
+                );
+                if let Some(warning) = api_level_warning(level, &server_version) {
+                    tracing::warn!(
+                        api_level = level,
+                        server_version = %server_version,
+                        minimum_api_level = MIN_SUPPORTED_JS_API_LEVEL,
+                        warning = %warning,
+                        "external NATS server is below the supported JetStream API level"
+                    );
+                }
+                Some(level)
+            }
+            Err(error) => {
+                tracing::warn!(
+                    server_version = %server_version,
+                    error = %error,
+                    minimum_api_level = MIN_SUPPORTED_JS_API_LEVEL,
+                    "could not read JetStream API level; Minga is tested only on NATS 2.14 and 2.15"
+                );
+                None
+            }
+        }
+    }
+
+    async fn ensure_kv_consumer_limits(js: &JetStream, api_level: Option<usize>) {
+        if !api_level.is_some_and(|level| level >= MIN_SUPPORTED_JS_API_LEVEL) {
+            return;
+        }
+
+        for bucket in ["MINGA_ASSIGN", "MINGA_STATUS", "MINGA_LEASES"] {
+            let stream_name = format!("KV_{bucket}");
+            let mut stream = match js.get_stream(&stream_name).await {
+                Ok(stream) => stream,
+                Err(error) => {
+                    tracing::warn!(
+                        stream = %stream_name,
+                        error = %error,
+                        "could not inspect KV consumer limit; retrying on the next manager connection"
+                    );
+                    continue;
+                }
+            };
+            let mut config = match stream.info().await {
+                Ok(info) => info.config.clone(),
+                Err(error) => {
+                    tracing::warn!(
+                        stream = %stream_name,
+                        error = %error,
+                        "could not inspect KV consumer limit; retrying on the next manager connection"
+                    );
+                    continue;
+                }
+            };
+            if config.max_consumers != KV_MAX_CONSUMERS {
+                config.max_consumers = KV_MAX_CONSUMERS;
+                if let Err(error) = js.update_stream(config).await {
+                    tracing::warn!(
+                        stream = %stream_name,
+                        error = %error,
+                        "could not apply KV consumer limit; retrying on the next manager connection"
+                    );
+                }
+            }
+        }
     }
 
     /// An ordered consumer on MINGA_ASSIGN filtered to `prefix`, with its
@@ -345,6 +444,8 @@ impl NatsBus {
         let js = jetstream::new(client.clone());
 
         let (status_kv, assignments_kv, leases_kv) = Self::setup_when_ready(&js, lease_ttl).await?;
+        let api_level = Self::read_api_level(&js, &client).await;
+        Self::ensure_kv_consumer_limits(&js, api_level).await;
 
         Ok(Arc::new(Self {
             client,
@@ -352,6 +453,7 @@ impl NatsBus {
             status_kv,
             assignments_kv,
             leases_kv,
+            api_level,
             worker_node_id: None,
         }))
     }
@@ -393,6 +495,8 @@ impl NatsBus {
 
         let (status_kv, assignments_kv, leases_kv) =
             Self::setup_when_ready(&js, DEFAULT_LEASE_TTL).await?;
+        let api_level = Self::read_api_level(&js, &client).await;
+        Self::ensure_kv_consumer_limits(&js, api_level).await;
 
         Ok(Arc::new(Self {
             client,
@@ -400,6 +504,7 @@ impl NatsBus {
             status_kv,
             assignments_kv,
             leases_kv,
+            api_level,
             worker_node_id: None,
         }))
     }
@@ -431,6 +536,8 @@ impl NatsBus {
         let js = jetstream::new(client.clone());
 
         let (status_kv, assignments_kv, leases_kv) = Self::setup_when_ready(&js, lease_ttl).await?;
+        let api_level = Self::read_api_level(&js, &client).await;
+        Self::ensure_kv_consumer_limits(&js, api_level).await;
 
         Ok(Arc::new(Self {
             client,
@@ -438,6 +545,7 @@ impl NatsBus {
             status_kv,
             assignments_kv,
             leases_kv,
+            api_level,
             worker_node_id: None,
         }))
     }
@@ -485,6 +593,7 @@ impl NatsBus {
             status_kv,
             assignments_kv,
             leases_kv,
+            api_level: None,
             worker_node_id: Some(node_id),
         }))
     }
@@ -1249,5 +1358,23 @@ mod tests {
             rejection_for(&BusError::Other("handler busy".into())),
             Rejection::Nak(NAK_DELAY)
         );
+    }
+
+    #[test]
+    fn api_level_warning_only_reports_levels_below_four() {
+        assert_eq!(
+            api_level_warning(0, "2.10.22").as_deref(),
+            Some(
+                "NATS server 2.10.22 reports JetStream API level 0; Minga requires API level 4 and is tested only on NATS 2.14 and 2.15"
+            )
+        );
+        assert_eq!(
+            api_level_warning(3, "2.14.0").as_deref(),
+            Some(
+                "NATS server 2.14.0 reports JetStream API level 3; Minga requires API level 4 and is tested only on NATS 2.14 and 2.15"
+            )
+        );
+        assert_eq!(api_level_warning(4, "2.14.10"), None);
+        assert_eq!(api_level_warning(5, "2.15.3"), None);
     }
 }

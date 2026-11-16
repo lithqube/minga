@@ -88,8 +88,8 @@ A tenant over quota gets 429 or 507 with the quota named. Quotas are desired sta
   - A leaked tenant key can mint users for its own tenant only.
   - mTLS stays as the transport.
 - **External NATS** (`MINGA_NATS_URL`): a multi-tenant cluster needs the bundled sidecar, or an external server in operator mode with the same account layout. Docs ship the layout, and Minga checks it at startup.
-- **Server version.** The release bundles nats-server 2.10.22, which reached end of life in May 2025, and the test containers pin `nats:2.10-alpine`. Before this work, move both to a supported line, checking which lines are supported at that time (2.15 is out). Check `$JS.API.INFO` `api.level` at startup instead of parsing version strings.
-  - From 2.12, the server rejects unknown fields on JetStream API requests (strict mode). `setup_kv` reads `info().config` and sends it back through `update_stream`. **Checked on 2.15.3: accepted**, because async-nats 0.50 sends only fields it knows (`tests/nats_stream_update.rs`). `ensure_replicas` uses the same pattern but needs a cluster to exercise; cover it when the containers are upgraded.
+- **Server version.** The release bundles nats-server v2.15.3. CI tests v2.14.10 and v2.15.3; external servers below JetStream API level 4 get a manager startup warning. Managers query `$JS.API.INFO` instead of parsing server version strings. Consumer-limit update failures during mixed-version rollouts warn and retry on the next manager connection.
+  - From 2.12, the server rejects unknown fields on JetStream API requests (strict mode). `setup_kv` reads `info().config` and sends it back through `update_stream`. It is accepted on 2.15.3, and the 2.14.10 and 2.15.3 suites cover KV stream updates; the three-server cluster test covers `ensure_replicas`.
   - Changing the lease TTL failed on any server version: a shorter TTL kept the old duplicate window, which the server refuses to keep longer than max age. `setup_kv` now resizes the window too.
 
 ## Rule for every change: tenancy checklist
@@ -131,7 +131,7 @@ Every plan, ADR and PR that adds state, an endpoint, a bus subject, a node-local
 
 ## Delivery
 
-0. **T0.** Upgrade the bundled nats-server and the test container images to a supported line, gate features on `api.level`, and cover `ensure_replicas` on a 2.12+ cluster. No tenancy yet.
+0. **T0 — complete (Phase 14).** The release bundles nats-server v2.15.3, external NATS v2.14.10 and v2.15.3 pass the bus suite, manager feature gating uses API level 4, and single-server plus rolling upgrade proofs passed.
 1. **T1.** `Tenant` type, `tenant` fields with the `default` upgrade, fixtures, and cluster-operator tenant CRUD.
 2. **T2.** `O` in certificates, tenant filtering on every API route and in Docker API responses, and the 404 rule. Compose files deploy unchanged, because the tenant comes from the caller.
 3. **T3.** Node join tokens per tenant, the hard placement filter, managers without workloads when there are 2+ tenants, and WireGuard peer sets per tenant.

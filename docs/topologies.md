@@ -157,6 +157,20 @@ option. See [ADR 0006](adr/0006-workers-leave-raft.md#11-bus-partitions-preserve
   their hosting NATS server is down; they become available again when it
   returns. Do not treat the log stream as HA storage.
 
+**External NATS compatibility**
+
+- The release bundles nats-server v2.15.3. External NATS is tested on v2.14.10
+  and v2.15.3; managers warn at startup when JetStream `api.level` is below 4.
+  A below-floor server still connects, but Minga does not apply the
+  50,000-consumer KV limit there.
+- During a mixed-version NATS rollout, rejected KV consumer-limit updates are
+  logged and deferred. Reconnect Minga managers after all servers are upgraded
+  to retry the 50,000-consumer limit.
+- Single-server and three-server upgrade proofs cover v2.10.22 to v2.15.3.
+  The tested single-server store also reopened on v2.10.22 with assignment,
+  status, lease and log data intact. v2.10.22 is not a supported external
+  line; rollback evidence is specific to that proof.
+
 **Workers**
 
 - Workers have no Raft data, bind address or peer list. Connect to the
