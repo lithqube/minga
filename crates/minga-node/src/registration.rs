@@ -25,6 +25,9 @@ pub struct NodeIdentity {
     /// Compute capacity, e.g. from [`host_capacity`].
     pub capacity: ResourceSpec,
     pub role: NodeRole,
+    /// TCP/UDP ports owned by this node's Minga services.
+    #[serde(default)]
+    pub reserved_ports: Vec<minga_state::types::ReservedPort>,
     /// WireGuard public key. The private key is never registered.
     #[serde(default)]
     pub wg_public_key: Option<String>,
@@ -47,6 +50,7 @@ impl NodeIdentity {
             overlay_ip: None,
             last_seen_unix: None,
             role: self.role,
+            reserved_ports: self.reserved_ports.clone(),
         }
     }
 }
@@ -390,6 +394,7 @@ mod tests {
                 gpus: 0,
             },
             role: NodeRole::Worker,
+            reserved_ports: Vec::new(),
             wg_public_key: Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into()),
             wg_endpoint: None,
         }

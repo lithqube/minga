@@ -125,7 +125,6 @@ fn translate_service(
     env.entry("MINGA_STACK".to_string())
         .or_insert_with(|| stack.to_string());
 
-    // Ports: take the start of each range (Phase 0 — no port range expansion).
     let ports = svc
         .ports
         .iter()
@@ -133,6 +132,10 @@ fn translate_service(
             target: p.target.start,
             published: p.published.map(|pr| pr.start),
             protocol: p.protocol.clone(),
+            mode: match p.mode.as_deref().unwrap_or("ingress") {
+                "host" => minga_state::types::PortMode::Host,
+                _ => minga_state::types::PortMode::Ingress,
+            },
         })
         .collect();
 

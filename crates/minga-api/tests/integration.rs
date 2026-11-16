@@ -27,6 +27,12 @@ use serde_json::{json, Value};
 /// Binds to `0.0.0.0` so testcontainers can reach it from inside containers.
 /// Also registers the test node in the state store so `docker node ls` works.
 async fn start_test_server() -> (ApiServer, String, tempfile::TempDir) {
+    start_test_server_with_reserved_ports(Vec::new()).await
+}
+
+async fn start_test_server_with_reserved_ports(
+    reserved_ports: Vec<minga_state::types::ReservedPort>,
+) -> (ApiServer, String, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(
         StateStore::open(1, "127.0.0.1:0", dir.path(), BTreeMap::new())
@@ -51,6 +57,7 @@ async fn start_test_server() -> (ApiServer, String, tempfile::TempDir) {
             overlay_ip: None,
             last_seen_unix: None,
             role: Default::default(),
+            reserved_ports,
         })
         .await
         .unwrap();
@@ -423,6 +430,56 @@ async fn full_stack_deploy_workflow() {
         .unwrap();
     let services: Vec<Value> = resp.json().await.unwrap();
     assert_eq!(services.len(), 0, "all services should be removed");
+}
+
+#[tokio::test]
+async fn ingress_port_conflicts_return_http_409() {
+    let (_server, base, _dir) =
+        start_test_server_with_reserved_ports(vec![minga_state::types::ReservedPort {
+            port: 18082,
+            protocol: "tcp".into(),
+        }])
+        .await;
+    let http = client();
+    let spec = |name: &str, port: u16| {
+        json!({
+            "Name": name,
+            "TaskTemplate": {"ContainerSpec": {"Image": "nginx:latest"}},
+            "Mode": {"Replicated": {"Replicas": 1}},
+            "EndpointSpec": {
+                "Ports": [{
+                    "Protocol": "tcp",
+                    "PublishedPort": port,
+                    "TargetPort": 80,
+                    "PublishMode": "ingress"
+                }]
+            }
+        })
+    };
+
+    let first = http
+        .post(format!("{base}/v1.41/services/create"))
+        .json(&spec("first", 18080))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(first.status(), 201);
+
+    let duplicate = http
+        .post(format!("{base}/v1.41/services/create"))
+        .json(&spec("duplicate", 18080))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(duplicate.status(), 409);
+
+    let reserved = http
+        .post(format!("{base}/v1.41/services/create"))
+        .json(&spec("reserved", 18082))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(reserved.status(), 409);
 }
 
 #[tokio::test]

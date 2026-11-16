@@ -221,6 +221,10 @@ async fn ensure_placeable(
     updating: Option<&str>,
 ) -> ApiResult<()> {
     let nodes = app.store.list_nodes().await?;
+    let services = app.store.list_services().await?;
+    if let Err(error) = validate_ingress_ports(svc, &services, &nodes) {
+        return Err(conflict(error));
+    }
     let statuses = app.task_statuses().await?;
     let all_tasks: Vec<_> = app
         .store
@@ -242,6 +246,72 @@ async fn ensure_placeable(
     };
     minga_scheduler::check_placeable(svc, &nodes, &tasks, &networks, unix_now())
         .map_err(|e| conflict(e.to_string()))
+}
+
+fn validate_ingress_ports(
+    service: &StateService,
+    services: &[StateService],
+    nodes: &[ClusterNode],
+) -> Result<(), String> {
+    for (index, port) in service.ports.iter().enumerate() {
+        let Some(published) = port.published else {
+            continue;
+        };
+        let is_ingress = port.mode == minga_state::types::PortMode::Ingress;
+        let same_port = |other: &minga_state::types::PortMapping| {
+            other.published == Some(published)
+                && other.protocol.eq_ignore_ascii_case(&port.protocol)
+        };
+        let ingress_conflict = is_ingress
+            || service.ports[..index].iter().any(|other| {
+                same_port(other) && other.mode == minga_state::types::PortMode::Ingress
+            })
+            || services
+                .iter()
+                .filter(|other| other.id != service.id)
+                .any(|other| {
+                    other.ports.iter().any(|other_port| {
+                        same_port(other_port)
+                            && other_port.mode == minga_state::types::PortMode::Ingress
+                    })
+                });
+        if !ingress_conflict {
+            continue;
+        }
+        if service.ports[..index].iter().any(|other| {
+            same_port(other) && (is_ingress || other.mode == minga_state::types::PortMode::Ingress)
+        }) {
+            return Err(format!(
+                "ingress port {published}/{} is declared more than once",
+                port.protocol
+            ));
+        }
+        for other in services.iter().filter(|other| other.id != service.id) {
+            if other.ports.iter().any(|other_port| {
+                same_port(other_port)
+                    && (is_ingress || other_port.mode == minga_state::types::PortMode::Ingress)
+            }) {
+                return Err(format!(
+                    "ingress port {published}/{} is already used by service {}",
+                    port.protocol, other.id
+                ));
+            }
+        }
+        if is_ingress {
+            for node in nodes {
+                if node.reserved_ports.iter().any(|reserved| {
+                    reserved.port == published
+                        && reserved.protocol.eq_ignore_ascii_case(&port.protocol)
+                }) {
+                    return Err(format!(
+                        "ingress port {published}/{} is reserved on node {}",
+                        port.protocol, node.id
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -387,6 +457,7 @@ pub async fn create_node(
         // until explicitly removed or drained.
         last_seen_unix: None,
         role: Default::default(),
+        reserved_ports: Vec::new(),
     };
     app.store.upsert_node(node.clone()).await?;
     tracing::info!(node = id, address = %node.address, "node registered via API");
@@ -1059,6 +1130,7 @@ mod tests {
                 overlay_ip: None,
                 last_seen_unix: None,
                 role: Default::default(),
+                reserved_ports: Vec::new(),
             })
             .await
             .unwrap();

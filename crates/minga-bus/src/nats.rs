@@ -219,8 +219,9 @@ impl NatsBus {
 
     fn check_worker_key(&self, key: &str) -> Result<()> {
         if let Some(node_id) = self.worker_node_id {
-            let task_prefix = format!("node.{node_id}.task.");
-            if !key.starts_with(&task_prefix) {
+            let task_prefix = subjects::kv_assignment_node_prefix(node_id);
+            let ingress_prefix = subjects::kv_assignment_ingress_prefix(node_id);
+            if !key.starts_with(&task_prefix) && !key.starts_with(&ingress_prefix) {
                 return Err(BusError::Kv(format!(
                     "worker {node_id} cannot access assignment/status key {key}"
                 )));
@@ -231,10 +232,11 @@ impl NatsBus {
 
     fn check_worker_prefix(&self, prefix: &str) -> Result<()> {
         if let Some(node_id) = self.worker_node_id {
-            let task_prefix = format!("node.{node_id}.task.");
-            if prefix != task_prefix && prefix != "net." {
+            let task_prefix = subjects::kv_assignment_node_prefix(node_id);
+            let ingress_prefix = subjects::kv_assignment_ingress_prefix(node_id);
+            if prefix != task_prefix && prefix != ingress_prefix && prefix != "net." {
                 return Err(BusError::Kv(format!(
-                    "worker {node_id} may list its own assignments or shared network metadata"
+                    "worker {node_id} may list its own task/ingress assignments or shared network metadata"
                 )));
             }
         }
@@ -243,9 +245,14 @@ impl NatsBus {
 
     fn check_worker_watch(&self, prefix: &str) -> Result<()> {
         if let Some(node_id) = self.worker_node_id {
-            let task_prefix = format!("node.{node_id}.task.");
+            let task_prefix = subjects::kv_assignment_node_prefix(node_id);
+            let ingress_prefix = subjects::kv_assignment_ingress_prefix(node_id);
             let wireguard_key = format!("node.{node_id}.wg");
-            if prefix != task_prefix && prefix != wireguard_key && prefix != "net." {
+            if prefix != task_prefix
+                && prefix != ingress_prefix
+                && prefix != wireguard_key
+                && prefix != "net."
+            {
                 return Err(BusError::Kv(format!(
                     "worker {node_id} may watch its own assignments or shared network metadata"
                 )));

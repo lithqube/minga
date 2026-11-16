@@ -357,6 +357,7 @@ mod tests {
             overlay_ip: None,
             last_seen_unix: None,
             role: Default::default(),
+            reserved_ports: Vec::new(),
         }
     }
 
@@ -373,6 +374,7 @@ mod tests {
                 target: 80,
                 published: Some(8080),
                 protocol: "tcp".to_string(),
+                mode: minga_state::types::PortMode::Ingress,
             }],
             networks: vec!["test_default".to_string()],
             resources: ResourceSpec::default(),

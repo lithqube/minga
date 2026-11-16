@@ -314,6 +314,13 @@ impl Port {
         if !matches!(self.protocol.as_str(), "tcp" | "udp" | "sctp") {
             return Err(format!("{s:?}: protocol must be tcp, udp or sctp"));
         }
+        if self
+            .mode
+            .as_deref()
+            .is_some_and(|mode| !matches!(mode, "ingress" | "host"))
+        {
+            return Err(format!("{s:?}: mode must be ingress or host"));
+        }
         Ok(())
     }
 }
@@ -964,6 +971,15 @@ mod tests {
         assert!(Port::parse_short("9000-9002:80-81").is_err());
         assert!(Port::parse_short("80/http").is_err());
         assert!(Port::parse_short("99999").is_err());
+    }
+
+    #[test]
+    fn long_port_mode_is_validated() {
+        let port: Port = serde_yaml::from_str("target: 80\npublished: 8080\nmode: host").unwrap();
+        assert_eq!(port.mode.as_deref(), Some("host"));
+        assert!(
+            serde_yaml::from_str::<Port>("target: 80\npublished: 8080\nmode: invalid").is_err()
+        );
     }
 
     #[test]

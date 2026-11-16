@@ -72,6 +72,8 @@ pub enum SchedulerError {
     RelayManagerUnavailable,
     #[error("serialization error: {0}")]
     Serialization(String),
+    #[error("node ID {0} has no address in the WireGuard mesh subnet")]
+    MeshAddressUnavailable(u64),
 }
 
 /// Merges current task status from MINGA_STATUS with Raft's desired task record.
@@ -302,6 +304,7 @@ impl Scheduler {
         let services = self.state.list_services().await?;
         let tasks = self.state.list_tasks().await?;
         let networks = self.state.list_networks().await?;
+        let live_node_ids: HashSet<_> = nodes.iter().map(|node| node.id).collect();
         let service_by_id: HashMap<_, _> = services
             .iter()
             .map(|service| (service.id.as_str(), service))
@@ -311,6 +314,8 @@ impl Scheduler {
             .map(|network| (network.id.as_str(), network))
             .collect();
         let mut network_tasks: HashMap<&str, Vec<NetworkDnsTask>> = HashMap::new();
+        let mut ingress_backends: HashMap<(u16, String), Vec<minga_state::types::IngressBackend>> =
+            HashMap::new();
         let mut desired = HashSet::new();
         for task in &tasks {
             let Some(service) = service_by_id.get(task.service_id.as_str()) else {
@@ -355,6 +360,60 @@ impl Scheduler {
                             ip: ip.clone(),
                         });
                 }
+            }
+            if live_node_ids.contains(&task.node_id)
+                && !matches!(
+                    task.state,
+                    minga_state::types::TaskState::Stopped | minga_state::types::TaskState::Failed
+                )
+            {
+                if let Some(ip) = task.spec.ips.values().next() {
+                    for port in &task.spec.ports {
+                        let (Some(published), minga_state::types::PortMode::Ingress) =
+                            (port.published, port.mode)
+                        else {
+                            continue;
+                        };
+                        ingress_backends
+                            .entry((published, port.protocol.clone()))
+                            .or_default()
+                            .push(minga_state::types::IngressBackend {
+                                node_id: task.node_id,
+                                ip: ip.clone(),
+                                target_port: port.target,
+                            });
+                    }
+                }
+            }
+        }
+        for backends in ingress_backends.values_mut() {
+            backends.sort_by(|left, right| {
+                (left.node_id, &left.ip, left.target_port).cmp(&(
+                    right.node_id,
+                    &right.ip,
+                    right.target_port,
+                ))
+            });
+        }
+        for node in nodes {
+            for ((published, protocol), backends) in &ingress_backends {
+                let assignment = minga_state::types::IngressAssignment {
+                    published: *published,
+                    protocol: protocol.clone(),
+                    backends: backends.clone(),
+                    source_overlay_ip: Some(
+                        minga_net::overlay::mesh_node_ip(node.id)
+                            .map_err(|_| SchedulerError::MeshAddressUnavailable(node.id))?
+                            .to_string(),
+                    ),
+                };
+                let key = subjects::kv_assignment_ingress(node.id, *published, protocol);
+                let value = minga_state::codec::encode_wire(&assignment)
+                    .map_err(|error| SchedulerError::Serialization(error.to_string()))?;
+                bus.put_assignment(&key, &value)
+                    .await
+                    .map_err(|error| SchedulerError::Bus(error.to_string()))?;
+                desired.insert(key);
             }
         }
         for network in &networks {
@@ -475,6 +534,33 @@ fn build_wireguard_peer_sets(
 ) -> Result<HashMap<u64, WireGuardPeerSet>, SchedulerError> {
     let node_by_id: HashMap<_, _> = nodes.iter().map(|node| (node.id, node)).collect();
     let network_ids: HashSet<&str> = networks.iter().map(|network| network.id.as_str()).collect();
+    let mesh_node_ips: HashMap<_, _> = nodes
+        .iter()
+        .map(|node| {
+            minga_net::overlay::mesh_node_ip(node.id)
+                .map(|address| (node.id, address.to_string()))
+                .map_err(|_| SchedulerError::MeshAddressUnavailable(node.id))
+        })
+        .collect::<Result<_, _>>()?;
+    let mut ingress_network_ids = HashSet::new();
+    if nodes.len() > 1 {
+        for task in tasks {
+            if matches!(task.state, TaskState::Stopped | TaskState::Failed)
+                || !task.spec.ports.iter().any(|port| {
+                    port.published.is_some() && port.mode == minga_state::types::PortMode::Ingress
+                })
+            {
+                continue;
+            }
+            ingress_network_ids.extend(
+                task.spec
+                    .ips
+                    .keys()
+                    .filter(|network_id| network_ids.contains(network_id.as_str()))
+                    .map(String::as_str),
+            );
+        }
+    }
     let mut task_ips: HashMap<u64, HashMap<String, Vec<String>>> = HashMap::new();
     for task in tasks {
         for (network_id, ip) in &task.spec.ips {
@@ -515,6 +601,17 @@ fn build_wireguard_peer_sets(
             }
         }
     }
+    for node in nodes
+        .iter()
+        .filter(|node| node.role == NodeRole::Worker && node.wg_endpoint.is_none())
+    {
+        for network_id in &ingress_network_ids {
+            nat_workers_by_network
+                .entry(network_id)
+                .or_default()
+                .insert(node.id);
+        }
+    }
     let relay_network_ids: HashSet<String> = nat_workers_by_network
         .into_iter()
         .filter_map(|(network_id, workers)| (workers.len() > 1).then(|| network_id.to_owned()))
@@ -548,6 +645,8 @@ fn build_wireguard_peer_sets(
             .into_iter()
             .flat_map(|node_networks| node_networks.keys().map(String::as_str))
             .collect();
+        let mut routing_network_ids = local_network_ids.clone();
+        routing_network_ids.extend(ingress_network_ids.iter().copied());
         let mut node_networks: Vec<_> = networks
             .iter()
             .filter_map(|network| {
@@ -557,6 +656,7 @@ fn build_wireguard_peer_sets(
                     .map(|subnet| WireGuardNetworkAssignment {
                         network_id: network.id.clone(),
                         subnet: subnet.clone(),
+                        ingress: ingress_network_ids.contains(network.id.as_str()),
                         local: local_network_ids.contains(network.id.as_str()),
                         relay: home_manager == Some(node.id)
                             && relay_network_ids.contains(&network.id),
@@ -571,10 +671,12 @@ fn build_wireguard_peer_sets(
                 continue;
             }
             let peer_has_local_network = task_ips.get(&peer.id).is_some_and(|peer_networks| {
-                local_network_ids
+                routing_network_ids
                     .iter()
                     .any(|network_id| peer_networks.contains_key(*network_id))
-            });
+            }) || local_network_ids
+                .iter()
+                .any(|network_id| ingress_network_ids.contains(network_id));
             let peer_is_manager = peer.role == NodeRole::Manager;
             if node.role != NodeRole::Manager && !peer_is_manager && !peer_has_local_network {
                 continue;
@@ -588,7 +690,8 @@ fn build_wireguard_peer_sets(
             }
 
             let mut allowed_ips = HashSet::new();
-            for network_id in &local_network_ids {
+            allowed_ips.insert(format!("{}/32", mesh_node_ips[&peer.id]));
+            for network_id in &routing_network_ids {
                 if let Some(ips) = task_ips
                     .get(&peer.id)
                     .and_then(|peer_networks| peer_networks.get(*network_id))
@@ -628,11 +731,25 @@ fn build_wireguard_peer_sets(
                     }
                     for (network_id, ips) in target_networks {
                         if relay_network_ids.contains(network_id)
-                            && local_network_ids.contains(network_id.as_str())
+                            && routing_network_ids.contains(network_id.as_str())
                         {
                             allowed_ips.extend(ips.iter().cloned());
+                            allowed_ips.insert(format!("{}/32", mesh_node_ips[target_node_id]));
                             relayed = true;
                         }
+                    }
+                }
+                if ingress_network_ids
+                    .iter()
+                    .any(|network_id| routing_network_ids.contains(network_id))
+                {
+                    for target in nodes.iter().filter(|target| {
+                        target.id != node.id
+                            && target.role == NodeRole::Worker
+                            && target.wg_endpoint.is_none()
+                    }) {
+                        allowed_ips.insert(format!("{}/32", mesh_node_ips[&target.id]));
+                        relayed = true;
                     }
                 }
             }

@@ -52,6 +52,7 @@ fn cluster_node(id: u64, addr: &str) -> ClusterNode {
         } else {
             NodeRole::Worker
         },
+        reserved_ports: Vec::new(),
     }
 }
 

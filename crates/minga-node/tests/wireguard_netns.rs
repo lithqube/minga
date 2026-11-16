@@ -6,6 +6,7 @@
 
 #![cfg(target_os = "linux")]
 
+use std::collections::HashSet;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
@@ -62,6 +63,30 @@ import urllib.request
 body = b"x" * 65536
 req = urllib.request.Request("http://web.test:8080/", data=body)
 print(urllib.request.urlopen(req, timeout=4).read().decode())
+"#;
+
+const HTTP_SERVER_REPLICA_TWO: &str = r#"
+from http.server import BaseHTTPRequestHandler, HTTPServer
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200); self.end_headers(); self.wfile.write(b"replica-2")
+    def log_message(self, *_): pass
+HTTPServer(("0.0.0.0", 8080), Handler).serve_forever()
+"#;
+
+const INGRESS_CLIENT: &str = r#"
+import urllib.request
+print(urllib.request.urlopen("http://198.18.0.1:18080/", timeout=4).read().decode())
+"#;
+
+const HOST_CLIENT: &str = r#"
+import urllib.request
+print(urllib.request.urlopen("http://198.18.0.2:18081/", timeout=2).read().decode())
+"#;
+
+const WRONG_HOST_CLIENT: &str = r#"
+import socket
+s = socket.create_connection(("198.18.0.1", 18081), timeout=1)
 "#;
 
 struct Cleanup {
@@ -442,6 +467,224 @@ fn install_mesh_rules(
     Ok(())
 }
 
+fn install_ingress_mesh_rules(
+    ingress_node: &str,
+    backend_node: &str,
+    backend_bridge: &str,
+) -> Result<(), String> {
+    const MARK: &str = "0x4d494e47";
+    in_ns(
+        ingress_node,
+        "iptables",
+        &["-w", "5", "-t", "mangle", "-N", "MINGA_INGRESS_MARK"],
+    )?;
+    in_ns(
+        ingress_node,
+        "iptables",
+        &[
+            "-w",
+            "5",
+            "-t",
+            "mangle",
+            "-A",
+            "PREROUTING",
+            "-m",
+            "addrtype",
+            "--dst-type",
+            "LOCAL",
+            "-j",
+            "MINGA_INGRESS_MARK",
+        ],
+    )?;
+    in_ns(
+        ingress_node,
+        "iptables",
+        &[
+            "-w",
+            "5",
+            "-t",
+            "mangle",
+            "-A",
+            "MINGA_INGRESS_MARK",
+            "-p",
+            "tcp",
+            "--dport",
+            "18080",
+            "-m",
+            "conntrack",
+            "--ctstate",
+            "NEW",
+            "-j",
+            "CONNMARK",
+            "--set-mark",
+            MARK,
+        ],
+    )?;
+    in_ns(
+        ingress_node,
+        "iptables",
+        &["-w", "5", "-t", "nat", "-N", "MINGA_INGRESS"],
+    )?;
+    in_ns(
+        ingress_node,
+        "iptables",
+        &["-w", "5", "-t", "nat", "-N", "MINGA_INGRESS_SNAT"],
+    )?;
+    in_ns(
+        ingress_node,
+        "iptables",
+        &[
+            "-w",
+            "5",
+            "-t",
+            "nat",
+            "-A",
+            "PREROUTING",
+            "-m",
+            "addrtype",
+            "--dst-type",
+            "LOCAL",
+            "-j",
+            "MINGA_INGRESS",
+        ],
+    )?;
+    in_ns(
+        ingress_node,
+        "iptables",
+        &[
+            "-w",
+            "5",
+            "-t",
+            "nat",
+            "-A",
+            "MINGA_INGRESS",
+            "-p",
+            "tcp",
+            "--dport",
+            "18080",
+            "-m",
+            "statistic",
+            "--mode",
+            "random",
+            "--probability",
+            "0.5",
+            "-j",
+            "DNAT",
+            "--to-destination",
+            "10.242.0.20:8080",
+        ],
+    )?;
+    in_ns(
+        ingress_node,
+        "iptables",
+        &[
+            "-w",
+            "5",
+            "-t",
+            "nat",
+            "-A",
+            "MINGA_INGRESS",
+            "-p",
+            "tcp",
+            "--dport",
+            "18080",
+            "-j",
+            "DNAT",
+            "--to-destination",
+            "10.242.0.21:8080",
+        ],
+    )?;
+    in_ns(
+        ingress_node,
+        "iptables",
+        &[
+            "-w",
+            "5",
+            "-t",
+            "nat",
+            "-A",
+            "POSTROUTING",
+            "-j",
+            "MINGA_INGRESS_SNAT",
+        ],
+    )?;
+    for backend in ["10.242.0.20", "10.242.0.21"] {
+        in_ns(
+            ingress_node,
+            "iptables",
+            &[
+                "-w",
+                "5",
+                "-t",
+                "nat",
+                "-A",
+                "MINGA_INGRESS_SNAT",
+                "-p",
+                "tcp",
+                "-d",
+                &format!("{backend}/32"),
+                "--dport",
+                "8080",
+                "-m",
+                "conntrack",
+                "--ctstate",
+                "DNAT",
+                "-j",
+                "SNAT",
+                "--to-source",
+                "10.200.0.1",
+            ],
+        )?;
+    }
+    for (direction, iface) in [("-o", WG_INTERFACE_NAME), ("-i", WG_INTERFACE_NAME)] {
+        in_ns(
+            ingress_node,
+            "iptables",
+            &[
+                "-w",
+                "5",
+                "-t",
+                "filter",
+                "-I",
+                "MINGA_WG_FORWARD",
+                "1",
+                direction,
+                iface,
+                "-m",
+                "connmark",
+                "--mark",
+                MARK,
+                "-j",
+                "ACCEPT",
+            ],
+        )?;
+    }
+    in_ns(
+        backend_node,
+        "iptables",
+        &[
+            "-w",
+            "5",
+            "-t",
+            "filter",
+            "-I",
+            "MINGA_WG_FORWARD",
+            "1",
+            "-i",
+            WG_INTERFACE_NAME,
+            "-o",
+            backend_bridge,
+            "-s",
+            "10.200.0.0/16",
+            "-d",
+            "10.242.0.0/24",
+            "-j",
+            "ACCEPT",
+        ],
+    )?;
+    Ok(())
+}
+
 fn install_task_source_rules(namespace: &str, veth: &str, address: &str) -> Result<(), String> {
     const CHAIN: &str = "MINGA_TASK_SOURCE";
     in_ns(
@@ -692,6 +935,18 @@ async fn wireguard_routes_shared_tasks_and_isolates_other_networks() -> Result<(
             gateway: "10.242.0.1",
         },
     )?;
+    let task_b2 = create_task(
+        &mut cleanup,
+        TaskNetwork {
+            namespace_name: format!("mwt{pid}b2"),
+            node: &node_b,
+            bridge: &bridge_b,
+            host_veth: "tb1",
+            task_veth: "bt1",
+            address: "10.242.0.21/24",
+            gateway: "10.242.0.1",
+        },
+    )?;
     let task_c = create_task(
         &mut cleanup,
         TaskNetwork {
@@ -721,17 +976,25 @@ async fn wireguard_routes_shared_tasks_and_isolates_other_networks() -> Result<(
     }
     configure_wg(&node_a, 51820, &keys.path().join("a.key"), 1420)?;
     configure_wg(&node_b, 51821, &keys.path().join("b.key"), 1420)?;
+    ip_ns(
+        &node_a,
+        &["addr", "add", "10.200.0.1/32", "dev", WG_INTERFACE_NAME],
+    )?;
+    ip_ns(
+        &node_b,
+        &["addr", "add", "10.200.0.2/32", "dev", WG_INTERFACE_NAME],
+    )?;
     peer(
         &node_a,
         &key_b.public_key,
         "198.18.0.2:51821",
-        "10.242.0.20/32",
+        "10.242.0.20/32,10.242.0.21/32,10.200.0.2/32",
     )?;
     peer(
         &node_b,
         &key_a.public_key,
         "198.18.0.1:51820",
-        "10.242.0.10/32",
+        "10.242.0.10/32,10.200.0.1/32",
     )?;
     let wg_link = ip_ns(&node_a, &["-o", "link", "show", "dev", WG_INTERFACE_NAME])?;
     assert!(wg_link.contains("mtu 1420"), "WireGuard MTU: {wg_link}");
@@ -746,11 +1009,41 @@ async fn wireguard_routes_shared_tasks_and_isolates_other_networks() -> Result<(
         ],
     )?;
     ip_ns(
+        &node_a,
+        &[
+            "route",
+            "replace",
+            "10.242.0.21/32",
+            "dev",
+            WG_INTERFACE_NAME,
+        ],
+    )?;
+    ip_ns(
+        &node_a,
+        &[
+            "route",
+            "replace",
+            "10.200.0.2/32",
+            "dev",
+            WG_INTERFACE_NAME,
+        ],
+    )?;
+    ip_ns(
         &node_b,
         &[
             "route",
             "replace",
             "10.242.0.10/32",
+            "dev",
+            WG_INTERFACE_NAME,
+        ],
+    )?;
+    ip_ns(
+        &node_b,
+        &[
+            "route",
+            "replace",
+            "10.200.0.1/32",
             "dev",
             WG_INTERFACE_NAME,
         ],
@@ -799,7 +1092,9 @@ async fn wireguard_routes_shared_tasks_and_isolates_other_networks() -> Result<(
     install_mesh_rules(&node_c, &bridge_c, "10.243.0.0/24", "10.242.0.0/24")?;
     install_task_source_rules(&node_a, "ta0", "10.242.0.10/32")?;
     install_task_source_rules(&node_b, "tb0", "10.242.0.20/32")?;
+    install_task_source_rules(&node_b, "tb1", "10.242.0.21/32")?;
     install_task_source_rules(&node_c, "tc0", "10.243.0.30/32")?;
+    install_ingress_mesh_rules(&node_a, &node_b, &bridge_b)?;
     let forward_rules = in_ns(&node_a, "iptables", &["-S", "FORWARD"])?;
     let jump_order: Vec<&str> = forward_rules
         .lines()
@@ -853,14 +1148,58 @@ async fn wireguard_routes_shared_tasks_and_isolates_other_networks() -> Result<(
     );
     let mut dns = Server::start(&node_a, DNS_SERVER);
     let mut web = Server::start(&task_b, HTTP_SERVER);
+    let mut web_replica_two = Server::start(&task_b2, HTTP_SERVER_REPLICA_TWO);
     let mut isolated = Server::start(&task_c, HTTP_SERVER);
     dns.wait_listening(&node_a, "-lnu", 53).await?;
     web.wait_listening(&task_b, "-lnt", 8080).await?;
     isolated.wait_listening(&task_c, "-lnt", 8080).await?;
+    web_replica_two
+        .wait_listening(&task_b2, "-lnt", 8080)
+        .await?;
+    in_ns(
+        &node_b,
+        "iptables",
+        &[
+            "-w",
+            "5",
+            "-t",
+            "nat",
+            "-A",
+            "PREROUTING",
+            "-d",
+            "198.18.0.2",
+            "-p",
+            "tcp",
+            "--dport",
+            "18081",
+            "-j",
+            "DNAT",
+            "--to-destination",
+            "10.242.0.20:8080",
+        ],
+    )?;
+    assert_eq!(
+        in_ns(&node_c, "python3", &["-c", HOST_CLIENT])?,
+        "ready",
+        "host mode answers on the task's node"
+    );
+    assert!(
+        in_ns(&node_c, "python3", &["-c", WRONG_HOST_CLIENT]).is_err(),
+        "host mode must not answer on another node"
+    );
 
     ping(&task_a, "10.242.0.20", None)?;
     let response = in_ns(&task_a, "python3", &["-c", HTTP_CLIENT])?;
     assert_eq!(response, "65536", "DNS + 64KiB HTTP payload over WireGuard");
+    let mut ingress_backends = HashSet::new();
+    for _ in 0..20 {
+        ingress_backends.insert(in_ns(&node_c, "python3", &["-c", INGRESS_CLIENT])?);
+    }
+    assert_eq!(
+        ingress_backends,
+        HashSet::from(["ready".to_string(), "replica-2".to_string()]),
+        "20 published-port requests on node A must reach both node B replicas"
+    );
 
     // A compromised underlay peer cannot inject a task source into the mesh.
     ip_ns(&node_c, &["link", "set", "lo", "up"])?;

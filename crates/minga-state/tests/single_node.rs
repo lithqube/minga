@@ -42,6 +42,7 @@ fn sample_node(id: u64) -> ClusterNode {
         overlay_ip: None,
         last_seen_unix: None,
         role: Default::default(),
+        reserved_ports: Vec::new(),
     }
 }
 
@@ -58,6 +59,7 @@ fn sample_service(id: &str) -> Service {
             target: 8080,
             published: Some(443),
             protocol: "tcp".to_string(),
+            mode: minga_state::types::PortMode::Ingress,
         }],
         networks: vec!["backplane".to_string()],
         resources: ResourceSpec {

@@ -45,6 +45,7 @@ fn identity(id: u64) -> NodeIdentity {
             gpus: 0,
         },
         role: Default::default(),
+        reserved_ports: Vec::new(),
         wg_public_key: None,
         wg_endpoint: None,
     }

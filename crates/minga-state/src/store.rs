@@ -665,12 +665,16 @@ impl StateStore {
     /// [`StateError::Conflict`] unless `overwrite` is set.
     pub async fn import(&self, snapshot: StateSnapshot, overwrite: bool) -> Result<(), StateError> {
         let want = crate::codec::FORMAT_VERSION;
-        if snapshot.format_version != want {
-            // shortcut: no migration exists yet, so any other version is refused.
-            return Err(StateError::BadSnapshot(format!(
-                "snapshot has format version {}, this build reads {want}",
-                snapshot.format_version
-            )));
+        match snapshot.format_version {
+            crate::codec::FORMAT_VERSION | crate::codec::V2_FORMAT_VERSION => {
+                // Serde defaults legacy port modes to ingress; all imported
+                // state is then proposed through the current v3 Raft format.
+            }
+            found => {
+                return Err(StateError::BadSnapshot(format!(
+                    "snapshot has format version {found}, this build reads {want}"
+                )));
+            }
         }
         if !overwrite {
             let mut clashes = Vec::new();
