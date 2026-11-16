@@ -357,20 +357,26 @@ impl Scheduler {
                 }
             }
         }
+        // Each network goes only to the nodes that run one of its tasks, so a
+        // worker never reads other networks' names or task addresses.
         for network in &networks {
-            let value = NetworkAssignment {
-                tasks: network_tasks
-                    .remove(network.id.as_str())
-                    .unwrap_or_default(),
+            let dns_tasks = network_tasks
+                .remove(network.id.as_str())
+                .unwrap_or_default();
+            let task_nodes: std::collections::BTreeSet<_> =
+                dns_tasks.iter().map(|task| task.node_id).collect();
+            let value = minga_state::codec::encode_wire(&NetworkAssignment {
+                tasks: dns_tasks,
                 network: network.clone(),
-            };
-            let value = minga_state::codec::encode_wire(&value)
-                .map_err(|error| SchedulerError::Serialization(error.to_string()))?;
-            let key = subjects::kv_assignment_network(&network.id);
-            desired.insert(key.clone());
-            bus.put_assignment(&key, &value)
-                .await
-                .map_err(|error| SchedulerError::Bus(error.to_string()))?;
+            })
+            .map_err(|error| SchedulerError::Serialization(error.to_string()))?;
+            for node_id in task_nodes {
+                let key = subjects::kv_assignment_network(node_id, &network.id);
+                desired.insert(key.clone());
+                bus.put_assignment(&key, &value)
+                    .await
+                    .map_err(|error| SchedulerError::Bus(error.to_string()))?;
+            }
         }
         let peer_sets = build_wireguard_peer_sets(nodes, &tasks, &networks)?;
         for node in nodes {

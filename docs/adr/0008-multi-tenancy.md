@@ -9,7 +9,7 @@ Minga will run workloads for several customers on one cluster. Today, nothing se
 
 - **The stack is a name prefix, not a boundary.** `Secret`, `Config`, `Network` and `Volume` are cluster-level objects (`crates/minga-state/src/types.rs`). A `SecretRef` names a secret ID, and the API checks only that the secret is declared somewhere, not who owns it (`crates/minga-api/src/handlers.rs:519`).
 - **Roles are cluster-wide.** An ADR 0005 certificate carries a caller (`CN`) and a role (`OU`), so a deployer can change every stack.
-- **The bus has no tenant segment.** Subjects are `minga.task.>`, `minga.node.>` and `minga.egress.>`, all in one NATS account. Workers already get per-node permissions: `verify_and_map` maps a certificate to a user whose ACL comes from `subjects::worker_acl` (`crates/minga-cli/src/sidecar.rs`). Two gaps remain. Every worker may read `$KV.MINGA_ASSIGN.net.>`, which holds every network's DNS records: service names and task IPs. And all logs share one `MINGA_LOGS` stream (512 MiB, discard old).
+- **The bus has no tenant segment.** Subjects are `minga.task.>`, `minga.node.>` and `minga.egress.>`, all in one NATS account. Workers already get per-node permissions: `verify_and_map` maps a certificate to a user whose ACL comes from `subjects::worker_acl` (`crates/minga-cli/src/sidecar.rs`). Network records used to be shared at `net.<id>`, readable by every worker. They are now projected per node at `node.<n>.net.<id>`, and only to nodes running a task on that network. One gap remains: all logs share one `MINGA_LOGS` stream (512 MiB, discard old).
 - **Nodes, the per-node egress proxy and the WireGuard mesh are shared** by everything that runs on them.
 
 ## Decision
@@ -73,7 +73,7 @@ A tenant over quota gets 429 or 507 with the quota named. Quotas are desired sta
 
 - **One `MINGA` account for the control plane**, plus the NATS `SYS` account. Per-tenant accounts are kept for a later tenant bus, where tenant code does connect (agent-plane roadmap F16).
 - **Every subject and key carries the tenant** right after the prefix: `minga.<tenant>.task.<id>.status`, `$KV.MINGA_ASSIGN.<tenant>.node.<n>.>`, `$KV.MINGA_ASSIGN.<tenant>.net.<id>`. Tenant IDs use NATS token characters only (`a–z 0–9 - _`) and never start with `$`.
-- **Worker permissions become per tenant.** `worker_acl` grants `<tenant>.net.>` instead of every network. Consumers are named after the node, so the `$JS.API.CONSUMER.INFO` grant can name only the node's own consumers. `STREAM.INFO` on shared buckets still reveals bucket size; that is accepted and documented.
+- **Worker permissions become per tenant.** The per-node network grant (`node.<n>.net.>`, already in place) moves under the tenant segment. Consumers are named after the node, so the `$JS.API.CONSUMER.INFO` grant can name only the node's own consumers. `STREAM.INFO` on shared buckets still reveals bucket size; that is accepted and documented.
 - **Workers write only to per-tenant streams and buckets:**
   - `MINGA_LOGS_<tenant>`
   - `MINGA_STATUS_<tenant>`
@@ -88,8 +88,9 @@ A tenant over quota gets 429 or 507 with the quota named. Quotas are desired sta
   - A leaked tenant key can mint users for its own tenant only.
   - mTLS stays as the transport.
 - **External NATS** (`MINGA_NATS_URL`): a multi-tenant cluster needs the bundled sidecar, or an external server in operator mode with the same account layout. Docs ship the layout, and Minga checks it at startup.
-- **Server version.** The release bundles nats-server 2.10.22, which reached end of life in May 2025. Pin a supported line (2.14.x) before this work, and check `$JS.API.INFO` `api.level` at startup instead of parsing version strings.
-  - From 2.12, the server rejects unknown fields on JetStream API requests (strict mode). `setup_kv` and `ensure_replicas` read `info().config` and send it back through `update_stream`, which is the classic way to trip it. Cover both paths with a test against the bundled server.
+- **Server version.** The release bundles nats-server 2.10.22, which reached end of life in May 2025, and the test containers pin `nats:2.10-alpine`. Before this work, move both to a supported line, checking which lines are supported at that time (2.15 is out). Check `$JS.API.INFO` `api.level` at startup instead of parsing version strings.
+  - From 2.12, the server rejects unknown fields on JetStream API requests (strict mode). `setup_kv` reads `info().config` and sends it back through `update_stream`. **Checked on 2.15.3: accepted**, because async-nats 0.50 sends only fields it knows (`tests/nats_stream_update.rs`). `ensure_replicas` uses the same pattern but needs a cluster to exercise; cover it when the containers are upgraded.
+  - Changing the lease TTL failed on any server version: a shorter TTL kept the old duplicate window, which the server refuses to keep longer than max age. `setup_kv` now resizes the window too.
 
 ## Rule for every change: tenancy checklist
 
@@ -130,11 +131,11 @@ Every plan, ADR and PR that adds state, an endpoint, a bus subject, a node-local
 
 ## Delivery
 
-0. **T0.** Upgrade the bundled nats-server to a supported line, gate features on `api.level`, and test the strict-mode stream-update paths. No tenancy yet.
+0. **T0.** Upgrade the bundled nats-server and the test container images to a supported line, gate features on `api.level`, and cover `ensure_replicas` on a 2.12+ cluster. No tenancy yet.
 1. **T1.** `Tenant` type, `tenant` fields with the `default` upgrade, fixtures, and cluster-operator tenant CRUD.
 2. **T2.** `O` in certificates, tenant filtering on every API route and in Docker API responses, and the 404 rule. Compose files deploy unchanged, because the tenant comes from the caller.
 3. **T3.** Node join tokens per tenant, the hard placement filter, managers without workloads when there are 2+ tenants, and WireGuard peer sets per tenant.
-4. **T4.** Tenant segments in subjects and keys, the per-tenant worker ACL (fixing the `net.>` read), per-tenant streams and buckets, and operator/JWT mode with scoped signing keys per tenant.
+4. **T4.** Tenant segments in subjects and keys, the per-tenant worker ACL, per-tenant streams and buckets, and operator/JWT mode with scoped signing keys per tenant.
 5. **T5.** Quotas and the per-tenant audit trail.
 
 T1 and T2 come before agent-plane roadmap order 2 (budgets), because budgets and usage are tenant-owned.

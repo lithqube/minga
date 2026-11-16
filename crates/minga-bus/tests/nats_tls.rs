@@ -544,7 +544,11 @@ async fn worker_certificate_cannot_write_assignments_or_other_nodes_status_and_l
         .await
         .unwrap();
     manager
-        .put_assignment("net.test", b"network")
+        .put_assignment("node.7.net.test", b"network")
+        .await
+        .unwrap();
+    manager
+        .put_assignment("node.8.net.foreign", b"foreign-network")
         .await
         .unwrap();
     manager
@@ -599,14 +603,16 @@ async fn worker_certificate_cannot_write_assignments_or_other_nodes_status_and_l
         .await
         .is_err());
     assert!(worker_bus.watch_assignments("node.8.wg").await.is_err());
-    let networks = worker_bus.list_assignments("net.").await.unwrap();
+    let networks = worker_bus.list_assignments("node.7.net.").await.unwrap();
     assert_eq!(
         networks
             .iter()
             .map(|(key, _)| key.as_str())
             .collect::<Vec<_>>(),
-        ["net.test"]
+        ["node.7.net.test"]
     );
+    assert!(worker_bus.list_assignments("net.").await.is_err());
+    assert!(worker_bus.list_assignments("node.8.net.").await.is_err());
 
     // Enough data to cross several flow-control windows: the worker must be
     // allowed to answer the server's flow-control requests.
@@ -630,7 +636,7 @@ async fn worker_certificate_cannot_write_assignments_or_other_nodes_status_and_l
         .await
         .expect("manager listing stalled: flow-control replies denied?")
         .unwrap();
-    assert_eq!(listed.len(), 70);
+    assert_eq!(listed.len(), 71);
     for i in 0..64 {
         manager
             .delete_assignment(&format!("node.7.task.big-{i:02}"))
@@ -658,6 +664,26 @@ async fn worker_certificate_cannot_write_assignments_or_other_nodes_status_and_l
         .get_stream("KV_MINGA_ASSIGN")
         .await
         .expect("worker may read stream info");
+    // The server, not only the client guard, keeps worker 7 out of other
+    // nodes' networks.
+    for filter in [
+        "$KV.MINGA_ASSIGN.node.8.net.>",
+        "$KV.MINGA_ASSIGN.node.8.net.foreign",
+    ] {
+        let created = tokio::time::timeout(
+            Duration::from_secs(2),
+            stream.create_consumer(async_nats::jetstream::consumer::push::OrderedConfig {
+                deliver_subject: "_INBOX.peek-net".to_string(),
+                filter_subject: filter.to_string(),
+                ..Default::default()
+            }),
+        )
+        .await;
+        assert!(
+            !matches!(created, Ok(Ok(_))),
+            "worker 7 created a consumer over {filter}"
+        );
+    }
     for name in [None, Some("peek".to_string())] {
         let created = tokio::time::timeout(
             Duration::from_secs(2),

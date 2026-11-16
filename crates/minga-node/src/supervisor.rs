@@ -78,10 +78,11 @@ impl Assignments {
             .map_err(|e| e.to_string())
     }
 
-    pub async fn networks(&self) -> Result<Vec<NetworkAssignment>, String> {
+    /// The networks `node_id`'s tasks are attached to, with their DNS records.
+    pub async fn networks(&self, node_id: NodeId) -> Result<Vec<NetworkAssignment>, String> {
         let entries = self
             .bus
-            .list_assignments("net.")
+            .list_assignments(&subjects::kv_assignment_node_network_prefix(node_id))
             .await
             .map_err(|e| e.to_string())?;
         entries
@@ -89,7 +90,7 @@ impl Assignments {
             .map(|(key, bytes)| {
                 let assignment: NetworkAssignment = minga_state::codec::decode_wire(&bytes)
                     .map_err(|e| format!("invalid network assignment {key}: {e}"))?;
-                if key != format!("net.{}", assignment.network.id) {
+                if key != subjects::kv_assignment_network(node_id, &assignment.network.id) {
                     return Err(format!("network assignment key/value mismatch: {key}"));
                 }
                 Ok(assignment)
@@ -333,7 +334,7 @@ impl Supervisor {
             return;
         };
 
-        let assignments = match self.assignments.networks().await {
+        let assignments = match self.assignments.networks(self.node_id).await {
             Ok(assignments) => assignments,
             Err(error) => {
                 tracing::warn!(%error, "dns sync: cannot read network assignments");

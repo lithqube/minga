@@ -16,7 +16,7 @@
 //!
 //! | Bucket | Keys | Purpose |
 //! |---|---|---|
-//! | `MINGA_ASSIGN` | `node.{id}.task.{id}`, `net.{id}` | Manager-authored desired task assignments and network/DNS projection |
+//! | `MINGA_ASSIGN` | `node.{id}.task.{id}`, `node.{id}.net.{id}` | Manager-authored desired task assignments and, per node, the networks its tasks use with their DNS records |
 //! | `MINGA_LEASES` | `lease.node.{id}` | Liveness (server-expiring registration lease) |
 //! | `MINGA_STATUS` | `node.{id}.task.{id}` | Actual task status reports |
 //!
@@ -232,9 +232,10 @@ impl NatsBus {
     fn check_worker_prefix(&self, prefix: &str) -> Result<()> {
         if let Some(node_id) = self.worker_node_id {
             let task_prefix = format!("node.{node_id}.task.");
-            if prefix != task_prefix && prefix != "net." {
+            let network_prefix = subjects::kv_assignment_node_network_prefix(node_id);
+            if prefix != task_prefix && prefix != network_prefix {
                 return Err(BusError::Kv(format!(
-                    "worker {node_id} may list its own assignments or shared network metadata"
+                    "worker {node_id} may list only its own assignments and networks"
                 )));
             }
         }
@@ -245,9 +246,10 @@ impl NatsBus {
         if let Some(node_id) = self.worker_node_id {
             let task_prefix = format!("node.{node_id}.task.");
             let wireguard_key = format!("node.{node_id}.wg");
-            if prefix != task_prefix && prefix != wireguard_key && prefix != "net." {
+            let network_prefix = subjects::kv_assignment_node_network_prefix(node_id);
+            if prefix != task_prefix && prefix != wireguard_key && prefix != network_prefix {
                 return Err(BusError::Kv(format!(
-                    "worker {node_id} may watch its own assignments or shared network metadata"
+                    "worker {node_id} may watch only its own assignments and networks"
                 )));
             }
         }
@@ -577,6 +579,10 @@ impl NatsBus {
                     .clone();
                 if config.max_age != max_age {
                     config.max_age = max_age;
+                    // The server refuses a duplicate window longer than max
+                    // age, so a shorter TTL must shrink it too. Same sizing
+                    // as async-nats uses when it creates the bucket.
+                    config.duplicate_window = max_age.min(Duration::from_secs(120));
                     js.update_stream(config)
                         .await
                         .map_err(|e| BusError::Kv(format!("{bucket} max age: {e}")))?;
