@@ -146,6 +146,73 @@ async fn manager_without_endpoint_blocks_multi_node_placement() {
 }
 
 #[tokio::test]
+async fn network_is_projected_only_to_nodes_running_its_tasks() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(
+        StateStore::open(1, "127.0.0.1:0", dir.path(), BTreeMap::new())
+            .await
+            .unwrap(),
+    );
+    for id in [1, 2] {
+        store
+            .upsert_node(make_node(id, 8.0, 1 << 34))
+            .await
+            .unwrap();
+    }
+    for id in ["app_front", "app_back"] {
+        store
+            .upsert_network(minga_state::types::Network {
+                id: id.to_string(),
+                name: id.to_string(),
+                driver: "overlay".to_string(),
+                attachable: false,
+                subnet: None,
+                wg_port: None,
+            })
+            .await
+            .unwrap();
+    }
+    let mut web = make_service("app.web", 1);
+    web.networks = vec!["app_front".to_string()];
+    store.upsert_service(web).await.unwrap();
+    let bus = MemoryBus::new();
+    for id in [1, 2] {
+        bus.refresh_lease(id, b"registration").await.unwrap();
+    }
+    let scheduler = Scheduler::with_bus(store.clone(), bus.clone());
+    scheduler.reconcile_once().await.unwrap();
+
+    let node = store.list_tasks().await.unwrap()[0].node_id;
+    let other = if node == 1 { 2 } else { 1 };
+    let keys: Vec<String> = bus
+        .list_assignments("")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|(key, _)| key)
+        .collect();
+    assert!(keys.contains(&subjects::kv_assignment_network(node, "app_front")));
+    for key in &keys {
+        assert!(
+            !key.starts_with("net.") && !key.contains("app_back"),
+            "network with no task on the node leaked: {key}"
+        );
+        assert!(
+            !key.starts_with(&subjects::kv_assignment_node_network_prefix(other)),
+            "node {other} runs no task but got {key}"
+        );
+    }
+
+    drop(scheduler);
+    Arc::try_unwrap(store)
+        .ok()
+        .expect("scheduler dropped")
+        .shutdown()
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
 async fn empty_lease_set_does_not_remove_tasks() {
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(
@@ -352,10 +419,17 @@ async fn reconcile_projects_wireguard_peer_sets_from_live_placement() {
         .unwrap();
     assert_eq!(manager_peer.allowed_ips, ["10.1.0.10/32"]);
     assert_eq!(manager_peer.keepalive, 25);
+    // Nodes 1 and 2 run tasks on `shared`; node 3 does not, so it gets none.
+    assert!(entries
+        .iter()
+        .any(|(key, _)| key == &subjects::kv_assignment_network(1, "shared")));
+    assert!(!entries
+        .iter()
+        .any(|(key, _)| key == &subjects::kv_assignment_network(3, "shared")));
     let network_entry = entries
         .iter()
-        .find(|(key, _)| key == "net.shared")
-        .expect("network assignment published");
+        .find(|(key, _)| key == &subjects::kv_assignment_network(2, "shared"))
+        .expect("network assignment published to the worker running a task on it");
     let network_assignment: minga_state::types::NetworkAssignment =
         minga_state::codec::decode_wire(&network_entry.1).unwrap();
     assert!(network_assignment

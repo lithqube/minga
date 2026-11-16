@@ -103,9 +103,16 @@ pub fn kv_assignment_task(node_id: u64, task_id: &str) -> String {
     format!("{}{task_id}", kv_assignment_node_prefix(node_id))
 }
 
-/// KV key for network metadata and DNS assignments.
-pub fn kv_assignment_network(network_id: &str) -> String {
-    format!("net.{network_id}")
+/// KV key prefix for the networks a node's tasks are attached to.
+pub fn kv_assignment_node_network_prefix(node_id: u64) -> String {
+    format!("node.{node_id}.net.")
+}
+
+/// KV key for a network's metadata and DNS records, as projected to one node.
+/// Only nodes running a task on the network get the key, so a worker never
+/// learns other networks' names or task addresses.
+pub fn kv_assignment_network(node_id: u64, network_id: &str) -> String {
+    format!("{}{network_id}", kv_assignment_node_network_prefix(node_id))
 }
 
 /// KV key for a node's liveness lease.
@@ -115,15 +122,18 @@ pub fn kv_lease(node_id: u64) -> String {
 
 /// NATS permissions for the `minga-worker-{id}` identity: `(publish, subscribe)`.
 ///
-/// Worker N may read only its own assignments (plus network metadata) and
-/// write only its own status and lease. Consumer creation and direct gets are
+/// Worker N may read only its own assignments (tasks, WireGuard peer set and
+/// the networks its tasks use) and write only its own status and lease. Consumer creation and direct gets are
 /// granted only on subjects that carry the filter or key, so the server can
 /// bind them to `node.{id}`; a consumer whose filter rides in the payload is
 /// refused.
 pub fn worker_acl(node_id: u64) -> (Vec<String>, Vec<String>) {
     let own_tasks = format!("$KV.MINGA_ASSIGN.{}>", kv_assignment_node_prefix(node_id));
     let own_wireguard = format!("$KV.MINGA_ASSIGN.node.{node_id}.wg");
-    let networks = "$KV.MINGA_ASSIGN.net.>".to_string();
+    let networks = format!(
+        "$KV.MINGA_ASSIGN.{}>",
+        kv_assignment_node_network_prefix(node_id)
+    );
     let own_status = format!("$KV.MINGA_STATUS.node.{node_id}.task.>");
     let own_lease = format!("$KV.MINGA_LEASES.{}", kv_lease(node_id));
     let publish = vec![
@@ -204,7 +214,21 @@ mod tests {
             kv_assignment_task(4, "plant-7.db.0"),
             "node.4.task.plant-7.db.0"
         );
-        assert_eq!(kv_assignment_network("shop_default"), "net.shop_default");
+        assert_eq!(
+            kv_assignment_network(4, "shop_default"),
+            "node.4.net.shop_default"
+        );
+    }
+    #[test]
+    fn worker_network_acl_is_node_scoped() {
+        let (publish, subscribe) = worker_acl(7);
+        assert!(subscribe.contains(&"$KV.MINGA_ASSIGN.node.7.net.>".to_string()));
+        for subject in publish.iter().chain(&subscribe) {
+            assert!(
+                !subject.contains("MINGA_ASSIGN.net.") && !subject.contains("node.8"),
+                "worker 7 must not reach shared or other nodes' networks: {subject}"
+            );
+        }
     }
     #[test]
     fn worker_wireguard_acl_is_exactly_node_scoped() {
