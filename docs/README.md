@@ -39,6 +39,7 @@ Each ADR ends with an *Implementation status* section saying what shipped and wh
 
 - [Roadmap to v0.1.0](roadmap-v0.1.0.md): the seven release gates (historical, all closed)
 - [NATS/JetStream evaluation](research/nats-evaluation.md): the research behind ADR 0002
+- [Nevia evaluation](research/nevia-evaluation.md): where Minga could fit with the hosted Nevia agent cloud (notes, no decision)
 - [Design document](design.md): link to the living design doc
 - [Wave 9 plan](../Wave-9-PLAN.md): historical wave plan
 
