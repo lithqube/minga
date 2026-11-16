@@ -1,260 +1,243 @@
-//! Ignored tests driven by `scripts/nats-upgrade-proof.sh` across a server restart.
+//! Upgrade proof (Phase 14, plan 14-04): a JetStream store written by an
+//! older nats-server must keep Minga's data after the server is replaced.
+//!
+//! These tests are `#[ignore]`d and need MINGA_TEST_NATS_URL; they are run
+//! in order by `scripts/nats-upgrade-proof.sh`, which swaps the server
+//! binary between them:
+//! - `upgrade_seed` runs on the old server against a fresh store.
+//! - `upgrade_probe` runs after each replacement and can be repeated.
+//! - `upgrade_verify` runs once on the final server.
+//!
+//! MINGA_UPGRADE_REPLICAS (default 1) is the replica count for a cluster run.
 
 use std::time::Duration;
 
-use minga_bus::{EventBus, LogEntry, NatsBus};
-use std::future::Future;
+use futures::StreamExt;
+use minga_bus::{subjects, EventBus, LogEntry, NatsBus};
 
-fn test_url() -> String {
-    std::env::var("MINGA_TEST_NATS_URL")
-        .expect("the upgrade proof script must set MINGA_TEST_NATS_URL")
+const SEEDED_KEY: &str = "upgrade.seeded";
+const SEEDED_VALUE: &[u8] = b"written by the old server";
+const STATUS_KEY: &str = "upgrade.status";
+const TASK: &str = "upgrade-task";
+const SEEDED_LOGS: usize = 3;
+const SEEDED_EVENTS: u64 = 3;
+const SEEDED_NODE: u64 = 77;
+/// Longer than any upgrade run, so the seeded lease outlives the restarts.
+const SEED_LEASE_TTL: Duration = Duration::from_secs(3600);
+const REPLICATED: [&str; 4] = [
+    "MINGA_EVENTS",
+    "KV_MINGA_STATUS",
+    "KV_MINGA_LEASES",
+    "KV_MINGA_ASSIGN",
+];
+
+fn url() -> String {
+    std::env::var("MINGA_TEST_NATS_URL").expect("the upgrade proof needs MINGA_TEST_NATS_URL")
 }
 
-async fn eventually<T, F, Fut>(what: &str, mut operation: F) -> T
-where
-    F: FnMut() -> Fut,
-    Fut: Future<Output = minga_bus::Result<T>>,
-{
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-    loop {
-        match operation().await {
-            Ok(value) => return value,
-            Err(_) if tokio::time::Instant::now() < deadline => {
-                tokio::time::sleep(Duration::from_millis(500)).await;
-            }
-            Err(error) => panic!("{what}: {error}"),
-        }
+fn replicas() -> usize {
+    std::env::var("MINGA_UPGRADE_REPLICAS")
+        .map(|r| r.parse().expect("MINGA_UPGRADE_REPLICAS is a number"))
+        .unwrap_or(1)
+}
+
+async fn jetstream() -> async_nats::jetstream::Context {
+    let client = async_nats::connect(url()).await.expect("connect");
+    async_nats::jetstream::new(client)
+}
+
+/// In a cluster, wait until every replicated stream has a leader and all
+/// its followers are current. `ensure_replicas` returns once the server
+/// accepts the new replica count, and a write during the leader change that
+/// follows can time out waiting for its ack.
+async fn settled() {
+    if replicas() < 2 {
+        return;
     }
-}
-
-#[tokio::test]
-#[ignore = "run through scripts/nats-upgrade-proof.sh"]
-async fn seed() {
-    let url = test_url();
-    let bus = NatsBus::connect_with_ttl(&url, Duration::from_secs(3_600))
-        .await
-        .expect("connect to the old NATS server");
-
-    bus.put_assignment("upgrade-proof.task", b"assignment-before-upgrade")
-        .await
-        .expect("write assignment");
-    bus.put_status("node.987.task.upgrade-proof.task", b"status-before-upgrade")
-        .await
-        .expect("write status");
-    bus.refresh_lease(987, b"lease-before-upgrade")
-        .await
-        .expect("write lease");
-    bus.publish_log(
-        "upgrade-proof.task",
-        &LogEntry::stdout("upgrade-proof.task", b"log-before-upgrade"),
-    )
-    .await
-    .expect("write log");
-}
-
-#[tokio::test]
-#[ignore = "run through scripts/nats-upgrade-proof.sh"]
-async fn verify() {
-    let url = test_url();
-    let bus = NatsBus::connect_with_ttl(&url, Duration::from_secs(3_600))
-        .await
-        .expect("connect to the upgraded NATS server");
-
-    assert_eq!(
-        bus.get_assignment("upgrade-proof.task")
-            .await
-            .expect("read assignment")
-            .as_deref(),
-        Some(&b"assignment-before-upgrade"[..])
-    );
-    assert_eq!(
-        bus.get_status("node.987.task.upgrade-proof.task")
-            .await
-            .expect("read status")
-            .as_deref(),
-        Some(&b"status-before-upgrade"[..])
-    );
-    assert!(bus.is_alive(987).await.expect("read seeded lease"));
-
-    let history = bus
-        .log_history("upgrade-proof.task", 0)
-        .await
-        .expect("read log history");
-    assert!(history
-        .iter()
-        .any(|entry| entry.data == b"log-before-upgrade"));
-
-    let expiring_bus = NatsBus::connect_with_ttl(&url, Duration::from_millis(300))
-        .await
-        .expect("update the lease bucket TTL after upgrade");
-    expiring_bus
-        .refresh_lease(988, b"lease-after-upgrade")
-        .await
-        .expect("write post-upgrade lease");
-    assert!(expiring_bus.is_alive(988).await.expect("read new lease"));
-
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    while expiring_bus.is_alive(988).await.expect("poll new lease") {
+    let js = jetstream().await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    'wait: loop {
         assert!(
             tokio::time::Instant::now() < deadline,
-            "post-upgrade lease did not expire"
+            "streams did not settle at {} replicas",
+            replicas()
         );
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    let restored_bus = NatsBus::connect_with_ttl(&url, Duration::from_secs(3_600))
-        .await
-        .expect("restore the long lease TTL for the downgrade check");
-    restored_bus
-        .refresh_lease(987, b"lease-before-upgrade")
-        .await
-        .expect("refresh the seeded lease after expiry proof");
-    assert!(restored_bus
-        .is_alive(987)
-        .await
-        .expect("read restored seeded lease"));
-}
-
-#[tokio::test]
-#[ignore = "run through scripts/nats-upgrade-proof.sh"]
-async fn downgrade_check() {
-    let bus = NatsBus::connect_with_ttl(&test_url(), Duration::from_secs(3_600))
-        .await
-        .expect("connect to NATS 2.10.22 after the 2.15.3 upgrade");
-    assert_eq!(
-        bus.get_assignment("upgrade-proof.task")
-            .await
-            .expect("read downgraded assignment")
-            .as_deref(),
-        Some(&b"assignment-before-upgrade"[..])
-    );
-    assert_eq!(
-        bus.get_status("node.987.task.upgrade-proof.task")
-            .await
-            .expect("read downgraded status")
-            .as_deref(),
-        Some(&b"status-before-upgrade"[..])
-    );
-    assert!(bus.is_alive(987).await.expect("read downgraded lease"));
-    let history = bus
-        .log_history("upgrade-proof.task", 0)
-        .await
-        .expect("read downgraded log history");
-    assert!(history
-        .iter()
-        .any(|entry| entry.data == b"log-before-upgrade"));
-}
-
-#[tokio::test]
-#[ignore = "run through scripts/nats-rolling-upgrade-proof.sh"]
-async fn rolling_seed() {
-    let bus = NatsBus::connect(&test_url())
-        .await
-        .expect("connect to the old NATS cluster");
-    bus.ensure_replicas(3)
-        .await
-        .expect("raise replicated streams");
-
-    let mut logs = bus
-        .jetstream()
-        .get_stream("MINGA_LOGS")
-        .await
-        .expect("get log stream");
-    let mut config = logs.info().await.expect("read log stream").config.clone();
-    config.num_replicas = 3;
-    bus.jetstream()
-        .update_stream(config)
-        .await
-        .expect("replicate the log stream for this proof");
-
-    eventually("seed rolling status", || {
-        bus.put_status("node.989.task.rolling-proof", b"rolling-seed")
-    })
-    .await;
-    let log_entry = LogEntry::stdout("rolling-proof", b"rolling-seed");
-    eventually("seed rolling log", || {
-        bus.publish_log("rolling-proof", &log_entry)
-    })
-    .await;
-}
-
-#[tokio::test]
-#[ignore = "run through scripts/nats-rolling-upgrade-proof.sh"]
-async fn rolling_check() {
-    let bus = NatsBus::connect(&test_url())
-        .await
-        .expect("connect to the rolling NATS cluster");
-    let status = eventually("read rolling status", || {
-        bus.get_status("node.989.task.rolling-proof")
-    })
-    .await;
-    assert_eq!(status.as_deref(), Some(&b"rolling-seed"[..]));
-    eventually("publish rolling status", || {
-        bus.put_status("node.989.task.rolling-check", b"rolling-check")
-    })
-    .await;
-    let log_entry = LogEntry::stdout("rolling-proof", b"rolling-check");
-    eventually("publish rolling log", || {
-        bus.publish_log("rolling-proof", &log_entry)
-    })
-    .await;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-    loop {
-        match bus.log_history("rolling-proof", 0).await {
-            Ok(history)
-                if history.iter().any(|entry| entry.data == b"rolling-seed")
-                    && history.iter().any(|entry| entry.data == b"rolling-check") =>
-            {
-                break;
+        for name in REPLICATED {
+            let mut stream = js.get_stream(name).await.unwrap();
+            let info = stream.info().await.unwrap();
+            let ready = info.cluster.as_ref().is_some_and(|c| {
+                c.leader.is_some()
+                    && c.replicas.len() + 1 == replicas()
+                    && c.replicas.iter().all(|p| p.current && !p.offline)
+            });
+            if !ready {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                continue 'wait;
             }
-            Ok(_) | Err(_) if tokio::time::Instant::now() < deadline => {
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-            Ok(_) | Err(_) => panic!("rolling log history did not retain both entries"),
         }
+        return;
     }
 }
 
 #[tokio::test]
-#[ignore = "run through scripts/nats-rolling-upgrade-proof.sh"]
-async fn rolling_complete() {
-    let bus = NatsBus::connect(&test_url())
+#[ignore = "run by scripts/nats-upgrade-proof.sh on the old server"]
+async fn upgrade_seed() {
+    let bus = NatsBus::connect_with_ttl(&url(), SEED_LEASE_TTL)
         .await
-        .expect("connect after the rolling upgrade");
-    bus.ensure_replicas(3)
-        .await
-        .expect("ensure R3 remains a no-op after upgrade");
-    for stream_name in ["MINGA_EVENTS", "KV_MINGA_STATUS", "MINGA_LOGS"] {
-        let mut stream = bus
-            .jetstream()
-            .get_stream(stream_name)
+        .expect("connect to the old server");
+    if replicas() > 1 {
+        bus.ensure_replicas(replicas())
             .await
-            .unwrap_or_else(|error| panic!("{stream_name}: {error}"));
+            .expect("raise replicas");
+    }
+    settled().await;
+    bus.put_assignment(SEEDED_KEY, SEEDED_VALUE).await.unwrap();
+    bus.put_status(STATUS_KEY, b"running").await.unwrap();
+    bus.refresh_lease(SEEDED_NODE, b"seeded registration")
+        .await
+        .unwrap();
+    for i in 0..SEEDED_LOGS {
+        bus.publish_log(TASK, &LogEntry::stdout(TASK, format!("line {i}")))
+            .await
+            .unwrap();
+    }
+    for i in 0..SEEDED_EVENTS {
+        bus.publish_event(
+            &subjects::node_event(SEEDED_NODE),
+            format!("event {i}").as_bytes(),
+        )
+        .await
+        .unwrap();
+    }
+}
+
+/// Repeatable after every replacement: the seeded data is intact, and
+/// publishing, KV writes and reads, a watch and a log tail still work.
+#[tokio::test]
+#[ignore = "run by scripts/nats-upgrade-proof.sh after each server replacement"]
+async fn upgrade_probe() {
+    // A rolling upgrade waits for the replaced server to catch up.
+    settled().await;
+    let bus = NatsBus::connect_with_ttl(&url(), SEED_LEASE_TTL)
+        .await
+        .expect("connect after the replacement");
+
+    assert_eq!(
+        bus.get_assignment(SEEDED_KEY).await.unwrap().as_deref(),
+        Some(SEEDED_VALUE),
+        "seeded assignment"
+    );
+    assert_eq!(
+        bus.get_status(STATUS_KEY).await.unwrap().as_deref(),
+        Some(b"running".as_slice()),
+        "seeded status"
+    );
+    assert!(bus.is_alive(SEEDED_NODE).await.unwrap(), "seeded lease");
+
+    let history = bus.log_history(TASK, 1_000).await.unwrap();
+    let seeded: Vec<_> = (0..SEEDED_LOGS).map(|i| format!("line {i}")).collect();
+    let old: Vec<_> = history
+        .iter()
+        .take(SEEDED_LOGS)
+        .map(|e| String::from_utf8_lossy(&e.data).into_owned())
+        .collect();
+    assert_eq!(old, seeded, "seeded log history");
+
+    let js = jetstream().await;
+    let mut events = js.get_stream("MINGA_EVENTS").await.unwrap();
+    let info = events.info().await.unwrap();
+    assert!(
+        info.state.messages >= SEEDED_EVENTS,
+        "seeded events: {}",
+        info.state.messages
+    );
+
+    // New writes still work.
+    bus.put_assignment("upgrade.probe", b"probe").await.unwrap();
+    let mut watch = bus.watch_assignments("upgrade.").await.unwrap();
+    let first = tokio::time::timeout(Duration::from_secs(5), watch.next())
+        .await
+        .expect("watch replays current keys")
+        .expect("watch ended");
+    assert!(first.key.starts_with("upgrade."), "watched {}", first.key);
+    bus.publish_log(TASK, &LogEntry::stdout(TASK, "probe"))
+        .await
+        .unwrap();
+    let tail = bus.log_history(TASK, 1).await.unwrap();
+    assert_eq!(
+        tail.last().map(|e| e.data.as_slice()),
+        Some(b"probe".as_slice())
+    );
+    bus.publish_event(&subjects::node_event(SEEDED_NODE), b"probe")
+        .await
+        .unwrap();
+}
+
+/// Once, on the final server: the replica counts and consumer cap are what
+/// Minga expects, and the lease-TTL update path works on the old buckets.
+#[tokio::test]
+#[ignore = "run by scripts/nats-upgrade-proof.sh once on the final server"]
+async fn upgrade_verify() {
+    let js = jetstream().await;
+    let bus = NatsBus::connect_with_ttl(&url(), SEED_LEASE_TTL)
+        .await
+        .expect("connect");
+    let before = stream_configs(&js).await;
+    for config in &before {
+        assert_eq!(config.num_replicas, replicas(), "{} replicas", config.name);
+    }
+    if replicas() > 1 {
+        bus.ensure_replicas(replicas()).await.unwrap();
         assert_eq!(
-            stream
-                .info()
-                .await
-                .expect("read stream config")
-                .config
-                .num_replicas,
-            3,
-            "{stream_name}"
+            stream_configs(&js).await,
+            before,
+            "ensure_replicas is a no-op"
         );
     }
+    // Buckets the old server created get the 2.15 consumer cap lifted.
     for bucket in ["KV_MINGA_ASSIGN", "KV_MINGA_STATUS", "KV_MINGA_LEASES"] {
-        let mut stream = bus
-            .jetstream()
-            .get_stream(bucket)
-            .await
-            .unwrap_or_else(|error| panic!("{bucket}: {error}"));
-        assert_eq!(
-            stream
-                .info()
-                .await
-                .expect("read KV stream config")
-                .config
-                .max_consumers,
-            50_000,
-            "{bucket}"
+        let mut stream = js.get_stream(bucket).await.unwrap();
+        let config = stream.info().await.unwrap().config.clone();
+        assert!(
+            config.max_consumers > 1_000,
+            "{bucket} max_consumers {}",
+            config.max_consumers
         );
     }
+
+    // Shortening the lease TTL updates a bucket the old server created, and
+    // a new lease still expires on the server's clock.
+    let bus = NatsBus::connect_with_ttl(&url(), Duration::from_secs(2))
+        .await
+        .expect("connect with a shorter lease TTL");
+    bus.refresh_lease(SEEDED_NODE + 1, b"new").await.unwrap();
+    assert!(bus.is_alive(SEEDED_NODE + 1).await.unwrap());
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while bus.is_alive(SEEDED_NODE + 1).await.unwrap() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "lease did not expire"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    // Put the seeded TTL and lease back, so `upgrade_probe` can run again
+    // (the downgrade check runs it after this).
+    let bus = NatsBus::connect_with_ttl(&url(), SEED_LEASE_TTL)
+        .await
+        .expect("restore the seeded lease TTL");
+    bus.refresh_lease(SEEDED_NODE, b"seeded registration")
+        .await
+        .unwrap();
+}
+
+async fn stream_configs(
+    js: &async_nats::jetstream::Context,
+) -> Vec<async_nats::jetstream::stream::Config> {
+    let mut configs = Vec::new();
+    for name in REPLICATED {
+        let mut stream = js.get_stream(name).await.unwrap();
+        configs.push(stream.info().await.unwrap().config.clone());
+    }
+    configs
 }

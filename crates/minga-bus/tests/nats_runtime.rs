@@ -41,7 +41,7 @@ async fn manager_and_worker_api_levels_and_bucket_consumer_limits() {
             .await
             .unwrap_or_else(|error| panic!("inspect KV_{bucket}: {error}"));
         assert_eq!(
-            info.config.max_consumers, 50_000,
+            info.config.max_consumers, 100_000,
             "KV_{bucket} must override the NATS server default consumer cap"
         );
     }

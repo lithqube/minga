@@ -85,32 +85,37 @@ jobs:
 
       - name: NATS integration suites (fail closed)
         run: cargo test -p minga-bus
-      - name: Install NATS 2.10.22 for the direct-upgrade proof
-        if: matrix.nats-version == 'v2.15.3'
+
+  nats-upgrade:
+    name: NATS store upgrade 2.10.22 to 2.15.3 (plan 14-04)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+
+      - name: Fetch and verify both nats-server versions
+        # Checksums from each release's SHA256SUMS (2.15.3 matches release.yml).
         run: |
-          version=v2.10.22
-          asset="nats-server-${version}-linux-amd64.tar.gz"
-          dir="$RUNNER_TEMP/nats-2.10.22"
-          mkdir -p "$dir"
-          base="https://github.com/nats-io/nats-server/releases/download/${version}"
-          curl -fsSL -o "$dir/$asset" "$base/$asset"
-          curl -fsSL -o "$dir/SHA256SUMS" "$base/SHA256SUMS"
-          expected="$(awk -v asset="$asset" '$2 == asset || $2 == "*" asset { print $1; exit }' "$dir/SHA256SUMS")"
-          test -n "$expected"
-          (cd "$dir" && printf '%s  %s\n' "$expected" "$asset" | sha256sum -c -)
-          tar -xzf "$dir/$asset" -C "$dir" --strip-components=1 --wildcards '*/nats-server'
-          {
-            echo "MINGA_NATS_SERVER_21022_BIN=$dir/nats-server"
-            echo "MINGA_NATS_SERVER_2153_BIN=/usr/local/bin/nats-server"
-          } >> "$GITHUB_ENV"
+          fetch() {
+            local archive="nats-server-$1-linux-amd64.tar.gz"
+            curl -fsSL -o "$archive" "https://github.com/nats-io/nats-server/releases/download/$1/$archive"
+            echo "$2  $archive" | sha256sum -c -
+            mkdir -p "nats-$1"
+            tar -C "nats-$1" -xzf "$archive" --strip-components=1 --wildcards '*/nats-server'
+            "nats-$1/nats-server" --version
+          }
+          fetch v2.10.22 db0b3ccbe4cbdd3872ae7486ec4f6b0f85824632a0789f4da2e0a8518390483e
+          fetch v2.15.3 32e18c1e78d7ef4f86e483070eef3abb2647c3d4d67e29668077c7ad81da0797
 
-      - name: Verify 2.10.22 to 2.15.3 store upgrade
-        if: matrix.nats-version == 'v2.15.3'
-        run: ./scripts/nats-upgrade-proof.sh
-      - name: Verify rolling NATS 2.10.22 to 2.15.3 upgrade
-        if: matrix.nats-version == 'v2.15.3'
-        run: ./scripts/nats-rolling-upgrade-proof.sh
-
+      - name: Single-server and rolling three-server upgrade
+        run: scripts/nats-upgrade-proof.sh nats-v2.10.22/nats-server nats-v2.15.3/nats-server all
 
   containerd:
     name: Daemon-backed tests (never silently skipped)

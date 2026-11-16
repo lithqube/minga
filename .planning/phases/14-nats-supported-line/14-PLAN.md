@@ -38,7 +38,7 @@ Read in full: the v2.11.0, v2.12.0, v2.14.0 and v2.15.0 release notes, plus the 
 
 | Finding | Where | Minga impact | Action |
 | --- | --- | --- | --- |
-| **Streams default to at most 1,000 consumers** (v2.15.0; per-stream values `<= 0` inherit the server default in 2.15) | `KV_MINGA_ASSIGN` | Each worker holds two long-lived ordered consumers on it: the supervisor watch (`supervisor.rs:76`) and the WireGuard peer-set watch (`wireguard.rs:270`), plus transient ones when it lists. **Somewhere around 500 workers, new watches would fail** on 2.15, far below the T4 target of 5,000. | Set a positive per-stream limit of 50,000 on all Minga KV buckets (14-06); `-1` still inherits the default. Verified against 2.15.3 source and runtime. |
+| **Streams default to at most 1,000 consumers** (v2.15.0; overridable per stream with `max_consumers` or server-wide with `default_max_consumers`) | `KV_MINGA_ASSIGN` | Each worker holds two long-lived ordered consumers on it: the supervisor watch (`supervisor.rs:76`) and the WireGuard peer-set watch (`wireguard.rs:270`), plus transient ones when it lists. **Somewhere around 500 workers, new watches would fail** on 2.15, far below the T4 target of 5,000. | Code fix and test: new plan **14-06**. |
 | **No supported direct jump 2.10 → 2.15.** Each guide covers only the step from the previous minor. `js_raft_delete_range` became the default in 2.15. | every upgraded cluster | Bundling 2.15.3 means an existing cluster's sidecar jumps four minors at once. | **Release gate** below. 14-04 tests the direct jump first. |
 | Mixed-version clusters: replicated streams stay available, but scale and move operations stall until every server is upgraded | T3 rolling upgrade | `ensure_replicas` changes replica counts | 14-04 and the docs: don't change `--nats-replicas` during a rollout. |
 | Stream updates with replicas > 1 are rejected on a non-clustered server (v2.14.6) | `raise_replicas` | It only raises when the cluster has the servers; it is a no-op on a single node. | Covered by the 14-03 cluster test. |
@@ -49,7 +49,9 @@ Read in full: the v2.11.0, v2.12.0, v2.14.0 and v2.15.0 release notes, plus the 
 | Info and list API requests are queued at lower priority (v2.14.0) | `setup_kv`'s stream-info read | Slower startup under load, not a failure | Note only. |
 | Config keys Minga writes (`listen`, `server_name`, `authorization`, `http`, `tls`, `cluster`, `jetstream.{store_dir,max_memory_store,max_file_store}`) | sidecar | None deprecated or renamed. Defaults changed only for TLS ciphers, JetStream strict mode, `max_buffered_*` and the consumer cap. | Covered by the rows above. |
 
-**Release gate.** Bundling 2.15.3 is safe to merge, because releases only happen on `v*` tags. **No release may be tagged with 2.15.3 until 14-04 proves the direct 2.10.22 → 2.15.3 store upgrade and 14-06 lifts the consumer cap.** If the direct jump fails, decide with the user: an intermediate release bundling 2.14.x, or a documented stepwise upgrade.
+**Release gate.** The consumer-cap fix (14-06) missed #87's squash merge. It is re-landed in PR #89, and until #89 merges, `main` bundles 2.15.3 without it. **No `v*` tag, and no manual Release run (which publishes the `edge` image), may ship 2.15.3 until 14-04 proves the direct 2.10.22 → 2.15.3 store upgrade.** If the direct jump fails, decide with the user: an intermediate release bundling 2.14.x, or a documented stepwise upgrade.
+
+**Update (2026-11-17):** PRs #89 and #90 merged. The cap is 100,000 and the upgrade proof is in CI; PR #88 adds the 2.14.10/2.15.3 NATS matrix and API-level checks, still awaiting its own CI.
 
 ## Design decisions
 
@@ -96,20 +98,21 @@ Order: 14-01 first, because it moves the pins everything else runs against. 14-0
 - **Done when:** both matrix legs pass, and no NATS test can pass by skipping in that job.
 
 ### 14-04 — Upgrade proof (NATS-UPGRADE)
-- [x] **Single server:** `scripts/nats-upgrade-proof.sh` does this:
+- [x] **Single server:** `scripts/nats-upgrade-proof.sh` (mode `single`) does this, with the tests in `crates/minga-bus/tests/nats_upgrade.rs`:
   1. Start v2.10.22 on a fresh store dir.
   2. Run an `#[ignore]` seeding test that creates every Minga stream and bucket and writes known keys, log entries and a lease.
   3. Stop the server, then start v2.15.3 on the same store dir.
   4. Run an `#[ignore]` verifying test: the keys and log history are intact, `NatsBus` connects (including the lease-TTL update path), and a new lease still expires.
 
-  The proof runs in CI with the NATS job.
-- [x] **Rolling cluster:** `scripts/nats-rolling-upgrade-proof.sh` starts three v2.10.22 servers with R3 streams, replaces them one at a time with v2.15.3, and checks KV reads, writes and log history after each replacement. Once all are upgraded, `ensure_replicas(3)` leaves streams at R3. The local run completed in under five minutes, so CI runs it on the 2.15.3 matrix leg.
-- [x] Downgrade: after the direct upgrade, v2.10.22 reopened the tested store and the `downgrade_check` passed for assignments, status, lease and log history. This is proof for the seeded store, not a blanket compatibility guarantee.
+  It runs in CI in its own job, `NATS store upgrade 2.10.22 to 2.15.3`. 14-03 can fold that job into the NATS job.
+- [x] **Rolling cluster:** three servers on v2.10.22 with R3 streams (`--nats-replicas 3`). Replace them one at a time with v2.15.3. After each replacement, publishing, KV reads and a log tail must keep working, and once all three are replaced, `ensure_replicas` must be a no-op. Run it locally first. Add it to CI only if it takes under five minutes. **It took 15s, so it runs in the same CI job (mode `cluster`).** The probe waits for every stream to have a leader and current followers. Without that wait, a KV put right after `ensure_replicas` raised the streams from R1 to R3 timed out during the leader change.
+- [x] Downgrade: try opening the upgraded store dir with v2.10.22 again, and record whether it works. The docs state the result. **It worked for Minga's streams** (the probe passed on 2.10.22). This is not a supported path: the docs say to back up the store before upgrading.
 - **Done when:** both proofs are recorded in STATE.md, with the commands and the versions used.
 
 ### 14-06 — Lift the 2.15 consumer cap on the assignment bucket (NATS-CAP)
-- [x] After manager setup reads `api.level`, update `KV_MINGA_ASSIGN`, `KV_MINGA_STATUS`, and `KV_MINGA_LEASES` to the positive per-stream limit `max_consumers: 50_000` only when the level is at least 4. NATS 2.15.3 applies `default_max_consumers` (1,000) whenever a stream value is non-positive; a positive per-stream value overrides it and works on 2.14.10. The 50,000 cap gives the 5,000-worker target 5x headroom over two long-lived assignment watches per worker. Below-floor servers warn and skip the update; during mixed-version rollouts, rejected updates warn and retry on the next manager connection, so reconnect managers after all servers are upgraded. Don't use server-wide `default_max_consumers`, which is unavailable before 2.15.
-- [x] Test on 2.15.3: open more than 1,000 ordered consumers on `KV_MINGA_ASSIGN` and confirm the next watch still succeeds. On 2.14.10 the same test confirms the update is accepted.
+- [x] `setup_kv` sets an explicit `max_consumers` of 100,000 (`BUCKET_MAX_CONSUMERS`) on all three KV buckets, both new and existing, with a stream update. Since 2.12.5 the server accepts that change after creation. **-1 does not work:** on 2.15 it means "server default", which is the 1,000 cap. Buckets created through async-nats already report -1 and were still refused at consumer #1,000 (`maximum consumers limit reached`, error 10026). Servers older than 2.12.5 refuse the update; `setup_kv` logs a warning and continues, because those servers have no default cap. The server-wide `default_max_consumers` is not used: servers before 2.15 don't know it, it has to be removed before a downgrade, and it wouldn't help an external NATS server.
+- [x] Test (`tests/nats_consumer_cap.rs`) on 2.15.3: failed before the fix at consumer #1,000. After the fix it passes on a server holding the old -1 buckets (existing-bucket path) and on a fresh server (create path, `max_consumers: 100000`).
+- [ ] The same test on 2.14.10, in the 14-03 CI matrix.
 - **Done when:** a cluster with more than 500 workers can't hit the cap, shown by the test above on both lines.
 
 ### 14-05 — Docs and release notes (NATS-DOCS)

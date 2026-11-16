@@ -68,6 +68,12 @@ const REDELIVERY_BACKOFF: [Duration; 4] = [
 /// Redelivery delay for a message nak'd after a transient failure.
 const NAK_DELAY: Duration = Duration::from_secs(5);
 
+/// Consumer limit set on every KV bucket. nats-server 2.15 otherwise caps a
+/// stream at 1,000. shortcut: sized for the T4 target (5,000 workers, two
+/// watches each, plus listings) with 10x headroom; raise it if a cluster
+/// outgrows that.
+const BUCKET_MAX_CONSUMERS: i32 = 100_000;
+
 /// Streams (KV buckets are `KV_`-prefixed streams) that losing one NATS
 /// server must not lose. `MINGA_LOGS` stays at one replica: it is the
 /// largest stream, best effort, and edge disks are small.
@@ -110,10 +116,6 @@ fn kv_event(prefix_subject: &str, message: &jetstream::Message) -> Option<KvEven
 }
 
 const MIN_SUPPORTED_JS_API_LEVEL: usize = 4;
-// NATS 2.15 applies default_max_consumers when max_consumers <= 0. This
-// positive per-stream cap overrides that fallback with 5x headroom over the
-// two persistent assignment watches per node at the 5,000-worker target.
-const KV_MAX_CONSUMERS: i32 = 50_000;
 
 /// Returns a warning for a JetStream API level below Minga's supported floor.
 pub fn api_level_warning(level: usize, server_version: &str) -> Option<String> {
@@ -170,48 +172,6 @@ impl NatsBus {
                     "could not read JetStream API level; Minga is tested only on NATS 2.14 and 2.15"
                 );
                 None
-            }
-        }
-    }
-
-    async fn ensure_kv_consumer_limits(js: &JetStream, api_level: Option<usize>) {
-        if !api_level.is_some_and(|level| level >= MIN_SUPPORTED_JS_API_LEVEL) {
-            return;
-        }
-
-        for bucket in ["MINGA_ASSIGN", "MINGA_STATUS", "MINGA_LEASES"] {
-            let stream_name = format!("KV_{bucket}");
-            let mut stream = match js.get_stream(&stream_name).await {
-                Ok(stream) => stream,
-                Err(error) => {
-                    tracing::warn!(
-                        stream = %stream_name,
-                        error = %error,
-                        "could not inspect KV consumer limit; retrying on the next manager connection"
-                    );
-                    continue;
-                }
-            };
-            let mut config = match stream.info().await {
-                Ok(info) => info.config.clone(),
-                Err(error) => {
-                    tracing::warn!(
-                        stream = %stream_name,
-                        error = %error,
-                        "could not inspect KV consumer limit; retrying on the next manager connection"
-                    );
-                    continue;
-                }
-            };
-            if config.max_consumers != KV_MAX_CONSUMERS {
-                config.max_consumers = KV_MAX_CONSUMERS;
-                if let Err(error) = js.update_stream(config).await {
-                    tracing::warn!(
-                        stream = %stream_name,
-                        error = %error,
-                        "could not apply KV consumer limit; retrying on the next manager connection"
-                    );
-                }
             }
         }
     }
@@ -445,7 +405,6 @@ impl NatsBus {
 
         let (status_kv, assignments_kv, leases_kv) = Self::setup_when_ready(&js, lease_ttl).await?;
         let api_level = Self::read_api_level(&js, &client).await;
-        Self::ensure_kv_consumer_limits(&js, api_level).await;
 
         Ok(Arc::new(Self {
             client,
@@ -496,7 +455,6 @@ impl NatsBus {
         let (status_kv, assignments_kv, leases_kv) =
             Self::setup_when_ready(&js, DEFAULT_LEASE_TTL).await?;
         let api_level = Self::read_api_level(&js, &client).await;
-        Self::ensure_kv_consumer_limits(&js, api_level).await;
 
         Ok(Arc::new(Self {
             client,
@@ -537,7 +495,6 @@ impl NatsBus {
 
         let (status_kv, assignments_kv, leases_kv) = Self::setup_when_ready(&js, lease_ttl).await?;
         let api_level = Self::read_api_level(&js, &client).await;
-        Self::ensure_kv_consumer_limits(&js, api_level).await;
 
         Ok(Arc::new(Self {
             client,
@@ -704,6 +661,7 @@ impl NatsBus {
                         .map_err(|e| BusError::Kv(format!("{bucket} max age: {e}")))?;
                 }
             }
+            Self::lift_consumer_cap(js, bucket, &mut store).await?;
             return Ok(store);
         }
         let config = KvConfig {
@@ -712,9 +670,44 @@ impl NatsBus {
             max_age,
             ..Default::default()
         };
-        js.create_key_value(config)
+        let mut store = js
+            .create_key_value(config)
             .await
-            .map_err(|e| BusError::Kv(format!("{bucket}: {e}")))
+            .map_err(|e| BusError::Kv(format!("{bucket}: {e}")))?;
+        Self::lift_consumer_cap(js, bucket, &mut store).await?;
+        Ok(store)
+    }
+
+    /// nats-server 2.15 caps a stream at 1,000 consumers unless the stream
+    /// sets a positive `max_consumers` (-1 means "server default" there).
+    /// Every worker holds two watches on the assignment bucket, so the cap
+    /// would block new workers at about 500.
+    async fn lift_consumer_cap(
+        js: &JetStream,
+        bucket: &str,
+        store: &mut jetstream::kv::Store,
+    ) -> Result<()> {
+        let mut config = store
+            .stream
+            .info()
+            .await
+            .map_err(|e| BusError::Kv(format!("{bucket} info: {e}")))?
+            .config
+            .clone();
+        if config.max_consumers >= BUCKET_MAX_CONSUMERS {
+            return Ok(());
+        }
+        config.max_consumers = BUCKET_MAX_CONSUMERS;
+        if let Err(error) = js.update_stream(config).await {
+            // Servers before 2.12.5 refuse to change max_consumers after
+            // creation, but they also have no default cap to lift.
+            tracing::warn!(
+                bucket,
+                %error,
+                "cannot raise the bucket's consumer limit; fine on servers older than 2.15"
+            );
+        }
+        Ok(())
     }
 }
 
