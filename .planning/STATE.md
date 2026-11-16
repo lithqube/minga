@@ -68,4 +68,4 @@ Waves 1–9 predate this GSD planning workspace and their claims were **not** in
 
 **10-01 host gate remains BLOCKED** by user choice: Talos staging is out of scope for `v0.1.0` and no hcloud provisioning is authorized. OrbStack Ubuntu is Linux evidence only. Do not advance Talos-dependent claims or compliance qualification — FIPS, SOC 2, VS-NfD and NATO are **not assessed**, which is different from not applicable.
 
-**Immediate next action:** Run Phase 13-04 through 13-06 real-kernel coverage and complete 13-07 live proof, benchmarks, and docs. Cross-node networking remains unsupported until that proof lands. Talos/hcloud staging stays blocked pending authorization; compliance is not assessed.
+**Immediate next action:** Implement the Phase 13-06 routing mesh (honor `ports[].mode`, ingress port reservation with 409 on conflict, per-port backend sets, and random-chain SNAT), then run Phase 13-04 through 13-06 real-kernel coverage and complete 13-07 live proof, benchmarks, and docs. Cross-node networking remains unsupported until that proof lands. Talos/hcloud staging stays blocked pending authorization; compliance is not assessed.
