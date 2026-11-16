@@ -53,8 +53,8 @@ pub struct NetworkOverlay {
     pub ipam: Ipam,
 }
 
-
 /// The overlay manager.
+#[derive(Default)]
 pub struct OverlayManager {
     networks: HashMap<String, NetworkOverlay>,
     dns: DnsStore,
@@ -224,7 +224,6 @@ impl OverlayManager {
         };
         self.dns.resolve(&fqdn)
     }
-
 }
 
 /// Allocate a supernet for the overlay mesh itself (node-to-node WireGuard IPs).
@@ -372,8 +371,6 @@ mod tests {
         let ips = mgr.resolve("web.plant-7");
         assert_eq!(ips, vec![Ipv4Addr::new(10, 100, 0, 10)]);
     }
-
-
 
     #[test]
     fn multiple_networks_independent_ipam() {
