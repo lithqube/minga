@@ -179,6 +179,31 @@ async fn replicated_bus_survives_losing_one_server() {
 
     // New copies catch up for a moment after scaling; writes can time out.
     eventually("put", || bus.put_status("node.77.task.ha", b"running")).await;
+    // `ensure_replicas` returns once the server accepts R3. Stopping a server
+    // before the new followers are current leaves no quorum to elect a leader.
+    eventually("followers current", || async {
+        let mut stream = bus
+            .jetstream()
+            .get_stream("KV_MINGA_STATUS")
+            .await
+            .map_err(|e| minga_bus::BusError::Other(e.to_string()))?;
+        let info = stream
+            .info()
+            .await
+            .map_err(|e| minga_bus::BusError::Other(e.to_string()))?;
+        let cluster = info.cluster.as_ref();
+        let current = cluster.is_some_and(|c| {
+            c.leader.is_some() && c.replicas.len() == 2 && c.replicas.iter().all(|p| p.current)
+        });
+        if current {
+            Ok(())
+        } else {
+            Err(minga_bus::BusError::Other(format!(
+                "followers not current: {cluster:?}"
+            )))
+        }
+    })
+    .await;
 
     containers[0].stop().await.expect("stop one server");
 
