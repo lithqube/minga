@@ -1241,7 +1241,7 @@ async fn nat_workers_relay_through_manager_and_use_direct_path_to_reachable_work
     let relay_rules = in_ns(&manager, "iptables", &["-S", "MINGA_WG_FORWARD"])?;
     assert!(
         relay_rules
-            .contains("-i minga-wg0 -o minga-wg0 -s 10.242.0.0/24 -d 10.242.0.0/24 -j ACCEPT"),
+            .contains("-s 10.242.0.0/24 -d 10.242.0.0/24 -i minga-wg0 -o minga-wg0 -j ACCEPT"),
         "manager relay rule is not limited to the overlay subnet: {relay_rules}"
     );
 
