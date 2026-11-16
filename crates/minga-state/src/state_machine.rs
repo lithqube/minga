@@ -7,7 +7,7 @@
 use std::fmt::Debug;
 use std::io::Cursor;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use openraft::entry::{EntryPayload, RaftPayload};
 use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine, Snapshot, SnapshotMeta};
@@ -15,14 +15,14 @@ use openraft::{
     AnyError, BasicNode, Entry, ErrorSubject, ErrorVerb, LogId, OptionalSend, StorageError,
     StorageIOError, StoredMembership,
 };
-use redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use std::sync::Mutex;
 
-use crate::codec::{check_format, FORMAT_KEY, FORMAT_VERSION};
+use crate::codec::{check_format, FORMAT_KEY, FORMAT_VERSION, V2_FORMAT_VERSION};
 use crate::command::{StateCommand, StateResponse};
 use crate::types::*;
 use crate::TypeConfig;
+use redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition};
 
 // --- redb table definitions --------------------------------------------------
 
@@ -45,6 +45,50 @@ const ENTITY_TABLES: [TableDefinition<&str, &[u8]>; 7] = [
     SECRETS_TABLE,
     CONFIGS_TABLE,
 ];
+
+/// Re-encodes the state records whose serialized shape changed in v3.
+///
+/// The caller advances the marker in the same redb transaction, so a failure
+/// leaves both the old values and the v2 marker intact.
+#[allow(clippy::result_large_err)]
+fn migrate_v2_state(tx: &redb::WriteTransaction) -> Result<(), StorageIOError<u64>> {
+    rewrite_state_table::<ClusterNode>(tx, NODES_TABLE)?;
+    rewrite_state_table::<Service>(tx, SERVICES_TABLE)?;
+    rewrite_state_table::<Task>(tx, TASKS_TABLE)?;
+
+    let mut meta = tx.open_table(SM_META_TABLE).map_err(sm_io_err)?;
+    meta.insert(FORMAT_KEY, [FORMAT_VERSION].as_slice())
+        .map_err(sm_io_err)?;
+    Ok(())
+}
+
+#[allow(clippy::result_large_err)]
+fn rewrite_state_table<T: DeserializeOwned + Serialize>(
+    tx: &redb::WriteTransaction,
+    definition: TableDefinition<&str, &[u8]>,
+) -> Result<(), StorageIOError<u64>> {
+    let records = {
+        let table = tx.open_table(definition).map_err(sm_io_err)?;
+        let mut records = Vec::new();
+        for row in table.iter().map_err(sm_io_err)? {
+            let (key, value) = row.map_err(sm_io_err)?;
+            records.push((key.value().to_owned(), value.value().to_vec()));
+        }
+        records
+    };
+
+    let mut table = tx.open_table(definition).map_err(sm_io_err)?;
+    for (key, value) in records {
+        let decoded: T = crate::codec::decode(&value)
+            .map_err(|e| sm_io_err_any(ErrorSubject::Store, ErrorVerb::Read, e))?;
+        let encoded = crate::codec::encode(&decoded)
+            .map_err(|e| sm_io_err_any(ErrorSubject::Store, ErrorVerb::Write, e))?;
+        table
+            .insert(key.as_str(), encoded.as_slice())
+            .map_err(sm_io_err)?;
+    }
+    Ok(())
+}
 
 // --- snapshot -----------------------------------------------------------------
 
@@ -89,13 +133,22 @@ impl RedbStateMachine {
             let table = tx.open_table(table).map_err(sm_io_err)?;
             empty &= table.is_empty().map_err(sm_io_err)?;
         }
-        {
-            let mut meta = tx.open_table(SM_META_TABLE).map_err(sm_io_err)?;
+        let stored = {
+            let meta = tx.open_table(SM_META_TABLE).map_err(sm_io_err)?;
             let stored = meta
                 .get(FORMAT_KEY)
                 .map_err(sm_io_err)?
                 .map(|v| v.value().to_vec());
             empty &= meta.is_empty().map_err(sm_io_err)?;
+            stored
+        };
+
+        if stored.as_deref() == Some(&[V2_FORMAT_VERSION]) {
+            // Raft metadata is untouched; only changed entity records and the
+            // marker are rewritten in this transaction.
+            migrate_v2_state(&tx)?;
+        } else {
+            let mut meta = tx.open_table(SM_META_TABLE).map_err(sm_io_err)?;
             if check_format(stored.as_deref(), empty).map_err(sm_io_err)? {
                 meta.insert(FORMAT_KEY, [FORMAT_VERSION].as_slice())
                     .map_err(sm_io_err)?;

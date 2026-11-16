@@ -16,7 +16,7 @@ use openraft::{
 use redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition};
 use std::sync::Mutex;
 
-use crate::codec::{check_format, FORMAT_KEY, FORMAT_VERSION};
+use crate::codec::{check_format, FORMAT_KEY, FORMAT_VERSION, V2_FORMAT_VERSION};
 use crate::TypeConfig;
 
 /// Log entries: log index → serialized entry.
@@ -24,6 +24,35 @@ const LOGS_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("raft_logs"
 /// Metadata: key → serialized value. Keys: `vote`, `committed`, `last_purged_log_id`
 /// and `format_version` (a single byte, not JSON).
 const META_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("raft_meta");
+
+/// Re-encodes each Raft entry and advances the marker atomically.
+#[allow(clippy::result_large_err)]
+fn migrate_v2_logs(tx: &redb::WriteTransaction) -> Result<(), StorageIOError<u64>> {
+    let entries = {
+        let logs = tx.open_table(LOGS_TABLE).map_err(io_err)?;
+        let mut entries = Vec::new();
+        for row in logs.iter().map_err(io_err)? {
+            let (index, value) = row.map_err(io_err)?;
+            entries.push((index.value(), value.value().to_vec()));
+        }
+        entries
+    };
+
+    let mut logs = tx.open_table(LOGS_TABLE).map_err(io_err)?;
+    for (index, value) in entries {
+        let entry: Entry<TypeConfig> = crate::codec::decode(&value)
+            .map_err(|e| io_err_any(ErrorSubject::LogIndex(index), ErrorVerb::Read, e))?;
+        let encoded = crate::codec::encode(&entry)
+            .map_err(|e| io_err_any(ErrorSubject::LogIndex(index), ErrorVerb::Write, e))?;
+        logs.insert(index, encoded.as_slice()).map_err(io_err)?;
+    }
+    drop(logs);
+
+    let mut meta = tx.open_table(META_TABLE).map_err(io_err)?;
+    meta.insert(FORMAT_KEY, [FORMAT_VERSION].as_slice())
+        .map_err(io_err)?;
+    Ok(())
+}
 
 /// A redb-backed Raft log store.
 pub struct RedbLogStore {
@@ -38,14 +67,21 @@ impl RedbLogStore {
         // Ensure tables exist, and that the file was written in the format this
         // build reads. On an error the transaction is dropped and nothing changes.
         let tx = db.begin_write().map_err(io_err)?;
-        {
+        let (stored, empty) = {
             let logs = tx.open_table(LOGS_TABLE).map_err(io_err)?;
-            let mut meta = tx.open_table(META_TABLE).map_err(io_err)?;
+            let meta = tx.open_table(META_TABLE).map_err(io_err)?;
             let stored = meta
                 .get(FORMAT_KEY)
                 .map_err(io_err)?
                 .map(|v| v.value().to_vec());
             let empty = logs.is_empty().map_err(io_err)? && meta.is_empty().map_err(io_err)?;
+            (stored, empty)
+        };
+
+        if stored.as_deref() == Some(&[V2_FORMAT_VERSION]) {
+            migrate_v2_logs(&tx)?;
+        } else {
+            let mut meta = tx.open_table(META_TABLE).map_err(io_err)?;
             if check_format(stored.as_deref(), empty).map_err(io_err)? {
                 meta.insert(FORMAT_KEY, [FORMAT_VERSION].as_slice())
                     .map_err(io_err)?;
@@ -338,4 +374,12 @@ impl RaftLogStorage<TypeConfig> for RedbLogStore {
 
 fn io_err<E: std::error::Error + Send + Sync + 'static>(e: E) -> StorageIOError<u64> {
     StorageIOError::new(ErrorSubject::Store, ErrorVerb::Write, AnyError::new(&e))
+}
+
+fn io_err_any<E: std::error::Error + Send + Sync + 'static>(
+    subject: ErrorSubject<u64>,
+    verb: ErrorVerb,
+    error: E,
+) -> StorageIOError<u64> {
+    StorageIOError::new(subject, verb, AnyError::new(&error))
 }

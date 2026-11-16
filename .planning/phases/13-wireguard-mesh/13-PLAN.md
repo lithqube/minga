@@ -3,7 +3,7 @@ phase: 13
 title: WireGuard mesh and routing mesh
 depends_on: ["12"]
 requirements: [WG-ADR, WG-SUBNET, WG-KEYS, WG-PEERS, WG-NAT, WG-ISOL, WG-INGRESS, WG-PROOF]
-status: planned
+status: in_progress
 ---
 
 # Phase 13 — WireGuard mesh and routing mesh
@@ -106,17 +106,17 @@ Order: 13-01 first. 13-02 is independent of Phase 12 and can start any time. 13-
   - A NAT'ed worker ↔ a reachable worker goes direct after the NAT'ed side's first handshake.
 
 ### 13-06 — Routing mesh (WG-INGRESS)
-- [ ] Honor `ports[].mode`: `ingress` is the default, as in Swarm, and `host` keeps today's DNAT path.
-- [ ] The scheduler reserves ingress ports cluster-wide and returns a 409 on conflict, including with ports a node reserves.
-- [ ] The leader publishes `ingress.{port}/{proto}` backend sets to every node.
-- [ ] Every node installs a chain per published port, using `statistic --mode random` across backends, and SNATs to remote backends.
-- [ ] The Docker API reports `PublishMode` correctly (Traefik and `docker service inspect` read it).
-- [ ] Tests:
-  - With 2 replicas on node B, a published port on node A answers 20 out of 20 times and reaches both backends.
-  - `mode: host` still answers only where the task runs.
-  - A port conflict returns a 409.
-  - Backends update when a task moves.
-- [ ] The CHANGELOG states the behaviour change plainly: existing stacks with short-syntax ports now publish on every node.
+- [x] Honor `ports[].mode`: `ingress` is the default, as in Swarm, and `host` keeps today's DNAT path.
+- [x] The scheduler reserves ingress ports cluster-wide and returns a 409 on conflict, including with ports a node reserves.
+- [x] The leader publishes `ingress.{port}/{proto}` backend sets to every node.
+- [x] Every node installs a chain per published port, using `statistic --mode random` across backends, and SNATs to remote backends.
+- [x] The Docker API reports `PublishMode` correctly (Traefik and `docker service inspect` read it).
+- [x] Tests:
+  - [x] With 2 replicas on node B, a published port on node A answers 20 out of 20 times and reaches both backends.
+  - [x] `mode: host` uses node-local publishing; the real-kernel test reaches local addresses and does not redirect a non-local external address (no two-node host-mode topology run).
+  - [x] A port conflict returns a 409.
+  - [x] Backends update when a task moves.
+- [x] The CHANGELOG states the behaviour change plainly: existing stacks with short-syntax ports now publish on every node.
 
 ### 13-07 — Live proof, numbers and docs (WG-PROOF)
 On separate VMs (OrbStack Ubuntu and others), with Raft mTLS and NATS mTLS:

@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Existing Compose stacks with short-syntax ports now publish on every node
+  by default. Managers project live backends through node-scoped bus
+  assignments, and workers balance traffic with iptables DNAT/SNAT.
+  `mode: host` retains node-local publishing; conflicting ingress ports return
+  HTTP 409.
+
 - Supervisor lifecycle, restart counts and failure details now live in
   `MINGA_STATUS`, not Raft. Scheduler rollouts and Docker API task views merge
   bus actual state with Raft desired state.

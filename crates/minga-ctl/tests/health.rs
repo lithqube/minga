@@ -39,6 +39,7 @@ async fn cluster() -> Cluster {
             gpus: 0,
         },
         role: Default::default(),
+        reserved_ports: Vec::new(),
         wg_public_key: None,
         wg_endpoint: None,
     };

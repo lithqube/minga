@@ -29,6 +29,24 @@ pub type SecretId = String;
 /// Config identifier.
 pub type ConfigId = String;
 
+/// How a published port is exposed on cluster nodes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PortMode {
+    /// Publish the port through the cluster ingress.
+    #[default]
+    Ingress,
+    /// Publish the port directly on the node running the task.
+    Host,
+}
+
+/// A port reserved by a node for a host-mode service.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReservedPort {
+    pub port: u16,
+    pub protocol: String,
+}
+
 /// A machine in the cluster.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ClusterNode {
@@ -56,6 +74,9 @@ pub struct ClusterNode {
     /// Manager or worker; matched by `node.role` placement constraints.
     #[serde(default)]
     pub role: NodeRole,
+    /// Host-mode ports unavailable for scheduling on this node.
+    #[serde(default)]
+    pub reserved_ports: Vec<ReservedPort>,
 }
 
 /// Checks a `user` value is `user[:group]`, each part a number or a name of
@@ -302,6 +323,8 @@ pub struct PortMapping {
     pub target: u16,
     pub published: Option<u16>,
     pub protocol: String,
+    #[serde(default)]
+    pub mode: PortMode,
 }
 
 /// A task: one replica of a service placed on a node.
@@ -491,6 +514,24 @@ pub struct TaskAssignment {
 pub struct NetworkAssignment {
     pub network: Network,
     pub tasks: Vec<NetworkDnsTask>,
+}
+
+/// A backend for a published ingress port.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IngressBackend {
+    pub node_id: NodeId,
+    pub ip: String,
+    pub target_port: u16,
+}
+
+/// A published ingress port and its scheduled task backends.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IngressAssignment {
+    pub published: u16,
+    pub protocol: String,
+    pub backends: Vec<IngressBackend>,
+    /// Source address used for SNAT by the local overlay ingress.
+    pub source_overlay_ip: Option<String>,
 }
 
 /// One task's DNS contribution to a network assignment.

@@ -166,6 +166,7 @@ pub fn ensure_interface(
     key_path: &Path,
     listen_port: u16,
     mtu: u16,
+    node_id: u64,
     peer_count: usize,
 ) -> Result<(), WireGuardError> {
     if peer_count == 0 {
@@ -173,7 +174,7 @@ pub fn ensure_interface(
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (key_path, listen_port, mtu);
+        let _ = (key_path, listen_port, mtu, node_id);
         Err(WireGuardError::UnsupportedPlatform)
     }
     #[cfg(target_os = "linux")]
@@ -209,6 +210,15 @@ pub fn ensure_interface(
             "listen-port",
             &listen_port.to_string(),
         ]))?;
+        let mesh_address = minga_net::overlay::mesh_node_ip(node_id)
+            .map_err(|error| WireGuardError::InvalidAssignment(error.to_string()))?;
+        run_ip(&[
+            "addr",
+            "replace",
+            &format!("{mesh_address}/32"),
+            "dev",
+            interface,
+        ])?;
         run_ip(&["link", "set", "dev", interface, "mtu", &mtu.to_string()])?;
         run_ip(&["link", "set", "dev", interface, "up"])?;
         Ok(())
@@ -371,7 +381,7 @@ async fn apply_peer_assignment(
     }
 
     #[cfg(target_os = "linux")]
-    ensure_interface(key_path, listen_port, mtu, set.peers.len())?;
+    ensure_interface(key_path, listen_port, mtu, node_id, set.peers.len())?;
     #[cfg(target_os = "linux")]
     {
         apply_peer_diff(&set, current.as_ref())?;
@@ -427,7 +437,7 @@ fn validate_peer_set(set: &minga_net::wireguard::WireGuardPeerSet) -> Result<(),
                 network.network_id
             ))
         })?;
-        if network.local || network.relay {
+        if network.local || network.relay || network.ingress {
             allowed_subnets.push(subnet);
         }
     }
@@ -460,9 +470,11 @@ fn validate_peer_set(set: &minga_net::wireguard::WireGuardPeerSet) -> Result<(),
                     "AllowedIP must be an IPv4 /32: {allowed_ip:?}"
                 )));
             }
-            if !allowed_subnets.iter().any(|subnet| subnet.contains(ip)) {
+            let peer_mesh_ip = minga_net::overlay::mesh_node_ip(peer.node_id)
+                .map_err(|error| WireGuardError::InvalidAssignment(error.to_string()))?;
+            if !allowed_subnets.iter().any(|subnet| subnet.contains(ip)) && ip != peer_mesh_ip {
                 return Err(WireGuardError::InvalidAssignment(format!(
-                    "AllowedIP {allowed_ip:?} is outside assigned networks"
+                    "AllowedIP {allowed_ip:?} is outside assigned task and mesh addresses"
                 )));
             }
         }
@@ -737,7 +749,7 @@ mod tests {
 
     #[test]
     fn no_interface_is_created_without_peers() {
-        assert!(ensure_interface(Path::new("/missing/wg.key"), 51820, 1420, 0).is_ok());
+        assert!(ensure_interface(Path::new("/missing/wg.key"), 51820, 1420, 1, 0).is_ok());
     }
     #[test]
     fn peer_allowed_ips_must_belong_to_local_networks() {
@@ -756,8 +768,18 @@ mod tests {
                 subnet: "10.242.0.0/24".into(),
                 local: true,
                 relay: false,
+                ingress: false,
             }],
         };
+        let mut mesh_address = set.clone();
+        mesh_address.networks.clear();
+        mesh_address.peers[0].allowed_ips = vec!["10.200.0.2/32".into()];
+        assert!(validate_peer_set(&mesh_address).is_ok());
+        let mut ingress_route = set.clone();
+        ingress_route.networks[0].local = false;
+        ingress_route.networks[0].ingress = true;
+        ingress_route.networks[0].subnet = "10.243.0.0/24".into();
+        assert!(validate_peer_set(&ingress_route).is_ok());
         let mut relayed = set.clone();
         relayed
             .networks
@@ -766,6 +788,7 @@ mod tests {
                 subnet: "10.243.0.0/24".into(),
                 local: false,
                 relay: true,
+                ingress: false,
             });
         assert!(validate_peer_set(&relayed).is_ok());
         assert!(validate_peer_set(&set).is_err());

@@ -44,6 +44,7 @@ async fn cluster() -> (Arc<StateStore>, String, tempfile::TempDir) {
             gpus: 0,
         },
         role: Default::default(),
+        reserved_ports: Vec::new(),
         wg_public_key: None,
         wg_endpoint: None,
     };

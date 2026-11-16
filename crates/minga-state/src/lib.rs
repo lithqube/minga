@@ -33,6 +33,7 @@
 //!     overlay_ip: None,
 //!     last_seen_unix: None,
 //!     role: Default::default(),
+//!     reserved_ports: vec![],
 //! }).await?;
 //!
 //! let nodes = store.list_nodes().await?;

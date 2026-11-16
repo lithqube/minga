@@ -97,6 +97,18 @@ pub fn kv_node_status(node_id: u64) -> String {
 pub fn kv_assignment_node_prefix(node_id: u64) -> String {
     format!("node.{node_id}.task.")
 }
+/// KV key prefix for one node's ingress backend assignments.
+pub fn kv_assignment_ingress_prefix(node_id: u64) -> String {
+    format!("node.{node_id}.ingress.")
+}
+
+/// KV key for one node's ingress port assignment.
+pub fn kv_assignment_ingress(node_id: u64, published: u16, protocol: &str) -> String {
+    format!(
+        "{}{published}.{protocol}",
+        kv_assignment_ingress_prefix(node_id)
+    )
+}
 
 /// KV key for a task assignment.
 pub fn kv_assignment_task(node_id: u64, task_id: &str) -> String {
@@ -122,13 +134,14 @@ pub fn kv_lease(node_id: u64) -> String {
 
 /// NATS permissions for the `minga-worker-{id}` identity: `(publish, subscribe)`.
 ///
-/// Worker N may read only its own assignments (tasks, WireGuard peer set and
-/// the networks its tasks use) and write only its own status and lease. Consumer creation and direct gets are
-/// granted only on subjects that carry the filter or key, so the server can
-/// bind them to `node.{id}`; a consumer whose filter rides in the payload is
-/// refused.
+/// Worker N may read only its own task, ingress, WireGuard and network assignments,
+/// and write only its own status and lease. Consumer creation and direct gets
+/// are scoped to the key carried in the subject, so the server can bind them
+/// to `node.{id}`; a consumer whose filter rides in the payload is refused.
 pub fn worker_acl(node_id: u64) -> (Vec<String>, Vec<String>) {
     let own_tasks = format!("$KV.MINGA_ASSIGN.{}>", kv_assignment_node_prefix(node_id));
+    let own_ingress_prefix = kv_assignment_ingress_prefix(node_id);
+    let own_ingress = format!("$KV.MINGA_ASSIGN.{own_ingress_prefix}>");
     let own_wireguard = format!("$KV.MINGA_ASSIGN.node.{node_id}.wg");
     let networks = format!(
         "$KV.MINGA_ASSIGN.{}>",
@@ -145,19 +158,22 @@ pub fn worker_acl(node_id: u64) -> (Vec<String>, Vec<String>) {
         "$JS.API.STREAM.INFO.KV_MINGA_LEASES".into(),
         // Flow-control replies; without them an ordered consumer stalls.
         "$JS.FC.KV_MINGA_ASSIGN.>".into(),
-        // CONSUMER.CREATE.<stream>.<name>.<filter>: the server rejects a
-        // payload filter that differs from the one in the subject.
+        // Consumer creation is allowed only when the filter is scoped to
+        // this node, as encoded in the API subject.
         format!("$JS.API.CONSUMER.CREATE.KV_MINGA_ASSIGN.*.{own_tasks}"),
+        format!("$JS.API.CONSUMER.CREATE.KV_MINGA_ASSIGN.*.{own_ingress}"),
         format!("$JS.API.CONSUMER.CREATE.KV_MINGA_ASSIGN.*.{networks}"),
         format!("$JS.API.CONSUMER.CREATE.KV_MINGA_ASSIGN.*.{own_wireguard}"),
         "$JS.API.CONSUMER.INFO.KV_MINGA_ASSIGN.>".into(),
         format!("$JS.API.DIRECT.GET.KV_MINGA_ASSIGN.{own_tasks}"),
+        format!("$JS.API.DIRECT.GET.KV_MINGA_ASSIGN.{own_ingress}"),
         format!("$JS.API.DIRECT.GET.KV_MINGA_ASSIGN.{networks}"),
         format!("$JS.API.DIRECT.GET.KV_MINGA_STATUS.{own_status}"),
         format!("$JS.API.DIRECT.GET.KV_MINGA_LEASES.{own_lease}"),
     ];
     let subscribe = vec![
         own_tasks,
+        own_ingress,
         own_wireguard,
         networks,
         own_lease,
@@ -218,6 +234,10 @@ mod tests {
             kv_assignment_network(4, "shop_default"),
             "node.4.net.shop_default"
         );
+        assert_eq!(
+            kv_assignment_ingress(7, 8080, "tcp"),
+            "node.7.ingress.8080.tcp"
+        );
     }
     #[test]
     fn worker_network_acl_is_node_scoped() {
@@ -237,6 +257,20 @@ mod tests {
             &"$JS.API.CONSUMER.CREATE.KV_MINGA_ASSIGN.*.$KV.MINGA_ASSIGN.node.7.wg".to_string()
         ));
         assert!(subscribe.contains(&"$KV.MINGA_ASSIGN.node.7.wg".to_string()));
+        assert!(publish.contains(
+            &"$JS.API.CONSUMER.CREATE.KV_MINGA_ASSIGN.*.$KV.MINGA_ASSIGN.node.7.ingress.>"
+                .to_string()
+        ));
+        assert!(subscribe.contains(&"$KV.MINGA_ASSIGN.node.7.ingress.>".to_string()));
+        assert!(publish.contains(
+            &"$JS.API.DIRECT.GET.KV_MINGA_ASSIGN.$KV.MINGA_ASSIGN.node.7.ingress.>".to_string()
+        ));
+        assert!(!publish
+            .iter()
+            .any(|subject| subject.contains("node.8.ingress")));
+        assert!(!subscribe
+            .iter()
+            .any(|subject| subject.contains("node.8.ingress")));
         assert!(!publish.iter().any(|subject| subject.contains("node.8.wg")));
         assert!(!subscribe
             .iter()

@@ -946,6 +946,7 @@ mod tests {
             target: 80,
             published: Some(8080),
             protocol: "tcp".to_string(),
+            mode: minga_state::types::PortMode::Ingress,
         });
         let spec = spec_from_task("c1", &ts);
         let ports_json = spec.annotations.get("minga/task/ports").unwrap();

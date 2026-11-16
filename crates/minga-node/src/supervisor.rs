@@ -97,6 +97,43 @@ impl Assignments {
             })
             .collect()
     }
+    pub async fn ingress(&self) -> Result<Vec<minga_state::types::IngressAssignment>, String> {
+        let Some(node_id) = self.node_id else {
+            return Ok(Vec::new());
+        };
+        let prefix = minga_bus::subjects::kv_assignment_ingress_prefix(node_id);
+        self.bus
+            .list_assignments(&prefix)
+            .await
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .map(|(key, bytes)| {
+                let assignment: minga_state::types::IngressAssignment =
+                    minga_state::codec::decode_wire(&bytes)
+                        .map_err(|error| format!("invalid ingress assignment {key}: {error}"))?;
+                if key
+                    != minga_bus::subjects::kv_assignment_ingress(
+                        node_id,
+                        assignment.published,
+                        &assignment.protocol,
+                    )
+                {
+                    return Err(format!("ingress assignment key/value mismatch: {key}"));
+                }
+                if assignment.published == 0
+                    || !matches!(assignment.protocol.as_str(), "tcp" | "udp" | "sctp")
+                    || assignment.backends.is_empty()
+                    || assignment.backends.iter().any(|backend| {
+                        backend.ip.parse::<std::net::Ipv4Addr>().is_err()
+                            || backend.target_port == 0
+                    })
+                {
+                    return Err(format!("invalid ingress assignment contents: {key}"));
+                }
+                Ok(assignment)
+            })
+            .collect()
+    }
 }
 #[derive(Debug, Error)]
 pub enum SupervisorError {
@@ -314,6 +351,8 @@ impl Supervisor {
         // --- DNS: keep records and listeners in sync with placement ----------
         #[cfg(target_os = "linux")]
         self.sync_dns().await;
+        #[cfg(target_os = "linux")]
+        self.sync_ingress().await;
 
         // running_count() already includes agents.
         let running = self.running_count().await;
@@ -384,6 +423,23 @@ impl Supervisor {
             Err(e) => {
                 tracing::error!(error = %e, binds = ?binds, "dns: server start failed");
             }
+        }
+    }
+    /// Reconciles every node-local ingress frontend with the leader's backend sets.
+    #[cfg(target_os = "linux")]
+    async fn sync_ingress(&self) {
+        let Some(net) = &self.networking else {
+            return;
+        };
+        let assignments = match self.assignments.ingress().await {
+            Ok(assignments) => assignments,
+            Err(error) => {
+                tracing::warn!(%error, "ingress sync: cannot read backend assignments");
+                return;
+            }
+        };
+        if let Err(error) = net.setup.setup_ingress(&assignments, self.node_id).await {
+            tracing::error!(%error, "ingress sync: failed to apply backend assignments");
         }
     }
 

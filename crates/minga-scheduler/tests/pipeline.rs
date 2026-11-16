@@ -34,6 +34,7 @@ fn node(id: u64, cpus: f64, mem: u64, gpus: u32, labels: &[(&str, &str)]) -> Clu
         overlay_ip: None,
         last_seen_unix: None,
         role: Default::default(),
+        reserved_ports: Vec::new(),
     }
 }
 
@@ -78,6 +79,7 @@ services:
     assert_eq!(web.ports.len(), 1);
     assert_eq!(web.ports[0].target, 80);
     assert_eq!(web.ports[0].published, Some(8080));
+    assert_eq!(web.ports[0].mode, minga_state::types::PortMode::Ingress);
     assert_eq!(web.networks, vec!["plant-7_default"]);
 
     let api = translated
@@ -130,6 +132,26 @@ services:
         .collect();
     let actions2 = plan(&translated.services, &tasks, &nodes, &[], 0);
     assert!(actions2.is_empty(), "reconcile should be idempotent");
+}
+
+#[test]
+fn host_publish_mode_survives_compose_translation() {
+    let project = load(
+        r#"
+services:
+  web:
+    image: nginx:1.25
+    ports:
+      - target: 80
+        published: 8080
+        mode: host
+"#,
+    );
+    let translated = translate_project(&project, "host-mode", None).unwrap();
+    assert_eq!(
+        translated.services[0].ports[0].mode,
+        minga_state::types::PortMode::Host
+    );
 }
 
 #[test]

@@ -247,6 +247,7 @@ mod tests {
             overlay_ip: None,
             last_seen_unix: None,
             role: Default::default(),
+            reserved_ports: Vec::new(),
         }
     }
 
@@ -263,6 +264,7 @@ mod tests {
                 target: 80,
                 published: None,
                 protocol: "tcp".to_string(),
+                mode: minga_state::types::PortMode::Ingress,
             }],
             networks: vec!["default".to_string()],
             resources: ResourceSpec::default(),
@@ -499,6 +501,7 @@ mod tests {
             target: 80,
             published: Some(80),
             protocol: "tcp".to_string(),
+            mode: minga_state::types::PortMode::Ingress,
         }];
         let old = Service {
             ports: published.clone(),

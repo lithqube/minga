@@ -38,6 +38,8 @@ pub enum OverlayError {
     NetworkNotFound(String),
     #[error("network already exists: {0}")]
     NetworkExists(String),
+    #[error("node ID {0} is outside the WireGuard mesh address range")]
+    NodeIdOutOfRange(u64),
 }
 
 /// State for a single overlay network.
@@ -233,6 +235,16 @@ pub fn allocate_mesh_subnet() -> Result<Cidr, OverlayError> {
     Ok(Cidr::parse("10.200.0.0/16")?)
 }
 
+/// Assigns a stable, unique address from the WireGuard mesh subnet to a node.
+pub fn mesh_node_ip(node_id: u64) -> Result<Ipv4Addr, OverlayError> {
+    let host_index = node_id
+        .checked_sub(1)
+        .ok_or(OverlayError::NodeIdOutOfRange(node_id))?;
+    allocate_mesh_subnet()?
+        .nth_host(host_index)
+        .ok_or(OverlayError::NodeIdOutOfRange(node_id))
+}
+
 /// Checks a network's driver options (Compose `driver_opts`, Docker
 /// `Options`). Only `encrypted` is accepted, as a no-op; anything else
 /// fails loudly instead of being dropped.
@@ -398,5 +410,14 @@ mod tests {
         assert_eq!(services.to_cidr_string(), "10.100.0.0/16");
         // No overlap
         assert!(!mesh.contains(services.network()));
+    }
+
+    #[test]
+    fn mesh_node_addresses_are_stable_and_unique() {
+        assert_eq!(mesh_node_ip(1).unwrap(), Ipv4Addr::new(10, 200, 0, 1));
+        assert_eq!(mesh_node_ip(2).unwrap(), Ipv4Addr::new(10, 200, 0, 2));
+        assert_ne!(mesh_node_ip(1).unwrap(), mesh_node_ip(2).unwrap());
+        assert!(mesh_node_ip(0).is_err());
+        assert!(mesh_node_ip(65_535).is_err());
     }
 }
