@@ -84,10 +84,10 @@ Order: 13-01 first. 13-02 is independent of Phase 12 and can start any time. 13-
 - [x] Tests: key file mode, stable public key across restarts, and old `ClusterNode` rows decoding with no WireGuard fields.
 
 ### 13-04 — Peer sets, routes and cross-node isolation (WG-PEERS, WG-ISOL)
-- [ ] The leader computes each node's peer set (decision 4) from Raft placement, and writes `node.{id}.wg` when a placement or node changes. On election it re-derives the whole set, as 12-04 does for assignments.
-- [ ] The node applies a diff: peers, `AllowedIPs`, /32 routes, `proxy_arp` on overlay bridges, the MTU, MSS clamping, and the `minga-wg0 → bridge` FORWARD rules from decision 6. Teardown removes all of it.
-- [ ] DNS: records already include every task of a service (from cluster state through the 12-04 `net.{id}` data), so remote IPs resolve with no change. Check this with a test.
-- [ ] Tests in the real-kernel CI job, with three network namespaces acting as nodes, each with its own `minga-wg0`:
+- [x] The leader computes each node's peer set (decision 4) from Raft placement, and writes `node.{id}.wg` when a placement or node changes. On election it re-derives the whole set, as 12-04 does for assignments.
+- [x] The node applies a diff: peers, `AllowedIPs`, /32 routes, `proxy_arp` on overlay bridges, the MTU, MSS clamping, and the `minga-wg0 → bridge` FORWARD rules from decision 6. Teardown removes all of it.
+- [x] DNS: records already include every task of a service (from cluster state through the 12-04 `net.{id}` data), so remote IPs resolve with no change. Check this with a test.
+- [x] Tests in the real-kernel CI job, with three network namespaces acting as nodes, each with its own `minga-wg0`:
   - Same-network ping and HTTP across "nodes", by name.
   - A different-network task across "nodes" is blocked.
   - A packet spoofing another node's task IP is dropped.
@@ -96,10 +96,10 @@ Order: 13-01 first. 13-02 is independent of Phase 12 and can start any time. 13-
 - **Done when:** the CI job proves all of the above, and never skips silently, like the existing real-kernel job.
 
 ### 13-05 — NAT traversal by relay (WG-NAT)
-- [ ] Keepalive from nodes without an endpoint. A manager in a multi-node cluster refuses to start without `--wg-endpoint`.
-- [ ] The leader marks each pair direct or relayed, and picks a home manager for each NAT'ed worker. That manager carries the relayed /32s, with `ip_forward` on and a FORWARD rule `minga-wg0 → minga-wg0` for overlay subnets only.
-- [ ] Failover: when the home manager's lease expires, the leader moves the relay to the next manager.
-- [ ] Tests in the same real-kernel job, with two "workers" behind iptables MASQUERADE that have no inbound path:
+- [x] Keepalive from nodes without an endpoint. A manager in a multi-node cluster refuses to start without `--wg-endpoint`.
+- [x] The leader marks each pair direct or relayed, and picks a home manager for each NAT'ed worker. That manager carries the relayed /32s, with `ip_forward` on and a FORWARD rule `minga-wg0 → minga-wg0` for overlay subnets only.
+- [x] Failover: when the home manager's lease expires, the leader moves the relay to the next manager.
+- [x] Tests in the same real-kernel job, with two "workers" behind iptables MASQUERADE that have no inbound path:
   - Worker ↔ manager is direct.
   - Worker ↔ worker relays through the home manager.
   - Killing the home manager moves the relay within one lease TTL plus one handshake.

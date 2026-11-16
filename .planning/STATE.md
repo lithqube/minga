@@ -29,13 +29,19 @@
 - `ClusterNode` WireGuard metadata stays `#[serde(default)]`; the frozen v2 fixture still decodes.
 - Verification: `cargo test -p minga-net` (77 passed); `cargo test -p minga-node --lib wireguard::tests` (5 passed); registration metadata and legacy-row decoding tests passed; `minga manager --help` shows the three flags; `minga net create smoke-overlay` succeeded.
 
-**Phase 13 13-06 ingress implementation in the working tree; real-kernel ingress proof passed:**
+**Phase 13 13-06 ingress implementation in PR #86; real-kernel ingress proof passed:**
 
 - Compose and Docker API publish modes round-trip; omitted Docker mode defaults to ingress, while `host` stays node-local.
 - API admission rejects conflicting ingress ports with HTTP 409. The scheduler publishes backend sets to live nodes, picks a deterministic primary network address matching node attachment order, and limits ingress-only WireGuard routes to published backends.
 - Node reconciliation installs per-port iptables DNAT balancing and SNATs remote backends. CHANGELOG documents the short-syntax default change.
 - Verification: ingress 409 integration, scheduler backend-movement, peer-set projection, NAT relay/failover, worker ACL, Docker publish-mode and Compose mode tests passed. On OrbStack Ubuntu with iptables-nft, real-kernel ingress balancing passed with two ingress-mode tasks: 20 requests reached both remote backends. The host-mode published-port netns test passed local-address, hairpin, isolation, external-address and reserved-DNS checks; no two-node host-mode topology was run.
 
+**Phase 13 13-04/13-05 kernel CI evidence (2026-11-16, PR #86):**
+
+- The `Overlay network paths on a real kernel (never silently skipped)` job passed on Ubuntu 24.04 with `MINGA_REQUIRE_NETNS=1`; `netns` passed 2/2 and `wireguard_netns` passed 2/2.
+- The WireGuard cases covered named cross-node HTTP and 64 KiB transfer, cross-network isolation, anti-spoofing, remote ingress, removal of stale /32s, NAT worker relay, direct path to a reachable worker, and relay failover.
+- Scheduler tests also cover assignment projection and home-manager reselection after lease expiry.
+- This is real-kernel namespace evidence, not multi-VM deployment proof. Phase 13-07 T2/T3, benchmark numbers, and topology docs remain open; cross-node networking stays unsupported until that proof lands.
 ---
 
 
@@ -75,4 +81,4 @@ Waves 1–9 predate this GSD planning workspace and their claims were **not** in
 
 **10-01 host gate remains BLOCKED** by user choice: Talos staging is out of scope for `v0.1.0` and no hcloud provisioning is authorized. OrbStack Ubuntu is Linux evidence only. Do not advance Talos-dependent claims or compliance qualification — FIPS, SOC 2, VS-NfD and NATO are **not assessed**, which is different from not applicable.
 
-**Immediate next action:** Run Phase 13-04/13-05 real-kernel WireGuard coverage on a host with kernel WireGuard support and `wg` tooling (the current OrbStack Ubuntu host lacks both), then complete 13-07 T2/T3 live proof, benchmarks and docs. Keep cross-node networking unsupported until that proof lands. Talos/hcloud staging stays blocked pending authorization; compliance is not assessed.
+- **Immediate next action:** Complete Phase 13-07 T2/T3 live proof, benchmarks, and docs on authorized multi-VM infrastructure. The PR #86 Ubuntu CI now proves the WireGuard data path in real network namespaces with required tests, but it does not prove multi-VM control-plane behavior. Keep cross-node networking unsupported until T2/T3 proof. Talos/hcloud staging remains blocked pending authorization; compliance is not assessed.
