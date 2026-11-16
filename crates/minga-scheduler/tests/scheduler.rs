@@ -440,7 +440,7 @@ async fn rollout_uses_failed_status_from_bus_kv() {
 async fn reconcile_creates_tasks_for_service() {
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(
-        StateStore::open(1, "127.0.0.1:50051", dir.path(), BTreeMap::new())
+        StateStore::open(1, "127.0.0.1:0", dir.path(), BTreeMap::new())
             .await
             .unwrap(),
     );
@@ -487,7 +487,7 @@ async fn reconcile_creates_tasks_for_service() {
 async fn reconcile_is_idempotent() {
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(
-        StateStore::open(1, "127.0.0.1:50052", dir.path(), BTreeMap::new())
+        StateStore::open(1, "127.0.0.1:0", dir.path(), BTreeMap::new())
             .await
             .unwrap(),
     );
@@ -524,7 +524,7 @@ async fn reconcile_is_idempotent() {
 async fn reconcile_removes_tasks_when_service_deleted() {
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(
-        StateStore::open(1, "127.0.0.1:50053", dir.path(), BTreeMap::new())
+        StateStore::open(1, "127.0.0.1:0", dir.path(), BTreeMap::new())
             .await
             .unwrap(),
     );
@@ -564,7 +564,7 @@ async fn reconcile_removes_tasks_when_service_deleted() {
 async fn reconcile_handles_scale_down() {
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(
-        StateStore::open(1, "127.0.0.1:50054", dir.path(), BTreeMap::new())
+        StateStore::open(1, "127.0.0.1:0", dir.path(), BTreeMap::new())
             .await
             .unwrap(),
     );
@@ -609,7 +609,7 @@ async fn reconcile_handles_scale_down() {
 async fn reconcile_global_service() {
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(
-        StateStore::open(1, "127.0.0.1:50055", dir.path(), BTreeMap::new())
+        StateStore::open(1, "127.0.0.1:0", dir.path(), BTreeMap::new())
             .await
             .unwrap(),
     );
@@ -646,7 +646,7 @@ async fn reconcile_global_service() {
 async fn reconcile_no_nodes_no_tasks() {
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(
-        StateStore::open(1, "127.0.0.1:50056", dir.path(), BTreeMap::new())
+        StateStore::open(1, "127.0.0.1:0", dir.path(), BTreeMap::new())
             .await
             .unwrap(),
     );
@@ -677,7 +677,7 @@ async fn reconcile_no_nodes_no_tasks() {
 async fn reconcile_loop_runs_and_converges() {
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(
-        StateStore::open(1, "127.0.0.1:50057", dir.path(), BTreeMap::new())
+        StateStore::open(1, "127.0.0.1:0", dir.path(), BTreeMap::new())
             .await
             .unwrap(),
     );
