@@ -88,8 +88,8 @@ Sequential implementation for one developer: B (NATS TLS/transport boundary) →
 - [ ] 14-01 — Pin 2.15.3 in release, CI and test images; release-notes review 2.11–2.15
 - [ ] 14-02 — Read `api.level` on managers; warn below the 2.14 floor; worker ACL unchanged
 - [ ] 14-03 — Shared fail-closed test helper; cluster test on real binaries; CI matrix 2.14.10 / 2.15.3
-- [ ] 14-04 — Upgrade proof: 2.10.22 store dir on 2.15.3, rolling 3-server replacement, downgrade result
+- [x] 14-04 — Upgrade proof: 2.10.22 store dir on 2.15.3, rolling 3-server replacement, downgrade result
 - [x] 14-06 — Lift the 2.15 default cap of 1,000 consumers per stream on the assignment, status and lease buckets
 - [ ] 14-05 — CHANGELOG, CONTRIBUTING, ADR 0002/0008, topologies
 
-**Release gate:** no `v*` tag and no manual Release run (it publishes the `edge` image) with 2.15.3 until 14-04 proves the direct 2.10.22 → 2.15.3 store upgrade. The consumer cap (14-06) is lifted in the same PR as the pin.
+**Release gate:** no `v*` tag and no manual Release run (it publishes the `edge` image) with 2.15.3 until both the consumer-cap fix (14-06, PR #89; it missed #87's squash merge) and the 14-04 upgrade proof are on `main`. 14-04 passed locally on 2026-11-16 (STATE.md).

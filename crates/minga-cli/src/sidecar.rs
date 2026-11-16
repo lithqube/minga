@@ -664,14 +664,16 @@ mod tests {
         use std::collections::{BTreeMap, HashMap};
         use std::net::{IpAddr, Ipv4Addr};
 
-        let listeners: Vec<_> = (0..9)
-            .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
+        // Held until each sidecar starts: a port released early can be taken
+        // by a parallel test before the sidecar binds it.
+        let mut listeners: Vec<_> = (0..9)
+            .map(|_| Some(std::net::TcpListener::bind("127.0.0.1:0").unwrap()))
             .collect();
         let ports: Vec<u16> = listeners
             .iter()
+            .flatten()
             .map(|listener| listener.local_addr().unwrap().port())
             .collect();
-        drop(listeners);
 
         let raft_listeners: Vec<_> = (0..3)
             .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
@@ -774,6 +776,9 @@ mod tests {
                     .map(|(_, route)| route.clone())
                     .collect(),
             };
+            for port in [i, 3 + i, 6 + i] {
+                listeners[port] = None;
+            }
             let side = NatsSidecar::start(&SidecarOptions {
                 data_dir: dir.path().to_path_buf(),
                 node_id: i as u64 + 1,
