@@ -51,7 +51,7 @@ Sequential implementation for one developer: B (NATS TLS/transport boundary) →
 **Requirements:** MOR-ADR, MOR-LEASE, MOR-STATUS, MOR-ASSIGN, MOR-AUTHZ, MOR-JOIN, MOR-FOLD, MOR-NATS, MOR-PART, MOR-PROOF
 **Plans:** `.planning/phases/12-managers-only-raft/12-PLAN.md`
 **Mode:** standard
-**Status:** In progress (14-01 in PR)
+**Status:** Complete (PR #76)
 
 - [ ] 12-01 — ADR 0006: Workers leave Raft (no code)
 - [ ] 12-02 — Liveness and registration off Raft
@@ -92,4 +92,4 @@ Sequential implementation for one developer: B (NATS TLS/transport boundary) →
 - [ ] 14-06 — Lift the 2.15 default cap of 1,000 consumers per stream on the assignment, status and lease buckets
 - [ ] 14-05 — CHANGELOG, CONTRIBUTING, ADR 0002/0008, topologies
 
-**Release gate:** no release is tagged with 2.15.3 until 14-04 proves the direct 2.10.22 → 2.15.3 store upgrade and 14-06 lifts the consumer cap.
+**Release gate:** no `v*` tag and no manual Release run (it publishes the `edge` image) with 2.15.3 until 14-04 proves the direct 2.10.22 → 2.15.3 store upgrade and 14-06 lifts the consumer cap.
