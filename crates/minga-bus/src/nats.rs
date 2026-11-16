@@ -68,6 +68,12 @@ const REDELIVERY_BACKOFF: [Duration; 4] = [
 /// Redelivery delay for a message nak'd after a transient failure.
 const NAK_DELAY: Duration = Duration::from_secs(5);
 
+/// Consumer limit set on every KV bucket. nats-server 2.15 otherwise caps a
+/// stream at 1,000. shortcut: sized for the T4 target (5,000 workers, two
+/// watches each, plus listings) with 10x headroom; raise it if a cluster
+/// outgrows that.
+const BUCKET_MAX_CONSUMERS: i32 = 100_000;
+
 /// Streams (KV buckets are `KV_`-prefixed streams) that losing one NATS
 /// server must not lose. `MINGA_LOGS` stays at one replica: it is the
 /// largest stream, best effort, and edge disks are small.
@@ -595,6 +601,7 @@ impl NatsBus {
                         .map_err(|e| BusError::Kv(format!("{bucket} max age: {e}")))?;
                 }
             }
+            Self::lift_consumer_cap(js, bucket, &mut store).await?;
             return Ok(store);
         }
         let config = KvConfig {
@@ -603,9 +610,44 @@ impl NatsBus {
             max_age,
             ..Default::default()
         };
-        js.create_key_value(config)
+        let mut store = js
+            .create_key_value(config)
             .await
-            .map_err(|e| BusError::Kv(format!("{bucket}: {e}")))
+            .map_err(|e| BusError::Kv(format!("{bucket}: {e}")))?;
+        Self::lift_consumer_cap(js, bucket, &mut store).await?;
+        Ok(store)
+    }
+
+    /// nats-server 2.15 caps a stream at 1,000 consumers unless the stream
+    /// sets a positive `max_consumers` (-1 means "server default" there).
+    /// Every worker holds two watches on the assignment bucket, so the cap
+    /// would block new workers at about 500.
+    async fn lift_consumer_cap(
+        js: &JetStream,
+        bucket: &str,
+        store: &mut jetstream::kv::Store,
+    ) -> Result<()> {
+        let mut config = store
+            .stream
+            .info()
+            .await
+            .map_err(|e| BusError::Kv(format!("{bucket} info: {e}")))?
+            .config
+            .clone();
+        if config.max_consumers >= BUCKET_MAX_CONSUMERS {
+            return Ok(());
+        }
+        config.max_consumers = BUCKET_MAX_CONSUMERS;
+        if let Err(error) = js.update_stream(config).await {
+            // Servers before 2.12.5 refuse to change max_consumers after
+            // creation, but they also have no default cap to lift.
+            tracing::warn!(
+                bucket,
+                %error,
+                "cannot raise the bucket's consumer limit; fine on servers older than 2.15"
+            );
+        }
+        Ok(())
     }
 }
 
