@@ -543,6 +543,10 @@ async fn ingress_port_reaches_each_backend_on_another_node() {
     let _ = sh("iptables", &["-w", "5", "-t", "nat", "-X", "MINGA_INGRESS"]);
     let _ = sh(
         "iptables",
+        &["-w", "5", "-t", "filter", "-X", "MINGA_INGRESS_FWD"],
+    );
+    let _ = sh(
+        "iptables",
         &["-w", "5", "-t", "nat", "-X", "MINGA_INGRESS_SNAT"],
     );
     let _ = sh(

@@ -467,11 +467,7 @@ fn install_mesh_rules(
     Ok(())
 }
 
-fn install_ingress_mesh_rules(
-    ingress_node: &str,
-    backend_node: &str,
-    backend_bridge: &str,
-) -> Result<(), String> {
+fn install_ingress_mesh_rules(ingress_node: &str, backend_node: &str) -> Result<(), String> {
     const MARK: &str = "0x4d494e47";
     in_ns(
         ingress_node,
@@ -659,6 +655,35 @@ fn install_ingress_mesh_rules(
             ],
         )?;
     }
+    // Mirrors `setup_ingress`: mesh-sourced traffic reaches only this node's
+    // backends on their target port, never the rest of the network.
+    in_ns(
+        backend_node,
+        "iptables",
+        &["-w", "5", "-t", "filter", "-N", "MINGA_INGRESS_FWD"],
+    )?;
+    for backend in ["10.242.0.20", "10.242.0.21"] {
+        in_ns(
+            backend_node,
+            "iptables",
+            &[
+                "-w",
+                "5",
+                "-t",
+                "filter",
+                "-A",
+                "MINGA_INGRESS_FWD",
+                "-d",
+                &format!("{backend}/32"),
+                "-p",
+                "tcp",
+                "--dport",
+                "8080",
+                "-j",
+                "ACCEPT",
+            ],
+        )?;
+    }
     in_ns(
         backend_node,
         "iptables",
@@ -672,14 +697,10 @@ fn install_ingress_mesh_rules(
             "1",
             "-i",
             WG_INTERFACE_NAME,
-            "-o",
-            backend_bridge,
             "-s",
             "10.200.0.0/16",
-            "-d",
-            "10.242.0.0/24",
             "-j",
-            "ACCEPT",
+            "MINGA_INGRESS_FWD",
         ],
     )?;
     Ok(())
@@ -1094,7 +1115,7 @@ async fn wireguard_routes_shared_tasks_and_isolates_other_networks() -> Result<(
     install_task_source_rules(&node_b, "tb0", "10.242.0.20/32")?;
     install_task_source_rules(&node_b, "tb1", "10.242.0.21/32")?;
     install_task_source_rules(&node_c, "tc0", "10.243.0.30/32")?;
-    install_ingress_mesh_rules(&node_a, &node_b, &bridge_b)?;
+    install_ingress_mesh_rules(&node_a, &node_b)?;
     let forward_rules = in_ns(&node_a, "iptables", &["-S", "FORWARD"])?;
     let jump_order: Vec<&str> = forward_rules
         .lines()

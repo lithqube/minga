@@ -107,6 +107,9 @@ const TASK_FAIL_CLOSED_IN_CHAIN: &str = "MINGA_TASK_FAIL_CLOSED_IN";
 const TASK_FAIL_CLOSED_OUT_CHAIN: &str = "MINGA_TASK_FAIL_CLOSED_OUT";
 const TASK_MASQUERADE_CHAIN: &str = "MINGA_MASQUERADE";
 const INGRESS_CONNMARK: &str = "0x4d494e47";
+/// Mesh-sourced traffic may reach only this node's ingress backends, each on
+/// its target port. `MINGA_WG_FORWARD` jumps here for `-s <mesh subnet>`.
+const INGRESS_FORWARD_CHAIN: &str = "MINGA_INGRESS_FWD";
 
 async fn remove_wireguard_rules() {
     run_tolerated(
@@ -610,6 +613,29 @@ fn task_veth_for_ip(
     })
 }
 
+/// Builds the `iptables-restore` batch that admits mesh-sourced ingress
+/// traffic to this node's own backends only, by address, protocol and port.
+fn ingress_forward_batch(
+    assignments: &[minga_state::types::IngressAssignment],
+    node_id: minga_state::types::NodeId,
+) -> String {
+    let mut batch = format!("*filter\n:{INGRESS_FORWARD_CHAIN} - [0:0]\n");
+    for assignment in assignments {
+        for backend in assignment
+            .backends
+            .iter()
+            .filter(|backend| backend.node_id == node_id)
+        {
+            batch.push_str(&format!(
+                "-A {INGRESS_FORWARD_CHAIN} -d {}/32 -p {} --dport {} -j ACCEPT\n",
+                backend.ip, assignment.protocol, backend.target_port
+            ));
+        }
+    }
+    batch.push_str("COMMIT\n");
+    batch
+}
+
 fn ingress_port_chain(assignment: &minga_state::types::IngressAssignment) -> String {
     let protocol = match assignment.protocol.as_str() {
         "tcp" => "T",
@@ -817,7 +843,7 @@ impl NetworkSetup {
             .lines()
             .filter_map(|line| {
                 let fields: Vec<_> = line.split_whitespace().collect();
-                if fields.get(0) != Some(&"-A") || fields.get(1) != Some(&"MINGA_INGRESS") {
+                if fields.first() != Some(&"-A") || fields.get(1) != Some(&"MINGA_INGRESS") {
                     return None;
                 }
                 let target = fields.windows(2).find_map(|pair| {
@@ -880,6 +906,7 @@ impl NetworkSetup {
         }
         mark_batch.push_str("COMMIT\n");
         iptables_restore(&mark_batch).await?;
+        iptables_restore(&ingress_forward_batch(assignments, node_id)).await?;
         batch.push_str("COMMIT\n");
         iptables_restore(&batch).await
     }
@@ -1104,7 +1131,22 @@ impl NetworkSetup {
                 "-j".to_string(),
                 "ACCEPT".to_string(),
             ],
+            vec![
+                "-i".to_string(),
+                wg.to_string(),
+                "-s".to_string(),
+                mesh_subnet.clone(),
+                "-j".to_string(),
+                INGRESS_FORWARD_CHAIN.to_string(),
+            ],
         ];
+        // The jump target must exist before the restore; `setup_ingress` owns
+        // its contents and an empty chain returns to the drops below.
+        run_tolerated(
+            "iptables",
+            &["-w", "5", "-t", "filter", "-N", INGRESS_FORWARD_CHAIN],
+        )
+        .await;
         for network in networks {
             let subnet = subnet_for(&network.network_id, Some(&network.subnet))?;
             if network.relay {
@@ -1137,22 +1179,6 @@ impl NetworkSetup {
                 "-j".to_string(),
                 "ACCEPT".to_string(),
             ]);
-            if network.ingress {
-                // Mesh-address SNAT is allowed only from authenticated peers
-                // to this network's ingress-published tasks.
-                rules.push(vec![
-                    "-i".to_string(),
-                    wg.to_string(),
-                    "-o".to_string(),
-                    bridge.clone(),
-                    "-s".to_string(),
-                    mesh_subnet.clone(),
-                    "-d".to_string(),
-                    cidr.clone(),
-                    "-j".to_string(),
-                    "ACCEPT".to_string(),
-                ]);
-            }
             rules.push(vec![
                 "-i".to_string(),
                 wg.to_string(),
@@ -1662,6 +1688,32 @@ pub fn system_upstream_resolver() -> Option<std::net::SocketAddr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ingress_forward_admits_only_local_backend_ports() {
+        let backend = |node_id, ip: &str| minga_state::types::IngressBackend {
+            node_id,
+            ip: ip.into(),
+            target_port: 8080,
+        };
+        let assignment = minga_state::types::IngressAssignment {
+            published: 18080,
+            protocol: "tcp".into(),
+            backends: vec![backend(2, "10.242.0.20"), backend(3, "10.242.0.21")],
+            source_overlay_ip: Some("10.200.0.1".into()),
+        };
+        assert_eq!(
+            ingress_forward_batch(&[assignment], 2),
+            "*filter\n:MINGA_INGRESS_FWD - [0:0]\n\
+             -A MINGA_INGRESS_FWD -d 10.242.0.20/32 -p tcp --dport 8080 -j ACCEPT\n\
+             COMMIT\n"
+        );
+        // No assignments leaves an empty chain, so mesh traffic falls to the drops.
+        assert_eq!(
+            ingress_forward_batch(&[], 2),
+            "*filter\n:MINGA_INGRESS_FWD - [0:0]\nCOMMIT\n"
+        );
+    }
 
     #[test]
     fn deterministic_names_fit_ifnamsiz() {
