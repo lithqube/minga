@@ -197,9 +197,21 @@ async fn rolling_check() {
         bus.publish_log("rolling-proof", &log_entry)
     })
     .await;
-    let history = eventually("read rolling log", || bus.log_history("rolling-proof", 0)).await;
-    assert!(history.iter().any(|entry| entry.data == b"rolling-seed"));
-    assert!(history.iter().any(|entry| entry.data == b"rolling-check"));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        match bus.log_history("rolling-proof", 0).await {
+            Ok(history)
+                if history.iter().any(|entry| entry.data == b"rolling-seed")
+                    && history.iter().any(|entry| entry.data == b"rolling-check") =>
+            {
+                break;
+            }
+            Ok(_) | Err(_) if tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Ok(_) | Err(_) => panic!("rolling log history did not retain both entries"),
+        }
+    }
 }
 
 #[tokio::test]
