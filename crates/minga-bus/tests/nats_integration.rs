@@ -1,7 +1,7 @@
 //! Integration tests for [`NatsBus`] against a real NATS server.
 //!
-//! A server is shared across tests in this binary. Tests are serialized because
-//! concurrent stream setup against that server can time out under CI load.
+//! Each test keeps its NATS server alive until the bus is dropped. Tests are
+//! serialized because concurrent stream setup can time out under CI load.
 //!
 //! To run: `cargo test -p minga-bus --test nats_integration -- --nocapture`
 
@@ -16,6 +16,7 @@ static NATS_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(()
 
 struct NatsTestBus {
     bus: Arc<NatsBus>,
+    _server: Arc<common::NatsServer>,
     _lock: tokio::sync::MutexGuard<'static, ()>,
 }
 
@@ -33,7 +34,11 @@ async fn connect() -> Option<NatsTestBus> {
     let bus = NatsBus::connect(&url)
         .await
         .unwrap_or_else(|e| panic!("failed to connect to NATS at {url}: {e}"));
-    Some(NatsTestBus { bus, _lock: lock })
+    Some(NatsTestBus {
+        bus,
+        _server: url,
+        _lock: lock,
+    })
 }
 
 /// Waits for a stream to yield one item, or fails the test on timeout.
