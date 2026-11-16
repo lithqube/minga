@@ -49,7 +49,7 @@ Read in full: the v2.11.0, v2.12.0, v2.14.0 and v2.15.0 release notes, plus the 
 | Info and list API requests are queued at lower priority (v2.14.0) | `setup_kv`'s stream-info read | Slower startup under load, not a failure | Note only. |
 | Config keys Minga writes (`listen`, `server_name`, `authorization`, `http`, `tls`, `cluster`, `jetstream.{store_dir,max_memory_store,max_file_store}`) | sidecar | None deprecated or renamed. Defaults changed only for TLS ciphers, JetStream strict mode, `max_buffered_*` and the consumer cap. | Covered by the rows above. |
 
-**Release gate.** Bundling 2.15.3 is safe to merge, because releases only happen on `v*` tags. **No release may be tagged with 2.15.3 until 14-04 proves the direct 2.10.22 → 2.15.3 store upgrade and 14-06 lifts the consumer cap.** If the direct jump fails, decide with the user: an intermediate release bundling 2.14.x, or a documented stepwise upgrade.
+**Release gate.** The consumer cap is lifted in the same PR as the 2.15.3 pin (14-06), so no build bundles 2.15.3 without the fix. **No `v*` tag, and no manual Release run (which publishes the `edge` image), may ship 2.15.3 until 14-04 proves the direct 2.10.22 → 2.15.3 store upgrade.** If the direct jump fails, decide with the user: an intermediate release bundling 2.14.x, or a documented stepwise upgrade.
 
 ## Design decisions
 
@@ -108,8 +108,9 @@ Order: 14-01 first, because it moves the pins everything else runs against. 14-0
 - **Done when:** both proofs are recorded in STATE.md, with the commands and the versions used.
 
 ### 14-06 — Lift the 2.15 consumer cap on the assignment bucket (NATS-CAP)
-- [ ] After `setup_kv` creates or opens `MINGA_ASSIGN`, set `max_consumers: -1` (unlimited) on `KV_MINGA_ASSIGN` with a stream update. Since 2.12.5 the server accepts that change after creation. Do it the same way for `MINGA_STATUS` and `MINGA_LEASES`, which workers read too. Don't use the server-wide `default_max_consumers`: it is unknown to servers before 2.15 and has to be removed before a downgrade.
-- [ ] Test on 2.15.3: open more than 1,000 ordered consumers on `KV_MINGA_ASSIGN` and confirm the next watch still succeeds. On 2.14.10 the same test confirms the update is accepted.
+- [x] `setup_kv` sets an explicit `max_consumers` of 100,000 (`BUCKET_MAX_CONSUMERS`) on all three KV buckets, both new and existing, with a stream update. Since 2.12.5 the server accepts that change after creation. **-1 does not work:** on 2.15 it means "server default", which is the 1,000 cap. Buckets created through async-nats already report -1 and were still refused at consumer #1,000 (`maximum consumers limit reached`, error 10026). Servers older than 2.12.5 refuse the update; `setup_kv` logs a warning and continues, because those servers have no default cap. The server-wide `default_max_consumers` is not used: servers before 2.15 don't know it, it has to be removed before a downgrade, and it wouldn't help an external NATS server.
+- [x] Test (`tests/nats_consumer_cap.rs`) on 2.15.3: failed before the fix at consumer #1,000. After the fix it passes on a server holding the old -1 buckets (existing-bucket path) and on a fresh server (create path, `max_consumers: 100000`).
+- [ ] The same test on 2.14.10, in the 14-03 CI matrix.
 - **Done when:** a cluster with more than 500 workers can't hit the cap, shown by the test above on both lines.
 
 ### 14-05 — Docs and release notes (NATS-DOCS)
