@@ -32,7 +32,7 @@ static NATS: OnceCell<Option<String>> = OnceCell::const_new();
 /// Docker is unavailable.
 async fn nats_url() -> Option<String> {
     NATS.get_or_init(|| async {
-        let image = GenericImage::new("nats", "2.10-alpine")
+        let image = GenericImage::new("nats", "2.15.3-alpine")
             .with_exposed_port(NATS_PORT.into())
             // nats-server logs its readiness banner to stderr, not stdout.
             .with_wait_for(WaitFor::message_on_stderr("Server is ready"))

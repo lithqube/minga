@@ -51,7 +51,7 @@ Sequential implementation for one developer: B (NATS TLS/transport boundary) →
 **Requirements:** MOR-ADR, MOR-LEASE, MOR-STATUS, MOR-ASSIGN, MOR-AUTHZ, MOR-JOIN, MOR-FOLD, MOR-NATS, MOR-PART, MOR-PROOF
 **Plans:** `.planning/phases/12-managers-only-raft/12-PLAN.md`
 **Mode:** standard
-**Status:** Planned
+**Status:** In progress (14-01 in PR)
 
 - [ ] 12-01 — ADR 0006: Workers leave Raft (no code)
 - [ ] 12-02 — Liveness and registration off Raft
@@ -76,3 +76,20 @@ Sequential implementation for one developer: B (NATS TLS/transport boundary) →
 - [ ] 13-05 — NAT traversal by relay through managers
 - [ ] 13-06 — Routing mesh (`mode: ingress` as in Swarm, cluster-wide port reservation)
 - [ ] 13-07 — Live proof on VMs, iperf3 numbers, docs, CHANGELOG, site roadmap
+
+## Phase 14: Supported NATS server line (tenancy T0)
+**Goal:** Bundle nats-server 2.15.3 instead of the out-of-support 2.10.22, prove the bus on both supported lines (2.14, 2.15) in CI that fails closed, prove an existing cluster's JetStream data survives the upgrade, and read the server's `api.level` on managers (warn below 2.14).
+**Depends on:** nothing open. Step T0 of `docs/adr/0008-multi-tenancy.md`; independent of 13-07.
+**Requirements:** NATS-PIN, NATS-LEVEL, NATS-CI, NATS-UPGRADE, NATS-CAP, NATS-DOCS
+**Plans:** `.planning/phases/14-nats-supported-line/14-PLAN.md`
+**Mode:** standard
+**Status:** In progress (14-01 in PR)
+
+- [ ] 14-01 — Pin 2.15.3 in release, CI and test images; release-notes review 2.11–2.15
+- [ ] 14-02 — Read `api.level` on managers; warn below the 2.14 floor; worker ACL unchanged
+- [ ] 14-03 — Shared fail-closed test helper; cluster test on real binaries; CI matrix 2.14.10 / 2.15.3
+- [ ] 14-04 — Upgrade proof: 2.10.22 store dir on 2.15.3, rolling 3-server replacement, downgrade result
+- [ ] 14-06 — Lift the 2.15 default cap of 1,000 consumers per stream on the assignment, status and lease buckets
+- [ ] 14-05 — CHANGELOG, CONTRIBUTING, ADR 0002/0008, topologies
+
+**Release gate:** no release is tagged with 2.15.3 until 14-04 proves the direct 2.10.22 → 2.15.3 store upgrade and 14-06 lifts the consumer cap.

@@ -31,3 +31,12 @@ The controls below are engineering targets, **not** an assertion of certificatio
 - [ ] **WG-ISOL** Network isolation and anti-spoofing hold across nodes. A task can't reach another network on another node, or send as another node's task.
 - [ ] **WG-INGRESS** `mode: ingress` (the default) answers on every node and load-balances to tasks anywhere. `mode: host` keeps per-node publishing and the client IP. Port conflicts fail cluster-wide with a 409.
 - [ ] **WG-PROOF** Separate VMs with one worker behind NAT demonstrate each item above, with iperf3 numbers for direct and relayed paths. Docs, CHANGELOG and the site roadmap are updated.
+
+# Phase 14 requirements (Supported NATS server line, tenancy T0)
+
+- [ ] **NATS-PIN** Releases bundle nats-server 2.15.3 with a checksum taken from the release, and CI installs it. No 2.10 pin remains in workflows, test images or docs.
+- [ ] **NATS-LEVEL** Managers read the server's JetStream `api.level` at startup, keep it for feature gates, and warn (naming version, level and floor) below level 4 (2.14). Workers never get `$JS.API.INFO`.
+- [ ] **NATS-CI** The `minga-bus` suites, including a three-server cluster test of `ensure_replicas`, run on 2.14.10 and 2.15.3 and fail instead of skipping when no server is available.
+- [ ] **NATS-UPGRADE** A 2.10.22 store dir with Minga's streams and buckets opens on 2.15.3 with data intact, a three-server cluster survives a rolling replacement, and the downgrade result is recorded.
+- [ ] **NATS-CAP** The assignment, status and lease buckets accept more than 1,000 consumers on 2.15 (the new default cap), so a cluster with more than 500 workers can still watch its assignments.
+- [ ] **NATS-DOCS** CHANGELOG, CONTRIBUTING, ADR 0002, ADR 0008 and `docs/topologies.md` state the supported lines and the floor and the upgrade result.
