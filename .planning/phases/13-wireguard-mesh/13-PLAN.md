@@ -76,12 +76,12 @@ Order: 13-01 first. 13-02 is independent of Phase 12 and can start any time. 13-
 - **Done when:** no code path can give two networks the same subnet.
 
 ### 13-03 — Node keys and the WireGuard interface (WG-KEYS)
-- [ ] Generate the keypair at first start into `<data_dir>/wg.key` (0600), reusing `KeyPair`. Add `--wg-listen`, `--wg-endpoint` and `--wg-mtu`.
-- [ ] The registration payload (from 12-02) carries the public key, the endpoint and reachability. The leader stores them on `ClusterNode` as `#[serde(default)]` fields. Refresh the frozen fixtures.
-- [ ] Create `minga-wg0` only when the node has at least one peer; single-host clusters are unchanged. If the kernel module or `wg` is missing, report a clear error.
-- [ ] Remove the per-network WireGuard port from `OverlayManager`, and the `minga net` printout that depends on it.
-- [ ] Key rotation: `minga tls`-style re-issue (delete `wg.key` and restart). The leader updates every peer set that contains the node.
-- [ ] Tests: the key file mode, a stable public key across restarts, and old `ClusterNode` rows decoding with no WireGuard fields.
+- [x] Generate the keypair at first start into `<data_dir>/wg.key` (0600), reusing `KeyPair`. Add `--wg-listen`, `--wg-endpoint` and `--wg-mtu`.
+- [x] The registration payload (from 12-02) carries the public key and endpoint. The leader stores them on `ClusterNode` as `#[serde(default)]` fields; the frozen fixtures remain unchanged.
+- [x] Create `minga-wg0` only when the node has at least one peer; single-host clusters are unchanged. If the kernel module or `wg` is missing, report a clear error.
+- [x] Remove the network-scoped WireGuard config API from `OverlayManager`; the `minga net` output no longer advertises an interface per network.
+- [x] Key rotation: delete `wg.key` and restart. Registration refreshes the public key, and the leader reconciles peer assignments.
+- [x] Tests: key file mode, stable public key across restarts, and old `ClusterNode` rows decoding with no WireGuard fields.
 
 ### 13-04 — Peer sets, routes and cross-node isolation (WG-PEERS, WG-ISOL)
 - [ ] The leader computes each node's peer set (decision 4) from Raft placement, and writes `node.{id}.wg` when a placement or node changes. On election it re-derives the whole set, as 12-04 does for assignments.

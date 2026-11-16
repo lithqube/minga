@@ -1,8 +1,8 @@
-//! Overlay manager: coordinates IPAM, WireGuard, and DNS for overlay networks.
+//! Overlay manager: coordinates IPAM and DNS for overlay networks.
 //!
 //! The `OverlayManager` owns cluster network IPAM and service discovery.
-//! WireGuard identity is node-local; generated interface configs take an
-//! explicit persisted keypair rather than generating one per manager.
+//! WireGuard identity and interface configuration are node-local and handled
+//! by `minga-node`.
 //!
 //! # Architecture
 //!
@@ -27,7 +27,6 @@ use thiserror::Error;
 use crate::cidr::{Cidr, CidrError, DEFAULT_SUPERNET};
 use crate::dns::{self, DnsStore};
 use crate::ipam::{self, Ipam, IpamError};
-use crate::wireguard::{InterfaceConfig, KeyPair, Peer};
 
 #[derive(Debug, Error)]
 pub enum OverlayError {
@@ -54,27 +53,17 @@ pub struct NetworkOverlay {
     pub ipam: Ipam,
 }
 
-/// Peer information for WireGuard config generation.
-#[derive(Debug, Clone)]
-pub struct PeerInfo {
-    pub node_id: u64,
-    pub public_key: String,
-    pub endpoint: Option<String>,
-    pub overlay_ip: String,
-}
 
 /// The overlay manager.
 pub struct OverlayManager {
-    node_id: u64,
     networks: HashMap<String, NetworkOverlay>,
     dns: DnsStore,
 }
 
 impl OverlayManager {
-    /// Create a new overlay manager for a node.
-    pub fn new(node_id: u64) -> Self {
+    /// Create a new overlay manager.
+    pub fn new() -> Self {
         Self {
-            node_id,
             networks: HashMap::new(),
             dns: DnsStore::new(),
         }
@@ -236,41 +225,6 @@ impl OverlayManager {
         self.dns.resolve(&fqdn)
     }
 
-    // --- WireGuard config generation ----------------------------------------
-
-    /// Generate the WireGuard interface config for a network on this node.
-    ///
-    /// `overlay_ip` is this node's IP in the network's subnet (with CIDR suffix).
-    /// `peers` are the remote nodes to configure.
-    pub fn wg_interface_config(
-        &self,
-        keypair: &KeyPair,
-        network_id: &str,
-        listen_port: u16,
-        overlay_ip: &str,
-        peers: &[PeerInfo],
-    ) -> Result<InterfaceConfig, OverlayError> {
-        if !self.networks.contains_key(network_id) {
-            return Err(OverlayError::NetworkNotFound(network_id.to_string()));
-        }
-        let wg_peers: Vec<Peer> = peers
-            .iter()
-            .filter(|peer| peer.node_id != self.node_id)
-            .map(|p| Peer {
-                public_key: p.public_key.clone(),
-                allowed_ips: vec![format!("{}/32", p.overlay_ip)],
-                endpoint: p.endpoint.clone(),
-                keepalive: if p.endpoint.is_some() { 25 } else { 0 },
-            })
-            .collect();
-
-        Ok(InterfaceConfig {
-            private_key: keypair.private_key.clone(),
-            listen_port,
-            address: overlay_ip.to_string(),
-            peers: wg_peers,
-        })
-    }
 }
 
 /// Allocate a supernet for the overlay mesh itself (node-to-node WireGuard IPs).
@@ -305,7 +259,7 @@ mod tests {
     use super::*;
 
     fn test_manager() -> OverlayManager {
-        OverlayManager::new(1)
+        OverlayManager::new()
     }
 
     #[test]
@@ -419,61 +373,7 @@ mod tests {
         assert_eq!(ips, vec![Ipv4Addr::new(10, 100, 0, 10)]);
     }
 
-    #[test]
-    fn wg_config_generation() {
-        let mut mgr = test_manager();
-        mgr.create_network("net-1", "frontend", "10.100.0.0/24")
-            .unwrap();
-        let peers = vec![
-            PeerInfo {
-                node_id: 1,
-                public_key: "SELF_PUBKEY=".to_string(),
-                endpoint: Some("127.0.0.1:52000".to_string()),
-                overlay_ip: "10.100.0.1".to_string(),
-            },
-            PeerInfo {
-                node_id: 2,
-                public_key: "PEER2_PUBKEY=".to_string(),
-                endpoint: Some("10.0.0.2:51820".to_string()),
-                overlay_ip: "10.100.0.2".to_string(),
-            },
-            PeerInfo {
-                node_id: 3,
-                public_key: "PEER3_PUBKEY=".to_string(),
-                endpoint: None,
-                overlay_ip: "10.100.0.3".to_string(),
-            },
-        ];
-        let keypair = KeyPair::generate();
-        let config = mgr
-            .wg_interface_config(&keypair, "net-1", 52000, "10.100.0.1/24", &peers)
-            .unwrap();
-        assert_eq!(config.listen_port, 52000);
-        assert_eq!(config.address, "10.100.0.1/24");
-        assert_eq!(config.private_key, keypair.private_key);
-        assert_eq!(config.peers.len(), 2);
-        assert!(!config
-            .peers
-            .iter()
-            .any(|peer| peer.public_key == "SELF_PUBKEY="));
-        assert_eq!(config.peers[0].public_key, "PEER2_PUBKEY=");
-        assert_eq!(config.peers[0].allowed_ips, vec!["10.100.0.2/32"]);
-        assert_eq!(config.peers[0].endpoint, Some("10.0.0.2:51820".to_string()));
-        assert_eq!(config.peers[0].keepalive, 25);
-        assert_eq!(config.peers[1].keepalive, 0); // no endpoint → no keepalive
 
-        let s = config.to_config_string();
-        assert!(s.contains("ListenPort = 52000"));
-        assert!(s.contains("Address = 10.100.0.1/24"));
-    }
-
-    #[test]
-    fn wg_config_nonexistent_network() {
-        let mgr = test_manager();
-        let result =
-            mgr.wg_interface_config(&KeyPair::generate(), "nope", 51820, "10.100.0.1/24", &[]);
-        assert!(result.is_err());
-    }
 
     #[test]
     fn multiple_networks_independent_ipam() {

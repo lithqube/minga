@@ -23,6 +23,7 @@ use crate::codec::{check_format, FORMAT_KEY, FORMAT_VERSION};
 use crate::command::{StateCommand, StateResponse};
 use crate::types::*;
 use crate::TypeConfig;
+use redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition};
 
 // --- redb table definitions --------------------------------------------------
 
