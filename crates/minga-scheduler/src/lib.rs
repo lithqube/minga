@@ -49,7 +49,7 @@ use minga_net::wireguard::{
     WireGuardNetworkAssignment, WireGuardPeerAssignment, WireGuardPeerPath, WireGuardPeerSet,
 };
 use minga_state::types::{
-    ClusterNode, Network, NetworkAssignment, NetworkDnsTask, NodeRole, Service, Task,
+    ClusterNode, Network, NetworkAssignment, NetworkDnsTask, NodeRole, NodeStatus, Service, Task,
     TaskAssignment, TaskState,
 };
 use minga_state::{StateError, StateStore};
@@ -66,6 +66,10 @@ pub enum SchedulerError {
     State(#[from] StateError),
     #[error("bus error: {0}")]
     Bus(String),
+    #[error("managers in a multi-node cluster require a reachable WireGuard endpoint")]
+    ManagerEndpointUnavailable,
+    #[error("no active manager with a reachable WireGuard endpoint can relay overlay traffic")]
+    RelayManagerUnavailable,
     #[error("serialization error: {0}")]
     Serialization(String),
 }
@@ -192,6 +196,7 @@ impl Scheduler {
             }
             nodes.retain(|node| live_nodes.contains(&node.id));
         }
+        validate_manager_endpoints(&nodes)?;
         let services = self.state.list_services().await?;
         let mut tasks = self.state.list_tasks().await?;
         if let Some(bus) = &self.bus {
@@ -367,80 +372,15 @@ impl Scheduler {
                 .await
                 .map_err(|error| SchedulerError::Bus(error.to_string()))?;
         }
+        let peer_sets = build_wireguard_peer_sets(nodes, &tasks, &networks)?;
         for node in nodes {
             let key = format!("node.{}.wg", node.id);
-            let local_network_ids: HashSet<&str> = tasks
-                .iter()
-                .filter(|task| task.node_id == node.id)
-                .flat_map(|task| task.spec.ips.keys().map(String::as_str))
-                .filter(|id| network_by_id.contains_key(id))
-                .collect();
-            let mut node_networks: Vec<WireGuardNetworkAssignment> = networks
-                .iter()
-                .filter_map(|network| {
-                    network
-                        .subnet
-                        .as_ref()
-                        .map(|subnet| WireGuardNetworkAssignment {
-                            network_id: network.id.clone(),
-                            subnet: subnet.clone(),
-                            local: local_network_ids.contains(network.id.as_str()),
-                        })
-                })
-                .collect();
-            node_networks.sort_by(|a, b| a.network_id.cmp(&b.network_id));
-
-            let mut peers = Vec::new();
-            for peer in nodes {
-                if peer.id == node.id {
-                    continue;
-                }
-                let peer_is_manager = peer.role == NodeRole::Manager;
-                if node.role != NodeRole::Manager
-                    && !peer_is_manager
-                    && !local_network_ids.iter().any(|id| {
-                        tasks
-                            .iter()
-                            .any(|task| task.node_id == peer.id && task.spec.ips.contains_key(*id))
-                    })
-                {
-                    continue;
-                }
-                let Some(public_key) = &peer.wg_public_key else {
-                    continue;
-                };
-                let mut allowed_ips: Vec<String> = tasks
-                    .iter()
-                    .filter(|task| task.node_id == peer.id)
-                    .flat_map(|task| {
-                        task.spec
-                            .ips
-                            .iter()
-                            .filter(|(network_id, ip)| {
-                                local_network_ids.contains(network_id.as_str())
-                                    && ip.parse::<std::net::Ipv4Addr>().is_ok()
-                            })
-                            .map(|(_, ip)| format!("{ip}/32"))
-                    })
-                    .collect();
-                allowed_ips.sort();
-                allowed_ips.dedup();
-                peers.push(WireGuardPeerAssignment {
-                    node_id: peer.id,
-                    public_key: public_key.clone(),
-                    allowed_ips,
-                    endpoint: peer.wg_endpoint.clone(),
-                    keepalive: 25,
-                    path: WireGuardPeerPath::Direct,
-                });
-            }
-            peers.sort_by_key(|peer| peer.node_id);
-            let value = WireGuardPeerSet {
-                peers,
-                networks: node_networks,
-            };
-            let value = minga_state::codec::encode_wire(&value)
-                .map_err(|error| SchedulerError::Serialization(error.to_string()))?;
+            let value = minga_state::codec::encode_wire(
+                peer_sets
+                    .get(&node.id)
+                    .expect("peer set built for each live node"),
+            )
+            .map_err(|error| SchedulerError::Serialization(error.to_string()))?;
             bus.put_assignment(&key, &value)
                 .await
                 .map_err(|error| SchedulerError::Bus(error.to_string()))?;
@@ -512,4 +452,214 @@ impl Scheduler {
             tokio::time::sleep(interval).await;
         }
     }
+}
+
+fn validate_manager_endpoints(nodes: &[ClusterNode]) -> Result<(), SchedulerError> {
+    if nodes.len() > 1
+        && nodes.iter().any(|node| {
+            node.role == NodeRole::Manager
+                && node.wg_endpoint.as_deref().map_or(true, |endpoint| {
+                    !minga_net::wireguard::validate_endpoint(endpoint)
+                })
+        })
+    {
+        return Err(SchedulerError::ManagerEndpointUnavailable);
+    }
+    Ok(())
+}
+
+fn build_wireguard_peer_sets(
+    nodes: &[ClusterNode],
+    tasks: &[Task],
+    networks: &[Network],
+) -> Result<HashMap<u64, WireGuardPeerSet>, SchedulerError> {
+    let node_by_id: HashMap<_, _> = nodes.iter().map(|node| (node.id, node)).collect();
+    let network_ids: HashSet<&str> = networks.iter().map(|network| network.id.as_str()).collect();
+    let mut task_ips: HashMap<u64, HashMap<String, Vec<String>>> = HashMap::new();
+    for task in tasks {
+        for (network_id, ip) in &task.spec.ips {
+            if network_ids.contains(network_id.as_str()) && ip.parse::<std::net::Ipv4Addr>().is_ok()
+            {
+                task_ips
+                    .entry(task.node_id)
+                    .or_default()
+                    .entry(network_id.clone())
+                    .or_default()
+                    .push(format!("{ip}/32"));
+            }
+        }
+    }
+    for node_networks in task_ips.values_mut() {
+        for ips in node_networks.values_mut() {
+            ips.sort();
+            ips.dedup();
+        }
+    }
+    let mut nat_workers_by_network: HashMap<&str, HashSet<u64>> = HashMap::new();
+    for task in tasks {
+        let Some(node) = node_by_id.get(&task.node_id) else {
+            continue;
+        };
+        if node.role != NodeRole::Worker || node.wg_endpoint.is_some() {
+            continue;
+        }
+        for network_id in task.spec.ips.keys() {
+            if task_ips
+                .get(&task.node_id)
+                .is_some_and(|node_networks| node_networks.contains_key(network_id.as_str()))
+            {
+                nat_workers_by_network
+                    .entry(network_id)
+                    .or_default()
+                    .insert(task.node_id);
+            }
+        }
+    }
+    let relay_network_ids: HashSet<String> = nat_workers_by_network
+        .into_iter()
+        .filter_map(|(network_id, workers)| (workers.len() > 1).then(|| network_id.to_owned()))
+        .collect();
+
+    let home_manager = if relay_network_ids.is_empty() {
+        None
+    } else {
+        Some(
+            nodes
+                .iter()
+                .filter(|node| {
+                    node.role == NodeRole::Manager
+                        && node.status == NodeStatus::Active
+                        && node.wg_public_key.is_some()
+                        && node
+                            .wg_endpoint
+                            .as_deref()
+                            .is_some_and(minga_net::wireguard::validate_endpoint)
+                })
+                .map(|node| node.id)
+                .min()
+                .ok_or(SchedulerError::RelayManagerUnavailable)?,
+        )
+    };
+
+    let mut peer_sets = HashMap::with_capacity(nodes.len());
+    for node in nodes {
+        let local_network_ids: HashSet<&str> = task_ips
+            .get(&node.id)
+            .into_iter()
+            .flat_map(|node_networks| node_networks.keys().map(String::as_str))
+            .collect();
+        let mut node_networks: Vec<_> = networks
+            .iter()
+            .filter_map(|network| {
+                network
+                    .subnet
+                    .as_ref()
+                    .map(|subnet| WireGuardNetworkAssignment {
+                        network_id: network.id.clone(),
+                        subnet: subnet.clone(),
+                        local: local_network_ids.contains(network.id.as_str()),
+                        relay: home_manager == Some(node.id)
+                            && relay_network_ids.contains(&network.id),
+                    })
+            })
+            .collect();
+        node_networks.sort_by(|left, right| left.network_id.cmp(&right.network_id));
+
+        let mut peers = Vec::new();
+        for peer in nodes {
+            if peer.id == node.id {
+                continue;
+            }
+            let peer_has_local_network = task_ips.get(&peer.id).is_some_and(|peer_networks| {
+                local_network_ids
+                    .iter()
+                    .any(|network_id| peer_networks.contains_key(*network_id))
+            });
+            let peer_is_manager = peer.role == NodeRole::Manager;
+            if node.role != NodeRole::Manager && !peer_is_manager && !peer_has_local_network {
+                continue;
+            }
+            let Some(public_key) = &peer.wg_public_key else {
+                continue;
+            };
+            let direct = node.wg_endpoint.is_some() || peer.wg_endpoint.is_some();
+            if node.role != NodeRole::Manager && peer.role == NodeRole::Worker && !direct {
+                continue;
+            }
+
+            let mut allowed_ips = HashSet::new();
+            for network_id in &local_network_ids {
+                if let Some(ips) = task_ips
+                    .get(&peer.id)
+                    .and_then(|peer_networks| peer_networks.get(*network_id))
+                {
+                    allowed_ips.extend(ips.iter().cloned());
+                }
+            }
+
+            let mut relayed = false;
+            if node.role == NodeRole::Manager
+                && home_manager == Some(node.id)
+                && peer.role == NodeRole::Worker
+                && peer.wg_endpoint.is_none()
+            {
+                if let Some(peer_networks) = task_ips.get(&peer.id) {
+                    for (network_id, ips) in peer_networks {
+                        if relay_network_ids.contains(network_id) {
+                            allowed_ips.extend(ips.iter().cloned());
+                            relayed = true;
+                        }
+                    }
+                }
+            } else if node.role == NodeRole::Worker
+                && peer.role == NodeRole::Manager
+                && home_manager == Some(peer.id)
+                && node.wg_endpoint.is_none()
+            {
+                for (target_node_id, target_networks) in &task_ips {
+                    let Some(target) = node_by_id.get(target_node_id) else {
+                        continue;
+                    };
+                    if *target_node_id == node.id
+                        || target.role != NodeRole::Worker
+                        || target.wg_endpoint.is_some()
+                    {
+                        continue;
+                    }
+                    for (network_id, ips) in target_networks {
+                        if relay_network_ids.contains(network_id)
+                            && local_network_ids.contains(network_id.as_str())
+                        {
+                            allowed_ips.extend(ips.iter().cloned());
+                            relayed = true;
+                        }
+                    }
+                }
+            }
+
+            let mut allowed_ips: Vec<_> = allowed_ips.into_iter().collect();
+            allowed_ips.sort();
+            let mut peer = WireGuardPeerAssignment {
+                node_id: peer.id,
+                public_key: public_key.clone(),
+                allowed_ips,
+                endpoint: peer.wg_endpoint.clone(),
+                keepalive: if node.wg_endpoint.is_none() { 25 } else { 0 },
+                path: WireGuardPeerPath::Direct,
+            };
+            if relayed {
+                peer.path = WireGuardPeerPath::Relay;
+            }
+            peers.push(peer);
+        }
+        peers.sort_by_key(|peer| peer.node_id);
+        peer_sets.insert(
+            node.id,
+            WireGuardPeerSet {
+                peers,
+                networks: node_networks,
+            },
+        );
+    }
+    Ok(peer_sets)
 }

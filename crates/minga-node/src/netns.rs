@@ -838,6 +838,10 @@ impl NetworkSetup {
         networks: &[minga_net::wireguard::WireGuardNetworkAssignment],
     ) -> Result<(), NetError> {
         let wg = minga_net::wireguard::WG_INTERFACE_NAME;
+        if networks.iter().any(|network| network.relay) {
+            // Linux resets per-interface IPv4 settings when ip_forward changes.
+            run("sysctl", &["-w", "net.ipv4.ip_forward=1"]).await?;
+        }
         for bridge in minga_bridges().await? {
             run_tolerated(
                 "sysctl",
@@ -848,9 +852,13 @@ impl NetworkSetup {
 
         let mut local_bridges = Vec::new();
         let mut remote_subnets = Vec::new();
+        let mut relay_subnets = Vec::new();
         let mut rules = Vec::with_capacity(networks.len() * 2 + 2);
         for network in networks {
             let subnet = subnet_for(&network.network_id, Some(&network.subnet))?;
+            if network.relay {
+                relay_subnets.push(subnet.to_string());
+            }
             if !network.local {
                 remote_subnets.push(subnet.to_string());
                 continue;
@@ -898,6 +906,20 @@ impl NetworkSetup {
                     "DROP".to_string(),
                 ]);
             }
+        }
+        for subnet in &relay_subnets {
+            rules.push(vec![
+                "-i".to_string(),
+                wg.to_string(),
+                "-o".to_string(),
+                wg.to_string(),
+                "-s".to_string(),
+                subnet.clone(),
+                "-d".to_string(),
+                subnet.clone(),
+                "-j".to_string(),
+                "ACCEPT".to_string(),
+            ]);
         }
         rules.push(["-o", wg, "-j", "DROP"].map(str::to_owned).to_vec());
         rules.push(["-i", wg, "-j", "DROP"].map(str::to_owned).to_vec());

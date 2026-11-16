@@ -32,6 +32,10 @@
   `--wg-mtu` provide per-node interface settings. The interface helper leaves
   `minga-wg0` absent when the peer set is empty; `minga net` no longer accepts
   or prints per-network WireGuard ports.
+- NAT-isolated workers without a direct path relay overlay traffic through the
+  lowest-ID healthy manager. Multi-node managers require a reachable
+  `--wg-endpoint`; relays decrypt and re-encrypt traffic and can inspect
+  container payloads.
 
 
 ## [1.2.0] — 2026-11-13

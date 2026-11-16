@@ -119,6 +119,9 @@ pub struct WireGuardNetworkAssignment {
     pub subnet: String,
     /// This node hosts at least one task on the network.
     pub local: bool,
+    /// This manager forwards packets between peers on this overlay network.
+    #[serde(default)]
+    pub relay: bool,
 }
 
 /// Node-scoped peer and network-route assignment stored in MINGA_ASSIGN.
