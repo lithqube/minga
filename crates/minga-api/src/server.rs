@@ -36,6 +36,15 @@ struct TokenAuthenticated;
 
 #[derive(Clone, Copy)]
 struct InvalidClientIdentity;
+
+/// How the caller proved who they are.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Source {
+    Token,
+    Certificate,
+    /// A tokenless direct client on a cluster whose only tenant is `default`.
+    Legacy,
+}
 /// Combined state for all routes.
 #[derive(Clone)]
 struct ApiState {
@@ -86,15 +95,14 @@ async fn authenticate(
     mut req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
-    let (caller, token_valid) = match resolve_caller(&state, req.headers(), req.extensions()).await
-    {
+    let (caller, source) = match resolve_caller(&state, req.headers(), req.extensions()).await {
         Ok(resolved) => resolved,
         Err(denied) => return denied,
     };
-    if let Err(denied) = authorize(&caller, req.method(), req.uri().path()) {
+    if let Err(denied) = authorize(&caller, source, req.method(), req.uri().path()) {
         return denied;
     }
-    if token_valid {
+    if source == Source::Token {
         req.extensions_mut().insert(TokenAuthenticated);
     }
     req.extensions_mut().insert(caller);
@@ -129,13 +137,12 @@ async fn sole_default_tenant(store: &StateStore) -> Result<bool, axum::response:
 
 // The Err is the HTTP reply itself, built at most once per request.
 #[allow(clippy::result_large_err)]
-/// Resolves who is calling. The flag is true when the configured token was
-/// presented.
+/// Resolves who is calling and how they proved it.
 async fn resolve_caller(
     state: &ApiState,
     headers: &axum::http::HeaderMap,
     extensions: &axum::http::Extensions,
-) -> Result<(Caller, bool), axum::response::Response> {
+) -> Result<(Caller, Source), axum::response::Response> {
     let token_valid = state.auth_token.as_deref().is_some_and(|expected| {
         headers
             .get(axum::http::header::AUTHORIZATION)
@@ -153,7 +160,7 @@ async fn resolve_caller(
             tenant_id,
             cluster_operator: true,
         };
-        return Ok((caller, true));
+        return Ok((caller, Source::Token));
     }
     if extensions.get::<InvalidClientIdentity>().is_some() {
         return Err(auth_forbidden("client certificate identity is invalid; reissue it with one CN, one OU, and at most one O"));
@@ -188,7 +195,7 @@ async fn resolve_caller(
             tenant_id,
             cluster_operator,
         };
-        return Ok((caller, false));
+        return Ok((caller, Source::Certificate));
     }
     if state.auth_token.is_some() {
         return Err(auth_unauthorized("authentication required"));
@@ -212,7 +219,7 @@ async fn resolve_caller(
             tenant_id: Some(DEFAULT_TENANT_ID.to_owned()),
             cluster_operator: false,
         };
-        return Ok((caller, false));
+        return Ok((caller, Source::Legacy));
     }
     Err(auth_forbidden(
         "no tenant identity is available; reissue the client certificate with the tenant id in O",
@@ -225,6 +232,7 @@ async fn resolve_caller(
 /// the role the operation requires: the `O=*` certificate does not lift it.
 fn authorize(
     caller: &Caller,
+    source: Source,
     method: &axum::http::Method,
     path: &str,
 ) -> Result<(), axum::response::Response> {
@@ -233,7 +241,13 @@ fn authorize(
             "a certificate for a specific tenant is required to access tenant resources",
         ));
     }
-    if cluster_operator_path(path) && !caller.cluster_operator {
+    // The Docker CLI cannot send a token, and a sole-tenant cluster has nothing
+    // to hide from its one tenant, so `docker info` / `docker node ls` and
+    // health probes keep working there. Writes and `/minga/*` stay operator-only.
+    let legacy_read = source == Source::Legacy
+        && matches!(*method, axum::http::Method::GET | axum::http::Method::HEAD)
+        && !path.starts_with("/minga/");
+    if cluster_operator_path(path) && !caller.cluster_operator && !legacy_read {
         return Err(auth_forbidden("cluster operator identity required"));
     }
     if !caller.role.permits(request_minimum_role(method, path)) {
@@ -905,6 +919,45 @@ mod tests {
                 assert_eq!(status, StatusCode::FORBIDDEN, "{role:?} on {uri}");
             }
         }
+    }
+
+    #[tokio::test]
+    async fn tokenless_sole_tenant_caller_reads_inventory_but_cannot_administer() {
+        let (_router, store, _dir) = admin_router().await;
+        let router = build_router_with_auth(store.clone(), Arc::new(ReadyState::new()), None);
+        let call = |method: &'static str, uri: &'static str| {
+            let router = router.clone();
+            async move {
+                let req = Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header("Content-Type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap();
+                send_request(router, req).await.0
+            }
+        };
+        assert_eq!(call("GET", "/v1.41/info").await, StatusCode::OK);
+        assert_eq!(call("GET", "/v1.41/nodes").await, StatusCode::OK);
+        assert_eq!(
+            call("POST", "/v1.41/nodes/1/update").await,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(call("GET", "/minga/tenants").await, StatusCode::FORBIDDEN);
+        assert_eq!(call("POST", "/minga/tenants").await, StatusCode::FORBIDDEN);
+
+        // A second tenant ends the compatibility access.
+        store
+            .upsert_tenant(minga_state::types::Tenant {
+                id: "tenant-a".into(),
+                name: "A".into(),
+                quotas: Default::default(),
+                created_at: 0,
+            })
+            .await
+            .unwrap();
+        assert_eq!(call("GET", "/v1.41/info").await, StatusCode::FORBIDDEN);
+        assert_eq!(call("GET", "/v1.41/nodes").await, StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]
