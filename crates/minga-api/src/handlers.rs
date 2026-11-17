@@ -351,6 +351,7 @@ pub async fn import_state(
     let services = snapshot.services.len();
     app.store.import(snapshot, q.overwrite).await?;
     tracing::info!(
+        tenant = %tenant_id,
         services,
         overwrite = q.overwrite,
         "tenant state imported via API"
@@ -786,7 +787,7 @@ pub async fn create_service(
             other => ApiError::from(other),
         })?;
 
-    tracing::info!(service = %svc.id, image = %svc.image, "service created via API");
+    tracing::info!(tenant = %tenant_id, service = %svc.id, image = %svc.image, "service created via API");
 
     Ok((
         StatusCode::CREATED,
@@ -856,7 +857,7 @@ pub async fn delete_service(
 
     app.store.remove_service(svc.id.clone()).await?;
 
-    tracing::info!(service = %svc.id, "service removed via API");
+    tracing::info!(tenant = %tenant_id, service = %svc.id, "service removed via API");
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -926,7 +927,7 @@ pub async fn update_service(
             other => ApiError::from(other),
         })?;
 
-    tracing::info!(service = %svc.id, "service updated via API");
+    tracing::info!(tenant = %tenant_id, service = %svc.id, "service updated via API");
 
     Ok(ok_message(""))
 }
@@ -1143,7 +1144,7 @@ pub async fn create_network(
     }
     app.store.upsert_network(net.clone()).await?;
 
-    tracing::info!(network = %net.id, driver = %net.driver, "network created via API");
+    tracing::info!(tenant = %tenant_id, network = %net.id, driver = %net.driver, "network created via API");
 
     Ok((
         StatusCode::CREATED,
@@ -1187,7 +1188,7 @@ pub async fn delete_network(
 
     app.store.remove_network(net.id.clone()).await?;
 
-    tracing::info!(network = %net.id, "network removed via API");
+    tracing::info!(tenant = %tenant_id, network = %net.id, "network removed via API");
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -1254,7 +1255,7 @@ pub async fn create_secret(
     secret.tenant_id = tenant_id.to_owned();
     app.store.upsert_secret(secret.clone()).await?;
 
-    tracing::info!(secret = %secret.id, "secret created via API");
+    tracing::info!(tenant = %tenant_id, secret = %secret.id, "secret created via API");
 
     Ok((
         StatusCode::CREATED,
@@ -1295,7 +1296,7 @@ pub async fn delete_secret(
 
     app.store.remove_secret(secret.id.clone()).await?;
 
-    tracing::info!(secret = %secret.id, "secret removed via API");
+    tracing::info!(tenant = %tenant_id, secret = %secret.id, "secret removed via API");
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -1347,7 +1348,7 @@ pub async fn create_config(
     config.tenant_id = tenant_id.to_owned();
     app.store.upsert_config(config.clone()).await?;
 
-    tracing::info!(config = %config.id, "config created via API");
+    tracing::info!(tenant = %tenant_id, config = %config.id, "config created via API");
 
     Ok((
         StatusCode::CREATED,
@@ -1388,7 +1389,7 @@ pub async fn delete_config(
 
     app.store.remove_config(config.id.clone()).await?;
 
-    tracing::info!(config = %config.id, "config removed via API");
+    tracing::info!(tenant = %tenant_id, config = %config.id, "config removed via API");
 
     Ok(StatusCode::NO_CONTENT)
 }
