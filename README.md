@@ -322,10 +322,11 @@ Requirements: Rust 1.80+ with `rustfmt` and `clippy`, and `nats-server` for the 
 
 Next, in order (rationale in [docs/architecture.md](docs/architecture.md)):
 
-1. Managers-only Raft: workers become pure JetStream clients, liveness moves to `MINGA_LEASES`, and nodes can join a running cluster.
-2. A multi-node WireGuard mesh on top of the per-node data plane.
+1. ~~Managers-only Raft: workers become pure JetStream clients, liveness moves to `MINGA_LEASES`, and nodes can join a running cluster.~~ Done.
+2. A multi-node WireGuard mesh on top of the per-node data plane. The mesh, the NAT relay through managers and the ingress routing mesh are merged; the live proof with a NAT'ed worker on separate VMs is still open.
 3. ~~Registry credentials for image pull (an in-process pull that honors `--containerd-socket`).~~ Done in `v1.1.0`.
-4. Host capabilities for agent sandboxes: WASI, egress-only networking, host-injected workload identity, memory limits.
+4. Tenant isolation ([ADR 0008](docs/adr/0008-multi-tenancy.md)): the tenant is in the client certificate and the API is tenant-scoped. Next come nodes owned by one tenant, tenant segments in bus subjects and keys, and quotas.
+5. Host capabilities for agent sandboxes: WASI, egress-only networking, host-injected workload identity, memory limits.
 
 ## Documentation
 

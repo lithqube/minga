@@ -53,13 +53,13 @@ Sequential implementation for one developer: B (NATS TLS/transport boundary) →
 **Mode:** standard
 **Status:** Complete (PR #76)
 
-- [ ] 12-01 — ADR 0006: Workers leave Raft (no code)
-- [ ] 12-02 — Liveness and registration off Raft
-- [ ] 12-03 — Actual task state off Raft
-- [ ] 12-04 — Assignment KV, workers without a StateStore, one dispatch path, NATS subject permissions
-- [ ] 12-05 — Join and remove managers, cluster the managers' NATS sidecars (can run in parallel with 12-02…12-04)
-- [ ] 12-06 — Fold `minga api` into the manager
-- [ ] 12-07 — Live proof, docs, CHANGELOG, site roadmap
+- [x] 12-01 — ADR 0006: Workers leave Raft (no code)
+- [x] 12-02 — Liveness and registration off Raft
+- [x] 12-03 — Actual task state off Raft
+- [x] 12-04 — Assignment KV, workers without a StateStore, one dispatch path, NATS subject permissions
+- [x] 12-05 — Join and remove managers, cluster the managers' NATS sidecars (can run in parallel with 12-02…12-04)
+- [x] 12-06 — Fold `minga api` into the manager
+- [x] 12-07 — Live proof, docs, CHANGELOG, site roadmap
 
 ## Phase 13: WireGuard mesh and routing mesh
 **Goal:** Containers on different nodes reach each other over kernel WireGuard, with the same names and IPs, including edge workers behind NAT (relayed through managers). Published ports in Swarm's default `ingress` mode answer on every node.
@@ -67,14 +67,14 @@ Sequential implementation for one developer: B (NATS TLS/transport boundary) →
 **Requirements:** WG-ADR, WG-SUBNET, WG-KEYS, WG-PEERS, WG-NAT, WG-ISOL, WG-INGRESS, WG-PROOF
 **Plans:** `.planning/phases/13-wireguard-mesh/13-PLAN.md`
 **Mode:** standard
-**Status:** In progress
+**Status:** In progress — code complete through 13-06 (PRs #81, #83, #86); 13-07 needs a host with kernel WireGuard and `wg` tooling
 
 - [x] 13-01 — ADR 0007: WireGuard mesh and routing mesh (no code)
 - [x] 13-02 — Unique subnets and strict network `driver_opts` (independent of Phase 12)
 - [x] 13-03 — Node keys and the `minga-wg0` interface
-- [ ] 13-04 — Peer sets, /32 routes, proxy ARP, cross-node isolation
-- [ ] 13-05 — NAT traversal by relay through managers
-- [ ] 13-06 — Routing mesh (`mode: ingress` as in Swarm, cluster-wide port reservation)
+- [x] 13-04 — Peer sets, /32 routes, proxy ARP, cross-node isolation
+- [x] 13-05 — NAT traversal by relay through managers
+- [x] 13-06 — Routing mesh (`mode: ingress` as in Swarm, cluster-wide port reservation)
 - [ ] 13-07 — Live proof on VMs, iperf3 numbers, docs, CHANGELOG, site roadmap
 
 ## Phase 14: Supported NATS server line (tenancy T0)
@@ -83,13 +83,29 @@ Sequential implementation for one developer: B (NATS TLS/transport boundary) →
 **Requirements:** NATS-PIN, NATS-LEVEL, NATS-CI, NATS-UPGRADE, NATS-CAP, NATS-DOCS
 **Plans:** `.planning/phases/14-nats-supported-line/14-PLAN.md`
 **Mode:** standard
-**Status:** In progress (14-01 in PR)
+**Status:** Complete (PRs #87–#90)
 
-- [ ] 14-01 — Pin 2.15.3 in release, CI and test images; release-notes review 2.11–2.15
-- [ ] 14-02 — Read `api.level` on managers; warn below the 2.14 floor; worker ACL unchanged
-- [ ] 14-03 — Shared fail-closed test helper; cluster test on real binaries; CI matrix 2.14.10 / 2.15.3
+- [x] 14-01 — Pin 2.15.3 in release, CI and test images; release-notes review 2.11–2.15
+- [x] 14-02 — Read `api.level` on managers; warn below the 2.14 floor; worker ACL unchanged
+- [x] 14-03 — Shared fail-closed test helper; cluster test on real binaries; CI matrix 2.14.10 / 2.15.3
 - [x] 14-04 — Upgrade proof: 2.10.22 store dir on 2.15.3, rolling 3-server replacement, downgrade result
 - [x] 14-06 — Lift the 2.15 default cap of 1,000 consumers per stream on the assignment, status and lease buckets
-- [ ] 14-05 — CHANGELOG, CONTRIBUTING, ADR 0002/0008, topologies
+- [x] 14-05 — CHANGELOG, CONTRIBUTING, ADR 0002/0008, topologies
 
 **Release gate:** no `v*` tag and no manual Release run (it publishes the `edge` image) with 2.15.3 until both the consumer-cap fix (14-06, PR #89; it missed #87's squash merge) and the 14-04 upgrade proof are on `main`. 14-04 passed locally on 2026-11-16 (STATE.md).
+
+**Release gate lifted:** PRs #89 and #90 are on `main`, so a `v*` tag with 2.15.3 is allowed.
+
+## Phase 15: Tenant isolation (ADR 0008 T1–T5)
+**Goal:** Several customers share one cluster without sharing machines, bus credentials, secret values or network peers. A tenant never learns that another tenant's object exists, and a node serves exactly one tenant.
+**Depends on:** Phase 12 (bus registration and `MINGA_ASSIGN` permissions), Phase 14 (T0, the supported NATS line).
+**Requirements:** TEN-STATE, TEN-IDENTITY, TEN-SCOPE, TEN-OPERATOR, TEN-NODE, TEN-BUS, TEN-QUOTA
+**Plans:** `docs/adr/0008-multi-tenancy.md` (the delivery list is the plan; the ADR's tenancy checklist governs every change)
+**Mode:** standard
+**Status:** In progress — T1 and T2 merged (PRs #92, #93, #94); T3 is next
+
+- [x] T1 — Tenant as desired state: the `Tenant` type, quotas, the replicated `default` tenant, cluster-operator CRUD
+- [x] T2 — Identity and API scoping: the tenant in the client certificate, tenant-filtered routes, 404 for foreign lookups, operator-only cluster routes
+- [ ] T3 — Node join tokens per tenant, the hard placement filter, managers without tenant workloads once a cluster has two tenants, WireGuard peer sets per tenant
+- [ ] T4 — Tenant segments in bus subjects and keys, the per-tenant worker ACL, per-tenant streams and buckets, operator/JWT mode with scoped signing keys
+- [ ] T5 — Quota enforcement and the per-tenant audit trail
