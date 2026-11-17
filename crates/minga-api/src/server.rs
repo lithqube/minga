@@ -167,7 +167,7 @@ async fn resolve_caller(
     }
     if let Some(identity) = extensions.get::<ClientIdentity>() {
         let role = identity.role.ok_or_else(|| {
-            auth_forbidden("client certificate has an unsupported role; reissue it with OU viewer, agent, deployer, or admin")
+            auth_forbidden("client certificate has an unsupported role; reissue it with OU viewer, deployer, or admin")
         })?;
         let (tenant_id, cluster_operator) = match identity.tenant.as_deref() {
             Some("*") => (None, true),
@@ -556,7 +556,11 @@ async fn serve_tls_bounded(
     limits: minga_telemetry::serve::Limits,
 ) {
     let slots = Arc::new(tokio::sync::Semaphore::new(limits.max_connections));
+    // Dropping the set, when the server's task is aborted, aborts every open
+    // connection with it.
+    let mut connections = tokio::task::JoinSet::new();
     loop {
+        while connections.try_join_next().is_some() {}
         let permit = match slots.clone().acquire_owned().await {
             Ok(permit) => permit,
             Err(_) => return,
@@ -571,7 +575,7 @@ async fn serve_tls_bounded(
         };
         let acceptor = acceptor.clone();
         let router = router.clone();
-        tokio::spawn(async move {
+        connections.spawn(async move {
             let _permit = permit;
             if tokio::time::timeout(limits.header_read_timeout, stream.readable())
                 .await
@@ -596,13 +600,14 @@ async fn serve_tls_bounded(
                 Some(identity) => TowerToHyperService::new(router.layer(Extension(identity))),
                 None => TowerToHyperService::new(router.layer(Extension(InvalidClientIdentity))),
             };
-            let mut builder = auto::Builder::new(TokioExecutor::new());
+            // No ALPN is offered and the Docker client speaks HTTP/1.1, so
+            // HTTP/2 (and its stream and keepalive limits) is not served here.
+            let mut builder = auto::Builder::new(TokioExecutor::new()).http1_only();
             builder
                 .http1()
                 .timer(TokioTimer::new())
                 .header_read_timeout(limits.header_read_timeout)
                 .max_buf_size(limits.max_buf_size);
-            builder.http2().timer(TokioTimer::new());
             if let Err(error) = builder
                 .serve_connection_with_upgrades(TokioIo::new(stream), service)
                 .await
@@ -612,6 +617,7 @@ async fn serve_tls_bounded(
         });
     }
 }
+
 /// The API server. Owns the router, the TCP listener task and the
 /// readiness probe.
 pub struct ApiServer {
@@ -902,7 +908,7 @@ mod tests {
             ),
             ("/v1.41/nodes/1/update", "{}"),
         ];
-        for role in [ApiRole::Viewer, ApiRole::Deployer, ApiRole::Agent] {
+        for role in [ApiRole::Viewer, ApiRole::Deployer] {
             for (uri, body) in writes {
                 let mut req = Request::builder()
                     .method("POST")
@@ -958,6 +964,158 @@ mod tests {
             .unwrap();
         assert_eq!(call("GET", "/v1.41/info").await, StatusCode::FORBIDDEN);
         assert_eq!(call("GET", "/v1.41/nodes").await, StatusCode::FORBIDDEN);
+    }
+
+    fn test_ca() -> (rcgen::Certificate, rcgen::KeyPair) {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "test-ca");
+        (params.self_signed(&key).unwrap(), key)
+    }
+
+    fn test_leaf(
+        ca: &(rcgen::Certificate, rcgen::KeyPair),
+        sans: &[&str],
+        subject: &[(rcgen::DnType, &str)],
+        usage: rcgen::ExtendedKeyUsagePurpose,
+    ) -> (rcgen::Certificate, rcgen::KeyPair) {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let mut params =
+            rcgen::CertificateParams::new(sans.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+                .unwrap();
+        for (kind, value) in subject {
+            params.distinguished_name.push(kind.clone(), *value);
+        }
+        params.extended_key_usages.push(usage);
+        let cert = params.signed_by(&key, &ca.0, &ca.1).unwrap();
+        (cert, key)
+    }
+
+    /// One GET over a real TLS connection; `None` when the connection fails.
+    async fn tls_status(
+        addr: &str,
+        ca: &rcgen::Certificate,
+        client: Option<&(rcgen::Certificate, rcgen::KeyPair)>,
+        path: &str,
+    ) -> Option<u16> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(ca.der().clone()).unwrap();
+        let builder = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots);
+        let config = match client {
+            Some((cert, key)) => builder
+                .with_client_auth_cert(
+                    vec![cert.der().clone()],
+                    rustls::pki_types::PrivateKeyDer::try_from(key.serialize_der()).unwrap(),
+                )
+                .unwrap(),
+            None => builder.with_no_client_auth(),
+        };
+        let tcp = tokio::net::TcpStream::connect(addr).await.ok()?;
+        let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+        let mut tls = tokio_rustls::TlsConnector::from(Arc::new(config))
+            .connect(name, tcp)
+            .await
+            .ok()?;
+        let request =
+            format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+        tls.write_all(request.as_bytes()).await.ok()?;
+        let mut reply = Vec::new();
+        // A server that drops the connection mid-read leaves what it sent.
+        let _ = tls.read_to_end(&mut reply).await;
+        String::from_utf8_lossy(&reply)
+            .split_whitespace()
+            .nth(1)?
+            .parse()
+            .ok()
+    }
+
+    #[tokio::test]
+    async fn mtls_accepts_ca_signed_clients_and_maps_them_to_roles() {
+        use std::os::unix::fs::PermissionsExt;
+        let ca = test_ca();
+        let server = test_leaf(
+            &ca,
+            &["localhost"],
+            &[(rcgen::DnType::CommonName, "minga-api")],
+            rcgen::ExtendedKeyUsagePurpose::ServerAuth,
+        );
+        let client = |ou: &str| {
+            test_leaf(
+                &ca,
+                &[],
+                &[
+                    (rcgen::DnType::CommonName, "ci"),
+                    (rcgen::DnType::OrganizationalUnitName, ou),
+                    (rcgen::DnType::OrganizationName, "default"),
+                ],
+                rcgen::ExtendedKeyUsagePurpose::ClientAuth,
+            )
+        };
+        let files = tempfile::tempdir().unwrap();
+        let write = |name: &str, pem: String, mode: u32| {
+            let path = files.path().join(name);
+            std::fs::write(&path, pem).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+            path
+        };
+        let tls = ApiTlsConfig {
+            cert: write("server.pem", server.0.pem(), 0o644),
+            key: write("server-key.pem", server.1.serialize_pem(), 0o600),
+            client_ca: write("ca.pem", ca.0.pem(), 0o644),
+        };
+        let (_router, store, _dir) = admin_router().await;
+        let api = ApiServer::start_with_tls(store, "127.0.0.1:0", None, tls)
+            .await
+            .unwrap();
+        let addr = api.addr().to_owned();
+
+        let viewer = client("viewer");
+        assert_eq!(
+            tls_status(&addr, &ca.0, Some(&viewer), "/v1.41/version").await,
+            Some(200)
+        );
+        assert_eq!(
+            tls_status(&addr, &ca.0, Some(&viewer), "/v1.41/services").await,
+            Some(200)
+        );
+        // A tenant certificate is not a cluster operator.
+        assert_eq!(
+            tls_status(&addr, &ca.0, Some(&viewer), "/minga/tenants").await,
+            Some(403)
+        );
+        // An OU that is not a role is refused, not guessed at.
+        let unknown = client("agent");
+        assert_eq!(
+            tls_status(&addr, &ca.0, Some(&unknown), "/v1.41/version").await,
+            Some(403)
+        );
+        // A certificate from another CA, or none, never reaches the router.
+        let rogue_ca = test_ca();
+        let rogue = test_leaf(
+            &rogue_ca,
+            &[],
+            &[
+                (rcgen::DnType::CommonName, "ci"),
+                (rcgen::DnType::OrganizationalUnitName, "admin"),
+                (rcgen::DnType::OrganizationName, "default"),
+            ],
+            rcgen::ExtendedKeyUsagePurpose::ClientAuth,
+        );
+        assert_eq!(
+            tls_status(&addr, &ca.0, Some(&rogue), "/v1.41/version").await,
+            None
+        );
+        assert_eq!(tls_status(&addr, &ca.0, None, "/v1.41/version").await, None);
+        api.shutdown();
     }
 
     #[tokio::test]
