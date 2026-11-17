@@ -812,7 +812,7 @@ async fn docker_cli_service_ls_via_testcontainer() {
 }
 
 #[tokio::test]
-async fn docker_cli_node_ls_via_testcontainer() {
+async fn docker_cli_node_ls_requires_operator_identity() {
     if !docker_available().await {
         eprintln!("skipping: Docker daemon not available");
         return;
@@ -833,13 +833,13 @@ async fn docker_cli_node_ls_via_testcontainer() {
     };
     eprintln!("docker node ls output:\n{output}");
     assert!(
-        output.contains("HOSTNAME") || output.contains("ID"),
-        "docker node ls should list nodes, got: {output}"
+        output.contains("cluster operator identity required"),
+        "docker node ls should require an operator identity, got: {output}"
     );
 }
 
 #[tokio::test]
-async fn docker_cli_info_via_testcontainer() {
+async fn docker_cli_info_requires_operator_identity() {
     if !docker_available().await {
         eprintln!("skipping: Docker daemon not available");
         return;
@@ -863,8 +863,8 @@ async fn docker_cli_info_via_testcontainer() {
     };
     eprintln!("docker info output: {output}");
     assert!(
-        output.contains("active"),
-        "docker info should show Swarm active, got: {output}"
+        output.contains("cluster operator identity required"),
+        "docker info should require an operator identity, got: {output}"
     );
 }
 
