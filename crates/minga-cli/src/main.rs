@@ -863,42 +863,12 @@ fn valid_certificate_field(value: &str, max_len: usize) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }
 
-fn pem_certificate_der(pem: &[u8]) -> Option<Vec<u8>> {
-    let text = std::str::from_utf8(pem).ok()?;
-    let body = text
-        .split_once("-----BEGIN CERTIFICATE-----")?
-        .1
-        .split_once("-----END CERTIFICATE-----")?
-        .0;
-    let mut der = Vec::with_capacity(body.len() * 3 / 4);
-    let mut chunk = [0u8; 4];
-    let mut used = 0;
-    for byte in body.bytes().filter(|byte| !byte.is_ascii_whitespace()) {
-        chunk[used] = match byte {
-            b'A'..=b'Z' => byte - b'A',
-            b'a'..=b'z' => byte - b'a' + 26,
-            b'0'..=b'9' => byte - b'0' + 52,
-            b'+' => 62,
-            b'/' => 63,
-            b'=' => 64,
-            _ => return None,
-        };
-        used += 1;
-        if used == 4 {
-            der.push((chunk[0] << 2) | (chunk[1] >> 4));
-            if chunk[2] != 64 {
-                der.push((chunk[1] << 4) | (chunk[2] >> 2));
-            }
-            if chunk[3] != 64 {
-                der.push((chunk[2] << 6) | chunk[3]);
-            }
-            if chunk[2] == 64 || chunk[3] == 64 {
-                break;
-            }
-            used = 0;
-        }
-    }
-    (used == 0 && !der.is_empty()).then_some(der)
+/// Every certificate in a PEM bundle, as DER.
+fn pem_certificates(mut pem: &[u8]) -> Vec<Vec<u8>> {
+    rustls_pemfile::certs(&mut pem)
+        .filter_map(Result::ok)
+        .map(|cert| cert.as_ref().to_vec())
+        .collect()
 }
 
 fn write_new_file(
@@ -918,28 +888,10 @@ fn write_new_file(
 }
 
 fn set_client_validity(params: &mut rcgen::CertificateParams) {
-    let today = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("system clock is after the Unix epoch")
-        .as_secs() as i64
-        / 86_400;
-    let date = |days: i64| {
-        let z = days + 719_468;
-        let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-        let day_of_era = z - era * 146_097;
-        let year_of_era =
-            (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
-        let year = year_of_era + era * 400;
-        let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
-        let month_prime = (5 * day_of_year + 2) / 153;
-        let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
-        let month = month_prime + if month_prime < 10 { 3 } else { -9 };
-        (year + i64::from(month <= 2), month, day)
-    };
-    let (year, month, day) = date(today - 1);
-    params.not_before = rcgen::date_time_ymd(year as i32, month as u8, day as u8);
-    let (year, month, day) = date(today + 29);
-    params.not_after = rcgen::date_time_ymd(year as i32, month as u8, day as u8);
+    // shortcut: fixed 30-day validity with no revocation, add --days and a CRL when rotation is needed.
+    let now = time::OffsetDateTime::now_utc();
+    params.not_before = now - time::Duration::days(1);
+    params.not_after = now + time::Duration::days(29);
 }
 
 fn run_tls(cmd: TlsCommand) -> ExitCode {
@@ -1139,8 +1091,13 @@ fn run_tls(cmd: TlsCommand) -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
-            let mut params = rcgen::CertificateParams::new(Vec::<String>::new())
-                .expect("client certificate params");
+            let mut params = match rcgen::CertificateParams::new(Vec::<String>::new()) {
+                Ok(params) => params,
+                Err(error) => {
+                    eprintln!("error: building client certificate: {error}");
+                    return ExitCode::FAILURE;
+                }
+            };
             set_client_validity(&mut params);
             params.distinguished_name = rcgen::DistinguishedName::new();
             params
@@ -1287,9 +1244,10 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
-            let same_der = pem_certificate_der(&raft_pem)
-                .zip(pem_certificate_der(&client_pem))
-                .is_some_and(|(raft, client)| raft == client);
+            let raft_certs = pem_certificates(&raft_pem);
+            let same_der = pem_certificates(&client_pem)
+                .iter()
+                .any(|cert| raft_certs.contains(cert));
             if raft_pem == client_pem || same_der {
                 eprintln!(
                     "error: --api-client-ca must not be the Raft CA; use a separate API client CA"
@@ -1642,14 +1600,18 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
                  gets unauthenticated default-tenant access. Set --api-token or configure API client TLS"
             );
         }
-        let api_tls =
-            (api_tls_count == api_tls_parts.len()).then(|| minga_api::server::ApiTlsConfig {
-                cert: PathBuf::from(args.api_tls_cert.as_deref().expect("TLS fields validated")),
-                key: PathBuf::from(args.api_tls_key.as_deref().expect("TLS fields validated")),
-                client_ca: PathBuf::from(
-                    args.api_client_ca.as_deref().expect("TLS fields validated"),
-                ),
-            });
+        let api_tls = match (
+            args.api_tls_cert.as_deref(),
+            args.api_tls_key.as_deref(),
+            args.api_client_ca.as_deref(),
+        ) {
+            (Some(cert), Some(key), Some(client_ca)) => Some(minga_api::server::ApiTlsConfig {
+                cert: PathBuf::from(cert),
+                key: PathBuf::from(key),
+                client_ca: PathBuf::from(client_ca),
+            }),
+            _ => None,
+        };
         match minga_api::ApiServer::start_with_bus_and_auth_and_tls(
             state
                 .as_ref()

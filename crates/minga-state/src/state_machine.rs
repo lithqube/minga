@@ -119,6 +119,29 @@ fn tenant_has_records<T: DeserializeOwned>(
     Ok(false)
 }
 
+/// Whether `id` already exists under a tenant other than `tenant_id`. Called
+/// inside the write transaction, before the table is opened for writing, so
+/// two API writes that both passed admission cannot take over each other's
+/// object.
+#[allow(clippy::result_large_err)]
+fn owned_by_other_tenant<T: DeserializeOwned>(
+    tx: &redb::WriteTransaction,
+    definition: TableDefinition<&str, &[u8]>,
+    id: &str,
+    tenant_id: &str,
+    tenant_of: impl Fn(&T) -> &str,
+) -> Result<bool, StorageError<u64>> {
+    let table = tx.open_table(definition).map_err(sm_io_err)?;
+    let Some(raw) = table.get(id).map_err(sm_io_err)? else {
+        return Ok(false);
+    };
+    let record: T = crate::codec::decode(raw.value())
+        .map_err(|e| sm_storage_err(ErrorSubject::Store, ErrorVerb::Read, e))?;
+    Ok(tenant_of(&record) != tenant_id)
+}
+
+const NAME_IN_USE: &str = "name is already in use";
+
 #[allow(clippy::result_large_err)]
 fn tenant_has_resources(
     tx: &redb::WriteTransaction,
@@ -322,6 +345,12 @@ impl RedbStateMachine {
                         others.push(other);
                     }
                 }
+                if stored
+                    .as_ref()
+                    .is_some_and(|stored| stored.tenant_id != svc.tenant_id)
+                {
+                    return Ok(StateResponse::Conflict(NAME_IN_USE.into()));
+                }
                 // A write that keeps the stored ports (a rollout or rollback
                 // step) passes, so state from before this rule never wedges.
                 let ports_unchanged = stored.is_some_and(|stored| stored.ports == svc.ports);
@@ -355,6 +384,15 @@ impl RedbStateMachine {
                 Ok(StateResponse::Ok)
             }
             StateCommand::UpsertNetwork(net) => {
+                if owned_by_other_tenant(
+                    tx,
+                    NETWORKS_TABLE,
+                    &net.id,
+                    &net.tenant_id,
+                    |n: &Network| &n.tenant_id,
+                )? {
+                    return Ok(StateResponse::Conflict(NAME_IN_USE.into()));
+                }
                 let mut t = tx.open_table(NETWORKS_TABLE).map_err(sm_io_err)?;
                 let bytes = crate::codec::encode(net)
                     .map_err(|e| sm_storage_err(ErrorSubject::Store, ErrorVerb::Write, e))?;
@@ -381,6 +419,11 @@ impl RedbStateMachine {
                 Ok(StateResponse::Ok)
             }
             StateCommand::UpsertSecret(s) => {
+                if owned_by_other_tenant(tx, SECRETS_TABLE, &s.id, &s.tenant_id, |r: &Secret| {
+                    &r.tenant_id
+                })? {
+                    return Ok(StateResponse::Conflict(NAME_IN_USE.into()));
+                }
                 let mut t = tx.open_table(SECRETS_TABLE).map_err(sm_io_err)?;
                 let bytes = crate::codec::encode(s)
                     .map_err(|e| sm_storage_err(ErrorSubject::Store, ErrorVerb::Write, e))?;
@@ -394,6 +437,11 @@ impl RedbStateMachine {
                 Ok(StateResponse::Ok)
             }
             StateCommand::UpsertConfig(c) => {
+                if owned_by_other_tenant(tx, CONFIGS_TABLE, &c.id, &c.tenant_id, |r: &Config| {
+                    &r.tenant_id
+                })? {
+                    return Ok(StateResponse::Conflict(NAME_IN_USE.into()));
+                }
                 let mut t = tx.open_table(CONFIGS_TABLE).map_err(sm_io_err)?;
                 let bytes = crate::codec::encode(c)
                     .map_err(|e| sm_storage_err(ErrorSubject::Store, ErrorVerb::Write, e))?;

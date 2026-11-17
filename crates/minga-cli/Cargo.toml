@@ -23,6 +23,8 @@ minga-scheduler = { path = "../minga-scheduler" }
 minga-state = { path = "../minga-state" }
 minga-telemetry = { path = "../minga-telemetry" }
 rcgen.workspace = true
+rustls-pemfile.workspace = true
+time.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
