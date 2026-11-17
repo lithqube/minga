@@ -1,40 +1,53 @@
 use rustls::pki_types::CertificateDer;
 use x509_parser::prelude::parse_x509_certificate;
 
-/// A role encoded in a client certificate's subject OU.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// A role encoded in a client certificate's subject OU (ADR 0005).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ApiRole {
     Viewer,
-    Agent,
     Deployer,
     Admin,
 }
 
 impl ApiRole {
+    /// Every role name a certificate's OU may carry.
+    pub const NAMES: [&'static str; 3] = ["viewer", "deployer", "admin"];
+
+    /// The role named by a certificate OU, if it is one of [`Self::NAMES`].
+    #[must_use]
     pub fn parse(value: &str) -> Option<Self> {
         match value {
             "viewer" => Some(Self::Viewer),
-            "agent" => Some(Self::Agent),
             "deployer" => Some(Self::Deployer),
             "admin" => Some(Self::Admin),
             _ => None,
         }
     }
 
-    pub fn permits(self, minimum: Self) -> bool {
-        match minimum {
-            Self::Viewer => matches!(self, Self::Viewer | Self::Deployer | Self::Admin),
-            Self::Deployer => matches!(self, Self::Deployer | Self::Admin),
-            Self::Admin => self == Self::Admin,
-            Self::Agent => self == Self::Agent,
+    /// The OU value for this role.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Viewer => "viewer",
+            Self::Deployer => "deployer",
+            Self::Admin => "admin",
         }
+    }
+
+    /// Whether this role may do what `minimum` requires. Roles are ordered:
+    /// deployer includes viewer, admin includes both.
+    #[must_use]
+    pub fn permits(self, minimum: Self) -> bool {
+        self >= minimum
     }
 }
 
 /// Identity fields parsed from a CA-verified client certificate.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientIdentity {
+    /// The certificate subject CN.
     pub name: String,
+    /// `None` when the OU is not a known role.
     pub role: Option<ApiRole>,
     /// `None` means the certificate has no O; `Some("*")` is a cluster operator.
     pub tenant: Option<String>,
@@ -77,13 +90,19 @@ impl ClientIdentity {
 /// longer the cluster's only tenant.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Caller {
+    /// The certificate CN, or `token` / `legacy-client`.
     pub name: String,
+    /// What the caller may do inside its scope.
     pub role: ApiRole,
+    /// The one tenant the caller may touch; `None` for a cluster operator.
     pub tenant_id: Option<String>,
+    /// May use cluster-wide endpoints (`/minga/*`, nodes, info).
     pub cluster_operator: bool,
 }
 
 impl Caller {
+    /// The caller's tenant, if it is confined to one.
+    #[must_use]
     pub fn tenant_id(&self) -> Option<&str> {
         self.tenant_id.as_deref()
     }

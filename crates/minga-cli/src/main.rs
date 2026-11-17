@@ -200,25 +200,6 @@ enum NodeCertificateRole {
     Worker,
 }
 
-#[derive(Clone, Copy, clap::ValueEnum)]
-enum ApiClientRole {
-    Viewer,
-    Agent,
-    Deployer,
-    Admin,
-}
-
-impl ApiClientRole {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Viewer => "viewer",
-            Self::Agent => "agent",
-            Self::Deployer => "deployer",
-            Self::Admin => "admin",
-        }
-    }
-}
-
 #[derive(Subcommand)]
 enum TlsCommand {
     /// Create a cluster CA: writes ca.pem and ca-key.pem.
@@ -257,8 +238,8 @@ enum TlsCommand {
         #[arg(long)]
         cn: String,
         /// API role encoded as the organizational unit.
-        #[arg(long, value_enum)]
-        role: ApiClientRole,
+        #[arg(long, value_parser = clap::builder::PossibleValuesParser::new(minga_api::auth::ApiRole::NAMES))]
+        role: String,
         /// Tenant ID encoded as the organization; use '*' for cluster operator.
         #[arg(long)]
         tenant: String,
