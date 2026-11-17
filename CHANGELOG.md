@@ -12,6 +12,10 @@
   During mixed-version NATS rollouts, rejected updates are logged and retried
   when managers reconnect after the server upgrade.
 
+- Desired-state resources now record their `tenant_id`; legacy state defaults
+  to `default`. Persisted and Raft wire format v4 migrates v2/v3 stores and
+  imports v2/v3 snapshots. Cluster nodes must upgrade together.
+
 - Existing Compose stacks with short-syntax ports now publish on every node
   by default. Managers project live backends through node-scoped bus
   assignments, and workers balance traffic with iptables DNAT/SNAT.

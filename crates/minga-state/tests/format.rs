@@ -1,12 +1,11 @@
 //! The persisted format: frozen fixtures and the format marker.
 //!
-//! `tests/fixtures/v<FORMAT_VERSION>/*.json` hold the JSON of every persisted
-//! type with every field filled in. They must keep decoding in every later
-//! build, and every key and value in them must still be written as is. A field
-//! added later with `#[serde(default)]` passes: the fixture is a subset of the
-//! new JSON. If a test here fails, a persisted type was renamed, removed or
-//! re-typed: bump `FORMAT_VERSION`, add a migration (see `codec.rs`) and write a
-//! new fixture directory. Never edit the fixtures of an existing version.
+//! `tests/fixtures/v<FORMAT_VERSION>/*.json` contain frozen examples of the
+//! persisted types. They must keep decoding in every later build, and every
+//! existing key and value must still be written as is. These fixtures detect
+//! shape changes but do not replace a format-version bump and migration.
+//! Additive fields need `#[serde(default)]` so older values can decode. Never
+//! edit the fixtures of an existing version.
 //!
 //! To write the fixtures of a new version:
 //! `MINGA_WRITE_FIXTURES=1 cargo test -p minga-state --test format`
@@ -14,12 +13,12 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
 
-use minga_state::codec::{self, FORMAT_KEY, FORMAT_VERSION, V2_FORMAT_VERSION};
+use minga_state::codec::{self, FORMAT_KEY, FORMAT_VERSION, V2_FORMAT_VERSION, V3_FORMAT_VERSION};
 use minga_state::types::{
-    AgentSpec, ClusterNode, FailureAction, Healthcheck, MountKind, NodeRole, NodeStatus,
-    PortMapping, PortMode, ReservedPort, ResourceSpec, RestartCondition, RestartPolicy, SecretRef,
-    Service, ServiceMode, ServiceMount, Task, TaskSpec, TaskState, UpdateOrder, UpdatePolicy,
-    WorkloadKind,
+    AgentSpec, ClusterNode, Config, FailureAction, Healthcheck, MountKind, Network, NodeRole,
+    NodeStatus, PortMapping, PortMode, ReservedPort, ResourceSpec, RestartCondition, RestartPolicy,
+    Secret, SecretRef, Service, ServiceMode, ServiceMount, Task, TaskSpec, TaskState, UpdateOrder,
+    UpdatePolicy, Volume, WorkloadKind,
 };
 use minga_state::{StateCommand, StateSnapshot, StateStore, TypeConfig};
 use openraft::{BasicNode, CommittedLeaderId, Entry, EntryPayload, LogId, Membership, Vote};
@@ -81,12 +80,15 @@ fn a_fixture_accepts_added_fields_and_rejects_changed_ones() {
 
 /// Compares `value` with its fixture, and decodes the fixture back.
 fn check<T: Serialize + DeserializeOwned>(name: &str, value: &T) {
-    let old_path = fixture_path_for_version(V2_FORMAT_VERSION, name);
-    if old_path.exists() {
-        let old = std::fs::read_to_string(&old_path)
-            .unwrap_or_else(|e| panic!("cannot read frozen fixture {}: {e}", old_path.display()));
-        let _: T = codec::decode(old.as_bytes())
-            .unwrap_or_else(|e| panic!("v2 fixture {name} no longer decodes: {e}"));
+    for version in [V2_FORMAT_VERSION, V3_FORMAT_VERSION] {
+        let old_path = fixture_path_for_version(version, name);
+        if old_path.exists() {
+            let old = std::fs::read_to_string(&old_path).unwrap_or_else(|e| {
+                panic!("cannot read frozen fixture {}: {e}", old_path.display())
+            });
+            let _: T = codec::decode(old.as_bytes())
+                .unwrap_or_else(|e| panic!("v{version} fixture {name} no longer decodes: {e}"));
+        }
     }
     let actual = serde_json::to_value(value).unwrap();
     let path = fixture_path(name);
@@ -224,6 +226,7 @@ fn port() -> PortMapping {
 fn service(id: &str) -> Service {
     Service {
         id: id.into(),
+        tenant_id: "default".into(),
         name: "web".into(),
         image: "docker.io/library/nginx:1.27".into(),
         replicas: 2,
@@ -334,6 +337,7 @@ fn service_fixture() {
 fn task_fixture() {
     let task = Task {
         id: "shop.web.1".into(),
+        tenant_id: "default".into(),
         service_id: "shop.web".into(),
         node_id: 3,
         state: TaskState::Running,
@@ -344,6 +348,111 @@ fn task_fixture() {
         last_exit_code: None,
     };
     check("task", &task);
+}
+
+#[test]
+fn tenant_owned_resource_fixtures() {
+    check(
+        "network",
+        &Network {
+            id: "shop_default".into(),
+            tenant_id: "default".into(),
+            name: "default".into(),
+            driver: "bridge".into(),
+            attachable: true,
+            subnet: Some("10.100.0.0/24".into()),
+            wg_port: Some(51820),
+        },
+    );
+    check(
+        "volume",
+        &Volume {
+            id: "shop_data".into(),
+            tenant_id: "default".into(),
+            name: "data".into(),
+            driver: "local".into(),
+        },
+    );
+    check(
+        "secret",
+        &Secret {
+            id: "shop_password".into(),
+            tenant_id: "default".into(),
+            name: "password".into(),
+        },
+    );
+    check(
+        "config",
+        &Config {
+            id: "shop_settings".into(),
+            tenant_id: "default".into(),
+            name: "settings".into(),
+        },
+    );
+}
+
+fn legacy_json<T: Serialize>(value: &T) -> serde_json::Value {
+    let mut value = serde_json::to_value(value).unwrap();
+    strip_tenant_fields(&mut value);
+    value
+}
+
+#[test]
+fn legacy_tenant_owned_records_default_to_default_tenant() {
+    let service: Service = serde_json::from_value(legacy_json(&service("shop.web"))).unwrap();
+    assert_eq!(service.tenant_id, "default");
+
+    let task = Task {
+        id: "shop.web.1".into(),
+        tenant_id: "tenant-a".into(),
+        service_id: "shop.web".into(),
+        node_id: 3,
+        state: TaskState::Running,
+        spec: task_spec(),
+        running_since_unix: None,
+        restarts: 0,
+        last_error: None,
+        last_exit_code: None,
+    };
+    let task: Task = serde_json::from_value(legacy_json(&task)).unwrap();
+    assert_eq!(task.tenant_id, "default");
+
+    let network = Network {
+        id: "shop_default".into(),
+        tenant_id: "tenant-a".into(),
+        name: "default".into(),
+        driver: "bridge".into(),
+        attachable: true,
+        subnet: None,
+        wg_port: None,
+    };
+    let network: Network = serde_json::from_value(legacy_json(&network)).unwrap();
+    assert_eq!(network.tenant_id, "default");
+
+    let volume = Volume {
+        id: "shop_data".into(),
+        tenant_id: "tenant-a".into(),
+        name: "data".into(),
+        driver: "local".into(),
+    };
+    let volume: Volume = serde_json::from_value(legacy_json(&volume)).unwrap();
+    assert_eq!(volume.tenant_id, "default");
+
+    let secret = Secret {
+        id: "shop_password".into(),
+        tenant_id: "tenant-a".into(),
+        name: "password".into(),
+    };
+    let secret: Secret = serde_json::from_value(legacy_json(&secret)).unwrap();
+    assert_eq!(secret.tenant_id, "default");
+
+    let config = Config {
+        id: "shop_settings".into(),
+        tenant_id: "tenant-a".into(),
+        name: "settings".into(),
+    };
+    let config: Config = serde_json::from_value(legacy_json(&config)).unwrap();
+    assert_eq!(config.tenant_id, "default");
 }
 
 /// The failure reason was added after v2 was frozen: a task written without
@@ -448,6 +557,7 @@ fn strip_v3_fields(value: &mut serde_json::Value) {
     match value {
         serde_json::Value::Object(object) => {
             object.remove("reserved_ports");
+            object.remove("tenant_id");
             if let Some(serde_json::Value::Array(ports)) = object.get_mut("ports") {
                 for port in ports {
                     if let serde_json::Value::Object(port) = port {
@@ -468,7 +578,28 @@ fn strip_v3_fields(value: &mut serde_json::Value) {
     }
 }
 
-fn downgrade_string_table(tx: &redb::WriteTransaction, definition: TableDefinition<&str, &[u8]>) {
+fn strip_tenant_fields(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(object) => {
+            object.remove("tenant_id");
+            for nested in object.values_mut() {
+                strip_tenant_fields(nested);
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for nested in values {
+                strip_tenant_fields(nested);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn downgrade_string_table(
+    tx: &redb::WriteTransaction,
+    definition: TableDefinition<&str, &[u8]>,
+    version: u8,
+) {
     let records = {
         let table = tx.open_table(definition).unwrap();
         table
@@ -485,13 +616,17 @@ fn downgrade_string_table(tx: &redb::WriteTransaction, definition: TableDefiniti
     };
     let mut table = tx.open_table(definition).unwrap();
     for (key, mut value) in records {
-        strip_v3_fields(&mut value);
+        if version == V3_FORMAT_VERSION {
+            strip_tenant_fields(&mut value);
+        } else {
+            strip_v3_fields(&mut value);
+        }
         let bytes = serde_json::to_vec(&value).unwrap();
         table.insert(key.as_str(), bytes.as_slice()).unwrap();
     }
 }
 
-fn downgrade_log_table(tx: &redb::WriteTransaction) {
+fn downgrade_log_table(tx: &redb::WriteTransaction, version: u8) {
     let records = {
         let table = tx.open_table(RAFT_LOGS).unwrap();
         table
@@ -508,7 +643,11 @@ fn downgrade_log_table(tx: &redb::WriteTransaction) {
     };
     let mut table = tx.open_table(RAFT_LOGS).unwrap();
     for (index, mut value) in records {
-        strip_v3_fields(&mut value);
+        if version == V3_FORMAT_VERSION {
+            strip_tenant_fields(&mut value);
+        } else {
+            strip_v3_fields(&mut value);
+        }
         let bytes = serde_json::to_vec(&value).unwrap();
         table.insert(index, bytes.as_slice()).unwrap();
     }
@@ -517,9 +656,9 @@ fn downgrade_log_table(tx: &redb::WriteTransaction) {
 fn prepare_v2_state(file: &std::path::Path) {
     let db = Database::create(file).unwrap();
     let tx = db.begin_write().unwrap();
-    downgrade_string_table(&tx, SM_NODES);
-    downgrade_string_table(&tx, SM_SERVICES);
-    downgrade_string_table(&tx, SM_TASKS);
+    downgrade_string_table(&tx, SM_NODES, V2_FORMAT_VERSION);
+    downgrade_string_table(&tx, SM_SERVICES, V2_FORMAT_VERSION);
+    downgrade_string_table(&tx, SM_TASKS, V2_FORMAT_VERSION);
     tx.open_table(SM_META)
         .unwrap()
         .insert(FORMAT_KEY, [V2_FORMAT_VERSION].as_slice())
@@ -527,13 +666,35 @@ fn prepare_v2_state(file: &std::path::Path) {
     tx.commit().unwrap();
 }
 
+fn prepare_v3_state(file: &std::path::Path) {
+    let db = Database::create(file).unwrap();
+    let tx = db.begin_write().unwrap();
+    downgrade_string_table(&tx, SM_SERVICES, V3_FORMAT_VERSION);
+    tx.open_table(SM_META)
+        .unwrap()
+        .insert(FORMAT_KEY, [V3_FORMAT_VERSION].as_slice())
+        .unwrap();
+    tx.commit().unwrap();
+}
+
 fn prepare_v2_log(file: &std::path::Path) {
     let db = Database::create(file).unwrap();
     let tx = db.begin_write().unwrap();
-    downgrade_log_table(&tx);
+    downgrade_log_table(&tx, V2_FORMAT_VERSION);
     tx.open_table(RAFT_META)
         .unwrap()
         .insert(FORMAT_KEY, [V2_FORMAT_VERSION].as_slice())
+        .unwrap();
+    tx.commit().unwrap();
+}
+
+fn prepare_v3_log(file: &std::path::Path) {
+    let db = Database::create(file).unwrap();
+    let tx = db.begin_write().unwrap();
+    downgrade_log_table(&tx, V3_FORMAT_VERSION);
+    tx.open_table(RAFT_META)
+        .unwrap()
+        .insert(FORMAT_KEY, [V3_FORMAT_VERSION].as_slice())
         .unwrap();
     tx.commit().unwrap();
 }
@@ -584,6 +745,17 @@ fn has_ingress_port_mode(value: &serde_json::Value) -> bool {
     }
 }
 
+fn has_default_tenant(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Object(object) => {
+            object.get("tenant_id") == Some(&serde_json::json!("default"))
+                || object.values().any(has_default_tenant)
+        }
+        serde_json::Value::Array(values) => values.iter().any(has_default_tenant),
+        _ => false,
+    }
+}
+
 async fn open_error(path: &std::path::Path) -> String {
     match StateStore::open(1, "127.0.0.1:0", path, BTreeMap::new()).await {
         Ok(_) => panic!("opening must fail"),
@@ -612,6 +784,7 @@ async fn a_v2_state_file_is_rewritten_and_its_marker_advanced() {
         .unwrap();
     let service = store.get_service("shop.web").await.unwrap().unwrap();
     assert_eq!(service.ports[0].mode, PortMode::Ingress);
+    assert_eq!(service.tenant_id, "default");
     let node = store.get_node(3).await.unwrap().unwrap();
     assert!(node.reserved_ports.is_empty());
     store.shutdown().await.unwrap();
@@ -619,8 +792,29 @@ async fn a_v2_state_file_is_rewritten_and_its_marker_advanced() {
     assert_eq!(read_marker(&state_file, SM_META), Some(FORMAT_VERSION));
     let service = read_state_value(&state_file, SM_SERVICES, "shop.web");
     assert_eq!(service["ports"][0]["mode"], "ingress");
+    assert_eq!(service["tenant_id"], "default");
     let node = read_state_value(&state_file, SM_NODES, "3");
     assert_eq!(node["reserved_ports"], serde_json::json!([]));
+}
+
+#[tokio::test]
+async fn a_v3_state_file_defaults_legacy_records_to_the_default_tenant() {
+    let (_dir, path) = written_dir().await;
+    let state_file = path.join("state.redb");
+    prepare_v3_state(&state_file);
+
+    let store = StateStore::open(1, "127.0.0.1:0", &path, BTreeMap::new())
+        .await
+        .unwrap();
+    let service = store.get_service("shop.web").await.unwrap().unwrap();
+    assert_eq!(service.tenant_id, "default");
+    store.shutdown().await.unwrap();
+
+    assert_eq!(read_marker(&state_file, SM_META), Some(FORMAT_VERSION));
+    assert_eq!(
+        read_state_value(&state_file, SM_SERVICES, "shop.web")["tenant_id"],
+        "default"
+    );
 }
 
 #[tokio::test]
@@ -651,7 +845,40 @@ async fn a_v2_log_file_rewrites_entries_and_preserves_indices() {
 }
 
 #[tokio::test]
-async fn importing_a_v2_portable_snapshot_defaults_ports_and_exports_v3() {
+async fn a_v3_log_file_rewrites_entries_and_defaults_tenant_fields() {
+    let (_dir, path) = written_dir().await;
+    let log_file = path.join("raft_log.redb");
+    let indices: Vec<_> = read_log_values(&log_file)
+        .into_iter()
+        .map(|(index, _)| index)
+        .collect();
+    prepare_v3_log(&log_file);
+
+    let store = StateStore::open(1, "127.0.0.1:0", &path, BTreeMap::new())
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .get_service("shop.web")
+            .await
+            .unwrap()
+            .unwrap()
+            .tenant_id,
+        "default"
+    );
+    store.shutdown().await.unwrap();
+
+    assert_eq!(read_marker(&log_file, RAFT_META), Some(FORMAT_VERSION));
+    let entries = read_log_values(&log_file);
+    assert_eq!(
+        entries.iter().map(|(index, _)| *index).collect::<Vec<_>>(),
+        indices
+    );
+    assert!(entries.iter().any(|(_, value)| has_default_tenant(value)));
+}
+
+#[tokio::test]
+async fn importing_a_v2_portable_snapshot_defaults_fields_and_exports_current() {
     let (_dir, path) = written_dir().await;
     let store = StateStore::open(1, "127.0.0.1:0", &path, BTreeMap::new())
         .await
@@ -666,6 +893,27 @@ async fn importing_a_v2_portable_snapshot_defaults_ports_and_exports_v3() {
     store.import(snapshot, true).await.unwrap();
     let imported = store.get_service("shop.web").await.unwrap().unwrap();
     assert_eq!(imported.ports[0].mode, PortMode::Ingress);
+    assert_eq!(imported.tenant_id, "default");
+    assert_eq!(store.export().await.unwrap().format_version, FORMAT_VERSION);
+    store.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn importing_a_v3_portable_snapshot_defaults_tenant() {
+    let (_dir, path) = written_dir().await;
+    let store = StateStore::open(1, "127.0.0.1:0", &path, BTreeMap::new())
+        .await
+        .unwrap();
+
+    let mut old_json = serde_json::to_value(store.export().await.unwrap()).unwrap();
+    old_json["format_version"] = serde_json::json!(V3_FORMAT_VERSION);
+    strip_tenant_fields(&mut old_json);
+    let snapshot: StateSnapshot = serde_json::from_value(old_json).unwrap();
+    assert_eq!(snapshot.services[0].tenant_id, "default");
+
+    store.import(snapshot, true).await.unwrap();
+    let imported = store.get_service("shop.web").await.unwrap().unwrap();
+    assert_eq!(imported.tenant_id, "default");
     assert_eq!(store.export().await.unwrap().format_version, FORMAT_VERSION);
     store.shutdown().await.unwrap();
 }

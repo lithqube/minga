@@ -77,6 +77,7 @@ fn sample_node(id: u64, addr: &str) -> ClusterNode {
 fn sample_service(id: &str) -> Service {
     Service {
         id: id.to_string(),
+        tenant_id: "default".to_string(),
         name: id.to_string(),
         image: format!("registry.local/{id}:1.0"),
         replicas: 1,

@@ -156,6 +156,7 @@ mod tests {
     fn network(id: &str, subnet: Option<&str>) -> Network {
         Network {
             id: id.to_string(),
+            tenant_id: "default".to_string(),
             name: id.to_string(),
             driver: "overlay".to_string(),
             attachable: false,
@@ -167,6 +168,7 @@ mod tests {
     fn task(id: &str, ips: &[(&str, &str)]) -> Task {
         Task {
             id: id.to_string(),
+            tenant_id: "default".to_string(),
             service_id: "svc".to_string(),
             node_id: 1,
             state: TaskState::Running,

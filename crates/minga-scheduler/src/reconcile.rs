@@ -259,6 +259,7 @@ mod tests {
     fn svc(id: &str, replicas: u32) -> Service {
         Service {
             id: id.to_string(),
+            tenant_id: "default".to_string(),
             name: id.to_string(),
             image: "nginx:latest".to_string(),
             replicas,
@@ -298,6 +299,7 @@ mod tests {
     fn task(id: &str, service_id: &str, node_id: u64) -> Task {
         Task {
             id: format!("{id}.{}", rev()),
+            tenant_id: "default".to_string(),
             service_id: service_id.to_string(),
             node_id,
             state: TaskState::Running,

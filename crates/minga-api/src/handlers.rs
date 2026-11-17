@@ -1174,6 +1174,7 @@ mod tests {
         app.store
             .upsert_task(Task {
                 id: "web.1".to_string(),
+                tenant_id: "default".to_string(),
                 service_id: "web".to_string(),
                 node_id: 1,
                 state: TaskState::Running,

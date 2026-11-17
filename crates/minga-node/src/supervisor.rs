@@ -1858,6 +1858,7 @@ mod assignment_tests {
         let record = NetworkAssignment {
             network: minga_state::types::Network {
                 id: "network-1".to_string(),
+                tenant_id: "default".to_string(),
                 name: "network".to_string(),
                 driver: "bridge".to_string(),
                 attachable: true,

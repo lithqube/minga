@@ -25,6 +25,15 @@ pub type VolumeId = String;
 
 /// Secret identifier.
 pub type SecretId = String;
+/// Tenant identifier. Tenant IDs are stable and used as an isolation boundary.
+pub type TenantId = String;
+
+/// Tenant that owns all state written before tenant-aware deployments.
+pub const DEFAULT_TENANT_ID: &str = "default";
+
+fn default_tenant_id() -> TenantId {
+    DEFAULT_TENANT_ID.to_owned()
+}
 
 /// Config identifier.
 pub type ConfigId = String;
@@ -222,6 +231,9 @@ impl SecretRef {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Service {
     pub id: ServiceId,
+    /// Owning tenant; legacy records belong to the default tenant.
+    #[serde(default = "default_tenant_id")]
+    pub tenant_id: TenantId,
     pub name: String,
     /// Container image. Empty string for agent (WASM sandbox) services.
     pub image: String,
@@ -376,6 +388,9 @@ pub fn published_port_conflict<'a>(
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Task {
     pub id: TaskId,
+    /// Owning tenant; legacy records belong to the default tenant.
+    #[serde(default = "default_tenant_id")]
+    pub tenant_id: TenantId,
     pub service_id: ServiceId,
     pub node_id: NodeId,
     pub state: TaskState,
@@ -528,6 +543,9 @@ pub struct AgentSpec {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Network {
     pub id: NetworkId,
+    /// Owning tenant; legacy records belong to the default tenant.
+    #[serde(default = "default_tenant_id")]
+    pub tenant_id: TenantId,
     pub name: String,
     pub driver: String,
     pub attachable: bool,
@@ -593,6 +611,9 @@ pub struct NetworkDnsTask {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Volume {
     pub id: VolumeId,
+    /// Owning tenant; legacy records belong to the default tenant.
+    #[serde(default = "default_tenant_id")]
+    pub tenant_id: TenantId,
     pub name: String,
     pub driver: String,
 }
@@ -601,6 +622,9 @@ pub struct Volume {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Secret {
     pub id: SecretId,
+    /// Owning tenant; legacy records belong to the default tenant.
+    #[serde(default = "default_tenant_id")]
+    pub tenant_id: TenantId,
     pub name: String,
 }
 
@@ -608,6 +632,9 @@ pub struct Secret {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Config {
     pub id: ConfigId,
+    /// Owning tenant; legacy records belong to the default tenant.
+    #[serde(default = "default_tenant_id")]
+    pub tenant_id: TenantId,
     pub name: String,
 }
 
@@ -673,6 +700,7 @@ mod tests {
     fn service_roundtrip_with_agent() {
         let svc = Service {
             id: "stack.agent".to_string(),
+            tenant_id: "default".to_string(),
             name: "agent".to_string(),
             image: String::new(),
             replicas: 1,

@@ -19,7 +19,7 @@ Minga will run workloads for several customers on one cluster. Today, nothing se
 - `Tenant { id, name, quotas, created_at }` is desired state and goes through Raft.
 - Every stack, service, task, secret, config, network, volume, egress route, job, change request and budget has exactly one `tenant`.
 - Names are unique within a tenant, not across the cluster, so two tenants can each have a `db_password`.
-- **Upgrade:** a cluster created before this ADR gets one tenant, `default`, that owns everything. New fields are `#[serde(default)]` and default to `default`, so no format-version bump is needed. Frozen fixtures prove that old data loads into `default`.
+- **Upgrade:** a cluster created before this ADR gets one tenant, `default`, that owns everything. New fields use `#[serde(default)]` to decode old records, but persisted shape changes still require a format-version bump and migration. This rollout bumps format v3 to v4, rewrites state and Raft log values atomically, and accepts v2/v3 portable snapshots for import. Frozen fixtures from earlier versions remain unchanged.
 - **Application customers are a different thing.** The tenants of an *application*, such as a hotel served by a marketplace, are called **customers** in Minga. They are attribution labels inside one Minga tenant (agent-plane roadmap B5), never an isolation boundary.
 
 ### 2. Tenants are untrusted

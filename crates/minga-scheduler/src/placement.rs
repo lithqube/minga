@@ -273,6 +273,7 @@ pub fn place_service(
                 spec.ips = allocate_ips(&task_id, &mut ipams);
                 tasks.push(Task {
                     id: task_id,
+                    tenant_id: service.tenant_id.clone(),
                     service_id: service.id.clone(),
                     node_id: node.id,
                     state: TaskState::Pending,
@@ -305,6 +306,7 @@ pub fn place_service(
                         spec.ips = allocate_ips(&task_id, &mut ipams);
                         tasks.push(Task {
                             id: task_id,
+                            tenant_id: service.tenant_id.clone(),
                             service_id: service.id.clone(),
                             node_id: node.id,
                             state: TaskState::Pending,
@@ -413,6 +415,7 @@ mod tests {
     fn svc(id: &str, replicas: u32, mode: ServiceMode) -> Service {
         Service {
             id: id.to_string(),
+            tenant_id: "default".to_string(),
             name: id.to_string(),
             image: "nginx:latest".to_string(),
             replicas,
@@ -573,6 +576,7 @@ mod tests {
         // Existing task on node 1 uses 3 CPUs, leaving 1 — not enough for a 3-CPU task.
         let existing = vec![Task {
             id: "other.1".to_string(),
+            tenant_id: "default".to_string(),
             service_id: "other".to_string(),
             node_id: 1,
             state: TaskState::Running,
@@ -609,6 +613,7 @@ mod tests {
         };
         let existing = vec![Task {
             id: "old.1".to_string(),
+            tenant_id: "default".to_string(),
             service_id: "old".to_string(),
             node_id: 1,
             state: TaskState::Stopped,

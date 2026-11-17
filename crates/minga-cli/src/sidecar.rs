@@ -713,6 +713,7 @@ mod tests {
         let mut raft_stores = vec![raft1, raft2, raft3];
         let sample_service = |id: &str| Service {
             id: id.to_string(),
+            tenant_id: "default".to_string(),
             name: id.to_string(),
             image: "registry.local/test:1".to_string(),
             replicas: 1,
