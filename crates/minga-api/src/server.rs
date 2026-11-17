@@ -78,121 +78,168 @@ fn presented_token(header: &str) -> Option<String> {
     Some(credentials.split_once(':')?.1.to_string())
 }
 
-/// Authenticates token, verified certificate, or the legacy direct caller and
-/// resolves each identity to an existing tenant before routing.
-async fn bearer_auth(
+/// Authenticates the request, then checks tenant scope, operator-only paths
+/// and role. Identity comes from a token, a verified certificate, or the
+/// legacy direct caller, and always resolves to an existing tenant first.
+async fn authenticate(
     axum::extract::State(state): axum::extract::State<ApiState>,
     mut req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
-    let tenants = match state.store.list_tenants().await {
-        Ok(tenants) => tenants,
-        Err(error) => {
-            tracing::error!(%error, "cannot resolve API caller tenant");
-            return (
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                axum::Json(serde_json::json!({"message": "authentication failed"})),
-            )
-                .into_response();
-        }
+    let (caller, token_valid) = match resolve_caller(&state, req.headers(), req.extensions()).await
+    {
+        Ok(resolved) => resolved,
+        Err(denied) => return denied,
     };
-    let sole_default = tenants.len() == 1 && tenants[0].id == DEFAULT_TENANT_ID;
+    if let Err(denied) = authorize(&caller, req.method(), req.uri().path()) {
+        return denied;
+    }
+    if token_valid {
+        req.extensions_mut().insert(TokenAuthenticated);
+    }
+    req.extensions_mut().insert(caller);
+    next.run(req).await
+}
+
+fn auth_unavailable(error: impl std::fmt::Display) -> axum::response::Response {
+    tracing::error!(%error, "cannot resolve API caller tenant");
+    (
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+        axum::Json(serde_json::json!({"message": "authentication failed"})),
+    )
+        .into_response()
+}
+
+fn auth_unauthorized(message: &str) -> axum::response::Response {
+    (
+        axum::http::StatusCode::UNAUTHORIZED,
+        axum::Json(serde_json::json!({"message": message})),
+    )
+        .into_response()
+}
+
+// The Err is the HTTP reply itself, built at most once per request.
+#[allow(clippy::result_large_err)]
+/// Whether the default tenant is the cluster's only tenant. Read lazily:
+/// a certificate naming its tenant needs one `get_tenant`, not the full list.
+async fn sole_default_tenant(store: &StateStore) -> Result<bool, axum::response::Response> {
+    let tenants = store.list_tenants().await.map_err(auth_unavailable)?;
+    Ok(tenants.len() == 1 && tenants[0].id == DEFAULT_TENANT_ID)
+}
+
+// The Err is the HTTP reply itself, built at most once per request.
+#[allow(clippy::result_large_err)]
+/// Resolves who is calling. The flag is true when the configured token was
+/// presented.
+async fn resolve_caller(
+    state: &ApiState,
+    headers: &axum::http::HeaderMap,
+    extensions: &axum::http::Extensions,
+) -> Result<(Caller, bool), axum::response::Response> {
     let token_valid = state.auth_token.as_deref().is_some_and(|expected| {
-        req.headers()
+        headers
             .get(axum::http::header::AUTHORIZATION)
             .and_then(|value| value.to_str().ok())
             .and_then(presented_token)
             .is_some_and(|presented| constant_time_eq(&presented, expected))
     });
-    let caller = if token_valid {
-        Caller {
+    if token_valid {
+        let tenant_id = sole_default_tenant(&state.store)
+            .await?
+            .then(|| DEFAULT_TENANT_ID.to_owned());
+        let caller = Caller {
             name: "token".to_owned(),
             role: ApiRole::Admin,
-            tenant_id: sole_default.then(|| DEFAULT_TENANT_ID.to_owned()),
+            tenant_id,
             cluster_operator: true,
-        }
-    } else if req.extensions().get::<InvalidClientIdentity>().is_some() {
-        return auth_forbidden("client certificate identity is invalid; reissue it with one CN, one OU, and at most one O");
-    } else if let Some(identity) = req.extensions().get::<ClientIdentity>().cloned() {
-        let Some(role) = identity.role else {
-            return auth_forbidden("client certificate has an unsupported role; reissue it with OU viewer, agent, deployer, or admin");
         };
-        match identity.tenant.as_deref() {
-            Some("*") => Caller {
-                name: identity.name,
-                role,
-                tenant_id: None,
-                cluster_operator: true,
-            },
-            Some(tenant) if tenants.iter().any(|entry| entry.id == tenant) => Caller {
-                name: identity.name,
-                role,
-                tenant_id: Some(tenant.to_owned()),
-                cluster_operator: false,
-            },
-            Some(_) => return auth_forbidden("client certificate names an unknown tenant"),
-            None if sole_default => Caller {
-                name: identity.name,
-                role,
-                tenant_id: Some(DEFAULT_TENANT_ID.to_owned()),
-                cluster_operator: false,
-            },
-            None => return auth_forbidden(
+        return Ok((caller, true));
+    }
+    if extensions.get::<InvalidClientIdentity>().is_some() {
+        return Err(auth_forbidden("client certificate identity is invalid; reissue it with one CN, one OU, and at most one O"));
+    }
+    if let Some(identity) = extensions.get::<ClientIdentity>() {
+        let role = identity.role.ok_or_else(|| {
+            auth_forbidden("client certificate has an unsupported role; reissue it with OU viewer, agent, deployer, or admin")
+        })?;
+        let (tenant_id, cluster_operator) = match identity.tenant.as_deref() {
+            Some("*") => (None, true),
+            Some(tenant) => {
+                let known = state
+                    .store
+                    .get_tenant(tenant)
+                    .await
+                    .map_err(auth_unavailable)?;
+                if known.is_none() {
+                    return Err(auth_forbidden("client certificate names an unknown tenant"));
+                }
+                (Some(tenant.to_owned()), false)
+            }
+            None if sole_default_tenant(&state.store).await? => {
+                (Some(DEFAULT_TENANT_ID.to_owned()), false)
+            }
+            None => return Err(auth_forbidden(
                 "client certificate has no organization (O); reissue it with the tenant id in O",
-            ),
-        }
-    } else if state.auth_token.is_some() {
-        return (
-            axum::http::StatusCode::UNAUTHORIZED,
-            axum::Json(serde_json::json!({"message": "authentication required"})),
-        )
-            .into_response();
-    } else if state.tls_enabled {
-        return (
-            axum::http::StatusCode::UNAUTHORIZED,
-            axum::Json(serde_json::json!({"message": "verified client certificate required"})),
-        )
-            .into_response();
-    } else if let Some(why) = rebinding_risk(req.headers()) {
-        return (
+            )),
+        };
+        let caller = Caller {
+            name: identity.name.clone(),
+            role,
+            tenant_id,
+            cluster_operator,
+        };
+        return Ok((caller, false));
+    }
+    if state.auth_token.is_some() {
+        return Err(auth_unauthorized("authentication required"));
+    }
+    if state.tls_enabled {
+        return Err(auth_unauthorized("verified client certificate required"));
+    }
+    if let Some(why) = rebinding_risk(headers) {
+        return Err((
             axum::http::StatusCode::FORBIDDEN,
             axum::Json(serde_json::json!({
                 "message": format!("{why}; a tokenless API only answers direct clients (set --api-token to lift this)")
             })),
         )
-            .into_response();
-    } else if sole_default {
-        Caller {
+            .into_response());
+    }
+    if sole_default_tenant(&state.store).await? {
+        let caller = Caller {
             name: "legacy-client".to_owned(),
             role: ApiRole::Admin,
             tenant_id: Some(DEFAULT_TENANT_ID.to_owned()),
             cluster_operator: false,
-        }
-    } else {
-        return auth_forbidden("no tenant identity is available; reissue the client certificate with the tenant id in O");
-    };
-    req.extensions_mut().insert(caller);
-    if token_valid {
-        req.extensions_mut().insert(TokenAuthenticated);
+        };
+        return Ok((caller, false));
     }
-    let path = req.uri().path();
-    let caller = req
-        .extensions()
-        .get::<Caller>()
-        .expect("authenticated caller");
+    Err(auth_forbidden(
+        "no tenant identity is available; reissue the client certificate with the tenant id in O",
+    ))
+}
+
+// The Err is the HTTP reply itself, built at most once per request.
+#[allow(clippy::result_large_err)]
+/// Tenant scope, operator-only paths and role. A cluster operator still needs
+/// the role the operation requires: the `O=*` certificate does not lift it.
+fn authorize(
+    caller: &Caller,
+    method: &axum::http::Method,
+    path: &str,
+) -> Result<(), axum::response::Response> {
     if tenant_scoped_path(path) && caller.tenant_id.is_none() {
-        return auth_forbidden(
+        return Err(auth_forbidden(
             "a certificate for a specific tenant is required to access tenant resources",
-        );
+        ));
     }
     if cluster_operator_path(path) && !caller.cluster_operator {
-        return auth_forbidden("cluster operator identity required");
+        return Err(auth_forbidden("cluster operator identity required"));
     }
-    let required = request_minimum_role(req.method(), path);
-    if !role_allowed(&req, required) {
-        return auth_forbidden("caller role does not permit this operation");
+    if !caller.role.permits(request_minimum_role(method, path)) {
+        return Err(auth_forbidden("caller role does not permit this operation"));
     }
-    next.run(req).await
+    Ok(())
 }
 
 fn auth_forbidden(message: &str) -> axum::response::Response {
@@ -201,13 +248,6 @@ fn auth_forbidden(message: &str) -> axum::response::Response {
         axum::Json(serde_json::json!({"message": message})),
     )
         .into_response()
-}
-
-fn role_allowed(req: &axum::extract::Request, minimum: ApiRole) -> bool {
-    req.extensions().get::<Caller>().is_some_and(|caller| {
-        (caller.cluster_operator && cluster_operator_path(req.uri().path()))
-            || caller.role.permits(minimum)
-    })
 }
 
 fn tenant_scoped_path(path: &str) -> bool {
@@ -274,22 +314,20 @@ fn rebinding_risk(headers: &axum::http::HeaderMap) -> Option<&'static str> {
         Some("Host is a DNS name")
     }
 }
-/// Manager membership changes require a configured admin token even when the
-/// rest of the API is intentionally left tokenless.
-/// Tenant and manager administration are available to cluster operators.
-async fn require_admin_token(
-    axum::extract::State(_state): axum::extract::State<ApiState>,
+/// Tenant and manager administration needs a cluster operator holding the
+/// admin role: an `O=*` certificate with a lesser role is refused.
+async fn require_operator_admin(
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
     if req
         .extensions()
         .get::<Caller>()
-        .is_some_and(|caller| caller.cluster_operator)
+        .is_some_and(|caller| caller.cluster_operator && caller.role == ApiRole::Admin)
     {
         next.run(req).await
     } else {
-        auth_forbidden("cluster operator identity required")
+        auth_forbidden("cluster operator identity with the admin role required")
     }
 }
 
@@ -359,43 +397,30 @@ fn build_router_with_app_state(
             "/minga/managers",
             get(handlers::list_managers)
                 .post(handlers::add_manager)
-                .layer(axum::middleware::from_fn_with_state(
-                    api_state.clone(),
-                    require_admin_token,
-                )),
+                .layer(axum::middleware::from_fn(require_operator_admin)),
         )
         .route(
             "/minga/managers/:id",
-            delete(handlers::remove_manager).layer(axum::middleware::from_fn_with_state(
-                api_state.clone(),
-                require_admin_token,
-            )),
+            delete(handlers::remove_manager)
+                .layer(axum::middleware::from_fn(require_operator_admin)),
         )
         .route(
             "/minga/managers/migrate-v1",
-            post(handlers::migrate_manager_voters).layer(axum::middleware::from_fn_with_state(
-                api_state.clone(),
-                require_admin_token,
-            )),
+            post(handlers::migrate_manager_voters)
+                .layer(axum::middleware::from_fn(require_operator_admin)),
         )
         .route(
             "/minga/tenants",
             get(handlers::list_tenants)
                 .post(handlers::create_tenant)
-                .layer(axum::middleware::from_fn_with_state(
-                    api_state.clone(),
-                    require_admin_token,
-                )),
+                .layer(axum::middleware::from_fn(require_operator_admin)),
         )
         .route(
             "/minga/tenants/:id",
             get(handlers::get_tenant)
                 .put(handlers::update_tenant)
                 .delete(handlers::delete_tenant)
-                .layer(axum::middleware::from_fn_with_state(
-                    api_state.clone(),
-                    require_admin_token,
-                )),
+                .layer(axum::middleware::from_fn(require_operator_admin)),
         )
         // Versioned endpoints: /{version}/...
         .route("/:version/version", get(handlers::get_version))
@@ -447,7 +472,10 @@ fn build_router_with_app_state(
         .with_state(api_state.clone())
         // Observability endpoints: /metrics, /healthz, /readyz.
         .merge(minga_telemetry::router(ready_state.as_ref().clone()))
-        .layer(axum::middleware::from_fn_with_state(api_state, bearer_auth))
+        .layer(axum::middleware::from_fn_with_state(
+            api_state,
+            authenticate,
+        ))
 }
 
 /// Server TLS material. The client CA is used to require and verify mTLS peers.
@@ -848,6 +876,56 @@ mod tests {
             rollback: None,
             previous: None,
         }
+    }
+
+    #[tokio::test]
+    async fn operator_certificates_need_the_role_the_operation_requires() {
+        let (router, _store, _dir) = admin_router().await;
+        let writes = [
+            (
+                "/minga/tenants",
+                r#"{"id":"tenant-x","name":"x","quotas":{}}"#,
+            ),
+            ("/v1.41/nodes/1/update", "{}"),
+        ];
+        for role in [ApiRole::Viewer, ApiRole::Deployer, ApiRole::Agent] {
+            for (uri, body) in writes {
+                let mut req = Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap();
+                req.extensions_mut().insert(ClientIdentity {
+                    name: "operator".into(),
+                    role: Some(role),
+                    tenant: Some("*".into()),
+                });
+                let (status, _) = send_request(router.clone(), req).await;
+                assert_eq!(status, StatusCode::FORBIDDEN, "{role:?} on {uri}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_service_name_cannot_be_taken_over_by_another_tenant() {
+        let (_router, store, _dir) = admin_router().await;
+        store
+            .upsert_service(service_record("web", "tenant-a"))
+            .await
+            .unwrap();
+        let err = store
+            .upsert_service(service_record("web", "tenant-b"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, minga_state::StateError::NameInUse), "{err:?}");
+        let kept = store.get_service("web").await.unwrap().unwrap();
+        assert_eq!(kept.tenant_id, "tenant-a");
+        // The owner can still update its own service.
+        store
+            .upsert_service(service_record("web", "tenant-a"))
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

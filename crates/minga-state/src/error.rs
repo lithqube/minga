@@ -37,6 +37,10 @@ pub enum StateError {
     /// A service publishes a port that it or another service already holds.
     #[error("{0}")]
     PortConflict(String),
+    /// The ID already names an object owned by another tenant. The message
+    /// never says whose, so it cannot be used to probe other tenants.
+    #[error("name is already in use")]
+    NameInUse,
     /// A portable snapshot this build cannot read.
     #[error("{0}")]
     BadSnapshot(String),

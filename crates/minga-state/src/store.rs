@@ -578,6 +578,7 @@ impl StateStore {
 
     pub async fn upsert_service(&self, service: Service) -> Result<(), StateError> {
         match self.propose(StateCommand::UpsertService(service)).await? {
+            StateResponse::Conflict(_) => Err(StateError::NameInUse),
             StateResponse::Error(conflict) => Err(StateError::PortConflict(conflict)),
             _ => Ok(()),
         }
@@ -599,8 +600,10 @@ impl StateStore {
     }
 
     pub async fn upsert_network(&self, network: Network) -> Result<(), StateError> {
-        self.propose(StateCommand::UpsertNetwork(network)).await?;
-        Ok(())
+        match self.propose(StateCommand::UpsertNetwork(network)).await? {
+            StateResponse::Conflict(_) => Err(StateError::NameInUse),
+            _ => Ok(()),
+        }
     }
 
     pub async fn remove_network(&self, id: NetworkId) -> Result<(), StateError> {
@@ -619,8 +622,10 @@ impl StateStore {
     }
 
     pub async fn upsert_secret(&self, secret: Secret) -> Result<(), StateError> {
-        self.propose(StateCommand::UpsertSecret(secret)).await?;
-        Ok(())
+        match self.propose(StateCommand::UpsertSecret(secret)).await? {
+            StateResponse::Conflict(_) => Err(StateError::NameInUse),
+            _ => Ok(()),
+        }
     }
 
     pub async fn remove_secret(&self, id: SecretId) -> Result<(), StateError> {
@@ -629,8 +634,10 @@ impl StateStore {
     }
 
     pub async fn upsert_config(&self, config: StateConfig) -> Result<(), StateError> {
-        self.propose(StateCommand::UpsertConfig(config)).await?;
-        Ok(())
+        match self.propose(StateCommand::UpsertConfig(config)).await? {
+            StateResponse::Conflict(_) => Err(StateError::NameInUse),
+            _ => Ok(()),
+        }
     }
 
     pub async fn remove_config(&self, id: ConfigId) -> Result<(), StateError> {

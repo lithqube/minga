@@ -32,11 +32,12 @@ redb = "2"
 regex = "1"
 rpassword = "7"
 reqwest = { version = "0.12", default-features = false, features = ["json"] }
-rustls = "0.23"
+rustls = { version = "0.23", features = ["ring"] }
 rustls-pemfile = "2"
 tokio-rustls = "0.26"
 rcgen = { version = "0.13", features = ["x509-parser"] }
 x509-parser = "0.16"
+time = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_path_to_error = "0.1"
