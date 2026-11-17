@@ -17,7 +17,7 @@ use minga_compose::{
 };
 use minga_state::types::{
     AgentSpec, Config as StateConfig, FailureAction, Network, ResourceSpec, Secret, Service,
-    ServiceMode, UpdateOrder, UpdatePolicy, Volume,
+    ServiceMode, UpdateOrder, UpdatePolicy, Volume, DEFAULT_TENANT_ID,
 };
 use thiserror::Error;
 
@@ -308,6 +308,7 @@ fn translate_service(
 
     Ok(Service {
         id: format!("{stack}.{name}"),
+        tenant_id: DEFAULT_TENANT_ID.to_owned(),
         name: name.to_string(),
         image,
         replicas,
@@ -512,6 +513,7 @@ fn translate_networks(project: &Project, stack: &str) -> Result<Vec<Network>, Tr
         .iter()
         .map(|(name, net)| Network {
             id: network_id(stack, name),
+            tenant_id: DEFAULT_TENANT_ID.to_owned(),
             name: net.name.clone().unwrap_or_else(|| network_id(stack, name)),
             driver: net.driver.clone().unwrap_or_else(|| "overlay".to_string()),
             attachable: net.attachable.unwrap_or(false),
@@ -526,6 +528,7 @@ fn translate_networks(project: &Project, stack: &str) -> Result<Vec<Network>, Tr
     if uses_default && !networks.iter().any(|n| n.id == default_id) {
         networks.push(Network {
             id: default_id.clone(),
+            tenant_id: DEFAULT_TENANT_ID.to_owned(),
             name: default_id,
             driver: "overlay".to_string(),
             attachable: false,
@@ -543,6 +546,7 @@ fn translate_volumes(project: &Project, stack: &str) -> Vec<Volume> {
         .iter()
         .map(|(name, vol)| Volume {
             id: volume_id(stack, name),
+            tenant_id: DEFAULT_TENANT_ID.to_owned(),
             name: vol.name.clone().unwrap_or_else(|| volume_id(stack, name)),
             driver: vol.driver.clone().unwrap_or_else(|| "local".to_string()),
         })
@@ -555,6 +559,7 @@ fn translate_secrets(project: &Project, stack: &str) -> Vec<Secret> {
         .iter()
         .map(|(name, _)| Secret {
             id: secret_id(stack, name),
+            tenant_id: DEFAULT_TENANT_ID.to_owned(),
             name: name.clone(),
         })
         .collect()
@@ -566,6 +571,7 @@ fn translate_configs(project: &Project, stack: &str) -> Vec<StateConfig> {
         .iter()
         .map(|(name, _)| StateConfig {
             id: config_id(stack, name),
+            tenant_id: DEFAULT_TENANT_ID.to_owned(),
             name: name.clone(),
         })
         .collect()

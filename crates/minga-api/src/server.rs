@@ -892,6 +892,7 @@ mod tests {
         );
         let mut task = Task {
             id: "svc.1".into(),
+            tenant_id: "default".to_string(),
             service_id: "svc".into(),
             node_id: 1,
             state: TaskState::Assigned,
@@ -909,6 +910,7 @@ mod tests {
         store
             .upsert_network(Network {
                 id: "front".into(),
+                tenant_id: "default".to_string(),
                 name: "front".into(),
                 driver: "overlay".into(),
                 attachable: true,
@@ -965,6 +967,7 @@ mod tests {
         store
             .upsert_task(Task {
                 id: "svc.1".into(),
+                tenant_id: "default".to_string(),
                 service_id: "svc".into(),
                 node_id: 1,
                 state: TaskState::Assigned,

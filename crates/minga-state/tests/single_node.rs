@@ -49,6 +49,7 @@ fn sample_node(id: u64) -> ClusterNode {
 fn sample_service(id: &str) -> Service {
     Service {
         id: id.to_string(),
+        tenant_id: "default".to_string(),
         name: id.to_string(),
         image: format!("registry.local/{id}:1.0"),
         replicas: 2,
@@ -86,6 +87,7 @@ fn sample_service(id: &str) -> Service {
 fn sample_task(id: &str, service_id: &str, node_id: u64) -> Task {
     Task {
         id: id.to_string(),
+        tenant_id: "default".to_string(),
         service_id: service_id.to_string(),
         node_id,
         state: TaskState::Assigned,
@@ -210,6 +212,7 @@ async fn write_and_read_network_volume_secret_config() {
 
     let net = Network {
         id: "backplane".to_string(),
+        tenant_id: "default".to_string(),
         name: "backplane".to_string(),
         driver: "overlay".to_string(),
         attachable: true,
@@ -221,6 +224,7 @@ async fn write_and_read_network_volume_secret_config() {
 
     let vol = Volume {
         id: "models".to_string(),
+        tenant_id: "default".to_string(),
         name: "models".to_string(),
         driver: "local".to_string(),
     };
@@ -229,6 +233,7 @@ async fn write_and_read_network_volume_secret_config() {
 
     let secret = Secret {
         id: "api_token".to_string(),
+        tenant_id: "default".to_string(),
         name: "api_token".to_string(),
     };
     store.upsert_secret(secret.clone()).await.unwrap();
@@ -236,6 +241,7 @@ async fn write_and_read_network_volume_secret_config() {
 
     let config = Config {
         id: "agent_config".to_string(),
+        tenant_id: "default".to_string(),
         name: "agent_config".to_string(),
     };
     store.upsert_config(config.clone()).await.unwrap();

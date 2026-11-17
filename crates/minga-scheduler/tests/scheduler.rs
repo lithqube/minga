@@ -39,6 +39,7 @@ fn make_node(id: u64, cpus: f64, mem: u64) -> ClusterNode {
 fn make_service(id: &str, replicas: u32) -> Service {
     Service {
         id: id.to_string(),
+        tenant_id: "default".to_string(),
         name: id.to_string(),
         image: "nginx:latest".to_string(),
         replicas,
@@ -165,6 +166,7 @@ async fn network_is_projected_only_to_nodes_running_its_tasks() {
         store
             .upsert_network(minga_state::types::Network {
                 id: id.to_string(),
+                tenant_id: "default".to_string(),
                 name: id.to_string(),
                 driver: "overlay".to_string(),
                 attachable: false,
@@ -334,6 +336,7 @@ async fn reconcile_projects_wireguard_peer_sets_from_live_placement() {
         store
             .upsert_network(Network {
                 id: id.into(),
+                tenant_id: "default".to_string(),
                 name: id.into(),
                 driver: "overlay".into(),
                 attachable: false,
@@ -630,6 +633,7 @@ async fn ingress_backend_and_backendless_workers_peer_both_ways() {
     store
         .upsert_network(Network {
             id: "web".into(),
+            tenant_id: "default".to_string(),
             name: "web".into(),
             driver: "overlay".into(),
             attachable: false,
@@ -712,6 +716,7 @@ async fn ingress_backend_projection_tracks_task_movement() {
     store
         .upsert_network(Network {
             id: "default".into(),
+            tenant_id: "default".to_string(),
             name: "default".into(),
             driver: "overlay".into(),
             attachable: false,
@@ -1043,6 +1048,7 @@ async fn nat_workers_relay_through_the_lowest_manager_and_fail_over_after_lease_
     store
         .upsert_network(Network {
             id: "shared".into(),
+            tenant_id: "default".to_string(),
             name: "shared".into(),
             driver: "overlay".into(),
             attachable: false,

@@ -18,7 +18,7 @@ use minga_state::types::{
     AgentSpec, ClusterNode, Config as MingaConfig, FailureAction, Network, NetworkId, NodeId,
     NodeStatus as MingaNodeStatus, PortMapping, ResourceSpec, RestartCondition, RestartPolicy,
     Secret as MingaSecret, SecretRef, Service, ServiceMode, Task, TaskState, UpdateOrder,
-    UpdatePolicy,
+    UpdatePolicy, DEFAULT_TENANT_ID,
 };
 
 use crate::models;
@@ -343,6 +343,7 @@ pub fn service_spec_to_state(spec: &models::ServiceSpec) -> Result<Service, Stri
 
     Ok(Service {
         id: name.clone(),
+        tenant_id: DEFAULT_TENANT_ID.to_owned(),
         name,
         image: container.Image.clone(),
         replicas,
@@ -383,6 +384,7 @@ pub fn network_create_to_state(req: &models::NetworkCreateRequest) -> Network {
 
     Network {
         id: req.Name.clone(),
+        tenant_id: DEFAULT_TENANT_ID.to_owned(),
         name: req.Name.clone(),
         driver: req.Driver.clone().unwrap_or_else(|| "overlay".to_string()),
         attachable: req.Attachable.unwrap_or(true),
@@ -397,6 +399,7 @@ pub fn network_create_to_state(req: &models::NetworkCreateRequest) -> Network {
 pub fn secret_spec_to_state(spec: &models::SecretSpec) -> MingaSecret {
     MingaSecret {
         id: spec.Name.clone(),
+        tenant_id: DEFAULT_TENANT_ID.to_owned(),
         name: spec.Name.clone(),
     }
 }
@@ -405,6 +408,7 @@ pub fn secret_spec_to_state(spec: &models::SecretSpec) -> MingaSecret {
 pub fn config_spec_to_state(spec: &models::ConfigSpec) -> MingaConfig {
     MingaConfig {
         id: spec.Name.clone(),
+        tenant_id: DEFAULT_TENANT_ID.to_owned(),
         name: spec.Name.clone(),
     }
 }
@@ -1356,6 +1360,7 @@ mod tests {
     fn user_and_update_policy_survive_the_docker_api_round_trip() {
         let svc = Service {
             id: "web".to_string(),
+            tenant_id: DEFAULT_TENANT_ID.to_owned(),
             name: "web".to_string(),
             image: "nginx".to_string(),
             replicas: 1,
@@ -1436,6 +1441,7 @@ mod tests {
     fn service_to_docker_env_excludes_minga_stack() {
         let svc = Service {
             id: "test".to_string(),
+            tenant_id: DEFAULT_TENANT_ID.to_owned(),
             name: "test".to_string(),
             image: "nginx".to_string(),
             replicas: 1,
@@ -1540,6 +1546,7 @@ mod tests {
     fn task_to_docker_running() {
         let task = Task {
             id: "svc1.1.abcd1234".to_string(),
+            tenant_id: DEFAULT_TENANT_ID.to_owned(),
             service_id: "svc1".to_string(),
             node_id: 1,
             state: TaskState::Running,
@@ -1568,6 +1575,7 @@ mod tests {
     fn task_to_docker_pending() {
         let task = Task {
             id: "svc1.1.abcd1234".to_string(),
+            tenant_id: DEFAULT_TENANT_ID.to_owned(),
             service_id: "svc1".to_string(),
             node_id: 1,
             state: TaskState::Pending,
@@ -1592,6 +1600,7 @@ mod tests {
     fn task_to_docker_failed() {
         let task = Task {
             id: "svc1.2.abcd1234".to_string(),
+            tenant_id: DEFAULT_TENANT_ID.to_owned(),
             service_id: "svc1".to_string(),
             node_id: 2,
             state: TaskState::Failed,
@@ -1616,6 +1625,7 @@ mod tests {
         Task {
             id: "svc1.1.abcd1234".to_string(),
             service_id: "svc1".to_string(),
+            tenant_id: DEFAULT_TENANT_ID.to_owned(),
             node_id: 1,
             state,
             spec: TaskSpec::default(),
@@ -1672,6 +1682,7 @@ mod tests {
     fn network_to_docker_with_subnet() {
         let net = Network {
             id: "mystack_default".to_string(),
+            tenant_id: DEFAULT_TENANT_ID.to_owned(),
             name: "mystack_default".to_string(),
             driver: "overlay".to_string(),
             attachable: true,
@@ -1692,6 +1703,7 @@ mod tests {
     fn network_to_docker_without_subnet() {
         let net = Network {
             id: "default".to_string(),
+            tenant_id: DEFAULT_TENANT_ID.to_owned(),
             name: "default".to_string(),
             driver: "bridge".to_string(),
             attachable: false,
@@ -1765,6 +1777,7 @@ mod tests {
     fn secret_to_docker_translation() {
         let secret = MingaSecret {
             id: "sec1".to_string(),
+            tenant_id: DEFAULT_TENANT_ID.to_owned(),
             name: "db_password".to_string(),
         };
         let docker = secret_to_docker(&secret);
@@ -1776,6 +1789,7 @@ mod tests {
     fn config_to_docker_translation() {
         let config = MingaConfig {
             id: "cfg1".to_string(),
+            tenant_id: DEFAULT_TENANT_ID.to_owned(),
             name: "nginx_conf".to_string(),
         };
         let docker = config_to_docker(&config);

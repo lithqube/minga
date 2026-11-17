@@ -668,9 +668,11 @@ impl StateStore {
     pub async fn import(&self, snapshot: StateSnapshot, overwrite: bool) -> Result<(), StateError> {
         let want = crate::codec::FORMAT_VERSION;
         match snapshot.format_version {
-            crate::codec::FORMAT_VERSION | crate::codec::V2_FORMAT_VERSION => {
-                // Serde defaults legacy port modes to ingress; all imported
-                // state is then proposed through the current v3 Raft format.
+            crate::codec::FORMAT_VERSION
+            | crate::codec::V3_FORMAT_VERSION
+            | crate::codec::V2_FORMAT_VERSION => {
+                // Legacy tenant fields default to the default tenant, and all
+                // imported state is then proposed through the current format.
             }
             found => {
                 return Err(StateError::BadSnapshot(format!(

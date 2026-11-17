@@ -18,7 +18,9 @@ use openraft::{
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-use crate::codec::{check_format, FORMAT_KEY, FORMAT_VERSION, V2_FORMAT_VERSION};
+use crate::codec::{
+    check_format, FORMAT_KEY, FORMAT_VERSION, V2_FORMAT_VERSION, V3_FORMAT_VERSION,
+};
 use crate::command::{StateCommand, StateResponse};
 use crate::types::*;
 use crate::TypeConfig;
@@ -46,16 +48,21 @@ const ENTITY_TABLES: [TableDefinition<&str, &[u8]>; 7] = [
     CONFIGS_TABLE,
 ];
 
-/// Re-encodes the state records whose serialized shape changed in v3.
+/// Re-encodes records whose serialized shape changed in format v4.
 ///
 /// The caller advances the marker in the same redb transaction, so a failure
-/// leaves both the old values and the v2 marker intact.
+/// leaves both the old values and the old marker intact.
 #[allow(clippy::result_large_err)]
-fn migrate_v2_state(tx: &redb::WriteTransaction) -> Result<(), StorageIOError<u64>> {
+fn migrate_state(tx: &redb::WriteTransaction) -> Result<(), StorageIOError<u64>> {
+    // v2 also predates reserved node ports and port modes; v3 already has
+    // those fields, and re-encoding both versions keeps migration atomic.
     rewrite_state_table::<ClusterNode>(tx, NODES_TABLE)?;
     rewrite_state_table::<Service>(tx, SERVICES_TABLE)?;
     rewrite_state_table::<Task>(tx, TASKS_TABLE)?;
-
+    rewrite_state_table::<Network>(tx, NETWORKS_TABLE)?;
+    rewrite_state_table::<Volume>(tx, VOLUMES_TABLE)?;
+    rewrite_state_table::<Secret>(tx, SECRETS_TABLE)?;
+    rewrite_state_table::<Config>(tx, CONFIGS_TABLE)?;
     let mut meta = tx.open_table(SM_META_TABLE).map_err(sm_io_err)?;
     meta.insert(FORMAT_KEY, [FORMAT_VERSION].as_slice())
         .map_err(sm_io_err)?;
@@ -143,10 +150,11 @@ impl RedbStateMachine {
             stored
         };
 
-        if stored.as_deref() == Some(&[V2_FORMAT_VERSION]) {
-            // Raft metadata is untouched; only changed entity records and the
-            // marker are rewritten in this transaction.
-            migrate_v2_state(&tx)?;
+        if stored.as_deref() == Some(&[V2_FORMAT_VERSION])
+            || stored.as_deref() == Some(&[V3_FORMAT_VERSION])
+        {
+            // Tenant fields default legacy desired state to the default tenant.
+            migrate_state(&tx)?;
         } else {
             let mut meta = tx.open_table(SM_META_TABLE).map_err(sm_io_err)?;
             if check_format(stored.as_deref(), empty).map_err(sm_io_err)? {

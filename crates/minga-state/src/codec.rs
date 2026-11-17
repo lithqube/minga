@@ -2,8 +2,9 @@
 //!
 //! JSON, not bincode. Bincode is not self-describing and adding fields made
 //! earlier records undecodable. With JSON, serde defaults keep old records
-//! decodable, but a persisted shape change still requires a version bump and
-//! an explicit migration so the stored representation is current.
+//! decodable, but persisted shape changes require a format-version bump and an
+//! explicit migration. Migrations rewrite state and Raft logs; portable
+//! snapshots are versioned and migrated on import.
 //!
 //! # Rules for changing a persisted type
 //!
@@ -17,24 +18,27 @@
 //!
 //! Each redb file stores [`FORMAT_VERSION`] under [`FORMAT_KEY`] in its
 //! metadata table. A store with data and no marker was written by minga 1.0.2
-//! or older (bincode) and cannot be read. Format v2 is migrated to v3 by the
-//! state and log stores before the marker is advanced.
+//! or older (bincode) and cannot be read. Formats v2 and v3 are migrated to v4
+//! by the state and log stores before the marker is advanced.
 //!
 //! # Wire frame
 //!
 //! A Raft message is `[u32 BE length][u8 FORMAT_VERSION][JSON]`, the length
 //! covering the version byte and the JSON. Since peers reject a different
-//! frame version, v3 requires a coordinated upgrade of every cluster node;
-//! mixed v2/v3 nodes cannot exchange Raft messages.
+//! frame version, v4 requires a coordinated upgrade of every cluster node;
+//! mixed v3/v4 nodes cannot exchange Raft messages.
 
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
 /// Version of the persisted and wire format. Bump it for every persisted
-/// field-shape change and add the corresponding migration step.
-pub const FORMAT_VERSION: u8 = 3;
+/// field-shape change and add the corresponding migration.
+pub const FORMAT_VERSION: u8 = 4;
 
-/// The persisted version migrated by the v3 state and log stores.
+/// The persisted version migrated by the v4 state and log stores.
+pub const V3_FORMAT_VERSION: u8 = 3;
+
+/// An older persisted version migrated by the v4 state and log stores.
 pub const V2_FORMAT_VERSION: u8 = 2;
 
 /// Metadata key that holds [`FORMAT_VERSION`] in each redb file.
