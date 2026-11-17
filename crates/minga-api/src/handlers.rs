@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Extension, Path, Query, State},
     http::StatusCode,
     Json,
 };
@@ -22,6 +22,7 @@ use minga_state::StateStore;
 use serde::Deserialize;
 
 use crate::{
+    auth::Caller,
     error::{bad_request, conflict, internal, not_found, ok_message, ApiError, ApiResult},
     models::{self, Filters},
     translate,
@@ -72,6 +73,12 @@ impl AppState {
         }
         Ok(statuses)
     }
+}
+
+fn tenant_scope(caller: &Caller) -> ApiResult<&str> {
+    caller
+        .tenant_id()
+        .ok_or_else(|| ApiError::NotFound("resource not found".to_owned()))
 }
 #[derive(Debug, Deserialize)]
 pub struct AddManagerRequest {
@@ -227,8 +234,27 @@ fn task_status_for_api<'a>(
 /// Proposed): the snapshot carries service environment values.
 pub async fn export_state(
     State(app): State<Arc<AppState>>,
+    Extension(caller): Extension<Caller>,
 ) -> ApiResult<Json<minga_state::StateSnapshot>> {
-    Ok(Json(app.store.export().await?))
+    let tenant_id = tenant_scope(&caller)?;
+    let mut snapshot = app.store.export().await?;
+    snapshot.tenants.retain(|tenant| tenant.id == tenant_id);
+    snapshot
+        .services
+        .retain(|service| service.tenant_id == tenant_id);
+    snapshot
+        .networks
+        .retain(|network| network.tenant_id == tenant_id);
+    snapshot
+        .volumes
+        .retain(|volume| volume.tenant_id == tenant_id);
+    snapshot
+        .secrets
+        .retain(|secret| secret.tenant_id == tenant_id);
+    snapshot
+        .configs
+        .retain(|config| config.tenant_id == tenant_id);
+    Ok(Json(snapshot))
 }
 
 /// Query of `POST /v{version}/state`.
@@ -243,9 +269,11 @@ pub struct ImportQuery {
 /// [`export_state`]).
 pub async fn import_state(
     State(app): State<Arc<AppState>>,
+    Extension(caller): Extension<Caller>,
     Query(q): Query<ImportQuery>,
     Json(body): Json<serde_json::Value>,
 ) -> ApiResult<Json<serde_json::Value>> {
+    let tenant_id = tenant_scope(&caller)?;
     // Check the version before the shape: a newer file may not parse as ours.
     let want = minga_state::codec::FORMAT_VERSION;
     match body.get("format_version").and_then(|v| v.as_u64()) {
@@ -257,10 +285,76 @@ pub async fn import_state(
             )))
         }
     }
-    let snapshot: minga_state::StateSnapshot = serde_json::from_value(body)?;
+    let mut snapshot: minga_state::StateSnapshot = serde_json::from_value(body)?;
+    let tenant = app
+        .store
+        .get_tenant(tenant_id)
+        .await?
+        .ok_or_else(|| not_found("tenant", tenant_id))?;
+    if snapshot.tenants.iter().any(|tenant| tenant.id != tenant_id)
+        || snapshot
+            .services
+            .iter()
+            .any(|resource| resource.tenant_id != tenant_id)
+        || snapshot
+            .networks
+            .iter()
+            .any(|resource| resource.tenant_id != tenant_id)
+        || snapshot
+            .volumes
+            .iter()
+            .any(|resource| resource.tenant_id != tenant_id)
+        || snapshot
+            .secrets
+            .iter()
+            .any(|resource| resource.tenant_id != tenant_id)
+        || snapshot
+            .configs
+            .iter()
+            .any(|resource| resource.tenant_id != tenant_id)
+    {
+        return Err(ApiError::NotFound("resource not found".to_owned()));
+    }
+
+    for service in &snapshot.services {
+        for reference in &service.secrets {
+            let in_snapshot = snapshot
+                .secrets
+                .iter()
+                .any(|secret| secret.id == reference.secret_id);
+            let in_store = app
+                .store
+                .get_secret(&reference.secret_id)
+                .await?
+                .is_some_and(|secret| secret.tenant_id == tenant_id);
+            if !in_snapshot && !in_store {
+                return Err(not_found("secret", &reference.secret_id));
+            }
+        }
+        for network_id in &service.networks {
+            let in_snapshot = snapshot
+                .networks
+                .iter()
+                .any(|network| network.id == *network_id);
+            let in_store = app
+                .store
+                .get_network(network_id)
+                .await?
+                .is_some_and(|network| network.tenant_id == tenant_id);
+            if !in_snapshot && !in_store {
+                return Err(not_found("network", network_id));
+            }
+        }
+    }
+    // Quotas and tenant metadata are operator-managed, not tenant-importable.
+    snapshot.tenants = vec![tenant];
     let services = snapshot.services.len();
     app.store.import(snapshot, q.overwrite).await?;
-    tracing::info!(services, overwrite = q.overwrite, "state imported via API");
+    tracing::info!(
+        services,
+        overwrite = q.overwrite,
+        "tenant state imported via API"
+    );
     Ok(ok_message(format!("imported {services} service(s)")))
 }
 
@@ -313,8 +407,9 @@ async fn ensure_placeable(
             .collect(),
         None => all_tasks,
     };
-    minga_scheduler::check_placeable(svc, &nodes, &tasks, &networks, unix_now())
-        .map_err(|e| conflict(e.to_string()))
+    minga_scheduler::check_placeable(svc, &nodes, &tasks, &networks, unix_now()).map_err(|_| {
+        conflict("service cannot be placed with current cluster capacity or constraints")
+    })
 }
 
 fn validate_ingress_ports(
@@ -324,8 +419,8 @@ fn validate_ingress_ports(
 ) -> Result<(), String> {
     // The state machine applies the same rule at commit; this is the early,
     // readable rejection. Host-mode clashes on one node are placement's job.
-    if let Some(conflict) = minga_state::types::published_port_conflict(service, services) {
-        return Err(conflict);
+    if minga_state::types::published_port_conflict(service, services).is_some() {
+        return Err("published port conflicts with another cluster service".to_owned());
     }
     // An ingress port opens on every node, so no node's listener may own it.
     for port in &service.ports {
@@ -339,10 +434,7 @@ fn validate_ingress_ports(
             if node.reserved_ports.iter().any(|reserved| {
                 reserved.port == published && reserved.protocol.eq_ignore_ascii_case(&port.protocol)
             }) {
-                return Err(format!(
-                    "ingress port {published}/{} is reserved on node {}",
-                    port.protocol, node.id
-                ));
+                return Err("ingress port is reserved on a cluster node".to_owned());
             }
         }
     }
@@ -364,13 +456,29 @@ pub async fn get_version() -> Json<models::VersionInfo> {
 }
 
 /// `GET /v{version}/info` — system info.
-pub async fn get_info(State(app): State<Arc<AppState>>) -> ApiResult<Json<models::SystemInfo>> {
+pub async fn get_info(
+    State(app): State<Arc<AppState>>,
+    Extension(caller): Extension<Caller>,
+) -> ApiResult<Json<models::SystemInfo>> {
+    let tenant_id = caller.tenant_id();
     let node_id = app.store.node_id();
     let is_leader = app.store.is_leader().await;
 
     let nodes = app.store.list_nodes().await?;
-    let services = app.store.list_services().await?;
-    let tasks = app.store.list_tasks().await?;
+    let services: Vec<_> = app
+        .store
+        .list_services()
+        .await?
+        .into_iter()
+        .filter(|service| tenant_id.map_or(true, |tenant_id| service.tenant_id == tenant_id))
+        .collect();
+    let tasks: Vec<_> = app
+        .store
+        .list_tasks()
+        .await?
+        .into_iter()
+        .filter(|task| tenant_id.map_or(true, |tenant_id| task.tenant_id == tenant_id))
+        .collect();
     let statuses = app.task_statuses().await?;
 
     let running = tasks
@@ -563,6 +671,7 @@ pub async fn update_node(
 /// `GET /v{version}/services` — list services.
 pub async fn list_services(
     State(app): State<Arc<AppState>>,
+    Extension(caller): Extension<Caller>,
     Query(query): Query<models::ServiceListQuery>,
 ) -> ApiResult<Json<Vec<models::Service>>> {
     let filters = models::parse_filters(query.filters.as_deref());
@@ -570,10 +679,29 @@ pub async fn list_services(
     let name_filters = filters.get("name").cloned().unwrap_or_default();
     let id_filters = filters.get("id").cloned().unwrap_or_default();
 
-    let services = app.store.list_services().await?;
-    let tasks = app.store.list_tasks().await?;
+    let tenant_id = tenant_scope(&caller)?;
+    let services: Vec<_> = app
+        .store
+        .list_services()
+        .await?
+        .into_iter()
+        .filter(|service| service.tenant_id == tenant_id)
+        .collect();
+    let tasks: Vec<_> = app
+        .store
+        .list_tasks()
+        .await?
+        .into_iter()
+        .filter(|task| task.tenant_id == tenant_id)
+        .collect();
     let statuses = app.task_statuses().await?;
-    let networks = app.store.list_networks().await?;
+    let networks: Vec<_> = app
+        .store
+        .list_networks()
+        .await?
+        .into_iter()
+        .filter(|network| network.tenant_id == tenant_id)
+        .collect();
 
     let result: Vec<models::Service> = services
         .iter()
@@ -616,29 +744,47 @@ pub async fn list_services(
 /// `POST /v{version}/services/create` — create a service.
 pub async fn create_service(
     State(app): State<Arc<AppState>>,
+    Extension(caller): Extension<Caller>,
     Json(spec): Json<models::ServiceSpec>,
 ) -> ApiResult<(StatusCode, Json<models::ServiceCreateResponse>)> {
-    let svc = translate::service_spec_to_state(&spec).map_err(ApiError::BadRequest)?;
+    let tenant_id = tenant_scope(&caller)?;
+    let mut svc = translate::service_spec_to_state(&spec).map_err(ApiError::BadRequest)?;
+    svc.tenant_id = tenant_id.to_owned();
     for reference in &svc.secrets {
-        if app.store.get_secret(&reference.secret_id).await?.is_none() {
-            return Err(bad_request(format!(
-                "secret `{}` is not declared; create its metadata and provision it on eligible nodes first",
-                reference.secret_id
-            )));
+        let secret = app.store.get_secret(&reference.secret_id).await?;
+        match secret {
+            Some(secret) if secret.tenant_id == tenant_id => {}
+            Some(_) => return Err(not_found("secret", &reference.secret_id)),
+            None => {
+                return Err(bad_request(format!(
+                    "secret `{}` is not declared; create its metadata and provision it on eligible nodes first",
+                    reference.secret_id
+                )))
+            }
+        }
+    }
+    for network_id in &svc.networks {
+        let network = app.store.get_network(network_id).await?;
+        if !network.is_some_and(|network| network.tenant_id == tenant_id) {
+            return Err(not_found("network", network_id));
         }
     }
 
-    // Check for existing service with the same name.
-    if let Some(existing) = app.store.get_service(&svc.id).await? {
-        return Err(conflict(format!(
-            "service {} already exists",
-            existing.name
-        )));
+    if app.store.get_service(&svc.id).await?.is_some() {
+        return Err(conflict("service ID already exists"));
     }
 
     ensure_placeable(&app, &svc, None).await?;
 
-    app.store.upsert_service(svc.clone()).await?;
+    app.store
+        .upsert_service(svc.clone())
+        .await
+        .map_err(|error| match error {
+            minga_state::StateError::PortConflict(_) => {
+                conflict("published port conflicts with another cluster service")
+            }
+            other => ApiError::from(other),
+        })?;
 
     tracing::info!(service = %svc.id, image = %svc.image, "service created via API");
 
@@ -654,22 +800,30 @@ pub async fn create_service(
 /// `GET /v{version}/services/{id}` — inspect a service.
 pub async fn get_service(
     State(app): State<Arc<AppState>>,
+    Extension(caller): Extension<Caller>,
     Path((_version, id)): Path<(String, String)>,
 ) -> ApiResult<Json<models::Service>> {
+    let tenant_id = tenant_scope(&caller)?;
     let services = app.store.list_services().await?;
     let tasks = app.store.list_tasks().await?;
     let statuses = app.task_statuses().await?;
-    let networks = app.store.list_networks().await?;
+    let networks: Vec<_> = app
+        .store
+        .list_networks()
+        .await?
+        .into_iter()
+        .filter(|network| network.tenant_id == tenant_id)
+        .collect();
 
     let svc = services
         .iter()
-        .find(|s| s.id == id || s.name == id)
+        .find(|service| service.tenant_id == tenant_id && (service.id == id || service.name == id))
         .ok_or_else(|| not_found("service", &id))?;
 
     let mut docker_svc = translate::service_to_docker(svc);
     docker_svc.TaskList = tasks
         .iter()
-        .filter(|task| task.service_id == svc.id)
+        .filter(|task| task.tenant_id == tenant_id && task.service_id == svc.id)
         .map(|task| {
             let actual = task_status_for_api(&app, task, &statuses);
             translate::task_to_docker(task, actual.as_deref(), &networks)
@@ -682,17 +836,21 @@ pub async fn get_service(
 /// `DELETE /v{version}/services/{id}` — remove a service.
 pub async fn delete_service(
     State(app): State<Arc<AppState>>,
+    Extension(caller): Extension<Caller>,
     Path((_version, id)): Path<(String, String)>,
 ) -> ApiResult<StatusCode> {
+    let tenant_id = tenant_scope(&caller)?;
     let services = app.store.list_services().await?;
     let svc = services
         .iter()
-        .find(|s| s.id == id || s.name == id)
+        .find(|service| service.tenant_id == tenant_id && (service.id == id || service.name == id))
         .ok_or_else(|| not_found("service", &id))?;
 
-    // Remove all tasks for this service first.
     let tasks = app.store.list_tasks().await?;
-    for task in tasks.iter().filter(|t| t.service_id == svc.id) {
+    for task in tasks
+        .iter()
+        .filter(|task| task.tenant_id == tenant_id && task.service_id == svc.id)
+    {
         app.store.remove_task(task.id.clone()).await?;
     }
 
@@ -706,31 +864,41 @@ pub async fn delete_service(
 /// `POST /v{version}/services/{id}/update` — update a service.
 pub async fn update_service(
     State(app): State<Arc<AppState>>,
+    Extension(caller): Extension<Caller>,
     Path((_version, id)): Path<(String, String)>,
     Query(_query): Query<models::ServiceUpdateQuery>,
     Json(spec): Json<models::ServiceSpec>,
 ) -> ApiResult<Json<serde_json::Value>> {
+    let tenant_id = tenant_scope(&caller)?;
     let services = app.store.list_services().await?;
     let existing = services
         .iter()
-        .find(|s| s.id == id || s.name == id)
+        .find(|service| service.tenant_id == tenant_id && (service.id == id || service.name == id))
         .ok_or_else(|| not_found("service", &id))?;
 
-    // Translate the new spec, preserving the ID.
     let mut svc = translate::service_spec_to_state(&spec).map_err(ApiError::BadRequest)?;
+    svc.tenant_id = tenant_id.to_owned();
     for reference in &svc.secrets {
-        if app.store.get_secret(&reference.secret_id).await?.is_none() {
-            return Err(bad_request(format!(
-                "secret `{}` is not declared; create its metadata and provision it on eligible nodes first",
-                reference.secret_id
-            )));
+        match app.store.get_secret(&reference.secret_id).await? {
+            Some(secret) if secret.tenant_id == tenant_id => {}
+            Some(_) => return Err(not_found("secret", &reference.secret_id)),
+            None => {
+                return Err(bad_request(format!(
+                    "secret `{}` is not declared; create its metadata and provision it on eligible nodes first",
+                    reference.secret_id
+                )))
+            }
+        }
+    }
+    for network_id in &svc.networks {
+        let network = app.store.get_network(network_id).await?;
+        if !network.is_some_and(|network| network.tenant_id == tenant_id) {
+            return Err(not_found("network", network_id));
         }
     }
     svc.id = existing.id.clone();
     svc.name = existing.name.clone();
 
-    // A redeploy of the same spec is not a rollout, so it keeps whatever
-    // rollback target is already there.
     let comparable = |s: &minga_state::types::Service| minga_state::types::Service {
         previous: None,
         update: Default::default(),
@@ -748,7 +916,15 @@ pub async fn update_service(
 
     ensure_placeable(&app, &svc, Some(&svc.id)).await?;
 
-    app.store.upsert_service(svc.clone()).await?;
+    app.store
+        .upsert_service(svc.clone())
+        .await
+        .map_err(|error| match error {
+            minga_state::StateError::PortConflict(_) => {
+                conflict("published port conflicts with another cluster service")
+            }
+            other => ApiError::from(other),
+        })?;
 
     tracing::info!(service = %svc.id, "service updated via API");
 
@@ -762,6 +938,7 @@ pub async fn update_service(
 /// `GET /v{version}/tasks` — list tasks.
 pub async fn list_tasks(
     State(app): State<Arc<AppState>>,
+    Extension(caller): Extension<Caller>,
     Query(query): Query<models::TaskListQuery>,
 ) -> ApiResult<Json<Vec<models::Task>>> {
     let filters = models::parse_filters(query.filters.as_deref());
@@ -770,10 +947,31 @@ pub async fn list_tasks(
     let node_filters = filters.get("node").cloned().unwrap_or_default();
     let desired_state_filters = filters.get("desired-state").cloned().unwrap_or_default();
 
-    let tasks = app.store.list_tasks().await?;
-    let services = app.store.list_services().await?;
+    let tenant_id = tenant_scope(&caller)?;
+    let mut tasks: Vec<_> = app
+        .store
+        .list_tasks()
+        .await?
+        .into_iter()
+        .filter(|task| task.tenant_id == tenant_id)
+        .collect();
+    let services: Vec<_> = app
+        .store
+        .list_services()
+        .await?
+        .into_iter()
+        .filter(|service| service.tenant_id == tenant_id)
+        .collect();
+
+    tasks.retain(|task| services.iter().any(|service| service.id == task.service_id));
     let statuses = app.task_statuses().await?;
-    let networks = app.store.list_networks().await?;
+    let networks: Vec<_> = app
+        .store
+        .list_networks()
+        .await?
+        .into_iter()
+        .filter(|network| network.tenant_id == tenant_id)
+        .collect();
     let result: Vec<models::Task> = tasks
         .iter()
         .filter(|t| {
@@ -834,15 +1032,32 @@ pub async fn list_tasks(
 /// `GET /v{version}/tasks/{id}` — inspect a task.
 pub async fn get_task(
     State(app): State<Arc<AppState>>,
+    Extension(caller): Extension<Caller>,
     Path((_version, id)): Path<(String, String)>,
 ) -> ApiResult<Json<models::Task>> {
+    let tenant_id = tenant_scope(&caller)?;
     let task = app
         .store
         .get_task(&id)
         .await?
+        .filter(|task| task.tenant_id == tenant_id)
         .ok_or_else(|| not_found("task", &id))?;
+    if !app
+        .store
+        .get_service(&task.service_id)
+        .await?
+        .is_some_and(|service| service.tenant_id == tenant_id)
+    {
+        return Err(not_found("task", &id));
+    }
     let statuses = app.task_statuses().await?;
-    let networks = app.store.list_networks().await?;
+    let networks: Vec<_> = app
+        .store
+        .list_networks()
+        .await?
+        .into_iter()
+        .filter(|network| network.tenant_id == tenant_id)
+        .collect();
 
     let actual = task_status_for_api(&app, &task, &statuses);
 
@@ -860,6 +1075,7 @@ pub async fn get_task(
 /// `GET /v{version}/networks` — list networks.
 pub async fn list_networks(
     State(app): State<Arc<AppState>>,
+    Extension(caller): Extension<Caller>,
     Query(query): Query<models::NetworkListQuery>,
 ) -> ApiResult<Json<Vec<models::NetworkResource>>> {
     let filters = models::parse_filters(query.filters.as_deref());
@@ -867,7 +1083,14 @@ pub async fn list_networks(
     let id_filters = filters.get("id").cloned().unwrap_or_default();
     let label_filters = label_filters(&filters);
 
-    let networks = app.store.list_networks().await?;
+    let tenant_id = tenant_scope(&caller)?;
+    let networks: Vec<_> = app
+        .store
+        .list_networks()
+        .await?
+        .into_iter()
+        .filter(|network| network.tenant_id == tenant_id)
+        .collect();
     let result: Vec<models::NetworkResource> = networks
         .iter()
         .filter(|n| name_matches(&n.name, &name_filters))
@@ -882,19 +1105,27 @@ pub async fn list_networks(
 /// `POST /v{version}/networks/create` — create a network.
 pub async fn create_network(
     State(app): State<Arc<AppState>>,
+    Extension(caller): Extension<Caller>,
     Json(req): Json<models::NetworkCreateRequest>,
 ) -> ApiResult<(StatusCode, Json<models::NetworkCreateResponse>)> {
-    // Check for existing network with the same name.
-    if let Some(existing) = app.store.get_network(&req.Name).await? {
-        return Err(conflict(format!(
-            "network {} already exists",
-            existing.name
-        )));
+    let tenant_id = tenant_scope(&caller)?;
+    if let Some(network) = app.store.get_network(&req.Name).await? {
+        if network.tenant_id == tenant_id {
+            return Ok((
+                StatusCode::CREATED,
+                Json(models::NetworkCreateResponse {
+                    ID: network.id,
+                    Warning: None,
+                }),
+            ));
+        }
+        return Err(conflict("network name is already in use"));
     }
 
     minga_net::overlay::check_driver_opts(&req.Name, req.Options.keys().map(String::as_str))
         .map_err(bad_request)?;
-    let net = translate::network_create_to_state(&req);
+    let mut net = translate::network_create_to_state(&req);
+    net.tenant_id = tenant_id.to_owned();
     // An explicit subnet must not overlap another network's. Networks
     // without one get theirs from the leader's next reconcile pass.
     if let Some(raw) = &net.subnet {
@@ -904,10 +1135,9 @@ pub async fn create_network(
                 continue;
             };
             if minga_net::Cidr::parse(theirs).is_ok_and(|t| t.overlaps(&subnet)) {
-                return Err(conflict(format!(
-                    "network {} subnet {raw} overlaps network {} subnet {theirs}",
-                    net.name, other.name
-                )));
+                return Err(conflict(
+                    "network subnet overlaps an existing cluster network",
+                ));
             }
         }
     }
@@ -927,13 +1157,15 @@ pub async fn create_network(
 /// `GET /v{version}/networks/{id}` — inspect a network.
 pub async fn get_network(
     State(app): State<Arc<AppState>>,
+    Extension(caller): Extension<Caller>,
     Path((_version, id)): Path<(String, String)>,
 ) -> ApiResult<Json<models::NetworkResource>> {
-    // Docker clients may use either the network ID or name.
+    let tenant_id = tenant_scope(&caller)?;
     let net = app
         .store
         .get_network(&id)
         .await?
+        .filter(|network| network.tenant_id == tenant_id)
         .ok_or_else(|| not_found("network", &id))?;
 
     Ok(Json(translate::network_to_docker(&net)))
@@ -942,12 +1174,15 @@ pub async fn get_network(
 /// `DELETE /v{version}/networks/{id}` — remove a network.
 pub async fn delete_network(
     State(app): State<Arc<AppState>>,
+    Extension(caller): Extension<Caller>,
     Path((_version, id)): Path<(String, String)>,
 ) -> ApiResult<StatusCode> {
+    let tenant_id = tenant_scope(&caller)?;
     let net = app
         .store
         .get_network(&id)
         .await?
+        .filter(|network| network.tenant_id == tenant_id)
         .ok_or_else(|| not_found("network", &id))?;
 
     app.store.remove_network(net.id.clone()).await?;
@@ -964,13 +1199,21 @@ pub async fn delete_network(
 /// `GET /v{version}/secrets` — list secrets.
 pub async fn list_secrets(
     State(app): State<Arc<AppState>>,
+    Extension(caller): Extension<Caller>,
     Query(query): Query<models::SecretListQuery>,
 ) -> ApiResult<Json<Vec<models::Secret>>> {
+    let tenant_id = tenant_scope(&caller)?;
     let filters = models::parse_filters(query.filters.as_deref());
     let name_filters = filters.get("name").cloned().unwrap_or_default();
     let id_filters = filters.get("id").cloned().unwrap_or_default();
 
-    let secrets = app.store.list_secrets().await?;
+    let secrets: Vec<_> = app
+        .store
+        .list_secrets()
+        .await?
+        .into_iter()
+        .filter(|secret| secret.tenant_id == tenant_id)
+        .collect();
     let result: Vec<models::Secret> = secrets
         .iter()
         .filter(|s| name_matches(&s.name, &name_filters))
@@ -991,8 +1234,10 @@ pub async fn list_secrets(
 /// refused with a clear error instead.
 pub async fn create_secret(
     State(app): State<Arc<AppState>>,
+    Extension(caller): Extension<Caller>,
     Json(spec): Json<models::SecretSpec>,
 ) -> ApiResult<(StatusCode, Json<models::SecretCreateResponse>)> {
+    let tenant_id = tenant_scope(&caller)?;
     if !spec.Data.is_empty() {
         return Err(bad_request(
             "creating a secret with inline data is not supported: \
@@ -1001,11 +1246,12 @@ pub async fn create_secret(
         ));
     }
 
-    if let Some(existing) = app.store.get_secret(&spec.Name).await? {
-        return Err(conflict(format!("secret {} already exists", existing.name)));
+    if app.store.get_secret(&spec.Name).await?.is_some() {
+        return Err(conflict("secret ID already exists"));
     }
 
-    let secret = translate::secret_spec_to_state(&spec);
+    let mut secret = translate::secret_spec_to_state(&spec);
+    secret.tenant_id = tenant_id.to_owned();
     app.store.upsert_secret(secret.clone()).await?;
 
     tracing::info!(secret = %secret.id, "secret created via API");
@@ -1019,12 +1265,15 @@ pub async fn create_secret(
 /// `GET /v{version}/secrets/{id}` — inspect a secret.
 pub async fn get_secret(
     State(app): State<Arc<AppState>>,
+    Extension(caller): Extension<Caller>,
     Path((_version, id)): Path<(String, String)>,
 ) -> ApiResult<Json<models::Secret>> {
+    let tenant_id = tenant_scope(&caller)?;
     let secret = app
         .store
         .get_secret(&id)
         .await?
+        .filter(|secret| secret.tenant_id == tenant_id)
         .ok_or_else(|| not_found("secret", &id))?;
 
     Ok(Json(translate::secret_to_docker(&secret)))
@@ -1033,12 +1282,15 @@ pub async fn get_secret(
 /// `DELETE /v{version}/secrets/{id}` — remove a secret.
 pub async fn delete_secret(
     State(app): State<Arc<AppState>>,
+    Extension(caller): Extension<Caller>,
     Path((_version, id)): Path<(String, String)>,
 ) -> ApiResult<StatusCode> {
+    let tenant_id = tenant_scope(&caller)?;
     let secret = app
         .store
         .get_secret(&id)
         .await?
+        .filter(|secret| secret.tenant_id == tenant_id)
         .ok_or_else(|| not_found("secret", &id))?;
 
     app.store.remove_secret(secret.id.clone()).await?;
@@ -1055,13 +1307,21 @@ pub async fn delete_secret(
 /// `GET /v{version}/configs` — list configs.
 pub async fn list_configs(
     State(app): State<Arc<AppState>>,
+    Extension(caller): Extension<Caller>,
     Query(query): Query<models::ConfigListQuery>,
 ) -> ApiResult<Json<Vec<models::Config>>> {
+    let tenant_id = tenant_scope(&caller)?;
     let filters = models::parse_filters(query.filters.as_deref());
     let name_filters = filters.get("name").cloned().unwrap_or_default();
     let id_filters = filters.get("id").cloned().unwrap_or_default();
 
-    let configs = app.store.list_configs().await?;
+    let configs: Vec<_> = app
+        .store
+        .list_configs()
+        .await?
+        .into_iter()
+        .filter(|config| config.tenant_id == tenant_id)
+        .collect();
     let result: Vec<models::Config> = configs
         .iter()
         .filter(|c| name_matches(&c.name, &name_filters))
@@ -1075,13 +1335,16 @@ pub async fn list_configs(
 /// `POST /v{version}/configs/create` — create a config.
 pub async fn create_config(
     State(app): State<Arc<AppState>>,
+    Extension(caller): Extension<Caller>,
     Json(spec): Json<models::ConfigSpec>,
 ) -> ApiResult<(StatusCode, Json<models::ConfigCreateResponse>)> {
-    if let Some(existing) = app.store.get_config(&spec.Name).await? {
-        return Err(conflict(format!("config {} already exists", existing.name)));
+    let tenant_id = tenant_scope(&caller)?;
+    if app.store.get_config(&spec.Name).await?.is_some() {
+        return Err(conflict("config ID already exists"));
     }
 
-    let config = translate::config_spec_to_state(&spec);
+    let mut config = translate::config_spec_to_state(&spec);
+    config.tenant_id = tenant_id.to_owned();
     app.store.upsert_config(config.clone()).await?;
 
     tracing::info!(config = %config.id, "config created via API");
@@ -1095,12 +1358,15 @@ pub async fn create_config(
 /// `GET /v{version}/configs/{id}` — inspect a config.
 pub async fn get_config(
     State(app): State<Arc<AppState>>,
+    Extension(caller): Extension<Caller>,
     Path((_version, id)): Path<(String, String)>,
 ) -> ApiResult<Json<models::Config>> {
+    let tenant_id = tenant_scope(&caller)?;
     let config = app
         .store
         .get_config(&id)
         .await?
+        .filter(|config| config.tenant_id == tenant_id)
         .ok_or_else(|| not_found("config", &id))?;
 
     Ok(Json(translate::config_to_docker(&config)))
@@ -1109,12 +1375,15 @@ pub async fn get_config(
 /// `DELETE /v{version}/configs/{id}` — remove a config.
 pub async fn delete_config(
     State(app): State<Arc<AppState>>,
+    Extension(caller): Extension<Caller>,
     Path((_version, id)): Path<(String, String)>,
 ) -> ApiResult<StatusCode> {
+    let tenant_id = tenant_scope(&caller)?;
     let config = app
         .store
         .get_config(&id)
         .await?
+        .filter(|config| config.tenant_id == tenant_id)
         .ok_or_else(|| not_found("config", &id))?;
 
     app.store.remove_config(config.id.clone()).await?;
@@ -1192,39 +1461,61 @@ mod tests {
         Json(serde_json::from_value(v).unwrap())
     }
 
+    fn default_caller() -> Extension<Caller> {
+        Extension(Caller {
+            name: "test".into(),
+            role: crate::auth::ApiRole::Admin,
+            tenant_id: Some("default".into()),
+            cluster_operator: false,
+        })
+    }
+
     #[tokio::test]
-    async fn overlapping_ipam_subnet_is_refused_with_both_names() {
+    async fn overlapping_ipam_subnet_does_not_disclose_other_networks() {
         let (app, _dir) = app_with_node(1.0).await;
         let ipam = |s: &str| serde_json::json!({"IPAM": {"Config": [{"Subnet": s}]}});
-        let _ = create_network(State(app.clone()), net_req("a", ipam("10.100.5.0/24")))
-            .await
-            .expect("first subnet is free");
-        let err = create_network(State(app.clone()), net_req("b", ipam("10.100.5.128/25")))
-            .await
-            .unwrap_err();
+        let _ = create_network(
+            State(app.clone()),
+            default_caller(),
+            net_req("a", ipam("10.100.5.0/24")),
+        )
+        .await
+        .expect("first subnet is free");
+        let err = create_network(
+            State(app.clone()),
+            default_caller(),
+            net_req("b", ipam("10.100.5.128/25")),
+        )
+        .await
+        .unwrap_err();
         let ApiError::Conflict(msg) = err else {
             panic!("want 409, got {err:?}");
         };
-        assert!(
-            msg.contains("network b") && msg.contains("network a"),
-            "{msg}"
-        );
-        // Not stored, and a free subnet still works.
+        assert_eq!(msg, "network subnet overlaps an existing cluster network");
         assert!(app.store.get_network("b").await.unwrap().is_none());
-        let _ = create_network(State(app.clone()), net_req("c", ipam("10.100.6.0/24")))
-            .await
-            .expect("non-overlapping subnet");
+        let _ = create_network(
+            State(app.clone()),
+            default_caller(),
+            net_req("c", ipam("10.100.6.0/24")),
+        )
+        .await
+        .expect("non-overlapping subnet");
     }
 
     #[tokio::test]
     async fn unknown_network_driver_option_is_refused() {
         let (app, _dir) = app_with_node(1.0).await;
         let opts = |k: &str| serde_json::json!({"Options": {k: "1"}});
-        let _ = create_network(State(app.clone()), net_req("a", opts("encrypted")))
-            .await
-            .expect("encrypted is accepted");
+        let _ = create_network(
+            State(app.clone()),
+            default_caller(),
+            net_req("a", opts("encrypted")),
+        )
+        .await
+        .expect("encrypted is accepted");
         let err = create_network(
             State(app.clone()),
+            default_caller(),
             net_req("b", opts("com.docker.network.mtu")),
         )
         .await
@@ -1237,9 +1528,13 @@ mod tests {
         let (app, _dir) = app_with_node(1.0).await;
 
         // web takes half the node's CPU and (simulated) is running there.
-        let _ = create_service(State(app.clone()), Json(spec("web", 500_000_000)))
-            .await
-            .expect("web should fit");
+        let _ = create_service(
+            State(app.clone()),
+            default_caller(),
+            Json(spec("web", 500_000_000)),
+        )
+        .await
+        .expect("web should fit");
         app.store
             .upsert_task(Task {
                 id: "web.1".to_string(),
@@ -1264,18 +1559,22 @@ mod tests {
             .unwrap();
 
         // Another service asking for more than the remaining 0.5 CPU fails.
-        let err = create_service(State(app.clone()), Json(spec("other", 600_000_000)))
-            .await
-            .unwrap_err();
+        let err = create_service(
+            State(app.clone()),
+            default_caller(),
+            Json(spec("other", 600_000_000)),
+        )
+        .await
+        .unwrap_err();
         assert!(
-            matches!(err, ApiError::Conflict(ref m) if m.contains("insufficient capacity")),
-            "expected insufficient-capacity conflict, got {err:?}"
+            matches!(&err, ApiError::Conflict(m) if m == "service cannot be placed with current cluster capacity or constraints"),
+            "expected a generic placement conflict, got {err:?}"
         );
-
         // Updating web itself may use up to the full node: its own task's
         // capacity is freed by the replacement.
         let _ = update_service(
             State(app.clone()),
+            default_caller(),
             Path(("v1.41".to_string(), "web".to_string())),
             Query(
                 serde_json::from_value::<models::ServiceUpdateQuery>(serde_json::json!({}))
@@ -1289,6 +1588,7 @@ mod tests {
         // But not more than the whole node.
         let err = update_service(
             State(app.clone()),
+            default_caller(),
             Path(("v1.41".to_string(), "web".to_string())),
             Query(
                 serde_json::from_value::<models::ServiceUpdateQuery>(serde_json::json!({}))
@@ -1299,8 +1599,8 @@ mod tests {
         .await
         .unwrap_err();
         assert!(
-            matches!(err, ApiError::Conflict(ref m) if m.contains("insufficient capacity")),
-            "expected insufficient-capacity conflict, got {err:?}"
+            matches!(&err, ApiError::Conflict(m) if m == "service cannot be placed with current cluster capacity or constraints"),
+            "expected a generic placement conflict, got {err:?}"
         );
     }
 }

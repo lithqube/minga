@@ -22,7 +22,7 @@ minga-sandbox = { path = "../minga-sandbox" }
 minga-scheduler = { path = "../minga-scheduler" }
 minga-state = { path = "../minga-state" }
 minga-telemetry = { path = "../minga-telemetry" }
-rcgen = { version = "0.13", features = ["x509-parser"] }
+rcgen.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true

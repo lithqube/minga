@@ -26,6 +26,8 @@ services:
     image: redis:7
 "#;
 
+const API_TOKEN: &str = "state-e2e-token";
+
 /// A state store, an API server, a registered node and the scheduler loop.
 async fn cluster() -> (Arc<StateStore>, String, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
@@ -53,9 +55,13 @@ async fn cluster() -> (Arc<StateStore>, String, tempfile::TempDir) {
     bus.refresh_lease(1, b"registration").await.unwrap();
     let scheduler = minga_scheduler::Scheduler::with_bus(store.clone(), bus);
     tokio::spawn(async move { scheduler.run(Duration::from_millis(200)).await });
-    let server = minga_api::ApiServer::start(store.clone(), "127.0.0.1:0")
-        .await
-        .unwrap();
+    let server = minga_api::ApiServer::start_with_auth(
+        store.clone(),
+        "127.0.0.1:0",
+        Some(API_TOKEN.to_owned()),
+    )
+    .await
+    .unwrap();
     let url = format!("http://{}", server.addr());
     // Keep the server alive for the test's duration.
     std::mem::forget(server);
@@ -109,6 +115,8 @@ fn deploy(url: &str) {
         "shop",
         "--api-url",
         url,
+        "--api-token",
+        API_TOKEN,
         "--wait",
         "15",
     ]);
@@ -125,13 +133,23 @@ fn export(url: &str, dir: &tempfile::TempDir) -> std::path::PathBuf {
         path.to_str().unwrap(),
         "--api-url",
         url,
+        "--api-token",
+        API_TOKEN,
     ]);
     assert!(ok, "export failed:\n{out}{err}");
     path
 }
 
 fn import(url: &str, file: &std::path::Path, extra: &[&str]) -> (bool, String, String) {
-    let mut args = vec!["state", "import", file.to_str().unwrap(), "--api-url", url];
+    let mut args = vec![
+        "state",
+        "import",
+        file.to_str().unwrap(),
+        "--api-url",
+        url,
+        "--api-token",
+        API_TOKEN,
+    ];
     args.extend_from_slice(extra);
     minga(&args)
 }
@@ -245,6 +263,8 @@ async fn export_file_handling() {
         file.to_str().unwrap(),
         "--api-url",
         &a_url,
+        "--api-token",
+        API_TOKEN,
     ]);
     assert!(!ok && err.contains("--force"), "{err}");
     assert_eq!(std::fs::read_to_string(&file).unwrap(), "keep me");
@@ -259,6 +279,8 @@ async fn export_file_handling() {
         "--force",
         "--api-url",
         &a_url,
+        "--api-token",
+        API_TOKEN,
     ]);
     assert!(ok, "{err}");
     assert_eq!(
@@ -268,7 +290,14 @@ async fn export_file_handling() {
     serde_json::from_slice::<serde_json::Value>(&std::fs::read(&file).unwrap()).unwrap();
 
     // No -o: JSON on stdout.
-    let (ok, out, err) = minga(&["state", "export", "--api-url", &a_url]);
+    let (ok, out, err) = minga(&[
+        "state",
+        "export",
+        "--api-url",
+        &a_url,
+        "--api-token",
+        API_TOKEN,
+    ]);
     assert!(ok, "{err}");
     let json: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert_eq!(json["services"].as_array().unwrap().len(), 2);
