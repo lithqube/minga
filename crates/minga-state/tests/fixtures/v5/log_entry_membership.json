@@ -1,0 +1,27 @@
+{
+  "log_id": {
+    "index": 8,
+    "leader_id": {
+      "node_id": 1,
+      "term": 1
+    }
+  },
+  "payload": {
+    "Membership": {
+      "configs": [
+        [
+          1,
+          2
+        ]
+      ],
+      "nodes": {
+        "1": {
+          "addr": "10.0.0.1:7001"
+        },
+        "2": {
+          "addr": "10.0.0.2:7001"
+        }
+      }
+    }
+  }
+}

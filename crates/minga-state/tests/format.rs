@@ -13,12 +13,14 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
 
-use minga_state::codec::{self, FORMAT_KEY, FORMAT_VERSION, V2_FORMAT_VERSION, V3_FORMAT_VERSION};
+use minga_state::codec::{
+    self, FORMAT_KEY, FORMAT_VERSION, V2_FORMAT_VERSION, V3_FORMAT_VERSION, V4_FORMAT_VERSION,
+};
 use minga_state::types::{
     AgentSpec, ClusterNode, Config, FailureAction, Healthcheck, MountKind, Network, NodeRole,
     NodeStatus, PortMapping, PortMode, ReservedPort, ResourceSpec, RestartCondition, RestartPolicy,
-    Secret, SecretRef, Service, ServiceMode, ServiceMount, Task, TaskSpec, TaskState, UpdateOrder,
-    UpdatePolicy, Volume, WorkloadKind,
+    Secret, SecretRef, Service, ServiceMode, ServiceMount, Task, TaskSpec, TaskState, Tenant,
+    TenantQuotas, UpdateOrder, UpdatePolicy, Volume, WorkloadKind,
 };
 use minga_state::{StateCommand, StateSnapshot, StateStore, TypeConfig};
 use openraft::{BasicNode, CommittedLeaderId, Entry, EntryPayload, LogId, Membership, Vote};
@@ -80,7 +82,7 @@ fn a_fixture_accepts_added_fields_and_rejects_changed_ones() {
 
 /// Compares `value` with its fixture, and decodes the fixture back.
 fn check<T: Serialize + DeserializeOwned>(name: &str, value: &T) {
-    for version in [V2_FORMAT_VERSION, V3_FORMAT_VERSION] {
+    for version in [V2_FORMAT_VERSION, V3_FORMAT_VERSION, V4_FORMAT_VERSION] {
         let old_path = fixture_path_for_version(version, name);
         if old_path.exists() {
             let old = std::fs::read_to_string(&old_path).unwrap_or_else(|e| {
@@ -180,6 +182,25 @@ fn map(pairs: &[(&str, &str)]) -> HashMap<String, String> {
         .iter()
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .collect()
+}
+
+fn tenant() -> Tenant {
+    Tenant {
+        id: "tenant-a".into(),
+        name: "Tenant A".into(),
+        quotas: TenantQuotas {
+            services: Some(10),
+            tasks: Some(50),
+            secrets: Some(20),
+            networks: Some(5),
+            jobs: Some(3),
+            desired_state_bytes: Some(1_048_576),
+            api_requests_per_second: Some(100),
+            jetstream_bytes: Some(1_073_741_824),
+            jetstream_age_secs: Some(86_400),
+        },
+        created_at: 1_794_000_000,
+    }
 }
 
 fn agent() -> AgentSpec {
@@ -298,6 +319,10 @@ fn task_spec() -> TaskSpec {
     }
 }
 
+#[test]
+fn tenant_fixture() {
+    check("tenant", &tenant());
+}
 fn log_id(index: u64) -> LogId<u64> {
     LogId::new(CommittedLeaderId::new(1, 1), index)
 }
@@ -474,6 +499,22 @@ fn a_task_failure_reason_is_optional_and_round_trips() {
 #[test]
 fn command_fixtures() {
     check(
+        "command_create_tenant",
+        &StateCommand::CreateTenant(tenant()),
+    );
+    check(
+        "command_update_tenant",
+        &StateCommand::UpdateTenant {
+            id: "tenant-a".into(),
+            name: "Tenant Alpha".into(),
+            quotas: TenantQuotas::default(),
+        },
+    );
+    check(
+        "command_remove_tenant",
+        &StateCommand::RemoveTenant("tenant-a".into()),
+    );
+    check(
         "command_upsert_service",
         &StateCommand::UpsertService(service("shop.web")),
     );
@@ -520,6 +561,7 @@ const SM_META: TableDefinition<&str, &[u8]> = TableDefinition::new("sm_meta");
 const SM_NODES: TableDefinition<&str, &[u8]> = TableDefinition::new("nodes");
 const SM_SERVICES: TableDefinition<&str, &[u8]> = TableDefinition::new("services");
 const SM_TASKS: TableDefinition<&str, &[u8]> = TableDefinition::new("tasks");
+const SM_TENANTS: TableDefinition<&str, &[u8]> = TableDefinition::new("tenants");
 const RAFT_META: TableDefinition<&str, &[u8]> = TableDefinition::new("raft_meta");
 const RAFT_LOGS: TableDefinition<u64, &[u8]> = TableDefinition::new("raft_logs");
 
@@ -556,6 +598,7 @@ fn set_marker(file: PathBuf, table: TableDefinition<&str, &[u8]>, value: Option<
 fn strip_v3_fields(value: &mut serde_json::Value) {
     match value {
         serde_json::Value::Object(object) => {
+            object.remove("tenants");
             object.remove("reserved_ports");
             object.remove("tenant_id");
             if let Some(serde_json::Value::Array(ports)) = object.get_mut("ports") {
@@ -581,6 +624,7 @@ fn strip_v3_fields(value: &mut serde_json::Value) {
 fn strip_tenant_fields(value: &mut serde_json::Value) {
     match value {
         serde_json::Value::Object(object) => {
+            object.remove("tenants");
             object.remove("tenant_id");
             for nested in object.values_mut() {
                 strip_tenant_fields(nested);
@@ -592,6 +636,36 @@ fn strip_tenant_fields(value: &mut serde_json::Value) {
             }
         }
         _ => {}
+    }
+}
+
+fn clear_tenants(tx: &redb::WriteTransaction) {
+    let keys = {
+        let table = tx.open_table(SM_TENANTS).unwrap();
+        table
+            .iter()
+            .unwrap()
+            .map(|row| row.unwrap().0.value().to_owned())
+            .collect::<Vec<_>>()
+    };
+    let mut table = tx.open_table(SM_TENANTS).unwrap();
+    for key in keys {
+        table.remove(key.as_str()).unwrap();
+    }
+}
+
+fn replace_tenant_commands(value: &mut serde_json::Value) {
+    if let serde_json::Value::Object(object) = value {
+        if object.remove("CreateTenant").is_some() {
+            object.insert("UpsertNode".into(), serde_json::to_value(node()).unwrap());
+        }
+        for nested in object.values_mut() {
+            replace_tenant_commands(nested);
+        }
+    } else if let serde_json::Value::Array(values) = value {
+        for nested in values {
+            replace_tenant_commands(nested);
+        }
     }
 }
 
@@ -616,10 +690,10 @@ fn downgrade_string_table(
     };
     let mut table = tx.open_table(definition).unwrap();
     for (key, mut value) in records {
-        if version == V3_FORMAT_VERSION {
-            strip_tenant_fields(&mut value);
-        } else {
-            strip_v3_fields(&mut value);
+        match version {
+            V2_FORMAT_VERSION => strip_v3_fields(&mut value),
+            V3_FORMAT_VERSION => strip_tenant_fields(&mut value),
+            _ => {}
         }
         let bytes = serde_json::to_vec(&value).unwrap();
         table.insert(key.as_str(), bytes.as_slice()).unwrap();
@@ -643,11 +717,12 @@ fn downgrade_log_table(tx: &redb::WriteTransaction, version: u8) {
     };
     let mut table = tx.open_table(RAFT_LOGS).unwrap();
     for (index, mut value) in records {
-        if version == V3_FORMAT_VERSION {
-            strip_tenant_fields(&mut value);
-        } else {
-            strip_v3_fields(&mut value);
+        match version {
+            V2_FORMAT_VERSION => strip_v3_fields(&mut value),
+            V3_FORMAT_VERSION => strip_tenant_fields(&mut value),
+            _ => {}
         }
+        replace_tenant_commands(&mut value);
         let bytes = serde_json::to_vec(&value).unwrap();
         table.insert(index, bytes.as_slice()).unwrap();
     }
@@ -659,6 +734,7 @@ fn prepare_v2_state(file: &std::path::Path) {
     downgrade_string_table(&tx, SM_NODES, V2_FORMAT_VERSION);
     downgrade_string_table(&tx, SM_SERVICES, V2_FORMAT_VERSION);
     downgrade_string_table(&tx, SM_TASKS, V2_FORMAT_VERSION);
+    clear_tenants(&tx);
     tx.open_table(SM_META)
         .unwrap()
         .insert(FORMAT_KEY, [V2_FORMAT_VERSION].as_slice())
@@ -670,9 +746,21 @@ fn prepare_v3_state(file: &std::path::Path) {
     let db = Database::create(file).unwrap();
     let tx = db.begin_write().unwrap();
     downgrade_string_table(&tx, SM_SERVICES, V3_FORMAT_VERSION);
+    clear_tenants(&tx);
     tx.open_table(SM_META)
         .unwrap()
         .insert(FORMAT_KEY, [V3_FORMAT_VERSION].as_slice())
+        .unwrap();
+    tx.commit().unwrap();
+}
+
+fn prepare_v4_state(file: &std::path::Path) {
+    let db = Database::create(file).unwrap();
+    let tx = db.begin_write().unwrap();
+    clear_tenants(&tx);
+    tx.open_table(SM_META)
+        .unwrap()
+        .insert(FORMAT_KEY, [V4_FORMAT_VERSION].as_slice())
         .unwrap();
     tx.commit().unwrap();
 }
@@ -695,6 +783,17 @@ fn prepare_v3_log(file: &std::path::Path) {
     tx.open_table(RAFT_META)
         .unwrap()
         .insert(FORMAT_KEY, [V3_FORMAT_VERSION].as_slice())
+        .unwrap();
+    tx.commit().unwrap();
+}
+
+fn prepare_v4_log(file: &std::path::Path) {
+    let db = Database::create(file).unwrap();
+    let tx = db.begin_write().unwrap();
+    downgrade_log_table(&tx, V4_FORMAT_VERSION);
+    tx.open_table(RAFT_META)
+        .unwrap()
+        .insert(FORMAT_KEY, [V4_FORMAT_VERSION].as_slice())
         .unwrap();
     tx.commit().unwrap();
 }
@@ -818,6 +917,23 @@ async fn a_v3_state_file_defaults_legacy_records_to_the_default_tenant() {
 }
 
 #[tokio::test]
+async fn a_v4_state_file_is_migrated_and_seeds_the_default_tenant() {
+    let (_dir, path) = written_dir().await;
+    let state_file = path.join("state.redb");
+    prepare_v4_state(&state_file);
+
+    let store = StateStore::open(1, "127.0.0.1:0", &path, BTreeMap::new())
+        .await
+        .unwrap();
+    let service = store.get_service("shop.web").await.unwrap().unwrap();
+    assert_eq!(service.tenant_id, "default");
+    assert!(store.get_tenant("default").await.unwrap().is_some());
+    store.shutdown().await.unwrap();
+
+    assert_eq!(read_marker(&state_file, SM_META), Some(FORMAT_VERSION));
+}
+
+#[tokio::test]
 async fn a_v2_log_file_rewrites_entries_and_preserves_indices() {
     let (_dir, path) = written_dir().await;
     let log_file = path.join("raft_log.redb");
@@ -836,7 +952,11 @@ async fn a_v2_log_file_rewrites_entries_and_preserves_indices() {
     assert_eq!(read_marker(&log_file, RAFT_META), Some(FORMAT_VERSION));
     let entries = read_log_values(&log_file);
     assert_eq!(
-        entries.iter().map(|(index, _)| *index).collect::<Vec<_>>(),
+        entries
+            .iter()
+            .take(indices.len())
+            .map(|(index, _)| *index)
+            .collect::<Vec<_>>(),
         indices
     );
     assert!(entries
@@ -871,7 +991,48 @@ async fn a_v3_log_file_rewrites_entries_and_defaults_tenant_fields() {
     assert_eq!(read_marker(&log_file, RAFT_META), Some(FORMAT_VERSION));
     let entries = read_log_values(&log_file);
     assert_eq!(
-        entries.iter().map(|(index, _)| *index).collect::<Vec<_>>(),
+        entries
+            .iter()
+            .take(indices.len())
+            .map(|(index, _)| *index)
+            .collect::<Vec<_>>(),
+        indices
+    );
+    assert!(entries.iter().any(|(_, value)| has_default_tenant(value)));
+}
+
+#[tokio::test]
+async fn a_v4_log_file_rewrites_entries_and_preserves_tenant_fields() {
+    let (_dir, path) = written_dir().await;
+    let log_file = path.join("raft_log.redb");
+    let indices: Vec<_> = read_log_values(&log_file)
+        .into_iter()
+        .map(|(index, _)| index)
+        .collect();
+    prepare_v4_log(&log_file);
+
+    let store = StateStore::open(1, "127.0.0.1:0", &path, BTreeMap::new())
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .get_service("shop.web")
+            .await
+            .unwrap()
+            .unwrap()
+            .tenant_id,
+        "default"
+    );
+    store.shutdown().await.unwrap();
+
+    assert_eq!(read_marker(&log_file, RAFT_META), Some(FORMAT_VERSION));
+    let entries = read_log_values(&log_file);
+    assert_eq!(
+        entries
+            .iter()
+            .take(indices.len())
+            .map(|(index, _)| *index)
+            .collect::<Vec<_>>(),
         indices
     );
     assert!(entries.iter().any(|(_, value)| has_default_tenant(value)));
@@ -919,6 +1080,25 @@ async fn importing_a_v3_portable_snapshot_defaults_tenant() {
 }
 
 #[tokio::test]
+async fn importing_a_v4_portable_snapshot_seeds_default_tenant() {
+    let (_dir, path) = written_dir().await;
+    let store = StateStore::open(1, "127.0.0.1:0", &path, BTreeMap::new())
+        .await
+        .unwrap();
+
+    let mut old_json = serde_json::to_value(store.export().await.unwrap()).unwrap();
+    old_json["format_version"] = serde_json::json!(V4_FORMAT_VERSION);
+    old_json.as_object_mut().unwrap().remove("tenants");
+    let snapshot: StateSnapshot = serde_json::from_value(old_json).unwrap();
+    assert!(snapshot.tenants.is_empty());
+
+    store.import(snapshot, true).await.unwrap();
+    assert!(store.get_tenant("default").await.unwrap().is_some());
+    assert_eq!(store.export().await.unwrap().format_version, FORMAT_VERSION);
+    store.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn importing_unsupported_portable_snapshot_versions_is_refused() {
     let (_dir, path) = written_dir().await;
     let store = StateStore::open(1, "127.0.0.1:0", &path, BTreeMap::new())
@@ -929,6 +1109,7 @@ async fn importing_unsupported_portable_snapshot_versions_is_refused() {
         let snapshot = StateSnapshot {
             format_version: version,
             exported_at_unix: 0,
+            tenants: Vec::new(),
             services: Vec::new(),
             networks: Vec::new(),
             volumes: Vec::new(),

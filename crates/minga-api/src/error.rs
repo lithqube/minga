@@ -49,7 +49,8 @@ impl From<minga_state::StateError> for ApiError {
             E::Conflict(_) | E::PortConflict(_) | E::Membership(_) | E::NotLeader(_) => {
                 ApiError::Conflict(e.to_string())
             }
-            E::BadSnapshot(_) => ApiError::BadRequest(e.to_string()),
+            E::NotFound(_) => ApiError::NotFound(e.to_string()),
+            E::InvalidTenant(_) | E::BadSnapshot(_) => ApiError::BadRequest(e.to_string()),
             _ => ApiError::State(e.to_string()),
         }
     }

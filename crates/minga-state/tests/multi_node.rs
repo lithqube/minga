@@ -7,7 +7,9 @@ use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::time::Duration;
 
-use minga_state::types::{ClusterNode, NodeStatus, ResourceSpec, Service, ServiceMode};
+use minga_state::types::{
+    ClusterNode, NodeStatus, ResourceSpec, Service, ServiceMode, Tenant, TenantQuotas,
+};
 use minga_state::StateStore;
 
 /// Upper bound for any wait in this file, so a broken cluster fails instead of hanging.
@@ -260,6 +262,43 @@ async fn write_replicates_to_all_nodes() {
         let svc = store.get_service("web").await.unwrap();
         assert!(svc.is_some(), "node {i} should see the replicated service");
         assert_eq!(svc.unwrap().replicas, 1);
+    }
+
+    store1.shutdown().await.unwrap();
+    store2.shutdown().await.unwrap();
+    store3.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn tenant_writes_replicate_to_all_nodes() {
+    let (store1, store2, store3, _, _, _) = open_cluster().await;
+    let stores = [&store1, &store2, &store3];
+    let leader = leader(&stores).await;
+
+    leader
+        .create_tenant(Tenant {
+            id: "tenant-a".into(),
+            name: "Tenant A".into(),
+            quotas: TenantQuotas::default(),
+            created_at: 1_794_000_000,
+        })
+        .await
+        .unwrap();
+
+    for store in stores {
+        eventually("tenant write replicates to every manager", || async move {
+            store.get_tenant("tenant-a").await.unwrap().is_some()
+        })
+        .await;
+        assert_eq!(
+            store
+                .get_tenant("tenant-a")
+                .await
+                .unwrap()
+                .unwrap()
+                .created_at,
+            1_794_000_000
+        );
     }
 
     store1.shutdown().await.unwrap();

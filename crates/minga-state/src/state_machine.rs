@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::codec::{
     check_format, FORMAT_KEY, FORMAT_VERSION, V2_FORMAT_VERSION, V3_FORMAT_VERSION,
+    V4_FORMAT_VERSION,
 };
 use crate::command::{StateCommand, StateResponse};
 use crate::types::*;
@@ -35,10 +36,11 @@ const NETWORKS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("netwo
 const VOLUMES_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("volumes");
 const SECRETS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("secrets");
 const CONFIGS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("configs");
+const TENANTS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("tenants");
 const SM_META_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("sm_meta");
 
 /// All entity tables, used for clearing on snapshot install.
-const ENTITY_TABLES: [TableDefinition<&str, &[u8]>; 7] = [
+const ENTITY_TABLES: [TableDefinition<&str, &[u8]>; 8] = [
     NODES_TABLE,
     SERVICES_TABLE,
     TASKS_TABLE,
@@ -46,16 +48,17 @@ const ENTITY_TABLES: [TableDefinition<&str, &[u8]>; 7] = [
     VOLUMES_TABLE,
     SECRETS_TABLE,
     CONFIGS_TABLE,
+    TENANTS_TABLE,
 ];
 
-/// Re-encodes records whose serialized shape changed in format v4.
+/// Re-encodes entity records and advances the marker during the v5 migration.
 ///
 /// The caller advances the marker in the same redb transaction, so a failure
 /// leaves both the old values and the old marker intact.
 #[allow(clippy::result_large_err)]
 fn migrate_state(tx: &redb::WriteTransaction) -> Result<(), StorageIOError<u64>> {
-    // v2 also predates reserved node ports and port modes; v3 already has
-    // those fields, and re-encoding both versions keeps migration atomic.
+    // v2 predates reserved node ports, port modes, and tenant ownership; v3
+    // predates tenant ownership. Re-encoding keeps each migration atomic.
     rewrite_state_table::<ClusterNode>(tx, NODES_TABLE)?;
     rewrite_state_table::<Service>(tx, SERVICES_TABLE)?;
     rewrite_state_table::<Task>(tx, TASKS_TABLE)?;
@@ -97,6 +100,48 @@ fn rewrite_state_table<T: DeserializeOwned + Serialize>(
     Ok(())
 }
 
+#[allow(clippy::result_large_err)]
+fn tenant_has_records<T: DeserializeOwned>(
+    tx: &redb::WriteTransaction,
+    definition: TableDefinition<&str, &[u8]>,
+    tenant_id: &str,
+    matches: impl Fn(&T, &str) -> bool,
+) -> Result<bool, StorageError<u64>> {
+    let table = tx.open_table(definition).map_err(sm_io_err)?;
+    for row in table.iter().map_err(sm_io_err)? {
+        let (_, value) = row.map_err(sm_io_err)?;
+        let record: T = crate::codec::decode(value.value())
+            .map_err(|e| sm_storage_err(ErrorSubject::Store, ErrorVerb::Read, e))?;
+        if matches(&record, tenant_id) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+#[allow(clippy::result_large_err)]
+fn tenant_has_resources(
+    tx: &redb::WriteTransaction,
+    tenant_id: &str,
+) -> Result<bool, StorageError<u64>> {
+    Ok(
+        tenant_has_records::<Service>(tx, SERVICES_TABLE, tenant_id, |r, id| r.tenant_id == id)?
+            || tenant_has_records::<Task>(tx, TASKS_TABLE, tenant_id, |r, id| r.tenant_id == id)?
+            || tenant_has_records::<Network>(tx, NETWORKS_TABLE, tenant_id, |r, id| {
+                r.tenant_id == id
+            })?
+            || tenant_has_records::<Volume>(tx, VOLUMES_TABLE, tenant_id, |r, id| {
+                r.tenant_id == id
+            })?
+            || tenant_has_records::<Secret>(tx, SECRETS_TABLE, tenant_id, |r, id| {
+                r.tenant_id == id
+            })?
+            || tenant_has_records::<Config>(tx, CONFIGS_TABLE, tenant_id, |r, id| {
+                r.tenant_id == id
+            })?,
+    )
+}
+
 // --- snapshot -----------------------------------------------------------------
 
 /// A serializable snapshot of the entire state machine.
@@ -109,6 +154,8 @@ struct StateSnapshot {
     volumes: Vec<Volume>,
     secrets: Vec<Secret>,
     configs: Vec<Config>,
+    #[serde(default)]
+    tenants: Vec<Tenant>,
     last_applied: Option<LogId<u64>>,
     last_membership: StoredMembership<u64, BasicNode>,
 }
@@ -152,6 +199,7 @@ impl RedbStateMachine {
 
         if stored.as_deref() == Some(&[V2_FORMAT_VERSION])
             || stored.as_deref() == Some(&[V3_FORMAT_VERSION])
+            || stored.as_deref() == Some(&[V4_FORMAT_VERSION])
         {
             // Tenant fields default legacy desired state to the default tenant.
             migrate_state(&tx)?;
@@ -358,6 +406,69 @@ impl RedbStateMachine {
                 t.remove(id.as_str()).map_err(sm_io_err)?;
                 Ok(StateResponse::Ok)
             }
+            StateCommand::UpsertTenant(tenant) => {
+                let mut t = tx.open_table(TENANTS_TABLE).map_err(sm_io_err)?;
+                let bytes = crate::codec::encode(tenant)
+                    .map_err(|e| sm_storage_err(ErrorSubject::Store, ErrorVerb::Write, e))?;
+                t.insert(tenant.id.as_str(), bytes.as_slice())
+                    .map_err(sm_io_err)?;
+                Ok(StateResponse::Ok)
+            }
+            StateCommand::CreateTenant(tenant) => {
+                let mut t = tx.open_table(TENANTS_TABLE).map_err(sm_io_err)?;
+                if t.get(tenant.id.as_str()).map_err(sm_io_err)?.is_some() {
+                    return Ok(StateResponse::Conflict(format!(
+                        "tenant {} already exists",
+                        tenant.id
+                    )));
+                }
+                let bytes = crate::codec::encode(tenant)
+                    .map_err(|e| sm_storage_err(ErrorSubject::Store, ErrorVerb::Write, e))?;
+                t.insert(tenant.id.as_str(), bytes.as_slice())
+                    .map_err(sm_io_err)?;
+                Ok(StateResponse::Ok)
+            }
+            StateCommand::UpdateTenant { id, name, quotas } => {
+                let mut t = tx.open_table(TENANTS_TABLE).map_err(sm_io_err)?;
+                let existing: Option<Tenant> = t
+                    .get(id.as_str())
+                    .map_err(sm_io_err)?
+                    .map(|value| crate::codec::decode(value.value()))
+                    .transpose()
+                    .map_err(|e| sm_storage_err(ErrorSubject::Store, ErrorVerb::Read, e))?;
+                let Some(mut tenant) = existing else {
+                    return Ok(StateResponse::NotFound);
+                };
+                tenant.name.clone_from(name);
+                tenant.quotas.clone_from(quotas);
+                let bytes = crate::codec::encode(&tenant)
+                    .map_err(|e| sm_storage_err(ErrorSubject::Store, ErrorVerb::Write, e))?;
+                t.insert(id.as_str(), bytes.as_slice()).map_err(sm_io_err)?;
+                Ok(StateResponse::Ok)
+            }
+            StateCommand::RemoveTenant(id) => {
+                if id == DEFAULT_TENANT_ID {
+                    return Ok(StateResponse::Conflict(
+                        "the default tenant cannot be removed".into(),
+                    ));
+                }
+                let exists = {
+                    let t = tx.open_table(TENANTS_TABLE).map_err(sm_io_err)?;
+                    let exists = t.get(id.as_str()).map_err(sm_io_err)?.is_some();
+                    exists
+                };
+                if !exists {
+                    return Ok(StateResponse::NotFound);
+                }
+                if tenant_has_resources(tx, id)? {
+                    return Ok(StateResponse::Conflict(format!(
+                        "tenant {id} still owns resources"
+                    )));
+                }
+                let mut t = tx.open_table(TENANTS_TABLE).map_err(sm_io_err)?;
+                t.remove(id.as_str()).map_err(sm_io_err)?;
+                Ok(StateResponse::Ok)
+            }
         }
     }
 
@@ -549,6 +660,32 @@ impl RedbStateMachine {
         }
         Ok(configs)
     }
+    pub async fn get_tenant(&self, id: &str) -> Result<Option<Tenant>, String> {
+        let db = self.db.lock().unwrap();
+        let tx = db.begin_read().map_err(|e| e.to_string())?;
+        let t = tx.open_table(TENANTS_TABLE).map_err(|e| e.to_string())?;
+        match t.get(id).map_err(|e| e.to_string())? {
+            Some(value) => {
+                let tenant: Tenant =
+                    crate::codec::decode(value.value()).map_err(|e| e.to_string())?;
+                Ok(Some(tenant))
+            }
+            None => Ok(None),
+        }
+    }
+
+    pub async fn list_tenants(&self) -> Result<Vec<Tenant>, String> {
+        let db = self.db.lock().unwrap();
+        let tx = db.begin_read().map_err(|e| e.to_string())?;
+        let t = tx.open_table(TENANTS_TABLE).map_err(|e| e.to_string())?;
+        let mut tenants = Vec::new();
+        for row in t.iter().map_err(|e| e.to_string())? {
+            let (_, value) = row.map_err(|e| e.to_string())?;
+            let tenant: Tenant = crate::codec::decode(value.value()).map_err(|e| e.to_string())?;
+            tenants.push(tenant);
+        }
+        Ok(tenants)
+    }
 }
 
 impl Debug for RedbStateMachine {
@@ -703,6 +840,15 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
                     .map_err(sm_io_err)?;
             }
         }
+        {
+            let mut t = tx.open_table(TENANTS_TABLE).map_err(sm_io_err)?;
+            for tenant in &snap.tenants {
+                let bytes = crate::codec::encode(tenant)
+                    .map_err(|e| sm_storage_err(ErrorSubject::Store, ErrorVerb::Write, e))?;
+                t.insert(tenant.id.as_str(), bytes.as_slice())
+                    .map_err(sm_io_err)?;
+            }
+        }
 
         // Save snapshot metadata.
         Self::save_meta(&tx, snap.last_applied, &snap.last_membership)?;
@@ -744,6 +890,7 @@ impl RaftSnapshotBuilder<TypeConfig> for RedbSnapshotBuilder {
             volumes: Vec::new(),
             secrets: Vec::new(),
             configs: Vec::new(),
+            tenants: Vec::new(),
             last_applied: None,
             last_membership: StoredMembership::default(),
         };
@@ -810,6 +957,15 @@ impl RaftSnapshotBuilder<TypeConfig> for RedbSnapshotBuilder {
                 let c: Config = crate::codec::decode(v.value())
                     .map_err(|e| sm_storage_err(ErrorSubject::Store, ErrorVerb::Read, e))?;
                 snap.configs.push(c);
+            }
+        }
+        {
+            let t = tx.open_table(TENANTS_TABLE).map_err(sm_io_err)?;
+            for row in t.iter().map_err(sm_io_err)? {
+                let (_, value) = row.map_err(sm_io_err)?;
+                let tenant: Tenant = crate::codec::decode(value.value())
+                    .map_err(|e| sm_storage_err(ErrorSubject::Store, ErrorVerb::Read, e))?;
+                snap.tenants.push(tenant);
             }
         }
         // Read metadata.

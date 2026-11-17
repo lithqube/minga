@@ -35,6 +35,54 @@ fn default_tenant_id() -> TenantId {
     DEFAULT_TENANT_ID.to_owned()
 }
 
+/// A cluster tenant and its desired quotas.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Tenant {
+    pub id: TenantId,
+    pub name: String,
+    #[serde(default)]
+    pub quotas: TenantQuotas,
+    /// Unix timestamp in seconds when the tenant was created.
+    pub created_at: u64,
+}
+
+impl Tenant {
+    /// Validates the tenant ID and display name.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        Self::validate_id(&self.id)?;
+        if self.name.trim().is_empty() {
+            return Err("tenant name must not be empty");
+        }
+        Ok(())
+    }
+
+    /// Tenant IDs use the same safe token alphabet as NATS subjects.
+    pub fn validate_id(id: &str) -> Result<(), &'static str> {
+        if id.is_empty()
+            || !id.bytes().all(|byte| {
+                byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"_-".contains(&byte)
+            })
+        {
+            return Err("tenant ID must contain only lowercase ASCII letters, digits, '-' or '_'");
+        }
+        Ok(())
+    }
+}
+
+/// Optional per-tenant resource and shared-plane limits. `None` means no limit.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TenantQuotas {
+    pub services: Option<u64>,
+    pub tasks: Option<u64>,
+    pub secrets: Option<u64>,
+    pub networks: Option<u64>,
+    pub jobs: Option<u64>,
+    pub desired_state_bytes: Option<u64>,
+    pub api_requests_per_second: Option<u64>,
+    pub jetstream_bytes: Option<u64>,
+    pub jetstream_age_secs: Option<u64>,
+}
+
 /// Config identifier.
 pub type ConfigId = String;
 
@@ -641,6 +689,24 @@ pub struct Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tenant_ids_use_nats_safe_tokens() {
+        for id in ["default", "site-7", "tenant_1", "9"] {
+            assert!(Tenant::validate_id(id).is_ok(), "{id}");
+        }
+        for id in ["", "Tenant", "two.parts", "$system", "bad/id"] {
+            assert!(Tenant::validate_id(id).is_err(), "{id}");
+        }
+        assert!(Tenant {
+            id: "tenant-a".into(),
+            name: " ".into(),
+            quotas: TenantQuotas::default(),
+            created_at: 1,
+        }
+        .validate()
+        .is_err());
+    }
 
     #[test]
     fn workload_kind_default_is_container() {

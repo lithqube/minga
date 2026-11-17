@@ -18,7 +18,7 @@ use crate::network::{forward_write, serve_raft_rpc, RaftTlsConfig, TcpNetworkFac
 use crate::state_machine::RedbStateMachine;
 use crate::types::{
     ClusterNode, Config as StateConfig, ConfigId, Network, NetworkId, NodeId, Secret, SecretId,
-    Service, ServiceId, Task, TaskId, Volume, VolumeId,
+    Service, ServiceId, Task, TaskId, Tenant, TenantQuotas, Volume, VolumeId, DEFAULT_TENANT_ID,
 };
 use crate::TypeConfig;
 
@@ -27,15 +27,18 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Desired state in a portable form, for backup and restore.
 ///
-/// Holds services, networks, volumes and secret/config metadata. Nodes and
-/// tasks are left out: nodes re-register themselves and the scheduler
-/// re-places tasks. Secrets and configs are references, never values. Service
-/// specs do carry environment values, so treat a snapshot as sensitive.
+/// Holds tenants and desired resources: services, networks, volumes and
+/// secret/config metadata. Nodes and tasks are left out: nodes re-register
+/// themselves and the scheduler re-places tasks. Secrets and configs are
+/// references, never values. Service specs carry environment values, so treat
+/// a snapshot as sensitive.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct StateSnapshot {
     /// [`crate::codec::FORMAT_VERSION`] of the build that exported it.
     pub format_version: u8,
     pub exported_at_unix: u64,
+    #[serde(default)]
+    pub tenants: Vec<Tenant>,
     pub services: Vec<Service>,
     pub networks: Vec<Network>,
     pub volumes: Vec<Volume>,
@@ -242,14 +245,27 @@ impl StateStore {
             }
         }
 
-        Ok(Self {
+        let store = Self {
             raft,
             reader,
             node_id,
             rpc_server,
             tls_client: client_tls,
             membership_change: tokio::sync::Mutex::new(()),
-        })
+        };
+        if initialized {
+            let default_tenant = Tenant {
+                id: DEFAULT_TENANT_ID.to_owned(),
+                name: DEFAULT_TENANT_ID.to_owned(),
+                quotas: TenantQuotas::default(),
+                created_at: crate::types::unix_now(),
+            };
+            match store.create_tenant(default_tenant).await {
+                Ok(()) | Err(StateError::Conflict(_)) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(store)
     }
 
     /// This node's Raft ID.
@@ -481,6 +497,74 @@ impl StateStore {
         }
         unreachable!("loop returns on success, final failure, or exhausts attempts")
     }
+    /// Creates a tenant through Raft.
+    pub async fn create_tenant(&self, tenant: Tenant) -> Result<(), StateError> {
+        tenant
+            .validate()
+            .map_err(|error| StateError::InvalidTenant(error.into()))?;
+        match self.propose(StateCommand::CreateTenant(tenant)).await? {
+            StateResponse::Ok => Ok(()),
+            StateResponse::Conflict(message) => Err(StateError::Conflict(message)),
+            StateResponse::NotFound => Err(StateError::NotFound("tenant".into())),
+            StateResponse::Error(message) => Err(StateError::Raft(message)),
+        }
+    }
+
+    /// Updates a tenant's name and quotas without changing its identity or creation time.
+    pub async fn update_tenant(
+        &self,
+        id: impl AsRef<str>,
+        name: String,
+        quotas: TenantQuotas,
+    ) -> Result<(), StateError> {
+        let id = id.as_ref().to_owned();
+        let tenant = Tenant {
+            id: id.clone(),
+            name,
+            quotas,
+            created_at: 0,
+        };
+        tenant
+            .validate()
+            .map_err(|error| StateError::InvalidTenant(error.into()))?;
+        match self
+            .propose(StateCommand::UpdateTenant {
+                id: id.clone(),
+                name: tenant.name,
+                quotas: tenant.quotas,
+            })
+            .await?
+        {
+            StateResponse::Ok => Ok(()),
+            StateResponse::NotFound => Err(StateError::NotFound(id)),
+            StateResponse::Conflict(message) => Err(StateError::Conflict(message)),
+            StateResponse::Error(message) => Err(StateError::Raft(message)),
+        }
+    }
+
+    /// Upserts a tenant when importing a portable snapshot.
+    pub async fn upsert_tenant(&self, tenant: Tenant) -> Result<(), StateError> {
+        tenant
+            .validate()
+            .map_err(|error| StateError::InvalidTenant(error.into()))?;
+        self.propose(StateCommand::UpsertTenant(tenant)).await?;
+        Ok(())
+    }
+
+    /// Removes a tenant only when it owns no resources; `default` is permanent.
+    pub async fn remove_tenant(&self, id: impl AsRef<str>) -> Result<(), StateError> {
+        let id = id.as_ref();
+        Tenant::validate_id(id).map_err(|error| StateError::InvalidTenant(error.into()))?;
+        match self
+            .propose(StateCommand::RemoveTenant(id.to_owned()))
+            .await?
+        {
+            StateResponse::Ok => Ok(()),
+            StateResponse::NotFound => Err(StateError::NotFound(id.to_owned())),
+            StateResponse::Conflict(message) => Err(StateError::Conflict(message)),
+            StateResponse::Error(message) => Err(StateError::Raft(message)),
+        }
+    }
 
     pub async fn upsert_node(&self, node: ClusterNode) -> Result<(), StateError> {
         self.propose(StateCommand::UpsertNode(node)).await?;
@@ -645,6 +729,23 @@ impl StateStore {
             .map_err(StateError::storage)
     }
 
+    pub async fn get_tenant(&self, id: impl AsRef<str>) -> Result<Option<Tenant>, StateError> {
+        self.reader
+            .get_tenant(id.as_ref())
+            .await
+            .map_err(StateError::storage)
+    }
+
+    pub async fn list_tenants(&self) -> Result<Vec<Tenant>, StateError> {
+        let mut tenants = self
+            .reader
+            .list_tenants()
+            .await
+            .map_err(StateError::storage)?;
+        tenants.sort_unstable_by(|a, b| a.id.cmp(&b.id));
+        Ok(tenants)
+    }
+
     // --- backup and restore -----------------------------------------------------
 
     /// Reads desired state into a [`StateSnapshot`].
@@ -652,6 +753,7 @@ impl StateStore {
         Ok(StateSnapshot {
             format_version: crate::codec::FORMAT_VERSION,
             exported_at_unix: crate::types::unix_now(),
+            tenants: self.list_tenants().await?,
             services: self.list_services().await?,
             networks: self.list_networks().await?,
             volumes: self.list_volumes().await?,
@@ -660,19 +762,20 @@ impl StateStore {
         })
     }
 
-    /// Writes a snapshot through Raft, dependencies first: networks, secrets,
-    /// configs, volumes, then services. Nothing is written when the snapshot
-    /// is refused. Existing networks, volumes, secrets and configs are
-    /// upserted; existing services make this fail with
-    /// [`StateError::Conflict`] unless `overwrite` is set.
+    /// Writes a snapshot through Raft, tenants before their resources.
+    /// Nothing is written when the snapshot is refused. Existing tenant,
+    /// network, volume, secret and config records are upserted; existing
+    /// services make this fail with [`StateError::Conflict`] unless
+    /// `overwrite` is set.
     pub async fn import(&self, snapshot: StateSnapshot, overwrite: bool) -> Result<(), StateError> {
         let want = crate::codec::FORMAT_VERSION;
         match snapshot.format_version {
             crate::codec::FORMAT_VERSION
+            | crate::codec::V4_FORMAT_VERSION
             | crate::codec::V3_FORMAT_VERSION
             | crate::codec::V2_FORMAT_VERSION => {
-                // Legacy tenant fields default to the default tenant, and all
-                // imported state is then proposed through the current format.
+                // Legacy snapshots contain no tenant list; resource tenant IDs
+                // still default to `default` and are imported in the current format.
             }
             found => {
                 return Err(StateError::BadSnapshot(format!(
@@ -690,6 +793,18 @@ impl StateStore {
             if !clashes.is_empty() {
                 return Err(StateError::Conflict(clashes.join(", ")));
             }
+        }
+        let mut tenants = snapshot.tenants;
+        if !tenants.iter().any(|tenant| tenant.id == DEFAULT_TENANT_ID) {
+            tenants.push(Tenant {
+                id: DEFAULT_TENANT_ID.to_string(),
+                name: DEFAULT_TENANT_ID.to_string(),
+                quotas: TenantQuotas::default(),
+                created_at: crate::types::unix_now(),
+            });
+        }
+        for tenant in tenants {
+            self.upsert_tenant(tenant).await?;
         }
         for n in snapshot.networks {
             self.upsert_network(n).await?;
