@@ -200,6 +200,25 @@ enum NodeCertificateRole {
     Worker,
 }
 
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum ApiClientRole {
+    Viewer,
+    Agent,
+    Deployer,
+    Admin,
+}
+
+impl ApiClientRole {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Viewer => "viewer",
+            Self::Agent => "agent",
+            Self::Deployer => "deployer",
+            Self::Admin => "admin",
+        }
+    }
+}
+
 #[derive(Subcommand)]
 enum TlsCommand {
     /// Create a cluster CA: writes ca.pem and ca-key.pem.
@@ -225,6 +244,24 @@ enum TlsCommand {
         /// NATS role authorized by the certificate.
         #[arg(long, value_enum)]
         role: NodeCertificateRole,
+    },
+    /// Issue an API client certificate (CN caller, OU role, O tenant).
+    IssueClient {
+        /// Directory containing ca.pem and ca-key.pem.
+        #[arg(long)]
+        ca_dir: String,
+        /// Directory to write <cn>.pem and <cn>-key.pem into.
+        #[arg(long)]
+        out_dir: String,
+        /// Caller name in the certificate's common name.
+        #[arg(long)]
+        cn: String,
+        /// API role encoded as the organizational unit.
+        #[arg(long, value_enum)]
+        role: ApiClientRole,
+        /// Tenant ID encoded as the organization; use '*' for cluster operator.
+        #[arg(long)]
+        tenant: String,
     },
 }
 
@@ -298,6 +335,15 @@ struct NodeArgs {
     /// PEM file with this node's Raft private key.
     #[arg(long)]
     raft_tls_key: Option<String>,
+    /// Certificate presented by clients connecting to the Docker API.
+    #[arg(long)]
+    api_tls_cert: Option<String>,
+    /// Private key for --api-tls-cert.
+    #[arg(long)]
+    api_tls_key: Option<String>,
+    /// CA certificate used to verify API client certificates.
+    #[arg(long)]
+    api_client_ca: Option<String>,
     /// Node label as key=value (repeatable). Advertised to the cluster and
     /// usable in placement constraints (e.g. node.labels.gpu == true).
     #[arg(long = "label")]
@@ -809,6 +855,93 @@ fn node_certificate_names(node_id: u64, role: NodeCertificateRole) -> Vec<String
     names
 }
 
+fn valid_certificate_field(value: &str, max_len: usize) -> bool {
+    !value.is_empty()
+        && value.len() <= max_len
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
+fn pem_certificate_der(pem: &[u8]) -> Option<Vec<u8>> {
+    let text = std::str::from_utf8(pem).ok()?;
+    let body = text
+        .split_once("-----BEGIN CERTIFICATE-----")?
+        .1
+        .split_once("-----END CERTIFICATE-----")?
+        .0;
+    let mut der = Vec::with_capacity(body.len() * 3 / 4);
+    let mut chunk = [0u8; 4];
+    let mut used = 0;
+    for byte in body.bytes().filter(|byte| !byte.is_ascii_whitespace()) {
+        chunk[used] = match byte {
+            b'A'..=b'Z' => byte - b'A',
+            b'a'..=b'z' => byte - b'a' + 26,
+            b'0'..=b'9' => byte - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            b'=' => 64,
+            _ => return None,
+        };
+        used += 1;
+        if used == 4 {
+            der.push((chunk[0] << 2) | (chunk[1] >> 4));
+            if chunk[2] != 64 {
+                der.push((chunk[1] << 4) | (chunk[2] >> 2));
+            }
+            if chunk[3] != 64 {
+                der.push((chunk[2] << 6) | chunk[3]);
+            }
+            if chunk[2] == 64 || chunk[3] == 64 {
+                break;
+            }
+            used = 0;
+        }
+    }
+    (used == 0 && !der.is_empty()).then_some(der)
+}
+
+fn write_new_file(
+    path: &std::path::Path,
+    contents: &[u8],
+    private_key: bool,
+) -> std::io::Result<()> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let mode = if private_key { 0o600 } else { 0o644 };
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(mode)
+        .open(path)?;
+    file.set_permissions(std::fs::Permissions::from_mode(mode))?;
+    std::io::Write::write_all(&mut file, contents)
+}
+
+fn set_client_validity(params: &mut rcgen::CertificateParams) {
+    let today = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock is after the Unix epoch")
+        .as_secs() as i64
+        / 86_400;
+    let date = |days: i64| {
+        let z = days + 719_468;
+        let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+        let day_of_era = z - era * 146_097;
+        let year_of_era =
+            (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+        let year = year_of_era + era * 400;
+        let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+        let month_prime = (5 * day_of_year + 2) / 153;
+        let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+        let month = month_prime + if month_prime < 10 { 3 } else { -9 };
+        (year + i64::from(month <= 2), month, day)
+    };
+    let (year, month, day) = date(today - 1);
+    params.not_before = rcgen::date_time_ymd(year as i32, month as u8, day as u8);
+    let (year, month, day) = date(today + 29);
+    params.not_after = rcgen::date_time_ymd(year as i32, month as u8, day as u8);
+}
+
 fn run_tls(cmd: TlsCommand) -> ExitCode {
     match cmd {
         TlsCommand::InitCa { dir } => {
@@ -933,6 +1066,124 @@ fn run_tls(cmd: TlsCommand) -> ExitCode {
                 node_key_pem.display()
             );
         }
+        TlsCommand::IssueClient {
+            ca_dir,
+            out_dir,
+            cn,
+            role,
+            tenant,
+        } => {
+            if !valid_certificate_field(&cn, 64) {
+                eprintln!("error: --cn must contain 1-64 ASCII letters, digits, '.', '_' or '-'");
+                return ExitCode::FAILURE;
+            }
+            if tenant != "*" && minga_state::types::Tenant::validate_id(&tenant).is_err() {
+                eprintln!(
+                    "error: --tenant must be '*' or a lowercase tenant ID using letters, digits, '-' or '_'"
+                );
+                return ExitCode::FAILURE;
+            }
+            let ca_dir = PathBuf::from(&ca_dir);
+            let out_dir = PathBuf::from(&out_dir);
+            let client_pem = out_dir.join(format!("{cn}.pem"));
+            let client_key_pem = out_dir.join(format!("{cn}-key.pem"));
+            for path in [&client_pem, &client_key_pem] {
+                if path.exists() {
+                    eprintln!(
+                        "error: {} already exists; refusing to overwrite",
+                        path.display()
+                    );
+                    return ExitCode::FAILURE;
+                }
+            }
+            let read = |name: &str| -> Result<Vec<u8>, String> {
+                std::fs::read(ca_dir.join(name))
+                    .map_err(|e| format!("cannot read {name} from {}: {e}", ca_dir.display()))
+            };
+            let (ca_pem_raw, ca_key_raw) = match (read("ca.pem"), read("ca-key.pem")) {
+                (Ok(cert), Ok(key)) => (cert, key),
+                (Err(error), _) | (_, Err(error)) => {
+                    eprintln!("error: {error}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let ca_key =
+                match rcgen::KeyPair::from_pem(std::str::from_utf8(&ca_key_raw).unwrap_or("")) {
+                    Ok(key) => key,
+                    Err(error) => {
+                        eprintln!("error: parsing ca-key.pem: {error}");
+                        return ExitCode::FAILURE;
+                    }
+                };
+            let mut ca_params = match rcgen::CertificateParams::from_ca_cert_pem(
+                std::str::from_utf8(&ca_pem_raw).unwrap_or(""),
+            ) {
+                Ok(params) => params,
+                Err(error) => {
+                    eprintln!("error: parsing ca.pem: {error}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+            let ca = match ca_params.self_signed(&ca_key) {
+                Ok(ca) => ca,
+                Err(error) => {
+                    eprintln!("error: loading signing CA: {error}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let key = match rcgen::KeyPair::generate() {
+                Ok(key) => key,
+                Err(error) => {
+                    eprintln!("error: key generation failed: {error}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let mut params = rcgen::CertificateParams::new(Vec::<String>::new())
+                .expect("client certificate params");
+            set_client_validity(&mut params);
+            params.distinguished_name = rcgen::DistinguishedName::new();
+            params
+                .distinguished_name
+                .push(rcgen::DnType::CommonName, cn.as_str());
+            params
+                .distinguished_name
+                .push(rcgen::DnType::OrganizationalUnitName, role.as_str());
+            params
+                .distinguished_name
+                .push(rcgen::DnType::OrganizationName, tenant.as_str());
+            params
+                .extended_key_usages
+                .push(rcgen::ExtendedKeyUsagePurpose::ClientAuth);
+            params
+                .key_usages
+                .push(rcgen::KeyUsagePurpose::DigitalSignature);
+            let cert = match params.signed_by(&key, &ca, &ca_key) {
+                Ok(cert) => cert,
+                Err(error) => {
+                    eprintln!("error: signing client certificate: {error}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            if let Err(error) = private::create_dir(&out_dir) {
+                eprintln!("error: writing client certificate material: {error}");
+                return ExitCode::FAILURE;
+            }
+            if let Err(error) = write_new_file(&client_pem, cert.pem().as_bytes(), false) {
+                eprintln!("error: writing client certificate material: {error}");
+                return ExitCode::FAILURE;
+            }
+            if let Err(error) =
+                write_new_file(&client_key_pem, key.serialize_pem().as_bytes(), true)
+            {
+                let _ = std::fs::remove_file(&client_pem);
+                eprintln!("error: writing client certificate material: {error}");
+                return ExitCode::FAILURE;
+            }
+            println!("API client certificate written to {}", out_dir.display());
+            println!("  certificate: {}", client_pem.display());
+            println!("  private key: {}", client_key_pem.display());
+        }
     }
     ExitCode::SUCCESS
 }
@@ -949,6 +1200,9 @@ fn worker_has_manager_only_flags(args: &NodeArgs) -> bool {
         || args.nats_cluster_port.is_some()
         || args.api_bind.is_some()
         || args.api_token.is_some()
+        || args.api_tls_cert.is_some()
+        || args.api_tls_key.is_some()
+        || args.api_client_ca.is_some()
 }
 
 fn manager_requires_wg_endpoint(
@@ -999,6 +1253,50 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
             "error: Raft and API bind/token flags, peer, TLS, and replica flags are manager-only"
         );
         return ExitCode::FAILURE;
+    }
+    let api_tls_parts = [
+        args.api_tls_cert.is_some(),
+        args.api_tls_key.is_some(),
+        args.api_client_ca.is_some(),
+    ];
+    let api_tls_count = api_tls_parts.iter().filter(|set| **set).count();
+    if api_tls_count != 0 && api_tls_count != api_tls_parts.len() {
+        eprintln!("error: --api-tls-cert, --api-tls-key, and --api-client-ca must be set together");
+        return ExitCode::FAILURE;
+    }
+    if let (Some(raft_ca), Some(client_ca)) =
+        (args.raft_tls_ca.as_deref(), args.api_client_ca.as_deref())
+    {
+        let raft_ca = PathBuf::from(raft_ca);
+        let client_ca = PathBuf::from(client_ca);
+        if raft_ca.exists() && client_ca.exists() {
+            let raft_pem = match std::fs::read(&raft_ca) {
+                Ok(pem) => pem,
+                Err(error) => {
+                    eprintln!("error: cannot read Raft CA {}: {error}", raft_ca.display());
+                    return ExitCode::FAILURE;
+                }
+            };
+            let client_pem = match std::fs::read(&client_ca) {
+                Ok(pem) => pem,
+                Err(error) => {
+                    eprintln!(
+                        "error: cannot read API client CA {}: {error}",
+                        client_ca.display()
+                    );
+                    return ExitCode::FAILURE;
+                }
+            };
+            let same_der = pem_certificate_der(&raft_pem)
+                .zip(pem_certificate_der(&client_pem))
+                .is_some_and(|(raft, client)| raft == client);
+            if raft_pem == client_pem || same_der {
+                eprintln!(
+                    "error: --api-client-ca must not be the Raft CA; use a separate API client CA"
+                );
+                return ExitCode::FAILURE;
+            }
+        }
     }
     if is_manager && args.join && !args.peers.is_empty() {
         eprintln!("error: --join cannot be combined with --peer; add this manager through the API");
@@ -1337,14 +1635,22 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
     };
     let api_server = if is_manager {
         let api_bind = args.api_bind.as_deref().unwrap_or("0.0.0.0:2375");
-        if args.api_token.is_none() && !is_loopback_bind(api_bind) {
+        if args.api_token.is_none() && api_tls_count == 0 && !is_loopback_bind(api_bind) {
             tracing::warn!(
                 api_bind,
-                "the Docker API has no token and listens beyond loopback: anyone who can reach it \
-                 is cluster admin. Set --api-token or MINGA_API_TOKEN"
+                "the Docker API has no token or client TLS and listens beyond loopback: anyone who can reach it \
+                 gets unauthenticated default-tenant access. Set --api-token or configure API client TLS"
             );
         }
-        match minga_api::ApiServer::start_with_bus_and_auth(
+        let api_tls =
+            (api_tls_count == api_tls_parts.len()).then(|| minga_api::server::ApiTlsConfig {
+                cert: PathBuf::from(args.api_tls_cert.as_deref().expect("TLS fields validated")),
+                key: PathBuf::from(args.api_tls_key.as_deref().expect("TLS fields validated")),
+                client_ca: PathBuf::from(
+                    args.api_client_ca.as_deref().expect("TLS fields validated"),
+                ),
+            });
+        match minga_api::ApiServer::start_with_bus_and_auth_and_tls(
             state
                 .as_ref()
                 .expect("manager StateStore initialized")
@@ -1352,6 +1658,7 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
             bus.clone(),
             api_bind,
             args.api_token.clone(),
+            api_tls,
         )
         .await
         {

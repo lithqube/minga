@@ -4,28 +4,47 @@
 //! (or any `vX.Y` the client sends). The version segment is captured
 //! but not validated — Minga always responds with its own API version.
 
+use std::io::BufReader;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::{
+    extract::Extension,
     response::IntoResponse,
     routing::{delete, get, post},
     Router,
 };
+use hyper_util::{
+    rt::{TokioExecutor, TokioIo, TokioTimer},
+    server::conn::auto,
+    service::TowerToHyperService,
+};
 use minga_bus::EventBus;
-use minga_state::StateStore;
+use minga_state::{types::DEFAULT_TENANT_ID, StateStore};
 use minga_telemetry::{ReadyState, METRICS};
+use rustls::pki_types::CertificateDer;
 use tokio::net::TcpListener;
+use tokio_rustls::TlsAcceptor;
 
+use crate::auth::{ApiRole, Caller, ClientIdentity};
 use crate::handlers::{self, AppState};
 
+/// Marker that distinguishes token authentication from a certificate identity.
+#[derive(Clone, Copy)]
+struct TokenAuthenticated;
+
+#[derive(Clone, Copy)]
+struct InvalidClientIdentity;
 /// Combined state for all routes.
 #[derive(Clone)]
 struct ApiState {
     app_state: Arc<AppState>,
-    /// Bearer token required on all endpoints, when set.
+    /// Token accepted for cluster administration, when configured.
     auth_token: Option<Arc<str>>,
+    store: Arc<StateStore>,
+    tls_enabled: bool,
 }
-
 /// Allow extracting `Arc<AppState>` from `ApiState` for existing handlers.
 impl axum::extract::FromRef<ApiState> for Arc<AppState> {
     fn from_ref(state: &ApiState) -> Self {
@@ -59,38 +78,167 @@ fn presented_token(header: &str) -> Option<String> {
     Some(credentials.split_once(':')?.1.to_string())
 }
 
-/// Token gate. When a token is configured, every request must present it
-/// (see [`presented_token`]); anything else is a 401 with a
-/// Docker-compatible error body.
+/// Authenticates token, verified certificate, or the legacy direct caller and
+/// resolves each identity to an existing tenant before routing.
 async fn bearer_auth(
     axum::extract::State(state): axum::extract::State<ApiState>,
-    req: axum::extract::Request,
+    mut req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
-    if let Some(expected) = &state.auth_token {
-        let presented = req
-            .headers()
-            .get(axum::http::header::AUTHORIZATION)
-            .and_then(|v| v.to_str().ok())
-            .and_then(presented_token);
-        match presented {
-            Some(token) if constant_time_eq(&token, expected) => next.run(req).await,
-            _ => (
-                axum::http::StatusCode::UNAUTHORIZED,
-                axum::Json(serde_json::json!({"message": "authentication required"})),
+    let tenants = match state.store.list_tenants().await {
+        Ok(tenants) => tenants,
+        Err(error) => {
+            tracing::error!(%error, "cannot resolve API caller tenant");
+            return (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(serde_json::json!({"message": "authentication failed"})),
             )
-                .into_response(),
+                .into_response();
         }
+    };
+    let sole_default = tenants.len() == 1 && tenants[0].id == DEFAULT_TENANT_ID;
+    let token_valid = state.auth_token.as_deref().is_some_and(|expected| {
+        req.headers()
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(presented_token)
+            .is_some_and(|presented| constant_time_eq(&presented, expected))
+    });
+    let caller = if token_valid {
+        Caller {
+            name: "token".to_owned(),
+            role: ApiRole::Admin,
+            tenant_id: sole_default.then(|| DEFAULT_TENANT_ID.to_owned()),
+            cluster_operator: true,
+        }
+    } else if req.extensions().get::<InvalidClientIdentity>().is_some() {
+        return auth_forbidden("client certificate identity is invalid; reissue it with one CN, one OU, and at most one O");
+    } else if let Some(identity) = req.extensions().get::<ClientIdentity>().cloned() {
+        let Some(role) = identity.role else {
+            return auth_forbidden("client certificate has an unsupported role; reissue it with OU viewer, agent, deployer, or admin");
+        };
+        match identity.tenant.as_deref() {
+            Some("*") => Caller {
+                name: identity.name,
+                role,
+                tenant_id: None,
+                cluster_operator: true,
+            },
+            Some(tenant) if tenants.iter().any(|entry| entry.id == tenant) => Caller {
+                name: identity.name,
+                role,
+                tenant_id: Some(tenant.to_owned()),
+                cluster_operator: false,
+            },
+            Some(_) => return auth_forbidden("client certificate names an unknown tenant"),
+            None if sole_default => Caller {
+                name: identity.name,
+                role,
+                tenant_id: Some(DEFAULT_TENANT_ID.to_owned()),
+                cluster_operator: false,
+            },
+            None => return auth_forbidden(
+                "client certificate has no organization (O); reissue it with the tenant id in O",
+            ),
+        }
+    } else if state.auth_token.is_some() {
+        return (
+            axum::http::StatusCode::UNAUTHORIZED,
+            axum::Json(serde_json::json!({"message": "authentication required"})),
+        )
+            .into_response();
+    } else if state.tls_enabled {
+        return (
+            axum::http::StatusCode::UNAUTHORIZED,
+            axum::Json(serde_json::json!({"message": "verified client certificate required"})),
+        )
+            .into_response();
     } else if let Some(why) = rebinding_risk(req.headers()) {
-        (
+        return (
             axum::http::StatusCode::FORBIDDEN,
             axum::Json(serde_json::json!({
                 "message": format!("{why}; a tokenless API only answers direct clients (set --api-token to lift this)")
             })),
         )
-            .into_response()
+            .into_response();
+    } else if sole_default {
+        Caller {
+            name: "legacy-client".to_owned(),
+            role: ApiRole::Admin,
+            tenant_id: Some(DEFAULT_TENANT_ID.to_owned()),
+            cluster_operator: false,
+        }
     } else {
-        next.run(req).await
+        return auth_forbidden("no tenant identity is available; reissue the client certificate with the tenant id in O");
+    };
+    req.extensions_mut().insert(caller);
+    if token_valid {
+        req.extensions_mut().insert(TokenAuthenticated);
+    }
+    let path = req.uri().path();
+    let caller = req
+        .extensions()
+        .get::<Caller>()
+        .expect("authenticated caller");
+    if tenant_scoped_path(path) && caller.tenant_id.is_none() {
+        return auth_forbidden(
+            "a certificate for a specific tenant is required to access tenant resources",
+        );
+    }
+    if cluster_operator_path(path) && !caller.cluster_operator {
+        return auth_forbidden("cluster operator identity required");
+    }
+    let required = request_minimum_role(req.method(), path);
+    if !role_allowed(&req, required) {
+        return auth_forbidden("caller role does not permit this operation");
+    }
+    next.run(req).await
+}
+
+fn auth_forbidden(message: &str) -> axum::response::Response {
+    (
+        axum::http::StatusCode::FORBIDDEN,
+        axum::Json(serde_json::json!({"message": message})),
+    )
+        .into_response()
+}
+
+fn role_allowed(req: &axum::extract::Request, minimum: ApiRole) -> bool {
+    req.extensions().get::<Caller>().is_some_and(|caller| {
+        (caller.cluster_operator && cluster_operator_path(req.uri().path()))
+            || caller.role.permits(minimum)
+    })
+}
+
+fn tenant_scoped_path(path: &str) -> bool {
+    path.split('/').any(|segment| {
+        matches!(
+            segment,
+            "services" | "tasks" | "networks" | "secrets" | "configs" | "state"
+        )
+    })
+}
+
+fn cluster_operator_path(path: &str) -> bool {
+    path.starts_with("/minga/")
+        || path.split('/').nth(2) == Some("nodes")
+        || path.split('/').nth(2) == Some("info")
+        || matches!(path, "/healthz" | "/readyz" | "/metrics")
+}
+
+fn request_minimum_role(method: &axum::http::Method, path: &str) -> ApiRole {
+    use axum::http::Method;
+    if method == Method::GET || method == Method::HEAD {
+        ApiRole::Viewer
+    } else if path.split('/').nth(2) == Some("nodes") {
+        ApiRole::Admin
+    } else if matches!(
+        path.split('/').nth(2),
+        Some("services" | "networks" | "configs" | "secrets")
+    ) {
+        ApiRole::Deployer
+    } else {
+        ApiRole::Admin
     }
 }
 
@@ -128,28 +276,31 @@ fn rebinding_risk(headers: &axum::http::HeaderMap) -> Option<&'static str> {
 }
 /// Manager membership changes require a configured admin token even when the
 /// rest of the API is intentionally left tokenless.
+/// Tenant and manager administration are available to cluster operators.
 async fn require_admin_token(
-    axum::extract::State(state): axum::extract::State<ApiState>,
+    axum::extract::State(_state): axum::extract::State<ApiState>,
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
-    let authorized = state.auth_token.as_deref().is_some_and(|expected| {
-        req.headers()
-            .get(axum::http::header::AUTHORIZATION)
-            .and_then(|value| value.to_str().ok())
-            .and_then(presented_token)
-            .is_some_and(|presented| constant_time_eq(&presented, expected))
-    });
-    if authorized {
+    if req
+        .extensions()
+        .get::<Caller>()
+        .is_some_and(|caller| caller.cluster_operator)
+    {
         next.run(req).await
     } else {
-        (
-            axum::http::StatusCode::UNAUTHORIZED,
-            axum::Json(serde_json::json!({
-                "message": "manager administration requires a valid --api-token"
-            })),
-        )
-            .into_response()
+        auth_forbidden("cluster operator identity required")
+    }
+}
+
+async fn require_admin_role(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    if req.extensions().get::<TokenAuthenticated>().is_some() {
+        next.run(req).await
+    } else {
+        auth_forbidden("state backup and restore require the configured API token")
     }
 }
 
@@ -164,7 +315,12 @@ pub fn build_router_with_auth(
     ready_state: Arc<ReadyState>,
     auth_token: Option<String>,
 ) -> Router {
-    build_router_with_app_state(Arc::new(AppState::new(store)), ready_state, auth_token)
+    build_router_with_app_state(
+        Arc::new(AppState::new(store)),
+        ready_state,
+        auth_token,
+        false,
+    )
 }
 
 /// Builds the router with bus-backed task actual state.
@@ -178,6 +334,7 @@ pub fn build_router_with_bus_and_auth(
         Arc::new(AppState::with_bus(store, bus)),
         ready_state,
         auth_token,
+        false,
     )
 }
 
@@ -185,10 +342,14 @@ fn build_router_with_app_state(
     app_state: Arc<AppState>,
     ready_state: Arc<ReadyState>,
     auth_token: Option<String>,
+    tls_enabled: bool,
 ) -> Router {
+    let store = app_state.store.clone();
     let api_state = ApiState {
         app_state,
         auth_token: auth_token.map(Arc::from),
+        store,
+        tls_enabled,
     };
 
     Router::new()
@@ -278,7 +439,8 @@ fn build_router_with_app_state(
             "/:version/state",
             get(handlers::export_state)
                 .post(handlers::import_state)
-                .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024)),
+                .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024))
+                .layer(axum::middleware::from_fn(require_admin_role)),
         )
         // Fallback.
         .fallback(handlers::fallback)
@@ -288,6 +450,126 @@ fn build_router_with_app_state(
         .layer(axum::middleware::from_fn_with_state(api_state, bearer_auth))
 }
 
+/// Server TLS material. The client CA is used to require and verify mTLS peers.
+#[derive(Debug, Clone)]
+pub struct ApiTlsConfig {
+    pub cert: PathBuf,
+    pub key: PathBuf,
+    pub client_ca: PathBuf,
+}
+
+impl ApiTlsConfig {
+    fn server_config(&self) -> Result<Arc<rustls::ServerConfig>, std::io::Error> {
+        let load_certs = |path: &Path| {
+            rustls_pemfile::certs(&mut BufReader::new(std::fs::File::open(path)?))
+                .collect::<Result<Vec<CertificateDer<'static>>, _>>()
+        };
+        let mut roots = rustls::RootCertStore::empty();
+        for cert in load_certs(&self.client_ca)? {
+            roots
+                .add(cert)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        }
+        let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
+            Arc::new(roots),
+            Arc::new(rustls::crypto::ring::default_provider()),
+        )
+        .build()
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        let certs = load_certs(&self.cert)?;
+        let key_file = std::fs::File::open(&self.key)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = key_file.metadata()?.permissions().mode() & 0o777;
+            if mode & 0o077 != 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!(
+                        "API private key {} has mode {mode:o}; it must not be readable by group or others (chmod 600)",
+                        self.key.display()
+                    ),
+                ));
+            }
+        }
+        let key = rustls_pemfile::private_key(&mut BufReader::new(key_file))?.ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "no private key found")
+        })?;
+        let config = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?
+        .with_client_cert_verifier(verifier)
+        .with_single_cert(certs, key)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        Ok(Arc::new(config))
+    }
+}
+
+async fn serve_tls_bounded(
+    listener: TcpListener,
+    router: Router,
+    acceptor: TlsAcceptor,
+    limits: minga_telemetry::serve::Limits,
+) {
+    let slots = Arc::new(tokio::sync::Semaphore::new(limits.max_connections));
+    loop {
+        let permit = match slots.clone().acquire_owned().await {
+            Ok(permit) => permit,
+            Err(_) => return,
+        };
+        let (stream, _) = match listener.accept().await {
+            Ok(accepted) => accepted,
+            Err(error) => {
+                tracing::warn!(%error, "TLS API accept failed");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+        };
+        let acceptor = acceptor.clone();
+        let router = router.clone();
+        tokio::spawn(async move {
+            let _permit = permit;
+            if tokio::time::timeout(limits.header_read_timeout, stream.readable())
+                .await
+                .is_err()
+            {
+                return;
+            }
+            let Ok(Ok(stream)) =
+                tokio::time::timeout(limits.header_read_timeout, acceptor.accept(stream)).await
+            else {
+                return;
+            };
+            let Some(cert) = stream
+                .get_ref()
+                .1
+                .peer_certificates()
+                .and_then(|certs| certs.first())
+            else {
+                return;
+            };
+            let service = match ClientIdentity::from_certificate(cert) {
+                Some(identity) => TowerToHyperService::new(router.layer(Extension(identity))),
+                None => TowerToHyperService::new(router.layer(Extension(InvalidClientIdentity))),
+            };
+            let mut builder = auto::Builder::new(TokioExecutor::new());
+            builder
+                .http1()
+                .timer(TokioTimer::new())
+                .header_read_timeout(limits.header_read_timeout)
+                .max_buf_size(limits.max_buf_size);
+            builder.http2().timer(TokioTimer::new());
+            if let Err(error) = builder
+                .serve_connection_with_upgrades(TokioIo::new(stream), service)
+                .await
+            {
+                tracing::debug!(%error, "TLS API connection closed");
+            }
+        });
+    }
+}
 /// The API server. Owns the router, the TCP listener task and the
 /// readiness probe.
 pub struct ApiServer {
@@ -313,7 +595,7 @@ impl ApiServer {
         bind: &str,
         auth_token: Option<String>,
     ) -> Result<Self, ApiServerError> {
-        Self::start_inner(store, None, bind, auth_token).await
+        Self::start_inner(store, None, bind, auth_token, None).await
     }
 
     /// Starts the API server with actual task state read from the event bus.
@@ -323,7 +605,28 @@ impl ApiServer {
         bind: &str,
         auth_token: Option<String>,
     ) -> Result<Self, ApiServerError> {
-        Self::start_inner(store, Some(bus), bind, auth_token).await
+        Self::start_inner(store, Some(bus), bind, auth_token, None).await
+    }
+
+    /// Starts the API over bounded mutual TLS, requiring a CA-verified caller certificate.
+    pub async fn start_with_tls(
+        store: Arc<StateStore>,
+        bind: &str,
+        auth_token: Option<String>,
+        tls: ApiTlsConfig,
+    ) -> Result<Self, ApiServerError> {
+        Self::start_inner(store, None, bind, auth_token, Some(tls)).await
+    }
+
+    /// Starts the bus-backed API with optional mutual TLS.
+    pub async fn start_with_bus_and_auth_and_tls(
+        store: Arc<StateStore>,
+        bus: Arc<dyn EventBus>,
+        bind: &str,
+        auth_token: Option<String>,
+        tls: Option<ApiTlsConfig>,
+    ) -> Result<Self, ApiServerError> {
+        Self::start_inner(store, Some(bus), bind, auth_token, tls).await
     }
 
     async fn start_inner(
@@ -331,7 +634,14 @@ impl ApiServer {
         bus: Option<Arc<dyn EventBus>>,
         bind: &str,
         auth_token: Option<String>,
+        tls: Option<ApiTlsConfig>,
     ) -> Result<Self, ApiServerError> {
+        let acceptor = tls
+            .as_ref()
+            .map(ApiTlsConfig::server_config)
+            .transpose()
+            .map_err(|error| ApiServerError::Tls(error.to_string()))?
+            .map(TlsAcceptor::from);
         let listener = TcpListener::bind(bind)
             .await
             .map_err(|e| ApiServerError::Bind(format!("cannot bind {bind}: {e}")))?;
@@ -356,17 +666,23 @@ impl ApiServer {
             })
         };
         let ready_state = Arc::new(ready_state);
-        let router = match bus {
-            Some(bus) => build_router_with_bus_and_auth(store, bus, ready_state, auth_token),
-            None => build_router_with_auth(store, ready_state, auth_token),
+        let app_state = match bus {
+            Some(bus) => Arc::new(AppState::with_bus(store, bus)),
+            None => Arc::new(AppState::new(store)),
         };
-
-        let handle = tokio::spawn(minga_telemetry::serve::serve_bounded(
-            listener,
-            router,
-            minga_telemetry::serve::Limits::default(),
-            std::future::pending(),
-        ));
+        let router =
+            build_router_with_app_state(app_state, ready_state, auth_token, acceptor.is_some());
+        let limits = minga_telemetry::serve::Limits::default();
+        let handle = if let Some(acceptor) = acceptor {
+            tokio::spawn(serve_tls_bounded(listener, router, acceptor, limits))
+        } else {
+            tokio::spawn(minga_telemetry::serve::serve_bounded(
+                listener,
+                router,
+                limits,
+                std::future::pending(),
+            ))
+        };
 
         tracing::info!(addr = %addr, "Docker Engine API server listening");
 
@@ -394,6 +710,8 @@ impl ApiServer {
 pub enum ApiServerError {
     #[error("{0}")]
     Bind(String),
+    #[error("TLS configuration: {0}")]
+    Tls(String),
 }
 
 #[cfg(test)]
@@ -481,6 +799,55 @@ mod tests {
             })
         };
         (status, json)
+    }
+
+    fn operator_request(mut req: Request<Body>) -> Request<Body> {
+        req.extensions_mut().insert(ClientIdentity {
+            name: "test-operator".into(),
+            role: Some(ApiRole::Admin),
+            tenant: Some("*".into()),
+        });
+        req
+    }
+
+    async fn send_operator_request(
+        router: Router,
+        req: Request<Body>,
+    ) -> (StatusCode, serde_json::Value) {
+        send_request(router, operator_request(req)).await
+    }
+
+    fn service_record(id: &str, tenant_id: &str) -> minga_state::types::Service {
+        minga_state::types::Service {
+            id: id.into(),
+            tenant_id: tenant_id.into(),
+            name: id.into(),
+            image: "nginx:latest".into(),
+            replicas: 1,
+            mode: minga_state::types::ServiceMode::Replicated,
+            constraints: vec![],
+            env: Default::default(),
+            ports: vec![],
+            networks: vec![],
+            resources: minga_state::types::ResourceSpec {
+                cpus: 0.0,
+                memory_bytes: 0,
+                gpus: 0,
+            },
+            agent: None,
+            restart_policy: Default::default(),
+            secrets: vec![],
+            command: vec![],
+            entrypoint: vec![],
+            labels: Default::default(),
+            healthcheck: None,
+            mounts: vec![],
+            user: None,
+            extra_hosts: vec![],
+            update: Default::default(),
+            rollback: None,
+            previous: None,
+        }
     }
 
     #[tokio::test]
@@ -585,6 +952,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn client_certificates_scope_docker_routes_to_their_tenant() {
+        let (router, store, _dir) = admin_router().await;
+        for id in ["tenant-a", "tenant-b"] {
+            store
+                .upsert_tenant(minga_state::types::Tenant {
+                    id: id.into(),
+                    name: id.into(),
+                    quotas: Default::default(),
+                    created_at: 1,
+                })
+                .await
+                .unwrap();
+        }
+        for (id, tenant_id) in [
+            ("tenant-a-service", "tenant-a"),
+            ("tenant-b-service", "tenant-b"),
+        ] {
+            store
+                .upsert_service(service_record(id, tenant_id))
+                .await
+                .unwrap();
+        }
+
+        let request = |uri: &str, tenant: Option<&str>| {
+            let mut request = Request::builder().uri(uri).body(Body::empty()).unwrap();
+            request.extensions_mut().insert(ClientIdentity {
+                name: "client".into(),
+                role: Some(ApiRole::Deployer),
+                tenant: tenant.map(str::to_owned),
+            });
+            request
+        };
+        let (status, services) =
+            send_request(router.clone(), request("/v1.41/services", Some("tenant-a"))).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(services.as_array().unwrap().len(), 1);
+        assert_eq!(services[0]["ID"], "tenant-a-service");
+
+        let (status, _) = send_request(
+            router.clone(),
+            request("/v1.41/services/tenant-b-service", Some("tenant-a")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        let (status, _) = send_request(router.clone(), request("/v1.41/services", None)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        let mut operator = request("/minga/tenants", Some("*"));
+        operator
+            .extensions_mut()
+            .get_mut::<ClientIdentity>()
+            .unwrap()
+            .role = Some(ApiRole::Admin);
+        let (status, tenants) = send_request(router.clone(), operator).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(tenants.as_array().unwrap().len(), 3);
+
+        let mut operator = request("/v1.41/services", Some("*"));
+        operator
+            .extensions_mut()
+            .get_mut::<ClientIdentity>()
+            .unwrap()
+            .role = Some(ApiRole::Admin);
+        let (status, _) = send_request(router, operator).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
     async fn ping() {
         let (router, _dir) = test_router().await;
         let req = Request::builder()
@@ -620,7 +1056,7 @@ mod tests {
             .uri("/v1.41/info")
             .body(Body::empty())
             .unwrap();
-        let (status, json) = send_request(router, req).await;
+        let (status, json) = send_operator_request(router, req).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(json["Swarm"]["LocalNodeState"], "active");
         assert_eq!(json["Swarm"]["ControlAvailable"], true);
@@ -634,7 +1070,7 @@ mod tests {
             .uri("/v1.41/nodes")
             .body(Body::empty())
             .unwrap();
-        let (status, json) = send_request(router, req).await;
+        let (status, json) = send_operator_request(router, req).await;
         assert_eq!(status, StatusCode::OK);
         let arr = json.as_array().unwrap();
         assert_eq!(arr.len(), 1, "the registered test node must be listed");
@@ -1025,6 +1461,10 @@ mod tests {
                 .await
                 .unwrap(),
         );
+        store
+            .upsert_service(service_record("svc", "default"))
+            .await
+            .unwrap();
         let mut task = Task {
             id: "svc.1".into(),
             tenant_id: "default".to_string(),
@@ -1099,6 +1539,10 @@ mod tests {
                 .await
                 .unwrap(),
         );
+        store
+            .upsert_service(service_record("svc", "default"))
+            .await
+            .unwrap();
         store
             .upsert_task(Task {
                 id: "svc.1".into(),
@@ -1183,7 +1627,7 @@ mod tests {
                 .unwrap(),
             ))
             .unwrap();
-        let (status, json) = send_request(router.clone(), req).await;
+        let (status, json) = send_operator_request(router.clone(), req).await;
         assert_eq!(status, StatusCode::CREATED);
         assert_eq!(json["ID"], "2", "next free id after the test node");
         assert_eq!(json["Spec"]["Labels"]["gpu"], "true");
@@ -1196,7 +1640,7 @@ mod tests {
             .uri("/v1.41/nodes/2")
             .body(Body::empty())
             .unwrap();
-        let (status, json) = send_request(router, req).await;
+        let (status, json) = send_operator_request(router, req).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(json["Status"]["State"], "ready");
         assert_eq!(json["Status"]["Addr"], "10.0.0.2:50051");
@@ -1216,7 +1660,7 @@ mod tests {
                     .unwrap(),
             ))
             .unwrap();
-        let (status, _) = send_request(router.clone(), req).await;
+        let (status, _) = send_operator_request(router.clone(), req).await;
         assert_eq!(status, StatusCode::CONFLICT);
 
         // Duplicate address.
@@ -1228,7 +1672,7 @@ mod tests {
                 serde_json::to_vec(&serde_json::json!({"address": "127.0.0.1:50051"})).unwrap(),
             ))
             .unwrap();
-        let (status, _) = send_request(router.clone(), req).await;
+        let (status, _) = send_operator_request(router.clone(), req).await;
         assert_eq!(status, StatusCode::CONFLICT);
 
         // Empty address.
@@ -1240,7 +1684,7 @@ mod tests {
                 serde_json::to_vec(&serde_json::json!({"address": "  "})).unwrap(),
             ))
             .unwrap();
-        let (status, _) = send_request(router, req).await;
+        let (status, _) = send_operator_request(router, req).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 
@@ -1261,14 +1705,14 @@ mod tests {
             .header("Content-Type", "application/json")
             .body(Body::from(serde_json::to_vec(&body).unwrap()))
             .unwrap();
-        let (status, _) = send_request(router.clone(), req).await;
+        let (status, _) = send_operator_request(router.clone(), req).await;
         assert_eq!(status, StatusCode::OK);
 
         let req = Request::builder()
             .uri("/v1.41/nodes/1")
             .body(Body::empty())
             .unwrap();
-        let (status, json) = send_request(router, req).await;
+        let (status, json) = send_operator_request(router, req).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(json["Status"]["State"], "down", "drained node is down");
         assert_eq!(json["Spec"]["Labels"]["zone"], "b");
@@ -1290,7 +1734,7 @@ mod tests {
             .header("Content-Type", "application/json")
             .body(Body::from(serde_json::to_vec(&body).unwrap()))
             .unwrap();
-        let (status, json) = send_request(router.clone(), req).await;
+        let (status, json) = send_operator_request(router.clone(), req).await;
         assert_eq!(status, StatusCode::CONFLICT);
         assert!(json["message"].as_str().unwrap().contains("role"));
 
@@ -1302,7 +1746,7 @@ mod tests {
             .header("Content-Type", "application/json")
             .body(Body::from(serde_json::to_vec(&body).unwrap()))
             .unwrap();
-        let (status, json) = send_request(router.clone(), req).await;
+        let (status, json) = send_operator_request(router.clone(), req).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(json["message"].as_str().unwrap().contains("pause"));
 
@@ -1315,7 +1759,7 @@ mod tests {
             .header("Content-Type", "application/json")
             .body(Body::from(serde_json::to_vec(&body).unwrap()))
             .unwrap();
-        let (status, _) = send_request(router.clone(), req).await;
+        let (status, _) = send_operator_request(router.clone(), req).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
 
         // Unknown node.
@@ -1326,7 +1770,7 @@ mod tests {
             .header("Content-Type", "application/json")
             .body(Body::from(serde_json::to_vec(&body).unwrap()))
             .unwrap();
-        let (status, _) = send_request(router, req).await;
+        let (status, _) = send_operator_request(router, req).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
@@ -1526,12 +1970,9 @@ mod tests {
             .unwrap();
         let (status, json) = send_request(router.clone(), req).await;
         assert_eq!(status, StatusCode::CONFLICT);
-        assert!(
-            json["message"]
-                .as_str()
-                .unwrap()
-                .contains("no eligible nodes"),
-            "error must name the cause: {json}"
+        assert_eq!(
+            json["message"],
+            "service cannot be placed with current cluster capacity or constraints"
         );
 
         // Nothing was written to state.

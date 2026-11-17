@@ -8,6 +8,7 @@ license.workspace = true
 
 [dependencies]
 axum.workspace = true
+hyper-util.workspace = true
 minga-bus = { path = "../minga-bus" }
 base64.workspace = true
 chrono.workspace = true
@@ -15,12 +16,16 @@ minga-net = { path = "../minga-net" }
 minga-scheduler = { path = "../minga-scheduler" }
 minga-state = { path = "../minga-state" }
 minga-telemetry = { path = "../minga-telemetry" }
+rustls.workspace = true
+rustls-pemfile.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+tokio-rustls.workspace = true
 tower.workspace = true
 tracing.workspace = true
+x509-parser.workspace = true
 
 [dev-dependencies]
 reqwest.workspace = true
@@ -28,3 +33,4 @@ tempfile.workspace = true
 testcontainers.workspace = true
 tokio.workspace = true
 tower = { version = "0.5", features = ["util"] }
+rcgen.workspace = true

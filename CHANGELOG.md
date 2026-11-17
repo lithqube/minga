@@ -16,8 +16,15 @@
   `default`. Tenant definitions, quotas and cluster-operator CRUD are persisted
   through Raft. Format v5 migrates v2/v3/v4 state and Raft logs, imports
   v2/v3/v4 portable snapshots, and requires a coordinated cluster upgrade.
-  Tenant scoping of workload APIs and certificate identity remains follow-up
-  work.
+- API clients identify their tenant in the client certificate: `minga tls
+  issue-client` sets the caller (`CN`), the role (`OU`) and the tenant (`O`),
+  and managers can require API mTLS with a dedicated client CA. Workload
+  routes and their nested responses are filtered by tenant, so a foreign
+  service, network, secret or config returns 404 rather than 403. Tenant
+  CRUD, node inventory, cluster info and cluster health or metrics routes need
+  a cluster operator (`O=*`, or the configured API token), and an `O=*`
+  certificate gets no tenant workload access. A certificate without `O` maps
+  to `default` only while `default` is the sole tenant.
 
 - Existing Compose stacks with short-syntax ports now publish on every node
   by default. Managers project live backends through node-scoped bus

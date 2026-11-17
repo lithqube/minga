@@ -247,7 +247,7 @@ services:
 "#;
     let (ok, out) = run_deploy(compose, "toobig", &url, &[]);
     assert!(!ok, "an unplaceable service must fail the deploy");
-    assert!(out.contains("insufficient capacity"), "report:\n{out}");
+    assert!(out.contains("service cannot be placed"), "report:\n{out}");
     assert!(out.contains("[ERR] toobig.huge"), "report:\n{out}");
     assert!(store.list_services().await.unwrap().is_empty());
 }
