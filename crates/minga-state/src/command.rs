@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::types::{
     ClusterNode, Config, ConfigId, Network, NetworkId, NodeId, Secret, SecretId, Service,
-    ServiceId, Task, TaskId, Volume, VolumeId,
+    ServiceId, Task, TaskId, Tenant, TenantId, TenantQuotas, Volume, VolumeId,
 };
 
 /// A mutation proposed to the Raft log. This is the `D` (app data) type.
@@ -31,6 +31,15 @@ pub enum StateCommand {
     UpsertConfig(Config),
     RemoveConfig(ConfigId),
 
+    UpsertTenant(Tenant),
+    CreateTenant(Tenant),
+    UpdateTenant {
+        id: TenantId,
+        name: String,
+        quotas: TenantQuotas,
+    },
+    RemoveTenant(TenantId),
+
     /// Refreshes a node's lease in one log entry: sets `last_seen_unix`
     /// and revives the node unless it is draining. A missing record stays
     /// missing (`NotFound`): a removed node is not recreated. Read-modify-
@@ -47,5 +56,6 @@ pub enum StateCommand {
 pub enum StateResponse {
     Ok,
     NotFound,
+    Conflict(String),
     Error(String),
 }

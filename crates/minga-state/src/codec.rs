@@ -18,27 +18,30 @@
 //!
 //! Each redb file stores [`FORMAT_VERSION`] under [`FORMAT_KEY`] in its
 //! metadata table. A store with data and no marker was written by minga 1.0.2
-//! or older (bincode) and cannot be read. Formats v2 and v3 are migrated to v4
-//! by the state and log stores before the marker is advanced.
+//! or older (bincode) and cannot be read. Formats v2, v3 and v4 are migrated to
+//! v5 by the state and log stores before the marker is advanced.
 //!
 //! # Wire frame
 //!
 //! A Raft message is `[u32 BE length][u8 FORMAT_VERSION][JSON]`, the length
 //! covering the version byte and the JSON. Since peers reject a different
-//! frame version, v4 requires a coordinated upgrade of every cluster node;
-//! mixed v3/v4 nodes cannot exchange Raft messages.
+//! frame version, v5 requires a coordinated upgrade of every cluster node;
+//! mixed v4/v5 nodes cannot exchange Raft messages.
 
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
 /// Version of the persisted and wire format. Bump it for every persisted
 /// field-shape change and add the corresponding migration.
-pub const FORMAT_VERSION: u8 = 4;
+pub const FORMAT_VERSION: u8 = 5;
 
-/// The persisted version migrated by the v4 state and log stores.
+/// The persisted version immediately before tenant records were added.
+pub const V4_FORMAT_VERSION: u8 = 4;
+
+/// An older persisted version migrated by the v5 state and log stores.
 pub const V3_FORMAT_VERSION: u8 = 3;
 
-/// An older persisted version migrated by the v4 state and log stores.
+/// An older persisted version migrated by the v5 state and log stores.
 pub const V2_FORMAT_VERSION: u8 = 2;
 
 /// Metadata key that holds [`FORMAT_VERSION`] in each redb file.

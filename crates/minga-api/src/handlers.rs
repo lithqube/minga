@@ -16,7 +16,7 @@ use axum::{
 use minga_bus::{subjects, EventBus, TaskActualState, TaskStatusReport};
 use minga_state::types::{
     unix_now, ClusterNode, NodeStatus as MingaNodeStatus, ResourceSpec, Service as StateService,
-    Task,
+    Task, Tenant, TenantQuotas,
 };
 use minga_state::StateStore;
 use serde::Deserialize;
@@ -84,6 +84,21 @@ pub struct ManagerMigrationRequest {
     manager_ids: Vec<u64>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct CreateTenantRequest {
+    id: String,
+    name: String,
+    #[serde(default)]
+    quotas: TenantQuotas,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateTenantRequest {
+    name: String,
+    #[serde(default)]
+    quotas: TenantQuotas,
+}
+
 /// Lists the current Raft voters.
 pub async fn list_managers(State(app): State<Arc<AppState>>) -> ApiResult<Json<Vec<u64>>> {
     Ok(Json(app.store.manager_voters().await))
@@ -120,6 +135,60 @@ pub async fn migrate_manager_voters(
         .migrate_manager_voters(request.manager_ids)
         .await?;
     Ok(Json(serde_json::json!({"removed_voters": removed})))
+}
+
+/// Lists tenants. This route is available only to cluster operators.
+pub async fn list_tenants(State(app): State<Arc<AppState>>) -> ApiResult<Json<Vec<Tenant>>> {
+    Ok(Json(app.store.list_tenants().await?))
+}
+
+/// Gets one tenant by its stable ID.
+pub async fn get_tenant(
+    State(app): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<Tenant>> {
+    let tenant = app
+        .store
+        .get_tenant(&id)
+        .await?
+        .ok_or_else(|| not_found("tenant", &id))?;
+    Ok(Json(tenant))
+}
+
+/// Creates a tenant with operator-supplied desired quotas.
+pub async fn create_tenant(
+    State(app): State<Arc<AppState>>,
+    Json(request): Json<CreateTenantRequest>,
+) -> ApiResult<(StatusCode, Json<Tenant>)> {
+    let tenant = Tenant {
+        id: request.id,
+        name: request.name,
+        quotas: request.quotas,
+        created_at: unix_now(),
+    };
+    app.store.create_tenant(tenant.clone()).await?;
+    Ok((StatusCode::CREATED, Json(tenant)))
+}
+
+/// Updates a tenant's display name and quotas.
+pub async fn update_tenant(
+    State(app): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(request): Json<UpdateTenantRequest>,
+) -> ApiResult<StatusCode> {
+    app.store
+        .update_tenant(id, request.name, request.quotas)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Deletes an empty tenant.
+pub async fn delete_tenant(
+    State(app): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> ApiResult<StatusCode> {
+    app.store.remove_tenant(&id).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 fn task_status_for_api<'a>(

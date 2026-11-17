@@ -7,9 +7,9 @@ use std::collections::{BTreeMap, HashMap};
 
 use minga_state::types::{
     ClusterNode, Config, Network, NodeStatus, PortMapping, ResourceSpec, Secret, Service,
-    ServiceMode, Task, TaskSpec, TaskState, Volume,
+    ServiceMode, Task, TaskSpec, TaskState, Tenant, TenantQuotas, Volume,
 };
-use minga_state::StateStore;
+use minga_state::{StateError, StateStore};
 
 /// Unique port counter for parallel test isolation.
 /// Creates a StateStore in a unique temp directory.
@@ -333,5 +333,92 @@ async fn upsert_overwrites_existing() {
     assert_eq!(read.labels.get("zone").map(String::as_str), Some("a"));
     assert_eq!(store.list_nodes().await.unwrap().len(), 1);
 
+    store.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn tenant_crud_is_persisted_and_protects_owned_resources() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tenants");
+    let store = StateStore::open(1, "127.0.0.1:0", &path, BTreeMap::new())
+        .await
+        .unwrap();
+
+    let defaults = store.list_tenants().await.unwrap();
+    assert_eq!(defaults.len(), 1);
+    assert_eq!(defaults[0].id, "default");
+
+    let tenant = Tenant {
+        id: "tenant-a".into(),
+        name: "Tenant A".into(),
+        quotas: TenantQuotas {
+            services: Some(10),
+            ..TenantQuotas::default()
+        },
+        created_at: 123,
+    };
+    store.create_tenant(tenant.clone()).await.unwrap();
+    assert!(matches!(
+        store.create_tenant(tenant.clone()).await,
+        Err(StateError::Conflict(_))
+    ));
+
+    let updated_quotas = TenantQuotas {
+        services: Some(20),
+        ..TenantQuotas::default()
+    };
+    store
+        .update_tenant("tenant-a", "Tenant Alpha".into(), updated_quotas.clone())
+        .await
+        .unwrap();
+    let updated = store.get_tenant("tenant-a").await.unwrap().unwrap();
+    assert_eq!(updated.name, "Tenant Alpha");
+    assert_eq!(updated.quotas, updated_quotas);
+    assert_eq!(updated.created_at, 123);
+
+    store
+        .upsert_volume(Volume {
+            id: "tenant-a-data".into(),
+            tenant_id: "tenant-a".into(),
+            name: "data".into(),
+            driver: "local".into(),
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        store.remove_tenant("tenant-a").await,
+        Err(StateError::Conflict(_))
+    ));
+    store.remove_volume("tenant-a-data".into()).await.unwrap();
+    store.remove_tenant("tenant-a").await.unwrap();
+    assert!(store.get_tenant("tenant-a").await.unwrap().is_none());
+    assert!(matches!(
+        store.remove_tenant("default").await,
+        Err(StateError::Conflict(_))
+    ));
+
+    store
+        .create_tenant(Tenant {
+            id: "persisted".into(),
+            name: "Persisted".into(),
+            quotas: TenantQuotas::default(),
+            created_at: 456,
+        })
+        .await
+        .unwrap();
+    store.shutdown().await.unwrap();
+
+    let store = StateStore::open(1, "127.0.0.1:0", &path, BTreeMap::new())
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .get_tenant("persisted")
+            .await
+            .unwrap()
+            .unwrap()
+            .created_at,
+        456
+    );
     store.shutdown().await.unwrap();
 }

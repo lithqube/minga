@@ -1,6 +1,6 @@
 # ADR 0008: Multi-tenancy and isolation
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-11-16
 
 ## Context
@@ -19,7 +19,7 @@ Minga will run workloads for several customers on one cluster. Today, nothing se
 - `Tenant { id, name, quotas, created_at }` is desired state and goes through Raft.
 - Every stack, service, task, secret, config, network, volume, egress route, job, change request and budget has exactly one `tenant`.
 - Names are unique within a tenant, not across the cluster, so two tenants can each have a `db_password`.
-- **Upgrade:** a cluster created before this ADR gets one tenant, `default`, that owns everything. New fields use `#[serde(default)]` to decode old records, but persisted shape changes still require a format-version bump and migration. This rollout bumps format v3 to v4, rewrites state and Raft log values atomically, and accepts v2/v3 portable snapshots for import. Frozen fixtures from earlier versions remain unchanged.
+- **Upgrade:** a cluster created before this ADR gets one tenant, `default`, that owns everything. New fields use `#[serde(default)]` to decode old records, but persisted shape changes still require a format-version bump and migration. T1 bumps format v4 to v5, migrates v2/v3/v4 state and Raft logs, and accepts v2/v3/v4 portable snapshots. Tenant creation is replicated after initialization, and frozen fixtures from earlier versions remain unchanged. Cluster nodes must upgrade together.
 - **Application customers are a different thing.** The tenants of an *application*, such as a hotel served by a marketplace, are called **customers** in Minga. They are attribution labels inside one Minga tenant (agent-plane roadmap B5), never an isolation boundary.
 
 ### 2. Tenants are untrusted
@@ -132,8 +132,8 @@ Every plan, ADR and PR that adds state, an endpoint, a bus subject, a node-local
 ## Delivery
 
 0. **T0 — complete (Phase 14).** The release bundles nats-server v2.15.3, external NATS v2.14.10 and v2.15.3 pass the bus suite, manager feature gating uses API level 4, and single-server plus rolling upgrade proofs passed.
-1. **T1.** `Tenant` type, `tenant` fields with the `default` upgrade, fixtures, and cluster-operator tenant CRUD.
-2. **T2.** `O` in certificates, tenant filtering on every API route and in Docker API responses, and the 404 rule. Compose files deploy unchanged, because the tenant comes from the caller.
+1. **T1 — complete.** The `Tenant` type and quotas are persisted desired state; existing clusters receive a replicated `default` tenant. Cluster operators can create, list, update and delete empty tenants through `/minga/tenants`, authenticated by the current cluster admin token. Deleting `default` or a tenant that owns resources is refused.
+2. **T2.** Add `O` to certificates, filter every tenant-scoped API route and Docker API response, and enforce the 404 rule. T1’s CRUD endpoints remain cluster-operator-only; tenant identities and access filtering are not implemented yet.
 3. **T3.** Node join tokens per tenant, the hard placement filter, managers without workloads when there are 2+ tenants, and WireGuard peer sets per tenant.
 4. **T4.** Tenant segments in subjects and keys, the per-tenant worker ACL, per-tenant streams and buckets, and operator/JWT mode with scoped signing keys per tenant.
 5. **T5.** Quotas and the per-tenant audit trail.

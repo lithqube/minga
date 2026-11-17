@@ -217,6 +217,25 @@ fn build_router_with_app_state(
                 require_admin_token,
             )),
         )
+        .route(
+            "/minga/tenants",
+            get(handlers::list_tenants)
+                .post(handlers::create_tenant)
+                .layer(axum::middleware::from_fn_with_state(
+                    api_state.clone(),
+                    require_admin_token,
+                )),
+        )
+        .route(
+            "/minga/tenants/:id",
+            get(handlers::get_tenant)
+                .put(handlers::update_tenant)
+                .delete(handlers::delete_tenant)
+                .layer(axum::middleware::from_fn_with_state(
+                    api_state.clone(),
+                    require_admin_token,
+                )),
+        )
         // Versioned endpoints: /{version}/...
         .route("/:version/version", get(handlers::get_version))
         .route("/:version/info", get(handlers::get_info))
@@ -383,7 +402,7 @@ mod tests {
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use minga_bus::{subjects, EventBus, MemoryBus, TaskActualState, TaskStatusReport};
-    use minga_state::types::{Network, Task, TaskSpec, TaskState};
+    use minga_state::types::{Network, Task, TaskSpec, TaskState, Volume};
     use std::collections::BTreeMap;
     use tower::ServiceExt;
 
@@ -433,6 +452,21 @@ mod tests {
         (router, dir)
     }
 
+    async fn admin_router() -> (Router, Arc<StateStore>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            StateStore::open(1, "127.0.0.1:0", dir.path(), BTreeMap::new())
+                .await
+                .unwrap(),
+        );
+        let router = build_router_with_auth(
+            store.clone(),
+            Arc::new(ReadyState::new()),
+            Some("admin-token".to_string()),
+        );
+        (router, store, dir)
+    }
+
     async fn send_request(router: Router, req: Request<Body>) -> (StatusCode, serde_json::Value) {
         let resp = router.oneshot(req).await.unwrap();
         let status = resp.status();
@@ -447,6 +481,107 @@ mod tests {
             })
         };
         (status, json)
+    }
+
+    #[tokio::test]
+    async fn tenant_crud_requires_admin_and_protects_owned_resources() {
+        let (router, store, _dir) = admin_router().await;
+
+        let req = Request::builder()
+            .uri("/minga/tenants")
+            .body(Body::empty())
+            .unwrap();
+        let (status, _) = send_request(router.clone(), req).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        let req = Request::builder()
+            .uri("/minga/tenants")
+            .header("Authorization", "Bearer admin-token")
+            .body(Body::empty())
+            .unwrap();
+        let (status, tenants) = send_request(router.clone(), req).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(tenants.as_array().unwrap().len(), 1);
+        assert_eq!(tenants[0]["id"], "default");
+
+        let body = serde_json::json!({
+            "id": "tenant-a",
+            "name": "Hotel A",
+            "quotas": {"services": 5}
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/minga/tenants")
+            .header("Authorization", "Bearer admin-token")
+            .header("Content-Type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        let (status, created) = send_request(router.clone(), req).await;
+        assert_eq!(status, StatusCode::CREATED);
+        let created_at = created["created_at"].as_u64().unwrap();
+        assert_eq!(created["quotas"]["services"], 5);
+
+        let body = serde_json::json!({
+            "name": "Hotel Alpha",
+            "quotas": {"services": 10}
+        });
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/minga/tenants/tenant-a")
+            .header("Authorization", "Bearer admin-token")
+            .header("Content-Type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        let (status, _) = send_request(router.clone(), req).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let req = Request::builder()
+            .uri("/minga/tenants/tenant-a")
+            .header("Authorization", "Bearer admin-token")
+            .body(Body::empty())
+            .unwrap();
+        let (status, updated) = send_request(router.clone(), req).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(updated["name"], "Hotel Alpha");
+        assert_eq!(updated["quotas"]["services"], 10);
+        assert_eq!(updated["created_at"], created_at);
+
+        store
+            .upsert_volume(Volume {
+                id: "tenant-a-data".into(),
+                tenant_id: "tenant-a".into(),
+                name: "data".into(),
+                driver: "local".into(),
+            })
+            .await
+            .unwrap();
+        let req = Request::builder()
+            .method("DELETE")
+            .uri("/minga/tenants/tenant-a")
+            .header("Authorization", "Bearer admin-token")
+            .body(Body::empty())
+            .unwrap();
+        let (status, _) = send_request(router.clone(), req).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+
+        store.remove_volume("tenant-a-data".into()).await.unwrap();
+        let req = Request::builder()
+            .method("DELETE")
+            .uri("/minga/tenants/tenant-a")
+            .header("Authorization", "Bearer admin-token")
+            .body(Body::empty())
+            .unwrap();
+        let (status, _) = send_request(router.clone(), req).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let req = Request::builder()
+            .method("DELETE")
+            .uri("/minga/tenants/default")
+            .header("Authorization", "Bearer admin-token")
+            .body(Body::empty())
+            .unwrap();
+        let (status, _) = send_request(router, req).await;
+        assert_eq!(status, StatusCode::CONFLICT);
     }
 
     #[tokio::test]
