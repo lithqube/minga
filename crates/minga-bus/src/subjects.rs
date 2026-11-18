@@ -170,6 +170,13 @@ pub fn parse_kv_lease(key: &str) -> Option<(&str, u64)> {
     Some((tenant_id, node_id.parse().ok()?))
 }
 
+/// Inbox prefix a worker connects with. Replies to its requests and its
+/// consumer deliveries land under this prefix, so its ACL never needs the
+/// shared `_INBOX.>` that would expose other tenants' replies.
+pub fn worker_inbox_prefix(tenant_id: &str, node_id: u64) -> String {
+    format!("_INBOX.{tenant_id}.{node_id}")
+}
+
 /// NATS permissions for a tenant/node worker identity: `(publish, subscribe)`.
 pub fn worker_acl(tenant_id: &str, node_id: u64) -> crate::Result<(Vec<String>, Vec<String>)> {
     minga_state::types::Tenant::validate_id(tenant_id)
@@ -213,7 +220,7 @@ pub fn worker_acl(tenant_id: &str, node_id: u64) -> crate::Result<(Vec<String>, 
     let own_ping = format!("{PREFIX}.{tenant_id}.ctl.node.{node_id}.ping");
     let own_drain = format!("{PREFIX}.{tenant_id}.ctl.node.{node_id}.drain");
     let subscribe = vec![
-        "_INBOX.>".into(),
+        format!("{}.>", worker_inbox_prefix(tenant_id, node_id)),
         "$JS.ACK.KV_MINGA_ASSIGN.>".into(),
         "$JS.ACK.KV_MINGA_LEASES.>".into(),
         own_ping,
@@ -286,7 +293,8 @@ mod tests {
         let (publish, subscribe) = worker_acl("tenant_a", 7).unwrap();
         assert!(publish.contains(&"$KV.MINGA_LEASES.tenant_a.lease.node.7".to_string()));
         assert!(subscribe.contains(&"$JS.ACK.KV_MINGA_ASSIGN.>".to_string()));
-        assert!(subscribe.contains(&"_INBOX.>".to_string()));
+        assert!(subscribe.contains(&"_INBOX.tenant_a.7.>".to_string()));
+        assert!(!subscribe.iter().any(|subject| subject == "_INBOX.>"));
         assert!(!subscribe
             .iter()
             .any(|subject| subject.starts_with("$KV.MINGA_ASSIGN.")));

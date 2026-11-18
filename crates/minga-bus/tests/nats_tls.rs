@@ -415,6 +415,15 @@ async fn publish_jetstream_message(
     Ok(())
 }
 
+/// A raw client on the worker certificate, with the inbox prefix the worker
+/// ACL allows (production workers get it from `NatsBus::connect_worker*`).
+fn worker_raw_options(config: &NatsTlsConfig) -> async_nats::ConnectOptions {
+    config
+        .connect_options()
+        .unwrap()
+        .custom_inbox_prefix(minga_bus::subjects::worker_inbox_prefix("default", 7))
+}
+
 fn start_worker_acl_server(pki: &Pki) -> TlsServer {
     let dir = tempfile::tempdir().unwrap();
     let ca_path = dir.path().join("ca.pem");
@@ -718,9 +727,31 @@ async fn worker_certificate_cannot_write_assignments_or_other_nodes_status_and_l
         .await
         .is_err());
 
+    // The worker's inbox is scoped to `_INBOX.default.7`: a raw client on the
+    // worker certificate that subscribes to the shared `_INBOX.>` must not see
+    // the JetStream replies addressed to the manager's inbox.
+    let snoop =
+        async_nats::connect_with_options(url.as_str(), worker_config.connect_options().unwrap())
+            .await
+            .unwrap();
+    let mut snooped = snoop.subscribe("_INBOX.>").await.unwrap();
+    snoop.flush().await.unwrap();
+    manager
+        .get_assignment("default.node.7.task.allowed")
+        .await
+        .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(500), snooped.next())
+            .await
+            .ok()
+            .flatten()
+            .is_none(),
+        "a worker must not receive replies sent to another client's inbox"
+    );
+
     // A consumer whose filter covers another node's keys is refused, whether
     // the filter rides in the payload or in the subject.
-    let raw = async_nats::connect_with_options(&url, worker_config.connect_options().unwrap())
+    let raw = async_nats::connect_with_options(&url, worker_raw_options(&worker_config))
         .await
         .expect("worker certificate connects");
     let stream = async_nats::jetstream::new(raw)
@@ -764,7 +795,7 @@ async fn worker_certificate_cannot_write_assignments_or_other_nodes_status_and_l
         );
     }
 
-    let worker = async_nats::connect_with_options(&url, worker_config.connect_options().unwrap())
+    let worker = async_nats::connect_with_options(&url, worker_raw_options(&worker_config))
         .await
         .expect("worker certificate maps to the restricted NATS identity");
     let own_status = tokio::time::timeout(
@@ -817,10 +848,9 @@ async fn worker_certificate_cannot_write_assignments_or_other_nodes_status_and_l
         "minga.default.task.foreign.event",
         "minga.default.audit",
     ] {
-        let worker =
-            async_nats::connect_with_options(&url, worker_config.connect_options().unwrap())
-                .await
-                .expect("worker certificate reconnects");
+        let worker = async_nats::connect_with_options(&url, worker_raw_options(&worker_config))
+            .await
+            .expect("worker certificate reconnects");
         let result = tokio::time::timeout(
             Duration::from_secs(2),
             publish_jetstream_message(&worker, subject, b"forbidden"),

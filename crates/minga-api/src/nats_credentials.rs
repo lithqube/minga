@@ -163,7 +163,6 @@ fn worker_permission_template(tenant_id: &str) -> (Vec<String>, Vec<String>) {
         format!("$JS.API.DIRECT.GET.KV_MINGA_ASSIGN.$KV.MINGA_ASSIGN.{tenant_id}.node.{node}.>"),
         format!("$JS.API.DIRECT.GET.KV_MINGA_STATUS_{tenant_id}.$KV.MINGA_STATUS_{tenant_id}.node.{node}.task.>"),
         format!("$JS.API.DIRECT.GET.KV_MINGA_LEASES.$KV.MINGA_LEASES.{tenant_id}.lease.node.{node}"),
-        "_INBOX.>".to_string(),
     ];
     let subscribe = vec![
         format!("$KV.MINGA_ASSIGN.{tenant_id}.node.{node}.task.>"),
@@ -174,7 +173,7 @@ fn worker_permission_template(tenant_id: &str) -> (Vec<String>, Vec<String>) {
         format!("$KV.MINGA_LEASES.{tenant_id}.lease.node.{node}"),
         format!("minga.{tenant_id}.ctl.node.{node}.ping"),
         format!("minga.{tenant_id}.ctl.node.{node}.drain"),
-        "_INBOX.>".to_string(),
+        format!("_INBOX.{tenant_id}.{node}.>"),
     ];
     (publish, subscribe)
 }

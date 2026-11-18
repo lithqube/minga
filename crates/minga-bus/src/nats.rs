@@ -75,6 +75,7 @@ const NAK_DELAY: Duration = Duration::from_secs(5);
 /// watches each, plus listings) with 10x headroom; raise it if a cluster
 /// outgrows that.
 const BUCKET_MAX_CONSUMERS: i32 = 100_000;
+const EVENT_SUBJECTS: [&str; 3] = ["minga.*.node.>", "minga.*.task.>", "minga.*.egress.>"];
 const DEFAULT_TENANT_STREAM_MAX_BYTES: i64 = 512 * 1024 * 1024;
 const MAX_TENANT_STREAM_MAX_BYTES: i64 = 10 * 1024 * 1024 * 1024;
 const DEFAULT_TENANT_STREAM_MAX_AGE: Duration = Duration::from_secs(24 * 3600);
@@ -541,7 +542,7 @@ impl NatsBus {
         tenant_id: &str,
         token: Option<&str>,
     ) -> Result<Arc<Self>> {
-        let mut options = async_nats::ConnectOptions::new().ignore_discovered_servers();
+        let mut options = worker_options(async_nats::ConnectOptions::new(), node_id, tenant_id);
         if let Some(token) = token {
             options = options.token(token.to_string());
         }
@@ -677,10 +678,12 @@ impl NatsBus {
         validate_tenant_id(tenant_id)?;
         let options = Self::secure_options(url, config, None)?;
         Self::ensure_crypto_provider();
-        let client =
-            async_nats::connect_with_options(seed_list(url), options.ignore_discovered_servers())
-                .await
-                .map_err(|error| BusError::Connection(format!("TLS connection failed: {error}")))?;
+        let client = async_nats::connect_with_options(
+            seed_list(url),
+            worker_options(options, node_id, tenant_id),
+        )
+        .await
+        .map_err(|error| BusError::Connection(format!("TLS connection failed: {error}")))?;
         Self::from_worker_client(client, node_id, tenant_id).await
     }
 
@@ -694,10 +697,12 @@ impl NatsBus {
         validate_tenant_id(tenant_id)?;
         let options = Self::secure_options(url, config, Some(credentials))?;
         Self::ensure_crypto_provider();
-        let client =
-            async_nats::connect_with_options(seed_list(url), options.ignore_discovered_servers())
-                .await
-                .map_err(|error| BusError::Connection(format!("TLS connection failed: {error}")))?;
+        let client = async_nats::connect_with_options(
+            seed_list(url),
+            worker_options(options, node_id, tenant_id),
+        )
+        .await
+        .map_err(|error| BusError::Connection(format!("TLS connection failed: {error}")))?;
         Self::from_worker_client(client, node_id, tenant_id).await
     }
 
@@ -826,20 +831,32 @@ impl NatsBus {
 
     async fn setup_streams(js: &JetStream) -> Result<()> {
         // MINGA_EVENTS — status reports and lifecycle events.
+        let event_subjects = EVENT_SUBJECTS.map(str::to_string).to_vec();
         let events = StreamConfig {
             name: "MINGA_EVENTS".to_string(),
-            subjects: vec![
-                "minga.*.node.>".to_string(),
-                "minga.*.task.>".to_string(),
-                "minga.*.egress.>".to_string(),
-            ],
+            subjects: event_subjects.clone(),
             retention: RetentionPolicy::Limits,
             max_age: Duration::from_secs(72 * 3600),
             ..Default::default()
         };
-        js.get_or_create_stream(events)
+        let mut stream = js
+            .get_or_create_stream(events)
             .await
             .map_err(|e| BusError::Other(format!("MINGA_EVENTS: {e}")))?;
+        // A stream created before tenant-first subjects keeps its old filter;
+        // without this update every tenant publish fails with "no stream found".
+        let mut config = stream
+            .info()
+            .await
+            .map_err(|e| BusError::Other(format!("MINGA_EVENTS info: {e}")))?
+            .config
+            .clone();
+        if config.subjects != event_subjects {
+            config.subjects = event_subjects;
+            js.update_stream(config)
+                .await
+                .map_err(|e| BusError::Other(format!("MINGA_EVENTS subjects: {e}")))?;
+        }
 
         // Tenant logs use `minga.<tenant>.log.>`; the legacy stream below
         // stays outside the tenant namespace so these filters cannot overlap.
@@ -1839,6 +1856,18 @@ fn now_millis() -> u64 {
 }
 
 /// Splits a comma-separated seed list into the URLs async-nats accepts.
+/// Worker connections use a tenant- and node-scoped inbox; their ACL denies
+/// the shared `_INBOX.>`.
+fn worker_options(
+    options: async_nats::ConnectOptions,
+    node_id: u64,
+    tenant_id: &str,
+) -> async_nats::ConnectOptions {
+    options
+        .ignore_discovered_servers()
+        .custom_inbox_prefix(crate::subjects::worker_inbox_prefix(tenant_id, node_id))
+}
+
 fn seed_list(url: &str) -> Vec<&str> {
     url.split(',').map(str::trim).collect()
 }

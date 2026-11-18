@@ -835,22 +835,9 @@ impl ApiServer {
 
         // Spawned only once startup can no longer fail, so a failed bind leaks no task.
         let ready_state = ReadyState::without_bus();
-        let probe = {
-            let (store, ready) = (store.clone(), ready_state.clone());
-            tokio::spawn(async move {
-                loop {
-                    ready.set_raft_ready(store.current_leader().await.is_some());
-                    METRICS
-                        .raft_leader
-                        .set(if store.is_leader().await { 1.0 } else { 0.0 });
-                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                }
-            })
-        };
-        let ready_state = Arc::new(ready_state);
         let mut app_state = match bus {
-            Some(bus) => AppState::with_bus(store, bus),
-            None => AppState::new(store),
+            Some(bus) => AppState::with_bus(store.clone(), bus),
+            None => AppState::new(store.clone()),
         };
         if let Some(key) = join_token_key {
             app_state = app_state.with_join_token_key(key);
@@ -859,6 +846,22 @@ impl ApiServer {
             app_state = app_state.with_nats_credential_issuer(issuer);
         }
         let app_state = Arc::new(app_state);
+        let probe = {
+            let (store, ready, app) = (store, ready_state.clone(), app_state.clone());
+            tokio::spawn(async move {
+                let mut revocations_published = false;
+                loop {
+                    ready.set_raft_ready(store.current_leader().await.is_some());
+                    let leader = store.is_leader().await;
+                    METRICS.raft_leader.set(if leader { 1.0 } else { 0.0 });
+                    revocations_published =
+                        crate::handlers::sync_nats_revocations(&app, leader, revocations_published)
+                            .await;
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                }
+            })
+        };
+        let ready_state = Arc::new(ready_state);
         let router =
             build_router_with_app_state(app_state, ready_state, auth_token, acceptor.is_some());
         let limits = minga_telemetry::serve::Limits::default();

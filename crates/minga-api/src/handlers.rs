@@ -803,6 +803,14 @@ pub async fn create_node(
     ))
 }
 
+/// Serializes join-token issue, node removal and revocation publishing. Each
+/// reads a node's NATS key or the revocation list and then writes; interleaved,
+/// a removal can miss a freshly issued key or an older account claim can
+/// overwrite a newer one and un-revoke a user.
+/// shortcut: process-local; revocation runs only on the Raft leader, so move
+/// this into Raft if credential issuance ever runs on followers.
+pub(crate) static NODE_CREDENTIALS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// `POST /minga/nodes/{id}/join-token` — mint a tenant-bound token and NATS credentials.
 pub async fn issue_node_join_token(
     State(app): State<Arc<AppState>>,
@@ -810,6 +818,7 @@ pub async fn issue_node_join_token(
     Path(id): Path<String>,
 ) -> ApiResult<Json<models::NodeJoinToken>> {
     let node_id = id.parse::<u64>().map_err(|_| not_found("node", &id))?;
+    let credentials_guard = NODE_CREDENTIALS.lock().await;
     let node = app
         .store
         .get_node(node_id)
@@ -831,7 +840,7 @@ pub async fn issue_node_join_token(
     .await?;
     let issued_at = unix_now();
     if let Some(previous_key) = node.nats_user_public_key.as_deref() {
-        revoke_nats_user(&app, previous_key).await?;
+        revoke_nats_user(&app, previous_key, &credentials_guard).await?;
     }
     let (user_public_key, credentials) =
         issuer.issue(&node.tenant_id, node.id).map_err(internal)?;
@@ -864,6 +873,9 @@ pub async fn remove_node(
     Path((_version, id)): Path<(String, String)>,
 ) -> ApiResult<StatusCode> {
     let node_id = id.parse::<u64>().map_err(|_| not_found("node", &id))?;
+    // Read the key under the lock so a concurrent join-token issue cannot
+    // leave a key this removal never revokes.
+    let credentials_guard = NODE_CREDENTIALS.lock().await;
     let node = app
         .store
         .get_node(node_id)
@@ -878,13 +890,17 @@ pub async fn remove_node(
     )
     .await?;
     if let Some(public_key) = node.nats_user_public_key.as_deref() {
-        revoke_nats_user(&app, public_key).await?;
+        revoke_nats_user(&app, public_key, &credentials_guard).await?;
     }
     app.store.remove_node(node_id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn revoke_nats_user(app: &AppState, public_key: &str) -> ApiResult<()> {
+async fn revoke_nats_user(
+    app: &AppState,
+    public_key: &str,
+    guard: &tokio::sync::MutexGuard<'_, ()>,
+) -> ApiResult<()> {
     if !app.store.is_leader().await {
         return Err(crate::error::ApiError::Unavailable(
             "NATS credential revocation must run on the Raft leader".into(),
@@ -893,15 +909,57 @@ async fn revoke_nats_user(app: &AppState, public_key: &str) -> ApiResult<()> {
     let issuer = app.nats_credential_issuer.as_ref().ok_or_else(|| {
         crate::error::ApiError::Unavailable("tenant NATS signer is not configured".into())
     })?;
-    let bus = app.bus.as_ref().ok_or_else(|| {
-        crate::error::ApiError::Unavailable("NATS revocation bus is not configured".into())
-    })?;
+    if app.bus.is_none() {
+        return Err(crate::error::ApiError::Unavailable(
+            "NATS revocation bus is not configured".into(),
+        ));
+    }
     issuer
         .validate_user_public_key(public_key)
         .map_err(internal)?;
     app.store
         .record_nats_user_revocation(public_key.to_owned())
         .await?;
+    publish_nats_revocations(app, guard).await
+}
+
+/// Publishes the account claim carrying every revocation stored in Raft. The
+/// leader also runs this when it takes over, so a manager whose resolver
+/// lost the claim cannot accept a revoked node's credentials again.
+/// One leader-probe tick: republish the revocations once per leadership term,
+/// retrying on the next tick after a failure. Returns whether this term's
+/// revocations are published.
+pub(crate) async fn sync_nats_revocations(
+    app: &AppState,
+    is_leader: bool,
+    published: bool,
+) -> bool {
+    if !is_leader || app.nats_credential_issuer.is_none() || app.bus.is_none() {
+        return false;
+    }
+    if published {
+        return true;
+    }
+    let guard = NODE_CREDENTIALS.lock().await;
+    match publish_nats_revocations(app, &guard).await {
+        Ok(()) => true,
+        Err(error) => {
+            tracing::warn!(%error, "cannot republish NATS credential revocations; retrying");
+            false
+        }
+    }
+}
+
+pub(crate) async fn publish_nats_revocations(
+    app: &AppState,
+    _guard: &tokio::sync::MutexGuard<'_, ()>,
+) -> ApiResult<()> {
+    let issuer = app.nats_credential_issuer.as_ref().ok_or_else(|| {
+        crate::error::ApiError::Unavailable("tenant NATS signer is not configured".into())
+    })?;
+    let bus = app.bus.as_ref().ok_or_else(|| {
+        crate::error::ApiError::Unavailable("NATS revocation bus is not configured".into())
+    })?;
     let revoked_users = app
         .store
         .list_tenants()
@@ -909,6 +967,9 @@ async fn revoke_nats_user(app: &AppState, public_key: &str) -> ApiResult<()> {
         .into_iter()
         .flat_map(|tenant| tenant.nats_revoked_user_public_keys)
         .collect::<Vec<_>>();
+    if revoked_users.is_empty() {
+        return Ok(());
+    }
     let account_jwt = issuer
         .account_claim_with_revocations(&revoked_users, unix_now())
         .map_err(internal)?;
@@ -1914,6 +1975,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn new_leader_republishes_stored_revocations_once_per_term() {
+        use nats_jwt_rs::{account::Account, Claims};
+
+        let (base, _dir) = app_with_node(1.0).await;
+        let issuer = Arc::new(crate::nats_credentials::test_issuer("default"));
+        let (public_key, _) = issuer.issue("default", 1).unwrap();
+        base.store
+            .record_nats_user_revocation(public_key.clone())
+            .await
+            .unwrap();
+        let bus = minga_bus::memory::MemoryBus::new();
+        let app =
+            AppState::with_bus(base.store.clone(), bus.clone()).with_nats_credential_issuer(issuer);
+
+        assert!(!sync_nats_revocations(&app, false, false).await);
+        assert!(bus.account_claim_updates().is_empty());
+        assert!(sync_nats_revocations(&app, true, false).await);
+        assert!(sync_nats_revocations(&app, true, true).await);
+        let updates = bus.account_claim_updates();
+        assert_eq!(updates.len(), 1, "one publish per leadership term");
+        let claim = Claims::<Account>::decode(&updates[0]).unwrap();
+        assert!(claim.nats.revocations.unwrap().contains_key(&public_key));
+    }
+
+    #[tokio::test]
     async fn deleting_node_fails_closed_when_revocation_bus_is_missing() {
         let (base, _dir) = app_with_node(1.0).await;
         let issuer = Arc::new(crate::nats_credentials::test_issuer("default"));
@@ -1924,10 +2010,13 @@ mod tests {
             .unwrap();
         let app = Arc::new(AppState::new(base.store.clone()).with_nats_credential_issuer(issuer));
 
-        assert!(matches!(
-            revoke_nats_user(&app, &public_key).await,
-            Err(ApiError::Unavailable(_))
-        ));
+        {
+            let guard = NODE_CREDENTIALS.lock().await;
+            assert!(matches!(
+                revoke_nats_user(&app, &public_key, &guard).await,
+                Err(ApiError::Unavailable(_))
+            ));
+        }
         assert!(matches!(
             remove_node(
                 State(app.clone()),

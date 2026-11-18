@@ -244,7 +244,10 @@ impl Scheduler {
                         node = task.node_id,
                         "creating task"
                     );
-                    self.state.upsert_task(task.as_ref().clone()).await?;
+                    if let Err(error) = self.state.upsert_task(task.as_ref().clone()).await {
+                        skip_quota_error(error, &task.service_id)?;
+                        continue;
+                    }
                     minga_telemetry::METRICS
                         .scheduler_placement_decisions_total
                         .with_label_values(&["placed"])
@@ -263,19 +266,22 @@ impl Scheduler {
                     if let Some(rollback_policy) = &current.rollback {
                         rolled_back.update = *rollback_policy;
                     }
-                    self.state.upsert_service(rolled_back).await?;
+                    if let Err(error) = self.state.upsert_service(rolled_back).await {
+                        skip_quota_error(error, service_id)?;
+                    }
                 }
                 ReconcileAction::SettleService(service_id) => {
                     let Some(service) = services.iter().find(|s| &s.id == service_id) else {
                         continue;
                     };
                     tracing::info!(service = %service_id, "rollout settled");
-                    self.state
-                        .upsert_service(Service {
-                            previous: None,
-                            ..service.clone()
-                        })
-                        .await?;
+                    let settled = Service {
+                        previous: None,
+                        ..service.clone()
+                    };
+                    if let Err(error) = self.state.upsert_service(settled).await {
+                        skip_quota_error(error, service_id)?;
+                    }
                 }
                 ReconcileAction::RemoveTask { task_id, .. } => {
                     tracing::info!(task = %task_id, "removing task");
@@ -539,6 +545,18 @@ impl Scheduler {
             }
             tokio::time::sleep(interval).await;
         }
+    }
+}
+
+/// One tenant at its quota must not stop reconciliation for every tenant:
+/// the write is skipped and retried on the next pass.
+fn skip_quota_error(error: StateError, service_id: &str) -> Result<(), StateError> {
+    match error {
+        StateError::QuotaExceeded(quota) => {
+            tracing::warn!(service = %service_id, %quota, "tenant quota exceeded; skipping write");
+            Ok(())
+        }
+        other => Err(other),
     }
 }
 

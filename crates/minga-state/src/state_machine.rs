@@ -432,7 +432,21 @@ impl RedbStateMachine {
         match cmd {
             StateCommand::UpsertNode(node) => {
                 let mut t = tx.open_table(NODES_TABLE).map_err(sm_io_err)?;
-                let bytes = crate::codec::encode(node)
+                let stored_key = t
+                    .get(node.id.to_string().as_str())
+                    .map_err(sm_io_err)?
+                    .map(|v| crate::codec::decode::<ClusterNode>(v.value()))
+                    .transpose()
+                    .map_err(|e| sm_storage_err(ErrorSubject::Store, ErrorVerb::Read, e))?
+                    .and_then(|stored| stored.nats_user_public_key);
+                // Only SetNodeNatsUserPublicKey changes the key: a full record
+                // read before the key was set must not erase the handle that
+                // revokes the node's NATS credentials.
+                let mut node = node.clone();
+                if stored_key.is_some() {
+                    node.nats_user_public_key = stored_key;
+                }
+                let bytes = crate::codec::encode(&node)
                     .map_err(|e| sm_storage_err(ErrorSubject::Store, ErrorVerb::Write, e))?;
                 t.insert(node.id.to_string().as_str(), bytes.as_slice())
                     .map_err(sm_io_err)?;

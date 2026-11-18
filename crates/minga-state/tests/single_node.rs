@@ -634,6 +634,16 @@ async fn nats_public_key_update_preserves_node_and_missing_node_fails() {
     assert_eq!(node.nats_user_public_key.as_deref(), Some("UABC"));
     assert_eq!(node.labels.get("gpu").map(String::as_str), Some("true"));
 
+    // A full record read before the key was set (registration) must not
+    // erase the key that revokes the node's NATS credentials.
+    let mut stale = sample_node(7);
+    stale.last_seen_unix = Some(42);
+    assert!(stale.nats_user_public_key.is_none());
+    store.upsert_node(stale).await.unwrap();
+    let node = store.get_node(7).await.unwrap().unwrap();
+    assert_eq!(node.nats_user_public_key.as_deref(), Some("UABC"));
+    assert_eq!(node.last_seen_unix, Some(42));
+
     assert!(matches!(
         store
             .set_node_nats_user_public_key(999, Some("UDEF".into()))

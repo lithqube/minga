@@ -1303,3 +1303,62 @@ async fn nat_workers_relay_through_the_lowest_manager_and_fail_over_after_lease_
         .await
         .unwrap();
 }
+
+#[tokio::test]
+async fn one_tenant_at_its_task_quota_does_not_block_other_tenants() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(
+        StateStore::open(1, "127.0.0.1:0", dir.path(), BTreeMap::new())
+            .await
+            .unwrap(),
+    );
+    let mut default_tenant = store
+        .list_tenants()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|tenant| tenant.id == minga_state::types::DEFAULT_TENANT_ID)
+        .expect("default tenant");
+    default_tenant.quotas.tasks = Some(1);
+    store.upsert_tenant(default_tenant).await.unwrap();
+    store
+        .upsert_tenant(minga_state::types::Tenant {
+            nats_revoked_user_public_keys: Vec::new(),
+            id: "tenant-b".into(),
+            name: "Tenant B".into(),
+            quotas: Default::default(),
+            created_at: 1,
+        })
+        .await
+        .unwrap();
+
+    store.upsert_node(make_node(1, 8.0, 1 << 34)).await.unwrap();
+    let mut tenant_worker = make_node(2, 8.0, 1 << 34);
+    tenant_worker.tenant_id = "tenant-b".into();
+    store.upsert_node(tenant_worker).await.unwrap();
+
+    // Default wants three tasks against a quota of one; tenant B wants one.
+    store
+        .upsert_service(make_service("app.web", 3))
+        .await
+        .unwrap();
+    let mut service = make_service("tenant-b.web", 1);
+    service.tenant_id = "tenant-b".into();
+    store.upsert_service(service).await.unwrap();
+
+    let scheduler = Scheduler::new(store.clone());
+    scheduler.reconcile_once().await.unwrap();
+
+    let tasks = store.list_tasks().await.unwrap();
+    let count = |tenant: &str| tasks.iter().filter(|t| t.tenant_id == tenant).count();
+    assert_eq!(count(minga_state::types::DEFAULT_TENANT_ID), 1);
+    assert_eq!(count("tenant-b"), 1);
+
+    drop(scheduler);
+    Arc::try_unwrap(store)
+        .ok()
+        .expect("scheduler dropped")
+        .shutdown()
+        .await
+        .unwrap();
+}
