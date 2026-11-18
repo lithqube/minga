@@ -36,6 +36,7 @@ async fn cluster() -> Cluster {
     );
     let identity = NodeIdentity {
         node_id: 1,
+        tenant_id: "default".into(),
         address: "127.0.0.1:50051".to_string(),
         labels: Default::default(),
         capacity: ResourceSpec {
@@ -51,14 +52,20 @@ async fn cluster() -> Cluster {
     };
     store.upsert_node(identity.cluster_node()).await.unwrap();
     let bus = minga_bus::MemoryBus::new();
-    bus.refresh_lease(1, b"registration").await.unwrap();
-    let scheduler = minga_scheduler::Scheduler::with_bus(store.clone(), bus);
+    bus.refresh_tenant_lease("default", 1, b"registration")
+        .await
+        .unwrap();
+    let scheduler = minga_scheduler::Scheduler::with_bus(store.clone(), bus.clone());
     tokio::spawn(async move { scheduler.run(Duration::from_millis(100)).await });
 
-    let server =
-        minga_api::ApiServer::start_with_auth(store, "127.0.0.1:0", Some(TOKEN.to_string()))
-            .await
-            .unwrap();
+    let server = minga_api::ApiServer::start_with_bus_and_auth(
+        store,
+        bus,
+        "127.0.0.1:0",
+        Some(TOKEN.to_string()),
+    )
+    .await
+    .unwrap();
     let url = format!("http://{}", server.addr());
 
     let http = reqwest::Client::new();

@@ -12,6 +12,10 @@ use crate::types::{
 pub enum StateCommand {
     UpsertNode(ClusterNode),
     RemoveNode(NodeId),
+    SetNodeNatsUserPublicKey {
+        id: NodeId,
+        public_key: Option<String>,
+    },
 
     UpsertService(Service),
     RemoveService(ServiceId),
@@ -39,6 +43,9 @@ pub enum StateCommand {
         quotas: TenantQuotas,
     },
     RemoveTenant(TenantId),
+    RecordNatsUserRevocation {
+        user_public_key: String,
+    },
 
     /// Refreshes a node's lease in one log entry: sets `last_seen_unix`
     /// and revives the node unless it is draining. A missing record stays

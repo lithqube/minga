@@ -20,10 +20,14 @@ async fn server() -> (minga_api::ApiServer, tempfile::TempDir) {
             .await
             .unwrap(),
     );
-    let server =
-        minga_api::ApiServer::start_with_auth(store, "127.0.0.1:0", Some(TOKEN.to_string()))
-            .await
-            .unwrap();
+    let server = minga_api::ApiServer::start_with_bus_and_auth(
+        store,
+        minga_bus::MemoryBus::new(),
+        "127.0.0.1:0",
+        Some(TOKEN.to_string()),
+    )
+    .await
+    .unwrap();
     (server, dir)
 }
 

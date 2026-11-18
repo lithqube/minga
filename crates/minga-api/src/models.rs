@@ -429,6 +429,8 @@ pub struct NodeJoinToken {
     pub tenant_id: String,
     pub expires_at: u64,
     pub token: String,
+    /// Standard NATS `.creds` payload for this tenant-bound node.
+    pub credentials: String,
 }
 
 /// Query params for `POST /nodes/{id}/update`. Docker sends `version`;

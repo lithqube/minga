@@ -59,12 +59,22 @@ async fn start_test_server_with_reserved_ports(
             last_seen_unix: None,
             role: Default::default(),
             reserved_ports,
+            nats_user_public_key: None,
         })
         .await
         .unwrap();
 
     // Bind to 0.0.0.0 so containers can reach the server.
-    let server = ApiServer::start(store, "0.0.0.0:0").await.unwrap();
+    let server = ApiServer::start_with_bus_and_auth_and_tls_and_join_token_key(
+        store,
+        minga_bus::MemoryBus::new(),
+        "0.0.0.0:0",
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
     // Report the address as 127.0.0.1 for local HTTP tests.
     let port = server.addr().rsplit_once(':').unwrap().1;
     let base_url = format!("http://127.0.0.1:{port}");
@@ -72,7 +82,7 @@ async fn start_test_server_with_reserved_ports(
 }
 
 #[tokio::test]
-async fn operator_mints_tenant_bound_node_join_token() {
+async fn node_join_credentials_require_mutual_tls() {
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(
         StateStore::open(1, "127.0.0.1:0", dir.path(), BTreeMap::new())
@@ -81,6 +91,7 @@ async fn operator_mints_tenant_bound_node_join_token() {
     );
     store
         .create_tenant(minga_state::types::Tenant {
+            nats_revoked_user_public_keys: Vec::new(),
             id: "acme".into(),
             name: "Acme".into(),
             quotas: Default::default(),
@@ -126,18 +137,11 @@ async fn operator_mints_tenant_bound_node_join_token() {
         .send()
         .await
         .unwrap();
-    assert_eq!(response.status(), 200);
-    let value: Value = response.json().await.unwrap();
-    assert_eq!(value["node_id"], 2);
-    assert_eq!(value["tenant_id"], "acme");
-    let claims = key
-        .verify(
-            value["token"].as_str().unwrap(),
-            2,
-            minga_state::types::unix_now(),
-        )
-        .unwrap();
-    assert_eq!(claims.tenant_id, "acme");
+    assert_eq!(
+        response.status(),
+        403,
+        "node credentials must not be returned over plaintext HTTP"
+    );
 }
 
 /// Creates a reqwest client with a short timeout.

@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::codec::{
     check_format, FORMAT_KEY, FORMAT_VERSION, V2_FORMAT_VERSION, V3_FORMAT_VERSION,
-    V4_FORMAT_VERSION, V5_FORMAT_VERSION,
+    V4_FORMAT_VERSION, V5_FORMAT_VERSION, V6_FORMAT_VERSION, V7_FORMAT_VERSION,
 };
 use crate::command::{StateCommand, StateResponse};
 use crate::types::*;
@@ -51,15 +51,16 @@ const ENTITY_TABLES: [TableDefinition<&str, &[u8]>; 8] = [
     TENANTS_TABLE,
 ];
 
-/// Re-encodes entity records and advances the marker during the v6 migration.
+/// Re-encodes entity records and advances the marker during the v8 migration.
 ///
 /// The caller advances the marker in the same redb transaction, so a failure
 /// leaves both the old values and the old marker intact.
 #[allow(clippy::result_large_err)]
 fn migrate_state(tx: &redb::WriteTransaction) -> Result<(), StorageIOError<u64>> {
-    // Older versions lack progressively more fields; serde defaults every
-    // pre-tenant node to `default` while the migration re-encodes all records.
+    // Serde defaults fields introduced in later formats; re-encoding all
+    // records applies the new optional NATS identity shape.
     rewrite_state_table::<ClusterNode>(tx, NODES_TABLE)?;
+    rewrite_state_table::<Tenant>(tx, TENANTS_TABLE)?;
     rewrite_state_table::<Service>(tx, SERVICES_TABLE)?;
     rewrite_state_table::<Task>(tx, TASKS_TABLE)?;
     rewrite_state_table::<Network>(tx, NETWORKS_TABLE)?;
@@ -141,6 +142,135 @@ fn owned_by_other_tenant<T: DeserializeOwned>(
 }
 
 const NAME_IN_USE: &str = "name is already in use";
+
+#[allow(clippy::result_large_err)]
+fn tenant_quota(
+    tx: &redb::WriteTransaction,
+    tenant_id: &str,
+) -> Result<TenantQuotas, StorageError<u64>> {
+    let table = tx.open_table(TENANTS_TABLE).map_err(sm_io_err)?;
+    let quotas = table
+        .get(tenant_id)
+        .map_err(sm_io_err)?
+        .map(|value| crate::codec::decode(value.value()))
+        .transpose()
+        .map_err(|e| sm_storage_err(ErrorSubject::Store, ErrorVerb::Read, e))?
+        .map_or_else(TenantQuotas::default, |tenant: Tenant| tenant.quotas);
+    Ok(quotas)
+}
+
+#[allow(clippy::result_large_err)]
+fn enforce_count_quota<T: DeserializeOwned>(
+    tx: &redb::WriteTransaction,
+    table_definition: TableDefinition<&str, &[u8]>,
+    tenant_id: &str,
+    id: &str,
+    quota_name: &str,
+    limit: Option<u64>,
+    tenant_of: impl Fn(&T) -> &str,
+) -> Result<Option<String>, StorageError<u64>> {
+    let Some(limit) = limit else {
+        return Ok(None);
+    };
+    let table = tx.open_table(table_definition).map_err(sm_io_err)?;
+    let mut count = 0u64;
+    for row in table.iter().map_err(sm_io_err)? {
+        let (key, value) = row.map_err(sm_io_err)?;
+        let record: T = crate::codec::decode(value.value())
+            .map_err(|e| sm_storage_err(ErrorSubject::Store, ErrorVerb::Read, e))?;
+        if key.value() != id && tenant_of(&record) == tenant_id {
+            count += 1;
+        }
+    }
+    if count.saturating_add(1) > limit {
+        return Ok(Some(format!(
+            "tenant quota exceeded: {quota_name} limit {limit}"
+        )));
+    }
+    Ok(None)
+}
+#[allow(clippy::result_large_err)]
+fn enforce_job_quota(
+    tx: &redb::WriteTransaction,
+    tenant_id: &str,
+    id: &str,
+    is_job: bool,
+    limit: Option<u64>,
+) -> Result<Option<String>, StorageError<u64>> {
+    let (Some(limit), true) = (limit, is_job) else {
+        return Ok(None);
+    };
+    let table = tx.open_table(SERVICES_TABLE).map_err(sm_io_err)?;
+    let mut count = 0u64;
+    for row in table.iter().map_err(sm_io_err)? {
+        let (key, value) = row.map_err(sm_io_err)?;
+        let service: Service = crate::codec::decode(value.value())
+            .map_err(|e| sm_storage_err(ErrorSubject::Store, ErrorVerb::Read, e))?;
+        if key.value() != id && service.tenant_id == tenant_id && service.is_job {
+            count += 1;
+        }
+    }
+    if count.saturating_add(1) > limit {
+        return Ok(Some(format!("tenant quota exceeded: jobs limit {limit}")));
+    }
+    Ok(None)
+}
+
+#[allow(clippy::result_large_err)]
+fn enforce_desired_state_bytes(
+    tx: &redb::WriteTransaction,
+    tenant_id: &str,
+    replaced_table: &str,
+    replaced_id: &str,
+    candidate_len: usize,
+) -> Result<Option<String>, StorageError<u64>> {
+    let limit = tenant_quota(tx, tenant_id)?.desired_state_bytes;
+    let Some(limit) = limit else {
+        return Ok(None);
+    };
+    let mut total = 0u64;
+    for (table_name, definition) in [
+        ("services", SERVICES_TABLE),
+        ("tasks", TASKS_TABLE),
+        ("networks", NETWORKS_TABLE),
+        ("volumes", VOLUMES_TABLE),
+        ("secrets", SECRETS_TABLE),
+        ("configs", CONFIGS_TABLE),
+    ] {
+        let table = tx.open_table(definition).map_err(sm_io_err)?;
+        for row in table.iter().map_err(sm_io_err)? {
+            let (key, value) = row.map_err(sm_io_err)?;
+            let bytes = value.value();
+            let belongs = match table_name {
+                "services" => crate::codec::decode::<Service>(bytes)
+                    .map(|record| record.tenant_id == tenant_id),
+                "tasks" => {
+                    crate::codec::decode::<Task>(bytes).map(|record| record.tenant_id == tenant_id)
+                }
+                "networks" => crate::codec::decode::<Network>(bytes)
+                    .map(|record| record.tenant_id == tenant_id),
+                "volumes" => crate::codec::decode::<Volume>(bytes)
+                    .map(|record| record.tenant_id == tenant_id),
+                "secrets" => crate::codec::decode::<Secret>(bytes)
+                    .map(|record| record.tenant_id == tenant_id),
+                "configs" => crate::codec::decode::<Config>(bytes)
+                    .map(|record| record.tenant_id == tenant_id),
+                _ => unreachable!(),
+            }
+            .map_err(|e| sm_storage_err(ErrorSubject::Store, ErrorVerb::Read, e))?;
+            if belongs && !(table_name == replaced_table && key.value() == replaced_id) {
+                total = total.saturating_add(bytes.len() as u64);
+            }
+        }
+    }
+    total = total.saturating_add(candidate_len as u64);
+    if total > limit {
+        return Ok(Some(format!(
+            "tenant quota exceeded: desired_state_bytes limit {limit}"
+        )));
+    }
+    Ok(None)
+}
 
 #[allow(clippy::result_large_err)]
 fn tenant_has_resources(
@@ -228,6 +358,8 @@ impl RedbStateMachine {
             || stored.as_deref() == Some(&[V3_FORMAT_VERSION])
             || stored.as_deref() == Some(&[V4_FORMAT_VERSION])
             || stored.as_deref() == Some(&[V5_FORMAT_VERSION])
+            || stored.as_deref() == Some(&[V6_FORMAT_VERSION])
+            || stored.as_deref() == Some(&[V7_FORMAT_VERSION])
         {
             migrate_state(&tx)?;
         } else {
@@ -333,10 +465,29 @@ impl RedbStateMachine {
                     .map_err(sm_io_err)?;
                 Ok(StateResponse::Ok)
             }
+            StateCommand::SetNodeNatsUserPublicKey { id, public_key } => {
+                let mut t = tx.open_table(NODES_TABLE).map_err(sm_io_err)?;
+                let key = id.to_string();
+                let existing: Option<ClusterNode> = t
+                    .get(key.as_str())
+                    .map_err(sm_io_err)?
+                    .map(|v| crate::codec::decode::<ClusterNode>(v.value()))
+                    .transpose()
+                    .map_err(|e| sm_storage_err(ErrorSubject::Store, ErrorVerb::Read, e))?;
+                let Some(mut record) = existing else {
+                    return Ok(StateResponse::NotFound);
+                };
+                record.nats_user_public_key = public_key.clone();
+                let bytes = crate::codec::encode(&record)
+                    .map_err(|e| sm_storage_err(ErrorSubject::Store, ErrorVerb::Write, e))?;
+                t.insert(key.as_str(), bytes.as_slice())
+                    .map_err(sm_io_err)?;
+                Ok(StateResponse::Ok)
+            }
             StateCommand::UpsertService(svc) => {
-                let mut t = tx.open_table(SERVICES_TABLE).map_err(sm_io_err)?;
                 // Two API writes can both pass admission before either
                 // commits; this check, inside the write, decides exclusivity.
+                let t = tx.open_table(SERVICES_TABLE).map_err(sm_io_err)?;
                 let mut stored = None;
                 let mut others = Vec::new();
                 for row in t.iter().map_err(sm_io_err)? {
@@ -363,8 +514,36 @@ impl RedbStateMachine {
                         return Ok(StateResponse::Error(conflict));
                     }
                 }
+                drop(t);
+                let quotas = tenant_quota(tx, &svc.tenant_id)?;
+                if let Some(error) = enforce_count_quota::<Service>(
+                    tx,
+                    SERVICES_TABLE,
+                    &svc.tenant_id,
+                    &svc.id,
+                    "services",
+                    quotas.services,
+                    |record| &record.tenant_id,
+                )? {
+                    return Ok(StateResponse::Error(error));
+                }
+                if let Some(error) =
+                    enforce_job_quota(tx, &svc.tenant_id, &svc.id, svc.is_job, quotas.jobs)?
+                {
+                    return Ok(StateResponse::Error(error));
+                }
                 let bytes = crate::codec::encode(svc)
                     .map_err(|e| sm_storage_err(ErrorSubject::Store, ErrorVerb::Write, e))?;
+                if let Some(error) = enforce_desired_state_bytes(
+                    tx,
+                    &svc.tenant_id,
+                    "services",
+                    &svc.id,
+                    bytes.len(),
+                )? {
+                    return Ok(StateResponse::Error(error));
+                }
+                let mut t = tx.open_table(SERVICES_TABLE).map_err(sm_io_err)?;
                 t.insert(svc.id.as_str(), bytes.as_slice())
                     .map_err(sm_io_err)?;
                 Ok(StateResponse::Ok)
@@ -375,9 +554,35 @@ impl RedbStateMachine {
                 Ok(StateResponse::Ok)
             }
             StateCommand::UpsertTask(task) => {
-                let mut t = tx.open_table(TASKS_TABLE).map_err(sm_io_err)?;
+                if owned_by_other_tenant(tx, TASKS_TABLE, &task.id, &task.tenant_id, |r: &Task| {
+                    &r.tenant_id
+                })? {
+                    return Ok(StateResponse::Conflict(NAME_IN_USE.into()));
+                }
+                let quotas = tenant_quota(tx, &task.tenant_id)?;
+                if let Some(error) = enforce_count_quota::<Task>(
+                    tx,
+                    TASKS_TABLE,
+                    &task.tenant_id,
+                    &task.id,
+                    "tasks",
+                    quotas.tasks,
+                    |record| &record.tenant_id,
+                )? {
+                    return Ok(StateResponse::Error(error));
+                }
                 let bytes = crate::codec::encode(task)
                     .map_err(|e| sm_storage_err(ErrorSubject::Store, ErrorVerb::Write, e))?;
+                if let Some(error) = enforce_desired_state_bytes(
+                    tx,
+                    &task.tenant_id,
+                    "tasks",
+                    &task.id,
+                    bytes.len(),
+                )? {
+                    return Ok(StateResponse::Error(error));
+                }
+                let mut t = tx.open_table(TASKS_TABLE).map_err(sm_io_err)?;
                 t.insert(task.id.as_str(), bytes.as_slice())
                     .map_err(sm_io_err)?;
                 Ok(StateResponse::Ok)
@@ -397,9 +602,30 @@ impl RedbStateMachine {
                 )? {
                     return Ok(StateResponse::Conflict(NAME_IN_USE.into()));
                 }
-                let mut t = tx.open_table(NETWORKS_TABLE).map_err(sm_io_err)?;
+                let quotas = tenant_quota(tx, &net.tenant_id)?;
+                if let Some(error) = enforce_count_quota::<Network>(
+                    tx,
+                    NETWORKS_TABLE,
+                    &net.tenant_id,
+                    &net.id,
+                    "networks",
+                    quotas.networks,
+                    |record| &record.tenant_id,
+                )? {
+                    return Ok(StateResponse::Error(error));
+                }
                 let bytes = crate::codec::encode(net)
                     .map_err(|e| sm_storage_err(ErrorSubject::Store, ErrorVerb::Write, e))?;
+                if let Some(error) = enforce_desired_state_bytes(
+                    tx,
+                    &net.tenant_id,
+                    "networks",
+                    &net.id,
+                    bytes.len(),
+                )? {
+                    return Ok(StateResponse::Error(error));
+                }
+                let mut t = tx.open_table(NETWORKS_TABLE).map_err(sm_io_err)?;
                 t.insert(net.id.as_str(), bytes.as_slice())
                     .map_err(sm_io_err)?;
                 Ok(StateResponse::Ok)
@@ -410,9 +636,39 @@ impl RedbStateMachine {
                 Ok(StateResponse::Ok)
             }
             StateCommand::UpsertVolume(vol) => {
-                let mut t = tx.open_table(VOLUMES_TABLE).map_err(sm_io_err)?;
+                if owned_by_other_tenant(
+                    tx,
+                    VOLUMES_TABLE,
+                    &vol.id,
+                    &vol.tenant_id,
+                    |record: &Volume| &record.tenant_id,
+                )? {
+                    return Ok(StateResponse::Conflict(NAME_IN_USE.into()));
+                }
+                let quotas = tenant_quota(tx, &vol.tenant_id)?;
+                if let Some(error) = enforce_count_quota::<Volume>(
+                    tx,
+                    VOLUMES_TABLE,
+                    &vol.tenant_id,
+                    &vol.id,
+                    "volumes",
+                    quotas.volumes,
+                    |record| &record.tenant_id,
+                )? {
+                    return Ok(StateResponse::Error(error));
+                }
                 let bytes = crate::codec::encode(vol)
                     .map_err(|e| sm_storage_err(ErrorSubject::Store, ErrorVerb::Write, e))?;
+                if let Some(error) = enforce_desired_state_bytes(
+                    tx,
+                    &vol.tenant_id,
+                    "volumes",
+                    &vol.id,
+                    bytes.len(),
+                )? {
+                    return Ok(StateResponse::Error(error));
+                }
+                let mut t = tx.open_table(VOLUMES_TABLE).map_err(sm_io_err)?;
                 t.insert(vol.id.as_str(), bytes.as_slice())
                     .map_err(sm_io_err)?;
                 Ok(StateResponse::Ok)
@@ -428,9 +684,26 @@ impl RedbStateMachine {
                 })? {
                     return Ok(StateResponse::Conflict(NAME_IN_USE.into()));
                 }
-                let mut t = tx.open_table(SECRETS_TABLE).map_err(sm_io_err)?;
+                let quotas = tenant_quota(tx, &s.tenant_id)?;
+                if let Some(error) = enforce_count_quota::<Secret>(
+                    tx,
+                    SECRETS_TABLE,
+                    &s.tenant_id,
+                    &s.id,
+                    "secrets",
+                    quotas.secrets,
+                    |record| &record.tenant_id,
+                )? {
+                    return Ok(StateResponse::Error(error));
+                }
                 let bytes = crate::codec::encode(s)
                     .map_err(|e| sm_storage_err(ErrorSubject::Store, ErrorVerb::Write, e))?;
+                if let Some(error) =
+                    enforce_desired_state_bytes(tx, &s.tenant_id, "secrets", &s.id, bytes.len())?
+                {
+                    return Ok(StateResponse::Error(error));
+                }
+                let mut t = tx.open_table(SECRETS_TABLE).map_err(sm_io_err)?;
                 t.insert(s.id.as_str(), bytes.as_slice())
                     .map_err(sm_io_err)?;
                 Ok(StateResponse::Ok)
@@ -446,9 +719,26 @@ impl RedbStateMachine {
                 })? {
                     return Ok(StateResponse::Conflict(NAME_IN_USE.into()));
                 }
-                let mut t = tx.open_table(CONFIGS_TABLE).map_err(sm_io_err)?;
+                let quotas = tenant_quota(tx, &c.tenant_id)?;
+                if let Some(error) = enforce_count_quota::<Config>(
+                    tx,
+                    CONFIGS_TABLE,
+                    &c.tenant_id,
+                    &c.id,
+                    "configs",
+                    quotas.configs,
+                    |record| &record.tenant_id,
+                )? {
+                    return Ok(StateResponse::Error(error));
+                }
                 let bytes = crate::codec::encode(c)
                     .map_err(|e| sm_storage_err(ErrorSubject::Store, ErrorVerb::Write, e))?;
+                if let Some(error) =
+                    enforce_desired_state_bytes(tx, &c.tenant_id, "configs", &c.id, bytes.len())?
+                {
+                    return Ok(StateResponse::Error(error));
+                }
+                let mut t = tx.open_table(CONFIGS_TABLE).map_err(sm_io_err)?;
                 t.insert(c.id.as_str(), bytes.as_slice())
                     .map_err(sm_io_err)?;
                 Ok(StateResponse::Ok)
@@ -459,8 +749,24 @@ impl RedbStateMachine {
                 Ok(StateResponse::Ok)
             }
             StateCommand::UpsertTenant(tenant) => {
+                let mut tenant = tenant.clone();
+                let existing = {
+                    let t = tx.open_table(TENANTS_TABLE).map_err(sm_io_err)?;
+                    let value = t.get(tenant.id.as_str()).map_err(sm_io_err)?;
+                    match value {
+                        Some(value) => {
+                            Some(crate::codec::decode::<Tenant>(value.value()).map_err(|e| {
+                                sm_storage_err(ErrorSubject::Store, ErrorVerb::Read, e)
+                            })?)
+                        }
+                        None => None,
+                    }
+                };
+                if let Some(existing) = existing {
+                    tenant.nats_revoked_user_public_keys = existing.nats_revoked_user_public_keys;
+                }
                 let mut t = tx.open_table(TENANTS_TABLE).map_err(sm_io_err)?;
-                let bytes = crate::codec::encode(tenant)
+                let bytes = crate::codec::encode(&tenant)
                     .map_err(|e| sm_storage_err(ErrorSubject::Store, ErrorVerb::Write, e))?;
                 t.insert(tenant.id.as_str(), bytes.as_slice())
                     .map_err(sm_io_err)?;
@@ -496,6 +802,30 @@ impl RedbStateMachine {
                 let bytes = crate::codec::encode(&tenant)
                     .map_err(|e| sm_storage_err(ErrorSubject::Store, ErrorVerb::Write, e))?;
                 t.insert(id.as_str(), bytes.as_slice()).map_err(sm_io_err)?;
+                Ok(StateResponse::Ok)
+            }
+            StateCommand::RecordNatsUserRevocation { user_public_key } => {
+                let mut t = tx.open_table(TENANTS_TABLE).map_err(sm_io_err)?;
+                let mut tenant = {
+                    let Some(raw) = t.get(DEFAULT_TENANT_ID).map_err(sm_io_err)? else {
+                        return Ok(StateResponse::NotFound);
+                    };
+                    crate::codec::decode::<Tenant>(raw.value())
+                        .map_err(|e| sm_storage_err(ErrorSubject::Store, ErrorVerb::Read, e))?
+                };
+                if !tenant
+                    .nats_revoked_user_public_keys
+                    .contains(user_public_key)
+                {
+                    tenant
+                        .nats_revoked_user_public_keys
+                        .push(user_public_key.clone());
+                    tenant.nats_revoked_user_public_keys.sort_unstable();
+                    let bytes = crate::codec::encode(&tenant)
+                        .map_err(|e| sm_storage_err(ErrorSubject::Store, ErrorVerb::Write, e))?;
+                    t.insert(DEFAULT_TENANT_ID, bytes.as_slice())
+                        .map_err(sm_io_err)?;
+                }
                 Ok(StateResponse::Ok)
             }
             StateCommand::RemoveTenant(id) => {

@@ -20,8 +20,12 @@ use hyper_util::{
     server::conn::auto,
     service::TowerToHyperService,
 };
-use minga_bus::EventBus;
-use minga_state::{join_token::JoinTokenKey, types::DEFAULT_TENANT_ID, StateStore};
+use minga_bus::{AuditRecord, EventBus};
+use minga_state::{
+    join_token::JoinTokenKey,
+    types::{unix_now, DEFAULT_TENANT_ID},
+    StateStore,
+};
 use minga_telemetry::{ReadyState, METRICS};
 use rustls::pki_types::CertificateDer;
 use tokio::net::TcpListener;
@@ -102,6 +106,59 @@ async fn authenticate(
     if let Err(denied) = authorize(&caller, source, req.method(), req.uri().path()) {
         return denied;
     }
+    if req.uri().path().starts_with("/minga/nodes/")
+        && req.uri().path().ends_with("/join-token")
+        && !state.tls_enabled
+    {
+        return auth_forbidden("node credentials may only be issued over mutual TLS");
+    }
+    if let Some(tenant_id) = caller.tenant_id.as_deref() {
+        let tenant = match state.store.get_tenant(tenant_id).await {
+            Ok(Some(tenant)) => tenant,
+            Ok(None) => return auth_forbidden("tenant no longer exists"),
+            Err(error) => return auth_unavailable(error),
+        };
+        if let Some(limit) = tenant.quotas.api_requests_per_second {
+            let Some(bus) = state.app_state.bus.as_ref() else {
+                return quota_unavailable("event bus is not configured");
+            };
+            match bus
+                .check_tenant_request_quota(tenant_id, unix_now(), limit)
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => {
+                    return (
+                        axum::http::StatusCode::TOO_MANY_REQUESTS,
+                        axum::Json(serde_json::json!({
+                            "message": format!(
+                                "tenant quota exceeded: api_requests_per_second limit {limit}"
+                            )
+                        })),
+                    )
+                        .into_response();
+                }
+                Err(error) => return quota_unavailable(error),
+            }
+        }
+    }
+    if !matches!(req.method().as_str(), "GET" | "HEAD" | "OPTIONS") {
+        if let Some(tenant_id) = caller.tenant_id.as_deref() {
+            let Some(bus) = state.app_state.bus.as_ref() else {
+                return audit_unavailable("event bus is not configured");
+            };
+            let record = AuditRecord {
+                tenant_id: tenant_id.to_owned(),
+                actor: caller.name.clone(),
+                action: req.method().to_string(),
+                resource_path: req.uri().path().to_owned(),
+                occurred_at_unix: unix_now(),
+            };
+            if let Err(error) = bus.append_audit(record).await {
+                return audit_unavailable(format!("tenant audit append failed: {error}"));
+            }
+        }
+    }
     if source == Source::Token {
         req.extensions_mut().insert(TokenAuthenticated);
     }
@@ -114,6 +171,22 @@ fn auth_unavailable(error: impl std::fmt::Display) -> axum::response::Response {
     (
         axum::http::StatusCode::INTERNAL_SERVER_ERROR,
         axum::Json(serde_json::json!({"message": "authentication failed"})),
+    )
+        .into_response()
+}
+fn quota_unavailable(error: impl std::fmt::Display) -> axum::response::Response {
+    tracing::error!(%error, "tenant request quota service unavailable");
+    (
+        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        axum::Json(serde_json::json!({"message": "tenant request quota service unavailable"})),
+    )
+        .into_response()
+}
+fn audit_unavailable(error: impl std::fmt::Display) -> axum::response::Response {
+    tracing::error!(%error, "tenant audit service unavailable");
+    (
+        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        axum::Json(serde_json::json!({"message": "tenant audit service unavailable"})),
     )
         .into_response()
 }
@@ -265,12 +338,13 @@ fn auth_forbidden(message: &str) -> axum::response::Response {
 }
 
 fn tenant_scoped_path(path: &str) -> bool {
-    path.split('/').any(|segment| {
-        matches!(
-            segment,
-            "services" | "tasks" | "networks" | "secrets" | "configs" | "state"
-        )
-    })
+    !path.starts_with("/minga/")
+        && path.split('/').any(|segment| {
+            matches!(
+                segment,
+                "services" | "tasks" | "networks" | "secrets" | "configs" | "audit" | "state"
+            )
+        })
 }
 
 fn cluster_operator_path(path: &str) -> bool {
@@ -282,7 +356,9 @@ fn cluster_operator_path(path: &str) -> bool {
 
 fn request_minimum_role(method: &axum::http::Method, path: &str) -> ApiRole {
     use axum::http::Method;
-    if method == Method::GET || method == Method::HEAD {
+    if path.split('/').nth(2) == Some("audit") || path == "/minga/audit" {
+        ApiRole::Admin
+    } else if method == Method::GET || method == Method::HEAD {
         ApiRole::Viewer
     } else if path.split('/').nth(2) == Some("nodes") {
         ApiRole::Admin
@@ -408,6 +484,11 @@ fn build_router_with_app_state(
         // Unversioned endpoints.
         .route("/_ping", get(handlers::ping))
         .route(
+            "/minga/audit",
+            get(handlers::list_cluster_audit)
+                .layer(axum::middleware::from_fn(require_operator_admin)),
+        )
+        .route(
             "/minga/managers",
             get(handlers::list_managers)
                 .post(handlers::add_manager)
@@ -444,12 +525,16 @@ fn build_router_with_app_state(
         // Versioned endpoints: /{version}/...
         .route("/:version/version", get(handlers::get_version))
         .route("/:version/info", get(handlers::get_info))
+        .route("/:version/audit", get(handlers::list_audit))
         // Nodes.
         .route(
             "/:version/nodes",
             get(handlers::list_nodes).post(handlers::create_node),
         )
-        .route("/:version/nodes/:id", get(handlers::get_node))
+        .route(
+            "/:version/nodes/:id",
+            get(handlers::get_node).delete(handlers::remove_node),
+        )
         .route("/:version/nodes/:id/update", post(handlers::update_node))
         // Services.
         .route("/:version/services", get(handlers::list_services))
@@ -648,7 +733,7 @@ impl ApiServer {
         bind: &str,
         auth_token: Option<String>,
     ) -> Result<Self, ApiServerError> {
-        Self::start_inner(store, None, bind, auth_token, None, None).await
+        Self::start_inner(store, None, bind, auth_token, None, None, None).await
     }
 
     /// Starts the API server with actual task state read from the event bus.
@@ -658,7 +743,7 @@ impl ApiServer {
         bind: &str,
         auth_token: Option<String>,
     ) -> Result<Self, ApiServerError> {
-        Self::start_inner(store, Some(bus), bind, auth_token, None, None).await
+        Self::start_inner(store, Some(bus), bind, auth_token, None, None, None).await
     }
 
     /// Starts the API over bounded mutual TLS, requiring a CA-verified caller certificate.
@@ -668,7 +753,7 @@ impl ApiServer {
         auth_token: Option<String>,
         tls: ApiTlsConfig,
     ) -> Result<Self, ApiServerError> {
-        Self::start_inner(store, None, bind, auth_token, Some(tls), None).await
+        Self::start_inner(store, None, bind, auth_token, Some(tls), None, None).await
     }
 
     /// Starts the bus-backed API with optional mutual TLS.
@@ -679,7 +764,7 @@ impl ApiServer {
         auth_token: Option<String>,
         tls: Option<ApiTlsConfig>,
     ) -> Result<Self, ApiServerError> {
-        Self::start_inner(store, Some(bus), bind, auth_token, tls, None).await
+        Self::start_inner(store, Some(bus), bind, auth_token, tls, None, None).await
     }
 
     /// Starts the bus-backed API with optional TLS and manager-local signing.
@@ -691,7 +776,37 @@ impl ApiServer {
         tls: Option<ApiTlsConfig>,
         join_token_key: Option<Arc<JoinTokenKey>>,
     ) -> Result<Self, ApiServerError> {
-        Self::start_inner(store, Some(bus), bind, auth_token, tls, join_token_key).await
+        Self::start_inner(
+            store,
+            Some(bus),
+            bind,
+            auth_token,
+            tls,
+            join_token_key,
+            None,
+        )
+        .await
+    }
+    /// Starts the bus-backed API with tenant-scoped NATS credential issuance.
+    pub async fn start_with_bus_and_auth_and_tls_and_signers(
+        store: Arc<StateStore>,
+        bus: Arc<dyn EventBus>,
+        bind: &str,
+        auth_token: Option<String>,
+        tls: Option<ApiTlsConfig>,
+        join_token_key: Option<Arc<JoinTokenKey>>,
+        nats_credential_issuer: Option<Arc<crate::nats_credentials::NatsCredentialIssuer>>,
+    ) -> Result<Self, ApiServerError> {
+        Self::start_inner(
+            store,
+            Some(bus),
+            bind,
+            auth_token,
+            tls,
+            join_token_key,
+            nats_credential_issuer,
+        )
+        .await
     }
 
     async fn start_inner(
@@ -701,6 +816,7 @@ impl ApiServer {
         auth_token: Option<String>,
         tls: Option<ApiTlsConfig>,
         join_token_key: Option<Arc<JoinTokenKey>>,
+        nats_credential_issuer: Option<Arc<crate::nats_credentials::NatsCredentialIssuer>>,
     ) -> Result<Self, ApiServerError> {
         let acceptor = tls
             .as_ref()
@@ -738,6 +854,9 @@ impl ApiServer {
         };
         if let Some(key) = join_token_key {
             app_state = app_state.with_join_token_key(key);
+        }
+        if let Some(issuer) = nats_credential_issuer {
+            app_state = app_state.with_nats_credential_issuer(issuer);
         }
         let app_state = Arc::new(app_state);
         let router =
@@ -794,6 +913,52 @@ mod tests {
     use std::collections::BTreeMap;
     use tower::ServiceExt;
 
+    #[test]
+    fn tenant_audit_is_admin_only_and_tenant_scoped() {
+        let path = "/v1.41/audit";
+        let admin = Caller {
+            name: "tenant-admin".into(),
+            role: ApiRole::Admin,
+            tenant_id: Some("acme".into()),
+            cluster_operator: false,
+        };
+        assert!(authorize(&admin, Source::Certificate, &axum::http::Method::GET, path).is_ok());
+        assert!(authorize(
+            &admin,
+            Source::Certificate,
+            &axum::http::Method::GET,
+            "/minga/audit",
+        )
+        .is_err());
+
+        let viewer = Caller {
+            role: ApiRole::Viewer,
+            ..admin.clone()
+        };
+        assert!(authorize(&viewer, Source::Certificate, &axum::http::Method::GET, path).is_err());
+
+        let operator = Caller {
+            name: "operator".into(),
+            role: ApiRole::Admin,
+            tenant_id: None,
+            cluster_operator: true,
+        };
+        assert!(authorize(
+            &operator,
+            Source::Certificate,
+            &axum::http::Method::GET,
+            path
+        )
+        .is_err());
+        assert!(authorize(
+            &operator,
+            Source::Certificate,
+            &axum::http::Method::GET,
+            "/minga/audit",
+        )
+        .is_ok());
+    }
+
     /// Creates a test state store and router, with one active node
     /// registered — the state any cluster serving the API is really in.
     async fn test_router() -> (Router, tempfile::TempDir) {
@@ -832,12 +997,13 @@ mod tests {
                     last_seen_unix: None,
                     role: Default::default(),
                     reserved_ports: Vec::new(),
+                    nats_user_public_key: None,
                 })
                 .await
                 .unwrap();
         }
         let ready_state = Arc::new(ReadyState::new());
-        let router = build_router(store, ready_state);
+        let router = build_router_with_bus_and_auth(store, MemoryBus::new(), ready_state, None);
         (router, dir)
     }
 
@@ -848,8 +1014,9 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        let router = build_router_with_auth(
+        let router = build_router_with_bus_and_auth(
             store.clone(),
+            MemoryBus::new(),
             Arc::new(ReadyState::new()),
             Some("admin-token".to_string()),
         );
@@ -896,6 +1063,7 @@ mod tests {
             image: "nginx:latest".into(),
             replicas: 1,
             mode: minga_state::types::ServiceMode::Replicated,
+            is_job: false,
             constraints: vec![],
             env: Default::default(),
             ports: vec![],
@@ -978,6 +1146,7 @@ mod tests {
         // A second tenant ends the compatibility access.
         store
             .upsert_tenant(minga_state::types::Tenant {
+                nats_revoked_user_public_keys: Vec::new(),
                 id: "tenant-a".into(),
                 name: "A".into(),
                 quotas: Default::default(),
@@ -1269,6 +1438,7 @@ mod tests {
         for id in ["tenant-a", "tenant-b"] {
             store
                 .upsert_tenant(minga_state::types::Tenant {
+                    nats_revoked_user_public_keys: Vec::new(),
                     id: id.into(),
                     name: id.into(),
                     quotas: Default::default(),
@@ -1819,7 +1989,8 @@ mod tests {
             last_exit_code: None,
             running_since_unix: Some(999),
         };
-        bus.put_status(
+        bus.put_tenant_status(
+            "default",
             &subjects::kv_node_task_status(report.node_id, "svc.1"),
             &report.to_bytes().unwrap(),
         )
@@ -2197,8 +2368,9 @@ mod tests {
         let addr2 = listener.local_addr().unwrap().to_string();
         drop(listener);
         let store2 = Arc::new(StateStore::open_join(2, &addr2, dir2.path()).await.unwrap());
-        let router = build_router_with_auth(
+        let router = build_router_with_bus_and_auth(
             store1.clone(),
+            MemoryBus::new(),
             Arc::new(ReadyState::new()),
             Some("manager-secret".into()),
         );
@@ -2305,8 +2477,9 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        let router = build_router_with_auth(
+        let router = build_router_with_bus_and_auth(
             store,
+            MemoryBus::new(),
             Arc::new(ReadyState::new()),
             Some("s3cret".to_string()),
         );

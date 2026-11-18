@@ -91,6 +91,7 @@ fn sample_node(id: u64, addr: &str) -> ClusterNode {
         last_seen_unix: None,
         role: Default::default(),
         reserved_ports: Vec::new(),
+        nats_user_public_key: None,
     }
 }
 

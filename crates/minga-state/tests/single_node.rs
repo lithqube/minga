@@ -44,11 +44,13 @@ fn sample_node(id: u64) -> ClusterNode {
         last_seen_unix: None,
         role: Default::default(),
         reserved_ports: Vec::new(),
+        nats_user_public_key: None,
     }
 }
 
 fn sample_service(id: &str) -> Service {
     Service {
+        is_job: false,
         id: id.to_string(),
         tenant_id: "default".to_string(),
         name: id.to_string(),
@@ -350,6 +352,7 @@ async fn tenant_crud_is_persisted_and_protects_owned_resources() {
     assert_eq!(defaults[0].id, "default");
 
     let tenant = Tenant {
+        nats_revoked_user_public_keys: Vec::new(),
         id: "tenant-a".into(),
         name: "Tenant A".into(),
         quotas: TenantQuotas {
@@ -405,6 +408,7 @@ async fn tenant_crud_is_persisted_and_protects_owned_resources() {
         last_seen_unix: None,
         role: Default::default(),
         reserved_ports: Vec::new(),
+        nats_user_public_key: None,
     };
     store.upsert_node(node.clone()).await.unwrap();
     assert!(
@@ -425,6 +429,7 @@ async fn tenant_crud_is_persisted_and_protects_owned_resources() {
 
     store
         .create_tenant(Tenant {
+            nats_revoked_user_public_keys: Vec::new(),
             id: "persisted".into(),
             name: "Persisted".into(),
             quotas: TenantQuotas::default(),
@@ -446,5 +451,194 @@ async fn tenant_crud_is_persisted_and_protects_owned_resources() {
             .created_at,
         456
     );
+    store.shutdown().await.unwrap();
+}
+#[tokio::test]
+async fn cluster_revocations_survive_tenant_updates_and_deletion() {
+    let (store, _dir) = test_store("tenant-revocations").await;
+    store
+        .create_tenant(Tenant {
+            id: "tenant-a".into(),
+            name: "Tenant A".into(),
+            quotas: TenantQuotas::default(),
+            nats_revoked_user_public_keys: Vec::new(),
+            created_at: 1,
+        })
+        .await
+        .unwrap();
+    store
+        .record_nats_user_revocation("UABC".into())
+        .await
+        .unwrap();
+    store
+        .update_tenant(
+            "tenant-a",
+            "Tenant A updated".into(),
+            TenantQuotas::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .get_tenant("default")
+            .await
+            .unwrap()
+            .unwrap()
+            .nats_revoked_user_public_keys,
+        ["UABC"]
+    );
+    store.remove_tenant("tenant-a").await.unwrap();
+    assert!(store.get_tenant("tenant-a").await.unwrap().is_none());
+    store.shutdown().await.unwrap();
+}
+#[tokio::test]
+async fn tenant_count_and_desired_state_quotas_are_enforced_transactionally() {
+    let (store, _dir) = test_store("tenant-quotas").await;
+    store
+        .create_tenant(Tenant {
+            nats_revoked_user_public_keys: Vec::new(),
+            id: "count-limited".into(),
+            name: "Count limited".into(),
+            quotas: TenantQuotas {
+                services: Some(1),
+                ..TenantQuotas::default()
+            },
+            created_at: 1,
+        })
+        .await
+        .unwrap();
+
+    let mut first = sample_service("count-limited.web");
+    first.tenant_id = "count-limited".into();
+    first.ports.clear();
+    store.upsert_service(first).await.unwrap();
+    let mut second = sample_service("count-limited.api");
+    second.tenant_id = "count-limited".into();
+    second.ports.clear();
+    assert!(matches!(
+        store.upsert_service(second).await,
+        Err(StateError::QuotaExceeded(message)) if message == "services limit 1"
+    ));
+    assert_eq!(
+        store
+            .list_services()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|service| service.tenant_id == "count-limited")
+            .count(),
+        1
+    );
+
+    store
+        .create_tenant(Tenant {
+            nats_revoked_user_public_keys: Vec::new(),
+            id: "bytes-limited".into(),
+            name: "Bytes limited".into(),
+            quotas: TenantQuotas {
+                desired_state_bytes: Some(1),
+                ..TenantQuotas::default()
+            },
+            created_at: 2,
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        store
+            .upsert_volume(Volume {
+                id: "bytes-limited.data".into(),
+                tenant_id: "bytes-limited".into(),
+                name: "data".into(),
+                driver: "local".into(),
+            })
+            .await,
+        Err(StateError::QuotaExceeded(message))
+            if message == "desired_state_bytes limit 1"
+    ));
+    assert!(store.list_volumes().await.unwrap().is_empty());
+    store
+        .create_tenant(Tenant {
+            nats_revoked_user_public_keys: Vec::new(),
+            id: "object-limited".into(),
+            name: "Object limited".into(),
+            quotas: TenantQuotas {
+                volumes: Some(0),
+                configs: Some(0),
+                ..TenantQuotas::default()
+            },
+            created_at: 3,
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        store
+            .upsert_volume(Volume {
+                id: "object-limited.volume".into(),
+                tenant_id: "object-limited".into(),
+                name: "volume".into(),
+                driver: "local".into(),
+            })
+            .await,
+        Err(StateError::QuotaExceeded(message)) if message == "volumes limit 0"
+    ));
+    assert!(matches!(
+        store
+            .upsert_config(Config {
+                id: "object-limited.config".into(),
+                tenant_id: "object-limited".into(),
+                name: "config".into(),
+            })
+            .await,
+        Err(StateError::QuotaExceeded(message)) if message == "configs limit 0"
+    ));
+
+    store
+        .create_tenant(Tenant {
+            nats_revoked_user_public_keys: Vec::new(),
+            id: "job-limited".into(),
+            name: "Job limited".into(),
+            quotas: TenantQuotas {
+                jobs: Some(1),
+                ..TenantQuotas::default()
+            },
+            created_at: 4,
+        })
+        .await
+        .unwrap();
+    let mut first_job = sample_service("job-limited.first");
+    first_job.tenant_id = "job-limited".into();
+    first_job.is_job = true;
+    first_job.ports.clear();
+    store.upsert_service(first_job).await.unwrap();
+    let mut second_job = sample_service("job-limited.second");
+    second_job.tenant_id = "job-limited".into();
+    second_job.ports.clear();
+    second_job.is_job = true;
+    assert!(matches!(
+        store.upsert_service(second_job).await,
+        Err(StateError::QuotaExceeded(message)) if message == "jobs limit 1"
+    ));
+    store.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn nats_public_key_update_preserves_node_and_missing_node_fails() {
+    let (store, _dir) = test_store("node-nats-identity").await;
+    store.upsert_node(sample_node(7)).await.unwrap();
+
+    store
+        .set_node_nats_user_public_key(7, Some("UABC".into()))
+        .await
+        .unwrap();
+    let node = store.get_node(7).await.unwrap().unwrap();
+    assert_eq!(node.nats_user_public_key.as_deref(), Some("UABC"));
+    assert_eq!(node.labels.get("gpu").map(String::as_str), Some("true"));
+
+    assert!(matches!(
+        store
+            .set_node_nats_user_public_key(999, Some("UDEF".into()))
+            .await,
+        Err(StateError::NotFound(id)) if id == "node 999"
+    ));
     store.shutdown().await.unwrap();
 }

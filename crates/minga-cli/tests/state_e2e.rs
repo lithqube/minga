@@ -38,6 +38,7 @@ async fn cluster() -> (Arc<StateStore>, String, tempfile::TempDir) {
     );
     let identity = NodeIdentity {
         node_id: 1,
+        tenant_id: "default".into(),
         address: "127.0.0.1:50051".to_string(),
         labels: Default::default(),
         capacity: ResourceSpec {
@@ -53,11 +54,14 @@ async fn cluster() -> (Arc<StateStore>, String, tempfile::TempDir) {
     };
     store.upsert_node(identity.cluster_node()).await.unwrap();
     let bus = minga_bus::MemoryBus::new();
-    bus.refresh_lease(1, b"registration").await.unwrap();
-    let scheduler = minga_scheduler::Scheduler::with_bus(store.clone(), bus);
+    bus.refresh_tenant_lease("default", 1, b"registration")
+        .await
+        .unwrap();
+    let scheduler = minga_scheduler::Scheduler::with_bus(store.clone(), bus.clone());
     tokio::spawn(async move { scheduler.run(Duration::from_millis(200)).await });
-    let server = minga_api::ApiServer::start_with_auth(
+    let server = minga_api::ApiServer::start_with_bus_and_auth(
         store.clone(),
+        bus,
         "127.0.0.1:0",
         Some(API_TOKEN.to_owned()),
     )

@@ -54,6 +54,7 @@ fn cluster_node(id: u64, addr: &str) -> ClusterNode {
             NodeRole::Worker
         },
         reserved_ports: Vec::new(),
+        nats_user_public_key: None,
     }
 }
 
@@ -206,7 +207,9 @@ async fn phase0_gate_10_services_3_nodes() {
     // --- 6. Run the scheduler (places tasks across 3 nodes, publishes commands) --
     let bus = MemoryBus::with_lease_ttl(Duration::from_secs(300));
     for node_id in [1, 2, 3] {
-        bus.refresh_lease(node_id, b"registration").await.unwrap();
+        bus.refresh_tenant_lease("default", node_id, b"registration")
+            .await
+            .unwrap();
     }
     let scheduler = Scheduler::with_bus(leader.clone(), bus.clone());
     let actions = scheduler.reconcile_once().await.unwrap();
@@ -269,9 +272,9 @@ async fn phase0_gate_10_services_3_nodes() {
     let runtime2 = Arc::new(MockRuntime::new());
     let runtime3 = Arc::new(MockRuntime::new());
 
-    let sup1 = Supervisor::with_bus(runtime1.clone(), bus.clone(), 1);
-    let sup2 = Supervisor::with_bus(runtime2.clone(), bus.clone(), 2);
-    let sup3 = Supervisor::with_bus(runtime3.clone(), bus.clone(), 3);
+    let sup1 = Supervisor::with_tenant_bus(runtime1.clone(), bus.clone(), 1, "default");
+    let sup2 = Supervisor::with_tenant_bus(runtime2.clone(), bus.clone(), 2, "default");
+    let sup3 = Supervisor::with_tenant_bus(runtime3.clone(), bus.clone(), 3, "default");
 
     let (a1, a2, a3) = tokio::join!(
         sup1.reconcile_once(),
@@ -333,7 +336,7 @@ async fn phase0_gate_10_services_3_nodes() {
     // All 3 nodes should have live leases.
     for node_id in 1..=3u64 {
         assert!(
-            bus.is_alive(node_id).await.unwrap(),
+            bus.is_tenant_node_alive("default", node_id).await.unwrap(),
             "node {node_id} should have a live lease"
         );
     }
@@ -342,7 +345,7 @@ async fn phase0_gate_10_services_3_nodes() {
     for task in &all_tasks {
         let key = subjects::kv_node_task_status(task.node_id, &task.id);
         let status_bytes = bus
-            .get_status(&key)
+            .get_tenant_status("default", &key)
             .await
             .unwrap_or_else(|e| panic!("failed to get status for {}: {e}", task.id));
         assert!(

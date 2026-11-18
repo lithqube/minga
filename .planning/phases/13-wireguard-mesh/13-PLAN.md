@@ -117,16 +117,17 @@ Order: 13-01 first. 13-02 is independent of Phase 12 and can start any time. 13-
   - [x] A port conflict returns a 409.
   - [x] Backends update when a task moves.
 - [x] The CHANGELOG states the behaviour change plainly: existing stacks with short-syntax ports now publish on every node.
-- **Tenancy checklist (ADR 0008).** Tenants do not exist in code yet, so every object here belongs to the default tenant, and an upgraded cluster maps all existing services and ports to it. The answers below say what the routing mesh does today and what tenancy work must change.
-  1. **Owner.** An ingress assignment is derived from the service that publishes the port; the service's tenant owns it. A published port/protocol is owned cluster-wide by the first service that publishes it through ingress. The keys `node.{id}.ingress.{port}.{proto}` carry no tenant yet; they need a tenant segment when tenants land.
-  2. **Access.** Only the leader writes assignments; a worker reads its own node's keys. Admission goes through the service API, which has no roles yet. The 409 for a taken port names the holding service, so under tenancy it must become a generic conflict that does not reveal another tenant's service.
-  3. **Bus.** The worker ACL grants `node.{id}.ingress.>` for its own node only, and workers never write ingress keys. Per-tenant subjects are not applicable until tenant identity exists in the bus templates.
-  4. **Node.** Not met. Every node opens every ingress port and receives every backend set, including other services' task addresses, and every node peers with every node that runs a backend. Mesh-sourced traffic reaches only backend address, protocol and port (`MINGA_INGRESS_FWD`), never the rest of a network. Under tenancy, ingress must open, and peer, only on the owning tenant's nodes. This blocks running tenants on a shared cluster with the routing mesh on.
-  5. **Shared plane.** Writes are bounded by the number of published ingress ports (one assignment per node and port). There is no per-tenant port quota yet, so one tenant could claim the shared port space; tenancy needs a quota. A node's registered reserved ports are capped at 32 and validated.
-  6. **Audit.** Not applicable yet: there is no tenant identity to log. Assignment writes come from the leader's reconcile loop, not from a user request.
-  7. **Test.** No two-tenant test yet, because tenants do not exist. The isolation the mesh does enforce is tested: a mesh peer reaches only backend ports (unit test on `ingress_forward_batch`, real-kernel test), and a relay peer may carry only relayed workers' mesh addresses (`validate_peer_set`).
+**Tenancy checklist (ADR 0008).** T1–T3 are implemented. T4 bus isolation and T5 quotas/audit remain open; these notes describe ingress behavior and remaining tenancy constraints.
+1. **Owner.** An ingress assignment is derived from the service that publishes the port. Port/protocol reservations are currently cluster-wide; the assignment keys still lack a tenant segment, which T4 must add.
+2. **Access.** The tenant-scoped service API and state-machine commit path return a generic cross-tenant port conflict without naming the other tenant's service. Same-tenant conflicts retain the service name.
+3. **Bus.** Only the leader writes assignments, and a worker reads its node's keys. The current node-only ACL is not tenant-scoped; T4 must add the tenant segment and constrain workers to their tenant.
+4. **Node.** T3 scopes WireGuard peers and routes by tenant and excludes managers from tenant workload placement in multi-tenant clusters. The ingress mesh still needs tenant-scoped port opening and backend exposure; cross-node behavior remains unsupported until the deferred VM proof passes.
+5. **Shared plane.** Writes are bounded by the number of published ingress ports (one assignment per node and port). There is no per-tenant port quota yet, so one tenant could claim the shared port space; tenancy needs a quota. A node's registered reserved ports are capped at 32 and validated.
+6. **Audit.** Assignment writes come from the leader's reconcile loop, not a user request. T5 still needs per-tenant audit records.
+7. **Test.** The T3 scheduler integration test covers tenant placement and WireGuard peer projection; no two-tenant ingress isolation test exists. Multi-VM proof remains deferred until release readiness.
 
 ### 13-07 — Live proof, numbers and docs (WG-PROOF)
+Deferred until release readiness by user instruction. Do not run VM tests during Phase 15. The implementation through 13-06 is complete; cross-node networking remains unsupported until this proof passes.
 On separate VMs (OrbStack Ubuntu and others), with Raft mTLS and NATS mTLS:
 - [ ] **T2:** 1 manager plus 2 workers, one of them behind NAT (iptables MASQUERADE on its VM, no inbound path). Cross-node calls by name work in every direction, worker ↔ worker relays through the manager, and cutting the NAT'ed worker's network for 2 minutes recovers on its own.
 - [ ] **T3:** 3 managers plus 2 workers. Killing the home manager moves the relay, and traffic resumes.

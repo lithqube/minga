@@ -93,6 +93,16 @@ pub struct NatsJwtAuth {
     pub operator_jwt_file: PathBuf,
     /// Full account JWT resolver directory.
     pub resolver_dir: PathBuf,
+    /// Account JWT to preload into the full resolver.
+    pub account_jwt_file: PathBuf,
+    /// Control-plane account identity seed, held only by the manager.
+    pub account_seed_file: PathBuf,
+    /// Directory containing tenant-scoped signer seeds.
+    pub tenant_signer_dir: PathBuf,
+    /// NATS account public NKey matching the configured account JWT.
+    pub account_public_key: String,
+    /// SYS-account user credentials for resolver updates.
+    pub system_credentials_file: PathBuf,
 }
 
 /// Options for the NATS sidecar.
@@ -106,8 +116,6 @@ pub struct SidecarOptions {
     pub node_id: u64,
     /// Other manager identities in the NATS cluster.
     pub manager_node_ids: Vec<u64>,
-    /// Worker node identities allowed to connect with scoped KV permissions.
-    pub worker_node_ids: Vec<u64>,
     /// Client port (default 4222).
     pub client_port: u16,
     /// Monitor port (default 8222, localhost only).
@@ -136,7 +144,6 @@ impl Default for SidecarOptions {
             data_dir: PathBuf::from("/var/lib/minga"),
             node_id: 1,
             client_port: 4222,
-            worker_node_ids: Vec::new(),
             manager_node_ids: Vec::new(),
             monitor_port: 8222,
             max_memory_store: "64MB".to_string(),
@@ -172,17 +179,18 @@ impl NatsSidecar {
             if opts.client_token.is_some() || tls.verify_and_map || !tls.verify {
                 return Err(SidecarError::ConflictingAuth);
             }
-            if !jwt_auth.operator_jwt_file.is_file() {
-                return Err(SidecarError::JwtConfig(format!(
-                    "operator JWT file `{}` is missing",
-                    jwt_auth.operator_jwt_file.display()
-                )));
+            for path in [
+                &jwt_auth.operator_jwt_file,
+                &jwt_auth.account_jwt_file,
+                &jwt_auth.account_seed_file,
+                &jwt_auth.system_credentials_file,
+            ] {
+                crate::read_owner_only_file(path, 64 * 1024).map_err(SidecarError::JwtConfig)?;
             }
-            if !jwt_auth.resolver_dir.is_dir() {
-                return Err(SidecarError::JwtConfig(format!(
-                    "resolver directory `{}` is missing",
-                    jwt_auth.resolver_dir.display()
-                )));
+            if !jwt_auth.resolver_dir.is_dir() || !jwt_auth.tenant_signer_dir.is_dir() {
+                return Err(SidecarError::JwtConfig(
+                    "resolver and tenant signer directories must exist".to_string(),
+                ));
             }
         }
         // Create data directories.
@@ -196,6 +204,40 @@ impl NatsSidecar {
                 std::fs::set_permissions(&nats_dir, std::fs::Permissions::from_mode(0o700))
             })
             .map_err(|e| SidecarError::DataDir(e.to_string()))?;
+        if let Some(jwt_auth) = &opts.jwt_auth {
+            let account_claim_path = jwt_auth
+                .resolver_dir
+                .join(format!("{}.jwt", jwt_auth.account_public_key));
+            match std::fs::symlink_metadata(&account_claim_path) {
+                Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+                    return Err(SidecarError::JwtConfig(format!(
+                        "resolver claim path `{}` is not a regular file",
+                        account_claim_path.display()
+                    )));
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    std::fs::copy(&jwt_auth.account_jwt_file, &account_claim_path).map_err(
+                        |error| {
+                            SidecarError::JwtConfig(format!(
+                                "cannot preload account claim `{}`: {error}",
+                                account_claim_path.display()
+                            ))
+                        },
+                    )?;
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        std::fs::set_permissions(
+                            &account_claim_path,
+                            std::fs::Permissions::from_mode(0o600),
+                        )
+                        .map_err(|error| SidecarError::JwtConfig(error.to_string()))?;
+                    }
+                }
+                Err(error) => return Err(SidecarError::JwtConfig(error.to_string())),
+            }
+        }
 
         // Generate and write config.
         let config_path = nats_dir.join("server.conf");
@@ -358,18 +400,6 @@ fn generate_config(opts: &SidecarOptions, jetstream_dir: &Path) -> String {
                     "minga.>".into(),
                     "_INBOX.>".into(),
                 ],
-            );
-        }
-        let mut worker_ids = opts.worker_node_ids.clone();
-        worker_ids.sort_unstable();
-        worker_ids.dedup();
-        for node_id in worker_ids {
-            let (publish, subscribe) = minga_bus::subjects::worker_acl(node_id);
-            append_user(
-                &mut out,
-                &format!("minga-worker-{node_id}"),
-                &publish,
-                &subscribe,
             );
         }
         out.push_str("  ]\n}\n\n");
@@ -577,6 +607,11 @@ mod tests {
             jwt_auth: Some(NatsJwtAuth {
                 operator_jwt_file: PathBuf::from("/etc/minga/nats/operator.jwt"),
                 resolver_dir: PathBuf::from("/var/lib/minga/nats/resolver"),
+                account_jwt_file: PathBuf::from("/etc/minga/nats/account.jwt"),
+                account_seed_file: PathBuf::from("/etc/minga/nats/account.seed"),
+                tenant_signer_dir: PathBuf::from("/etc/minga/nats/signers"),
+                account_public_key: "A".to_string(),
+                system_credentials_file: PathBuf::from("/etc/minga/nats/sys.creds"),
             }),
             tls: Some(ServerTls {
                 cert_file: PathBuf::from("/etc/minga/tls/server-cert.pem"),
@@ -603,6 +638,11 @@ mod tests {
             jwt_auth: Some(NatsJwtAuth {
                 operator_jwt_file: PathBuf::from("/operator.jwt"),
                 resolver_dir: PathBuf::from("/resolver"),
+                account_jwt_file: PathBuf::from("/account.jwt"),
+                account_seed_file: PathBuf::from("/account.seed"),
+                tenant_signer_dir: PathBuf::from("/signers"),
+                account_public_key: "A".to_string(),
+                system_credentials_file: PathBuf::from("/sys.creds"),
             }),
             ..SidecarOptions::default()
         };
@@ -613,11 +653,10 @@ mod tests {
     }
 
     #[test]
-    fn worker_certificate_gets_node_scoped_key_value_permissions() {
+    fn certificate_mapping_does_not_create_static_worker_users() {
         let opts = SidecarOptions {
             node_id: 1,
             manager_node_ids: vec![2],
-            worker_node_ids: vec![7],
             tls: Some(ServerTls {
                 cert_file: PathBuf::from("/etc/minga/tls/server-cert.pem"),
                 key_file: PathBuf::from("/etc/minga/tls/server-key.pem"),
@@ -628,30 +667,8 @@ mod tests {
             ..SidecarOptions::default()
         };
         let config = generate_config(&opts, Path::new("/var/lib/minga/nats/jetstream"));
-
         assert!(config.contains("user: \"minga-manager-2\""));
-        assert!(config.contains("\"$JS.FC.>\""));
-        assert!(config.contains("user: \"minga-worker-7\""));
-        assert!(config.contains("\"$KV.MINGA_STATUS.node.7.task.>\""));
-        assert!(config.contains("\"$KV.MINGA_ASSIGN.node.7.task.>\""));
-        assert!(config.contains("\"$KV.MINGA_ASSIGN.node.7.wg\""));
-        assert!(config
-            .contains("\"$JS.API.CONSUMER.CREATE.KV_MINGA_ASSIGN.*.$KV.MINGA_ASSIGN.node.7.wg\""));
-        assert!(!config
-            .contains("$JS.API.CONSUMER.CREATE.KV_MINGA_ASSIGN.*.$KV.MINGA_ASSIGN.node.8.wg"));
-        assert!(!config.contains("\"$JS.API.KV.GET.KV_MINGA_ASSIGN.node.7.wg\""));
-        assert!(
-            !config.contains("\"$JS.API.DIRECT.GET.KV_MINGA_ASSIGN.$KV.MINGA_ASSIGN.node.7.wg\"")
-        );
-        assert!(config
-            .contains("\"$JS.API.DIRECT.GET.KV_MINGA_ASSIGN.$KV.MINGA_ASSIGN.node.7.task.>\""));
-        assert!(config
-            .contains("\"$JS.API.DIRECT.GET.KV_MINGA_STATUS.$KV.MINGA_STATUS.node.7.task.>\""));
-        assert!(!config.contains("\"$JS.API.DIRECT.GET.KV_MINGA_STATUS.$KV.MINGA_STATUS.node.8"));
-        assert!(!config.contains("\"$JS.API.DIRECT.GET.KV_MINGA_ASSIGN.$KV.MINGA_ASSIGN.node.8"));
-        assert!(!config.contains("\"$KV.MINGA_ASSIGN.node.8"));
-        assert!(!config.contains("\"$KV.MINGA_ASSIGN.node.8.wg\""));
-        assert!(!config.contains("\"$KV.MINGA_STATUS.node.8"));
+        assert!(!config.contains("minga-worker-"));
     }
 
     #[test]
@@ -799,6 +816,7 @@ mod tests {
         .unwrap();
         let mut raft_stores = vec![raft1, raft2, raft3];
         let sample_service = |id: &str| Service {
+            is_job: false,
             id: id.to_string(),
             tenant_id: "default".to_string(),
             name: id.to_string(),

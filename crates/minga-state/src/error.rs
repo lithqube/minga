@@ -41,6 +41,9 @@ pub enum StateError {
     /// never says whose, so it cannot be used to probe other tenants.
     #[error("name is already in use")]
     NameInUse,
+    /// A tenant resource limit rejected a desired-state write.
+    #[error("tenant quota exceeded: {0}")]
+    QuotaExceeded(String),
     /// A portable snapshot this build cannot read.
     #[error("{0}")]
     BadSnapshot(String),

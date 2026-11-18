@@ -16,15 +16,16 @@
 //! # Subject namespace
 //!
 //! ```text
-//! minga.node.{id}.status      JetStream   node status events
-//! minga.node.{id}.event       JetStream   node lifecycle events
-//! minga.task.{id}.status      JetStream   task lifecycle events
-//! minga.task.{id}.event       JetStream   task lifecycle events
-//! minga.log.node.{id}.{task}  JetStream   container log chunks
-//! KV_MINGA_ASSIGN             KV          manager-authored task/WireGuard assignments and network metadata
-//! KV_MINGA_LEASES             KV          node liveness leases
-//! minga.ctl.node.{id}.ping    core NATS   synchronous health probe [req/reply]
-//! minga.ctl.node.{id}.drain   core NATS   synchronous drain [req/reply]
+//! minga.<tenant>.node.{id}.status     JetStream   manager-owned node status events
+//! minga.<tenant>.node.{id}.event      JetStream   node lifecycle events
+//! minga.<tenant>.task.{id}.status     JetStream   manager-owned task status events
+//! minga.<tenant>.task.{id}.event      JetStream   task lifecycle events
+//! minga.<tenant>.log.node.{id}.{task} JetStream   container log chunks
+//! $KV.MINGA_ASSIGN.<tenant>.node.{id}.> KV         manager-authored assignments
+//! $KV.MINGA_LEASES.<tenant>.lease.node.{id} KV     node liveness leases
+//! $KV.MINGA_STATUS_<tenant>.node.{id}.task.{task} KV actual task status
+//! minga.<tenant>.ctl.node.{id}.ping   core NATS   health probe [req/reply]
+//! minga.<tenant>.ctl.node.{id}.drain  core NATS   drain request [req/reply]
 //! ```
 //!
 //!
@@ -308,6 +309,16 @@ impl NodeStatusReport {
     }
 }
 
+/// A bounded metadata-only audit record. Payloads and secret values do not belong here.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AuditRecord {
+    pub tenant_id: String,
+    pub actor: String,
+    pub action: String,
+    pub resource_path: String,
+    pub occurred_at_unix: u64,
+}
+
 // ---------------------------------------------------------------------------
 // Trait
 // ---------------------------------------------------------------------------
@@ -325,6 +336,21 @@ pub trait EventBus: Send + Sync {
     /// Subscribe to events matching any of the given subject patterns.
     /// Patterns support `*` (one token) and `>` (many tokens) wildcards.
     async fn subscribe_events(&self, patterns: &[&str]) -> Result<EventStream>;
+    async fn append_audit(&self, record: AuditRecord) -> Result<()>;
+    async fn list_audit(&self, tenant_id: &str, limit: usize) -> Result<Vec<AuditRecord>>;
+    async fn publish_tenant_event(
+        &self,
+        tenant_id: &str,
+        subject: &str,
+        payload: &[u8],
+    ) -> Result<()>;
+    async fn subscribe_tenant_events(&self, tenant_id: &str) -> Result<EventStream>;
+    async fn configure_tenant_quota(
+        &self,
+        tenant_id: &str,
+        quotas: &minga_state::types::TenantQuotas,
+    ) -> Result<()>;
+
     async fn put_assignment(&self, key: &str, value: &[u8]) -> Result<()>;
     async fn get_assignment(&self, key: &str) -> Result<Option<Vec<u8>>>;
     async fn list_assignments(&self, prefix: &str) -> Result<Vec<(String, Vec<u8>)>>;
@@ -347,21 +373,50 @@ pub trait EventBus: Send + Sync {
 
     /// Watch for changes to any status key.
     async fn watch_status(&self) -> Result<KvStream>;
+    /// Tenant-scoped status API. Workers are restricted to their authenticated tenant.
+    async fn put_tenant_status(&self, tenant_id: &str, key: &str, value: &[u8]) -> Result<()>;
+    async fn get_tenant_status(&self, tenant_id: &str, key: &str) -> Result<Option<Vec<u8>>>;
+    async fn list_tenant_status(&self, tenant_id: &str) -> Result<Vec<(String, Vec<u8>)>>;
+    async fn list_all_tenant_status(
+        &self,
+        tenant_ids: &[String],
+    ) -> Result<Vec<(String, String, Vec<u8>)>>;
 
     // -- Liveness (server-expiring leases) -----------------------------------
 
     /// Refresh a node lease, carrying the node's registration payload.
     async fn refresh_lease(&self, node_id: u64, registration: &[u8]) -> Result<()>;
+    /// Refresh a lease scoped to a tenant and node.
+    async fn refresh_tenant_lease(
+        &self,
+        tenant_id: &str,
+        node_id: u64,
+        registration: &[u8],
+    ) -> Result<()> {
+        let _ = tenant_id;
+        self.refresh_lease(node_id, registration).await
+    }
 
-    /// Check whether a node's lease key exists.
+    /// Check whether a node's lease exists in the specified tenant.
     async fn is_alive(&self, node_id: u64) -> Result<bool>;
+    async fn is_tenant_node_alive(&self, tenant_id: &str, node_id: u64) -> Result<bool> {
+        let _ = tenant_id;
+        self.is_alive(node_id).await
+    }
 
-    /// Return the node IDs whose lease keys currently exist.
+    /// Return all live node IDs (legacy default-tenant view).
     async fn list_alive_nodes(&self) -> Result<HashSet<u64>>;
+    async fn list_tenant_alive_nodes(&self) -> Result<HashSet<(String, u64)>> {
+        Ok(self
+            .list_alive_nodes()
+            .await?
+            .into_iter()
+            .map(|node_id| (minga_state::types::DEFAULT_TENANT_ID.to_owned(), node_id))
+            .collect())
+    }
 
     /// Watch lease changes, including the current lease entries.
     async fn watch_leases(&self) -> Result<KvStream>;
-
     // -- Request / Reply (synchronous control) -------------------------------
 
     /// Send a request and wait for a reply, with a timeout.
@@ -370,6 +425,19 @@ pub trait EventBus: Send + Sync {
     /// Subscribe to requests on a subject. Returns a stream of incoming requests.
     async fn subscribe_requests(&self, subject: &str) -> Result<RequestStream>;
 
+    /// Push a signed NATS account JWT to the full account resolver.
+    ///
+    /// The manager must authenticate through its configured SYS-account
+    /// connection. An absent resolver acknowledgement is an error.
+    async fn update_account_claim(&self, account_jwt: &str) -> Result<()>;
+
+    /// Atomically admit one API request in a tenant's shared rate window.
+    async fn check_tenant_request_quota(
+        &self,
+        tenant_id: &str,
+        window_start: u64,
+        limit: u64,
+    ) -> Result<bool>;
     /// Send a reply to a request.
     async fn reply(&self, reply_subject: &str, payload: &[u8]) -> Result<()>;
 
@@ -380,12 +448,21 @@ pub trait EventBus: Send + Sync {
     /// Publish a log entry with its originating node ID. Worker clients are
     /// restricted to their own node; managers publish on behalf of workers.
     async fn publish_node_log(&self, node_id: u64, task_id: &str, entry: &LogEntry) -> Result<()>;
+    async fn publish_tenant_node_log(
+        &self,
+        tenant_id: &str,
+        node_id: u64,
+        task_id: &str,
+        entry: &LogEntry,
+    ) -> Result<()>;
 
     /// Subscribe to log entries published **after** this call.
     ///
     /// This is a live tail: it does not replay previously published entries.
     /// Use [`EventBus::log_history`] to read the retained backlog.
     async fn subscribe_logs(&self, task_id: &str) -> Result<LogEventStream>;
+    async fn subscribe_tenant_logs(&self, tenant_id: &str, task_id: &str)
+        -> Result<LogEventStream>;
 
     /// Returns up to `tail` of the most recently published log entries for a
     /// task (or for `*`, across all tasks), oldest first.
@@ -393,6 +470,12 @@ pub trait EventBus: Send + Sync {
     /// `tail == 0` means "all retained entries", bounded by the transport's
     /// retention limits.
     async fn log_history(&self, task_id: &str, tail: usize) -> Result<Vec<LogEntry>>;
+    async fn tenant_log_history(
+        &self,
+        tenant_id: &str,
+        task_id: &str,
+        tail: usize,
+    ) -> Result<Vec<LogEntry>>;
 }
 
 // ---------------------------------------------------------------------------

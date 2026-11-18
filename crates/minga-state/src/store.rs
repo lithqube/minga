@@ -67,6 +67,13 @@ fn membership_error(e: RaftError<NodeId, ClientWriteError<NodeId, BasicNode>>) -
         None => StateError::Raft(e.to_string()),
     }
 }
+fn command_error(message: String) -> StateError {
+    if let Some(quota) = message.strip_prefix("tenant quota exceeded: ") {
+        StateError::QuotaExceeded(quota.to_owned())
+    } else {
+        StateError::Raft(message)
+    }
+}
 
 impl StateStore {
     /// Opens or creates a state store.
@@ -255,6 +262,7 @@ impl StateStore {
         };
         if initialized {
             let default_tenant = Tenant {
+                nats_revoked_user_public_keys: Vec::new(),
                 id: DEFAULT_TENANT_ID.to_owned(),
                 name: DEFAULT_TENANT_ID.to_owned(),
                 quotas: TenantQuotas::default(),
@@ -519,6 +527,7 @@ impl StateStore {
     ) -> Result<(), StateError> {
         let id = id.as_ref().to_owned();
         let tenant = Tenant {
+            nats_revoked_user_public_keys: Vec::new(),
             id: id.clone(),
             name,
             quotas,
@@ -539,6 +548,22 @@ impl StateStore {
             StateResponse::NotFound => Err(StateError::NotFound(id)),
             StateResponse::Conflict(message) => Err(StateError::Conflict(message)),
             StateResponse::Error(message) => Err(StateError::Raft(message)),
+        }
+    }
+    /// Records a revoked node NKey in permanent cluster state.
+    pub async fn record_nats_user_revocation(
+        &self,
+        user_public_key: String,
+    ) -> Result<(), StateError> {
+        match self
+            .propose(StateCommand::RecordNatsUserRevocation { user_public_key })
+            .await?
+        {
+            StateResponse::Ok => Ok(()),
+            StateResponse::NotFound => Err(StateError::NotFound("default tenant".into())),
+            StateResponse::Conflict(message) | StateResponse::Error(message) => {
+                Err(StateError::Raft(message))
+            }
         }
     }
 
@@ -575,12 +600,32 @@ impl StateStore {
         self.propose(StateCommand::RemoveNode(id)).await?;
         Ok(())
     }
+    /// Stores only the public NATS user identity used for account revocation.
+    pub async fn set_node_nats_user_public_key(
+        &self,
+        id: NodeId,
+        public_key: Option<String>,
+    ) -> Result<(), StateError> {
+        match self
+            .propose(StateCommand::SetNodeNatsUserPublicKey { id, public_key })
+            .await?
+        {
+            StateResponse::Ok => Ok(()),
+            StateResponse::NotFound => Err(StateError::NotFound(format!("node {id}"))),
+            StateResponse::Error(message) => Err(command_error(message)),
+            StateResponse::Conflict(_) => Err(StateError::NameInUse),
+        }
+    }
 
     pub async fn upsert_service(&self, service: Service) -> Result<(), StateError> {
         match self.propose(StateCommand::UpsertService(service)).await? {
+            StateResponse::Ok => Ok(()),
             StateResponse::Conflict(_) => Err(StateError::NameInUse),
-            StateResponse::Error(conflict) => Err(StateError::PortConflict(conflict)),
-            _ => Ok(()),
+            StateResponse::Error(message) if message.starts_with("tenant quota exceeded: ") => {
+                Err(command_error(message))
+            }
+            StateResponse::Error(message) => Err(StateError::PortConflict(message)),
+            StateResponse::NotFound => Err(StateError::NotFound("service".into())),
         }
     }
 
@@ -590,8 +635,12 @@ impl StateStore {
     }
 
     pub async fn upsert_task(&self, task: Task) -> Result<(), StateError> {
-        self.propose(StateCommand::UpsertTask(task)).await?;
-        Ok(())
+        match self.propose(StateCommand::UpsertTask(task)).await? {
+            StateResponse::Ok => Ok(()),
+            StateResponse::Conflict(_) => Err(StateError::NameInUse),
+            StateResponse::Error(message) => Err(command_error(message)),
+            StateResponse::NotFound => Err(StateError::NotFound("task".into())),
+        }
     }
 
     pub async fn remove_task(&self, id: TaskId) -> Result<(), StateError> {
@@ -601,8 +650,10 @@ impl StateStore {
 
     pub async fn upsert_network(&self, network: Network) -> Result<(), StateError> {
         match self.propose(StateCommand::UpsertNetwork(network)).await? {
+            StateResponse::Ok => Ok(()),
             StateResponse::Conflict(_) => Err(StateError::NameInUse),
-            _ => Ok(()),
+            StateResponse::Error(message) => Err(command_error(message)),
+            StateResponse::NotFound => Err(StateError::NotFound("network".into())),
         }
     }
 
@@ -612,10 +663,13 @@ impl StateStore {
     }
 
     pub async fn upsert_volume(&self, volume: Volume) -> Result<(), StateError> {
-        self.propose(StateCommand::UpsertVolume(volume)).await?;
-        Ok(())
+        match self.propose(StateCommand::UpsertVolume(volume)).await? {
+            StateResponse::Ok => Ok(()),
+            StateResponse::Conflict(_) => Err(StateError::NameInUse),
+            StateResponse::Error(message) => Err(command_error(message)),
+            StateResponse::NotFound => Err(StateError::NotFound("volume".into())),
+        }
     }
-
     pub async fn remove_volume(&self, id: VolumeId) -> Result<(), StateError> {
         self.propose(StateCommand::RemoveVolume(id)).await?;
         Ok(())
@@ -623,8 +677,10 @@ impl StateStore {
 
     pub async fn upsert_secret(&self, secret: Secret) -> Result<(), StateError> {
         match self.propose(StateCommand::UpsertSecret(secret)).await? {
+            StateResponse::Ok => Ok(()),
             StateResponse::Conflict(_) => Err(StateError::NameInUse),
-            _ => Ok(()),
+            StateResponse::Error(message) => Err(command_error(message)),
+            StateResponse::NotFound => Err(StateError::NotFound("secret".into())),
         }
     }
 
@@ -635,8 +691,10 @@ impl StateStore {
 
     pub async fn upsert_config(&self, config: StateConfig) -> Result<(), StateError> {
         match self.propose(StateCommand::UpsertConfig(config)).await? {
+            StateResponse::Ok => Ok(()),
             StateResponse::Conflict(_) => Err(StateError::NameInUse),
-            _ => Ok(()),
+            StateResponse::Error(message) => Err(command_error(message)),
+            StateResponse::NotFound => Err(StateError::NotFound("config".into())),
         }
     }
 
@@ -778,12 +836,14 @@ impl StateStore {
         let want = crate::codec::FORMAT_VERSION;
         match snapshot.format_version {
             crate::codec::FORMAT_VERSION
+            | crate::codec::V6_FORMAT_VERSION
+            | crate::codec::V7_FORMAT_VERSION
             | crate::codec::V5_FORMAT_VERSION
             | crate::codec::V4_FORMAT_VERSION
             | crate::codec::V3_FORMAT_VERSION
             | crate::codec::V2_FORMAT_VERSION => {
-                // Legacy resource fields default to `default`; the v6 node
-                // tenant field also defaults to `default` when absent.
+                // Legacy resource fields default to `default`; node records
+                // are not included in portable snapshots.
             }
             found => {
                 return Err(StateError::BadSnapshot(format!(
@@ -805,6 +865,7 @@ impl StateStore {
         let mut tenants = snapshot.tenants;
         if !tenants.iter().any(|tenant| tenant.id == DEFAULT_TENANT_ID) {
             tenants.push(Tenant {
+                nats_revoked_user_public_keys: Vec::new(),
                 id: DEFAULT_TENANT_ID.to_string(),
                 name: DEFAULT_TENANT_ID.to_string(),
                 quotas: TenantQuotas::default(),

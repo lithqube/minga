@@ -37,6 +37,7 @@ async fn store() -> (Arc<StateStore>, tempfile::TempDir) {
 fn identity(id: u64) -> NodeIdentity {
     NodeIdentity {
         node_id: id,
+        tenant_id: "default".into(),
         address: format!("127.0.0.1:{}", 50051 + id),
         labels: Default::default(),
         capacity: ResourceSpec {
@@ -116,7 +117,12 @@ async fn docker_api_service_creation_lands_in_raft() {
     let (membership, registration) = register_node(store.clone(), bus.clone(), identity(1)).await;
 
     let ready_state = Arc::new(minga_telemetry::ReadyState::new());
-    let router = minga_api::build_router(store.clone(), ready_state);
+    let router = minga_api::server::build_router_with_bus_and_auth(
+        store.clone(),
+        bus.clone(),
+        ready_state,
+        None,
+    );
 
     let status = post_service(router, service_spec("probe_web", "nginx:1.27", 2)).await;
     assert_eq!(status, 201, "the API should accept a valid service spec");
@@ -143,7 +149,12 @@ async fn service_creation_fails_loudly_when_no_node_is_registered() {
     let (store, _dir) = store().await;
 
     let ready_state = Arc::new(minga_telemetry::ReadyState::new());
-    let router = minga_api::build_router(store.clone(), ready_state);
+    let router = minga_api::server::build_router_with_bus_and_auth(
+        store.clone(),
+        MemoryBus::new(),
+        ready_state,
+        None,
+    );
 
     // Nobody registered: the cluster has zero nodes. The deploy must be a
     // hard failure, not a silent success with nothing running.
@@ -168,7 +179,12 @@ async fn a_registered_node_lets_the_service_run_end_to_end() {
     assert_eq!(store.list_nodes().await.unwrap().len(), 1);
 
     let ready_state = Arc::new(minga_telemetry::ReadyState::new());
-    let router = minga_api::build_router(store.clone(), ready_state);
+    let router = minga_api::server::build_router_with_bus_and_auth(
+        store.clone(),
+        bus.clone(),
+        ready_state,
+        None,
+    );
     let status = post_service(router, service_spec("probe_web", "nginx:1.27", 2)).await;
     assert_eq!(status, 201);
 
@@ -189,8 +205,12 @@ async fn a_registered_node_lets_the_service_run_end_to_end() {
 
     // The supervisor then starts them.
     let runtime = Arc::new(minga_node::MockRuntime::new());
-    let supervisor =
-        minga_node::Supervisor::with_bus(runtime.clone() as Arc<dyn minga_node::Runtime>, bus, 1);
+    let supervisor = minga_node::Supervisor::with_tenant_bus(
+        runtime.clone() as Arc<dyn minga_node::Runtime>,
+        bus,
+        1,
+        "default",
+    );
     let supervisor_actions = supervisor.reconcile_once().await.unwrap();
     assert_eq!(supervisor_actions, 2);
     assert_eq!(

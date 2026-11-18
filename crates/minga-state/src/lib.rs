@@ -34,6 +34,7 @@
 //!     tenant_id: "default".to_string(),
 //!     last_seen_unix: None,
 //!     role: Default::default(),
+//!     nats_user_public_key: None,
 //!     reserved_ports: vec![],
 //! }).await?;
 //!

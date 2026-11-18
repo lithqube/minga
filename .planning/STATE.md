@@ -15,7 +15,7 @@
   - **CI:** new job `NATS store upgrade 2.10.22 to 2.15.3`, which runs both modes on linux-amd64 with checksum-verified binaries.
 - **Follow-up (2026-11-17):** PRs #87, #88, #89 and #90 are all merged, so the 2.15.3 release gate is lifted. The NATS matrix and the fail-closed suites run in CI against 2.14.10 and 2.15.3, and the store-upgrade job runs on every push. Local verification passed: `cargo fmt --all --check`, `cargo clippy --all-targets -- -D warnings`, and `cargo test --workspace` (940 passed, 4 ignored) against NATS 2.15.3.
 
-**Current:** Phase 15 (tenant isolation, ADR 0008) T3 implementation is in progress. Tenant placement, manager workload exclusion and tenant-scoped WireGuard projections are implemented. Tenant-bound worker enrollment now uses operator-issued, 15-minute HMAC join tokens and a joined-tenant marker in JetStream. All managers need the same owner-only signing key; each worker still needs node-scoped NATS permissions. T3 end-to-end proof remains open. T1 and T2 are merged (PRs #92, #93, #94); Phase 14 is complete (PRs #87–#90). Phase 13 is code-complete through 13-06; only its 13-07 live proof is open. Phase 12 Managers-only Raft is complete (PR #76).
+**Current:** Phase 15 T1–T5 implementation is complete in the working tree. Focused local package tests and clippy pass; no VM tests were run. T3 end-to-end tenant-isolation proof remains open and deferred until release readiness. Phase 13 is code-complete through 13-06; defer 13-07 multi-VM proof and iperf3 measurements until release readiness, and keep cross-node networking marked unsupported until then. Phase 14 (PRs #87–#90) and Phase 12 (PR #76) are complete.
 
 **Phase 15 tenant isolation (ADR 0008 T1–T2, 2026-11-17):**
 
@@ -23,9 +23,11 @@
 - **T2 (PR #94):** `minga tls issue-client` issues client-auth certificates with caller (`CN`), role (`OU`) and tenant (`O`), and a manager can require API mTLS with a dedicated client CA. Tenant-scoped Docker routes and their nested responses filter by tenant, so a foreign service, network, secret or config returns 404 rather than 403. Tenant CRUD, node inventory, cluster info and cluster health or metrics routes need a cluster operator (`O=*` or the configured API token), and `O=*` gets no tenant workload access. A certificate without `O` maps to `default` only while `default` is the sole tenant; the same holds for a bearer token.
 - **Verification:** `cargo fmt --all`, `cargo clippy --all-targets -- -D warnings` and `cargo test` (955 passed, 4 ignored) locally, and the full CI matrix on the merged commit: fmt/clippy/workspace tests, lint and build, daemon-backed tests, overlay paths on a real kernel, the NATS 2.14.10 and 2.15.3 suites, and the 2.10.22 → 2.15.3 store upgrade.
 - **Two CI failures were stale test contracts, not product defects:** `docker node ls` and `docker info` had asserted that an anonymous client may read them, and both now require an operator identity. The tests assert the refusal instead.
-- **Not done:** T3 end-to-end verification, including proving tenant B cannot place on tenant A's node; T4 (tenant segments in subjects and keys, per-tenant streams and ACL, operator/JWT mode) and T5 (quotas and the per-tenant audit trail).
+- **Not done:** T3 end-to-end verification that tenant B cannot place on tenant A's node; this remains deferred until release readiness, with no VM tests during Phase 15.
+- T4 tenant-scoped bus isolation and T5 quotas/audit are implemented and locally verified; worker bus authorization, tenant enrollment, quota accounting and audited API writes have focused regression coverage.
+- **T4-adjacent security fix:** Cross-tenant ingress port conflicts no longer disclose the owning service ID; same-tenant diagnostics remain specific. The focused state regression test passed.
 
-**Phase 15 T3 implementation (working tree, 2026-11-17):**
+**Phase 15 T3 implementation (merged PR #98, 2026-11-18):**
 
 - Scheduler placement hard-filters by tenant; reconcile excludes managers from tenant workload placement when multiple tenants exist; WireGuard peer and route projections are tenant-scoped.
 - Operator-only `POST /nodes` accepts an optional `tenant_id` so a node can be assigned before worker registration. Unknown tenants are rejected; omitted IDs remain `default`. Lease payloads cannot assign tenants, and renewal preserves an operator-assigned node tenant.
@@ -41,7 +43,7 @@
 - **T3 log limitation:** Stopping manager 3, which hosted the single-copy `MINGA_LOGS` stream, caused `minga logs` to hang. Restoring it restored reads. Logs remain RF1 by ADR 0002; manager quorum does not make this stream available.
 - **Bus authorization:** Live TLS NATS test `worker_certificate_cannot_write_assignments_or_other_nodes_status_and_leases` verifies own-assignment reads and denies foreign assignment writes, foreign status/lease writes and foreign-key reads.
 - **v1.2.0 migration:** Built and ran the actual v1.2.0 Linux binary with managers 1/2 and worker 99, then deployed `phase12-v120-live.legacy`. Current manager migration dry-run identified `{1,2,99}` → `{1}`; apply committed `[1]`. Service remained listed and its container task `phase12-v120-live.legacy.1.03948649` stayed RUNNING at containerd PID 1599. Replaced the old worker with the current JetStream worker using the same data directory; it adopted the existing container at PID 1599.
-- **T4 scope:** The live topology exercised managers-only Raft with two workers and a separate third-worker join. No 5,000-worker load test was run; cross-node container networking remains unsupported pending Phase 13.
+- This is real-kernel namespace evidence, not multi-VM deployment proof. Phase 13-07 T2/T3 live VM proof, iperf3 measurements and topology documentation remain open and are deferred until release readiness. Cross-node networking stays unsupported until that proof lands.
 - **Phase 12 delivery:** PR #76 merged to `main` after its Rust, site, daemon-backed and real-kernel CI checks passed.
 
 **Phase 13 13-02 evidence (2026-11-15):**
@@ -105,4 +107,4 @@ Waves 1–9 predate this GSD planning workspace and their claims were **not** in
 
 **10-01 host gate remains BLOCKED** by user choice: Talos staging is out of scope for `v0.1.0` and no hcloud provisioning is authorized. OrbStack Ubuntu is Linux evidence only. Do not advance Talos-dependent claims or compliance qualification — FIPS, SOC 2, VS-NfD and NATO are **not assessed**, which is different from not applicable.
 
-- **Immediate next action:** Finish the focused tenant-enrollment tests and prove tenant B cannot place on tenant A's node. T4 needs tenant-scoped NATS subjects, streams and ACLs. In parallel, 13-07 needs a host with kernel WireGuard and `wg` tooling for the live proof and iperf3 numbers; keep cross-node networking unsupported until that proof lands. Talos/hcloud staging stays blocked pending authorization; compliance is not assessed.
+- **Immediate next action:** Proceed with Phase 15 T4: tenant-scoped NATS subjects and keys, per-tenant worker ACLs and streams/buckets, and scoped operator/JWT credentials. Keep T3 end-to-end verification open, but do not run VM tests until release readiness; defer Phase 13-07 live VM proof and iperf3 measurements to that release gate. Cross-node networking remains unsupported until then. Talos/hcloud staging remains blocked pending authorization; compliance is not assessed.

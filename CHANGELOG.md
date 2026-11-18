@@ -30,13 +30,18 @@
   a cluster operator (`O=*`, or the configured API token), and an `O=*`
   certificate gets no tenant workload access. A certificate without `O` maps
   to `default` only while `default` is the sole tenant.
-- Placement hard-filters nodes by tenant; managers stop hosting tenant
-  workloads once the cluster has multiple tenants. WireGuard peer and route
-  projections are tenant-scoped. Operators pre-register a node with
-  `tenant_id` through `POST /nodes` and mint a 15-minute node-bound join token
-  through `POST /minga/nodes/{id}/join-token`. Managers verify the token before
-  binding the lease to its tenant. NATS permissions must still restrict each
-  worker to its own lease key.
+- Tenant nodes carry `tenant_id` in their identity and use tenant-first NATS
+  subjects, lease and assignment keys. Worker credentials are scoped to one
+  tenant and node; workers cannot publish shared lifecycle events or audit
+  records. Per-tenant status, logs and audit streams are isolated from
+  manager-only shared assignments and events.
+- NATS operator/JWT mode uses tenant-scoped signing keys. Removed worker users
+  are revoked in the account claim, and revoked public keys persist in Raft
+  tenant state (format v8 migration).
+- Tenant JetStream byte and age quotas apply to each tenant's logs, audit,
+  status, usage and budget resources. Tenant audit is available at
+  `/v{version}/audit`; cluster operators can read active tenants at
+  `/minga/audit`.
 
 
 - Existing Compose stacks with short-syntax ports now publish on every node

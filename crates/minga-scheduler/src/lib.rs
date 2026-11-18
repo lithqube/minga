@@ -156,6 +156,8 @@ impl Scheduler {
             .scheduler_reconcile_duration_seconds
             .start_timer();
 
+        let services = self.state.list_services().await?;
+        let mut tasks = self.state.list_tasks().await?;
         let mut nodes = self.state.list_nodes().await?;
         if let Some(bus) = &self.bus {
             let live_nodes = match bus.list_alive_nodes().await {
@@ -199,10 +201,10 @@ impl Scheduler {
             nodes.retain(|node| live_nodes.contains(&node.id));
         }
         validate_manager_endpoints(&nodes)?;
-        let services = self.state.list_services().await?;
-        let mut tasks = self.state.list_tasks().await?;
+        let tenants = self.state.list_tenants().await?;
+        let tenant_ids: Vec<_> = tenants.iter().map(|tenant| tenant.id.clone()).collect();
         if let Some(bus) = &self.bus {
-            let (statuses, joined) = match read_task_statuses(bus.as_ref()).await {
+            let (statuses, joined) = match read_task_statuses(bus.as_ref(), &tenant_ids).await {
                 Ok(statuses) => statuses,
                 Err(error) => {
                     tracing::warn!(error = %error, "cannot read task status; skipping reconciliation");
@@ -220,7 +222,6 @@ impl Scheduler {
         let mut networks = self.state.list_networks().await?;
         self.fill_subnets(&mut networks, &tasks).await?;
 
-        let tenants = self.state.list_tenants().await?;
         let placement_nodes: Vec<_> = nodes
             .iter()
             .filter(|node| tenants.len() < 2 || node.role != NodeRole::Manager)
@@ -294,7 +295,9 @@ impl Scheduler {
         let services = self.state.list_services().await?;
         // Stored task state lags the nodes' reports; without the overlay a
         // replica reported Failed would stay an ingress backend.
-        let (statuses, _) = match read_task_statuses(bus.as_ref()).await {
+        let tenants = self.state.list_tenants().await?;
+        let tenant_ids: Vec<_> = tenants.iter().map(|tenant| tenant.id.clone()).collect();
+        let (statuses, _) = match read_task_statuses(bus.as_ref(), &tenant_ids).await {
             Ok(statuses) => statuses,
             Err(error) => {
                 tracing::warn!(error = %error, "cannot read task status; skipping projection");
@@ -349,7 +352,7 @@ impl Scheduler {
                 spec: task.spec.clone(),
                 networks: task_networks,
             };
-            let key = subjects::kv_assignment_task(task.node_id, &task.id);
+            let key = subjects::kv_assignment_task(&task.tenant_id, task.node_id, &task.id);
             let value = minga_state::codec::encode_wire(&assignment)
                 .map_err(|error| SchedulerError::Serialization(error.to_string()))?;
             bus.put_assignment(&key, &value)
@@ -426,7 +429,8 @@ impl Scheduler {
                             .to_string(),
                     ),
                 };
-                let key = subjects::kv_assignment_ingress(node.id, *published, protocol);
+                let key =
+                    subjects::kv_assignment_ingress(&node.tenant_id, node.id, *published, protocol);
                 let value = minga_state::codec::encode_wire(&assignment)
                     .map_err(|error| SchedulerError::Serialization(error.to_string()))?;
                 bus.put_assignment(&key, &value)
@@ -449,7 +453,7 @@ impl Scheduler {
             })
             .map_err(|error| SchedulerError::Serialization(error.to_string()))?;
             for node_id in task_nodes {
-                let key = subjects::kv_assignment_network(node_id, &network.id);
+                let key = subjects::kv_assignment_network(&network.tenant_id, node_id, &network.id);
                 desired.insert(key.clone());
                 bus.put_assignment(&key, &value)
                     .await
@@ -458,7 +462,7 @@ impl Scheduler {
         }
         let peer_sets = build_wireguard_peer_sets(nodes, &tasks, &networks)?;
         for node in nodes {
-            let key = format!("node.{}.wg", node.id);
+            let key = format!("{}.node.{}.wg", node.tenant_id, node.id);
             let value = minga_state::codec::encode_wire(
                 peer_sets
                     .get(&node.id)
@@ -557,25 +561,26 @@ fn validate_manager_endpoints(nodes: &[ClusterNode]) -> Result<(), SchedulerErro
 /// Task status reports, plus each node's joined tenant from the same listing.
 async fn read_task_statuses(
     bus: &dyn EventBus,
-) -> minga_bus::Result<(HashMap<String, TaskStatusReport>, HashMap<u64, String>)> {
+    tenant_ids: &[String],
+) -> minga_bus::Result<(
+    HashMap<(String, String), TaskStatusReport>,
+    HashMap<u64, String>,
+)> {
     let mut statuses = HashMap::new();
     let mut joined = HashMap::new();
-    for (key, bytes) in bus.list_status().await? {
+    for (tenant_id, key, bytes) in bus.list_all_tenant_status(tenant_ids).await? {
         if let Some(node_id) = key
             .strip_prefix(subjects::NODE_JOIN_PREFIX)
-            .and_then(|id| id.parse().ok())
+            .and_then(|id| id.parse::<u64>().ok())
         {
-            if let Ok(tenant_id) = String::from_utf8(bytes) {
-                joined.insert(node_id, tenant_id);
+            if std::str::from_utf8(&bytes).ok() == Some(tenant_id.as_str()) {
+                joined.insert(node_id, tenant_id.clone());
             }
-            continue;
-        }
-        if !key.starts_with("node.") || !key.contains(".task.") {
             continue;
         }
         match TaskStatusReport::from_bytes(&bytes) {
             Ok(report) if key == subjects::kv_node_task_status(report.node_id, &report.task_id) => {
-                statuses.insert(report.task_id.clone(), report);
+                statuses.insert((tenant_id, report.task_id.clone()), report);
             }
             Ok(_) => {}
             Err(error) => tracing::warn!(key, error = %error, "cannot decode task status"),
@@ -586,12 +591,12 @@ async fn read_task_statuses(
 
 fn overlay_task_statuses(
     tasks: Vec<Task>,
-    statuses: &HashMap<String, TaskStatusReport>,
+    statuses: &HashMap<(String, String), TaskStatusReport>,
 ) -> Vec<Task> {
     tasks
         .into_iter()
         .map(|task| {
-            let status = statuses.get(&task.id);
+            let status = statuses.get(&(task.tenant_id.clone(), task.id.clone()));
             task_with_actual_status(task, status)
         })
         .collect()

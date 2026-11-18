@@ -15,6 +15,9 @@ chrono.workspace = true
 minga-net = { path = "../minga-net" }
 minga-scheduler = { path = "../minga-scheduler" }
 minga-state = { path = "../minga-state" }
+nats-jwt-rs.workspace = true
+nkeys.workspace = true
+indexmap.workspace = true
 minga-telemetry = { path = "../minga-telemetry" }
 rustls.workspace = true
 rustls-pemfile.workspace = true
