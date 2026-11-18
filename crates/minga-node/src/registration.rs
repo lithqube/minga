@@ -523,6 +523,16 @@ async fn queue_node_registration_with_join(
         (minga_state::types::DEFAULT_TENANT_ID.to_owned(), None)
     };
     let already_joined = joined_tenant.is_some();
+    // After the node record committed, the deadline was cleared; a renewal
+    // replacing the entry must not restore it while the status writes retry.
+    let token_expires_at = match pending.get(&node_id) {
+        Some(previous)
+            if previous.token_expires_at.is_none() && previous.tenant_id == tenant_id =>
+        {
+            None
+        }
+        _ => token_expires_at,
+    };
 
     match stored {
         Some(node) => {
@@ -617,6 +627,13 @@ async fn register_pending_nodes_with_join(
                         continue;
                     }
                 }
+            }
+            Ok(None) if tenant_id != minga_state::types::DEFAULT_TENANT_ID => {
+                // Tokens are accepted only for an existing record, so the
+                // node was deleted after queueing; do not recreate it.
+                tracing::warn!(node_id, "node was removed before its join committed");
+                pending.remove(&node_id);
+                continue;
             }
             Ok(None) => {
                 if let Err(error) = store
@@ -1359,6 +1376,85 @@ mod tests {
         .await;
         assert!(pending.is_empty());
         assert!(store.get_node(3).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn node_deleted_between_queue_and_commit_is_not_recreated() {
+        let (store, _dir) = store().await;
+        wait_for_leader(&store).await;
+        create_tenant(&store, "acme").await;
+        preregister(&store, 1, "acme").await;
+        let key = JoinTokenKey::from_bytes(&[9; 32]).unwrap();
+        let bus = minga_bus::MemoryBus::with_lease_ttl(Duration::from_secs(5));
+        let mut stream = bus.watch_leases().await.unwrap();
+        let mut registered = load_registered_nodes(&store, bus.as_ref()).await.unwrap();
+        let mut pending = HashMap::new();
+        let mut joined = HashMap::new();
+
+        let event = publish(&bus, &mut stream, &with_token(1, &key, "acme")).await;
+        queue_node_registration_with_join(
+            &store,
+            event,
+            &mut registered,
+            &mut pending,
+            &joined,
+            Some(&key),
+        )
+        .await;
+        assert!(pending.contains_key(&1));
+        store.remove_node(1).await.unwrap();
+        register_pending_nodes_with_join(
+            &store,
+            bus.as_ref(),
+            &mut registered,
+            &mut pending,
+            &mut joined,
+        )
+        .await;
+
+        assert!(store.get_node(1).await.unwrap().is_none());
+        assert!(bus
+            .get_status(&joined_status_key(1))
+            .await
+            .unwrap()
+            .is_none());
+        assert!(pending.is_empty() && joined.is_empty());
+    }
+
+    #[tokio::test]
+    async fn renewal_keeps_a_cleared_deadline_after_the_node_committed() {
+        let (store, _dir) = store().await;
+        wait_for_leader(&store).await;
+        create_tenant(&store, "acme").await;
+        preregister(&store, 1, "acme").await;
+        let key = JoinTokenKey::from_bytes(&[9; 32]).unwrap();
+        let bus = minga_bus::MemoryBus::with_lease_ttl(Duration::from_secs(5));
+        let mut stream = bus.watch_leases().await.unwrap();
+        let mut registered = load_registered_nodes(&store, bus.as_ref()).await.unwrap();
+        // The node record committed and its status writes failed: the entry
+        // stays pending with its deadline cleared.
+        let mut pending = HashMap::from([(
+            1,
+            PendingRegistration {
+                identity: identity(1),
+                tenant_id: "acme".into(),
+                token_expires_at: None,
+            },
+        )]);
+
+        let mut renewed = with_token(1, &key, "acme");
+        renewed.wg_public_key = Some(KEY_B.into());
+        let event = publish(&bus, &mut stream, &renewed).await;
+        queue_node_registration_with_join(
+            &store,
+            event,
+            &mut registered,
+            &mut pending,
+            &HashMap::new(),
+            Some(&key),
+        )
+        .await;
+        assert_eq!(pending[&1].token_expires_at, None);
     }
 
     #[tokio::test]
