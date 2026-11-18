@@ -150,41 +150,10 @@ fn credentials_from_env() -> Result<Option<String>, ConnectError> {
 }
 
 fn read_credentials_file(path: &std::path::Path) -> Result<String, ConnectError> {
-    use std::io::Read;
-
-    let file = std::fs::File::open(path)
-        .map_err(|error| ConnectError::CredentialsFile(format!("{}: {error}", path.display())))?;
-    let metadata = file
-        .metadata()
-        .map_err(|error| ConnectError::CredentialsFile(format!("{}: {error}", path.display())))?;
-    if !metadata.is_file() {
-        return Err(ConnectError::CredentialsFile(format!(
-            "{} is not a regular file",
-            path.display()
-        )));
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = metadata.permissions().mode() & 0o777;
-        if mode & 0o077 != 0 {
-            return Err(ConnectError::CredentialsFile(format!(
-                "{} has insecure permissions {mode:o} (expected owner-only)",
-                path.display()
-            )));
-        }
-    }
-    let mut file = file.take(64 * 1024 + 1);
-    let mut contents = String::new();
-    file.read_to_string(&mut contents)
-        .map_err(|error| ConnectError::CredentialsFile(format!("{}: {error}", path.display())))?;
-    if contents.len() > 64 * 1024 {
-        return Err(ConnectError::CredentialsFile(format!(
-            "{} exceeds 64 KiB",
-            path.display()
-        )));
-    }
-    Ok(contents)
+    let bytes =
+        crate::read_owner_only_file(path, 64 * 1024).map_err(ConnectError::CredentialsFile)?;
+    String::from_utf8(bytes)
+        .map_err(|_| ConnectError::CredentialsFile(format!("{} is not UTF-8", path.display())))
 }
 
 /// Connect a worker with read-only assignment access and owner-scoped writes.

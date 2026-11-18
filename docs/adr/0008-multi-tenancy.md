@@ -141,8 +141,11 @@ Every plan, ADR and PR that adds state, an endpoint, a bus subject, a node-local
    `POST /nodes` pre-assigns a tenant; cluster operators can mint a 15-minute
    node-bound join token at `POST /minga/nodes/{id}/join-token`. Managers
    verify its HMAC, node ID and tenant before accepting a non-default lease,
-   then persist the joined tenant in JetStream so later renewals cannot change
-   it or require a live token. The same owner-only 32-byte signing key must be
+   and accept it only for an existing node record in the token's tenant, so
+   deleting the node revokes outstanding tokens. They then persist the joined
+   tenant in JetStream so later renewals cannot change it or require a live
+   token. Until that record exists, the scheduler gives a non-default node no
+   tasks and no WireGuard peers, even with a live lease. The same owner-only 32-byte signing key must be
    provisioned on every manager. This depends on node-scoped NATS permissions:
    certificate mapping or JWT user policy must restrict each client to its own
    lease key. T3 end-to-end verification remains open.

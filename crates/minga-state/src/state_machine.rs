@@ -148,7 +148,11 @@ fn tenant_has_resources(
     tenant_id: &str,
 ) -> Result<bool, StorageError<u64>> {
     Ok(
-        tenant_has_records::<Service>(tx, SERVICES_TABLE, tenant_id, |r, id| r.tenant_id == id)?
+        // Nodes too: a recreated tenant ID must not inherit the old tenant's nodes.
+        tenant_has_records::<ClusterNode>(tx, NODES_TABLE, tenant_id, |r, id| r.tenant_id == id)?
+            || tenant_has_records::<Service>(tx, SERVICES_TABLE, tenant_id, |r, id| {
+                r.tenant_id == id
+            })?
             || tenant_has_records::<Task>(tx, TASKS_TABLE, tenant_id, |r, id| r.tenant_id == id)?
             || tenant_has_records::<Network>(tx, NETWORKS_TABLE, tenant_id, |r, id| {
                 r.tenant_id == id

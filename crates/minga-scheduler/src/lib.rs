@@ -202,7 +202,7 @@ impl Scheduler {
         let services = self.state.list_services().await?;
         let mut tasks = self.state.list_tasks().await?;
         if let Some(bus) = &self.bus {
-            let statuses = match read_task_statuses(bus.as_ref()).await {
+            let (statuses, joined) = match read_task_statuses(bus.as_ref()).await {
                 Ok(statuses) => statuses,
                 Err(error) => {
                     tracing::warn!(error = %error, "cannot read task status; skipping reconciliation");
@@ -210,6 +210,12 @@ impl Scheduler {
                 }
             };
             tasks = overlay_task_statuses(tasks, &statuses);
+            // A live lease alone does not admit a non-default node: until a
+            // manager accepted its join token it gets no tasks and no peers.
+            nodes.retain(|node| {
+                node.tenant_id == minga_state::types::DEFAULT_TENANT_ID
+                    || joined.get(&node.id) == Some(&node.tenant_id)
+            });
         }
         let mut networks = self.state.list_networks().await?;
         self.fill_subnets(&mut networks, &tasks).await?;
@@ -288,7 +294,7 @@ impl Scheduler {
         let services = self.state.list_services().await?;
         // Stored task state lags the nodes' reports; without the overlay a
         // replica reported Failed would stay an ingress backend.
-        let statuses = match read_task_statuses(bus.as_ref()).await {
+        let (statuses, _) = match read_task_statuses(bus.as_ref()).await {
             Ok(statuses) => statuses,
             Err(error) => {
                 tracing::warn!(error = %error, "cannot read task status; skipping projection");
@@ -548,11 +554,22 @@ fn validate_manager_endpoints(nodes: &[ClusterNode]) -> Result<(), SchedulerErro
 
 /// Reads the nodes' task reports from MINGA_STATUS, keyed by task ID. A report
 /// whose key does not match its own node and task is ignored.
+/// Task status reports, plus each node's joined tenant from the same listing.
 async fn read_task_statuses(
     bus: &dyn EventBus,
-) -> minga_bus::Result<HashMap<String, TaskStatusReport>> {
+) -> minga_bus::Result<(HashMap<String, TaskStatusReport>, HashMap<u64, String>)> {
     let mut statuses = HashMap::new();
+    let mut joined = HashMap::new();
     for (key, bytes) in bus.list_status().await? {
+        if let Some(node_id) = key
+            .strip_prefix(subjects::NODE_JOIN_PREFIX)
+            .and_then(|id| id.parse().ok())
+        {
+            if let Ok(tenant_id) = String::from_utf8(bytes) {
+                joined.insert(node_id, tenant_id);
+            }
+            continue;
+        }
         if !key.starts_with("node.") || !key.contains(".task.") {
             continue;
         }
@@ -564,7 +581,7 @@ async fn read_task_statuses(
             Err(error) => tracing::warn!(key, error = %error, "cannot decode task status"),
         }
     }
-    Ok(statuses)
+    Ok((statuses, joined))
 }
 
 fn overlay_task_statuses(

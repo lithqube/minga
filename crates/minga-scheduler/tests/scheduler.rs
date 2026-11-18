@@ -204,6 +204,20 @@ async fn multi_tenant_placement_and_wireguard_routes_stay_tenant_scoped() {
         bus.refresh_lease(id, b"registration").await.unwrap();
     }
     let scheduler = Scheduler::with_bus(store.clone(), bus.clone());
+
+    // Live but not yet joined: tenant B's node gets no tasks and no peers.
+    scheduler.reconcile_once().await.unwrap();
+    assert!(store.list_tasks().await.unwrap().is_empty());
+    assert!(!bus
+        .list_assignments("")
+        .await
+        .unwrap()
+        .iter()
+        .any(|(key, _)| key.starts_with("node.2.")));
+
+    bus.put_status(&minga_bus::subjects::kv_node_join(2), b"tenant-b")
+        .await
+        .unwrap();
     scheduler.reconcile_once().await.unwrap();
 
     let tasks = store.list_tasks().await.unwrap();

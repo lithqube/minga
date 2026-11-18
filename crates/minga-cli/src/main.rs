@@ -1235,7 +1235,17 @@ async fn wait_for_node_shutdown() {
 fn read_owner_only_file(path: &std::path::Path, max_bytes: usize) -> Result<Vec<u8>, String> {
     use std::io::Read;
 
-    let file = std::fs::File::open(path)
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    // A FIFO with no writer would block open() forever; non-blocking, it
+    // opens at once and the regular-file check below rejects it.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = options
+        .open(path)
         .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
     let metadata = file
         .metadata()
@@ -2693,6 +2703,25 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::process::ExitCode;
     use tempfile::tempdir;
+
+    #[test]
+    fn owner_only_reader_rejects_a_fifo_without_blocking() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("credentials");
+        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: c_path is a valid NUL-terminated path for the call's duration.
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(super::read_owner_only_file(&path, 1024));
+        });
+        let result = receiver
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("opening a FIFO with no writer blocked");
+        assert!(result.unwrap_err().contains("not a regular file"));
+    }
 
     #[test]
     fn tls_init_join_key_creates_a_private_key_and_refuses_overwrite() {
