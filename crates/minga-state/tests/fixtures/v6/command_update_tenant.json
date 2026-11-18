@@ -1,0 +1,17 @@
+{
+  "UpdateTenant": {
+    "id": "tenant-a",
+    "name": "Tenant Alpha",
+    "quotas": {
+      "api_requests_per_second": null,
+      "desired_state_bytes": null,
+      "jetstream_age_secs": null,
+      "jetstream_bytes": null,
+      "jobs": null,
+      "networks": null,
+      "secrets": null,
+      "services": null,
+      "tasks": null
+    }
+  }
+}

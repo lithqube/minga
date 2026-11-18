@@ -31,6 +31,7 @@
 //!     wg_public_key: None,
 //!     wg_endpoint: None,
 //!     overlay_ip: None,
+//!     tenant_id: "default".to_string(),
 //!     last_seen_unix: None,
 //!     role: Default::default(),
 //!     reserved_ports: vec![],
