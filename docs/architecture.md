@@ -1,6 +1,6 @@
 # Architecture notes
 
-How Minga fits together **as of v1.2.0**, after Phase 12. Settled design decisions live in the [ADRs](adr/); this page describes the current code and the structural limits that remain.
+How Minga fits together in the current unreleased code after Phases 12 and 13. Settled design decisions live in the [ADRs](adr/); this page describes the current code and the structural limits that remain.
 
 ## Processes and state
 
@@ -43,22 +43,30 @@ The wire frame carries the format version but no schema revision, so nodes of on
 
 ## Remaining structural limits
 
-Phase 12 removes the worker-voter, Raft-liveness and dual-dispatch limits. Two
-limits remain:
+Phase 12 removes the worker-voter, Raft-liveness and dual-dispatch limits.
+Phase 13 implements the node-level WireGuard data plane, NAT relay and
+ingress routing mesh. T2/T3 live proofs passed, including relay failover and
+bidirectional task HTTP after WireGuard handshakes re-established.
 
-4. **Agent sandboxes have no host capabilities.** Modules are instantiated
+The remaining structural limits are:
+
+1. **Agent sandboxes have no host capabilities.** Modules are instantiated
    with zero imports: no WASI, network, env or clock. `memory_limit` and
    `token_budget` are not enforced. The egress proxy injects provider
    credentials itself (ADR 0003).
-5. **No container networking across nodes.** Bridges, network namespaces and
-   DNAT are per host. WireGuard configuration is generated but not applied;
-   communicating services must stay on one node.
+2. **T4 scale remains unmeasured.** The target is roughly 5,000 workers; no
+   large-cluster load test has run.
 
-The target mesh design, including NAT relay trust and ingress publishing, is in
-[ADR 0007: WireGuard Mesh and Routing Mesh](adr/0007-wireguard-mesh.md).
+Managers must have reachable WireGuard endpoints in multi-manager clusters.
+When both workers are behind NAT, a healthy manager relays packets by
+decrypting and re-encrypting them; that trusted manager can inspect the
+container payload. `MINGA_LOGS` remains single-replica and is unavailable while
+its hosting NATS server is down. A later manager-1 restart after test credential
+updates failed with NATS authorization; validate credential-refresh rejoin
+before release.
 
-The T4 target of roughly 5,000 workers has not had a load test. The functional
-architecture has no per-worker Raft replication or heartbeat writes.
+See [ADR 0007: WireGuard Mesh and Routing Mesh](adr/0007-wireguard-mesh.md)
+for the settled design and trust boundaries.
 
 ## Managers-only Raft
 
@@ -95,8 +103,7 @@ settled decisions and [supported topologies](topologies.md) for T1–T4.
 
 ## Next work
 
-1. WireGuard mesh and cross-node container networking.
-2. Sandbox host capabilities: WASI with explicit grants, outbound HTTP only
+1. Sandbox host capabilities: WASI with explicit grants, outbound HTTP only
    through the local egress proxy, host-injected workload identity and
    enforced memory limits.
 

@@ -62,8 +62,8 @@ impl NatsCredentialIssuer {
                 format!("tenant signer for `{tenant_id}` has no permission template")
             })?;
             let (publish, subscribe) = worker_permission_template(&tenant_id);
-            if template.permissions.publish.allow != publish
-                || template.permissions.subscribe.allow != subscribe
+            if !permission_lists_match(&template.permissions.publish.allow, &publish)
+                || !permission_lists_match(&template.permissions.subscribe.allow, &subscribe)
             {
                 return Err(format!(
                     "tenant signer for `{tenant_id}` has an unexpected permission template"
@@ -123,16 +123,9 @@ impl NatsCredentialIssuer {
         let public_key = user_key.public_key();
         let mut claim = User::new_claims(format!("minga-worker-{node_id}"), public_key.clone());
         claim.nats.issuer_account = Some(self.account_public_key.clone());
-        let (template_publish, template_subscribe) = worker_permission_template(tenant_id);
-        claim.nats.permissions.permissions.publish.allow = template_publish
-            .iter()
-            .map(|subject| subject.replace("{{tag(node)}}", &node_id.to_string()))
-            .collect();
-        claim.nats.permissions.permissions.subscribe.allow = template_subscribe
-            .iter()
-            .map(|subject| subject.replace("{{tag(node)}}", &node_id.to_string()))
-            .collect();
+        // NATS expands this scoped signer template from the node tag.
         claim.nats.generic_fields.tags = Some(vec![format!("node:{node_id}")]);
+        claim.nats.permissions.limits = None;
         let jwt = claim
             .encode(signer)
             .map_err(|error| format!("cannot sign worker JWT: {error}"))?;
@@ -144,6 +137,12 @@ impl NatsCredentialIssuer {
         );
         Ok((public_key, credentials))
     }
+}
+fn permission_lists_match(actual: &[String], expected: &[String]) -> bool {
+    actual.len() == expected.len()
+        && expected
+            .iter()
+            .all(|permission| actual.contains(permission))
 }
 
 fn worker_permission_template(tenant_id: &str) -> (Vec<String>, Vec<String>) {
@@ -159,6 +158,7 @@ fn worker_permission_template(tenant_id: &str) -> (Vec<String>, Vec<String>) {
         format!("$JS.API.CONSUMER.CREATE.KV_MINGA_ASSIGN.*.$KV.MINGA_ASSIGN.{tenant_id}.node.{node}.task.>"),
         format!("$JS.API.CONSUMER.CREATE.KV_MINGA_ASSIGN.*.$KV.MINGA_ASSIGN.{tenant_id}.node.{node}.ingress.>"),
         format!("$JS.API.CONSUMER.CREATE.KV_MINGA_ASSIGN.*.$KV.MINGA_ASSIGN.{tenant_id}.node.{node}.net.>"),
+        format!("$JS.API.CONSUMER.CREATE.KV_MINGA_ASSIGN.*.$KV.MINGA_ASSIGN.{tenant_id}.node.{node}.wg"),
         "$JS.API.CONSUMER.INFO.KV_MINGA_ASSIGN.*".to_string(),
         format!("$JS.API.DIRECT.GET.KV_MINGA_ASSIGN.$KV.MINGA_ASSIGN.{tenant_id}.node.{node}.>"),
         format!("$JS.API.DIRECT.GET.KV_MINGA_STATUS_{tenant_id}.$KV.MINGA_STATUS_{tenant_id}.node.{node}.task.>"),
@@ -180,6 +180,14 @@ fn worker_permission_template(tenant_id: &str) -> (Vec<String>, Vec<String>) {
 
 #[cfg(test)]
 pub(crate) fn test_issuer(tenant_id: &str) -> NatsCredentialIssuer {
+    test_issuer_with_sorted_permissions(tenant_id, false)
+}
+
+#[cfg(test)]
+fn test_issuer_with_sorted_permissions(
+    tenant_id: &str,
+    sort_permissions: bool,
+) -> NatsCredentialIssuer {
     use nats_jwt_rs::{
         account::Account,
         operator::Operator,
@@ -190,7 +198,11 @@ pub(crate) fn test_issuer(tenant_id: &str) -> NatsCredentialIssuer {
     let operator_key = KeyPair::new_operator();
     let account_key = KeyPair::new_account();
     let tenant_signer = KeyPair::new_account();
-    let (publish, subscribe) = worker_permission_template(tenant_id);
+    let (mut publish, mut subscribe) = worker_permission_template(tenant_id);
+    if sort_permissions {
+        publish.sort();
+        subscribe.sort();
+    }
     let template = UserPermissionLimits {
         permissions: Permissions {
             publish: Permission {
@@ -251,12 +263,28 @@ mod tests {
             .unwrap();
         let claim = Claims::<User>::decode(jwt).unwrap();
         assert_eq!(claim.sub, public_key);
-        let publish = &claim.nats.permissions.permissions.publish.allow;
-        let subscribe = &claim.nats.permissions.permissions.subscribe.allow;
-        assert!(publish.iter().all(|subject| !subject.contains("tenant-b")));
-        assert!(subscribe.iter().all(|subject| !subject.contains("node.8")));
-        assert!(publish.contains(&"$KV.MINGA_STATUS_tenant-a.node.7.task.>".to_string()));
-        assert!(publish.contains(&"$JS.API.CONSUMER.INFO.KV_MINGA_ASSIGN.*".to_string()));
+        assert!(claim.nats.permissions.permissions.publish.allow.is_empty());
+        assert!(claim
+            .nats
+            .permissions
+            .permissions
+            .subscribe
+            .allow
+            .is_empty());
+        assert!(claim.nats.permissions.limits.as_ref().is_none_or(|limits| {
+            limits.user_limits.is_none()
+                && limits.nats_limits.as_ref().is_none_or(|nats_limits| {
+                    nats_limits.subs.is_none()
+                        && nats_limits.data.is_none()
+                        && nats_limits.payload.is_none()
+                })
+        }));
+        assert!(claim
+            .nats
+            .generic_fields
+            .tags
+            .as_ref()
+            .is_some_and(|tags| tags == &["node:7"]));
         let seed = credentials
             .split("-----BEGIN USER NKEY SEED-----\n")
             .nth(1)
@@ -265,6 +293,27 @@ mod tests {
             .next()
             .unwrap();
         assert_eq!(KeyPair::from_seed(seed).unwrap().public_key(), public_key);
+    }
+
+    #[test]
+    fn wireguard_watch_permissions_are_limited_to_the_tenant_node_key() {
+        let (publish, subscribe) = worker_permission_template("tenant-a");
+        let create_consumer =
+            "$JS.API.CONSUMER.CREATE.KV_MINGA_ASSIGN.*.$KV.MINGA_ASSIGN.tenant-a.node.{{tag(node)}}.wg";
+
+        assert!(publish
+            .iter()
+            .any(|permission| permission == create_consumer));
+        assert!(subscribe
+            .iter()
+            .any(|permission| permission == "$KV.MINGA_ASSIGN.tenant-a.node.{{tag(node)}}.wg"));
+    }
+
+    #[test]
+    fn issuer_accepts_sorted_signer_template_permissions() {
+        let issuer = test_issuer_with_sorted_permissions("tenant-a", true);
+
+        assert!(issuer.issue("tenant-a", 7).is_ok());
     }
 
     #[test]

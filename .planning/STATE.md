@@ -15,7 +15,7 @@
   - **CI:** new job `NATS store upgrade 2.10.22 to 2.15.3`, which runs both modes on linux-amd64 with checksum-verified binaries.
 - **Follow-up (2026-11-17):** PRs #87, #88, #89 and #90 are all merged, so the 2.15.3 release gate is lifted. The NATS matrix and the fail-closed suites run in CI against 2.14.10 and 2.15.3, and the store-upgrade job runs on every push. Local verification passed: `cargo fmt --all --check`, `cargo clippy --all-targets -- -D warnings`, and `cargo test --workspace` (940 passed, 4 ignored) against NATS 2.15.3.
 
-**Current:** Phase 15 T1–T5 implementation is complete in the working tree. Focused local package tests and clippy pass; no VM tests were run. T3 end-to-end tenant-isolation proof remains open and deferred until release readiness. Phase 13 is code-complete through 13-06; defer 13-07 multi-VM proof and iperf3 measurements until release readiness, and keep cross-node networking marked unsupported until then. Phase 14 (PRs #87–#90) and Phase 12 (PR #76) are complete.
+**Current:** Phase 15 T1–T5 implementation is complete. Phase 13 is complete through 13-07: T2/T3 live VM proof, ingress, isolation and benchmark evidence are recorded below. Phase 15 T3 tenant-isolation end-to-end proof remains deferred until release readiness; no further VM tests before that gate. Phase 14 (PRs #87–#90) and Phase 12 (PR #76) are complete.
 
 **Phase 15 tenant isolation (ADR 0008 T1–T2, 2026-11-17):**
 
@@ -43,7 +43,7 @@
 - **T3 log limitation:** Stopping manager 3, which hosted the single-copy `MINGA_LOGS` stream, caused `minga logs` to hang. Restoring it restored reads. Logs remain RF1 by ADR 0002; manager quorum does not make this stream available.
 - **Bus authorization:** Live TLS NATS test `worker_certificate_cannot_write_assignments_or_other_nodes_status_and_leases` verifies own-assignment reads and denies foreign assignment writes, foreign status/lease writes and foreign-key reads.
 - **v1.2.0 migration:** Built and ran the actual v1.2.0 Linux binary with managers 1/2 and worker 99, then deployed `phase12-v120-live.legacy`. Current manager migration dry-run identified `{1,2,99}` → `{1}`; apply committed `[1]`. Service remained listed and its container task `phase12-v120-live.legacy.1.03948649` stayed RUNNING at containerd PID 1599. Replaced the old worker with the current JetStream worker using the same data directory; it adopted the existing container at PID 1599.
-- This is real-kernel namespace evidence, not multi-VM deployment proof. Phase 13-07 T2/T3 live VM proof, iperf3 measurements and topology documentation remain open and are deferred until release readiness. Cross-node networking stays unsupported until that proof lands.
+- Real-kernel namespace evidence is not multi-VM deployment proof. Phase 13-07 T2/T3 live VM proof and iperf3 measurements are recorded below; cross-node networking is supported with the documented WireGuard endpoint and relay requirements.
 - **Phase 12 delivery:** PR #76 merged to `main` after its Rust, site, daemon-backed and real-kernel CI checks passed.
 
 **Phase 13 13-02 evidence (2026-11-15):**
@@ -67,6 +67,16 @@
 - API admission rejects conflicting ingress ports with HTTP 409. The scheduler publishes backend sets to live nodes, picks a deterministic primary network address matching node attachment order, and limits ingress-only WireGuard routes to published backends.
 - Node reconciliation installs per-port iptables DNAT balancing and SNATs remote backends. CHANGELOG documents the short-syntax default change.
 - Verification: ingress 409 integration, scheduler backend-movement, peer-set projection, NAT relay/failover, worker ACL, Docker publish-mode and Compose mode tests passed. On OrbStack Ubuntu with iptables-nft, real-kernel ingress balancing passed with two ingress-mode tasks: 20 requests reached both remote backends. The host-mode published-port netns test passed local-address, hairpin, isolation, external-address and reserved-DNS checks; no two-node host-mode topology was run.
+
+**Phase 13 13-07 live proof (2026-11-18, OrbStack Ubuntu 24.04 arm64):**
+
+- **T2:** One manager and two NAT-isolated workers deployed with inbound UDP/51820 blocked. Worker 3 reached the worker-2-only `p13-t2.web` service by DNS through the manager relay; Traefik on manager 1 routed to it through the Swarm provider, and ingress-published port 8080 returned HTTP 200. Cutting a worker's network for 120 seconds recovered without a restart. Reverse worker-initiated HTTP was verified with the same NAT pair during T3.
+- **T3:** Three mTLS managers with route-TLS NATS sidecars and two NAT-only workers. Stopping home manager 1 moved the relay to manager 4; after WireGuard handshakes re-established, HTTP by service DNS passed in both worker-initiated directions. JetStream metadata retained quorum with two managers; `MINGA_LOGS` remains RF1.
+- **Isolation:** A task on another overlay network timed out; a packet spoofing another node's task IP was dropped while normal mesh traffic passed.
+- **Ingress:** Traefik Swarm-provider routing and ingress-published traffic both reached the remote worker-2-only service.
+- **Benchmark:** Ten-second task-namespace iperf3 samples measured 2.359 Gbit/s direct and 4.013 Gbit/s relayed; host underlay measured 74.411 Gbit/s. Mean RTTs were 1.629 ms, 2.378 ms and 0.157 ms respectively. These are short virtualized OrbStack samples, not capacity estimates; see `docs/benchmark.md`.
+- **Limit/follow-up:** T4 scale remains untested. After test credential updates, manager 1 failed to restart with an NATS authorization violation; verify manager rejoin after credential changes before release. This rejoin check is a pre-release follow-up, not a failed 13-07 acceptance item.
+
 
 ---
 
@@ -107,4 +117,4 @@ Waves 1–9 predate this GSD planning workspace and their claims were **not** in
 
 **10-01 host gate remains BLOCKED** by user choice: Talos staging is out of scope for `v0.1.0` and no hcloud provisioning is authorized. OrbStack Ubuntu is Linux evidence only. Do not advance Talos-dependent claims or compliance qualification — FIPS, SOC 2, VS-NfD and NATO are **not assessed**, which is different from not applicable.
 
-- **Immediate next action:** Proceed with Phase 15 T4: tenant-scoped NATS subjects and keys, per-tenant worker ACLs and streams/buckets, and scoped operator/JWT credentials. Keep T3 end-to-end verification open, but do not run VM tests until release readiness; defer Phase 13-07 live VM proof and iperf3 measurements to that release gate. Cross-node networking remains unsupported until then. Talos/hcloud staging remains blocked pending authorization; compliance is not assessed.
+- **Immediate next action:** At release readiness, run Phase 15 T3 end-to-end tenant-isolation validation (tenant B cannot place on tenant A's node). Keep VM tests deferred until then. Phase 13 cross-node networking is supported with the documented manager UDP endpoint and relay trust requirements. Talos/hcloud staging remains blocked pending authorization; compliance is not assessed.

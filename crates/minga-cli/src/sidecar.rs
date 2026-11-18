@@ -122,7 +122,7 @@ pub struct SidecarOptions {
     pub monitor_port: u16,
     /// JetStream max memory store (e.g. "64MB").
     pub max_memory_store: String,
-    /// JetStream max file store (e.g. "1GB").
+    /// JetStream max file store (e.g. "8GB").
     pub max_file_store: String,
     /// Client authentication token. When set, every client (including the
     /// manager itself) must present it to connect.
@@ -147,7 +147,7 @@ impl Default for SidecarOptions {
             manager_node_ids: Vec::new(),
             monitor_port: 8222,
             max_memory_store: "64MB".to_string(),
-            max_file_store: "1GB".to_string(),
+            max_file_store: "8GB".to_string(),
             client_token: None,
             jwt_auth: None,
             listen_addr: "127.0.0.1".to_string(),
@@ -732,7 +732,7 @@ mod tests {
         assert_eq!(opts.client_port, 4222);
         assert_eq!(opts.monitor_port, 8222);
         assert_eq!(opts.max_memory_store, "64MB");
-        assert_eq!(opts.max_file_store, "1GB");
+        assert_eq!(opts.max_file_store, "8GB");
     }
 
     #[test]

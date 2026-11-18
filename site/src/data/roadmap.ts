@@ -138,12 +138,19 @@ export const milestones: Milestone[] = [
     source: 'CHANGELOG.md',
   },
   {
-    version: 'Then',
-    status: 'next',
+    version: 'Unreleased',
+    status: 'shipped',
     title: 'WireGuard mesh',
-    features: ['Containers on different nodes reach each other'],
-    security: ['Node-to-node container traffic is encrypted'],
-    source: 'README.md',
+    features: [
+      'Containers on different nodes reach each other over the WireGuard mesh',
+      'Ingress-published ports route to tasks on any node',
+      'NAT-isolated workers relay through the lowest-ID healthy manager',
+    ],
+    security: [
+      'Cross-node task traffic is encrypted with WireGuard',
+      'Relay managers can inspect traffic they decrypt and re-encrypt',
+    ],
+    source: 'CHANGELOG.md',
   },
   {
     version: 'Then',

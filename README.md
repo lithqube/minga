@@ -12,7 +12,7 @@ Named after the [minga](https://en.wikipedia.org/wiki/Minga) of Chiloé, where a
 >
 > - **Compose and deploy:** Compose parsing that fails loudly on unknown keys, and `minga deploy` through the Swarm-compatible Docker Engine API (v1.41, optional bearer token).
 > - **Control plane:** Raft consensus with mTLS and write forwarding, a scheduler, and self-registering nodes with membership leases.
-> - **Runtime and networking:** a node supervisor driving a **real containerd runtime**, per-task netns/bridge networking with IPAM and embedded DNS, and real container logs.
+> - **Runtime and networking:** a node supervisor driving a **real containerd runtime**, per-task netns/bridge networking with IPAM and embedded DNS, ingress publishing, and cross-node WireGuard networking with NAT manager relays (Phase 13; live-verified, unreleased).
 > - **Platform:** NATS/JetStream with TLS, WASM sandboxes, an LLM egress proxy, and Prometheus metrics with health endpoints.
 > - **Updates:** rolling updates honoring `update_config`, enforced healthchecks, automatic rollback, and registry image pull through containerd's Transfer API with Docker credential helpers.
 > - **New in `v1.1.0`:** versioned state, so later upgrades keep it; `minga state export` and `import` for backup and restore ([guide](docs/backup.md)); a failed task records its last error and exit code, shown by the Docker API and `minga-ctl service ps` and `service inspect`; image pulls that keep the credential off the command line and read `credsStore`/`credHelpers`; published ports that only redirect traffic addressed to the node, with host-local and hairpin access; supplementary groups from the image. **Upgrading from 1.0.2 needs one last removal of the Raft files**: see the [release notes](docs/release-1.1.0.md#upgrade-notes).
@@ -23,7 +23,7 @@ Named after the [minga](https://en.wikipedia.org/wiki/Minga) of Chiloé, where a
 >
 > **Not in `v1.2.0`:**
 >
-> - Container networking across nodes: there's no WireGuard mesh yet.
+> - Cross-node WireGuard networking is implemented and T2/T3 live-verified in unreleased Phase 13; it is not part of the `v1.2.0` release. Manager rejoin after test credential updates still needs release validation.
 > - Joining a node to a running cluster: Raft membership is fixed at bootstrap.
 > - API roles, TLS on the API listener and a server-side audit log: designed in [ADR 0005](docs/adr/0005-api-identity-and-roles.md) (Proposed), not built. The API has one shared token.
 > - A plain-HTTP registry on containerd 1.7 (the Transfer API has no plain-HTTP option there).
@@ -50,7 +50,7 @@ Minga ships as **one binary** (plus the `nats-server` it supervises). There's no
 - **Swarm-compatible API.** Services, tasks, nodes, networks, secrets and configs, with label filters. `docker stack deploy`, `docker service ls`, `docker node ls` and Traefik v3's swarm provider work against the manager's API.
 - **Raft consensus.** Desired state and placement go through [openraft](https://docs.rs/openraft), persisted in [redb](https://docs.rs/redb) as versioned JSON: a node refuses data it cannot read and says why, and fields added later need no wipe. mTLS on the Raft transport and bounded frames. No external etcd.
 - **Backup and restore.** `minga state export` writes services, networks, volumes and secret and config references to a 0600 file; `minga state import` restores them into a fresh cluster, where the scheduler places the tasks again. [docs/backup.md](docs/backup.md) lists what else to copy.
-- **Container networking on a node.** Deterministic per-task IPs from IPAM (each network gets its own /24 from `10.100.0.0/16`, or from `--overlay-supernet`, stored in Raft by the leader), one bridge per network, a netns and veth pair per task, iptables DNAT for published ports (traffic addressed to the node only, reachable from the node itself and from tasks through the node's address), and embedded DNS (`<svc>`, `tasks.<svc>`, `<svc>.<stack>.minga.local`). Cross-node traffic needs the WireGuard mesh, which is generated as config but not applied yet.
+- **Container networking:** deterministic per-task IPs from IPAM (each network gets its own /24 from `10.100.0.0/16`, or from `--overlay-supernet`, stored in Raft by the leader), one bridge per network, a netns and veth pair per task, embedded DNS (`<svc>`, `tasks.<svc>`, `<svc>.<stack>.minga.local`), and a node-level WireGuard mesh for cross-node traffic. Ingress ports answer on every node; `mode: host` stays node-local. Multi-manager clusters require reachable manager UDP endpoints; NAT workers relay through trusted managers. See [supported topologies](docs/topologies.md).
 - **Secrets and logs.** Secrets are external references staged per task and content-addressed, so rotation never changes a running task's files. `minga logs [-f]` shows separated stdout/stderr from a JetStream-retained backlog.
 - **Agent workloads.** `x-minga-agent` Compose services run as WASM modules under wasmtime with fuel and timeout limits. An LLM egress proxy enforces per-workload token budgets, caches responses and redacts secrets. Today the WASM guest gets no host I/O: no WASI, no network, so it can't reach the proxy yet. Memory limits aren't enforced, and Firecracker is a stub.
 - **Observability.** `/metrics`, `/healthz` and `/readyz` on the manager API, and on manager and worker nodes via `--metrics-bind`. JSON logs on stderr for long-running roles. A failed container task keeps its last error and exit code, returned in the Docker API's task status and shown by `minga-ctl service ps` and `service inspect`; an agent task records the error only when it fails to start.
@@ -238,13 +238,14 @@ flowchart TB
     m1["one minga manager<br/>Raft voter + API + NATS sidecar"] --> ct1[containerd]
   end
 
-  subgraph multi["2 · Multi-node cluster (control plane only)"]
+  subgraph multi["2 · Multi-node cluster"]
     direction LR
     natsx[("manager sidecars with route TLS<br/>or external NATS")]
     mA["manager 1"] <-->|Raft mTLS| mB["manager 2"]
     mB <-->|Raft mTLS| mC["manager 3"]
     w1["worker"] -->|JetStream client mTLS| natsx
     mA & mB & mC -->|JetStream| natsx
+    mA & mB & mC <-->|WireGuard mesh| w1
   end
 ```
 
@@ -253,9 +254,9 @@ flowchart TB
 2. **Multi-node.** Only managers vote in Raft. Workers connect to JetStream and
    can join at runtime; managers can be added or removed through the API.
    Managers use clustered route-TLS sidecars or an external NATS cluster.
-   Containers on different nodes still cannot reach each other until the
-   WireGuard mesh lands. See [supported topologies](docs/topologies.md) for
-   manager and worker flags, port requirements and current limits.
+   Cross-node containers use the WireGuard mesh. Manager endpoints, relay
+   trust, ingress/host publishing and verification status are in
+   [supported topologies](docs/topologies.md).
 3. **Talos Linux.** **Validated single-node install** on Talos v1.14: Minga runs as two `ContainerConfig` containers pulled from GHCR — no system extension, no custom boot asset — and workload images preload via a Kubernetes Job using the bundled `ctr`. Guide: [docs/talos-deployment.md](docs/talos-deployment.md). Bare-metal and multi-node are not hardware-validated.
 4. **Air-gapped.** Copy the release archive (with `minga`, `nats-server` and the licenses) and image tarballs to the site. Then run `ctr -n minga images import <image>.tar` on each node and start the roles as above. No step needs a network connection.
 
@@ -323,9 +324,9 @@ Requirements: Rust 1.80+ with `rustfmt` and `clippy`, and `nats-server` for the 
 Next, in order (rationale in [docs/architecture.md](docs/architecture.md)):
 
 1. ~~Managers-only Raft: workers become pure JetStream clients, liveness moves to `MINGA_LEASES`, and nodes can join a running cluster.~~ Done.
-2. A multi-node WireGuard mesh on top of the per-node data plane. The mesh, the NAT relay through managers and the ingress routing mesh are merged; the live proof with a NAT'ed worker on separate VMs is still open.
+2. ~~A multi-node WireGuard mesh on top of the per-node data plane.~~ Complete in Phase 13; T2/T3 live evidence and limits are documented.
 3. ~~Registry credentials for image pull (an in-process pull that honors `--containerd-socket`).~~ Done in `v1.1.0`.
-4. Tenant isolation ([ADR 0008](docs/adr/0008-multi-tenancy.md)): the tenant is in the client certificate and the API is tenant-scoped. Next come nodes owned by one tenant, tenant segments in bus subjects and keys, and quotas.
+4. Tenant isolation ([ADR 0008](docs/adr/0008-multi-tenancy.md)): T1–T5 implementation is complete; tenant placement/isolation end-to-end proof remains a release-readiness gate.
 5. Host capabilities for agent sandboxes: WASI, egress-only networking, host-injected workload identity, memory limits.
 
 ## Documentation
