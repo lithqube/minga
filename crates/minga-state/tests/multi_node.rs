@@ -74,11 +74,13 @@ fn sample_node(id: u64, addr: &str) -> ClusterNode {
         last_seen_unix: None,
         role: Default::default(),
         reserved_ports: Vec::new(),
+        nats_user_public_key: None,
     }
 }
 
 fn sample_service(id: &str) -> Service {
     Service {
+        is_job: false,
         id: id.to_string(),
         tenant_id: "default".to_string(),
         name: id.to_string(),
@@ -278,6 +280,7 @@ async fn tenant_writes_replicate_to_all_nodes() {
 
     leader
         .create_tenant(Tenant {
+            nats_revoked_user_public_keys: Vec::new(),
             id: "tenant-a".into(),
             name: "Tenant A".into(),
             quotas: TenantQuotas::default(),

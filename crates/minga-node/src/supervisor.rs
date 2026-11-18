@@ -33,18 +33,27 @@ pub struct Assignments {
     bus: Arc<dyn EventBus>,
     prefix: String,
     node_id: Option<NodeId>,
+    tenant_id: String,
 }
 
 impl Assignments {
-    /// Manager sources list all assignment keys; worker sources are node-scoped.
     pub fn new(bus: Arc<dyn EventBus>, node_id: Option<NodeId>) -> Self {
+        Self::new_for_tenant(bus, node_id, minga_state::types::DEFAULT_TENANT_ID)
+    }
+
+    pub fn new_for_tenant(
+        bus: Arc<dyn EventBus>,
+        node_id: Option<NodeId>,
+        tenant_id: &str,
+    ) -> Self {
         let prefix = node_id
-            .map(|id| format!("node.{id}.task."))
+            .map(|id| subjects::kv_assignment_node_prefix(tenant_id, id))
             .unwrap_or_default();
         Self {
             bus,
             prefix,
             node_id,
+            tenant_id: tenant_id.to_owned(),
         }
     }
 
@@ -56,13 +65,17 @@ impl Assignments {
             .map_err(|e| e.to_string())?;
         entries
             .into_iter()
-            // Skip `node.N.wg` peer sets: only task keys decode as assignments.
-            .filter(|(key, _)| key.starts_with("node.") && key.contains(".task."))
+            .filter(|(key, _)| key.starts_with(&format!("{}.node.", self.tenant_id)))
             .map(|(key, bytes)| {
                 let assignment: TaskAssignment = minga_state::codec::decode_wire(&bytes)
                     .map_err(|e| format!("invalid assignment {key}: {e}"))?;
                 if self.node_id.is_some_and(|node| assignment.node_id != node)
-                    || key != format!("node.{}.task.{}", assignment.node_id, assignment.task_id)
+                    || key
+                        != subjects::kv_assignment_task(
+                            &self.tenant_id,
+                            assignment.node_id,
+                            &assignment.task_id,
+                        )
                 {
                     return Err(format!("assignment key/value mismatch: {key}"));
                 }
@@ -78,11 +91,13 @@ impl Assignments {
             .map_err(|e| e.to_string())
     }
 
-    /// The networks `node_id`'s tasks are attached to, with their DNS records.
     pub async fn networks(&self, node_id: NodeId) -> Result<Vec<NetworkAssignment>, String> {
         let entries = self
             .bus
-            .list_assignments(&subjects::kv_assignment_node_network_prefix(node_id))
+            .list_assignments(&subjects::kv_assignment_node_network_prefix(
+                &self.tenant_id,
+                node_id,
+            ))
             .await
             .map_err(|e| e.to_string())?;
         entries
@@ -90,37 +105,42 @@ impl Assignments {
             .map(|(key, bytes)| {
                 let assignment: NetworkAssignment = minga_state::codec::decode_wire(&bytes)
                     .map_err(|e| format!("invalid network assignment {key}: {e}"))?;
-                if key != subjects::kv_assignment_network(node_id, &assignment.network.id) {
+                if key
+                    != subjects::kv_assignment_network(
+                        &self.tenant_id,
+                        node_id,
+                        &assignment.network.id,
+                    )
+                {
                     return Err(format!("network assignment key/value mismatch: {key}"));
                 }
                 Ok(assignment)
             })
             .collect()
     }
+
     pub async fn ingress(&self) -> Result<Vec<minga_state::types::IngressAssignment>, String> {
         let Some(node_id) = self.node_id else {
             return Ok(Vec::new());
         };
-        let prefix = minga_bus::subjects::kv_assignment_ingress_prefix(node_id);
+        let prefix = subjects::kv_assignment_ingress_prefix(&self.tenant_id, node_id);
         self.bus
             .list_assignments(&prefix)
             .await
-            .map_err(|error| error.to_string())?
+            .map_err(|e| e.to_string())?
             .into_iter()
             .map(|(key, bytes)| {
                 let assignment: minga_state::types::IngressAssignment =
                     minga_state::codec::decode_wire(&bytes)
-                        .map_err(|error| format!("invalid ingress assignment {key}: {error}"))?;
+                        .map_err(|e| format!("invalid ingress assignment {key}: {e}"))?;
                 if key
-                    != minga_bus::subjects::kv_assignment_ingress(
+                    != subjects::kv_assignment_ingress(
+                        &self.tenant_id,
                         node_id,
                         assignment.published,
                         &assignment.protocol,
                     )
-                {
-                    return Err(format!("ingress assignment key/value mismatch: {key}"));
-                }
-                if assignment.published == 0
+                    || assignment.published == 0
                     || !matches!(assignment.protocol.as_str(), "tcp" | "udp" | "sctp")
                     || assignment.backends.is_empty()
                     || assignment.backends.iter().any(|backend| {
@@ -128,7 +148,7 @@ impl Assignments {
                             || backend.target_port == 0
                     })
                 {
-                    return Err(format!("invalid ingress assignment contents: {key}"));
+                    return Err(format!("invalid ingress assignment: {key}"));
                 }
                 Ok(assignment)
             })
@@ -233,11 +253,12 @@ fn build_dns_store(assignments: &[NetworkAssignment], node_id: NodeId) -> minga_
 /// actual state over the bus. It does not consume task commands or access
 /// the consensus state store.
 pub struct Supervisor {
+    node_id: NodeId,
     assignments: Assignments,
     runtime: Arc<dyn Runtime>,
     agent_executor: Option<Arc<dyn AgentExecutor>>,
     bus: Option<Arc<dyn EventBus>>,
-    node_id: NodeId,
+    tenant_id: String,
     running: RunningTasks,
     running_agents: RunningAgents,
     log_offsets: LogOffsets,
@@ -265,7 +286,16 @@ impl Supervisor {
     }
 
     pub fn with_bus(runtime: Arc<dyn Runtime>, bus: Arc<dyn EventBus>, node_id: NodeId) -> Self {
-        let assignments = Assignments::new(bus.clone(), Some(node_id));
+        Self::with_tenant_bus(runtime, bus, node_id, minga_state::types::DEFAULT_TENANT_ID)
+    }
+
+    pub fn with_tenant_bus(
+        runtime: Arc<dyn Runtime>,
+        bus: Arc<dyn EventBus>,
+        node_id: NodeId,
+        tenant_id: &str,
+    ) -> Self {
+        let assignments = Assignments::new_for_tenant(bus.clone(), Some(node_id), tenant_id);
         Self::build(assignments, runtime, Some(bus), None, node_id)
     }
 
@@ -275,7 +305,23 @@ impl Supervisor {
         agent_executor: Arc<dyn AgentExecutor>,
         node_id: NodeId,
     ) -> Self {
-        let assignments = Assignments::new(bus.clone(), Some(node_id));
+        Self::with_tenant_agent_executor(
+            runtime,
+            bus,
+            agent_executor,
+            node_id,
+            minga_state::types::DEFAULT_TENANT_ID,
+        )
+    }
+
+    pub fn with_tenant_agent_executor(
+        runtime: Arc<dyn Runtime>,
+        bus: Arc<dyn EventBus>,
+        agent_executor: Arc<dyn AgentExecutor>,
+        node_id: NodeId,
+        tenant_id: &str,
+    ) -> Self {
+        let assignments = Assignments::new_for_tenant(bus.clone(), Some(node_id), tenant_id);
         Self::build(
             assignments,
             runtime,
@@ -292,12 +338,14 @@ impl Supervisor {
         agent_executor: Option<Arc<dyn AgentExecutor>>,
         node_id: NodeId,
     ) -> Self {
+        let tenant_id = assignments.tenant_id.clone();
         Self {
+            node_id,
             assignments,
             runtime,
             agent_executor,
             bus,
-            node_id,
+            tenant_id,
             running: Arc::new(Mutex::new(HashMap::new())),
             running_agents: Arc::new(Mutex::new(HashSet::new())),
             log_offsets: Arc::new(Mutex::new(HashMap::new())),
@@ -793,7 +841,10 @@ impl Supervisor {
                     data: chunk.data.clone(),
                     timestamp: now_millis(),
                 };
-                if let Err(e) = bus.publish_node_log(self.node_id, task_id, &entry).await {
+                if let Err(e) = bus
+                    .publish_tenant_node_log(&self.tenant_id, self.node_id, task_id, &entry)
+                    .await
+                {
                     tracing::warn!(task = %task_id, error = %e, "failed to publish log entry");
                 }
             }
@@ -839,8 +890,14 @@ impl Supervisor {
                                 data,
                                 timestamp: now_millis(),
                             };
-                            if let Err(e) =
-                                bus.publish_node_log(self.node_id, task_id, &entry).await
+                            if let Err(e) = bus
+                                .publish_tenant_node_log(
+                                    &self.tenant_id,
+                                    self.node_id,
+                                    task_id,
+                                    &entry,
+                                )
+                                .await
                             {
                                 tracing::warn!(
                                     task = %task_id,
@@ -886,7 +943,7 @@ impl Supervisor {
         task_id: &TaskId,
     ) -> Option<TaskStatusReport> {
         let key = subjects::kv_node_task_status(self.node_id, task_id);
-        match bus.get_status(&key).await {
+        match bus.get_tenant_status(&self.tenant_id, &key).await {
             Ok(Some(bytes)) => match TaskStatusReport::from_bytes(&bytes) {
                 Ok(report) if report.node_id == self.node_id => Some(report),
                 Ok(_) => None,
@@ -910,7 +967,7 @@ impl Supervisor {
         update: TaskStatusUpdate,
     ) {
         let key = subjects::kv_node_task_status(self.node_id, task_id);
-        let current = match bus.get_status(&key).await {
+        let current = match bus.get_tenant_status(&self.tenant_id, &key).await {
             Ok(Some(bytes)) => match TaskStatusReport::from_bytes(&bytes) {
                 Ok(report) if report.node_id == self.node_id => Some(report),
                 Ok(_) => None,
@@ -990,7 +1047,7 @@ impl Supervisor {
         report.observed_at = now_millis();
         match report.to_bytes() {
             Ok(bytes) => {
-                if let Err(error) = bus.put_status(&key, &bytes).await {
+                if let Err(error) = bus.put_tenant_status(&self.tenant_id, &key, &bytes).await {
                     tracing::warn!(task = %task_id, error = %error, "failed to publish task status");
                 }
             }
@@ -1432,7 +1489,11 @@ mod assignment_tests {
     async fn write_assignment(bus: &MemoryBus, assignment: &TaskAssignment) {
         let bytes = minga_state::codec::encode_wire(assignment).unwrap();
         bus.put_assignment(
-            &format!("node.{}.task.{}", assignment.node_id, assignment.task_id),
+            &subjects::kv_assignment_task(
+                minga_state::types::DEFAULT_TENANT_ID,
+                assignment.node_id,
+                &assignment.task_id,
+            ),
             &bytes,
         )
         .await
@@ -1447,7 +1508,10 @@ mod assignment_tests {
     }
     async fn actual_status(bus: &MemoryBus, node_id: NodeId, task_id: &str) -> TaskStatusReport {
         let bytes = bus
-            .get_status(&subjects::kv_node_task_status(node_id, task_id))
+            .get_tenant_status(
+                minga_state::types::DEFAULT_TENANT_ID,
+                &subjects::kv_node_task_status(node_id, task_id),
+            )
             .await
             .unwrap()
             .unwrap();
@@ -1498,6 +1562,54 @@ mod assignment_tests {
         ) -> minga_bus::Result<minga_bus::EventStream> {
             self.inner.subscribe_events(patterns).await
         }
+        async fn subscribe_tenant_events(
+            &self,
+            tenant_id: &str,
+        ) -> minga_bus::Result<minga_bus::EventStream> {
+            self.inner.subscribe_tenant_events(tenant_id).await
+        }
+        async fn configure_tenant_quota(
+            &self,
+            tenant_id: &str,
+            quotas: &minga_state::types::TenantQuotas,
+        ) -> minga_bus::Result<()> {
+            self.inner.configure_tenant_quota(tenant_id, quotas).await
+        }
+        async fn append_audit(&self, record: minga_bus::AuditRecord) -> minga_bus::Result<()> {
+            self.inner.append_audit(record).await
+        }
+
+        async fn list_audit(
+            &self,
+            tenant_id: &str,
+            limit: usize,
+        ) -> minga_bus::Result<Vec<minga_bus::AuditRecord>> {
+            self.inner.list_audit(tenant_id, limit).await
+        }
+        async fn update_account_claim(&self, account_jwt: &str) -> minga_bus::Result<()> {
+            self.inner.update_account_claim(account_jwt).await
+        }
+
+        async fn check_tenant_request_quota(
+            &self,
+            tenant_id: &str,
+            window_start: u64,
+            limit: u64,
+        ) -> minga_bus::Result<bool> {
+            self.inner
+                .check_tenant_request_quota(tenant_id, window_start, limit)
+                .await
+        }
+        async fn publish_tenant_event(
+            &self,
+            tenant_id: &str,
+            subject: &str,
+            payload: &[u8],
+        ) -> minga_bus::Result<()> {
+            self.inner
+                .publish_tenant_event(tenant_id, subject, payload)
+                .await
+        }
 
         async fn put_assignment(&self, key: &str, value: &[u8]) -> minga_bus::Result<()> {
             self.inner.put_assignment(key, value).await
@@ -1542,6 +1654,36 @@ mod assignment_tests {
 
         async fn watch_status(&self) -> minga_bus::Result<KvStream> {
             self.inner.watch_status().await
+        }
+        async fn put_tenant_status(
+            &self,
+            tenant_id: &str,
+            key: &str,
+            value: &[u8],
+        ) -> minga_bus::Result<()> {
+            self.inner.put_tenant_status(tenant_id, key, value).await
+        }
+
+        async fn get_tenant_status(
+            &self,
+            tenant_id: &str,
+            key: &str,
+        ) -> minga_bus::Result<Option<Vec<u8>>> {
+            self.inner.get_tenant_status(tenant_id, key).await
+        }
+
+        async fn list_tenant_status(
+            &self,
+            tenant_id: &str,
+        ) -> minga_bus::Result<Vec<(String, Vec<u8>)>> {
+            self.inner.list_tenant_status(tenant_id).await
+        }
+
+        async fn list_all_tenant_status(
+            &self,
+            tenant_ids: &[String],
+        ) -> minga_bus::Result<Vec<(String, String, Vec<u8>)>> {
+            self.inner.list_all_tenant_status(tenant_ids).await
         }
 
         async fn refresh_lease(&self, node_id: u64, registration: &[u8]) -> minga_bus::Result<()> {
@@ -1592,12 +1734,30 @@ mod assignment_tests {
         ) -> minga_bus::Result<()> {
             self.inner.publish_node_log(node_id, task_id, entry).await
         }
+        async fn publish_tenant_node_log(
+            &self,
+            tenant_id: &str,
+            node_id: u64,
+            task_id: &str,
+            entry: &LogEntry,
+        ) -> minga_bus::Result<()> {
+            self.inner
+                .publish_tenant_node_log(tenant_id, node_id, task_id, entry)
+                .await
+        }
 
         async fn subscribe_logs(
             &self,
             task_id: &str,
         ) -> minga_bus::Result<minga_bus::LogEventStream> {
             self.inner.subscribe_logs(task_id).await
+        }
+        async fn subscribe_tenant_logs(
+            &self,
+            tenant_id: &str,
+            task_id: &str,
+        ) -> minga_bus::Result<minga_bus::LogEventStream> {
+            self.inner.subscribe_tenant_logs(tenant_id, task_id).await
         }
 
         async fn log_history(
@@ -1606,6 +1766,16 @@ mod assignment_tests {
             tail: usize,
         ) -> minga_bus::Result<Vec<LogEntry>> {
             self.inner.log_history(task_id, tail).await
+        }
+        async fn tenant_log_history(
+            &self,
+            tenant_id: &str,
+            task_id: &str,
+            tail: usize,
+        ) -> minga_bus::Result<Vec<LogEntry>> {
+            self.inner
+                .tenant_log_history(tenant_id, task_id, tail)
+                .await
         }
     }
 
@@ -1619,7 +1789,9 @@ mod assignment_tests {
         assert_eq!(supervisor.reconcile_once().await.unwrap(), 2);
         assert_eq!(runtime.container_count(), 2);
         assert_eq!(supervisor.reconcile_once().await.unwrap(), 0);
-        bus.delete_assignment("node.7.task.first").await.unwrap();
+        bus.delete_assignment(&subjects::kv_assignment_task("default", 7, "first"))
+            .await
+            .unwrap();
         assert_eq!(supervisor.reconcile_once().await.unwrap(), 1);
         assert_eq!(runtime.container_count(), 1);
         assert_eq!(supervisor.running_tasks().await, vec!["second".to_string()]);
@@ -1643,9 +1815,12 @@ mod assignment_tests {
         let bus = MemoryBus::new();
         let assignment = assignment("task-1");
         let bytes = minga_state::codec::encode_wire(&assignment).unwrap();
-        bus.put_assignment("node.7.task.task-1", &bytes)
-            .await
-            .unwrap();
+        bus.put_assignment(
+            &subjects::kv_assignment_task("default", 7, "task-1"),
+            &bytes,
+        )
+        .await
+        .unwrap();
         let supervisor =
             Supervisor::with_bus(Arc::new(MockRuntime::new()), bus, assignment.node_id);
 
@@ -1676,7 +1851,9 @@ mod assignment_tests {
         assert_eq!(supervisor.running_tasks().await, vec!["kept".to_string()]);
         assert_eq!(supervisor.reconcile_once().await.unwrap(), 0);
 
-        bus.delete_assignment("node.7.task.kept").await.unwrap();
+        bus.delete_assignment(&subjects::kv_assignment_task("default", 7, "kept"))
+            .await
+            .unwrap();
         assert_eq!(supervisor.reconcile_once().await.unwrap(), 1);
         assert_eq!(runtime.container_count(), 0);
     }
@@ -1685,10 +1862,13 @@ mod assignment_tests {
         let bus = MemoryBus::new();
         let mut bytes = minga_state::codec::encode_wire(&assignment("task-1")).unwrap();
         bytes[0] = bytes[0].wrapping_add(1);
-        bus.put_assignment("node.7.task.task-1", &bytes)
-            .await
-            .unwrap();
-        let source = Assignments::new(bus, Some(7));
+        bus.put_assignment(
+            &subjects::kv_assignment_task("default", 7, "task-1"),
+            &bytes,
+        )
+        .await
+        .unwrap();
+        let source = Assignments::new_for_tenant(bus, Some(7), "default");
 
         assert!(source.list().await.is_err());
     }
@@ -1708,7 +1888,10 @@ mod assignment_tests {
 
         bus.assignments_offline
             .store(true, std::sync::atomic::Ordering::SeqCst);
-        inner.delete_assignment("node.7.task.move").await.unwrap();
+        inner
+            .delete_assignment(&subjects::kv_assignment_task("default", 7, "move"))
+            .await
+            .unwrap();
         assert_eq!(supervisor.reconcile_once().await.unwrap(), 0);
         assert_eq!(runtime.container_count(), 2);
 
@@ -1728,15 +1911,18 @@ mod assignment_tests {
             max_attempts: None,
         };
         let bytes = minga_state::codec::encode_wire(&desired).unwrap();
-        bus.put_assignment("node.7.task.task-1", &bytes)
-            .await
-            .unwrap();
+        bus.put_assignment(
+            &subjects::kv_assignment_task("default", 7, "task-1"),
+            &bytes,
+        )
+        .await
+        .unwrap();
         let runtime = Arc::new(MockRuntime::new());
         let supervisor = Supervisor::with_bus(runtime.clone(), bus.clone(), 7);
         supervisor.reconcile_once().await.unwrap();
 
         let status = bus
-            .get_status(&subjects::kv_node_task_status(7, "task-1"))
+            .get_tenant_status("default", &subjects::kv_node_task_status(7, "task-1"))
             .await
             .unwrap()
             .unwrap();
@@ -1744,7 +1930,11 @@ mod assignment_tests {
             TaskStatusReport::from_bytes(&status).unwrap().state,
             TaskActualState::Running
         );
-        assert!(!bus.log_history("task-1", 0).await.unwrap().is_empty());
+        assert!(!bus
+            .tenant_log_history("default", "task-1", 0)
+            .await
+            .unwrap()
+            .is_empty());
 
         let failed_container = runtime.list().await[0].id.clone();
         runtime.mark_failed(&failed_container);
@@ -1800,7 +1990,9 @@ mod assignment_tests {
         assert_eq!(runtime.container_count(), 0);
         assert_eq!(executor.agent_count(), 1);
 
-        bus.delete_assignment("node.7.task.agent-1").await.unwrap();
+        bus.delete_assignment(&subjects::kv_assignment_task("default", 7, "agent-1"))
+            .await
+            .unwrap();
         assert_eq!(supervisor.reconcile_once().await.unwrap(), 1);
         assert_eq!(executor.agent_count(), 0);
     }
@@ -1835,12 +2027,19 @@ mod assignment_tests {
         let (supervisor, _, bus) = setup(7).await;
         write_assignment(&bus, &assignment("task-1")).await;
         supervisor.reconcile_once().await.unwrap();
-        let first_count = bus.log_history("task-1", 0).await.unwrap().len();
+        let first_count = bus
+            .tenant_log_history("default", "task-1", 0)
+            .await
+            .unwrap()
+            .len();
         assert!(first_count > 0);
 
         supervisor.reconcile_once().await.unwrap();
         assert_eq!(
-            bus.log_history("task-1", 0).await.unwrap().len(),
+            bus.tenant_log_history("default", "task-1", 0)
+                .await
+                .unwrap()
+                .len(),
             first_count
         );
     }
@@ -1851,7 +2050,11 @@ mod assignment_tests {
         write_assignment(&bus, &agent_assignment("agent-1")).await;
 
         supervisor.reconcile_once().await.unwrap();
-        assert!(!bus.log_history("agent-1", 0).await.unwrap().is_empty());
+        assert!(!bus
+            .tenant_log_history("default", "agent-1", 0)
+            .await
+            .unwrap()
+            .is_empty());
     }
     #[test]
     fn dns_records_come_from_network_assignment_entries() {

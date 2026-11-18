@@ -214,16 +214,16 @@ pub fn service_spec_to_state(spec: &models::ServiceSpec) -> Result<Service, Stri
         .transpose()?
         .unwrap_or_default();
     // Mode and replicas.
-    let (replicas, mode) = match &spec.Mode {
+    let (replicas, mode, is_job) = match &spec.Mode {
         Some(models::ServiceMode::Replicated { Replicas }) => {
-            (*Replicas as u32, ServiceMode::Replicated)
+            (*Replicas as u32, ServiceMode::Replicated, false)
         }
-        Some(models::ServiceMode::Global {}) => (0, ServiceMode::Global),
+        Some(models::ServiceMode::Global {}) => (0, ServiceMode::Global, false),
         Some(models::ServiceMode::ReplicatedJob { Replicas }) => {
-            (*Replicas as u32, ServiceMode::Replicated)
+            (*Replicas as u32, ServiceMode::Replicated, true)
         }
-        Some(models::ServiceMode::GlobalJob { .. }) => (0, ServiceMode::Global),
-        None => (1, ServiceMode::Replicated),
+        Some(models::ServiceMode::GlobalJob { .. }) => (0, ServiceMode::Global, true),
+        None => (1, ServiceMode::Replicated, false),
     };
 
     // Placement constraints from TaskTemplate.Placement.
@@ -348,6 +348,7 @@ pub fn service_spec_to_state(spec: &models::ServiceSpec) -> Result<Service, Stri
         image: container.Image.clone(),
         replicas,
         mode,
+        is_job,
         constraints,
         env,
         ports,
@@ -543,11 +544,17 @@ pub fn service_to_docker(svc: &Service) -> models::Service {
         })
         .collect();
 
-    let mode = match svc.mode {
-        ServiceMode::Replicated => models::ServiceMode::Replicated {
+    let mode = match (svc.is_job, svc.mode) {
+        (false, ServiceMode::Replicated) => models::ServiceMode::Replicated {
             Replicas: svc.replicas as u64,
         },
-        ServiceMode::Global => models::ServiceMode::Global {},
+        (false, ServiceMode::Global) => models::ServiceMode::Global {},
+        (true, ServiceMode::Replicated) => models::ServiceMode::ReplicatedJob {
+            Replicas: svc.replicas as u64,
+        },
+        (true, ServiceMode::Global) => models::ServiceMode::GlobalJob {
+            Replicas: svc.replicas as u64,
+        },
     };
 
     let ports: Vec<models::PortConfig> = svc
@@ -1355,6 +1362,18 @@ mod tests {
             _ => panic!("expected Replicated"),
         }
     }
+    #[test]
+    fn replicated_job_mode_is_preserved_for_tenant_quota_accounting() {
+        let mut spec = sample_docker_spec();
+        spec.Mode = Some(models::ServiceMode::ReplicatedJob { Replicas: 4 });
+        let state = service_spec_to_state(&spec).unwrap();
+        assert!(state.is_job);
+        assert_eq!(state.replicas, 4);
+        assert!(matches!(
+            service_to_docker(&state).Spec.Mode,
+            Some(models::ServiceMode::ReplicatedJob { Replicas: 4 })
+        ));
+    }
 
     #[test]
     fn user_and_update_policy_survive_the_docker_api_round_trip() {
@@ -1365,6 +1384,7 @@ mod tests {
             image: "nginx".to_string(),
             replicas: 1,
             mode: ServiceMode::Replicated,
+            is_job: false,
             constraints: vec![],
             env: HashMap::new(),
             ports: vec![],
@@ -1446,6 +1466,7 @@ mod tests {
             image: "nginx".to_string(),
             replicas: 1,
             mode: ServiceMode::Replicated,
+            is_job: false,
             constraints: vec![],
             env: {
                 let mut e = HashMap::new();
@@ -1495,6 +1516,7 @@ mod tests {
             last_seen_unix: None,
             role: Default::default(),
             reserved_ports: Vec::new(),
+            nats_user_public_key: None,
         };
         let docker = node_to_docker(&node, true);
         assert_eq!(docker.ID, "1");
@@ -1519,6 +1541,7 @@ mod tests {
             last_seen_unix: None,
             role: Default::default(),
             reserved_ports: Vec::new(),
+            nats_user_public_key: None,
         };
         let docker = node_to_docker(&node, false);
         assert_eq!(docker.Spec.Role, "worker");
@@ -1540,6 +1563,7 @@ mod tests {
             last_seen_unix: None,
             role: Default::default(),
             reserved_ports: Vec::new(),
+            nats_user_public_key: None,
         };
         let docker = node_to_docker(&node, false);
         assert_eq!(docker.Status.State, "down");

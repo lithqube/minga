@@ -18,22 +18,26 @@
 //!
 //! Each redb file stores [`FORMAT_VERSION`] under [`FORMAT_KEY`] in its
 //! metadata table. A store with data and no marker was written by minga 1.0.2
-//! or older (bincode) and cannot be read. Formats v2 through v5 are migrated to
-//! v6 by the state and log stores before the marker is advanced.
+//! Formats v2 through v7 are migrated to v8 by the state and log stores.
 //!
 //! # Wire frame
 //!
 //! A Raft message is `[u32 BE length][u8 FORMAT_VERSION][JSON]`, the length
 //! covering the version byte and the JSON. Since peers reject a different
-//! frame version, v6 requires a coordinated upgrade of every cluster node;
-//! mixed v5/v6 nodes cannot exchange Raft messages.
+//! frame version, v8 requires a coordinated upgrade of every cluster node;
+//! mixed v7/v8 nodes cannot exchange Raft messages.
 
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
 /// Version of the persisted and wire format. Bump it for every persisted
 /// field-shape change and add the corresponding migration.
-pub const FORMAT_VERSION: u8 = 6;
+pub const FORMAT_VERSION: u8 = 8;
+
+/// The persisted version immediately before tenant revocation records were added.
+pub const V7_FORMAT_VERSION: u8 = 7;
+/// The persisted version immediately before node NATS identity was added.
+pub const V6_FORMAT_VERSION: u8 = 6;
 
 /// The persisted version before node records gained tenant ownership.
 pub const V5_FORMAT_VERSION: u8 = 5;
@@ -41,10 +45,10 @@ pub const V5_FORMAT_VERSION: u8 = 5;
 /// The persisted version immediately before tenant records were added.
 pub const V4_FORMAT_VERSION: u8 = 4;
 
-/// An older persisted version migrated by the v6 state and log stores.
+/// An older persisted version migrated by the state and log stores.
 pub const V3_FORMAT_VERSION: u8 = 3;
 
-/// An older persisted version migrated by the v6 state and log stores.
+/// An older persisted version migrated by the state and log stores.
 pub const V2_FORMAT_VERSION: u8 = 2;
 
 /// Metadata key that holds [`FORMAT_VERSION`] in each redb file.

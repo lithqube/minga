@@ -300,6 +300,9 @@ struct NodeArgs {
     /// This node's Raft ID.
     #[arg(long)]
     node_id: u64,
+    /// Tenant bound to this node's NATS credentials and leases.
+    #[arg(long, env = "MINGA_TENANT_ID", default_value = "default")]
+    tenant_id: String,
     /// Address to bind the Raft RPC server (e.g. 0.0.0.0:50051).
     #[arg(long)]
     bind: Option<String>,
@@ -348,8 +351,8 @@ struct NodeArgs {
     /// same token on manager and worker; certificate mapping replaces tokens.
     #[arg(long, env = "MINGA_NATS_TOKEN")]
     nats_token: Option<String>,
-    /// Client-facing TLS files for the built-in NATS sidecar. Set all three
-    /// to require client certificates and map them to per-node permissions.
+    /// Client-facing TLS for the built-in NATS sidecar; client certificates
+    /// are required for transport while operator/JWT credentials authorize users.
     #[arg(long)]
     nats_server_cert: Option<String>,
     #[arg(long)]
@@ -359,9 +362,6 @@ struct NodeArgs {
     /// Address for the built-in sidecar listener (non-loopback requires TLS).
     #[arg(long)]
     nats_listen_addr: Option<String>,
-    /// Worker node IDs authorized by this manager's built-in sidecar.
-    #[arg(long = "nats-worker-id")]
-    nats_worker_ids: Vec<u64>,
     /// Existing NATS cluster route to join (repeatable, `nats://host:6222`).
     #[arg(long = "nats-cluster-route")]
     nats_cluster_routes: Vec<String>,
@@ -428,6 +428,24 @@ struct NodeArgs {
     /// Owner-only 32-byte join-token signing key; use the same key on every manager.
     #[arg(long, env = "MINGA_JOIN_TOKEN_KEY_FILE")]
     join_token_key_file: Option<String>,
+    /// Owner-only NATS operator JWT used by the built-in full resolver.
+    #[arg(long, env = "MINGA_NATS_OPERATOR_JWT")]
+    nats_operator_jwt: Option<String>,
+    /// Full account resolver directory for the built-in sidecar.
+    #[arg(long, env = "MINGA_NATS_RESOLVER_DIR")]
+    nats_resolver_dir: Option<String>,
+    /// Owner-only control-plane account JWT.
+    #[arg(long, env = "MINGA_NATS_ACCOUNT_JWT_FILE")]
+    nats_account_jwt_file: Option<String>,
+    /// Owner-only control-plane account identity NKey seed.
+    #[arg(long, env = "MINGA_NATS_ACCOUNT_SEED_FILE")]
+    nats_account_seed_file: Option<String>,
+    /// Owner-only directory containing `{tenant-id}` scoped signer seed files.
+    #[arg(long, env = "MINGA_NATS_TENANT_SIGNER_DIR")]
+    nats_tenant_signer_dir: Option<String>,
+    /// Owner-only credentials for a user in the NATS system account.
+    #[arg(long, env = "MINGA_NATS_SYS_CREDENTIALS_FILE")]
+    nats_sys_credentials_file: Option<String>,
     /// Owner-only file containing the worker's tenant-bound join token.
     #[arg(long, env = "MINGA_NODE_JOIN_TOKEN_FILE")]
     join_token_file: Option<String>,
@@ -1268,6 +1286,96 @@ fn load_join_token_key(
         .map(Some)
         .map_err(|error| format!("invalid join-token key file {}: {error}", path.display()))
 }
+fn load_nats_credential_issuer(
+    operator_jwt_path: Option<&str>,
+    account_jwt_path: Option<&str>,
+    account_seed_path: Option<&str>,
+    tenant_signer_dir: Option<&str>,
+) -> Result<Option<Arc<minga_api::nats_credentials::NatsCredentialIssuer>>, String> {
+    let configured = [
+        operator_jwt_path,
+        account_jwt_path,
+        account_seed_path,
+        tenant_signer_dir,
+    ];
+    if configured.iter().all(Option::is_none) {
+        return Ok(None);
+    }
+    if configured.iter().any(Option::is_none) {
+        return Err(
+            "NATS operator JWT, account JWT, account seed, and tenant signer directory must be configured together"
+                .to_string(),
+        );
+    }
+    let read_text = |path: &str, limit| -> Result<String, String> {
+        let path = PathBuf::from(path);
+        let bytes = read_owner_only_file(&path, limit)?;
+        String::from_utf8(bytes)
+            .map(|text| text.trim().to_string())
+            .map_err(|_| format!("{} is not UTF-8", path.display()))
+    };
+    let operator_jwt = read_text(operator_jwt_path.unwrap(), 64 * 1024)?;
+    let account_jwt = read_text(account_jwt_path.unwrap(), 64 * 1024)?;
+    let account_seed = read_text(account_seed_path.unwrap(), 256)?;
+    let dir = PathBuf::from(tenant_signer_dir.unwrap());
+    let metadata = std::fs::metadata(&dir).map_err(|error| {
+        format!(
+            "cannot inspect NATS signer directory {}: {error}",
+            dir.display()
+        )
+    })?;
+    if !metadata.is_dir() {
+        return Err(format!("{} is not a directory", dir.display()));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = metadata.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            return Err(format!(
+                "NATS signer directory {} has insecure permissions {mode:o} (expected owner-only)",
+                dir.display()
+            ));
+        }
+    }
+    let mut paths = std::fs::read_dir(&dir)
+        .map_err(|error| {
+            format!(
+                "cannot read NATS signer directory {}: {error}",
+                dir.display()
+            )
+        })?
+        .map(|entry| {
+            entry
+                .map(|entry| entry.path())
+                .map_err(|error| format!("cannot read NATS signer directory entry: {error}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    paths.sort();
+    let mut signers = Vec::with_capacity(paths.len());
+    for path in paths {
+        let tenant_id = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| format!("invalid tenant signer filename in {}", dir.display()))?;
+        minga_state::types::Tenant::validate_id(tenant_id)
+            .map_err(|error| format!("invalid tenant signer filename `{tenant_id}`: {error}"))?;
+        let seed = read_text(
+            path.to_str()
+                .ok_or_else(|| "tenant signer path is not UTF-8".to_string())?,
+            256,
+        )?;
+        signers.push((tenant_id.to_string(), seed));
+    }
+    minga_api::nats_credentials::NatsCredentialIssuer::new(
+        &operator_jwt,
+        &account_jwt,
+        &account_seed,
+        signers,
+    )
+    .map(Arc::new)
+    .map(Some)
+}
 
 fn load_node_join_token(path: Option<&str>) -> Result<Option<String>, String> {
     let Some(path) = path else {
@@ -1287,6 +1395,10 @@ fn load_node_join_token(path: Option<&str>) -> Result<Option<String>, String> {
 /// Runs a node (manager or worker): managers open Raft state, while workers
 /// run only the supervisor against their bus assignments.
 async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
+    if let Err(error) = minga_state::types::Tenant::validate_id(&args.tenant_id) {
+        eprintln!("error: invalid tenant ID: {error}");
+        return ExitCode::FAILURE;
+    }
     if is_manager && args.bind.is_none() {
         eprintln!("error: managers require --bind for the Raft listener");
         return ExitCode::FAILURE;
@@ -1323,6 +1435,30 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
             }
         }
     };
+    let nats_credential_issuer = if is_manager {
+        match load_nats_credential_issuer(
+            args.nats_operator_jwt.as_deref(),
+            args.nats_account_jwt_file.as_deref(),
+            args.nats_account_seed_file.as_deref(),
+            args.nats_tenant_signer_dir.as_deref(),
+        ) {
+            Ok(issuer) => issuer,
+            Err(error) => {
+                eprintln!("error: {error}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        None
+    };
+    if args.nats_operator_jwt.is_some()
+        && (nats_credential_issuer.is_none() || args.nats_sys_credentials_file.is_none())
+    {
+        eprintln!(
+            "error: operator/JWT mode requires scoped signer files and --nats-sys-credentials-file"
+        );
+        return ExitCode::FAILURE;
+    }
     let api_tls_parts = [
         args.api_tls_cert.is_some(),
         args.api_tls_key.is_some(),
@@ -1405,7 +1541,6 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
         || args.nats_server_key.is_some()
         || args.nats_client_ca.is_some()
         || args.nats_listen_addr.is_some()
-        || !args.nats_worker_ids.is_empty()
         || cluster.is_some()
         || args.nats_cluster_port.is_some();
     let tls_parts = [
@@ -1416,10 +1551,6 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
     let tls_count = tls_parts.into_iter().filter(|set| *set).count();
     if tls_count != 0 && tls_count != tls_parts.len() {
         eprintln!("error: --nats-server-cert, --nats-server-key, and --nats-client-ca must be set together");
-        return ExitCode::FAILURE;
-    }
-    if !args.nats_worker_ids.is_empty() && tls_count != tls_parts.len() {
-        eprintln!("error: --nats-worker-id requires client TLS and certificate identity mapping");
         return ExitCode::FAILURE;
     }
     if sidecar_configured && (!is_manager || args.nats_url.is_some()) {
@@ -1578,6 +1709,7 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
     }));
     let identity = minga_node::NodeIdentity {
         node_id: args.node_id,
+        tenant_id: args.tenant_id.clone(),
         address: args.bind.clone().unwrap_or_default(),
         labels,
         capacity: minga_node::host_capacity(),
@@ -1597,6 +1729,11 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
     // - If manager and no --nats-url: spawn nats-server sidecar.
     // - If worker and no --nats-url: error (workers need the manager's NATS URL).
     let _sidecar: Option<NatsSidecar>;
+    let system_credentials_path = if is_manager {
+        args.nats_sys_credentials_file.as_deref().map(PathBuf::from)
+    } else {
+        None
+    };
     let bus: Arc<dyn minga_bus::EventBus> = match &args.nats_url {
         Some(url) => {
             _sidecar = None;
@@ -1605,10 +1742,17 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
                     url,
                     args.nats_token.as_deref(),
                     args.nats_replicas.unwrap_or(1).into(),
+                    system_credentials_path.as_deref(),
                 )
                 .await
             } else {
-                bus::connect_worker_bus(url, args.nats_token.as_deref(), args.node_id).await
+                bus::connect_worker_bus(
+                    url,
+                    args.nats_token.as_deref(),
+                    args.node_id,
+                    &args.tenant_id,
+                )
+                .await
             };
             match connection {
                 Ok(bus) => bus,
@@ -1635,28 +1779,48 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
             }
             // Manager: spawn the NATS sidecar.
             let jwt_auth = match (
-                std::env::var_os("MINGA_NATS_OPERATOR_JWT"),
-                std::env::var_os("MINGA_NATS_RESOLVER_DIR"),
+                args.nats_operator_jwt.as_deref(),
+                args.nats_resolver_dir.as_deref(),
+                args.nats_account_jwt_file.as_deref(),
+                args.nats_account_seed_file.as_deref(),
+                args.nats_tenant_signer_dir.as_deref(),
+                args.nats_sys_credentials_file.as_deref(),
+                nats_credential_issuer.as_ref(),
             ) {
-                (Some(operator_jwt), Some(resolver_dir)) => {
-                    tracing::warn!(
-                        "NATS JWT mode: Minga does not apply its per-node ACL; each user JWT \
-                         must limit the node to its own lease key and subjects, or a node can \
-                         write another node's lease"
-                    );
-                    Some(NatsJwtAuth {
-                        operator_jwt_file: PathBuf::from(operator_jwt),
-                        resolver_dir: PathBuf::from(resolver_dir),
-                    })
-                }
-                (None, None) => None,
+                (
+                    Some(operator),
+                    Some(resolver),
+                    Some(account_jwt),
+                    Some(account_seed),
+                    Some(tenant_dir),
+                    Some(sys_creds),
+                    Some(issuer),
+                ) => Some(NatsJwtAuth {
+                    operator_jwt_file: PathBuf::from(operator),
+                    resolver_dir: PathBuf::from(resolver),
+                    account_jwt_file: PathBuf::from(account_jwt),
+                    account_seed_file: PathBuf::from(account_seed),
+                    tenant_signer_dir: PathBuf::from(tenant_dir),
+                    account_public_key: issuer.account_public_key().to_string(),
+                    system_credentials_file: PathBuf::from(sys_creds),
+                }),
+                (None, None, None, None, None, None, None) => None,
                 _ => {
-                    eprintln!(
-                        "error: MINGA_NATS_OPERATOR_JWT and MINGA_NATS_RESOLVER_DIR must be set together"
-                    );
+                    eprintln!("error: operator/JWT mode requires all account, scoped signer, resolver, and SYS credential files");
                     return ExitCode::FAILURE;
                 }
             };
+            if jwt_auth.is_none()
+                && args
+                    .nats_listen_addr
+                    .as_deref()
+                    .is_some_and(|addr| !matches!(addr, "127.0.0.1" | "::1" | "localhost"))
+            {
+                eprintln!(
+                    "error: a routable NATS sidecar listener requires operator/JWT credentials"
+                );
+                return ExitCode::FAILURE;
+            }
             let tls = args.nats_server_cert.as_ref().map(|cert| ServerTls {
                 cert_file: PathBuf::from(cert),
                 key_file: PathBuf::from(
@@ -1677,7 +1841,6 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
                 data_dir: PathBuf::from(&args.data_dir),
                 node_id: args.node_id,
                 manager_node_ids,
-                worker_node_ids: args.nats_worker_ids.clone(),
                 client_token: args.nats_token.clone(),
                 listen_addr: args
                     .nats_listen_addr
@@ -1698,13 +1861,19 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
             tracing::info!(url = %url, "NATS sidecar ready");
             let replicas = args.nats_replicas.unwrap_or(1).into();
             let connect = if cluster.is_some() && replicas > 1 {
-                bus::connect_bus_with_replica_retry(&url, args.nats_token.as_deref(), replicas)
-                    .await
+                bus::connect_bus_with_replica_retry(
+                    &url,
+                    args.nats_token.as_deref(),
+                    replicas,
+                    system_credentials_path.as_deref(),
+                )
+                .await
             } else {
                 bus::connect_bus(
                     &url,
                     args.nats_token.as_deref(),
                     if cluster.is_some() { 1 } else { replicas },
+                    system_credentials_path.as_deref(),
                 )
                 .await
             };
@@ -1720,6 +1889,25 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
             }
         }
     };
+    if is_manager {
+        let store = state.as_ref().expect("manager StateStore initialized");
+        let tenants = match store.list_tenants().await {
+            Ok(tenants) => tenants,
+            Err(error) => {
+                eprintln!("error: cannot load tenant bus quotas: {error}");
+                return ExitCode::FAILURE;
+            }
+        };
+        for tenant in tenants {
+            if let Err(error) = bus.configure_tenant_quota(&tenant.id, &tenant.quotas).await {
+                eprintln!(
+                    "error: cannot configure bus resources for tenant {}: {error}",
+                    tenant.id
+                );
+                return ExitCode::FAILURE;
+            }
+        }
+    }
     // The node announces itself only after its bus connection is ready.
     let _membership = match minga_node::NodeMembership::start(bus.clone(), identity).await {
         Ok(membership) => membership,
@@ -1749,7 +1937,7 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
             }),
             _ => None,
         };
-        match minga_api::ApiServer::start_with_bus_and_auth_and_tls_and_join_token_key(
+        match minga_api::ApiServer::start_with_bus_and_auth_and_tls_and_signers(
             state
                 .as_ref()
                 .expect("manager StateStore initialized")
@@ -1759,6 +1947,7 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
             args.api_token.clone(),
             api_tls,
             join_token_key.clone(),
+            nats_credential_issuer.clone(),
         )
         .await
         {
@@ -1777,11 +1966,17 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
 
     let ready = minga_telemetry::ReadyState::new();
     if let Some(state) = state.clone() {
-        let (bus, ready, node_id) = (bus.clone(), ready.clone(), args.node_id);
+        let (bus, ready, node_id, tenant_id) = (
+            bus.clone(),
+            ready.clone(),
+            args.node_id,
+            args.tenant_id.clone(),
+        );
         tokio::spawn(async move {
             loop {
                 ready.set_raft_ready(state.current_leader().await.is_some());
-                ready.set_bus_connected(bus.is_alive(node_id).await.is_ok());
+                ready
+                    .set_bus_connected(bus.is_tenant_node_alive(&tenant_id, node_id).await.is_ok());
                 minga_telemetry::METRICS
                     .raft_leader
                     .set(if state.is_leader().await { 1.0 } else { 0.0 });
@@ -1789,11 +1984,17 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
             }
         });
     } else {
-        let (bus, ready, node_id) = (bus.clone(), ready.clone(), args.node_id);
+        let (bus, ready, node_id, tenant_id) = (
+            bus.clone(),
+            ready.clone(),
+            args.node_id,
+            args.tenant_id.clone(),
+        );
         tokio::spawn(async move {
             ready.set_raft_ready(true);
             loop {
-                ready.set_bus_connected(bus.is_alive(node_id).await.is_ok());
+                ready
+                    .set_bus_connected(bus.is_tenant_node_alive(&tenant_id, node_id).await.is_ok());
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
         });
@@ -1937,13 +2138,19 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
     // Create the supervisor with optional agent executor.
     #[allow(unused_mut)]
     let supervisor = match &agent_executor {
-        Some(exec) => minga_node::Supervisor::with_agent_executor(
+        Some(exec) => minga_node::Supervisor::with_tenant_agent_executor(
             runtime,
             bus.clone(),
             exec.clone(),
             args.node_id,
+            &args.tenant_id,
         ),
-        None => minga_node::Supervisor::with_bus(runtime, bus.clone(), args.node_id),
+        None => minga_node::Supervisor::with_tenant_bus(
+            runtime,
+            bus.clone(),
+            args.node_id,
+            &args.tenant_id,
+        ),
     };
     #[cfg(target_os = "linux")]
     let supervisor = match networking {
@@ -2465,7 +2672,7 @@ async fn run_agent(cmd: AgentCommand) -> ExitCode {
                 return ExitCode::FAILURE;
             };
 
-            let bus = match bus::connect_bus(&url, None, 1).await {
+            let bus = match bus::connect_bus(&url, None, 1, None).await {
                 Ok(b) => {
                     let bus: Arc<dyn minga_bus::EventBus> = b;
                     bus
@@ -2536,7 +2743,7 @@ async fn run_logs(task_id: &str, follow: bool, tail: usize, nats_url: Option<&st
         return ExitCode::FAILURE;
     };
 
-    let bus = match bus::connect_bus(url, None, 1).await {
+    let bus = match bus::connect_bus(url, None, 1, None).await {
         Ok(b) => {
             let bus: Arc<dyn minga_bus::EventBus> = b;
             bus

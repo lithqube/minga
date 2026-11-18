@@ -21,7 +21,8 @@ async fn manager_and_worker_api_levels_and_bucket_consumer_limits() {
     );
     assert_eq!(api_level_warning(level, "runtime server"), None);
 
-    let worker = NatsBus::connect_worker(&url, 73)
+    manager.ensure_tenant_resources("runtime").await.unwrap();
+    let worker = NatsBus::connect_worker(&url, 73, "runtime")
         .await
         .expect("connect worker using manager-created buckets");
     assert_eq!(

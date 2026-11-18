@@ -45,8 +45,8 @@ pub struct MemoryBus {
     kv: Mutex<HashMap<String, Vec<u8>>>,
     /// Broadcast channel for KV change notifications.
     kv_tx: broadcast::Sender<KvEvent>,
-    /// Liveness leases: node_id → last refresh and registration payload.
-    leases: Mutex<HashMap<u64, Lease>>,
+    /// Liveness leases: `(tenant_id, node_id)` → last refresh and payload.
+    leases: Mutex<HashMap<(String, u64), Lease>>,
     /// Broadcast channel for lease changes.
     lease_tx: broadcast::Sender<KvEvent>,
     /// Lease TTL.
@@ -57,10 +57,17 @@ pub struct MemoryBus {
     pending_replies: Mutex<HashMap<String, oneshot::Sender<Vec<u8>>>>,
     /// Counter for generating unique reply subjects.
     reply_counter: AtomicU64,
-    /// Broadcast channel for log entries.
     logs_tx: broadcast::Sender<LogEntry>,
+    tenant_logs_tx: broadcast::Sender<(String, LogEntry)>,
     /// Retained log entries per task, oldest first.
     log_history: Mutex<HashMap<String, VecDeque<LogEntry>>>,
+    tenant_log_history: Mutex<HashMap<(String, String), VecDeque<LogEntry>>>,
+    tenant_status: Mutex<HashMap<(String, String), Vec<u8>>>,
+    tenant_audit: Mutex<HashMap<String, VecDeque<crate::AuditRecord>>>,
+    /// Account JWTs accepted through the deterministic resolver simulation.
+    account_claim_updates: Mutex<Vec<String>>,
+    /// Cluster-shared request counters keyed by tenant and window.
+    tenant_api_requests: Mutex<HashMap<(String, u64), u64>>,
 }
 struct Lease {
     refreshed_at: Instant,
@@ -80,6 +87,7 @@ impl MemoryBus {
         let (assignment_tx, _) = broadcast::channel(CHANNEL_CAPACITY);
         let (lease_tx, _) = broadcast::channel(CHANNEL_CAPACITY);
         let (logs_tx, _) = broadcast::channel(CHANNEL_CAPACITY);
+        let (tenant_logs_tx, _) = broadcast::channel(CHANNEL_CAPACITY);
         Arc::new(Self {
             events_tx,
             assignments: Mutex::new(HashMap::new()),
@@ -93,8 +101,18 @@ impl MemoryBus {
             pending_replies: Mutex::new(HashMap::new()),
             reply_counter: AtomicU64::new(0),
             logs_tx,
+            tenant_logs_tx,
             log_history: Mutex::new(HashMap::new()),
+            tenant_log_history: Mutex::new(HashMap::new()),
+            tenant_status: Mutex::new(HashMap::new()),
+            tenant_audit: Mutex::new(HashMap::new()),
+            account_claim_updates: Mutex::new(Vec::new()),
+            tenant_api_requests: Mutex::new(HashMap::new()),
         })
+    }
+    /// Account JWTs accepted by the in-memory resolver simulation.
+    pub fn account_claim_updates(&self) -> Vec<String> {
+        self.account_claim_updates.lock().unwrap().clone()
     }
 }
 
@@ -140,6 +158,32 @@ impl EventBus for MemoryBus {
         });
 
         Ok(Box::pin(ReceiverStream { rx: mpsc_rx }))
+    }
+    async fn subscribe_tenant_events(&self, tenant_id: &str) -> Result<EventStream> {
+        validate_tenant_id(tenant_id)?;
+        self.subscribe_events(&[&subjects::tenant_event_wildcard(tenant_id)])
+            .await
+    }
+    async fn configure_tenant_quota(
+        &self,
+        tenant_id: &str,
+        _quotas: &minga_state::types::TenantQuotas,
+    ) -> Result<()> {
+        validate_tenant_id(tenant_id)
+    }
+    async fn publish_tenant_event(
+        &self,
+        tenant_id: &str,
+        subject: &str,
+        payload: &[u8],
+    ) -> Result<()> {
+        validate_tenant_id(tenant_id)?;
+        if !subject.starts_with(&format!("minga.{tenant_id}.task.")) {
+            return Err(BusError::Publish(
+                "event subject is outside tenant namespace".into(),
+            ));
+        }
+        self.publish_event(subject, payload).await
     }
     async fn put_assignment(&self, key: &str, value: &[u8]) -> Result<()> {
         self.assignments
@@ -236,6 +280,79 @@ impl EventBus for MemoryBus {
         let _ = self.kv_tx.send(event);
         Ok(())
     }
+    async fn put_tenant_status(&self, tenant_id: &str, key: &str, value: &[u8]) -> Result<()> {
+        validate_tenant_id(tenant_id)?;
+        self.tenant_status
+            .lock()
+            .unwrap()
+            .insert((tenant_id.to_owned(), key.to_owned()), value.to_vec());
+        Ok(())
+    }
+
+    async fn get_tenant_status(&self, tenant_id: &str, key: &str) -> Result<Option<Vec<u8>>> {
+        validate_tenant_id(tenant_id)?;
+        Ok(self
+            .tenant_status
+            .lock()
+            .unwrap()
+            .get(&(tenant_id.to_owned(), key.to_owned()))
+            .cloned())
+    }
+
+    async fn list_tenant_status(&self, tenant_id: &str) -> Result<Vec<(String, Vec<u8>)>> {
+        validate_tenant_id(tenant_id)?;
+        Ok(self
+            .tenant_status
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|((tenant, _), _)| tenant == tenant_id)
+            .map(|((_, key), value)| (key.clone(), value.clone()))
+            .collect())
+    }
+
+    async fn list_all_tenant_status(
+        &self,
+        tenant_ids: &[String],
+    ) -> Result<Vec<(String, String, Vec<u8>)>> {
+        for tenant in tenant_ids {
+            validate_tenant_id(tenant)?;
+        }
+        let allowed: HashSet<&str> = tenant_ids.iter().map(String::as_str).collect();
+        Ok(self
+            .tenant_status
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|((tenant, _), _)| allowed.contains(tenant.as_str()))
+            .map(|((tenant, key), value)| (tenant.clone(), key.clone(), value.clone()))
+            .collect())
+    }
+
+    async fn append_audit(&self, record: crate::AuditRecord) -> Result<()> {
+        validate_tenant_id(&record.tenant_id)?;
+        let mut audit = self.tenant_audit.lock().unwrap();
+        let records = audit.entry(record.tenant_id.clone()).or_default();
+        records.push_back(record);
+        while records.len() > LOG_HISTORY_CAPACITY {
+            records.pop_front();
+        }
+        Ok(())
+    }
+
+    async fn list_audit(&self, tenant_id: &str, limit: usize) -> Result<Vec<crate::AuditRecord>> {
+        validate_tenant_id(tenant_id)?;
+        let audit = self.tenant_audit.lock().unwrap();
+        let Some(records) = audit.get(tenant_id) else {
+            return Ok(Vec::new());
+        };
+        let skip = if limit > 0 {
+            records.len().saturating_sub(limit)
+        } else {
+            0
+        };
+        Ok(records.iter().skip(skip).cloned().collect())
+    }
 
     async fn get_status(&self, key: &str) -> Result<Option<Vec<u8>>> {
         Ok(self.kv.lock().unwrap().get(key).cloned())
@@ -268,35 +385,60 @@ impl EventBus for MemoryBus {
     }
 
     async fn refresh_lease(&self, node_id: u64, registration: &[u8]) -> Result<()> {
+        self.refresh_tenant_lease(minga_state::types::DEFAULT_TENANT_ID, node_id, registration)
+            .await
+    }
+
+    async fn refresh_tenant_lease(
+        &self,
+        tenant_id: &str,
+        node_id: u64,
+        registration: &[u8],
+    ) -> Result<()> {
+        validate_tenant_id(tenant_id)?;
         self.leases.lock().unwrap().insert(
-            node_id,
+            (tenant_id.to_owned(), node_id),
             Lease {
                 refreshed_at: Instant::now(),
                 registration: registration.to_vec(),
             },
         );
-        let event = KvEvent {
-            key: subjects::kv_lease(node_id),
+        let _ = self.lease_tx.send(KvEvent {
+            key: subjects::kv_lease(tenant_id, node_id),
             value: Some(registration.to_vec()),
             op: KvOp::Put,
-        };
-        let _ = self.lease_tx.send(event);
+        });
         Ok(())
     }
 
     async fn is_alive(&self, node_id: u64) -> Result<bool> {
+        self.is_tenant_node_alive(minga_state::types::DEFAULT_TENANT_ID, node_id)
+            .await
+    }
+
+    async fn is_tenant_node_alive(&self, tenant_id: &str, node_id: u64) -> Result<bool> {
+        validate_tenant_id(tenant_id)?;
         let leases = self.leases.lock().unwrap();
         Ok(leases
-            .get(&node_id)
+            .get(&(tenant_id.to_owned(), node_id))
             .is_some_and(|lease| lease.refreshed_at.elapsed() < self.lease_ttl))
     }
 
     async fn list_alive_nodes(&self) -> Result<HashSet<u64>> {
+        Ok(self
+            .list_tenant_alive_nodes()
+            .await?
+            .into_iter()
+            .map(|(_, id)| id)
+            .collect())
+    }
+
+    async fn list_tenant_alive_nodes(&self) -> Result<HashSet<(String, u64)>> {
         let leases = self.leases.lock().unwrap();
         Ok(leases
             .iter()
             .filter(|(_, lease)| lease.refreshed_at.elapsed() < self.lease_ttl)
-            .map(|(node_id, _)| *node_id)
+            .map(|((tenant_id, node_id), _)| (tenant_id.clone(), *node_id))
             .collect())
     }
 
@@ -307,8 +449,8 @@ impl EventBus for MemoryBus {
             leases
                 .iter()
                 .filter(|(_, lease)| lease.refreshed_at.elapsed() < self.lease_ttl)
-                .map(|(node_id, lease)| KvEvent {
-                    key: subjects::kv_lease(*node_id),
+                .map(|((tenant_id, node_id), lease)| KvEvent {
+                    key: subjects::kv_lease(tenant_id, *node_id),
                     value: Some(lease.registration.clone()),
                     op: KvOp::Put,
                 })
@@ -390,6 +532,40 @@ impl EventBus for MemoryBus {
         Ok(Box::pin(ReceiverStream { rx }))
     }
 
+    async fn update_account_claim(&self, account_jwt: &str) -> Result<()> {
+        if account_jwt.trim().is_empty() {
+            return Err(BusError::Other(
+                "account JWT update cannot be empty".to_string(),
+            ));
+        }
+        self.account_claim_updates
+            .lock()
+            .unwrap()
+            .push(account_jwt.to_string());
+        Ok(())
+    }
+    async fn check_tenant_request_quota(
+        &self,
+        tenant_id: &str,
+        window_start: u64,
+        limit: u64,
+    ) -> Result<bool> {
+        minga_state::types::Tenant::validate_id(tenant_id)
+            .map_err(|error| BusError::Other(format!("invalid tenant ID: {error}")))?;
+        if limit == 0 {
+            return Ok(false);
+        }
+        let mut requests = self.tenant_api_requests.lock().unwrap();
+        let count = requests
+            .entry((tenant_id.to_owned(), window_start))
+            .or_default();
+        if *count >= limit {
+            return Ok(false);
+        }
+        *count += 1;
+        Ok(true)
+    }
+
     async fn reply(&self, reply_subject: &str, payload: &[u8]) -> Result<()> {
         let sender = self.pending_replies.lock().unwrap().remove(reply_subject);
         match sender {
@@ -426,6 +602,32 @@ impl EventBus for MemoryBus {
     async fn publish_node_log(&self, _node_id: u64, task_id: &str, entry: &LogEntry) -> Result<()> {
         self.publish_log(task_id, entry).await
     }
+    async fn publish_tenant_node_log(
+        &self,
+        tenant_id: &str,
+        _node_id: u64,
+        task_id: &str,
+        entry: &LogEntry,
+    ) -> Result<()> {
+        validate_tenant_id(tenant_id)?;
+        if entry.task_id != task_id {
+            return Err(BusError::Publish(
+                "log subject task ID does not match entry".to_string(),
+            ));
+        }
+        let mut history = self.tenant_log_history.lock().unwrap();
+        let entries = history
+            .entry((tenant_id.to_owned(), task_id.to_owned()))
+            .or_default();
+        entries.push_back(entry.clone());
+        while entries.len() > LOG_HISTORY_CAPACITY {
+            entries.pop_front();
+        }
+        let _ = self
+            .tenant_logs_tx
+            .send((tenant_id.to_owned(), entry.clone()));
+        Ok(())
+    }
 
     async fn subscribe_logs(&self, task_id: &str) -> Result<LogEventStream> {
         let mut rx = self.logs_tx.subscribe();
@@ -453,6 +655,34 @@ impl EventBus for MemoryBus {
 
         Ok(Box::pin(ReceiverStream { rx: mpsc_rx }))
     }
+    async fn subscribe_tenant_logs(
+        &self,
+        tenant_id: &str,
+        task_id: &str,
+    ) -> Result<LogEventStream> {
+        validate_tenant_id(tenant_id)?;
+        let mut rx = self.tenant_logs_tx.subscribe();
+        let tenant_id = tenant_id.to_owned();
+        let task_id = task_id.to_owned();
+        let (tx, mpsc_rx) = mpsc::channel(CHANNEL_CAPACITY);
+        tokio::spawn(async move {
+            loop {
+                match rx.recv().await {
+                    Ok((tenant, entry))
+                        if tenant == tenant_id && (task_id == "*" || entry.task_id == task_id) =>
+                    {
+                        if tx.send(entry).await.is_err() {
+                            break;
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
+        Ok(Box::pin(ReceiverStream { rx: mpsc_rx }))
+    }
 
     async fn log_history(&self, task_id: &str, tail: usize) -> Result<Vec<LogEntry>> {
         let history = self.log_history.lock().unwrap();
@@ -472,6 +702,30 @@ impl EventBus for MemoryBus {
             entries.drain(..entries.len() - tail);
         }
 
+        Ok(entries)
+    }
+    async fn tenant_log_history(
+        &self,
+        tenant_id: &str,
+        task_id: &str,
+        tail: usize,
+    ) -> Result<Vec<LogEntry>> {
+        validate_tenant_id(tenant_id)?;
+        let history = self.tenant_log_history.lock().unwrap();
+        let mut entries = Vec::new();
+        if task_id == "*" {
+            for ((tenant, _), task_entries) in history.iter() {
+                if tenant == tenant_id {
+                    entries.extend(task_entries.iter().cloned());
+                }
+            }
+        } else if let Some(task_entries) = history.get(&(tenant_id.to_owned(), task_id.to_owned()))
+        {
+            entries.extend(task_entries.iter().cloned());
+        }
+        if tail > 0 && entries.len() > tail {
+            entries.drain(..entries.len() - tail);
+        }
         Ok(entries)
     }
 }
@@ -516,6 +770,11 @@ fn now_millis() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+fn validate_tenant_id(tenant_id: &str) -> Result<()> {
+    minga_state::types::Tenant::validate_id(tenant_id)
+        .map_err(|error| BusError::Other(format!("invalid tenant ID: {error}")))
 }
 
 // ---------------------------------------------------------------------------
@@ -767,6 +1026,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn same_node_id_in_different_tenants_has_distinct_leases() {
+        let bus = MemoryBus::new();
+        bus.refresh_tenant_lease("acme", 7, b"acme registration")
+            .await
+            .unwrap();
+        bus.refresh_tenant_lease("beta", 7, b"beta registration")
+            .await
+            .unwrap();
+
+        assert!(bus.is_tenant_node_alive("acme", 7).await.unwrap());
+        assert!(bus.is_tenant_node_alive("beta", 7).await.unwrap());
+        assert_eq!(
+            bus.list_tenant_alive_nodes().await.unwrap(),
+            HashSet::from([("acme".to_owned(), 7), ("beta".to_owned(), 7)])
+        );
+    }
+
+    #[tokio::test]
+    async fn same_node_id_assignments_and_status_are_isolated_by_tenant() {
+        let bus = MemoryBus::new();
+        let acme_key = subjects::kv_assignment_task("acme", 7, "task");
+        let beta_key = subjects::kv_assignment_task("beta", 7, "task");
+        bus.put_assignment(&acme_key, b"acme").await.unwrap();
+        bus.put_assignment(&beta_key, b"beta").await.unwrap();
+        assert_eq!(
+            bus.get_assignment(&acme_key).await.unwrap(),
+            Some(b"acme".to_vec())
+        );
+        assert_eq!(
+            bus.get_assignment(&beta_key).await.unwrap(),
+            Some(b"beta".to_vec())
+        );
+        bus.put_tenant_status("acme", "node.7.task.task", b"acme")
+            .await
+            .unwrap();
+        bus.put_tenant_status("beta", "node.7.task.task", b"beta")
+            .await
+            .unwrap();
+        assert_eq!(
+            bus.get_tenant_status("acme", "node.7.task.task")
+                .await
+                .unwrap(),
+            Some(b"acme".to_vec())
+        );
+        assert_eq!(
+            bus.get_tenant_status("beta", "node.7.task.task")
+                .await
+                .unwrap(),
+            Some(b"beta".to_vec())
+        );
+    }
+
+    #[tokio::test]
     async fn test_lease_per_node() {
         let bus = MemoryBus::with_lease_ttl(Duration::from_millis(100));
 
@@ -781,7 +1093,7 @@ mod tests {
     async fn test_request_reply() {
         let bus = MemoryBus::new();
         let mut requests = bus
-            .subscribe_requests(&subjects::ctl_ping(1))
+            .subscribe_requests(&subjects::ctl_ping("default", 1))
             .await
             .unwrap();
 
@@ -794,7 +1106,11 @@ mod tests {
         });
 
         let reply = bus
-            .request(&subjects::ctl_ping(1), b"ping", Duration::from_secs(1))
+            .request(
+                &subjects::ctl_ping("default", 1),
+                b"ping",
+                Duration::from_secs(1),
+            )
             .await
             .unwrap();
         assert_eq!(reply, b"pong");
@@ -965,5 +1281,79 @@ mod tests {
         assert_eq!(entries.len(), 2);
         assert!(entries.iter().any(|(k, v)| k == "task.a" && v == b"one"));
         assert!(entries.iter().any(|(k, v)| k == "task.b" && v == b"two"));
+    }
+    #[tokio::test]
+    async fn tenant_request_quota_is_atomic_and_isolated_by_window_and_tenant() {
+        let bus = MemoryBus::new();
+        for _ in 0..3 {
+            assert!(bus
+                .check_tenant_request_quota("tenant-a", 100, 3)
+                .await
+                .unwrap());
+        }
+        assert!(!bus
+            .check_tenant_request_quota("tenant-a", 100, 3)
+            .await
+            .unwrap());
+        assert!(bus
+            .check_tenant_request_quota("tenant-b", 100, 3)
+            .await
+            .unwrap());
+        assert!(bus
+            .check_tenant_request_quota("tenant-a", 101, 3)
+            .await
+            .unwrap());
+    }
+    #[tokio::test]
+    async fn tenant_status_and_audit_are_isolated() {
+        let bus = MemoryBus::new();
+        bus.put_tenant_status("alpha", "node.1.task.x", b"running")
+            .await
+            .unwrap();
+        bus.put_tenant_status("beta", "node.1.task.x", b"failed")
+            .await
+            .unwrap();
+        assert_eq!(
+            bus.get_tenant_status("alpha", "node.1.task.x")
+                .await
+                .unwrap(),
+            Some(b"running".to_vec())
+        );
+        assert_eq!(bus.list_tenant_status("alpha").await.unwrap().len(), 1);
+        assert_eq!(
+            bus.list_all_tenant_status(&["alpha".to_string()])
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        let record = crate::AuditRecord {
+            tenant_id: "alpha".into(),
+            actor: "node-1".into(),
+            action: "task.start".into(),
+            resource_path: "/tasks/task.x".into(),
+            occurred_at_unix: 1,
+        };
+        bus.append_audit(record.clone()).await.unwrap();
+        assert_eq!(bus.list_audit("alpha", 100).await.unwrap(), vec![record]);
+        assert!(bus.list_audit("beta", 100).await.unwrap().is_empty());
+        bus.publish_tenant_node_log("alpha", 1, "task.x", &LogEntry::stdout("task.x", b"alpha"))
+            .await
+            .unwrap();
+        bus.publish_tenant_node_log("beta", 1, "task.x", &LogEntry::stdout("task.x", b"beta"))
+            .await
+            .unwrap();
+        let alpha_logs = bus.tenant_log_history("alpha", "task.x", 10).await.unwrap();
+        assert_eq!(alpha_logs.len(), 1);
+        assert_eq!(alpha_logs[0].data, b"alpha");
+        assert!(bus
+            .tenant_log_history("other", "task.x", 10)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(bus
+            .get_tenant_status("../beta", "node.1.task.x")
+            .await
+            .is_err());
     }
 }

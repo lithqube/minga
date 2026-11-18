@@ -42,6 +42,10 @@ pub struct Tenant {
     pub name: String,
     #[serde(default)]
     pub quotas: TenantQuotas,
+    /// Cluster-wide revoked worker NKeys, stored on the permanent default tenant
+    /// so deleting another tenant cannot make an old NATS identity live again.
+    #[serde(default)]
+    pub nats_revoked_user_public_keys: Vec<String>,
     /// Unix timestamp in seconds when the tenant was created.
     pub created_at: u64,
 }
@@ -76,6 +80,10 @@ pub struct TenantQuotas {
     pub tasks: Option<u64>,
     pub secrets: Option<u64>,
     pub networks: Option<u64>,
+    #[serde(default)]
+    pub volumes: Option<u64>,
+    #[serde(default)]
+    pub configs: Option<u64>,
     pub jobs: Option<u64>,
     pub desired_state_bytes: Option<u64>,
     pub api_requests_per_second: Option<u64>,
@@ -137,6 +145,9 @@ pub struct ClusterNode {
     /// Host-mode ports unavailable for scheduling on this node.
     #[serde(default)]
     pub reserved_ports: Vec<ReservedPort>,
+    /// NATS user public NKey, stored to revoke this node's credentials.
+    #[serde(default)]
+    pub nats_user_public_key: Option<String>,
 }
 
 /// Checks a `user` value is `user[:group]`, each part a number or a name of
@@ -290,6 +301,9 @@ pub struct Service {
     pub image: String,
     pub replicas: u32,
     pub mode: ServiceMode,
+    /// Docker job-mode service, counted against the tenant's job quota.
+    #[serde(default)]
+    pub is_job: bool,
     /// Placement constraints, e.g. `node.labels.gpu == true`.
     pub constraints: Vec<String>,
     pub env: HashMap<String, String>,
@@ -425,10 +439,14 @@ pub fn published_port_conflict<'a>(
                 published(other_port).as_ref() == Some(&tuple)
                     && (port.mode == PortMode::Ingress || other_port.mode == PortMode::Ingress)
             }) {
-                return Some(format!(
-                    "ingress port {}/{} is already used by service {}",
-                    tuple.0, tuple.1, other.id
-                ));
+                return Some(if other.tenant_id == service.tenant_id {
+                    format!(
+                        "ingress port {}/{} is already used by service {}",
+                        tuple.0, tuple.1, other.id
+                    )
+                } else {
+                    format!("ingress port {}/{} is already in use", tuple.0, tuple.1)
+                });
             }
         }
     }
@@ -471,6 +489,14 @@ pub enum TaskState {
     Stopping,
     Stopped,
     Failed,
+}
+
+impl TaskState {
+    /// A stopped or failed task no longer runs and does not count toward
+    /// the tenant's task quota.
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Stopped | Self::Failed)
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -705,10 +731,66 @@ mod tests {
             id: "tenant-a".into(),
             name: " ".into(),
             quotas: TenantQuotas::default(),
+            nats_revoked_user_public_keys: Vec::new(),
             created_at: 1,
         }
         .validate()
         .is_err());
+    }
+    fn service_with_ingress_port(id: &str, tenant_id: &str) -> Service {
+        Service {
+            id: id.to_owned(),
+            tenant_id: tenant_id.to_owned(),
+            name: id.to_owned(),
+            image: "nginx".to_owned(),
+            replicas: 1,
+            mode: ServiceMode::Replicated,
+            is_job: false,
+            constraints: Vec::new(),
+            env: HashMap::new(),
+            ports: vec![PortMapping {
+                target: 80,
+                published: Some(8080),
+                protocol: "tcp".to_owned(),
+                mode: PortMode::Ingress,
+            }],
+            networks: Vec::new(),
+            resources: ResourceSpec::default(),
+            agent: None,
+            restart_policy: RestartPolicy::default(),
+            secrets: Vec::new(),
+            command: Vec::new(),
+            entrypoint: Vec::new(),
+            labels: HashMap::new(),
+            healthcheck: None,
+            mounts: Vec::new(),
+            user: None,
+            extra_hosts: Vec::new(),
+            update: UpdatePolicy::default(),
+            rollback: None,
+            previous: None,
+        }
+    }
+
+    #[test]
+    fn cross_tenant_ingress_conflict_does_not_disclose_service_id() {
+        let owner = service_with_ingress_port("tenant-a.web", "tenant-a");
+        let request = service_with_ingress_port("tenant-b.web", "tenant-b");
+        let conflict = published_port_conflict(&request, [&owner]).unwrap();
+
+        assert_eq!(conflict, "ingress port 8080/tcp is already in use");
+        assert!(!conflict.contains("tenant-a.web"));
+    }
+
+    #[test]
+    fn same_tenant_ingress_conflict_names_service() {
+        let owner = service_with_ingress_port("tenant-a.web", "tenant-a");
+        let request = service_with_ingress_port("tenant-a.api", "tenant-a");
+
+        assert_eq!(
+            published_port_conflict(&request, [&owner]).as_deref(),
+            Some("ingress port 8080/tcp is already used by service tenant-a.web")
+        );
     }
 
     #[test]
@@ -774,6 +856,7 @@ mod tests {
             image: String::new(),
             replicas: 1,
             mode: ServiceMode::Replicated,
+            is_job: false,
             constraints: vec![],
             env: HashMap::new(),
             ports: vec![],

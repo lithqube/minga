@@ -35,6 +35,7 @@ pub async fn cluster() -> Cluster {
     );
     let identity = NodeIdentity {
         node_id: 1,
+        tenant_id: "default".into(),
         address: "127.0.0.1:50051".to_string(),
         labels: Default::default(),
         capacity: ResourceSpec {
@@ -50,7 +51,9 @@ pub async fn cluster() -> Cluster {
     };
     store.upsert_node(identity.cluster_node()).await.unwrap();
     let bus = MemoryBus::new();
-    bus.refresh_lease(1, b"registration").await.unwrap();
+    bus.refresh_tenant_lease("default", 1, b"registration")
+        .await
+        .unwrap();
     let scheduler = minga_scheduler::Scheduler::with_bus(store.clone(), bus.clone());
     tokio::spawn(async move { scheduler.run(Duration::from_millis(100)).await });
 

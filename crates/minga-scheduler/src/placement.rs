@@ -411,11 +411,13 @@ mod tests {
             last_seen_unix: None,
             role: Default::default(),
             reserved_ports: Vec::new(),
+            nats_user_public_key: None,
         }
     }
 
     fn svc(id: &str, replicas: u32, mode: ServiceMode) -> Service {
         Service {
+            is_job: false,
             id: id.to_string(),
             tenant_id: "default".to_string(),
             name: id.to_string(),

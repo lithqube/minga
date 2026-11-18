@@ -135,6 +135,7 @@ mod tests {
             last_seen_unix: None,
             role: Default::default(),
             reserved_ports: Vec::new(),
+            nats_user_public_key: None,
         }
     }
 

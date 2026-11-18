@@ -195,7 +195,7 @@ async fn replicated_bus_survives_losing_one_server() {
     assert_eq!(replicas(&bus, "KV_MINGA_ASSIGN").await, 3);
 
     // New copies catch up for a moment after scaling; writes can time out.
-    eventually("put", || bus.put_status("node.77.task.ha", b"running")).await;
+    eventually("put", || bus.put_status("internal.ha-test", b"running")).await;
     // `ensure_replicas` returns once the server accepts R3. Stopping a server
     // before the new followers are current leaves no quorum to elect a leader.
     eventually("followers current", || async {
@@ -261,6 +261,6 @@ async fn replicated_bus_survives_losing_one_server() {
         .expect("a non-leader server");
     servers[victim].child.kill().expect("stop one server");
     servers[victim].child.wait().expect("reap stopped server");
-    let status = eventually("get_status", || survivor.get_status("node.77.task.ha")).await;
+    let status = eventually("get_status", || survivor.get_status("internal.ha-test")).await;
     assert_eq!(status.as_deref(), Some(&b"running"[..]));
 }

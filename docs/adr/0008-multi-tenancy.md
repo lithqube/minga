@@ -5,12 +5,12 @@
 
 ## Context
 
-Minga will run workloads for several customers on one cluster. Today, nothing separates them:
+At ADR adoption, Minga had no tenant boundary:
 
 - **The stack is a name prefix, not a boundary.** `Secret`, `Config`, `Network` and `Volume` are cluster-level objects (`crates/minga-state/src/types.rs`). A `SecretRef` names a secret ID, and the API checks only that the secret is declared somewhere, not who owns it (`crates/minga-api/src/handlers.rs:519`).
 - **Roles are cluster-wide.** An ADR 0005 certificate carries a caller (`CN`) and a role (`OU`), so a deployer can change every stack.
-- **The bus has no tenant segment.** Subjects are `minga.task.>`, `minga.node.>` and `minga.egress.>`, all in one NATS account. Workers already get per-node permissions: `verify_and_map` maps a certificate to a user whose ACL comes from `subjects::worker_acl` (`crates/minga-cli/src/sidecar.rs`). Network records used to be shared at `net.<id>`, readable by every worker. They are now projected per node at `node.<n>.net.<id>`, and only to nodes running a task on that network. One gap remains: all logs share one `MINGA_LOGS` stream (512 MiB, discard old).
-- **Nodes, the per-node egress proxy and the WireGuard mesh are shared** by everything that runs on them.
+- **The bus originally had no tenant segment.** Phase 15 adds tenant-first subjects and keys, node-scoped worker credentials, per-tenant status/log/audit resources and manager-only shared assignments/events. Networks are projected per node and tenant.
+- **Nodes, the per-node egress proxy and the WireGuard mesh were shared** by everything that ran on them; Phase 15 assigns each worker to one tenant and filters placement and peers accordingly.
 
 ## Decision
 
@@ -72,27 +72,20 @@ A tenant over quota gets 429 or 507 with the quota named. Quotas are desired sta
 **Tenants never connect to Minga's NATS.** Only managers and workers do, and a worker runs on hardware dedicated to one tenant. The threat is a tenant who escapes a container and uses the worker's bus credentials. The defence is permissions scoped to that node and tenant, not one NATS account per tenant: accounts would split the control-plane data that managers must read as a whole, and need cross-account imports to put it back together.
 
 - **One `MINGA` account for the control plane**, plus the NATS `SYS` account. Per-tenant accounts are kept for a later tenant bus, where tenant code does connect (agent-plane roadmap F16).
-- **Every subject and key carries the tenant** right after the prefix: `minga.<tenant>.task.<id>.status`, `$KV.MINGA_ASSIGN.<tenant>.node.<n>.>`, `$KV.MINGA_ASSIGN.<tenant>.net.<id>`. Tenant IDs use NATS token characters only (`a–z 0–9 - _`) and never start with `$`.
-- **Worker permissions become per tenant.** The per-node network grant (`node.<n>.net.>`, already in place) moves under the tenant segment. Consumers are named after the node, so the `$JS.API.CONSUMER.INFO` grant can name only the node's own consumers. `STREAM.INFO` on shared buckets still reveals bucket size; that is accepted and documented.
-- **Workers write only to per-tenant streams and buckets:**
-  - `MINGA_LOGS_<tenant>`
-  - `MINGA_STATUS_<tenant>`
-  - `MINGA_USAGE_<tenant>`
-  - `MINGA_BUDGET_<tenant>`
+- **Every subject and key carries the tenant** immediately after the prefix: `minga.<tenant>.task.<id>.status`, `$KV.MINGA_ASSIGN.<tenant>.node.<n>.>`, `$KV.MINGA_LEASES.<tenant>.lease.node.<n>`. Tenant IDs use NATS token characters only (`a–z 0–9 - _`) and never start with `$`.
+- **Worker permissions are tenant-and-node scoped.** Assignment consumers are named with both tenant and node; a worker reads only its own task, network, ingress, WireGuard, lease and status keys, and writes only its own lease, status and logs. It cannot publish shared lifecycle events or audit records. `STREAM.INFO` on shared buckets still reveals bucket size; that is accepted and documented.
+- **Worker resources are tenant-scoped:**
+  - `MINGA_LOGS_<tenant>` and `MINGA_STATUS_<tenant>` are worker-writable.
+  - `MINGA_USAGE_<tenant>` and `MINGA_BUDGET_<tenant>` are pre-created for tenant accounting.
 
-  Each has `max_bytes` and `max_age` from the tenant's quota, so one tenant's log flood evicts only its own logs. Buckets written only by managers (`MINGA_ASSIGN`, `MINGA_EVENTS`) and one-key-per-node `MINGA_LEASES` stay shared, keyed by tenant.
-- **Identity moves to operator/JWT mode with a full resolver.** Today workers are a static `authorization.users` list built from `--nats-worker-ids`, so adding a worker means regenerating the sidecar config. In the new model:
-  - The `MINGA` account has one **scoped signing key per tenant**. Its permission template allows only that tenant's subjects, using user tags for the node (`{{tag(node)}}`).
-  - The join flow (§3) mints the node's user JWT with that key, so no sidecar restart is needed for a join or a new tenant.
-  - Removing a node revokes its user.
-  - A leaked tenant key can mint users for its own tenant only.
-  - mTLS stays as the transport.
-  - **Initial key custody:** NATS operator/account and tenant-scoped signing keys are manager-local files, provisioned with restrictive permissions; they are never stored in Raft, JetStream, logs, or worker images. This is an initial software-signer deployment, not an HSM-equivalent boundary.
-  - Each manager that may issue credentials must have the same signer material installed locally; it is not replicated. A later signer-provider integration can move key operations to an HSM, Vault, or service without changing the worker credential contract.
-- **External NATS** (`MINGA_NATS_URL`): a multi-tenant cluster needs the bundled sidecar, or an external server in operator mode with the same account layout. Docs ship the layout, and Minga checks it at startup.
-- **Server version.** The release bundles nats-server v2.15.3. CI tests v2.14.10 and v2.15.3; external servers below JetStream API level 4 get a manager startup warning. Managers query `$JS.API.INFO` instead of parsing server version strings. Consumer-limit update failures during mixed-version rollouts warn and retry on the next manager connection.
-  - From 2.12, the server rejects unknown fields on JetStream API requests (strict mode). `setup_kv` reads `info().config` and sends it back through `update_stream`. It is accepted on 2.15.3, and the 2.14.10 and 2.15.3 suites cover KV stream updates; the three-server cluster test covers `ensure_replicas`.
-  - Changing the lease TTL failed on any server version: a shorter TTL kept the old duplicate window, which the server refuses to keep longer than max age. `setup_kv` now resizes the window too.
+  Tenant `jetstream_bytes` and `jetstream_age_secs` limits configure each tenant stream and KV bucket. `MINGA_ASSIGN` and `MINGA_EVENTS` are shared and manager-only; `MINGA_LEASES` is shared with tenant-first keys.
+- **Identity uses operator/JWT mode with a full resolver.** The `MINGA` account has one scoped signing key per tenant. Its permission template allows only that tenant's subjects, using user tags for the node (`{{tag(node)}}`). The join flow (§3) mints the node's user JWT with that key, so new workers need no sidecar restart.
+  - Removing a node revokes its user; revoked public keys are recorded in replicated tenant state so account claims remain revoked after manager restart.
+  - A leaked tenant key can mint users for its own tenant only. mTLS remains the transport.
+  - **Initial key custody:** NATS operator/account and tenant-scoped signing keys are manager-local files with restrictive permissions; they are never stored in Raft, JetStream, logs, or worker images. This is a software-signer deployment, not an HSM-equivalent boundary.
+  - Each manager that may issue credentials needs the same signer material locally; it is not replicated. A later signer-provider integration can move key operations to an HSM, Vault, or service without changing the worker credential contract.
+- **External NATS** (`MINGA_NATS_URL`): a multi-tenant cluster needs the bundled sidecar or an external server in operator mode with the same account layout. Minga checks the layout at startup.
+- **Server version.** The release bundles nats-server v2.15.3. CI tests v2.14.10 and v2.15.3; external servers below JetStream API level 4 get a manager startup warning. Managers query `$JS.API.INFO`, not version strings.
 
 ## Rule for every change: tenancy checklist
 
@@ -136,7 +129,7 @@ Every plan, ADR and PR that adds state, an endpoint, a bus subject, a node-local
 0. **T0 — complete (Phase 14).** The release bundles nats-server v2.15.3, external NATS v2.14.10 and v2.15.3 pass the bus suite, manager feature gating uses API level 4, and single-server plus rolling upgrade proofs passed.
 1. **T1 — complete.** The `Tenant` type and quotas are persisted desired state; existing clusters receive a replicated `default` tenant. Cluster operators can create, list, update and delete empty tenants through `/minga/tenants`, authenticated by the current cluster admin token. Deleting `default` or a tenant that owns resources is refused.
 2. **T2 — complete.** `minga tls issue-client` issues client-auth certificates with caller (`CN`), role (`OU`) and tenant (`O`); managers can require API mTLS with a dedicated client CA. Tenant-scoped Docker routes and nested responses filter by tenant, and foreign lookups return 404. Tenant CRUD, node inventory, cluster info and cluster health/metrics routes require a cluster operator (`O=*` or the configured API token); `O=*` operators do not receive tenant workload access. Missing `O` maps to `default` only while it is the sole tenant. A bearer token retains default-tenant workload access only while `default` is the sole tenant.
-3. **T3 — in progress.** The hard placement filter, manager workload
+3. **T3 — implementation complete; verification open.** The hard placement filter, manager workload
    exclusion and tenant-scoped WireGuard peer sets are implemented.
    `POST /nodes` pre-assigns a tenant; cluster operators can mint a 15-minute
    node-bound join token at `POST /minga/nodes/{id}/join-token`. Managers
@@ -146,10 +139,9 @@ Every plan, ADR and PR that adds state, an endpoint, a bus subject, a node-local
    tenant in JetStream so later renewals cannot change it or require a live
    token. Until that record exists, the scheduler gives a non-default node no
    tasks and no WireGuard peers, even with a live lease. The same owner-only 32-byte signing key must be
-   provisioned on every manager. This depends on node-scoped NATS permissions:
-   certificate mapping or JWT user policy must restrict each client to its own
-   lease key. T3 end-to-end verification remains open.
-4. **T4.** Tenant segments in subjects and keys, the per-tenant worker ACL, per-tenant streams and buckets, and operator/JWT mode with scoped signing keys per tenant.
-5. **T5.** Quotas and the per-tenant audit trail.
+   provisioned on every manager. T3 implementation merged in PR #98; end-to-end
+   tenant-isolation verification remains open.
+4. **T4 — implementation complete.** Tenant-first bus subjects and keys, tenant-and-node worker ACLs, per-tenant status/log/audit resources, manager-only shared events and assignments, scoped operator/JWT credentials and persisted NATS user revocation.
+5. **T5 — implementation complete.** Tenant object/state quotas and API request rates are enforced; JetStream byte/age limits apply to each tenant stream and KV bucket; tenant-scoped audit is available at `/v{version}/audit` and cluster-operator audit at `/minga/audit`.
 
 T1 and T2 come before agent-plane roadmap order 2 (budgets), because budgets and usage are tenant-owned.

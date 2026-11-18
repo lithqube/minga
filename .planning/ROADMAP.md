@@ -67,7 +67,7 @@ Sequential implementation for one developer: B (NATS TLS/transport boundary) →
 **Requirements:** WG-ADR, WG-SUBNET, WG-KEYS, WG-PEERS, WG-NAT, WG-ISOL, WG-INGRESS, WG-PROOF
 **Plans:** `.planning/phases/13-wireguard-mesh/13-PLAN.md`
 **Mode:** standard
-**Status:** In progress — code complete through 13-06 (PRs #81, #83, #86); 13-07 needs a host with kernel WireGuard and `wg` tooling
+- **Status:** In progress — code complete through 13-06 (PRs #81, #83, #86); 13-07 live VM proof and iperf3 measurements are deferred until release readiness. Cross-node networking remains unsupported until that proof.
 
 - [x] 13-01 — ADR 0007: WireGuard mesh and routing mesh (no code)
 - [x] 13-02 — Unique subnets and strict network `driver_opts` (independent of Phase 12)
@@ -75,7 +75,7 @@ Sequential implementation for one developer: B (NATS TLS/transport boundary) →
 - [x] 13-04 — Peer sets, /32 routes, proxy ARP, cross-node isolation
 - [x] 13-05 — NAT traversal by relay through managers
 - [x] 13-06 — Routing mesh (`mode: ingress` as in Swarm, cluster-wide port reservation)
-- [ ] 13-07 — Live proof on VMs, iperf3 numbers, docs, CHANGELOG, site roadmap
+- [ ] 13-07 — Live VM proof, iperf3 numbers, docs, CHANGELOG, site roadmap (deferred until release readiness; no VM tests during Phase 15)
 
 ## Phase 14: Supported NATS server line (tenancy T0)
 **Goal:** Bundle nats-server 2.15.3 instead of the out-of-support 2.10.22, prove the bus on both supported lines (2.14, 2.15) in CI that fails closed, prove an existing cluster's JetStream data survives the upgrade, and read the server's `api.level` on managers (warn below 2.14).
@@ -102,10 +102,11 @@ Sequential implementation for one developer: B (NATS TLS/transport boundary) →
 **Requirements:** TEN-STATE, TEN-IDENTITY, TEN-SCOPE, TEN-OPERATOR, TEN-NODE, TEN-BUS, TEN-QUOTA
 **Plans:** `docs/adr/0008-multi-tenancy.md` (the delivery list is the plan; the ADR's tenancy checklist governs every change)
 **Mode:** standard
-**Status:** In progress — T1 and T2 merged (PRs #92, #93, #94); T3 placement and peer isolation are implemented, while join credentials depend on the T4 NATS identity foundation. Initial signer custody is manager-local; see ADR 0008.
+- **Status:** Implementation complete for T1–T5; T3 end-to-end proof remains open and is deferred until release readiness. No VM tests during Phase 15.
 
 - [x] T1 — Tenant as desired state: the `Tenant` type, quotas, the replicated `default` tenant, cluster-operator CRUD
 - [x] T2 — Identity and API scoping: the tenant in the client certificate, tenant-filtered routes, 404 for foreign lookups, operator-only cluster routes
-- [ ] T3 — Node join tokens per tenant, the hard placement filter, managers without tenant workloads once a cluster has two tenants, WireGuard peer sets per tenant
-- [ ] T4 — Tenant segments in bus subjects and keys, per-tenant worker ACL, streams and buckets, operator/JWT mode with scoped signing keys (**authentication foundation starts before T3 enrollment**)
-- [ ] T5 — Quota enforcement and the per-tenant audit trail
+- [x] T3 implementation — Tenant-bound node joins, hard tenant placement, manager workload exclusion, and tenant-scoped WireGuard peers (PR #98)
+- [ ] T3 verification — End-to-end proof that tenant B cannot place on tenant A's node (deferred until release readiness; no VM tests during Phase 15)
+- [x] T4 — Tenant-first bus subjects and keys, per-tenant worker ACL, streams and buckets, operator/JWT mode with scoped signing keys per tenant
+- [x] T5 — Quota enforcement and the per-tenant audit trail

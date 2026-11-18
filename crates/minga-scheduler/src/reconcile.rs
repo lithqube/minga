@@ -254,11 +254,13 @@ mod tests {
             last_seen_unix: None,
             role: Default::default(),
             reserved_ports: Vec::new(),
+            nats_user_public_key: None,
         }
     }
 
     fn svc(id: &str, replicas: u32) -> Service {
         Service {
+            is_job: false,
             id: id.to_string(),
             tenant_id: "default".to_string(),
             name: id.to_string(),
@@ -334,6 +336,7 @@ mod tests {
 
     fn updated(order: UpdateOrder, parallelism: u32, replicas: u32) -> Service {
         Service {
+            is_job: false,
             image: "nginx:2".to_string(),
             update: UpdatePolicy {
                 parallelism,
@@ -513,6 +516,7 @@ mod tests {
                 mode,
             }];
             let old = Service {
+                is_job: false,
                 ports: published.clone(),
                 ..svc("web", 1)
             };

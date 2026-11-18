@@ -288,20 +288,21 @@ async fn nats_publish_and_subscribe_events() {
     };
 
     let mut stream = bus
-        .subscribe_events(&["minga.task.>"])
+        .subscribe_tenant_events("default")
         .await
-        .expect("failed to subscribe to events");
+        .expect("failed to subscribe to tenant events");
 
-    bus.publish_event("minga.task.abc.event", b"task-event")
+    let subject = minga_bus::subjects::task_event("default", "abc");
+    bus.publish_tenant_event("default", &subject, b"task-event")
         .await
-        .expect("failed to publish event");
+        .expect("failed to publish tenant event");
 
     let event = tokio::time::timeout(Duration::from_secs(10), stream.next())
         .await
         .expect("timed out waiting for event")
         .expect("event stream ended unexpectedly");
 
-    assert_eq!(event.subject, "minga.task.abc.event");
+    assert_eq!(event.subject, subject);
     assert_eq!(event.payload, b"task-event");
 }
 

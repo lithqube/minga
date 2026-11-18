@@ -48,8 +48,9 @@ pub async fn connect_bus(
     url: &str,
     token: Option<&str>,
     replicas: usize,
+    system_credentials_file: Option<&std::path::Path>,
 ) -> Result<Arc<dyn EventBus>, ConnectError> {
-    connect_nats_bus(url, token, replicas)
+    connect_nats_bus(url, token, replicas, system_credentials_file)
         .await
         .map(|bus| bus as Arc<dyn EventBus>)
 }
@@ -60,8 +61,9 @@ pub async fn connect_bus_with_replica_retry(
     url: &str,
     token: Option<&str>,
     replicas: usize,
+    system_credentials_file: Option<&std::path::Path>,
 ) -> Result<Arc<dyn EventBus>, ConnectError> {
-    let bus = connect_nats_bus(url, token, 1).await?;
+    let bus = connect_nats_bus(url, token, 1, system_credentials_file).await?;
     let replica_bus = bus.clone();
     tokio::spawn(async move {
         loop {
@@ -78,6 +80,7 @@ async fn connect_nats_bus(
     url: &str,
     token: Option<&str>,
     replicas: usize,
+    system_credentials_file: Option<&std::path::Path>,
 ) -> Result<Arc<minga_bus::NatsBus>, ConnectError> {
     let tls = NatsTlsConfig::from_env().map_err(|e| ConnectError::TlsConfig(e.to_string()))?;
     // Explicit flag wins; environment variables provide process-wide defaults.
@@ -95,6 +98,7 @@ async fn connect_nats_bus(
         url: url.to_string(),
         reason: e.to_string(),
     };
+    let system_tls = tls.clone();
     let bus = match tls {
         Some(config) => match credentials.as_deref() {
             Some(credentials) => {
@@ -137,6 +141,29 @@ async fn connect_nats_bus(
             .map_err(connect_error)?
         }
     };
+    let system_credentials_path = system_credentials_file
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("MINGA_NATS_SYS_CREDENTIALS_FILE").map(Into::into));
+    let system_credentials = system_credentials_path
+        .as_deref()
+        .map(read_credentials_file)
+        .transpose()?;
+    if (std::env::var_os("MINGA_NATS_OPERATOR_JWT").is_some() || system_credentials_file.is_some())
+        && system_credentials.is_none()
+    {
+        return Err(ConnectError::TlsConfig(
+            "operator/JWT mode requires MINGA_NATS_SYS_CREDENTIALS_FILE for resolver updates"
+                .to_string(),
+        ));
+    }
+    if let Some(credentials) = system_credentials.as_deref() {
+        let config = system_tls.as_ref().ok_or_else(|| {
+            ConnectError::TlsConfig("SYS-account credentials require NATS TLS".to_string())
+        })?;
+        bus.enable_system_account(url, config, credentials)
+            .await
+            .map_err(connect_error)?;
+    }
     bus.ensure_replicas(replicas).await.map_err(connect_error)?;
     Ok(bus)
 }
@@ -163,6 +190,7 @@ pub async fn connect_worker_bus(
     url: &str,
     token: Option<&str>,
     node_id: u64,
+    tenant_id: &str,
 ) -> Result<Arc<dyn EventBus>, ConnectError> {
     let tls =
         NatsTlsConfig::from_env().map_err(|error| ConnectError::TlsConfig(error.to_string()))?;
@@ -186,10 +214,11 @@ pub async fn connect_worker_bus(
                 &config,
                 credentials,
                 node_id,
+                tenant_id,
             )
             .await
             .map_err(connect_error)?,
-            None => minga_bus::NatsBus::connect_worker_secure(url, &config, node_id)
+            None => minga_bus::NatsBus::connect_worker_secure(url, &config, node_id, tenant_id)
                 .await
                 .map_err(connect_error)?,
         },
@@ -217,9 +246,10 @@ pub async fn connect_worker_bus(
             }
             match token {
                 Some(token) => {
-                    minga_bus::NatsBus::connect_worker_with_token(url, &token, node_id).await
+                    minga_bus::NatsBus::connect_worker_with_token(url, &token, node_id, tenant_id)
+                        .await
                 }
-                None => minga_bus::NatsBus::connect_worker(url, node_id).await,
+                None => minga_bus::NatsBus::connect_worker(url, node_id, tenant_id).await,
             }
             .map_err(connect_error)?
         }
@@ -247,7 +277,7 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        match rt.block_on(connect_bus("tls://localhost:4222", None, 1)) {
+        match rt.block_on(connect_bus("tls://localhost:4222", None, 1, None)) {
             Ok(_) => panic!("tls:// without material must be refused"),
             Err(ConnectError::TlsConfig(_)) => {}
             Err(other) => panic!("unexpected error variant: {other}"),

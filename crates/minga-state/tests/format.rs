@@ -15,7 +15,7 @@ use std::path::PathBuf;
 
 use minga_state::codec::{
     self, FORMAT_KEY, FORMAT_VERSION, V2_FORMAT_VERSION, V3_FORMAT_VERSION, V4_FORMAT_VERSION,
-    V5_FORMAT_VERSION,
+    V5_FORMAT_VERSION, V6_FORMAT_VERSION, V7_FORMAT_VERSION,
 };
 use minga_state::types::{
     AgentSpec, ClusterNode, Config, FailureAction, Healthcheck, MountKind, Network, NodeRole,
@@ -23,7 +23,7 @@ use minga_state::types::{
     Secret, SecretRef, Service, ServiceMode, ServiceMount, Task, TaskSpec, TaskState, Tenant,
     TenantQuotas, UpdateOrder, UpdatePolicy, Volume, WorkloadKind,
 };
-use minga_state::{StateCommand, StateSnapshot, StateStore, TypeConfig};
+use minga_state::{ObjectKind, StateCommand, StateSnapshot, StateStore, TypeConfig};
 use openraft::{BasicNode, CommittedLeaderId, Entry, EntryPayload, LogId, Membership, Vote};
 use redb::{Database, ReadableTable, TableDefinition};
 use serde::de::DeserializeOwned;
@@ -88,6 +88,8 @@ fn check<T: Serialize + DeserializeOwned>(name: &str, value: &T) {
         V3_FORMAT_VERSION,
         V4_FORMAT_VERSION,
         V5_FORMAT_VERSION,
+        V6_FORMAT_VERSION,
+        V7_FORMAT_VERSION,
     ] {
         let old_path = fixture_path_for_version(version, name);
         if old_path.exists() {
@@ -142,6 +144,7 @@ fn old_cluster_node_without_wireguard_or_reservation_fields_decodes() {
     assert_eq!(node.overlay_ip, None);
     assert!(node.reserved_ports.is_empty());
     assert_eq!(node.tenant_id, minga_state::types::DEFAULT_TENANT_ID);
+    assert_eq!(node.nats_user_public_key, None);
 }
 
 #[test]
@@ -182,6 +185,7 @@ fn node() -> ClusterNode {
             port: 9090,
             protocol: "tcp".into(),
         }],
+        nats_user_public_key: None,
     }
 }
 
@@ -194,6 +198,7 @@ fn map(pairs: &[(&str, &str)]) -> HashMap<String, String> {
 
 fn tenant() -> Tenant {
     Tenant {
+        nats_revoked_user_public_keys: Vec::new(),
         id: "tenant-a".into(),
         name: "Tenant A".into(),
         quotas: TenantQuotas {
@@ -201,8 +206,10 @@ fn tenant() -> Tenant {
             tasks: Some(50),
             secrets: Some(20),
             networks: Some(5),
-            jobs: Some(3),
-            desired_state_bytes: Some(1_048_576),
+            volumes: Some(6),
+            configs: Some(7),
+            jobs: Some(8),
+            desired_state_bytes: Some(10_485_760),
             api_requests_per_second: Some(100),
             jetstream_bytes: Some(1_073_741_824),
             jetstream_age_secs: Some(86_400),
@@ -254,6 +261,7 @@ fn port() -> PortMapping {
 
 fn service(id: &str) -> Service {
     Service {
+        is_job: false,
         id: id.into(),
         tenant_id: "default".into(),
         name: "web".into(),
@@ -534,8 +542,23 @@ fn command_fixtures() {
         },
     );
     check(
+        "command_set_node_nats_user_public_key",
+        &StateCommand::SetNodeNatsUserPublicKey {
+            id: 3,
+            public_key: Some("UABC123".into()),
+        },
+    );
+    check(
         "command_remove_task",
         &StateCommand::RemoveTask("shop.web.1".into()),
+    );
+    check(
+        "command_remove_owned",
+        &StateCommand::RemoveOwned {
+            kind: ObjectKind::Task,
+            id: "shop.web.1".into(),
+            tenant_id: "tenant-a".into(),
+        },
     );
 }
 
@@ -665,7 +688,41 @@ fn strip_node_tenant(value: &mut serde_json::Value) {
         _ => {}
     }
 }
+fn strip_node_nats_identity(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(object) => {
+            if object.contains_key("address") && object.contains_key("capacity") {
+                object.remove("nats_user_public_key");
+            }
+            for nested in object.values_mut() {
+                strip_node_nats_identity(nested);
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for nested in values {
+                strip_node_nats_identity(nested);
+            }
+        }
+        _ => {}
+    }
+}
 
+fn strip_tenant_revocations(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(object) => {
+            object.remove("nats_revoked_user_public_keys");
+            for nested in object.values_mut() {
+                strip_tenant_revocations(nested);
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for nested in values {
+                strip_tenant_revocations(nested);
+            }
+        }
+        _ => {}
+    }
+}
 fn clear_tenants(tx: &redb::WriteTransaction) {
     let keys = {
         let table = tx.open_table(SM_TENANTS).unwrap();
@@ -721,6 +778,8 @@ fn downgrade_string_table(
             V2_FORMAT_VERSION => strip_v3_fields(&mut value),
             V3_FORMAT_VERSION => strip_tenant_fields(&mut value),
             V5_FORMAT_VERSION => strip_node_tenant(&mut value),
+            V6_FORMAT_VERSION => strip_node_nats_identity(&mut value),
+            V7_FORMAT_VERSION => strip_tenant_revocations(&mut value),
             _ => {}
         }
         let bytes = serde_json::to_vec(&value).unwrap();
@@ -749,6 +808,8 @@ fn downgrade_log_table(tx: &redb::WriteTransaction, version: u8) {
             V2_FORMAT_VERSION => strip_v3_fields(&mut value),
             V3_FORMAT_VERSION => strip_tenant_fields(&mut value),
             V5_FORMAT_VERSION => strip_node_tenant(&mut value),
+            V6_FORMAT_VERSION => strip_node_nats_identity(&mut value),
+            V7_FORMAT_VERSION => strip_tenant_revocations(&mut value),
             _ => {}
         }
         replace_tenant_commands(&mut value);
@@ -804,7 +865,27 @@ fn prepare_v5_state(file: &std::path::Path) {
         .unwrap();
     tx.commit().unwrap();
 }
+fn prepare_v6_state(file: &std::path::Path) {
+    let db = Database::create(file).unwrap();
+    let tx = db.begin_write().unwrap();
+    downgrade_string_table(&tx, SM_NODES, V6_FORMAT_VERSION);
+    tx.open_table(SM_META)
+        .unwrap()
+        .insert(FORMAT_KEY, [V6_FORMAT_VERSION].as_slice())
+        .unwrap();
+    tx.commit().unwrap();
+}
 
+fn prepare_v7_state(file: &std::path::Path) {
+    let db = Database::create(file).unwrap();
+    let tx = db.begin_write().unwrap();
+    downgrade_string_table(&tx, SM_TENANTS, V7_FORMAT_VERSION);
+    tx.open_table(SM_META)
+        .unwrap()
+        .insert(FORMAT_KEY, [V7_FORMAT_VERSION].as_slice())
+        .unwrap();
+    tx.commit().unwrap();
+}
 fn prepare_v2_log(file: &std::path::Path) {
     let db = Database::create(file).unwrap();
     let tx = db.begin_write().unwrap();
@@ -848,7 +929,27 @@ fn prepare_v5_log(file: &std::path::Path) {
         .unwrap();
     tx.commit().unwrap();
 }
+fn prepare_v6_log(file: &std::path::Path) {
+    let db = Database::create(file).unwrap();
+    let tx = db.begin_write().unwrap();
+    downgrade_log_table(&tx, V6_FORMAT_VERSION);
+    tx.open_table(RAFT_META)
+        .unwrap()
+        .insert(FORMAT_KEY, [V6_FORMAT_VERSION].as_slice())
+        .unwrap();
+    tx.commit().unwrap();
+}
 
+fn prepare_v7_log(file: &std::path::Path) {
+    let db = Database::create(file).unwrap();
+    let tx = db.begin_write().unwrap();
+    downgrade_log_table(&tx, V7_FORMAT_VERSION);
+    tx.open_table(RAFT_META)
+        .unwrap()
+        .insert(FORMAT_KEY, [V7_FORMAT_VERSION].as_slice())
+        .unwrap();
+    tx.commit().unwrap();
+}
 fn read_marker(file: &std::path::Path, table: TableDefinition<&str, &[u8]>) -> Option<u8> {
     let db = Database::create(file).unwrap();
     let tx = db.begin_read().unwrap();
@@ -1008,7 +1109,72 @@ async fn a_v5_state_and_log_file_migrate_node_tenants_to_default() {
         "default"
     );
 }
+#[tokio::test]
+async fn a_v6_state_and_log_file_migrate_nats_node_identity() {
+    let (_dir, path) = written_dir().await;
+    let state_file = path.join("state.redb");
+    let log_file = path.join("raft_log.redb");
+    let indices: Vec<_> = read_log_values(&log_file)
+        .into_iter()
+        .map(|(index, _)| index)
+        .collect();
+    prepare_v6_state(&state_file);
+    prepare_v6_log(&log_file);
 
+    let store = StateStore::open(1, "127.0.0.1:0", &path, BTreeMap::new())
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .get_node(3)
+            .await
+            .unwrap()
+            .unwrap()
+            .nats_user_public_key,
+        None
+    );
+    store.shutdown().await.unwrap();
+
+    assert_eq!(read_marker(&state_file, SM_META), Some(FORMAT_VERSION));
+    assert_eq!(read_marker(&log_file, RAFT_META), Some(FORMAT_VERSION));
+    assert_eq!(
+        read_state_value(&state_file, SM_NODES, "3")["nats_user_public_key"],
+        serde_json::Value::Null
+    );
+    let entries = read_log_values(&log_file);
+    assert_eq!(
+        entries
+            .iter()
+            .take(indices.len())
+            .map(|(index, _)| *index)
+            .collect::<Vec<_>>(),
+        indices
+    );
+}
+
+#[tokio::test]
+async fn a_v7_state_and_log_file_migrate_tenant_revocation_records() {
+    let (_dir, path) = written_dir().await;
+    let state_file = path.join("state.redb");
+    let log_file = path.join("raft_log.redb");
+    prepare_v7_state(&state_file);
+    prepare_v7_log(&log_file);
+
+    let store = StateStore::open(1, "127.0.0.1:0", &path, BTreeMap::new())
+        .await
+        .unwrap();
+    assert!(store
+        .get_tenant("default")
+        .await
+        .unwrap()
+        .unwrap()
+        .nats_revoked_user_public_keys
+        .is_empty());
+    store.shutdown().await.unwrap();
+
+    assert_eq!(read_marker(&state_file, SM_META), Some(FORMAT_VERSION));
+    assert_eq!(read_marker(&log_file, RAFT_META), Some(FORMAT_VERSION));
+}
 #[tokio::test]
 async fn a_v2_log_file_rewrites_entries_and_preserves_indices() {
     let (_dir, path) = written_dir().await;

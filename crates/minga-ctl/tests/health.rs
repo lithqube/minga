@@ -31,6 +31,7 @@ async fn cluster() -> Cluster {
     // A node so services are placeable; no scheduler, so they get no tasks.
     let identity = NodeIdentity {
         node_id: 1,
+        tenant_id: "default".into(),
         address: "127.0.0.1:50051".to_string(),
         labels: Default::default(),
         capacity: ResourceSpec {
@@ -45,10 +46,14 @@ async fn cluster() -> Cluster {
         join_token: None,
     };
     store.upsert_node(identity.cluster_node()).await.unwrap();
-    let server =
-        minga_api::ApiServer::start_with_auth(store, "127.0.0.1:0", Some(TOKEN.to_string()))
-            .await
-            .unwrap();
+    let server = minga_api::ApiServer::start_with_bus_and_auth(
+        store,
+        minga_bus::MemoryBus::new(),
+        "127.0.0.1:0",
+        Some(TOKEN.to_string()),
+    )
+    .await
+    .unwrap();
     Cluster {
         url: format!("http://{}", server.addr()),
         _dir: dir,

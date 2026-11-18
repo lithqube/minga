@@ -44,11 +44,13 @@ fn sample_node(id: u64) -> ClusterNode {
         last_seen_unix: None,
         role: Default::default(),
         reserved_ports: Vec::new(),
+        nats_user_public_key: None,
     }
 }
 
 fn sample_service(id: &str) -> Service {
     Service {
+        is_job: false,
         id: id.to_string(),
         tenant_id: "default".to_string(),
         name: id.to_string(),
@@ -350,6 +352,7 @@ async fn tenant_crud_is_persisted_and_protects_owned_resources() {
     assert_eq!(defaults[0].id, "default");
 
     let tenant = Tenant {
+        nats_revoked_user_public_keys: Vec::new(),
         id: "tenant-a".into(),
         name: "Tenant A".into(),
         quotas: TenantQuotas {
@@ -390,9 +393,12 @@ async fn tenant_crud_is_persisted_and_protects_owned_resources() {
         store.remove_tenant("tenant-a").await,
         Err(StateError::Conflict(_))
     ));
-    store.remove_volume("tenant-a-data".into()).await.unwrap();
+    store
+        .remove_volume("tenant-a-data".into(), "tenant-a")
+        .await
+        .unwrap();
 
-    let mut node = minga_state::types::ClusterNode {
+    let node = minga_state::types::ClusterNode {
         id: 42,
         address: "10.0.0.42:50051".into(),
         labels: Default::default(),
@@ -405,6 +411,7 @@ async fn tenant_crud_is_persisted_and_protects_owned_resources() {
         last_seen_unix: None,
         role: Default::default(),
         reserved_ports: Vec::new(),
+        nats_user_public_key: None,
     };
     store.upsert_node(node.clone()).await.unwrap();
     assert!(
@@ -414,8 +421,8 @@ async fn tenant_crud_is_persisted_and_protects_owned_resources() {
         ),
         "a tenant that still owns nodes must not be deleted"
     );
-    node.tenant_id = "default".into();
-    store.upsert_node(node).await.unwrap();
+    // A node never moves between tenants in place; it is removed first.
+    store.remove_node(node.id).await.unwrap();
     store.remove_tenant("tenant-a").await.unwrap();
     assert!(store.get_tenant("tenant-a").await.unwrap().is_none());
     assert!(matches!(
@@ -425,6 +432,7 @@ async fn tenant_crud_is_persisted_and_protects_owned_resources() {
 
     store
         .create_tenant(Tenant {
+            nats_revoked_user_public_keys: Vec::new(),
             id: "persisted".into(),
             name: "Persisted".into(),
             quotas: TenantQuotas::default(),
@@ -446,5 +454,367 @@ async fn tenant_crud_is_persisted_and_protects_owned_resources() {
             .created_at,
         456
     );
+    store.shutdown().await.unwrap();
+}
+#[tokio::test]
+async fn cluster_revocations_survive_tenant_updates_and_deletion() {
+    let (store, _dir) = test_store("tenant-revocations").await;
+    store
+        .create_tenant(Tenant {
+            id: "tenant-a".into(),
+            name: "Tenant A".into(),
+            quotas: TenantQuotas::default(),
+            nats_revoked_user_public_keys: Vec::new(),
+            created_at: 1,
+        })
+        .await
+        .unwrap();
+    store
+        .record_nats_user_revocation("UABC".into())
+        .await
+        .unwrap();
+    store
+        .update_tenant(
+            "tenant-a",
+            "Tenant A updated".into(),
+            TenantQuotas::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .get_tenant("default")
+            .await
+            .unwrap()
+            .unwrap()
+            .nats_revoked_user_public_keys,
+        ["UABC"]
+    );
+    store.remove_tenant("tenant-a").await.unwrap();
+    assert!(store.get_tenant("tenant-a").await.unwrap().is_none());
+    store.shutdown().await.unwrap();
+}
+#[tokio::test]
+async fn tenant_count_and_desired_state_quotas_are_enforced_transactionally() {
+    let (store, _dir) = test_store("tenant-quotas").await;
+    store
+        .create_tenant(Tenant {
+            nats_revoked_user_public_keys: Vec::new(),
+            id: "count-limited".into(),
+            name: "Count limited".into(),
+            quotas: TenantQuotas {
+                services: Some(1),
+                ..TenantQuotas::default()
+            },
+            created_at: 1,
+        })
+        .await
+        .unwrap();
+
+    let mut first = sample_service("count-limited.web");
+    first.tenant_id = "count-limited".into();
+    first.ports.clear();
+    store.upsert_service(first).await.unwrap();
+    let mut second = sample_service("count-limited.api");
+    second.tenant_id = "count-limited".into();
+    second.ports.clear();
+    assert!(matches!(
+        store.upsert_service(second).await,
+        Err(StateError::QuotaExceeded(message)) if message == "services limit 1"
+    ));
+    assert_eq!(
+        store
+            .list_services()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|service| service.tenant_id == "count-limited")
+            .count(),
+        1
+    );
+
+    store
+        .create_tenant(Tenant {
+            nats_revoked_user_public_keys: Vec::new(),
+            id: "bytes-limited".into(),
+            name: "Bytes limited".into(),
+            quotas: TenantQuotas {
+                desired_state_bytes: Some(1),
+                ..TenantQuotas::default()
+            },
+            created_at: 2,
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        store
+            .upsert_volume(Volume {
+                id: "bytes-limited.data".into(),
+                tenant_id: "bytes-limited".into(),
+                name: "data".into(),
+                driver: "local".into(),
+            })
+            .await,
+        Err(StateError::QuotaExceeded(message))
+            if message == "desired_state_bytes limit 1"
+    ));
+    assert!(store.list_volumes().await.unwrap().is_empty());
+    store
+        .create_tenant(Tenant {
+            nats_revoked_user_public_keys: Vec::new(),
+            id: "object-limited".into(),
+            name: "Object limited".into(),
+            quotas: TenantQuotas {
+                volumes: Some(0),
+                configs: Some(0),
+                ..TenantQuotas::default()
+            },
+            created_at: 3,
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        store
+            .upsert_volume(Volume {
+                id: "object-limited.volume".into(),
+                tenant_id: "object-limited".into(),
+                name: "volume".into(),
+                driver: "local".into(),
+            })
+            .await,
+        Err(StateError::QuotaExceeded(message)) if message == "volumes limit 0"
+    ));
+    assert!(matches!(
+        store
+            .upsert_config(Config {
+                id: "object-limited.config".into(),
+                tenant_id: "object-limited".into(),
+                name: "config".into(),
+            })
+            .await,
+        Err(StateError::QuotaExceeded(message)) if message == "configs limit 0"
+    ));
+
+    store
+        .create_tenant(Tenant {
+            nats_revoked_user_public_keys: Vec::new(),
+            id: "job-limited".into(),
+            name: "Job limited".into(),
+            quotas: TenantQuotas {
+                jobs: Some(1),
+                ..TenantQuotas::default()
+            },
+            created_at: 4,
+        })
+        .await
+        .unwrap();
+    let mut first_job = sample_service("job-limited.first");
+    first_job.tenant_id = "job-limited".into();
+    first_job.is_job = true;
+    first_job.ports.clear();
+    store.upsert_service(first_job).await.unwrap();
+    let mut second_job = sample_service("job-limited.second");
+    second_job.tenant_id = "job-limited".into();
+    second_job.ports.clear();
+    second_job.is_job = true;
+    assert!(matches!(
+        store.upsert_service(second_job).await,
+        Err(StateError::QuotaExceeded(message)) if message == "jobs limit 1"
+    ));
+    store.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn nats_public_key_update_preserves_node_and_missing_node_fails() {
+    let (store, _dir) = test_store("node-nats-identity").await;
+    store.upsert_node(sample_node(7)).await.unwrap();
+
+    store
+        .set_node_nats_user_public_key(7, Some("UABC".into()))
+        .await
+        .unwrap();
+    let node = store.get_node(7).await.unwrap().unwrap();
+    assert_eq!(node.nats_user_public_key.as_deref(), Some("UABC"));
+    assert_eq!(node.labels.get("gpu").map(String::as_str), Some("true"));
+
+    // A full record read before the key was set (registration) must not
+    // erase the key that revokes the node's NATS credentials.
+    let mut stale = sample_node(7);
+    stale.last_seen_unix = Some(42);
+    assert!(stale.nats_user_public_key.is_none());
+    store.upsert_node(stale).await.unwrap();
+    let node = store.get_node(7).await.unwrap().unwrap();
+    assert_eq!(node.nats_user_public_key.as_deref(), Some("UABC"));
+    assert_eq!(node.last_seen_unix, Some(42));
+
+    assert!(matches!(
+        store
+            .set_node_nats_user_public_key(999, Some("UDEF".into()))
+            .await,
+        Err(StateError::NotFound(id)) if id == "node 999"
+    ));
+    store.shutdown().await.unwrap();
+}
+
+fn named_tenant(id: &str, quotas: TenantQuotas) -> Tenant {
+    Tenant {
+        nats_revoked_user_public_keys: Vec::new(),
+        id: id.into(),
+        name: id.into(),
+        quotas,
+        created_at: 1,
+    }
+}
+
+#[tokio::test]
+async fn writes_under_a_missing_tenant_are_refused_but_default_is_permanent() {
+    let (store, _dir) = test_store("missing-tenant").await;
+    let mut service = sample_service("ghost.web");
+    service.tenant_id = "ghost".into();
+    service.ports.clear();
+    assert!(matches!(
+        store.upsert_service(service).await,
+        Err(StateError::NotFound(_))
+    ));
+    let mut node = sample_node(9);
+    node.tenant_id = "ghost".into();
+    assert!(matches!(
+        store.upsert_node(node).await,
+        Err(StateError::NotFound(_))
+    ));
+    assert!(store.list_services().await.unwrap().is_empty());
+    store.upsert_node(sample_node(9)).await.unwrap();
+    store.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_node_keeps_its_tenant_and_removals_only_touch_the_owners_object() {
+    let (store, _dir) = test_store("owned-writes").await;
+    for id in ["tenant-a", "tenant-b"] {
+        store
+            .create_tenant(named_tenant(id, TenantQuotas::default()))
+            .await
+            .unwrap();
+    }
+    store.upsert_node(sample_node(4)).await.unwrap();
+    let mut takeover = sample_node(4);
+    takeover.tenant_id = "tenant-a".into();
+    assert!(matches!(
+        store.upsert_node(takeover).await,
+        Err(StateError::NameInUse)
+    ));
+    assert_eq!(
+        store.get_node(4).await.unwrap().unwrap().tenant_id,
+        "default"
+    );
+
+    let mut service = sample_service("shared.web");
+    service.tenant_id = "tenant-b".into();
+    service.ports.clear();
+    store.upsert_service(service).await.unwrap();
+    // A delayed removal by tenant A must not delete tenant B's object.
+    store
+        .remove_service("shared.web".into(), "tenant-a")
+        .await
+        .unwrap();
+    assert!(store.get_service("shared.web").await.unwrap().is_some());
+    store
+        .remove_service("shared.web".into(), "tenant-b")
+        .await
+        .unwrap();
+    assert!(store.get_service("shared.web").await.unwrap().is_none());
+    store.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn quotas_ignore_stopped_tasks_and_never_block_rewrites() {
+    let (store, _dir) = test_store("quota-rewrites").await;
+    store
+        .create_tenant(named_tenant(
+            "limited",
+            TenantQuotas {
+                tasks: Some(1),
+                ..TenantQuotas::default()
+            },
+        ))
+        .await
+        .unwrap();
+    let task = |id: &str, state: TaskState| {
+        let mut task = sample_task(id, "limited.web", 1);
+        task.tenant_id = "limited".into();
+        task.state = state;
+        task
+    };
+    store
+        .upsert_task(task("limited.web.1", TaskState::Running))
+        .await
+        .unwrap();
+    assert!(matches!(
+        store
+            .upsert_task(task("limited.web.2", TaskState::Pending))
+            .await,
+        Err(StateError::QuotaExceeded(_))
+    ));
+    // A status write on an existing task never grows the count.
+    store
+        .upsert_task(task("limited.web.1", TaskState::Failed))
+        .await
+        .unwrap();
+    // A failed task no longer holds a slot.
+    store
+        .upsert_task(task("limited.web.2", TaskState::Pending))
+        .await
+        .unwrap();
+
+    // Lowering the byte quota below current usage still lets an object be
+    // rewritten at the same size, but not grown.
+    let existing = store.list_tasks().await.unwrap();
+    let used: u64 = existing
+        .iter()
+        .map(|task| serde_json::to_vec(task).unwrap().len() as u64)
+        .sum();
+    store
+        .update_tenant(
+            "limited",
+            "limited".into(),
+            TenantQuotas {
+                tasks: Some(1),
+                desired_state_bytes: Some(used / 2),
+                ..TenantQuotas::default()
+            },
+        )
+        .await
+        .unwrap();
+    store
+        .upsert_task(task("limited.web.2", TaskState::Running))
+        .await
+        .unwrap();
+    let mut grown = task("limited.web.2", TaskState::Running);
+    grown.spec.image = "x".repeat(4096);
+    assert!(matches!(
+        store.upsert_task(grown).await,
+        Err(StateError::QuotaExceeded(_))
+    ));
+    store.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn importing_a_snapshot_keeps_existing_tenant_quotas() {
+    let (store, _dir) = test_store("import-quotas").await;
+    let quotas = TenantQuotas {
+        services: Some(3),
+        ..TenantQuotas::default()
+    };
+    store
+        .update_tenant("default", "Default".into(), quotas.clone())
+        .await
+        .unwrap();
+    // A pre-v8 snapshot carries no tenants, so import synthesizes `default`.
+    let mut snapshot = store.export().await.unwrap();
+    snapshot.tenants.clear();
+    store.import(snapshot, true).await.unwrap();
+    let default = store.get_tenant("default").await.unwrap().unwrap();
+    assert_eq!(default.quotas, quotas);
+    assert_eq!(default.name, "Default");
     store.shutdown().await.unwrap();
 }

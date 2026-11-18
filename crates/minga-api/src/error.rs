@@ -33,6 +33,8 @@ pub enum ApiError {
 
     #[error("state error: {0}")]
     State(String),
+    #[error("{0}")]
+    QuotaExceeded(String),
 }
 
 impl ApiError {
@@ -42,6 +44,13 @@ impl ApiError {
             ApiError::NotFound(_) => StatusCode::NOT_FOUND,
             ApiError::Conflict(_) => StatusCode::CONFLICT,
             ApiError::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
+            ApiError::QuotaExceeded(message)
+                if message.contains("desired_state_bytes")
+                    || message.contains("jetstream_bytes") =>
+            {
+                StatusCode::INSUFFICIENT_STORAGE
+            }
+            ApiError::QuotaExceeded(_) => StatusCode::TOO_MANY_REQUESTS,
             ApiError::Internal(_) | ApiError::State(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -58,6 +67,7 @@ impl From<minga_state::StateError> for ApiError {
             | E::NotLeader(_) => ApiError::Conflict(e.to_string()),
             E::NotFound(_) => ApiError::NotFound(e.to_string()),
             E::InvalidTenant(_) | E::BadSnapshot(_) => ApiError::BadRequest(e.to_string()),
+            E::QuotaExceeded(_) => ApiError::QuotaExceeded(e.to_string()),
             _ => ApiError::State(e.to_string()),
         }
     }
@@ -166,5 +176,14 @@ mod tests {
         let state_err = minga_state::StateError::Storage("test".to_string());
         let api_err: ApiError = state_err.into();
         assert!(matches!(api_err, ApiError::State(_)));
+    }
+    #[test]
+    fn quota_errors_map_to_rate_limit_or_storage_status() {
+        let resource_quota: ApiError =
+            minga_state::StateError::QuotaExceeded("services limit 2".into()).into();
+        let state_size_quota: ApiError =
+            minga_state::StateError::QuotaExceeded("desired_state_bytes limit 1024".into()).into();
+        assert_eq!(resource_quota.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(state_size_quota.status(), StatusCode::INSUFFICIENT_STORAGE);
     }
 }

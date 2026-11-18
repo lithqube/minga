@@ -12,6 +12,10 @@ use crate::types::{
 pub enum StateCommand {
     UpsertNode(ClusterNode),
     RemoveNode(NodeId),
+    SetNodeNatsUserPublicKey {
+        id: NodeId,
+        public_key: Option<String>,
+    },
 
     UpsertService(Service),
     RemoveService(ServiceId),
@@ -39,6 +43,9 @@ pub enum StateCommand {
         quotas: TenantQuotas,
     },
     RemoveTenant(TenantId),
+    RecordNatsUserRevocation {
+        user_public_key: String,
+    },
 
     /// Refreshes a node's lease in one log entry: sets `last_seen_unix`
     /// and revives the node unless it is draining. A missing record stays
@@ -48,6 +55,26 @@ pub enum StateCommand {
         id: NodeId,
         last_seen_unix: u64,
     },
+
+    /// Removes an object only while it still belongs to `tenant_id`, so a
+    /// delayed removal cannot delete another tenant's object that reused
+    /// the ID. The untenanted `Remove*` variants stay for log replay.
+    RemoveOwned {
+        kind: ObjectKind,
+        id: String,
+        tenant_id: TenantId,
+    },
+}
+
+/// The tenant-owned tables [`StateCommand::RemoveOwned`] can delete from.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ObjectKind {
+    Service,
+    Task,
+    Network,
+    Volume,
+    Secret,
+    Config,
 }
 
 /// The response returned by the state machine after applying a command.

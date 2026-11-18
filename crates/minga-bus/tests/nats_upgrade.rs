@@ -103,7 +103,7 @@ async fn upgrade_seed() {
     }
     for i in 0..SEEDED_EVENTS {
         bus.publish_event(
-            &subjects::node_event(SEEDED_NODE),
+            &subjects::node_event("default", SEEDED_NODE),
             format!("event {i}").as_bytes(),
         )
         .await
@@ -168,7 +168,7 @@ async fn upgrade_probe() {
         tail.last().map(|e| e.data.as_slice()),
         Some(b"probe".as_slice())
     );
-    bus.publish_event(&subjects::node_event(SEEDED_NODE), b"probe")
+    bus.publish_event(&subjects::node_event("default", SEEDED_NODE), b"probe")
         .await
         .unwrap();
 }

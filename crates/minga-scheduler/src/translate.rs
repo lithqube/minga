@@ -309,6 +309,7 @@ fn translate_service(
     Ok(Service {
         id: format!("{stack}.{name}"),
         tenant_id: DEFAULT_TENANT_ID.to_owned(),
+        is_job: false,
         name: name.to_string(),
         image,
         replicas,

@@ -1,0 +1,6 @@
+{
+  "mode": "host",
+  "protocol": "tcp",
+  "published": 8080,
+  "target": 80
+}

@@ -13,7 +13,7 @@ use axum::{
     http::StatusCode,
     Json,
 };
-use minga_bus::{subjects, EventBus, TaskActualState, TaskStatusReport};
+use minga_bus::{subjects, AuditRecord, EventBus, TaskActualState, TaskStatusReport};
 use minga_state::types::{
     unix_now, ClusterNode, NodeStatus as MingaNodeStatus, ResourceSpec, Service as StateService,
     Task, Tenant, TenantQuotas,
@@ -33,6 +33,7 @@ pub struct AppState {
     pub store: Arc<StateStore>,
     pub bus: Option<Arc<dyn EventBus>>,
     pub join_token_key: Option<Arc<JoinTokenKey>>,
+    pub nats_credential_issuer: Option<Arc<crate::nats_credentials::NatsCredentialIssuer>>,
 }
 
 impl AppState {
@@ -41,6 +42,7 @@ impl AppState {
             store,
             bus: None,
             join_token_key: None,
+            nats_credential_issuer: None,
         }
     }
 
@@ -49,6 +51,7 @@ impl AppState {
             store,
             bus: Some(bus),
             join_token_key: None,
+            nats_credential_issuer: None,
         }
     }
 
@@ -56,14 +59,28 @@ impl AppState {
         self.join_token_key = Some(key);
         self
     }
+    pub fn with_nats_credential_issuer(
+        mut self,
+        issuer: Arc<crate::nats_credentials::NatsCredentialIssuer>,
+    ) -> Self {
+        self.nats_credential_issuer = Some(issuer);
+        self
+    }
 
-    async fn task_statuses(&self) -> ApiResult<HashMap<String, TaskStatusReport>> {
+    async fn task_statuses(&self) -> ApiResult<HashMap<String, HashMap<String, TaskStatusReport>>> {
         let Some(bus) = &self.bus else {
             return Ok(HashMap::new());
         };
+        let tenant_ids = self
+            .store
+            .list_tenants()
+            .await?
+            .into_iter()
+            .map(|tenant| tenant.id)
+            .collect::<Vec<_>>();
         let mut statuses = HashMap::new();
-        for (key, bytes) in bus
-            .list_status()
+        for (tenant_id, key, bytes) in bus
+            .list_all_tenant_status(&tenant_ids)
             .await
             .map_err(|error| internal(error.to_string()))?
         {
@@ -74,7 +91,10 @@ impl AppState {
                 Ok(report)
                     if key == subjects::kv_node_task_status(report.node_id, &report.task_id) =>
                 {
-                    statuses.insert(report.task_id.clone(), report);
+                    statuses
+                        .entry(tenant_id)
+                        .or_insert_with(HashMap::new)
+                        .insert(report.task_id.clone(), report);
                 }
                 Ok(_) => {}
                 Err(error) => {
@@ -176,46 +196,176 @@ pub async fn get_tenant(
 /// Creates a tenant with operator-supplied desired quotas.
 pub async fn create_tenant(
     State(app): State<Arc<AppState>>,
+    Extension(caller): Extension<Caller>,
     Json(request): Json<CreateTenantRequest>,
 ) -> ApiResult<(StatusCode, Json<Tenant>)> {
     let tenant = Tenant {
+        nats_revoked_user_public_keys: Vec::new(),
         id: request.id,
         name: request.name,
         quotas: request.quotas,
         created_at: unix_now(),
     };
+    Tenant::validate_id(&tenant.id).map_err(bad_request)?;
+    if app.store.get_tenant(&tenant.id).await?.is_some() {
+        return Err(conflict(format!("tenant {} already exists", tenant.id)));
+    }
+    configure_tenant_bus(&app, &tenant).await?;
+    append_tenant_audit(
+        &app,
+        &tenant.id,
+        &caller.name,
+        "tenant.create.requested",
+        &format!("/tenants/{}", tenant.id),
+    )
+    .await?;
     app.store.create_tenant(tenant.clone()).await?;
     Ok((StatusCode::CREATED, Json(tenant)))
+}
+
+async fn append_tenant_audit(
+    app: &AppState,
+    tenant_id: &str,
+    actor: &str,
+    action: &str,
+    resource_path: &str,
+) -> ApiResult<()> {
+    let bus = app
+        .bus
+        .as_ref()
+        .ok_or_else(|| ApiError::Unavailable("tenant audit service is not configured".into()))?;
+    bus.append_audit(AuditRecord {
+        tenant_id: tenant_id.into(),
+        actor: actor.into(),
+        action: action.into(),
+        resource_path: resource_path.into(),
+        occurred_at_unix: unix_now(),
+    })
+    .await
+    .map_err(|error| ApiError::Unavailable(format!("tenant audit append failed: {error}")))
 }
 
 /// Updates a tenant's display name and quotas.
 pub async fn update_tenant(
     State(app): State<Arc<AppState>>,
+    Extension(caller): Extension<Caller>,
     Path(id): Path<String>,
     Json(request): Json<UpdateTenantRequest>,
 ) -> ApiResult<StatusCode> {
+    let current = app
+        .store
+        .get_tenant(&id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("tenant not found".into()))?;
+    append_tenant_audit(
+        &app,
+        &current.id,
+        &caller.name,
+        "tenant.update.requested",
+        &format!("/tenants/{}", current.id),
+    )
+    .await?;
     app.store
-        .update_tenant(id, request.name, request.quotas)
+        .update_tenant(id.clone(), request.name, request.quotas)
         .await?;
+    let tenant = app
+        .store
+        .get_tenant(id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("tenant not found".into()))?;
+    configure_tenant_bus(&app, &tenant).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+async fn configure_tenant_bus(app: &AppState, tenant: &Tenant) -> ApiResult<()> {
+    let bus = app.bus.as_ref().ok_or_else(|| {
+        ApiError::Unavailable("tenant bus resource manager is not configured".into())
+    })?;
+    bus.configure_tenant_quota(&tenant.id, &tenant.quotas)
+        .await
+        .map_err(|error| {
+            ApiError::Unavailable(format!(
+                "cannot configure bus resources for tenant {}: {error}",
+                tenant.id
+            ))
+        })
 }
 
 /// Deletes an empty tenant.
 pub async fn delete_tenant(
     State(app): State<Arc<AppState>>,
+    Extension(caller): Extension<Caller>,
     Path(id): Path<String>,
 ) -> ApiResult<StatusCode> {
+    append_tenant_audit(
+        &app,
+        &id,
+        &caller.name,
+        "tenant.delete.requested",
+        &format!("/tenants/{id}"),
+    )
+    .await?;
     app.store.remove_tenant(&id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// `GET /v{version}/audit` — list only the authenticated tenant's audit trail.
+pub async fn list_audit(
+    State(app): State<Arc<AppState>>,
+    Extension(caller): Extension<Caller>,
+    Query(query): Query<AuditQuery>,
+) -> ApiResult<Json<Vec<AuditRecord>>> {
+    let tenant_id = tenant_scope(&caller)?;
+    let bus = app
+        .bus
+        .as_ref()
+        .ok_or_else(|| ApiError::Unavailable("tenant audit service is not configured".into()))?;
+    let limit = query.limit.unwrap_or(100).clamp(1, 1000);
+    let records = bus
+        .list_audit(tenant_id, limit)
+        .await
+        .map_err(|error| ApiError::Unavailable(format!("tenant audit query failed: {error}")))?;
+    Ok(Json(records))
+}
+
+/// `GET /minga/audit` — list the cluster audit trail for operators.
+pub async fn list_cluster_audit(
+    State(app): State<Arc<AppState>>,
+    Query(query): Query<AuditQuery>,
+) -> ApiResult<Json<Vec<AuditRecord>>> {
+    let bus = app
+        .bus
+        .as_ref()
+        .ok_or_else(|| ApiError::Unavailable("tenant audit service is not configured".into()))?;
+    let limit = query.limit.unwrap_or(100).clamp(1, 1000);
+    let mut records = Vec::new();
+    for tenant in app.store.list_tenants().await? {
+        records.extend(bus.list_audit(&tenant.id, limit).await.map_err(|error| {
+            ApiError::Unavailable(format!("tenant audit query failed: {error}"))
+        })?);
+    }
+    records.sort_by(|left, right| {
+        right
+            .occurred_at_unix
+            .cmp(&left.occurred_at_unix)
+            .then_with(|| left.tenant_id.cmp(&right.tenant_id))
+    });
+    records.truncate(limit);
+    Ok(Json(records))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AuditQuery {
+    limit: Option<usize>,
+}
 fn task_status_for_api<'a>(
     app: &AppState,
     task: &Task,
-    statuses: &'a HashMap<String, TaskStatusReport>,
+    statuses: &'a HashMap<String, HashMap<String, TaskStatusReport>>,
 ) -> Option<Cow<'a, TaskStatusReport>> {
     if let Some(report) = statuses
-        .get(&task.id)
+        .get(&task.tenant_id)
+        .and_then(|tenant_statuses| tenant_statuses.get(&task.id))
         .filter(|report| report.task_id == task.id && report.node_id == task.node_id)
     {
         return Some(Cow::Borrowed(report));
@@ -407,7 +557,9 @@ async fn ensure_placeable(
         .await?
         .into_iter()
         .map(|task| {
-            let status = statuses.get(&task.id);
+            let status = statuses
+                .get(&task.tenant_id)
+                .and_then(|tenant_statuses| tenant_statuses.get(&task.id));
             minga_scheduler::task_with_actual_status(task, status)
         })
         .collect();
@@ -502,10 +654,13 @@ pub async fn get_info(
     let running = tasks
         .iter()
         .filter(|task| {
-            statuses.get(&task.id).is_some_and(|status| {
-                status.node_id == task.node_id
-                    && status.state == minga_bus::TaskActualState::Running
-            })
+            statuses
+                .get(&task.tenant_id)
+                .and_then(|tenant_statuses| tenant_statuses.get(&task.id))
+                .is_some_and(|status| {
+                    status.node_id == task.node_id
+                        && status.state == minga_bus::TaskActualState::Running
+                })
         })
         .count();
 
@@ -578,6 +733,7 @@ pub async fn get_node(
 /// `POST /v{version}/nodes` — register a node out-of-band (Minga extension).
 pub async fn create_node(
     State(app): State<Arc<AppState>>,
+    Extension(caller): Extension<Caller>,
     Json(req): Json<models::NodeCreateRequest>,
 ) -> ApiResult<(StatusCode, Json<models::Node>)> {
     if req.address.trim().is_empty() {
@@ -627,7 +783,16 @@ pub async fn create_node(
         last_seen_unix: None,
         role: Default::default(),
         reserved_ports: Vec::new(),
+        nats_user_public_key: None,
     };
+    append_tenant_audit(
+        &app,
+        &node.tenant_id,
+        &caller.name,
+        "node.create.requested",
+        &format!("/nodes/{}", node.id),
+    )
+    .await?;
     app.store.upsert_node(node.clone()).await?;
     tracing::info!(node = id, address = %node.address, "node registered via API");
 
@@ -638,12 +803,22 @@ pub async fn create_node(
     ))
 }
 
-/// `POST /minga/nodes/{id}/join-token` — mint a short-lived tenant-bound token.
+/// Serializes join-token issue, node removal and revocation publishing. Each
+/// reads a node's NATS key or the revocation list and then writes; interleaved,
+/// a removal can miss a freshly issued key or an older account claim can
+/// overwrite a newer one and un-revoke a user.
+/// shortcut: process-local; revocation runs only on the Raft leader, so move
+/// this into Raft if credential issuance ever runs on followers.
+pub(crate) static NODE_CREDENTIALS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// `POST /minga/nodes/{id}/join-token` — mint a tenant-bound token and NATS credentials.
 pub async fn issue_node_join_token(
     State(app): State<Arc<AppState>>,
+    Extension(caller): Extension<Caller>,
     Path(id): Path<String>,
 ) -> ApiResult<Json<models::NodeJoinToken>> {
     let node_id = id.parse::<u64>().map_err(|_| not_found("node", &id))?;
+    let credentials_guard = NODE_CREDENTIALS.lock().await;
     let node = app
         .store
         .get_node(node_id)
@@ -652,25 +827,161 @@ pub async fn issue_node_join_token(
     let key = app.join_token_key.as_ref().ok_or_else(|| {
         crate::error::ApiError::Unavailable("node join-token signer is not configured".into())
     })?;
+    let issuer = app.nats_credential_issuer.as_ref().ok_or_else(|| {
+        crate::error::ApiError::Unavailable("tenant NATS signer is not configured".into())
+    })?;
+    append_tenant_audit(
+        &app,
+        &node.tenant_id,
+        &caller.name,
+        "node.join-token.issue.requested",
+        &format!("/nodes/{}", node.id),
+    )
+    .await?;
     let issued_at = unix_now();
+    if let Some(previous_key) = node.nats_user_public_key.as_deref() {
+        revoke_nats_user(&app, previous_key, &credentials_guard).await?;
+    }
+    let (user_public_key, credentials) =
+        issuer.issue(&node.tenant_id, node.id).map_err(internal)?;
     let expires_at = issued_at.saturating_add(15 * 60);
     let token = key
         .issue(node.id, node.tenant_id.clone(), issued_at, expires_at)
         .map_err(|error| internal(error.to_string()))?;
+    app.store
+        .set_node_nats_user_public_key(node.id, Some(user_public_key))
+        .await?;
     tracing::info!(
         node = node.id,
         tenant = %node.tenant_id,
         expires_at,
-        "node join token issued"
+        "node join token and NATS credentials issued"
     );
     Ok(Json(models::NodeJoinToken {
         node_id: node.id,
         tenant_id: node.tenant_id,
         expires_at,
         token,
+        credentials,
     }))
 }
 
+/// `DELETE /v{version}/nodes/{id}` — revoke bus identity before removing a node.
+pub async fn remove_node(
+    State(app): State<Arc<AppState>>,
+    Extension(caller): Extension<Caller>,
+    Path((_version, id)): Path<(String, String)>,
+) -> ApiResult<StatusCode> {
+    let node_id = id.parse::<u64>().map_err(|_| not_found("node", &id))?;
+    // Read the key under the lock so a concurrent join-token issue cannot
+    // leave a key this removal never revokes.
+    let credentials_guard = NODE_CREDENTIALS.lock().await;
+    let node = app
+        .store
+        .get_node(node_id)
+        .await?
+        .ok_or_else(|| not_found("node", &id))?;
+    append_tenant_audit(
+        &app,
+        &node.tenant_id,
+        &caller.name,
+        "node.remove.requested",
+        &format!("/nodes/{node_id}"),
+    )
+    .await?;
+    if let Some(public_key) = node.nats_user_public_key.as_deref() {
+        revoke_nats_user(&app, public_key, &credentials_guard).await?;
+    }
+    app.store.remove_node(node_id).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn revoke_nats_user(
+    app: &AppState,
+    public_key: &str,
+    guard: &tokio::sync::MutexGuard<'_, ()>,
+) -> ApiResult<()> {
+    if !app.store.is_leader().await {
+        return Err(crate::error::ApiError::Unavailable(
+            "NATS credential revocation must run on the Raft leader".into(),
+        ));
+    }
+    let issuer = app.nats_credential_issuer.as_ref().ok_or_else(|| {
+        crate::error::ApiError::Unavailable("tenant NATS signer is not configured".into())
+    })?;
+    if app.bus.is_none() {
+        return Err(crate::error::ApiError::Unavailable(
+            "NATS revocation bus is not configured".into(),
+        ));
+    }
+    issuer
+        .validate_user_public_key(public_key)
+        .map_err(internal)?;
+    app.store
+        .record_nats_user_revocation(public_key.to_owned())
+        .await?;
+    publish_nats_revocations(app, guard).await
+}
+
+/// Publishes the account claim carrying every revocation stored in Raft. The
+/// leader also runs this when it takes over, so a manager whose resolver
+/// lost the claim cannot accept a revoked node's credentials again.
+/// One leader-probe tick: republish the revocations once per leadership term,
+/// retrying on the next tick after a failure. Returns whether this term's
+/// revocations are published.
+pub(crate) async fn sync_nats_revocations(
+    app: &AppState,
+    is_leader: bool,
+    published: bool,
+) -> bool {
+    if !is_leader || app.nats_credential_issuer.is_none() || app.bus.is_none() {
+        return false;
+    }
+    if published {
+        return true;
+    }
+    let guard = NODE_CREDENTIALS.lock().await;
+    match publish_nats_revocations(app, &guard).await {
+        Ok(()) => true,
+        Err(error) => {
+            tracing::warn!(%error, "cannot republish NATS credential revocations; retrying");
+            false
+        }
+    }
+}
+
+pub(crate) async fn publish_nats_revocations(
+    app: &AppState,
+    _guard: &tokio::sync::MutexGuard<'_, ()>,
+) -> ApiResult<()> {
+    let issuer = app.nats_credential_issuer.as_ref().ok_or_else(|| {
+        crate::error::ApiError::Unavailable("tenant NATS signer is not configured".into())
+    })?;
+    let bus = app.bus.as_ref().ok_or_else(|| {
+        crate::error::ApiError::Unavailable("NATS revocation bus is not configured".into())
+    })?;
+    let revoked_users = app
+        .store
+        .list_tenants()
+        .await?
+        .into_iter()
+        .flat_map(|tenant| tenant.nats_revoked_user_public_keys)
+        .collect::<Vec<_>>();
+    if revoked_users.is_empty() {
+        return Ok(());
+    }
+    let account_jwt = issuer
+        .account_claim_with_revocations(&revoked_users, unix_now())
+        .map_err(internal)?;
+    bus.update_account_claim(&account_jwt)
+        .await
+        .map_err(|error| {
+            crate::error::ApiError::Unavailable(format!(
+                "cannot publish node credential revocation: {error}"
+            ))
+        })?;
+    Ok(())
+}
 /// `POST /v{version}/nodes/{id}/update` — update labels and availability.
 ///
 /// Only what Minga can honestly do is accepted: label replacement and
@@ -678,6 +989,7 @@ pub async fn issue_node_join_token(
 /// names are `node-{id}`; requests to change either fail loudly.
 pub async fn update_node(
     State(app): State<Arc<AppState>>,
+    Extension(caller): Extension<Caller>,
     Path((_version, id)): Path<(String, String)>,
     Query(_query): Query<models::NodeUpdateQuery>,
     Json(spec): Json<models::NodeSpec>,
@@ -717,6 +1029,14 @@ pub async fn update_node(
     };
     node.labels = spec.Labels;
 
+    append_tenant_audit(
+        &app,
+        &node.tenant_id,
+        &caller.name,
+        "node.update.requested",
+        &format!("/nodes/{}", node.id),
+    )
+    .await?;
     app.store.upsert_node(node.clone()).await?;
     tracing::info!(node = node.id, status = ?node.status, "node updated via API");
 
@@ -910,10 +1230,14 @@ pub async fn delete_service(
         .iter()
         .filter(|task| task.tenant_id == tenant_id && task.service_id == svc.id)
     {
-        app.store.remove_task(task.id.clone()).await?;
+        app.store
+            .remove_task(task.id.clone(), &task.tenant_id)
+            .await?;
     }
 
-    app.store.remove_service(svc.id.clone()).await?;
+    app.store
+        .remove_service(svc.id.clone(), &svc.tenant_id)
+        .await?;
 
     tracing::info!(tenant = %tenant_id, service = %svc.id, "service removed via API");
 
@@ -1244,7 +1568,9 @@ pub async fn delete_network(
         .filter(|network| network.tenant_id == tenant_id)
         .ok_or_else(|| not_found("network", &id))?;
 
-    app.store.remove_network(net.id.clone()).await?;
+    app.store
+        .remove_network(net.id.clone(), &net.tenant_id)
+        .await?;
 
     tracing::info!(tenant = %tenant_id, network = %net.id, "network removed via API");
 
@@ -1352,7 +1678,9 @@ pub async fn delete_secret(
         .filter(|secret| secret.tenant_id == tenant_id)
         .ok_or_else(|| not_found("secret", &id))?;
 
-    app.store.remove_secret(secret.id.clone()).await?;
+    app.store
+        .remove_secret(secret.id.clone(), &secret.tenant_id)
+        .await?;
 
     tracing::info!(tenant = %tenant_id, secret = %secret.id, "secret removed via API");
 
@@ -1445,7 +1773,9 @@ pub async fn delete_config(
         .filter(|config| config.tenant_id == tenant_id)
         .ok_or_else(|| not_found("config", &id))?;
 
-    app.store.remove_config(config.id.clone()).await?;
+    app.store
+        .remove_config(config.id.clone(), &config.tenant_id)
+        .await?;
 
     tracing::info!(tenant = %tenant_id, config = %config.id, "config removed via API");
 
@@ -1466,6 +1796,7 @@ pub async fn fallback() -> ApiResult<StatusCode> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use minga_bus::MemoryBus;
     use minga_state::types::{NodeStatus, Task, TaskSpec, TaskState};
     use std::collections::{BTreeMap, HashMap};
 
@@ -1495,10 +1826,44 @@ mod tests {
                 last_seen_unix: None,
                 role: Default::default(),
                 reserved_ports: Vec::new(),
+                nats_user_public_key: None,
             })
             .await
             .unwrap();
-        (Arc::new(AppState::new(store)), dir)
+        (Arc::new(AppState::with_bus(store, MemoryBus::new())), dir)
+    }
+
+    #[tokio::test]
+    async fn cluster_audit_merges_tenant_trails_by_time() {
+        let (app, _dir) = app_with_node(1.0).await;
+        app.store
+            .create_tenant(Tenant {
+                nats_revoked_user_public_keys: Vec::new(),
+                id: "acme".into(),
+                name: "Acme".into(),
+                quotas: Default::default(),
+                created_at: 1,
+            })
+            .await
+            .unwrap();
+        let bus = app.bus.as_ref().unwrap();
+        for (tenant_id, occurred_at_unix) in [("default", 10), ("acme", 20)] {
+            bus.append_audit(AuditRecord {
+                tenant_id: tenant_id.into(),
+                actor: "operator".into(),
+                action: "tenant.update".into(),
+                resource_path: format!("/tenants/{tenant_id}"),
+                occurred_at_unix,
+            })
+            .await
+            .unwrap();
+        }
+
+        let Json(records) = list_cluster_audit(State(app), Query(AuditQuery { limit: Some(1) }))
+            .await
+            .unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].tenant_id, "acme");
     }
 
     fn spec(name: &str, nano_cpus: i64) -> models::ServiceSpec {
@@ -1535,6 +1900,7 @@ mod tests {
         let (app, _dir) = app_with_node(1.0).await;
         app.store
             .create_tenant(minga_state::types::Tenant {
+                nats_revoked_user_public_keys: Vec::new(),
                 id: "acme".into(),
                 name: "Acme".into(),
                 quotas: Default::default(),
@@ -1549,7 +1915,7 @@ mod tests {
             "tenant_id": "acme"
         }))
         .unwrap();
-        let _response = create_node(State(app.clone()), Json(tenant_request))
+        let _response = create_node(State(app.clone()), default_caller(), Json(tenant_request))
             .await
             .unwrap();
         let registered = app.store.get_node(2).await.unwrap().unwrap();
@@ -1560,7 +1926,7 @@ mod tests {
             "address": "127.0.0.1:50053"
         }))
         .unwrap();
-        let _response = create_node(State(app.clone()), Json(default_request))
+        let _response = create_node(State(app.clone()), default_caller(), Json(default_request))
             .await
             .unwrap();
         let registered = app.store.get_node(3).await.unwrap().unwrap();
@@ -1573,19 +1939,164 @@ mod tests {
         }))
         .unwrap();
         assert!(matches!(
-            create_node(State(app.clone()), Json(unknown_tenant_request)).await,
+            create_node(
+                State(app.clone()),
+                default_caller(),
+                Json(unknown_tenant_request)
+            )
+            .await,
             Err(ApiError::NotFound(_))
         ));
-        assert!(app.store.get_node(4).await.unwrap().is_none());
     }
 
+    #[tokio::test]
+    async fn deleting_node_revokes_its_bus_user_before_removing_it() {
+        let (base, _dir) = app_with_node(1.0).await;
+        let issuer = Arc::new(crate::nats_credentials::test_issuer("default"));
+        let (public_key, _) = issuer.issue("default", 1).unwrap();
+        base.store
+            .set_node_nats_user_public_key(1, Some(public_key.clone()))
+            .await
+            .unwrap();
+        let bus = minga_bus::memory::MemoryBus::new();
+        let app = Arc::new(
+            AppState::with_bus(base.store.clone(), bus).with_nats_credential_issuer(issuer),
+        );
+
+        assert_eq!(
+            remove_node(
+                State(app.clone()),
+                default_caller(),
+                Path(("v1.41".into(), "1".into())),
+            )
+            .await
+            .unwrap(),
+            StatusCode::NO_CONTENT
+        );
+        assert!(app.store.get_node(1).await.unwrap().is_none());
+        assert!(app
+            .store
+            .get_tenant("default")
+            .await
+            .unwrap()
+            .unwrap()
+            .nats_revoked_user_public_keys
+            .contains(&public_key));
+    }
+
+    #[tokio::test]
+    async fn new_leader_republishes_stored_revocations_once_per_term() {
+        use nats_jwt_rs::{account::Account, Claims};
+
+        let (base, _dir) = app_with_node(1.0).await;
+        let issuer = Arc::new(crate::nats_credentials::test_issuer("default"));
+        let (public_key, _) = issuer.issue("default", 1).unwrap();
+        base.store
+            .record_nats_user_revocation(public_key.clone())
+            .await
+            .unwrap();
+        let bus = minga_bus::memory::MemoryBus::new();
+        let app =
+            AppState::with_bus(base.store.clone(), bus.clone()).with_nats_credential_issuer(issuer);
+
+        assert!(!sync_nats_revocations(&app, false, false).await);
+        assert!(bus.account_claim_updates().is_empty());
+        assert!(sync_nats_revocations(&app, true, false).await);
+        assert!(sync_nats_revocations(&app, true, true).await);
+        let updates = bus.account_claim_updates();
+        assert_eq!(updates.len(), 1, "one publish per leadership term");
+        let claim = Claims::<Account>::decode(&updates[0]).unwrap();
+        assert!(claim.nats.revocations.unwrap().contains_key(&public_key));
+    }
+
+    #[tokio::test]
+    async fn deleting_node_fails_closed_when_revocation_bus_is_missing() {
+        let (base, _dir) = app_with_node(1.0).await;
+        let issuer = Arc::new(crate::nats_credentials::test_issuer("default"));
+        let (public_key, _) = issuer.issue("default", 1).unwrap();
+        base.store
+            .set_node_nats_user_public_key(1, Some(public_key.clone()))
+            .await
+            .unwrap();
+        let app = Arc::new(AppState::new(base.store.clone()).with_nats_credential_issuer(issuer));
+
+        {
+            let guard = NODE_CREDENTIALS.lock().await;
+            assert!(matches!(
+                revoke_nats_user(&app, &public_key, &guard).await,
+                Err(ApiError::Unavailable(_))
+            ));
+        }
+        assert!(matches!(
+            remove_node(
+                State(app.clone()),
+                default_caller(),
+                Path(("v1.41".into(), "1".into())),
+            )
+            .await,
+            Err(ApiError::Unavailable(_))
+        ));
+        assert!(app.store.get_node(1).await.unwrap().is_some());
+    }
+    #[tokio::test]
+    async fn reissuing_node_credentials_revokes_the_previous_nkey() {
+        let (base, _dir) = app_with_node(1.0).await;
+        let issuer = Arc::new(crate::nats_credentials::test_issuer("default"));
+        let key = Arc::new(JoinTokenKey::from_bytes(&[9; 32]).unwrap());
+        let bus = minga_bus::memory::MemoryBus::new();
+        let app = Arc::new(
+            AppState::with_bus(base.store.clone(), bus)
+                .with_join_token_key(key)
+                .with_nats_credential_issuer(issuer),
+        );
+
+        let Json(first) =
+            issue_node_join_token(State(app.clone()), default_caller(), Path("1".into()))
+                .await
+                .unwrap();
+        let old_public_key = app
+            .store
+            .get_node(1)
+            .await
+            .unwrap()
+            .unwrap()
+            .nats_user_public_key
+            .unwrap();
+        let Json(second) =
+            issue_node_join_token(State(app.clone()), default_caller(), Path("1".into()))
+                .await
+                .unwrap();
+
+        assert_ne!(first.credentials, second.credentials);
+        assert_eq!(
+            app.store
+                .get_tenant("default")
+                .await
+                .unwrap()
+                .unwrap()
+                .nats_revoked_user_public_keys,
+            vec![old_public_key.clone()]
+        );
+        let new_public_key = app
+            .store
+            .get_node(1)
+            .await
+            .unwrap()
+            .unwrap()
+            .nats_user_public_key
+            .unwrap();
+        assert_ne!(new_public_key, old_public_key);
+    }
     #[tokio::test]
     async fn node_join_token_is_signed_for_the_preregistered_tenant() {
         let (mut app, _dir) = app_with_node(1.0).await;
         let key = Arc::new(JoinTokenKey::from_bytes(&[5; 32]).unwrap());
         Arc::get_mut(&mut app).unwrap().join_token_key = Some(key.clone());
+        Arc::get_mut(&mut app).unwrap().nats_credential_issuer =
+            Some(Arc::new(crate::nats_credentials::test_issuer("acme")));
         app.store
             .create_tenant(Tenant {
+                nats_revoked_user_public_keys: Vec::new(),
                 id: "acme".into(),
                 name: "Acme".into(),
                 quotas: Default::default(),
@@ -1599,16 +2110,20 @@ mod tests {
             "tenant_id": "acme"
         }))
         .unwrap();
-        let _ = create_node(State(app.clone()), Json(request))
+        let _ = create_node(State(app.clone()), default_caller(), Json(request))
             .await
             .unwrap();
 
-        let Json(response) = issue_node_join_token(State(app), Path("2".into()))
-            .await
-            .unwrap();
+        let Json(response) =
+            issue_node_join_token(State(app.clone()), default_caller(), Path("2".into()))
+                .await
+                .unwrap();
         let claims = key
             .verify(&response.token, 2, minga_state::types::unix_now())
             .unwrap();
+        assert!(response.credentials.contains("BEGIN NATS USER JWT"));
+        let registered = app.store.get_node(2).await.unwrap().unwrap();
+        assert!(registered.nats_user_public_key.is_some());
         assert_eq!(response.tenant_id, "acme");
         assert_eq!(claims.tenant_id, "acme");
         assert_eq!(claims.node_id, response.node_id);

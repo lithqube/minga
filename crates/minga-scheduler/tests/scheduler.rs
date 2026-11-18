@@ -34,11 +34,13 @@ fn make_node(id: u64, cpus: f64, mem: u64) -> ClusterNode {
         last_seen_unix: None,
         role: Default::default(),
         reserved_ports: Vec::new(),
+        nats_user_public_key: None,
     }
 }
 
 fn make_service(id: &str, replicas: u32) -> Service {
     Service {
+        is_job: false,
         id: id.to_string(),
         tenant_id: "default".to_string(),
         name: id.to_string(),
@@ -80,7 +82,7 @@ async fn bus_lease_controls_node_eligibility() {
         .await
         .unwrap();
     let bus = minga_bus::MemoryBus::new();
-    bus.put_assignment("node.99.task.stale", b"stale")
+    bus.put_assignment("default.node.99.task.stale", b"stale")
         .await
         .unwrap();
     let scheduler = Scheduler::with_bus(store.clone(), bus.clone());
@@ -98,10 +100,10 @@ async fn bus_lease_controls_node_eligibility() {
     let assignments = bus.list_assignments("").await.unwrap();
     assert!(!assignments
         .iter()
-        .any(|(key, _)| key == "node.99.task.stale"));
+        .any(|(key, _)| key == "default.node.99.task.stale"));
     let task_entry = assignments
         .iter()
-        .find(|(key, _)| key.starts_with("node.1.task.app.web.1."))
+        .find(|(key, _)| key.starts_with("default.node.1.task.app.web.1."))
         .expect("leader publishes the placed task assignment");
     let assignment: minga_state::types::TaskAssignment =
         minga_state::codec::decode_wire(&task_entry.1).unwrap();
@@ -159,6 +161,7 @@ async fn multi_tenant_placement_and_wireguard_routes_stay_tenant_scoped() {
     );
     store
         .upsert_tenant(minga_state::types::Tenant {
+            nats_revoked_user_public_keys: Vec::new(),
             id: "tenant-b".into(),
             name: "Tenant B".into(),
             quotas: Default::default(),
@@ -200,9 +203,12 @@ async fn multi_tenant_placement_and_wireguard_routes_stay_tenant_scoped() {
     store.upsert_service(service).await.unwrap();
 
     let bus = MemoryBus::new();
-    for id in [1, 2, 3] {
+    for id in [1, 3] {
         bus.refresh_lease(id, b"registration").await.unwrap();
     }
+    bus.refresh_tenant_lease("tenant-b", 2, b"registration")
+        .await
+        .unwrap();
     let scheduler = Scheduler::with_bus(store.clone(), bus.clone());
 
     // Live but not yet joined: tenant B's node gets no tasks and no peers.
@@ -213,11 +219,15 @@ async fn multi_tenant_placement_and_wireguard_routes_stay_tenant_scoped() {
         .await
         .unwrap()
         .iter()
-        .any(|(key, _)| key.starts_with("node.2.")));
+        .any(|(key, _)| key.starts_with("tenant-b.node.2.")));
 
-    bus.put_status(&minga_bus::subjects::kv_node_join(2), b"tenant-b")
-        .await
-        .unwrap();
+    bus.put_tenant_status(
+        "tenant-b",
+        &minga_bus::subjects::kv_node_join("tenant-b", 2),
+        b"tenant-b",
+    )
+    .await
+    .unwrap();
     scheduler.reconcile_once().await.unwrap();
 
     let tasks = store.list_tasks().await.unwrap();
@@ -228,16 +238,16 @@ async fn multi_tenant_placement_and_wireguard_routes_stay_tenant_scoped() {
     );
 
     let assignments = bus.list_assignments("").await.unwrap();
-    let peer_set = |node_id| {
+    let peer_set = |tenant_id: &str, node_id| {
         let bytes = assignments
             .iter()
-            .find(|(key, _)| key == &format!("node.{node_id}.wg"))
+            .find(|(key, _)| key == &format!("{tenant_id}.node.{node_id}.wg"))
             .expect("peer set is published")
             .1
             .as_slice();
         minga_state::codec::decode_wire::<minga_net::wireguard::WireGuardPeerSet>(bytes).unwrap()
     };
-    let tenant_b_peers = peer_set(2);
+    let tenant_b_peers = peer_set("tenant-b", 2);
     assert_eq!(
         tenant_b_peers
             .peers
@@ -251,12 +261,13 @@ async fn multi_tenant_placement_and_wireguard_routes_stay_tenant_scoped() {
     assert_eq!(tenant_b_peers.networks[0].network_id, "tenant-b-net");
     assert!(assignments
         .iter()
-        .any(|(key, _)| key == "node.2.net.tenant-b-net"));
+        .any(|(key, _)| key == "tenant-b.node.2.net.tenant-b-net"));
     assert!(!assignments
         .iter()
-        .any(|(key, _)| key == "node.1.net.tenant-b-net" || key == "node.3.net.tenant-b-net"));
+        .any(|(key, _)| key == "default.node.1.net.tenant-b-net"
+            || key == "default.node.3.net.tenant-b-net"));
 
-    let default_peers = peer_set(3);
+    let default_peers = peer_set("default", 3);
     assert!(default_peers.networks.is_empty());
     assert!(!default_peers.peers.iter().any(|peer| peer.node_id == 2));
 
@@ -316,14 +327,20 @@ async fn network_is_projected_only_to_nodes_running_its_tasks() {
         .into_iter()
         .map(|(key, _)| key)
         .collect();
-    assert!(keys.contains(&subjects::kv_assignment_network(node, "app_front")));
+    assert!(keys.contains(&subjects::kv_assignment_network(
+        "default",
+        node,
+        "app_front"
+    )));
     for key in &keys {
         assert!(
             !key.starts_with("net.") && !key.contains("app_back"),
             "network with no task on the node leaked: {key}"
         );
         assert!(
-            !key.starts_with(&subjects::kv_assignment_node_network_prefix(other)),
+            !key.starts_with(&subjects::kv_assignment_node_network_prefix(
+                "default", other
+            )),
             "node {other} runs no task but got {key}"
         );
     }
@@ -502,16 +519,18 @@ async fn reconcile_projects_wireguard_peer_sets_from_live_placement() {
     for id in [1, 2, 3] {
         bus.refresh_lease(id, b"registration").await.unwrap();
     }
-    bus.put_assignment("node.99.wg", b"stale").await.unwrap();
+    bus.put_assignment("default.node.99.wg", b"stale")
+        .await
+        .unwrap();
     let scheduler = Scheduler::with_bus(store.clone(), bus.clone());
     scheduler.reconcile_once().await.unwrap();
 
     let entries = bus.list_assignments("").await.unwrap();
-    assert!(!entries.iter().any(|(key, _)| key == "node.99.wg"));
+    assert!(!entries.iter().any(|(key, _)| key == "default.node.99.wg"));
     let decode = |id| {
         let value = entries
             .iter()
-            .find(|(key, _)| key == &format!("node.{id}.wg"))
+            .find(|(key, _)| key == &format!("default.node.{id}.wg"))
             .expect("peer set published for eligible node");
         minga_state::codec::decode_wire::<minga_net::wireguard::WireGuardPeerSet>(&value.1).unwrap()
     };
@@ -564,10 +583,10 @@ async fn reconcile_projects_wireguard_peer_sets_from_live_placement() {
     // Nodes 1 and 2 run tasks on `shared`; node 3 does not, so it gets none.
     assert!(entries
         .iter()
-        .any(|(key, _)| key == &subjects::kv_assignment_network(1, "shared")));
+        .any(|(key, _)| key == &subjects::kv_assignment_network("default", 1, "shared")));
     assert!(!entries
         .iter()
-        .any(|(key, _)| key == &subjects::kv_assignment_network(3, "shared")));
+        .any(|(key, _)| key == &subjects::kv_assignment_network("default", 3, "shared")));
 
     let ingress_only_set = decode(3);
     assert!(ingress_only_set
@@ -593,14 +612,14 @@ async fn reconcile_projects_wireguard_peer_sets_from_live_placement() {
     );
     let ingress = entries
         .iter()
-        .find(|(key, _)| key == &subjects::kv_assignment_ingress(3, 18080, "tcp"))
+        .find(|(key, _)| key == &subjects::kv_assignment_ingress("default", 3, 18080, "tcp"))
         .expect("ingress-only node receives a backend assignment");
     let ingress: minga_state::types::IngressAssignment =
         minga_state::codec::decode_wire(&ingress.1).unwrap();
     assert_eq!(ingress.backends[0].node_id, 2);
     let network_entry = entries
         .iter()
-        .find(|(key, _)| key == &subjects::kv_assignment_network(2, "shared"))
+        .find(|(key, _)| key == &subjects::kv_assignment_network("default", 2, "shared"))
         .expect("network assignment published to the worker running a task on it");
     let network_assignment: minga_state::types::NetworkAssignment =
         minga_state::codec::decode_wire(&network_entry.1).unwrap();
@@ -655,7 +674,8 @@ async fn rollout_uses_failed_status_from_bus_kv() {
         last_exit_code: None,
         running_since_unix: None,
     };
-    bus.put_status(
+    bus.put_tenant_status(
+        "default",
         &subjects::kv_node_task_status(task.node_id, &task.id),
         &status.to_bytes().unwrap(),
     )
@@ -786,7 +806,7 @@ async fn ingress_backend_and_backendless_workers_peer_both_ways() {
         let bus = bus.clone();
         async move {
             let value = bus
-                .get_assignment(&format!("node.{id}.wg"))
+                .get_assignment(&format!("default.node.{id}.wg"))
                 .await
                 .unwrap()
                 .expect("peer set published");
@@ -860,7 +880,7 @@ async fn ingress_backend_projection_tracks_task_movement() {
     bus.refresh_lease(2, b"registration").await.unwrap();
     let scheduler = Scheduler::with_bus(store.clone(), bus.clone());
     scheduler.reconcile_once().await.unwrap();
-    let key = subjects::kv_assignment_ingress(1, 18080, "tcp");
+    let key = subjects::kv_assignment_ingress("default", 1, 18080, "tcp");
     let initial: minga_state::types::IngressAssignment =
         minga_state::codec::decode_wire(&bus.get_assignment(&key).await.unwrap().unwrap()).unwrap();
     assert_eq!(initial.backends.len(), 1);
@@ -870,7 +890,7 @@ async fn ingress_backend_projection_tracks_task_movement() {
     tokio::time::sleep(Duration::from_millis(150)).await;
     bus.refresh_lease(2, b"registration").await.unwrap();
     scheduler.reconcile_once().await.unwrap();
-    let key = subjects::kv_assignment_ingress(2, 18080, "tcp");
+    let key = subjects::kv_assignment_ingress("default", 2, 18080, "tcp");
     let moved: minga_state::types::IngressAssignment =
         minga_state::codec::decode_wire(&bus.get_assignment(&key).await.unwrap().unwrap()).unwrap();
     assert_eq!(moved.backends.len(), 1);
@@ -888,10 +908,12 @@ async fn ingress_backend_projection_tracks_task_movement() {
     scheduler.reconcile_once().await.unwrap();
     for node_id in [1, 2] {
         assert!(
-            bus.get_assignment(&subjects::kv_assignment_ingress(node_id, 18081, "tcp"))
-                .await
-                .unwrap()
-                .is_none(),
+            bus.get_assignment(&subjects::kv_assignment_ingress(
+                "default", node_id, 18081, "tcp"
+            ))
+            .await
+            .unwrap()
+            .is_none(),
             "host-mode ports must remain node-local, not enter the ingress mesh"
         );
     }
@@ -964,7 +986,10 @@ async fn reconcile_removes_tasks_when_service_deleted() {
     assert_eq!(store.list_tasks().await.unwrap().len(), 2);
 
     // Delete the service.
-    store.remove_service("app.web".to_string()).await.unwrap();
+    store
+        .remove_service("app.web".to_string(), minga_state::types::DEFAULT_TENANT_ID)
+        .await
+        .unwrap();
 
     // Second pass: removes both tasks.
     let actions = scheduler.reconcile_once().await.unwrap();
@@ -1202,7 +1227,7 @@ async fn nat_workers_relay_through_the_lowest_manager_and_fail_over_after_lease_
     let decode = |entries: &[(String, Vec<u8>)], id| {
         let value = entries
             .iter()
-            .find(|(key, _)| key == &format!("node.{id}.wg"))
+            .find(|(key, _)| key == &format!("default.node.{id}.wg"))
             .expect("peer set published");
         minga_state::codec::decode_wire::<minga_net::wireguard::WireGuardPeerSet>(&value.1).unwrap()
     };
@@ -1271,7 +1296,66 @@ async fn nat_workers_relay_through_the_lowest_manager_and_fail_over_after_lease_
         ["10.1.0.30/32", "10.200.0.3/32", "10.200.0.4/32"]
     );
     assert!(!worker.peers.iter().any(|peer| peer.node_id == 1));
-    assert!(!entries.iter().any(|(key, _)| key == "node.1.wg"));
+    assert!(!entries.iter().any(|(key, _)| key == "default.node.1.wg"));
+
+    drop(scheduler);
+    Arc::try_unwrap(store)
+        .ok()
+        .expect("scheduler dropped")
+        .shutdown()
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn one_tenant_at_its_task_quota_does_not_block_other_tenants() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(
+        StateStore::open(1, "127.0.0.1:0", dir.path(), BTreeMap::new())
+            .await
+            .unwrap(),
+    );
+    let mut default_tenant = store
+        .list_tenants()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|tenant| tenant.id == minga_state::types::DEFAULT_TENANT_ID)
+        .expect("default tenant");
+    default_tenant.quotas.tasks = Some(1);
+    store.upsert_tenant(default_tenant).await.unwrap();
+    store
+        .upsert_tenant(minga_state::types::Tenant {
+            nats_revoked_user_public_keys: Vec::new(),
+            id: "tenant-b".into(),
+            name: "Tenant B".into(),
+            quotas: Default::default(),
+            created_at: 1,
+        })
+        .await
+        .unwrap();
+
+    store.upsert_node(make_node(1, 8.0, 1 << 34)).await.unwrap();
+    let mut tenant_worker = make_node(2, 8.0, 1 << 34);
+    tenant_worker.tenant_id = "tenant-b".into();
+    store.upsert_node(tenant_worker).await.unwrap();
+
+    // Default wants three tasks against a quota of one; tenant B wants one.
+    store
+        .upsert_service(make_service("app.web", 3))
+        .await
+        .unwrap();
+    let mut service = make_service("tenant-b.web", 1);
+    service.tenant_id = "tenant-b".into();
+    store.upsert_service(service).await.unwrap();
+
+    let scheduler = Scheduler::new(store.clone());
+    scheduler.reconcile_once().await.unwrap();
+
+    let tasks = store.list_tasks().await.unwrap();
+    let count = |tenant: &str| tasks.iter().filter(|t| t.tenant_id == tenant).count();
+    assert_eq!(count(minga_state::types::DEFAULT_TENANT_ID), 1);
+    assert_eq!(count("tenant-b"), 1);
 
     drop(scheduler);
     Arc::try_unwrap(store)
