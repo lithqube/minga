@@ -62,6 +62,7 @@ pub mod auth;
 pub mod error;
 pub mod handlers;
 pub mod models;
+pub mod nats_credentials;
 pub mod server;
 pub mod translate;
 
