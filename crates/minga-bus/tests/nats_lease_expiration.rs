@@ -27,7 +27,7 @@ async fn jetstream_expiry_makes_a_node_ineligible() {
         .await
         .expect("lease watch did not replay the current entry")
         .expect("lease watch ended");
-    assert_eq!(snapshot.key, "lease.node.91");
+    assert_eq!(snapshot.key, minga_bus::subjects::kv_lease("default", 91));
     assert_eq!(
         snapshot.value.as_deref(),
         Some(b"registration payload".as_slice())
