@@ -210,12 +210,7 @@ impl Scheduler {
                 }
             };
             tasks = overlay_task_statuses(tasks, &statuses);
-            // A live lease alone does not admit a non-default node: until a
-            // manager accepted its join token it gets no tasks and no peers.
-            nodes.retain(|node| {
-                node.tenant_id == minga_state::types::DEFAULT_TENANT_ID
-                    || joined.get(&node.id) == Some(&node.tenant_id)
-            });
+            nodes.retain(|node| admitted(node, &joined));
         }
         let mut networks = self.state.list_networks().await?;
         self.fill_subnets(&mut networks, &tasks).await?;
@@ -294,13 +289,21 @@ impl Scheduler {
         let services = self.state.list_services().await?;
         // Stored task state lags the nodes' reports; without the overlay a
         // replica reported Failed would stay an ingress backend.
-        let (statuses, _) = match read_task_statuses(bus.as_ref()).await {
+        let (statuses, joined) = match read_task_statuses(bus.as_ref()).await {
             Ok(statuses) => statuses,
             Err(error) => {
                 tracing::warn!(error = %error, "cannot read task status; skipping projection");
                 return Ok(());
             }
         };
+        // Re-check on this read: a node re-enrolled since reconcile's read
+        // must not receive its old tenant's networks or peers.
+        let nodes: Vec<_> = nodes
+            .iter()
+            .filter(|node| admitted(node, &joined))
+            .cloned()
+            .collect();
+        let nodes = nodes.as_slice();
         let tasks = overlay_task_statuses(self.state.list_tasks().await?, &statuses);
         let networks = self.state.list_networks().await?;
         let live_node_ids: HashSet<_> = nodes.iter().map(|node| node.id).collect();
@@ -554,6 +557,13 @@ fn validate_manager_endpoints(nodes: &[ClusterNode]) -> Result<(), SchedulerErro
 
 /// Reads the nodes' task reports from MINGA_STATUS, keyed by task ID. A report
 /// whose key does not match its own node and task is ignored.
+/// A live lease alone does not admit a non-default node: until a manager
+/// accepted its join token it gets no tasks and no peers.
+fn admitted(node: &ClusterNode, joined: &HashMap<u64, String>) -> bool {
+    node.tenant_id == minga_state::types::DEFAULT_TENANT_ID
+        || joined.get(&node.id) == Some(&node.tenant_id)
+}
+
 /// Task status reports, plus each node's joined tenant from the same listing.
 async fn read_task_statuses(
     bus: &dyn EventBus,

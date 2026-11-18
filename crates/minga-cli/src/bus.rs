@@ -239,6 +239,7 @@ mod tests {
             "MINGA_NATS_TLS_CERT",
             "MINGA_NATS_TLS_KEY",
             "MINGA_NATS_TLS_SERVER_NAME",
+            "MINGA_NATS_CREDENTIALS_FILE",
         ] {
             std::env::remove_var(var);
         }

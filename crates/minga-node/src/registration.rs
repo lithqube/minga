@@ -365,6 +365,9 @@ struct PendingRegistration {
     identity: NodeIdentity,
     tenant_id: String,
     token_expires_at: Option<u64>,
+    /// Queued against an existing node record: if that record is gone at
+    /// commit, the node was deleted and must not be recreated.
+    requires_record: bool,
 }
 
 #[cfg(test)]
@@ -544,6 +547,7 @@ async fn queue_node_registration_with_join(
                         identity,
                         tenant_id,
                         token_expires_at,
+                        requires_record: true,
                     },
                 );
             }
@@ -555,6 +559,7 @@ async fn queue_node_registration_with_join(
                     identity,
                     tenant_id,
                     token_expires_at,
+                    requires_record: false,
                 },
             );
         }
@@ -601,6 +606,7 @@ async fn register_pending_nodes_with_join(
         let token_expires_at = pending_registration.token_expires_at;
         let tenant_id = pending_registration.tenant_id.clone();
         let identity = pending_registration.identity.clone();
+        let requires_record = pending_registration.requires_record;
         if token_expires_at.is_some_and(|expires_at| expires_at <= unix_now()) {
             tracing::warn!(
                 node_id,
@@ -628,9 +634,9 @@ async fn register_pending_nodes_with_join(
                     }
                 }
             }
-            Ok(None) if tenant_id != minga_state::types::DEFAULT_TENANT_ID => {
-                // Tokens are accepted only for an existing record, so the
-                // node was deleted after queueing; do not recreate it.
+            Ok(None) if requires_record => {
+                // Queued against an existing record (any tenant, token or
+                // not): the node was deleted after queueing; do not recreate it.
                 tracing::warn!(node_id, "node was removed before its join committed");
                 pending.remove(&node_id);
                 continue;
@@ -1220,6 +1226,7 @@ mod tests {
                 identity: identity(2),
                 tenant_id: "acme".into(),
                 token_expires_at: Some(unix_now() - 1),
+                requires_record: false,
             },
         )]);
         let mut joined = HashMap::new();
@@ -1380,10 +1387,16 @@ mod tests {
 
     #[tokio::test]
     async fn node_deleted_between_queue_and_commit_is_not_recreated() {
+        for tenant in ["acme", minga_state::types::DEFAULT_TENANT_ID] {
+            node_deleted_between_queue_and_commit(tenant).await;
+        }
+    }
+
+    async fn node_deleted_between_queue_and_commit(tenant: &str) {
         let (store, _dir) = store().await;
         wait_for_leader(&store).await;
         create_tenant(&store, "acme").await;
-        preregister(&store, 1, "acme").await;
+        preregister(&store, 1, tenant).await;
         let key = JoinTokenKey::from_bytes(&[9; 32]).unwrap();
         let bus = minga_bus::MemoryBus::with_lease_ttl(Duration::from_secs(5));
         let mut stream = bus.watch_leases().await.unwrap();
@@ -1391,7 +1404,7 @@ mod tests {
         let mut pending = HashMap::new();
         let mut joined = HashMap::new();
 
-        let event = publish(&bus, &mut stream, &with_token(1, &key, "acme")).await;
+        let event = publish(&bus, &mut stream, &with_token(1, &key, tenant)).await;
         queue_node_registration_with_join(
             &store,
             event,
@@ -1439,6 +1452,7 @@ mod tests {
                 identity: identity(1),
                 tenant_id: "acme".into(),
                 token_expires_at: None,
+                requires_record: true,
             },
         )]);
 
