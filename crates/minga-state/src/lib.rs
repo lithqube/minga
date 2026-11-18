@@ -46,6 +46,7 @@
 pub mod codec;
 mod command;
 mod error;
+pub mod join_token;
 mod log_store;
 pub mod network;
 mod state_machine;
