@@ -102,10 +102,10 @@ Sequential implementation for one developer: B (NATS TLS/transport boundary) →
 **Requirements:** TEN-STATE, TEN-IDENTITY, TEN-SCOPE, TEN-OPERATOR, TEN-NODE, TEN-BUS, TEN-QUOTA
 **Plans:** `docs/adr/0008-multi-tenancy.md` (the delivery list is the plan; the ADR's tenancy checklist governs every change)
 **Mode:** standard
-**Status:** In progress — T1 and T2 merged (PRs #92, #93, #94); T3 is next
+**Status:** In progress — T1 and T2 merged (PRs #92, #93, #94); T3 placement and peer isolation are implemented, while join credentials depend on the T4 NATS identity foundation. Initial signer custody is manager-local; see ADR 0008.
 
 - [x] T1 — Tenant as desired state: the `Tenant` type, quotas, the replicated `default` tenant, cluster-operator CRUD
 - [x] T2 — Identity and API scoping: the tenant in the client certificate, tenant-filtered routes, 404 for foreign lookups, operator-only cluster routes
 - [ ] T3 — Node join tokens per tenant, the hard placement filter, managers without tenant workloads once a cluster has two tenants, WireGuard peer sets per tenant
-- [ ] T4 — Tenant segments in bus subjects and keys, the per-tenant worker ACL, per-tenant streams and buckets, operator/JWT mode with scoped signing keys
+- [ ] T4 — Tenant segments in bus subjects and keys, per-tenant worker ACL, streams and buckets, operator/JWT mode with scoped signing keys (**authentication foundation starts before T3 enrollment**)
 - [ ] T5 — Quota enforcement and the per-tenant audit trail

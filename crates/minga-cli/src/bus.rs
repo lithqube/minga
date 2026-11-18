@@ -26,6 +26,8 @@ pub enum ConnectError {
 
     #[error("cannot connect to NATS at {url}: {reason}")]
     Connect { url: String, reason: String },
+    #[error("NATS credentials file is invalid: {0}")]
+    CredentialsFile(String),
 }
 
 /// Connect to NATS, using TLS when the environment provides material.
@@ -33,6 +35,8 @@ pub enum ConnectError {
 /// `url` is the server URL as given by the user. The environment variables
 /// `MINGA_NATS_TLS_CA`, `MINGA_NATS_TLS_CERT`, `MINGA_NATS_TLS_KEY` and
 /// `MINGA_NATS_TLS_SERVER_NAME` select secure mode.
+/// `MINGA_NATS_CREDENTIALS_FILE` selects a NATS user credentials file. Its
+/// contents are used only over TLS, and the file must be owner-only.
 ///
 /// In secure mode `url` may be a comma-separated seed list for a NATS
 /// cluster. `replicas` raises the replicated streams and buckets (see
@@ -76,20 +80,38 @@ async fn connect_nats_bus(
     replicas: usize,
 ) -> Result<Arc<minga_bus::NatsBus>, ConnectError> {
     let tls = NatsTlsConfig::from_env().map_err(|e| ConnectError::TlsConfig(e.to_string()))?;
-    // Explicit flag wins; MINGA_NATS_TOKEN is the fallback.
-    let token: Option<String> = token
-        .map(String::from)
+    // Explicit flag wins; environment variables provide process-wide defaults.
+    let token = token
+        .map(str::to_owned)
         .or_else(|| std::env::var("MINGA_NATS_TOKEN").ok());
+    let credentials = credentials_from_env()?;
+    if token.is_some() && credentials.is_some() {
+        return Err(ConnectError::TlsConfig(
+            "NATS token and JWT credentials cannot be used together".to_string(),
+        ));
+    }
 
     let connect_error = |e: minga_bus::BusError| ConnectError::Connect {
         url: url.to_string(),
         reason: e.to_string(),
     };
     let bus = match tls {
-        Some(config) => minga_bus::NatsBus::connect_secure(url, &config)
-            .await
-            .map_err(connect_error)?,
+        Some(config) => match credentials.as_deref() {
+            Some(credentials) => {
+                minga_bus::NatsBus::connect_secure_with_credentials(url, &config, credentials)
+                    .await
+                    .map_err(connect_error)?
+            }
+            None => minga_bus::NatsBus::connect_secure(url, &config)
+                .await
+                .map_err(connect_error)?,
+        },
         None => {
+            if credentials.is_some() {
+                return Err(ConnectError::TlsConfig(
+                    "NATS JWT credentials require TLS transport".to_string(),
+                ));
+            }
             // Plaintext is a loopback-only development mode. A token adds
             // credential-checking but does not make plaintext routable.
             let authority = url.strip_prefix("nats://").and_then(|rest| {
@@ -119,6 +141,52 @@ async fn connect_nats_bus(
     Ok(bus)
 }
 
+fn credentials_from_env() -> Result<Option<String>, ConnectError> {
+    let Some(path) = std::env::var_os("MINGA_NATS_CREDENTIALS_FILE") else {
+        return Ok(None);
+    };
+    let path = std::path::PathBuf::from(path);
+    read_credentials_file(&path).map(Some)
+}
+
+fn read_credentials_file(path: &std::path::Path) -> Result<String, ConnectError> {
+    use std::io::Read;
+
+    let file = std::fs::File::open(path)
+        .map_err(|error| ConnectError::CredentialsFile(format!("{}: {error}", path.display())))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| ConnectError::CredentialsFile(format!("{}: {error}", path.display())))?;
+    if !metadata.is_file() {
+        return Err(ConnectError::CredentialsFile(format!(
+            "{} is not a regular file",
+            path.display()
+        )));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = metadata.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            return Err(ConnectError::CredentialsFile(format!(
+                "{} has insecure permissions {mode:o} (expected owner-only)",
+                path.display()
+            )));
+        }
+    }
+    let mut file = file.take(64 * 1024 + 1);
+    let mut contents = String::new();
+    file.read_to_string(&mut contents)
+        .map_err(|error| ConnectError::CredentialsFile(format!("{}: {error}", path.display())))?;
+    if contents.len() > 64 * 1024 {
+        return Err(ConnectError::CredentialsFile(format!(
+            "{} exceeds 64 KiB",
+            path.display()
+        )));
+    }
+    Ok(contents)
+}
+
 /// Connect a worker with read-only assignment access and owner-scoped writes.
 ///
 /// Unlike [`connect_bus`], this never creates buckets or raises replicas.
@@ -129,6 +197,7 @@ pub async fn connect_worker_bus(
 ) -> Result<Arc<dyn EventBus>, ConnectError> {
     let tls =
         NatsTlsConfig::from_env().map_err(|error| ConnectError::TlsConfig(error.to_string()))?;
+    let credentials = credentials_from_env()?;
     let token = token
         .map(String::from)
         .or_else(|| std::env::var("MINGA_NATS_TOKEN").ok());
@@ -136,11 +205,31 @@ pub async fn connect_worker_bus(
         url: url.to_string(),
         reason: error.to_string(),
     };
+    if token.is_some() && credentials.is_some() {
+        return Err(ConnectError::TlsConfig(
+            "NATS token and JWT credentials cannot be used together".to_string(),
+        ));
+    }
     let bus = match tls {
-        Some(config) => minga_bus::NatsBus::connect_worker_secure(url, &config, node_id)
+        Some(config) => match credentials.as_deref() {
+            Some(credentials) => minga_bus::NatsBus::connect_worker_secure_with_credentials(
+                url,
+                &config,
+                credentials,
+                node_id,
+            )
             .await
             .map_err(connect_error)?,
+            None => minga_bus::NatsBus::connect_worker_secure(url, &config, node_id)
+                .await
+                .map_err(connect_error)?,
+        },
         None => {
+            if credentials.is_some() {
+                return Err(ConnectError::TlsConfig(
+                    "NATS JWT credentials require TLS transport".to_string(),
+                ));
+            }
             let authority = url.strip_prefix("nats://").and_then(|rest| {
                 if rest.contains(['/', '?', '@', ',']) {
                     return None;
@@ -194,5 +283,22 @@ mod tests {
             Err(ConnectError::TlsConfig(_)) => {}
             Err(other) => panic!("unexpected error variant: {other}"),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn credentials_file_requires_owner_only_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("worker.creds");
+        std::fs::write(&path, "private credentials").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(read_credentials_file(&path).unwrap(), "private credentials");
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let error = read_credentials_file(&path).unwrap_err();
+        assert!(matches!(error, ConnectError::CredentialsFile(_)));
+        assert!(!error.to_string().contains("private credentials"));
     }
 }

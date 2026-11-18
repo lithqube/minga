@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand};
 use minga_compose::{DeployMode, LoadOptions, Loaded};
-use sidecar::{ClusterTls, NatsSidecar, ServerTls, SidecarOptions};
+use sidecar::{ClusterTls, NatsJwtAuth, NatsSidecar, ServerTls, SidecarOptions};
 
 /// Minga: single-binary orchestrator for edge, on-prem and air-gapped sites.
 #[derive(Parser)]
@@ -230,6 +230,12 @@ enum TlsCommand {
         #[arg(long)]
         dir: String,
     },
+    /// Generate a 32-byte join-token signing key; copy it securely to every manager.
+    InitJoinKey {
+        /// File to create with mode 0600. Refuses to overwrite an existing file.
+        #[arg(long)]
+        out: String,
+    },
     /// Issue a node certificate with the Raft SAN and a NATS user identity.
     IssueNode {
         /// Directory containing ca.pem and ca-key.pem.
@@ -438,6 +444,12 @@ struct NodeArgs {
     /// Token required on API requests. Prefer MINGA_API_TOKEN to keep it out of process listings.
     #[arg(long, env = "MINGA_API_TOKEN")]
     api_token: Option<String>,
+    /// Owner-only 32-byte join-token signing key; use the same key on every manager.
+    #[arg(long, env = "MINGA_JOIN_TOKEN_KEY_FILE")]
+    join_token_key_file: Option<String>,
+    /// Owner-only file containing the worker's tenant-bound join token.
+    #[arg(long, env = "MINGA_NODE_JOIN_TOKEN_FILE")]
+    join_token_file: Option<String>,
     /// Range each network's /24 is allocated from (by the Raft leader).
     /// Refused when it overlaps one of this host's routes.
     #[arg(long, env = "MINGA_OVERLAY_SUPERNET", default_value = minga_net::DEFAULT_SUPERNET)]
@@ -939,6 +951,27 @@ fn run_tls(cmd: TlsCommand) -> ExitCode {
                 ca_key_pem.display()
             );
         }
+        TlsCommand::InitJoinKey { out } => {
+            use rand::RngCore;
+
+            let path = PathBuf::from(out);
+            let mut key = [0u8; 32];
+            if let Err(error) = rand::rngs::OsRng.try_fill_bytes(&mut key) {
+                eprintln!("error: join-token key generation failed: {error}");
+                return ExitCode::FAILURE;
+            }
+            let result = write_new_file(&path, &key, true);
+            key.fill(0);
+            if let Err(error) = result {
+                eprintln!(
+                    "error: cannot create join-token key {}: {error}",
+                    path.display()
+                );
+                return ExitCode::FAILURE;
+            }
+            println!("join-token signing key written to {}", path.display());
+            println!("  securely copy this file to every manager");
+        }
         TlsCommand::IssueNode {
             ca_dir,
             out_dir,
@@ -1157,6 +1190,7 @@ fn worker_has_manager_only_flags(args: &NodeArgs) -> bool {
         || args.nats_cluster_port.is_some()
         || args.api_bind.is_some()
         || args.api_token.is_some()
+        || args.join_token_key_file.is_some()
         || args.api_tls_cert.is_some()
         || args.api_tls_key.is_some()
         || args.api_client_ca.is_some()
@@ -1198,6 +1232,67 @@ async fn wait_for_node_shutdown() {
     }
 }
 
+fn read_owner_only_file(path: &std::path::Path, max_bytes: usize) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+
+    let file = std::fs::File::open(path)
+        .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("cannot inspect {}: {error}", path.display()))?;
+    if !metadata.is_file() {
+        return Err(format!("{} is not a regular file", path.display()));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = metadata.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            return Err(format!(
+                "{} has insecure permissions {mode:o} (expected owner-only)",
+                path.display()
+            ));
+        }
+    }
+    let mut file = file.take(max_bytes as u64 + 1);
+    let mut contents = Vec::new();
+    file.read_to_end(&mut contents)
+        .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    if contents.len() > max_bytes {
+        return Err(format!("{} exceeds {max_bytes} bytes", path.display()));
+    }
+    Ok(contents)
+}
+
+fn load_join_token_key(
+    path: Option<&str>,
+) -> Result<Option<Arc<minga_state::join_token::JoinTokenKey>>, String> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    let path = PathBuf::from(path);
+    let contents = read_owner_only_file(&path, 32)?;
+    minga_state::join_token::JoinTokenKey::from_bytes(&contents)
+        .map(Arc::new)
+        .map(Some)
+        .map_err(|error| format!("invalid join-token key file {}: {error}", path.display()))
+}
+
+fn load_node_join_token(path: Option<&str>) -> Result<Option<String>, String> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    let path = PathBuf::from(path);
+    let contents = read_owner_only_file(&path, 16 * 1024)?;
+    let token =
+        String::from_utf8(contents).map_err(|_| format!("{} is not UTF-8", path.display()))?;
+    let token = token.trim().to_owned();
+    if token.is_empty() {
+        return Err(format!("{} is empty", path.display()));
+    }
+    Ok(Some(token))
+}
+
 /// Runs a node (manager or worker): managers open Raft state, while workers
 /// run only the supervisor against their bus assignments.
 async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
@@ -1211,6 +1306,32 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
         );
         return ExitCode::FAILURE;
     }
+    if is_manager && args.join_token_file.is_some() {
+        eprintln!("error: MINGA_NODE_JOIN_TOKEN_FILE is worker-only");
+        return ExitCode::FAILURE;
+    }
+    let join_token_key = if is_manager {
+        match load_join_token_key(args.join_token_key_file.as_deref()) {
+            Ok(key) => key,
+            Err(error) => {
+                eprintln!("error: {error}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        None
+    };
+    let join_token = if is_manager {
+        None
+    } else {
+        match load_node_join_token(args.join_token_file.as_deref()) {
+            Ok(token) => token,
+            Err(error) => {
+                eprintln!("error: {error}");
+                return ExitCode::FAILURE;
+            }
+        }
+    };
     let api_tls_parts = [
         args.api_tls_cert.is_some(),
         args.api_tls_key.is_some(),
@@ -1477,6 +1598,7 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
         reserved_ports,
         wg_public_key: Some(wg_public_key),
         wg_endpoint: args.wg_endpoint.clone(),
+        join_token,
     };
 
     // Create the event bus.
@@ -1521,6 +1643,22 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
                 return ExitCode::FAILURE;
             }
             // Manager: spawn the NATS sidecar.
+            let jwt_auth = match (
+                std::env::var_os("MINGA_NATS_OPERATOR_JWT"),
+                std::env::var_os("MINGA_NATS_RESOLVER_DIR"),
+            ) {
+                (Some(operator_jwt), Some(resolver_dir)) => Some(NatsJwtAuth {
+                    operator_jwt_file: PathBuf::from(operator_jwt),
+                    resolver_dir: PathBuf::from(resolver_dir),
+                }),
+                (None, None) => None,
+                _ => {
+                    eprintln!(
+                        "error: MINGA_NATS_OPERATOR_JWT and MINGA_NATS_RESOLVER_DIR must be set together"
+                    );
+                    return ExitCode::FAILURE;
+                }
+            };
             let tls = args.nats_server_cert.as_ref().map(|cert| ServerTls {
                 cert_file: PathBuf::from(cert),
                 key_file: PathBuf::from(
@@ -1534,9 +1672,10 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
                         .expect("TLS fields validated"),
                 ),
                 verify: true,
-                verify_and_map: true,
+                verify_and_map: jwt_auth.is_none(),
             });
             let opts = SidecarOptions {
+                jwt_auth,
                 data_dir: PathBuf::from(&args.data_dir),
                 node_id: args.node_id,
                 manager_node_ids,
@@ -1612,7 +1751,7 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
             }),
             _ => None,
         };
-        match minga_api::ApiServer::start_with_bus_and_auth_and_tls(
+        match minga_api::ApiServer::start_with_bus_and_auth_and_tls_and_join_token_key(
             state
                 .as_ref()
                 .expect("manager StateStore initialized")
@@ -1621,6 +1760,7 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
             api_bind,
             args.api_token.clone(),
             api_tls,
+            join_token_key.clone(),
         )
         .await
         {
@@ -1829,7 +1969,7 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
         );
         tokio::select! {
             _ = scheduler.run(interval) => {},
-            _ = minga_node::run_node_registration(state.clone(), bus.clone()) => {},
+            _ = minga_node::run_node_registration(state.clone(), bus.clone(), join_token_key.clone()) => {},
             _ = supervisor.run(interval) => {},
             _ = minga_node::run_wireguard_assignments(
                 bus.clone(),
@@ -2539,9 +2679,39 @@ fn port_of(addr: &str) -> Option<u16> {
 mod tests {
     use super::{
         is_loopback_bind, manager_requires_wg_endpoint, node_certificate_names, port_of,
-        project_dir, run_node, worker_has_manager_only_flags, Cli, Command, NodeCertificateRole,
+        project_dir, run_node, run_tls, worker_has_manager_only_flags, Cli, Command,
+        NodeCertificateRole, TlsCommand,
     };
     use clap::Parser;
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::ExitCode;
+    use tempfile::tempdir;
+
+    #[test]
+    fn tls_init_join_key_creates_a_private_key_and_refuses_overwrite() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("join.key");
+
+        assert_eq!(
+            run_tls(TlsCommand::InitJoinKey {
+                out: path.display().to_string(),
+            }),
+            ExitCode::SUCCESS
+        );
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(bytes.len(), 32);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            run_tls(TlsCommand::InitJoinKey {
+                out: path.display().to_string(),
+            }),
+            ExitCode::FAILURE
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    }
 
     #[test]
     fn worker_rejects_peer_flag() {

@@ -28,8 +28,12 @@ pub enum SidecarError {
 
     #[error("plaintext NATS sidecar may only listen on loopback")]
     InsecureListener,
-    #[error("NATS token authentication cannot be combined with certificate identity mapping")]
+    #[error(
+        "NATS token, certificate mapping, and operator/JWT authentication are mutually exclusive"
+    )]
     ConflictingAuth,
+    #[error("invalid NATS operator/JWT configuration: {0}")]
+    JwtConfig(String),
     #[error("failed to spawn nats-server: {0}")]
     Spawn(String),
 
@@ -82,9 +86,20 @@ pub struct ClusterTls {
     pub routes: Vec<String>,
 }
 
+/// NATS operator and account JWT resolver configuration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NatsJwtAuth {
+    /// Public operator JWT file loaded by `nats-server`.
+    pub operator_jwt_file: PathBuf,
+    /// Full account JWT resolver directory.
+    pub resolver_dir: PathBuf,
+}
+
 /// Options for the NATS sidecar.
 #[derive(Debug, Clone)]
 pub struct SidecarOptions {
+    /// Operator/JWT client authentication instead of certificate mapping.
+    pub jwt_auth: Option<NatsJwtAuth>,
     /// Data directory (config and JetStream store live under this).
     pub data_dir: PathBuf,
     /// Node ID (used in server_name).
@@ -127,6 +142,7 @@ impl Default for SidecarOptions {
             max_memory_store: "64MB".to_string(),
             max_file_store: "1GB".to_string(),
             client_token: None,
+            jwt_auth: None,
             listen_addr: "127.0.0.1".to_string(),
             tls: None,
             cluster: None,
@@ -148,6 +164,26 @@ impl NatsSidecar {
         }
         if opts.tls.as_ref().is_some_and(|tls| tls.verify_and_map) && opts.client_token.is_some() {
             return Err(SidecarError::ConflictingAuth);
+        }
+        if let Some(jwt_auth) = &opts.jwt_auth {
+            let Some(tls) = &opts.tls else {
+                return Err(SidecarError::JwtConfig("requires client TLS".to_string()));
+            };
+            if opts.client_token.is_some() || tls.verify_and_map || !tls.verify {
+                return Err(SidecarError::ConflictingAuth);
+            }
+            if !jwt_auth.operator_jwt_file.is_file() {
+                return Err(SidecarError::JwtConfig(format!(
+                    "operator JWT file `{}` is missing",
+                    jwt_auth.operator_jwt_file.display()
+                )));
+            }
+            if !jwt_auth.resolver_dir.is_dir() {
+                return Err(SidecarError::JwtConfig(format!(
+                    "resolver directory `{}` is missing",
+                    jwt_auth.resolver_dir.display()
+                )));
+            }
         }
         // Create data directories.
         let nats_dir = opts.data_dir.join("nats");
@@ -260,7 +296,17 @@ fn generate_config(opts: &SidecarOptions, jetstream_dir: &Path) -> String {
     ));
     out.push_str(&format!("server_name: minga-{}\n", opts.node_id));
     let verify_and_map = opts.tls.as_ref().is_some_and(|tls| tls.verify_and_map);
-    if !verify_and_map {
+    if let Some(jwt_auth) = &opts.jwt_auth {
+        out.push_str(&format!(
+            "operator: \"{}\"\n",
+            jwt_auth.operator_jwt_file.display()
+        ));
+        out.push_str("resolver: {\n    type: full\n");
+        out.push_str(&format!(
+            "    dir: \"{}\"\n}}\n",
+            jwt_auth.resolver_dir.display()
+        ));
+    } else if !verify_and_map {
         if let Some(token) = &opts.client_token {
             out.push_str(&format!("authorization: {{ token: \"{token}\" }}\n"));
         }
@@ -523,6 +569,47 @@ mod tests {
         assert!(config.contains("ca_file: \"/etc/minga/tls/ca.pem\""));
         assert!(config.contains("verify: true"));
         assert!(config.contains("verify_and_map: true"));
+    }
+
+    #[test]
+    fn config_enables_operator_jwt_resolver_without_certificate_mapping() {
+        let opts = SidecarOptions {
+            jwt_auth: Some(NatsJwtAuth {
+                operator_jwt_file: PathBuf::from("/etc/minga/nats/operator.jwt"),
+                resolver_dir: PathBuf::from("/var/lib/minga/nats/resolver"),
+            }),
+            tls: Some(ServerTls {
+                cert_file: PathBuf::from("/etc/minga/tls/server-cert.pem"),
+                key_file: PathBuf::from("/etc/minga/tls/server-key.pem"),
+                ca_file: PathBuf::from("/etc/minga/tls/ca.pem"),
+                verify: true,
+                verify_and_map: false,
+            }),
+            ..SidecarOptions::default()
+        };
+        let config = generate_config(&opts, Path::new("/var/lib/minga/nats/jetstream"));
+
+        assert!(config.contains("operator: \"/etc/minga/nats/operator.jwt\""));
+        assert!(config.contains("resolver: {"));
+        assert!(config.contains("type: full"));
+        assert!(config.contains("dir: \"/var/lib/minga/nats/resolver\""));
+        assert!(!config.contains("verify_and_map"));
+        assert!(!config.contains("authorization:"));
+    }
+
+    #[tokio::test]
+    async fn jwt_auth_rejects_missing_tls() {
+        let opts = SidecarOptions {
+            jwt_auth: Some(NatsJwtAuth {
+                operator_jwt_file: PathBuf::from("/operator.jwt"),
+                resolver_dir: PathBuf::from("/resolver"),
+            }),
+            ..SidecarOptions::default()
+        };
+        assert!(matches!(
+            NatsSidecar::start(&opts).await,
+            Err(SidecarError::JwtConfig(_))
+        ));
     }
 
     #[test]

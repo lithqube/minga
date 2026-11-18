@@ -30,6 +30,7 @@ fn make_node(id: u64, cpus: f64, mem: u64) -> ClusterNode {
         wg_public_key: None,
         wg_endpoint: None,
         overlay_ip: None,
+        tenant_id: minga_state::types::DEFAULT_TENANT_ID.to_owned(),
         last_seen_unix: None,
         role: Default::default(),
         reserved_ports: Vec::new(),
@@ -138,6 +139,112 @@ async fn manager_without_endpoint_blocks_multi_node_placement() {
 
     assert!(scheduler.reconcile_once().await.is_err());
     assert!(store.list_tasks().await.unwrap().is_empty());
+
+    drop(scheduler);
+    Arc::try_unwrap(store)
+        .ok()
+        .expect("scheduler dropped")
+        .shutdown()
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn multi_tenant_placement_and_wireguard_routes_stay_tenant_scoped() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(
+        StateStore::open(1, "127.0.0.1:0", dir.path(), BTreeMap::new())
+            .await
+            .unwrap(),
+    );
+    store
+        .upsert_tenant(minga_state::types::Tenant {
+            id: "tenant-b".into(),
+            name: "Tenant B".into(),
+            quotas: Default::default(),
+            created_at: 1,
+        })
+        .await
+        .unwrap();
+
+    let mut manager = make_node(1, 8.0, 1 << 34);
+    manager.role = NodeRole::Manager;
+    manager.wg_public_key = Some("manager-key".into());
+    manager.wg_endpoint = Some("192.0.2.1:51820".into());
+    let mut tenant_worker = make_node(2, 8.0, 1 << 34);
+    tenant_worker.tenant_id = "tenant-b".into();
+    tenant_worker.wg_public_key = Some("tenant-b-key".into());
+    tenant_worker.wg_endpoint = Some("192.0.2.2:51820".into());
+    let mut default_worker = make_node(3, 8.0, 1 << 34);
+    default_worker.wg_public_key = Some("default-key".into());
+    default_worker.wg_endpoint = Some("192.0.2.3:51820".into());
+    for node in [manager, tenant_worker, default_worker] {
+        store.upsert_node(node).await.unwrap();
+    }
+
+    store
+        .upsert_network(Network {
+            id: "tenant-b-net".into(),
+            tenant_id: "tenant-b".into(),
+            name: "private".into(),
+            driver: "overlay".into(),
+            attachable: false,
+            subnet: Some("10.70.0.0/24".into()),
+            wg_port: None,
+        })
+        .await
+        .unwrap();
+    let mut service = make_service("tenant-b.web", 1);
+    service.tenant_id = "tenant-b".into();
+    service.networks = vec!["tenant-b-net".into()];
+    store.upsert_service(service).await.unwrap();
+
+    let bus = MemoryBus::new();
+    for id in [1, 2, 3] {
+        bus.refresh_lease(id, b"registration").await.unwrap();
+    }
+    let scheduler = Scheduler::with_bus(store.clone(), bus.clone());
+    scheduler.reconcile_once().await.unwrap();
+
+    let tasks = store.list_tasks().await.unwrap();
+    assert_eq!(tasks.len(), 1);
+    assert_eq!(
+        tasks[0].node_id, 2,
+        "tenant workloads must avoid managers and foreign workers"
+    );
+
+    let assignments = bus.list_assignments("").await.unwrap();
+    let peer_set = |node_id| {
+        let bytes = assignments
+            .iter()
+            .find(|(key, _)| key == &format!("node.{node_id}.wg"))
+            .expect("peer set is published")
+            .1
+            .as_slice();
+        minga_state::codec::decode_wire::<minga_net::wireguard::WireGuardPeerSet>(bytes).unwrap()
+    };
+    let tenant_b_peers = peer_set(2);
+    assert_eq!(
+        tenant_b_peers
+            .peers
+            .iter()
+            .map(|peer| peer.node_id)
+            .collect::<Vec<_>>(),
+        [1],
+        "tenant workers may peer with managers, never another tenant's worker"
+    );
+    assert_eq!(tenant_b_peers.networks.len(), 1);
+    assert_eq!(tenant_b_peers.networks[0].network_id, "tenant-b-net");
+    assert!(assignments
+        .iter()
+        .any(|(key, _)| key == "node.2.net.tenant-b-net"));
+    assert!(!assignments
+        .iter()
+        .any(|(key, _)| key == "node.1.net.tenant-b-net" || key == "node.3.net.tenant-b-net"));
+
+    let default_peers = peer_set(3);
+    assert!(default_peers.networks.is_empty());
+    assert!(!default_peers.peers.iter().any(|peer| peer.node_id == 2));
 
     drop(scheduler);
     Arc::try_unwrap(store)

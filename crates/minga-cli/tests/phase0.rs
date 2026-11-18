@@ -46,6 +46,7 @@ fn cluster_node(id: u64, addr: &str) -> ClusterNode {
         wg_public_key: None,
         wg_endpoint: Some(format!("192.0.2.{}:51820", id)),
         overlay_ip: None,
+        tenant_id: minga_state::types::DEFAULT_TENANT_ID.to_owned(),
         last_seen_unix: None,
         role: if id == 1 {
             NodeRole::Manager

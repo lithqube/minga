@@ -55,6 +55,7 @@ async fn start_test_server_with_reserved_ports(
             wg_public_key: None,
             wg_endpoint: None,
             overlay_ip: None,
+            tenant_id: minga_state::types::DEFAULT_TENANT_ID.to_owned(),
             last_seen_unix: None,
             role: Default::default(),
             reserved_ports,
@@ -68,6 +69,75 @@ async fn start_test_server_with_reserved_ports(
     let port = server.addr().rsplit_once(':').unwrap().1;
     let base_url = format!("http://127.0.0.1:{port}");
     (server, base_url, dir)
+}
+
+#[tokio::test]
+async fn operator_mints_tenant_bound_node_join_token() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(
+        StateStore::open(1, "127.0.0.1:0", dir.path(), BTreeMap::new())
+            .await
+            .unwrap(),
+    );
+    store
+        .create_tenant(minga_state::types::Tenant {
+            id: "acme".into(),
+            name: "Acme".into(),
+            quotas: Default::default(),
+            created_at: 1,
+        })
+        .await
+        .unwrap();
+    let key = Arc::new(minga_state::join_token::JoinTokenKey::from_bytes(&[7; 32]).unwrap());
+    let server = ApiServer::start_with_bus_and_auth_and_tls_and_join_token_key(
+        store,
+        minga_bus::MemoryBus::new(),
+        "127.0.0.1:0",
+        Some("operator-secret".into()),
+        None,
+        Some(key.clone()),
+    )
+    .await
+    .unwrap();
+    let base = format!("http://{}", server.addr());
+    let http = client();
+    let create = http
+        .post(format!("{base}/v1.41/nodes"))
+        .bearer_auth("operator-secret")
+        .json(&json!({
+            "id": 2,
+            "address": "127.0.0.1:50052",
+            "tenant_id": "acme"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(create.status(), 201);
+
+    let endpoint = format!("{base}/minga/nodes/2/join-token");
+    assert_eq!(
+        http.post(&endpoint).send().await.unwrap().status(),
+        401,
+        "join-token issuance requires operator authentication"
+    );
+    let response = http
+        .post(endpoint)
+        .bearer_auth("operator-secret")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let value: Value = response.json().await.unwrap();
+    assert_eq!(value["node_id"], 2);
+    assert_eq!(value["tenant_id"], "acme");
+    let claims = key
+        .verify(
+            value["token"].as_str().unwrap(),
+            2,
+            minga_state::types::unix_now(),
+        )
+        .unwrap();
+    assert_eq!(claims.tenant_id, "acme");
 }
 
 /// Creates a reqwest client with a short timeout.

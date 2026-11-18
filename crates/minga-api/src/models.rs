@@ -398,8 +398,9 @@ pub struct NodeListQuery {
 /// Request body for `POST /nodes` — register a node out-of-band.
 ///
 /// Minga extension: the Docker API has no node-create route (Swarm nodes
-/// join via tokens). Nodes created here carry no membership lease; they
-/// stay eligible for placement until an operator removes or drains them.
+/// join via tokens). A cluster operator may pre-register a node with its
+/// tenant before startup; omitted tenant IDs use `default`. Nodes created
+/// here carry no membership lease and stay eligible until removed or drained.
 /// Nodes started via `minga manager`/`minga worker` register themselves.
 #[derive(Debug, Clone, Deserialize)]
 pub struct NodeCreateRequest {
@@ -407,6 +408,10 @@ pub struct NodeCreateRequest {
     pub id: Option<u64>,
     /// Address the node's Raft RPC is reachable on.
     pub address: String,
+    /// Tenant assigned by a cluster operator before the node joins.
+    /// Omitted for legacy/default-tenant nodes.
+    #[serde(default)]
+    pub tenant_id: Option<String>,
     #[serde(default)]
     pub labels: HashMap<String, String>,
     /// Advertised CPU count. Defaults to 1.
@@ -415,6 +420,15 @@ pub struct NodeCreateRequest {
     pub memory_bytes: Option<u64>,
     /// Advertised GPU count. Defaults to 0.
     pub gpus: Option<u32>,
+}
+
+/// Response from `POST /nodes/{id}/join-token`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeJoinToken {
+    pub node_id: u64,
+    pub tenant_id: String,
+    pub expires_at: u64,
+    pub token: String,
 }
 
 /// Query params for `POST /nodes/{id}/update`. Docker sends `version`;

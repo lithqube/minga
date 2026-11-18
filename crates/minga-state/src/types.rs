@@ -123,6 +123,9 @@ pub struct ClusterNode {
     /// This node's IP in the WireGuard overlay mesh.
     #[serde(default)]
     pub overlay_ip: Option<String>,
+    /// Tenant this worker serves. Managers use `default` as a compatibility value.
+    #[serde(default = "default_tenant_id")]
+    pub tenant_id: TenantId,
     /// Unix time of the node's last lease renewal. `None` means the node
     /// was registered out-of-band (e.g. `POST /nodes`) and carries no
     /// lease: it is considered live regardless of age.

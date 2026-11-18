@@ -22,6 +22,7 @@ minga-sandbox = { path = "../minga-sandbox" }
 minga-scheduler = { path = "../minga-scheduler" }
 minga-state = { path = "../minga-state" }
 minga-telemetry = { path = "../minga-telemetry" }
+rand.workspace = true
 rcgen.workspace = true
 rustls-pemfile.workspace = true
 time.workspace = true

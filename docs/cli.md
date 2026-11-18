@@ -71,7 +71,8 @@ The API waits for catch-up before promotion. Remove it with
 | `--runtime <mock\|containerd>` | `mock` | **Set `containerd` for real containers.** `mock` is in-memory and meant for tests. `scripts/minga.service` passes `containerd`. |
 | `--containerd-socket <PATH>` | `/run/containerd/containerd.sock` | A filesystem path, not a `unix://` URL. |
 | `--nats-url <URL>`, `MINGA_NATS_URL` | none | Unset on a manager: it starts the NATS sidecar. Workers must set it; use a comma-separated TLS seed list for clustered managers. |
-| `--nats-token`, `MINGA_NATS_TOKEN` | none | Development-only token authentication. Token mode provides no isolation between workers. |
+| `--nats-token`, `MINGA_NATS_TOKEN` | none | Development-only plaintext-loopback token authentication. Mutually exclusive with NATS JWT credentials. |
+| `MINGA_NATS_CREDENTIALS_FILE` | none | Owner-only NATS user `.creds` file for operator/JWT authentication; requires mTLS. |
 | `--nats-replicas <N>` | `1` | Copies of the event, status, lease, and assignment streams/buckets. Set 3 or 5 on a cluster with at least that many servers. Works with external NATS or route-TLS sidecars. |
 | `--nats-cluster-route <URL>` | none | Repeat for existing sidecar routes, e.g. `nats://manager-1:6222`. Requires route TLS. |
 | `--nats-cluster-cert`, `--nats-cluster-key`, `--nats-cluster-ca` | none | Route certificate, key, and peer CA for the built-in sidecar; required together and separate from client-facing TLS. `--nats-cluster-port` defaults to `6222`. |
@@ -101,6 +102,27 @@ local TLS client and `minga-manager-ID` for remote clients. Set
 on workers, use the manager hostname from the URL (for example,
 `minga-manager-1`) so it matches the manager certificate SAN. Set
 `MINGA_NATS_TLS_CA`, `MINGA_NATS_TLS_CERT` and `MINGA_NATS_TLS_KEY`, then run:
+
+If NATS user JWT authentication is enabled, also set
+`MINGA_NATS_CREDENTIALS_FILE` to an owner-only `.creds` file. JWT credentials
+require TLS and cannot be combined with `--nats-token` or `MINGA_NATS_TOKEN`.
+For the built-in sidecar, configure `MINGA_NATS_OPERATOR_JWT` and
+`MINGA_NATS_RESOLVER_DIR` on every manager. Add each client's account JWT to
+the resolver with the required NATS permissions.
+
+Create the key once with `minga tls init-join-key --out FILE`, then copy it
+securely to every manager and set `MINGA_JOIN_TOKEN_KEY_FILE` to that
+owner-only 32-byte key.
+
+An operator pre-registers the node with `POST /v1.41/nodes`, then calls
+`POST /minga/nodes/ID/join-token` with cluster-operator authentication. Store
+the returned token in an owner-only file and set `MINGA_NODE_JOIN_TOKEN_FILE`
+on the worker. Tokens expire after 15 minutes; the manager records the tenant
+binding after the first valid lease.
+
+The worker's NATS identity must be restricted to its own lease key
+(`lease.node.ID`) by certificate mapping or JWT permissions. The join token
+does not replace NATS subject authorization.
 
 ```bash
 minga worker --node-id ID --nats-url tls://minga-manager-1:4222,tls://minga-manager-2:4222
@@ -232,7 +254,10 @@ stack or context does not exist.
 | `MINGA_API_URL` | `minga deploy`, `minga state` | API URL (default `http://127.0.0.1:2375`). |
 | `MINGA_API_TOKEN` | `minga manager`; `minga deploy`, `minga state` | API token, server and client side. |
 | `MINGA_NATS_URL` | Manager/worker roles, `minga logs`, `minga agent ls` | NATS URL. |
-| `MINGA_NATS_TOKEN` | Manager/worker roles | NATS token (not used over TLS). |
+| `MINGA_NATS_TOKEN` | Manager/worker roles | Development-only NATS token for plaintext loopback. Mutually exclusive with JWT credentials. |
+| `MINGA_NATS_CREDENTIALS_FILE` | Manager/worker roles | Owner-only NATS user `.creds` file; requires mTLS. |
+| `MINGA_NATS_OPERATOR_JWT` | `minga manager` | Public operator JWT file; enables operator/JWT auth on the built-in sidecar. Set with the resolver directory. |
+| `MINGA_NATS_RESOLVER_DIR` | `minga manager` | Writable full-resolver directory for account JWTs; set with the operator JWT file. |
 | `MINGA_NATS_TLS_CA`, `MINGA_NATS_TLS_CERT`, `MINGA_NATS_TLS_KEY`, `MINGA_NATS_TLS_SERVER_NAME` | Everything that connects to NATS | Client certificate settings for a `tls://` URL. |
 | `MINGA_NATS_REPLICAS` | Node roles | Same as `--nats-replicas`. |
 | `MINGA_NATS_SERVER_BIN` | `minga manager` | The `nats-server` the sidecar runs, instead of the one next to `minga` or on `PATH`. |

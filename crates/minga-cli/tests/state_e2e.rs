@@ -49,6 +49,7 @@ async fn cluster() -> (Arc<StateStore>, String, tempfile::TempDir) {
         reserved_ports: Vec::new(),
         wg_public_key: None,
         wg_endpoint: None,
+        join_token: None,
     };
     store.upsert_node(identity.cluster_node()).await.unwrap();
     let bus = minga_bus::MemoryBus::new();

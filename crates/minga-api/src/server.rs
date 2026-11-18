@@ -21,7 +21,7 @@ use hyper_util::{
     service::TowerToHyperService,
 };
 use minga_bus::EventBus;
-use minga_state::{types::DEFAULT_TENANT_ID, StateStore};
+use minga_state::{join_token::JoinTokenKey, types::DEFAULT_TENANT_ID, StateStore};
 use minga_telemetry::{ReadyState, METRICS};
 use rustls::pki_types::CertificateDer;
 use tokio::net::TcpListener;
@@ -424,6 +424,11 @@ fn build_router_with_app_state(
                 .layer(axum::middleware::from_fn(require_operator_admin)),
         )
         .route(
+            "/minga/nodes/:id/join-token",
+            post(handlers::issue_node_join_token)
+                .layer(axum::middleware::from_fn(require_operator_admin)),
+        )
+        .route(
             "/minga/tenants",
             get(handlers::list_tenants)
                 .post(handlers::create_tenant)
@@ -637,7 +642,7 @@ impl ApiServer {
         bind: &str,
         auth_token: Option<String>,
     ) -> Result<Self, ApiServerError> {
-        Self::start_inner(store, None, bind, auth_token, None).await
+        Self::start_inner(store, None, bind, auth_token, None, None).await
     }
 
     /// Starts the API server with actual task state read from the event bus.
@@ -647,7 +652,7 @@ impl ApiServer {
         bind: &str,
         auth_token: Option<String>,
     ) -> Result<Self, ApiServerError> {
-        Self::start_inner(store, Some(bus), bind, auth_token, None).await
+        Self::start_inner(store, Some(bus), bind, auth_token, None, None).await
     }
 
     /// Starts the API over bounded mutual TLS, requiring a CA-verified caller certificate.
@@ -657,7 +662,7 @@ impl ApiServer {
         auth_token: Option<String>,
         tls: ApiTlsConfig,
     ) -> Result<Self, ApiServerError> {
-        Self::start_inner(store, None, bind, auth_token, Some(tls)).await
+        Self::start_inner(store, None, bind, auth_token, Some(tls), None).await
     }
 
     /// Starts the bus-backed API with optional mutual TLS.
@@ -668,7 +673,19 @@ impl ApiServer {
         auth_token: Option<String>,
         tls: Option<ApiTlsConfig>,
     ) -> Result<Self, ApiServerError> {
-        Self::start_inner(store, Some(bus), bind, auth_token, tls).await
+        Self::start_inner(store, Some(bus), bind, auth_token, tls, None).await
+    }
+
+    /// Starts the bus-backed API with optional TLS and manager-local signing.
+    pub async fn start_with_bus_and_auth_and_tls_and_join_token_key(
+        store: Arc<StateStore>,
+        bus: Arc<dyn EventBus>,
+        bind: &str,
+        auth_token: Option<String>,
+        tls: Option<ApiTlsConfig>,
+        join_token_key: Option<Arc<JoinTokenKey>>,
+    ) -> Result<Self, ApiServerError> {
+        Self::start_inner(store, Some(bus), bind, auth_token, tls, join_token_key).await
     }
 
     async fn start_inner(
@@ -677,6 +694,7 @@ impl ApiServer {
         bind: &str,
         auth_token: Option<String>,
         tls: Option<ApiTlsConfig>,
+        join_token_key: Option<Arc<JoinTokenKey>>,
     ) -> Result<Self, ApiServerError> {
         let acceptor = tls
             .as_ref()
@@ -708,10 +726,14 @@ impl ApiServer {
             })
         };
         let ready_state = Arc::new(ready_state);
-        let app_state = match bus {
-            Some(bus) => Arc::new(AppState::with_bus(store, bus)),
-            None => Arc::new(AppState::new(store)),
+        let mut app_state = match bus {
+            Some(bus) => AppState::with_bus(store, bus),
+            None => AppState::new(store),
         };
+        if let Some(key) = join_token_key {
+            app_state = app_state.with_join_token_key(key);
+        }
+        let app_state = Arc::new(app_state);
         let router =
             build_router_with_app_state(app_state, ready_state, auth_token, acceptor.is_some());
         let limits = minga_telemetry::serve::Limits::default();
@@ -800,6 +822,7 @@ mod tests {
                     wg_public_key: None,
                     wg_endpoint: None,
                     overlay_ip: None,
+                    tenant_id: minga_state::types::DEFAULT_TENANT_ID.to_owned(),
                     last_seen_unix: None,
                     role: Default::default(),
                     reserved_ports: Vec::new(),
