@@ -1647,10 +1647,17 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
                 std::env::var_os("MINGA_NATS_OPERATOR_JWT"),
                 std::env::var_os("MINGA_NATS_RESOLVER_DIR"),
             ) {
-                (Some(operator_jwt), Some(resolver_dir)) => Some(NatsJwtAuth {
-                    operator_jwt_file: PathBuf::from(operator_jwt),
-                    resolver_dir: PathBuf::from(resolver_dir),
-                }),
+                (Some(operator_jwt), Some(resolver_dir)) => {
+                    tracing::warn!(
+                        "NATS JWT mode: Minga does not apply its per-node ACL; each user JWT \
+                         must limit the node to its own lease key and subjects, or a node can \
+                         write another node's lease"
+                    );
+                    Some(NatsJwtAuth {
+                        operator_jwt_file: PathBuf::from(operator_jwt),
+                        resolver_dir: PathBuf::from(resolver_dir),
+                    })
+                }
                 (None, None) => None,
                 _ => {
                     eprintln!(

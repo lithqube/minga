@@ -150,6 +150,34 @@ mod tests {
     }
 
     #[test]
+    fn token_rejects_a_changed_payload_and_future_issue_time() {
+        let token = key(7).issue(12, "acme", 100, 200).unwrap();
+        let (_, signature) = token.split_once('.').unwrap();
+        let forged_claims = serde_json::to_vec(&JoinTokenClaims {
+            version: TOKEN_VERSION,
+            node_id: 12,
+            tenant_id: "beta".into(),
+            issued_at: 100,
+            expires_at: 200,
+        })
+        .unwrap();
+        let forged = format!("{}.{signature}", URL_SAFE_NO_PAD.encode(forged_claims));
+        assert_eq!(
+            key(7).verify(&forged, 12, 150),
+            Err(JoinTokenError::InvalidSignature)
+        );
+
+        // Up to 60s of clock skew is tolerated, no more.
+        let early = key(7).issue(12, "acme", 1_060, 2_000).unwrap();
+        assert!(key(7).verify(&early, 12, 1_000).is_ok());
+        let too_early = key(7).issue(12, "acme", 1_061, 2_000).unwrap();
+        assert_eq!(
+            key(7).verify(&too_early, 12, 1_000),
+            Err(JoinTokenError::Expired)
+        );
+    }
+
+    #[test]
     fn token_rejects_malformed_and_invalid_tenant() {
         assert_eq!(
             key(7).verify("invalid", 1, 100),

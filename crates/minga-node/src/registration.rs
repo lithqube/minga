@@ -196,6 +196,7 @@ pub async fn run_node_registration(
                         tracing::warn!("node lease watch ended; reconnecting");
                         break;
                     };
+                    refresh_joined_node(bus.as_ref(), &event, &mut joined).await;
                     queue_node_registration_with_join(
                         &store,
                         event,
@@ -286,11 +287,50 @@ async fn load_joined_nodes(
         else {
             continue;
         };
-        let tenant_id = std::str::from_utf8(&value).map_err(|error| error.to_string())?;
-        minga_state::types::Tenant::validate_id(tenant_id).map_err(|error| error.to_string())?;
-        joined.insert(node_id, tenant_id.to_owned());
+        if let Some(tenant_id) = parse_joined_tenant(node_id, &value) {
+            joined.insert(node_id, tenant_id);
+        }
     }
     Ok(joined)
+}
+
+/// A corrupt record is skipped, so the node must present a fresh token,
+/// instead of stopping registration for every node on this manager.
+fn parse_joined_tenant(node_id: NodeId, value: &[u8]) -> Option<String> {
+    let tenant_id = std::str::from_utf8(value).ok()?;
+    if let Err(error) = minga_state::types::Tenant::validate_id(tenant_id) {
+        tracing::warn!(node_id, error = %error, "ignoring invalid joined-tenant record");
+        return None;
+    }
+    Some(tenant_id.to_owned())
+}
+
+/// Picks up a join another manager committed after this one loaded `joined`,
+/// e.g. on the new leader after a failover.
+async fn refresh_joined_node(
+    bus: &dyn EventBus,
+    event: &KvEvent,
+    joined: &mut HashMap<NodeId, String>,
+) {
+    let Some(node_id) = event
+        .key
+        .strip_prefix("lease.node.")
+        .and_then(|id| id.parse::<NodeId>().ok())
+    else {
+        return;
+    };
+    if event.op == KvOp::Delete || joined.contains_key(&node_id) {
+        return;
+    }
+    match bus.get_status(&joined_status_key(node_id)).await {
+        Ok(Some(value)) => {
+            if let Some(tenant_id) = parse_joined_tenant(node_id, &value) {
+                joined.insert(node_id, tenant_id);
+            }
+        }
+        Ok(None) => {}
+        Err(error) => tracing::warn!(node_id, error = %error, "cannot read joined-tenant record"),
+    }
 }
 
 /// A node lists a handful of Minga listeners; more is malformed or abusive.
@@ -394,14 +434,20 @@ async fn queue_node_registration_with_join(
     if stored.is_none() && registered.contains(&node_id) {
         return;
     }
-    let (tenant_id, token_expires_at) = if let Some(joined_tenant) = joined.get(&node_id) {
-        if stored
+    // A record for a node that is gone or now belongs to another tenant is
+    // stale: the node must re-join with a token for its current tenant.
+    let joined_tenant = joined.get(&node_id).filter(|tenant| {
+        stored
             .as_ref()
-            .map_or(true, |node| node.tenant_id != *joined_tenant)
-        {
-            tracing::warn!(node_id, "ignoring lease with stale joined-tenant state");
-            return;
-        }
+            .is_some_and(|node| node.tenant_id == **tenant)
+    });
+    if joined.contains_key(&node_id) && joined_tenant.is_none() {
+        tracing::warn!(
+            node_id,
+            "joined-tenant record is stale; a new join token is required"
+        );
+    }
+    let (tenant_id, token_expires_at) = if let Some(joined_tenant) = joined_tenant {
         (joined_tenant.clone(), None)
     } else if let Some(token) = identity.join_token.as_deref() {
         let Some(key) = join_token_key else {
@@ -437,13 +483,33 @@ async fn queue_node_registration_with_join(
             );
             return;
         }
+        if stored.is_none() && !store.manager_voters().await.contains(&node_id) {
+            // Like bearer-token access, tokenless self-enrollment into
+            // `default` only holds while `default` is the sole tenant.
+            // Raft voters (managers) are already admitted by an operator.
+            match store.list_tenants().await {
+                Ok(tenants) if tenants.len() > 1 => {
+                    tracing::warn!(
+                        node_id,
+                        "unregistered node requires a join token once a second tenant exists"
+                    );
+                    return;
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(node_id, error = %error, "cannot check tenant count");
+                    return;
+                }
+            }
+        }
         (minga_state::types::DEFAULT_TENANT_ID.to_owned(), None)
     };
+    let already_joined = joined_tenant.is_some();
 
     match stored {
         Some(node) => {
             registered.insert(node_id);
-            if !joined.contains_key(&node_id) || registration_changed(&node, &identity) {
+            if !already_joined || registration_changed(&node, &identity) {
                 pending.insert(
                     node_id,
                     PendingRegistration {
@@ -982,5 +1048,246 @@ mod tests {
 
         assert!(store.get_node(1).await.unwrap().is_none());
         membership.leave().await;
+    }
+
+    const KEY_A: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+    const KEY_B: &str = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=";
+
+    async fn create_tenant(store: &StateStore, id: &str) {
+        store
+            .create_tenant(minga_state::types::Tenant {
+                id: id.into(),
+                name: id.into(),
+                quotas: Default::default(),
+                created_at: 1,
+            })
+            .await
+            .unwrap();
+    }
+
+    async fn preregister(store: &StateStore, node_id: NodeId, tenant: &str) {
+        let mut node = identity(node_id).cluster_node_for_tenant(tenant);
+        node.wg_public_key = Some(KEY_A.into());
+        store.upsert_node(node).await.unwrap();
+    }
+
+    async fn publish(
+        bus: &minga_bus::MemoryBus,
+        stream: &mut minga_bus::KvStream,
+        identity: &NodeIdentity,
+    ) -> KvEvent {
+        let payload = minga_state::codec::encode_wire(identity).unwrap();
+        bus.refresh_lease(identity.node_id, &payload).await.unwrap();
+        next_lease(stream).await
+    }
+
+    fn with_token(node_id: NodeId, key: &JoinTokenKey, tenant: &str) -> NodeIdentity {
+        let now = unix_now();
+        let mut identity = identity(node_id);
+        identity.join_token = Some(key.issue(node_id, tenant, now, now + 900).unwrap());
+        identity
+    }
+
+    #[tokio::test]
+    async fn renewal_uses_a_join_committed_by_another_manager() {
+        let (store, _dir) = store().await;
+        wait_for_leader(&store).await;
+        create_tenant(&store, "acme").await;
+        preregister(&store, 1, "acme").await;
+        let bus = minga_bus::MemoryBus::with_lease_ttl(Duration::from_secs(5));
+        let mut stream = bus.watch_leases().await.unwrap();
+        // Another manager committed the join after this one loaded `joined`.
+        let mut joined = load_joined_nodes(bus.as_ref()).await.unwrap();
+        bus.put_status(&joined_status_key(1), b"acme")
+            .await
+            .unwrap();
+
+        // The worker's token has since expired; it renews without one and
+        // a new WireGuard key.
+        let mut renewed = identity(1);
+        renewed.wg_public_key = Some(KEY_B.into());
+        let event = publish(&bus, &mut stream, &renewed).await;
+        let mut registered = load_registered_nodes(&store, bus.as_ref()).await.unwrap();
+        let mut pending = HashMap::new();
+        refresh_joined_node(bus.as_ref(), &event, &mut joined).await;
+        queue_node_registration_with_join(
+            &store,
+            event,
+            &mut registered,
+            &mut pending,
+            &joined,
+            None,
+        )
+        .await;
+        register_pending_nodes_with_join(
+            &store,
+            bus.as_ref(),
+            &mut registered,
+            &mut pending,
+            &mut joined,
+        )
+        .await;
+
+        let stored = store.get_node(1).await.unwrap().unwrap();
+        assert_eq!(stored.tenant_id, "acme");
+        assert_eq!(stored.wg_public_key.as_deref(), Some(KEY_B));
+    }
+
+    #[tokio::test]
+    async fn non_default_node_needs_a_token_for_its_own_tenant() {
+        let (store, _dir) = store().await;
+        wait_for_leader(&store).await;
+        create_tenant(&store, "acme").await;
+        create_tenant(&store, "beta").await;
+        preregister(&store, 1, "acme").await;
+        let key = JoinTokenKey::from_bytes(&[9; 32]).unwrap();
+        let bus = minga_bus::MemoryBus::with_lease_ttl(Duration::from_secs(5));
+        let mut stream = bus.watch_leases().await.unwrap();
+        let mut registered = load_registered_nodes(&store, bus.as_ref()).await.unwrap();
+        let mut pending = HashMap::new();
+
+        let mut forged = with_token(1, &key, "acme");
+        forged.join_token = Some(forged.join_token.unwrap().replace('.', ".x"));
+        for lease in [identity(1), with_token(1, &key, "beta"), forged] {
+            let event = publish(&bus, &mut stream, &lease).await;
+            queue_node_registration_with_join(
+                &store,
+                event,
+                &mut registered,
+                &mut pending,
+                &HashMap::new(),
+                Some(&key),
+            )
+            .await;
+            assert!(pending.is_empty(), "accepted {:?}", lease.join_token);
+        }
+    }
+
+    #[tokio::test]
+    async fn join_token_expiring_before_commit_is_dropped() {
+        let (store, _dir) = store().await;
+        wait_for_leader(&store).await;
+        create_tenant(&store, "acme").await;
+        let bus = minga_bus::MemoryBus::with_lease_ttl(Duration::from_secs(5));
+        let membership =
+            NodeMembership::start_with_interval(bus.clone(), identity(2), Duration::from_secs(10))
+                .await
+                .unwrap();
+        let mut registered = HashSet::new();
+        let mut pending = HashMap::from([(
+            2,
+            PendingRegistration {
+                identity: identity(2),
+                tenant_id: "acme".into(),
+                token_expires_at: Some(unix_now() - 1),
+            },
+        )]);
+        let mut joined = HashMap::new();
+        register_pending_nodes_with_join(
+            &store,
+            bus.as_ref(),
+            &mut registered,
+            &mut pending,
+            &mut joined,
+        )
+        .await;
+
+        assert!(pending.is_empty());
+        assert!(store.get_node(2).await.unwrap().is_none());
+        assert!(joined.is_empty());
+        membership.leave().await;
+    }
+
+    #[tokio::test]
+    async fn stale_joined_record_requires_a_token_for_the_current_tenant() {
+        let (store, _dir) = store().await;
+        wait_for_leader(&store).await;
+        create_tenant(&store, "acme").await;
+        create_tenant(&store, "beta").await;
+        // Node 1 once joined acme; an operator re-created it for beta.
+        preregister(&store, 1, "beta").await;
+        let mut joined = HashMap::from([(1, "acme".to_string())]);
+        let key = JoinTokenKey::from_bytes(&[9; 32]).unwrap();
+        let bus = minga_bus::MemoryBus::with_lease_ttl(Duration::from_secs(5));
+        let mut stream = bus.watch_leases().await.unwrap();
+        let mut registered = load_registered_nodes(&store, bus.as_ref()).await.unwrap();
+        let mut pending = HashMap::new();
+
+        let event = publish(&bus, &mut stream, &identity(1)).await;
+        queue_node_registration_with_join(
+            &store,
+            event,
+            &mut registered,
+            &mut pending,
+            &joined,
+            Some(&key),
+        )
+        .await;
+        assert!(
+            pending.is_empty(),
+            "stale record must not admit a tokenless lease"
+        );
+
+        let event = publish(&bus, &mut stream, &with_token(1, &key, "beta")).await;
+        queue_node_registration_with_join(
+            &store,
+            event,
+            &mut registered,
+            &mut pending,
+            &joined,
+            Some(&key),
+        )
+        .await;
+        register_pending_nodes_with_join(
+            &store,
+            bus.as_ref(),
+            &mut registered,
+            &mut pending,
+            &mut joined,
+        )
+        .await;
+        assert_eq!(joined.get(&1).map(String::as_str), Some("beta"));
+        assert_eq!(
+            bus.get_status(&joined_status_key(1))
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(b"beta".as_slice())
+        );
+    }
+
+    #[tokio::test]
+    async fn tokenless_self_enrollment_stops_once_a_second_tenant_exists() {
+        let (store, _dir) = store().await;
+        wait_for_leader(&store).await;
+        create_tenant(&store, "acme").await;
+        let bus = minga_bus::MemoryBus::with_lease_ttl(Duration::from_secs(5));
+        let mut stream = bus.watch_leases().await.unwrap();
+        let mut registered = load_registered_nodes(&store, bus.as_ref()).await.unwrap();
+        let mut pending = HashMap::new();
+
+        let event = publish(&bus, &mut stream, &identity(5)).await;
+        queue_node_registration(&store, event, &mut registered, &mut pending).await;
+        assert!(pending.is_empty(), "unknown worker enrolled into default");
+
+        // Node 1 is this store's own Raft voter, so its manager lease passes.
+        let mut manager = identity(1);
+        manager.role = NodeRole::Manager;
+        let event = publish(&bus, &mut stream, &manager).await;
+        queue_node_registration(&store, event, &mut registered, &mut pending).await;
+        assert!(pending.contains_key(&1));
+    }
+
+    #[tokio::test]
+    async fn invalid_joined_record_is_skipped_not_fatal() {
+        let bus = minga_bus::MemoryBus::new();
+        bus.put_status(&joined_status_key(1), b"Not A Tenant")
+            .await
+            .unwrap();
+        bus.put_status(&joined_status_key(2), b"acme")
+            .await
+            .unwrap();
+        let joined = load_joined_nodes(bus.as_ref()).await.unwrap();
+        assert_eq!(joined, HashMap::from([(2, "acme".to_string())]));
     }
 }

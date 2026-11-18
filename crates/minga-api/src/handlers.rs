@@ -649,15 +649,20 @@ pub async fn issue_node_join_token(
         .get_node(node_id)
         .await?
         .ok_or_else(|| not_found("node", &id))?;
-    let key = app
-        .join_token_key
-        .as_ref()
-        .ok_or_else(|| internal("node join-token signer is not configured"))?;
+    let key = app.join_token_key.as_ref().ok_or_else(|| {
+        crate::error::ApiError::Unavailable("node join-token signer is not configured".into())
+    })?;
     let issued_at = unix_now();
     let expires_at = issued_at.saturating_add(15 * 60);
     let token = key
         .issue(node.id, node.tenant_id.clone(), issued_at, expires_at)
         .map_err(|error| internal(error.to_string()))?;
+    tracing::info!(
+        node = node.id,
+        tenant = %node.tenant_id,
+        expires_at,
+        "node join token issued"
+    );
     Ok(Json(models::NodeJoinToken {
         node_id: node.id,
         tenant_id: node.tenant_id,
