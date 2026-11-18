@@ -432,17 +432,7 @@ impl NatsBus {
         url: &str,
         config: &crate::tls::NatsTlsConfig,
     ) -> Result<Arc<Self>> {
-        config
-            .preflight()
-            .map_err(|e| BusError::Connection(format!("TLS preflight failed: {e}")))?;
-
-        config
-            .validate_url(url)
-            .map_err(|e| BusError::Connection(format!("TLS URL rejected: {e}")))?;
-
-        let options = config
-            .connect_options()
-            .map_err(|e| BusError::Connection(format!("TLS configuration failed: {e}")))?;
+        let options = Self::secure_options(url, config, None)?;
 
         Self::ensure_crypto_provider();
         let client =
@@ -473,17 +463,7 @@ impl NatsBus {
         config: &crate::tls::NatsTlsConfig,
         lease_ttl: Duration,
     ) -> Result<Arc<Self>> {
-        config
-            .preflight()
-            .map_err(|e| BusError::Connection(format!("TLS preflight failed: {e}")))?;
-
-        config
-            .validate_url(url)
-            .map_err(|e| BusError::Connection(format!("TLS URL rejected: {e}")))?;
-
-        let options = config
-            .connect_options()
-            .map_err(|e| BusError::Connection(format!("TLS configuration failed: {e}")))?;
+        let options = Self::secure_options(url, config, None)?;
 
         Self::ensure_crypto_provider();
         let client =
@@ -513,21 +493,76 @@ impl NatsBus {
         config: &crate::tls::NatsTlsConfig,
         node_id: u64,
     ) -> Result<Arc<Self>> {
-        config
-            .preflight()
-            .map_err(|error| BusError::Connection(format!("TLS preflight failed: {error}")))?;
-        config
-            .validate_url(url)
-            .map_err(|error| BusError::Connection(format!("TLS URL rejected: {error}")))?;
-        let options = config
-            .connect_options()
-            .map_err(|error| BusError::Connection(format!("TLS configuration failed: {error}")))?;
+        let options = Self::secure_options(url, config, None)?;
         Self::ensure_crypto_provider();
         let client =
             async_nats::connect_with_options(seed_list(url), options.ignore_discovered_servers())
                 .await
                 .map_err(|error| BusError::Connection(format!("TLS connection failed: {error}")))?;
         Self::from_worker_client(client, node_id).await
+    }
+    /// Connect a worker with NATS JWT credentials over mTLS.
+    ///
+    /// The credentials authenticate the NATS principal; the client
+    /// certificate remains required for transport security.
+    pub async fn connect_worker_secure_with_credentials(
+        url: &str,
+        config: &crate::tls::NatsTlsConfig,
+        credentials: &str,
+        node_id: u64,
+    ) -> Result<Arc<Self>> {
+        let options = Self::secure_options(url, config, Some(credentials))?;
+        Self::ensure_crypto_provider();
+        let client =
+            async_nats::connect_with_options(seed_list(url), options.ignore_discovered_servers())
+                .await
+                .map_err(|error| BusError::Connection(format!("TLS connection failed: {error}")))?;
+        Self::from_worker_client(client, node_id).await
+    }
+
+    /// Connect a manager with NATS JWT credentials over mTLS.
+    pub async fn connect_secure_with_credentials(
+        url: &str,
+        config: &crate::tls::NatsTlsConfig,
+        credentials: &str,
+    ) -> Result<Arc<Self>> {
+        let options = Self::secure_options(url, config, Some(credentials))?;
+        Self::ensure_crypto_provider();
+        let client =
+            async_nats::connect_with_options(seed_list(url), options.ignore_discovered_servers())
+                .await
+                .map_err(|error| BusError::Connection(format!("TLS connection failed: {error}")))?;
+        let js = jetstream::new(client.clone());
+        let (status_kv, assignments_kv, leases_kv) =
+            Self::setup_when_ready(&js, DEFAULT_LEASE_TTL).await?;
+        let api_level = Self::read_api_level(&js, &client).await;
+        Ok(Arc::new(Self {
+            client,
+            js,
+            status_kv,
+            assignments_kv,
+            leases_kv,
+            api_level,
+            worker_node_id: None,
+        }))
+    }
+
+    fn secure_options(
+        url: &str,
+        config: &crate::tls::NatsTlsConfig,
+        credentials: Option<&str>,
+    ) -> Result<async_nats::ConnectOptions> {
+        config
+            .preflight()
+            .map_err(|error| BusError::Connection(format!("TLS preflight failed: {error}")))?;
+        config
+            .validate_url(url)
+            .map_err(|error| BusError::Connection(format!("TLS URL rejected: {error}")))?;
+        let options = match credentials {
+            Some(credentials) => config.connect_options_with_credentials(credentials),
+            None => config.connect_options(),
+        };
+        options.map_err(|error| BusError::Connection(format!("TLS configuration failed: {error}")))
     }
 
     async fn from_worker_client(client: Client, node_id: u64) -> Result<Arc<Self>> {

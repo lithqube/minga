@@ -778,11 +778,12 @@ impl StateStore {
         let want = crate::codec::FORMAT_VERSION;
         match snapshot.format_version {
             crate::codec::FORMAT_VERSION
+            | crate::codec::V5_FORMAT_VERSION
             | crate::codec::V4_FORMAT_VERSION
             | crate::codec::V3_FORMAT_VERSION
             | crate::codec::V2_FORMAT_VERSION => {
-                // Legacy snapshots contain no tenant list; resource tenant IDs
-                // still default to `default` and are imported in the current format.
+                // Legacy resource fields default to `default`; the v6 node
+                // tenant field also defaults to `default` when absent.
             }
             found => {
                 return Err(StateError::BadSnapshot(format!(

@@ -40,6 +40,7 @@ fn sample_node(id: u64) -> ClusterNode {
         wg_public_key: None,
         wg_endpoint: None,
         overlay_ip: None,
+        tenant_id: minga_state::types::DEFAULT_TENANT_ID.to_owned(),
         last_seen_unix: None,
         role: Default::default(),
         reserved_ports: Vec::new(),
@@ -390,6 +391,31 @@ async fn tenant_crud_is_persisted_and_protects_owned_resources() {
         Err(StateError::Conflict(_))
     ));
     store.remove_volume("tenant-a-data".into()).await.unwrap();
+
+    let mut node = minga_state::types::ClusterNode {
+        id: 42,
+        address: "10.0.0.42:50051".into(),
+        labels: Default::default(),
+        status: minga_state::types::NodeStatus::Active,
+        capacity: Default::default(),
+        wg_public_key: None,
+        wg_endpoint: None,
+        overlay_ip: None,
+        tenant_id: "tenant-a".into(),
+        last_seen_unix: None,
+        role: Default::default(),
+        reserved_ports: Vec::new(),
+    };
+    store.upsert_node(node.clone()).await.unwrap();
+    assert!(
+        matches!(
+            store.remove_tenant("tenant-a").await,
+            Err(StateError::Conflict(_))
+        ),
+        "a tenant that still owns nodes must not be deleted"
+    );
+    node.tenant_id = "default".into();
+    store.upsert_node(node).await.unwrap();
     store.remove_tenant("tenant-a").await.unwrap();
     assert!(store.get_tenant("tenant-a").await.unwrap().is_none());
     assert!(matches!(

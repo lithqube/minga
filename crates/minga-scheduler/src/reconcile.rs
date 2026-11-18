@@ -250,6 +250,7 @@ mod tests {
             wg_public_key: None,
             wg_endpoint: None,
             overlay_ip: None,
+            tenant_id: minga_state::types::DEFAULT_TENANT_ID.to_owned(),
             last_seen_unix: None,
             role: Default::default(),
             reserved_ports: Vec::new(),

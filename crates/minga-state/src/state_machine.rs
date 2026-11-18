@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::codec::{
     check_format, FORMAT_KEY, FORMAT_VERSION, V2_FORMAT_VERSION, V3_FORMAT_VERSION,
-    V4_FORMAT_VERSION,
+    V4_FORMAT_VERSION, V5_FORMAT_VERSION,
 };
 use crate::command::{StateCommand, StateResponse};
 use crate::types::*;
@@ -51,14 +51,14 @@ const ENTITY_TABLES: [TableDefinition<&str, &[u8]>; 8] = [
     TENANTS_TABLE,
 ];
 
-/// Re-encodes entity records and advances the marker during the v5 migration.
+/// Re-encodes entity records and advances the marker during the v6 migration.
 ///
 /// The caller advances the marker in the same redb transaction, so a failure
 /// leaves both the old values and the old marker intact.
 #[allow(clippy::result_large_err)]
 fn migrate_state(tx: &redb::WriteTransaction) -> Result<(), StorageIOError<u64>> {
-    // v2 predates reserved node ports, port modes, and tenant ownership; v3
-    // predates tenant ownership. Re-encoding keeps each migration atomic.
+    // Older versions lack progressively more fields; serde defaults every
+    // pre-tenant node to `default` while the migration re-encodes all records.
     rewrite_state_table::<ClusterNode>(tx, NODES_TABLE)?;
     rewrite_state_table::<Service>(tx, SERVICES_TABLE)?;
     rewrite_state_table::<Task>(tx, TASKS_TABLE)?;
@@ -148,7 +148,11 @@ fn tenant_has_resources(
     tenant_id: &str,
 ) -> Result<bool, StorageError<u64>> {
     Ok(
-        tenant_has_records::<Service>(tx, SERVICES_TABLE, tenant_id, |r, id| r.tenant_id == id)?
+        // Nodes too: a recreated tenant ID must not inherit the old tenant's nodes.
+        tenant_has_records::<ClusterNode>(tx, NODES_TABLE, tenant_id, |r, id| r.tenant_id == id)?
+            || tenant_has_records::<Service>(tx, SERVICES_TABLE, tenant_id, |r, id| {
+                r.tenant_id == id
+            })?
             || tenant_has_records::<Task>(tx, TASKS_TABLE, tenant_id, |r, id| r.tenant_id == id)?
             || tenant_has_records::<Network>(tx, NETWORKS_TABLE, tenant_id, |r, id| {
                 r.tenant_id == id
@@ -223,8 +227,8 @@ impl RedbStateMachine {
         if stored.as_deref() == Some(&[V2_FORMAT_VERSION])
             || stored.as_deref() == Some(&[V3_FORMAT_VERSION])
             || stored.as_deref() == Some(&[V4_FORMAT_VERSION])
+            || stored.as_deref() == Some(&[V5_FORMAT_VERSION])
         {
-            // Tenant fields default legacy desired state to the default tenant.
             migrate_state(&tx)?;
         } else {
             let mut meta = tx.open_table(SM_META_TABLE).map_err(sm_io_err)?;

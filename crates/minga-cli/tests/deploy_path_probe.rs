@@ -48,6 +48,7 @@ fn identity(id: u64) -> NodeIdentity {
         reserved_ports: Vec::new(),
         wg_public_key: None,
         wg_endpoint: None,
+        join_token: None,
     }
 }
 
@@ -59,7 +60,7 @@ async fn register_node(
     let membership = minga_node::NodeMembership::start(bus.clone(), identity)
         .await
         .unwrap();
-    let registration = tokio::spawn(minga_node::run_node_registration(store.clone(), bus));
+    let registration = tokio::spawn(minga_node::run_node_registration(store.clone(), bus, None));
     tokio::time::timeout(Duration::from_secs(3), async {
         while store.get_node(1).await.unwrap().is_none() {
             tokio::time::sleep(Duration::from_millis(10)).await;

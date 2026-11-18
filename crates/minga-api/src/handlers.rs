@@ -18,7 +18,7 @@ use minga_state::types::{
     unix_now, ClusterNode, NodeStatus as MingaNodeStatus, ResourceSpec, Service as StateService,
     Task, Tenant, TenantQuotas,
 };
-use minga_state::StateStore;
+use minga_state::{join_token::JoinTokenKey, StateStore};
 use serde::Deserialize;
 
 use crate::{
@@ -32,18 +32,29 @@ use crate::{
 pub struct AppState {
     pub store: Arc<StateStore>,
     pub bus: Option<Arc<dyn EventBus>>,
+    pub join_token_key: Option<Arc<JoinTokenKey>>,
 }
 
 impl AppState {
     pub fn new(store: Arc<StateStore>) -> Self {
-        Self { store, bus: None }
+        Self {
+            store,
+            bus: None,
+            join_token_key: None,
+        }
     }
 
     pub fn with_bus(store: Arc<StateStore>, bus: Arc<dyn EventBus>) -> Self {
         Self {
             store,
             bus: Some(bus),
+            join_token_key: None,
         }
+    }
+
+    pub fn with_join_token_key(mut self, key: Arc<JoinTokenKey>) -> Self {
+        self.join_token_key = Some(key);
+        self
     }
 
     async fn task_statuses(&self) -> ApiResult<HashMap<String, TaskStatusReport>> {
@@ -408,9 +419,15 @@ async fn ensure_placeable(
             .collect(),
         None => all_tasks,
     };
-    minga_scheduler::check_placeable(svc, &nodes, &tasks, &networks, unix_now()).map_err(|_| {
-        conflict("service cannot be placed with current cluster capacity or constraints")
-    })
+    let tenants = app.store.list_tenants().await?;
+    let placement_nodes: Vec<_> = nodes
+        .iter()
+        .filter(|node| tenants.len() < 2 || node.role != minga_state::types::NodeRole::Manager)
+        .cloned()
+        .collect();
+    minga_scheduler::check_placeable(svc, &placement_nodes, &tasks, &networks, unix_now()).map_err(
+        |_| conflict("service cannot be placed with current cluster capacity or constraints"),
+    )
 }
 
 fn validate_ingress_ports(
@@ -566,6 +583,13 @@ pub async fn create_node(
     if req.address.trim().is_empty() {
         return Err(bad_request("node address must not be empty"));
     }
+    let tenant_id = req
+        .tenant_id
+        .unwrap_or_else(|| minga_state::types::DEFAULT_TENANT_ID.to_owned());
+    minga_state::types::Tenant::validate_id(&tenant_id).map_err(bad_request)?;
+    if app.store.get_tenant(&tenant_id).await?.is_none() {
+        return Err(not_found("tenant", &tenant_id));
+    }
 
     let nodes = app.store.list_nodes().await?;
     let id = match req.id {
@@ -597,6 +621,7 @@ pub async fn create_node(
         wg_public_key: None,
         wg_endpoint: None,
         overlay_ip: None,
+        tenant_id,
         // Operator-registered nodes carry no lease: they stay eligible
         // until explicitly removed or drained.
         last_seen_unix: None,
@@ -611,6 +636,39 @@ pub async fn create_node(
         StatusCode::CREATED,
         Json(translate::node_to_docker(&node, is_leader)),
     ))
+}
+
+/// `POST /minga/nodes/{id}/join-token` — mint a short-lived tenant-bound token.
+pub async fn issue_node_join_token(
+    State(app): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<models::NodeJoinToken>> {
+    let node_id = id.parse::<u64>().map_err(|_| not_found("node", &id))?;
+    let node = app
+        .store
+        .get_node(node_id)
+        .await?
+        .ok_or_else(|| not_found("node", &id))?;
+    let key = app.join_token_key.as_ref().ok_or_else(|| {
+        crate::error::ApiError::Unavailable("node join-token signer is not configured".into())
+    })?;
+    let issued_at = unix_now();
+    let expires_at = issued_at.saturating_add(15 * 60);
+    let token = key
+        .issue(node.id, node.tenant_id.clone(), issued_at, expires_at)
+        .map_err(|error| internal(error.to_string()))?;
+    tracing::info!(
+        node = node.id,
+        tenant = %node.tenant_id,
+        expires_at,
+        "node join token issued"
+    );
+    Ok(Json(models::NodeJoinToken {
+        node_id: node.id,
+        tenant_id: node.tenant_id,
+        expires_at,
+        token,
+    }))
 }
 
 /// `POST /v{version}/nodes/{id}/update` — update labels and availability.
@@ -1433,6 +1491,7 @@ mod tests {
                 wg_public_key: None,
                 wg_endpoint: None,
                 overlay_ip: None,
+                tenant_id: minga_state::types::DEFAULT_TENANT_ID.to_owned(),
                 last_seen_unix: None,
                 role: Default::default(),
                 reserved_ports: Vec::new(),
@@ -1471,6 +1530,89 @@ mod tests {
         })
     }
 
+    #[tokio::test]
+    async fn operator_registered_node_accepts_tenant_assignment_and_defaults_to_default() {
+        let (app, _dir) = app_with_node(1.0).await;
+        app.store
+            .create_tenant(minga_state::types::Tenant {
+                id: "acme".into(),
+                name: "Acme".into(),
+                quotas: Default::default(),
+                created_at: 1,
+            })
+            .await
+            .unwrap();
+
+        let tenant_request = serde_json::from_value(serde_json::json!({
+            "id": 2,
+            "address": "127.0.0.1:50052",
+            "tenant_id": "acme"
+        }))
+        .unwrap();
+        let _response = create_node(State(app.clone()), Json(tenant_request))
+            .await
+            .unwrap();
+        let registered = app.store.get_node(2).await.unwrap().unwrap();
+        assert_eq!(registered.tenant_id, "acme");
+
+        let default_request = serde_json::from_value(serde_json::json!({
+            "id": 3,
+            "address": "127.0.0.1:50053"
+        }))
+        .unwrap();
+        let _response = create_node(State(app.clone()), Json(default_request))
+            .await
+            .unwrap();
+        let registered = app.store.get_node(3).await.unwrap().unwrap();
+        assert_eq!(registered.tenant_id, minga_state::types::DEFAULT_TENANT_ID);
+
+        let unknown_tenant_request = serde_json::from_value(serde_json::json!({
+            "id": 4,
+            "address": "127.0.0.1:50054",
+            "tenant_id": "missing"
+        }))
+        .unwrap();
+        assert!(matches!(
+            create_node(State(app.clone()), Json(unknown_tenant_request)).await,
+            Err(ApiError::NotFound(_))
+        ));
+        assert!(app.store.get_node(4).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn node_join_token_is_signed_for_the_preregistered_tenant() {
+        let (mut app, _dir) = app_with_node(1.0).await;
+        let key = Arc::new(JoinTokenKey::from_bytes(&[5; 32]).unwrap());
+        Arc::get_mut(&mut app).unwrap().join_token_key = Some(key.clone());
+        app.store
+            .create_tenant(Tenant {
+                id: "acme".into(),
+                name: "Acme".into(),
+                quotas: Default::default(),
+                created_at: 1,
+            })
+            .await
+            .unwrap();
+        let request = serde_json::from_value(serde_json::json!({
+            "id": 2,
+            "address": "127.0.0.1:50052",
+            "tenant_id": "acme"
+        }))
+        .unwrap();
+        let _ = create_node(State(app.clone()), Json(request))
+            .await
+            .unwrap();
+
+        let Json(response) = issue_node_join_token(State(app), Path("2".into()))
+            .await
+            .unwrap();
+        let claims = key
+            .verify(&response.token, 2, minga_state::types::unix_now())
+            .unwrap();
+        assert_eq!(response.tenant_id, "acme");
+        assert_eq!(claims.tenant_id, "acme");
+        assert_eq!(claims.node_id, response.node_id);
+    }
     #[tokio::test]
     async fn overlapping_ipam_subnet_does_not_disclose_other_networks() {
         let (app, _dir) = app_with_node(1.0).await;

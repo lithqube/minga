@@ -46,6 +46,7 @@ sha2 = "0.10"
 shlex = "2"
 thiserror = "2"
 clap = { version = "4", features = ["derive"] }
+hmac = "0.12"
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
 tempfile = "3"

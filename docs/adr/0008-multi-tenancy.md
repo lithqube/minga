@@ -87,6 +87,8 @@ A tenant over quota gets 429 or 507 with the quota named. Quotas are desired sta
   - Removing a node revokes its user.
   - A leaked tenant key can mint users for its own tenant only.
   - mTLS stays as the transport.
+  - **Initial key custody:** NATS operator/account and tenant-scoped signing keys are manager-local files, provisioned with restrictive permissions; they are never stored in Raft, JetStream, logs, or worker images. This is an initial software-signer deployment, not an HSM-equivalent boundary.
+  - Each manager that may issue credentials must have the same signer material installed locally; it is not replicated. A later signer-provider integration can move key operations to an HSM, Vault, or service without changing the worker credential contract.
 - **External NATS** (`MINGA_NATS_URL`): a multi-tenant cluster needs the bundled sidecar, or an external server in operator mode with the same account layout. Docs ship the layout, and Minga checks it at startup.
 - **Server version.** The release bundles nats-server v2.15.3. CI tests v2.14.10 and v2.15.3; external servers below JetStream API level 4 get a manager startup warning. Managers query `$JS.API.INFO` instead of parsing server version strings. Consumer-limit update failures during mixed-version rollouts warn and retry on the next manager connection.
   - From 2.12, the server rejects unknown fields on JetStream API requests (strict mode). `setup_kv` reads `info().config` and sends it back through `update_stream`. It is accepted on 2.15.3, and the 2.14.10 and 2.15.3 suites cover KV stream updates; the three-server cluster test covers `ensure_replicas`.
@@ -134,7 +136,19 @@ Every plan, ADR and PR that adds state, an endpoint, a bus subject, a node-local
 0. **T0 — complete (Phase 14).** The release bundles nats-server v2.15.3, external NATS v2.14.10 and v2.15.3 pass the bus suite, manager feature gating uses API level 4, and single-server plus rolling upgrade proofs passed.
 1. **T1 — complete.** The `Tenant` type and quotas are persisted desired state; existing clusters receive a replicated `default` tenant. Cluster operators can create, list, update and delete empty tenants through `/minga/tenants`, authenticated by the current cluster admin token. Deleting `default` or a tenant that owns resources is refused.
 2. **T2 — complete.** `minga tls issue-client` issues client-auth certificates with caller (`CN`), role (`OU`) and tenant (`O`); managers can require API mTLS with a dedicated client CA. Tenant-scoped Docker routes and nested responses filter by tenant, and foreign lookups return 404. Tenant CRUD, node inventory, cluster info and cluster health/metrics routes require a cluster operator (`O=*` or the configured API token); `O=*` operators do not receive tenant workload access. Missing `O` maps to `default` only while it is the sole tenant. A bearer token retains default-tenant workload access only while `default` is the sole tenant.
-3. **T3.** Node join tokens per tenant, the hard placement filter, managers without workloads when there are 2+ tenants, and WireGuard peer sets per tenant.
+3. **T3 — in progress.** The hard placement filter, manager workload
+   exclusion and tenant-scoped WireGuard peer sets are implemented.
+   `POST /nodes` pre-assigns a tenant; cluster operators can mint a 15-minute
+   node-bound join token at `POST /minga/nodes/{id}/join-token`. Managers
+   verify its HMAC, node ID and tenant before accepting a non-default lease,
+   and accept it only for an existing node record in the token's tenant, so
+   deleting the node revokes outstanding tokens. They then persist the joined
+   tenant in JetStream so later renewals cannot change it or require a live
+   token. Until that record exists, the scheduler gives a non-default node no
+   tasks and no WireGuard peers, even with a live lease. The same owner-only 32-byte signing key must be
+   provisioned on every manager. This depends on node-scoped NATS permissions:
+   certificate mapping or JWT user policy must restrict each client to its own
+   lease key. T3 end-to-end verification remains open.
 4. **T4.** Tenant segments in subjects and keys, the per-tenant worker ACL, per-tenant streams and buckets, and operator/JWT mode with scoped signing keys per tenant.
 5. **T5.** Quotas and the per-tenant audit trail.
 

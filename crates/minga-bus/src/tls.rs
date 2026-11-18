@@ -37,6 +37,9 @@ pub enum TlsError {
     #[error("TLS client key file `{path}` has insecure permissions {mode:o} (expected 0600)")]
     KeyPermissionsTooOpen { path: String, mode: u32 },
 
+    #[error("NATS credentials are invalid: {0}")]
+    Credentials(String),
+
     #[error("TLS CA file `{path}` contains no PEM certificates")]
     CaEmpty { path: String },
 
@@ -306,6 +309,20 @@ impl NatsTlsConfig {
             .require_tls(true)
             .tls_client_config(config))
     }
+
+    /// Build TLS options with NATS JWT credentials.
+    ///
+    /// Credentials authenticate the NATS principal; the client certificate
+    /// remains required for transport identity and server-side certificate
+    /// verification. Credential contents are never included in errors.
+    pub fn connect_options_with_credentials(
+        &self,
+        credentials: &str,
+    ) -> Result<async_nats::ConnectOptions, TlsError> {
+        self.connect_options()?
+            .credentials(credentials)
+            .map_err(|error| TlsError::Credentials(error.to_string()))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -446,6 +463,24 @@ mod tests {
         let cfg = NatsTlsConfig::new(&ca_path, &cert_path, &key_path, "localhost");
         cfg.preflight().expect("valid material must pass preflight");
         assert!(cfg.client_config().is_ok());
+    }
+    #[test]
+    fn credentials_builder_rejects_malformed_credentials_without_echoing_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ca, cert, key) = make_pki();
+        let ca_path = dir.path().join("ca.pem");
+        let cert_path = dir.path().join("cert.pem");
+        let key_path = dir.path().join("key.pem");
+        write_file(&ca_path, &ca, 0o644);
+        write_file(&cert_path, &cert, 0o644);
+        write_file(&key_path, &key, 0o600);
+
+        let cfg = NatsTlsConfig::new(&ca_path, &cert_path, &key_path, "localhost");
+        let error = cfg
+            .connect_options_with_credentials("private-credential-marker")
+            .unwrap_err();
+        assert!(matches!(error, TlsError::Credentials(_)));
+        assert!(!error.to_string().contains("private-credential-marker"));
     }
 
     #[test]

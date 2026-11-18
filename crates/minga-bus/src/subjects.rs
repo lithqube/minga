@@ -93,6 +93,14 @@ pub fn kv_node_status(node_id: u64) -> String {
     format!("node.{node_id}")
 }
 
+/// Prefix of the manager-written status keys recording each node's joined tenant.
+pub const NODE_JOIN_PREFIX: &str = "internal.node-join.";
+
+/// Status key holding the tenant a node joined; only managers write it.
+pub fn kv_node_join(node_id: u64) -> String {
+    format!("{NODE_JOIN_PREFIX}{node_id}")
+}
+
 /// KV key prefix for a node's task assignments.
 pub fn kv_assignment_node_prefix(node_id: u64) -> String {
     format!("node.{node_id}.task.")

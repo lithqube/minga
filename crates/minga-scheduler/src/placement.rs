@@ -29,6 +29,7 @@ use crate::{constraints, netassign};
 /// leases before handing nodes to this pure planner.
 pub(crate) fn is_eligible(n: &ClusterNode, service: &Service) -> bool {
     n.status == NodeStatus::Active
+        && n.tenant_id == service.tenant_id
         && service
             .constraints
             .iter()
@@ -406,6 +407,7 @@ mod tests {
             wg_public_key: None,
             wg_endpoint: None,
             overlay_ip: None,
+            tenant_id: minga_state::types::DEFAULT_TENANT_ID.to_owned(),
             last_seen_unix: None,
             role: Default::default(),
             reserved_ports: Vec::new(),
@@ -462,6 +464,19 @@ mod tests {
         assert_eq!(slot_of(&tasks[0].id), "web.1");
         assert_eq!(slot_of(&tasks[1].id), "web.2");
         assert!(tasks.iter().all(|t| t.state == TaskState::Pending));
+    }
+
+    #[test]
+    fn placement_hard_filters_nodes_to_service_tenant() {
+        let mut tenant_node = node(2, 4.0, 1 << 30, 0, &[]);
+        tenant_node.tenant_id = "tenant-b".to_owned();
+        let nodes = [node(1, 4.0, 1 << 30, 0, &[]), tenant_node];
+        let mut service = svc("tenant-b.web", 1, ServiceMode::Replicated);
+        service.tenant_id = "tenant-b".to_owned();
+
+        let tasks = place_service(&service, &nodes, &[], &[], 0);
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].node_id, 2);
     }
 
     #[test]

@@ -27,6 +27,10 @@ pub enum ApiError {
     #[error("{0}")]
     Internal(String),
 
+    /// A feature this manager was not configured for (not a server fault).
+    #[error("{0}")]
+    Unavailable(String),
+
     #[error("state error: {0}")]
     State(String),
 }
@@ -37,6 +41,7 @@ impl ApiError {
             ApiError::BadRequest(_) => StatusCode::BAD_REQUEST,
             ApiError::NotFound(_) => StatusCode::NOT_FOUND,
             ApiError::Conflict(_) => StatusCode::CONFLICT,
+            ApiError::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             ApiError::Internal(_) | ApiError::State(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }

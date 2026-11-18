@@ -31,6 +31,7 @@
 //!     wg_public_key: None,
 //!     wg_endpoint: None,
 //!     overlay_ip: None,
+//!     tenant_id: "default".to_string(),
 //!     last_seen_unix: None,
 //!     role: Default::default(),
 //!     reserved_ports: vec![],
@@ -45,6 +46,7 @@
 pub mod codec;
 mod command;
 mod error;
+pub mod join_token;
 mod log_store;
 pub mod network;
 mod state_machine;

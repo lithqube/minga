@@ -202,7 +202,7 @@ impl Scheduler {
         let services = self.state.list_services().await?;
         let mut tasks = self.state.list_tasks().await?;
         if let Some(bus) = &self.bus {
-            let statuses = match read_task_statuses(bus.as_ref()).await {
+            let (statuses, joined) = match read_task_statuses(bus.as_ref()).await {
                 Ok(statuses) => statuses,
                 Err(error) => {
                     tracing::warn!(error = %error, "cannot read task status; skipping reconciliation");
@@ -210,14 +210,26 @@ impl Scheduler {
                 }
             };
             tasks = overlay_task_statuses(tasks, &statuses);
+            // A live lease alone does not admit a non-default node: until a
+            // manager accepted its join token it gets no tasks and no peers.
+            nodes.retain(|node| {
+                node.tenant_id == minga_state::types::DEFAULT_TENANT_ID
+                    || joined.get(&node.id) == Some(&node.tenant_id)
+            });
         }
         let mut networks = self.state.list_networks().await?;
         self.fill_subnets(&mut networks, &tasks).await?;
 
+        let tenants = self.state.list_tenants().await?;
+        let placement_nodes: Vec<_> = nodes
+            .iter()
+            .filter(|node| tenants.len() < 2 || node.role != NodeRole::Manager)
+            .cloned()
+            .collect();
         let actions = plan(
             &services,
             &tasks,
-            &nodes,
+            &placement_nodes,
             &networks,
             minga_state::types::unix_now(),
         );
@@ -282,7 +294,7 @@ impl Scheduler {
         let services = self.state.list_services().await?;
         // Stored task state lags the nodes' reports; without the overlay a
         // replica reported Failed would stay an ingress backend.
-        let statuses = match read_task_statuses(bus.as_ref()).await {
+        let (statuses, _) = match read_task_statuses(bus.as_ref()).await {
             Ok(statuses) => statuses,
             Err(error) => {
                 tracing::warn!(error = %error, "cannot read task status; skipping projection");
@@ -300,14 +312,23 @@ impl Scheduler {
             .iter()
             .map(|network| (network.id.as_str(), network))
             .collect();
+        let node_by_id: HashMap<_, _> = nodes.iter().map(|node| (node.id, node)).collect();
         let mut network_tasks: HashMap<&str, Vec<NetworkDnsTask>> = HashMap::new();
-        let mut ingress_backends: HashMap<(u16, String), Vec<minga_state::types::IngressBackend>> =
-            HashMap::new();
+        let mut ingress_backends: HashMap<
+            (String, u16, String),
+            Vec<minga_state::types::IngressBackend>,
+        > = HashMap::new();
         let mut desired = HashSet::new();
         for task in &tasks {
             let Some(service) = service_by_id.get(task.service_id.as_str()) else {
                 continue;
             };
+            let Some(node) = node_by_id.get(&task.node_id) else {
+                continue;
+            };
+            if service.tenant_id != task.tenant_id || node.tenant_id != task.tenant_id {
+                continue;
+            }
             let task_networks: Vec<Network> = task
                 .spec
                 .ips
@@ -315,6 +336,7 @@ impl Scheduler {
                 .filter_map(|id| {
                     network_by_id
                         .get(id.as_str())
+                        .filter(|network| network.tenant_id == task.tenant_id)
                         .map(|network| (*network).clone())
                 })
                 .collect();
@@ -335,7 +357,10 @@ impl Scheduler {
                 .map_err(|error| SchedulerError::Bus(error.to_string()))?;
             desired.insert(key);
             for (network_id, ip) in &task.spec.ips {
-                if network_by_id.contains_key(network_id.as_str()) {
+                if network_by_id
+                    .get(network_id.as_str())
+                    .is_some_and(|network| network.tenant_id == task.tenant_id)
+                {
                     network_tasks
                         .entry(network_id)
                         .or_default()
@@ -354,9 +379,11 @@ impl Scheduler {
                     minga_state::types::TaskState::Stopped | minga_state::types::TaskState::Failed
                 )
             {
-                if let Some((_, ip)) = primary_task_ip(&task.spec.ips)
-                    .filter(|(network_id, _)| network_by_id.contains_key(network_id))
-                {
+                if let Some((_, ip)) = primary_task_ip(&task.spec.ips).filter(|(network_id, _)| {
+                    network_by_id
+                        .get(*network_id)
+                        .is_some_and(|network| network.tenant_id == task.tenant_id)
+                }) {
                     for port in &task.spec.ports {
                         let (Some(published), minga_state::types::PortMode::Ingress) =
                             (port.published, port.mode)
@@ -364,7 +391,7 @@ impl Scheduler {
                             continue;
                         };
                         ingress_backends
-                            .entry((published, port.protocol.clone()))
+                            .entry((task.tenant_id.clone(), published, port.protocol.clone()))
                             .or_default()
                             .push(minga_state::types::IngressBackend {
                                 node_id: task.node_id,
@@ -385,7 +412,10 @@ impl Scheduler {
             });
         }
         for node in nodes {
-            for ((published, protocol), backends) in &ingress_backends {
+            for ((tenant_id, published, protocol), backends) in &ingress_backends {
+                if node.tenant_id != *tenant_id {
+                    continue;
+                }
                 let assignment = minga_state::types::IngressAssignment {
                     published: *published,
                     protocol: protocol.clone(),
@@ -524,11 +554,22 @@ fn validate_manager_endpoints(nodes: &[ClusterNode]) -> Result<(), SchedulerErro
 
 /// Reads the nodes' task reports from MINGA_STATUS, keyed by task ID. A report
 /// whose key does not match its own node and task is ignored.
+/// Task status reports, plus each node's joined tenant from the same listing.
 async fn read_task_statuses(
     bus: &dyn EventBus,
-) -> minga_bus::Result<HashMap<String, TaskStatusReport>> {
+) -> minga_bus::Result<(HashMap<String, TaskStatusReport>, HashMap<u64, String>)> {
     let mut statuses = HashMap::new();
+    let mut joined = HashMap::new();
     for (key, bytes) in bus.list_status().await? {
+        if let Some(node_id) = key
+            .strip_prefix(subjects::NODE_JOIN_PREFIX)
+            .and_then(|id| id.parse().ok())
+        {
+            if let Ok(tenant_id) = String::from_utf8(bytes) {
+                joined.insert(node_id, tenant_id);
+            }
+            continue;
+        }
         if !key.starts_with("node.") || !key.contains(".task.") {
             continue;
         }
@@ -540,7 +581,7 @@ async fn read_task_statuses(
             Err(error) => tracing::warn!(key, error = %error, "cannot decode task status"),
         }
     }
-    Ok(statuses)
+    Ok((statuses, joined))
 }
 
 fn overlay_task_statuses(
@@ -570,6 +611,10 @@ fn build_wireguard_peer_sets(
 ) -> Result<HashMap<u64, WireGuardPeerSet>, SchedulerError> {
     let node_by_id: HashMap<_, _> = nodes.iter().map(|node| (node.id, node)).collect();
     let network_ids: HashSet<&str> = networks.iter().map(|network| network.id.as_str()).collect();
+    let network_tenants: HashMap<_, _> = networks
+        .iter()
+        .map(|network| (network.id.as_str(), network.tenant_id.as_str()))
+        .collect();
     let mesh_node_ips: HashMap<_, _> = nodes
         .iter()
         .map(|node| {
@@ -589,10 +634,16 @@ fn build_wireguard_peer_sets(
             {
                 continue;
             }
+            let Some(node) = node_by_id.get(&task.node_id) else {
+                continue;
+            };
             let Some((network_id, ip)) = primary_task_ip(&task.spec.ips) else {
                 continue;
             };
-            if !network_ids.contains(network_id) || ip.parse::<std::net::Ipv4Addr>().is_err() {
+            if node.tenant_id != task.tenant_id
+                || network_tenants.get(network_id) != Some(&task.tenant_id.as_str())
+                || ip.parse::<std::net::Ipv4Addr>().is_err()
+            {
                 continue;
             }
             ingress_network_ids.insert(network_id);
@@ -606,8 +657,16 @@ fn build_wireguard_peer_sets(
     }
     let mut task_ips: HashMap<u64, HashMap<String, Vec<String>>> = HashMap::new();
     for task in tasks {
+        let Some(node) = node_by_id.get(&task.node_id) else {
+            continue;
+        };
+        if node.tenant_id != task.tenant_id {
+            continue;
+        }
         for (network_id, ip) in &task.spec.ips {
-            if network_ids.contains(network_id.as_str()) && ip.parse::<std::net::Ipv4Addr>().is_ok()
+            if network_ids.contains(network_id.as_str())
+                && network_tenants.get(network_id.as_str()) == Some(&task.tenant_id.as_str())
+                && ip.parse::<std::net::Ipv4Addr>().is_ok()
             {
                 task_ips
                     .entry(task.node_id)
@@ -629,7 +688,10 @@ fn build_wireguard_peer_sets(
         let Some(node) = node_by_id.get(&task.node_id) else {
             continue;
         };
-        if node.role != NodeRole::Worker || node.wg_endpoint.is_some() {
+        if node.tenant_id != task.tenant_id
+            || node.role != NodeRole::Worker
+            || node.wg_endpoint.is_some()
+        {
             continue;
         }
         for network_id in task.spec.ips.keys() {
@@ -649,6 +711,9 @@ fn build_wireguard_peer_sets(
         .filter(|node| node.role == NodeRole::Worker && node.wg_endpoint.is_none())
     {
         for network_id in &ingress_network_ids {
+            if network_tenants.get(*network_id) != Some(&node.tenant_id.as_str()) {
+                continue;
+            }
             nat_workers_by_network
                 .entry(network_id)
                 .or_default()
@@ -689,20 +754,32 @@ fn build_wireguard_peer_sets(
             .flat_map(|node_networks| node_networks.keys().map(String::as_str))
             .collect();
         let mut routing_network_ids = local_network_ids.clone();
-        routing_network_ids.extend(ingress_network_ids.iter().copied());
+        routing_network_ids.extend(
+            ingress_network_ids
+                .iter()
+                .filter(|network_id| {
+                    network_tenants.get(**network_id) == Some(&node.tenant_id.as_str())
+                })
+                .copied(),
+        );
         let mut node_networks: Vec<_> = networks
             .iter()
             .filter_map(|network| {
+                let relay =
+                    home_manager == Some(node.id) && relay_network_ids.contains(&network.id);
+                if network.tenant_id != node.tenant_id && !relay {
+                    return None;
+                }
                 network
                     .subnet
                     .as_ref()
                     .map(|subnet| WireGuardNetworkAssignment {
                         network_id: network.id.clone(),
                         subnet: subnet.clone(),
-                        ingress: ingress_network_ids.contains(network.id.as_str()),
+                        ingress: ingress_network_ids.contains(network.id.as_str())
+                            && (network.tenant_id == node.tenant_id || relay),
                         local: local_network_ids.contains(network.id.as_str()),
-                        relay: home_manager == Some(node.id)
-                            && relay_network_ids.contains(&network.id),
+                        relay,
                     })
             })
             .collect();
@@ -711,6 +788,12 @@ fn build_wireguard_peer_sets(
         let mut peers = Vec::new();
         for peer in nodes {
             if peer.id == node.id {
+                continue;
+            }
+            if node.role == NodeRole::Worker
+                && peer.role == NodeRole::Worker
+                && node.tenant_id != peer.tenant_id
+            {
                 continue;
             }
             let peer_has_local_network = task_ips.get(&peer.id).is_some_and(|peer_networks| {
@@ -775,6 +858,7 @@ fn build_wireguard_peer_sets(
                     };
                     if *target_node_id == node.id
                         || target.role != NodeRole::Worker
+                        || target.tenant_id != node.tenant_id
                         || target.wg_endpoint.is_some()
                     {
                         continue;
@@ -807,6 +891,7 @@ fn build_wireguard_peer_sets(
                     for target in nodes.iter().filter(|target| {
                         target.id != node.id
                             && target.role == NodeRole::Worker
+                            && target.tenant_id == node.tenant_id
                             && target.wg_endpoint.is_none()
                     }) {
                         allowed_ips.insert(format!("{}/32", mesh_node_ips[&target.id]));

@@ -11,6 +11,11 @@
 - The 50,000-consumer KV limit is applied only on API level 4 or newer.
   During mixed-version NATS rollouts, rejected updates are logged and retried
   when managers reconnect after the server upgrade.
+- TLS NATS clients may authenticate with an owner-only user JWT `.creds` file
+  selected by `MINGA_NATS_CREDENTIALS_FILE`. Credential files require TLS,
+  cannot be combined with token auth, and their contents are never included
+  in errors. The built-in sidecar can use operator/JWT authentication with
+  `MINGA_NATS_OPERATOR_JWT` and `MINGA_NATS_RESOLVER_DIR`; mTLS remains required.
 
 - Desired-state resources now record `tenant_id`; legacy resources belong to
   `default`. Tenant definitions, quotas and cluster-operator CRUD are persisted
@@ -25,6 +30,14 @@
   a cluster operator (`O=*`, or the configured API token), and an `O=*`
   certificate gets no tenant workload access. A certificate without `O` maps
   to `default` only while `default` is the sole tenant.
+- Placement hard-filters nodes by tenant; managers stop hosting tenant
+  workloads once the cluster has multiple tenants. WireGuard peer and route
+  projections are tenant-scoped. Operators pre-register a node with
+  `tenant_id` through `POST /nodes` and mint a 15-minute node-bound join token
+  through `POST /minga/nodes/{id}/join-token`. Managers verify the token before
+  binding the lease to its tenant. NATS permissions must still restrict each
+  worker to its own lease key.
+
 
 - Existing Compose stacks with short-syntax ports now publish on every node
   by default. Managers project live backends through node-scoped bus

@@ -32,6 +32,7 @@ fn node(id: u64, cpus: f64, mem: u64, gpus: u32, labels: &[(&str, &str)]) -> Clu
         wg_public_key: None,
         wg_endpoint: None,
         overlay_ip: None,
+        tenant_id: minga_state::types::DEFAULT_TENANT_ID.to_owned(),
         last_seen_unix: None,
         role: Default::default(),
         reserved_ports: Vec::new(),

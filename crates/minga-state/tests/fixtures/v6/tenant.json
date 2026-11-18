@@ -1,0 +1,16 @@
+{
+  "created_at": 1794000000,
+  "id": "tenant-a",
+  "name": "Tenant A",
+  "quotas": {
+    "api_requests_per_second": 100,
+    "desired_state_bytes": 1048576,
+    "jetstream_age_secs": 86400,
+    "jetstream_bytes": 1073741824,
+    "jobs": 3,
+    "networks": 5,
+    "secrets": 20,
+    "services": 10,
+    "tasks": 50
+  }
+}
