@@ -55,6 +55,26 @@ pub enum StateCommand {
         id: NodeId,
         last_seen_unix: u64,
     },
+
+    /// Removes an object only while it still belongs to `tenant_id`, so a
+    /// delayed removal cannot delete another tenant's object that reused
+    /// the ID. The untenanted `Remove*` variants stay for log replay.
+    RemoveOwned {
+        kind: ObjectKind,
+        id: String,
+        tenant_id: TenantId,
+    },
+}
+
+/// The tenant-owned tables [`StateCommand::RemoveOwned`] can delete from.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ObjectKind {
+    Service,
+    Task,
+    Network,
+    Volume,
+    Secret,
+    Config,
 }
 
 /// The response returned by the state machine after applying a command.

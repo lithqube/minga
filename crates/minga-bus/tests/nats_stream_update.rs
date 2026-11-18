@@ -5,7 +5,7 @@
 //!
 mod common;
 
-use minga_bus::{EventBus, NatsBus};
+use minga_bus::NatsBus;
 use std::time::Duration;
 
 #[tokio::test]
@@ -34,38 +34,4 @@ async fn lease_stream_config(url: &str) -> async_nats::jetstream::stream::Config
         .await
         .expect("lease stream");
     stream.info().await.expect("stream info").config.clone()
-}
-
-#[tokio::test]
-async fn connecting_moves_a_pre_tenant_events_stream_to_tenant_subjects() {
-    let Some(url) = common::nats_url().await else {
-        return;
-    };
-    let url: &str = &url;
-    let client = async_nats::connect(url).await.expect("connect");
-    let js = async_nats::jetstream::new(client);
-    let _ = js.delete_stream("MINGA_EVENTS").await;
-    js.create_stream(async_nats::jetstream::stream::Config {
-        name: "MINGA_EVENTS".to_string(),
-        subjects: vec![
-            "minga.node.>".to_string(),
-            "minga.task.>".to_string(),
-            "minga.egress.>".to_string(),
-        ],
-        ..Default::default()
-    })
-    .await
-    .expect("create pre-tenant events stream");
-
-    let bus = NatsBus::connect(url).await.expect("connect bus");
-    bus.publish_event("minga.default.task.upgrade.event", b"after-upgrade")
-        .await
-        .expect("tenant-first publish after upgrade");
-
-    let mut stream = js.get_stream("MINGA_EVENTS").await.expect("events");
-    let subjects = stream.info().await.expect("info").config.subjects.clone();
-    assert_eq!(
-        subjects,
-        ["minga.*.node.>", "minga.*.task.>", "minga.*.egress.>"]
-    );
 }

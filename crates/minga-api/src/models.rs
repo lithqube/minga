@@ -423,7 +423,7 @@ pub struct NodeCreateRequest {
 }
 
 /// Response from `POST /nodes/{id}/join-token`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct NodeJoinToken {
     pub node_id: u64,
     pub tenant_id: String,
@@ -431,6 +431,37 @@ pub struct NodeJoinToken {
     pub token: String,
     /// Standard NATS `.creds` payload for this tenant-bound node.
     pub credentials: String,
+}
+
+/// The token and the `.creds` NKey seed are secrets; a `{:?}` in a log must
+/// not print them.
+impl std::fmt::Debug for NodeJoinToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NodeJoinToken")
+            .field("node_id", &self.node_id)
+            .field("tenant_id", &self.tenant_id)
+            .field("expires_at", &self.expires_at)
+            .field("token", &"<redacted>")
+            .field("credentials", &"<redacted>")
+            .finish()
+    }
+}
+
+#[cfg(test)]
+mod node_join_token_tests {
+    #[test]
+    fn debug_output_redacts_the_token_and_seed() {
+        let token = super::NodeJoinToken {
+            node_id: 3,
+            tenant_id: "acme".into(),
+            expires_at: 9,
+            token: "signed-token".into(),
+            credentials: "SUAEXAMPLESEED".into(),
+        };
+        let debug = format!("{token:?}");
+        assert!(!debug.contains("signed-token") && !debug.contains("SUAEXAMPLESEED"));
+        assert!(debug.contains("acme"));
+    }
 }
 
 /// Query params for `POST /nodes/{id}/update`. Docker sends `version`;

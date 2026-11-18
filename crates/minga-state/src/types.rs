@@ -491,6 +491,14 @@ pub enum TaskState {
     Failed,
 }
 
+impl TaskState {
+    /// A stopped or failed task no longer runs and does not count toward
+    /// the tenant's task quota.
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Stopped | Self::Failed)
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct TaskSpec {
     pub image: String,

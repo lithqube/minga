@@ -38,6 +38,10 @@
 - NATS operator/JWT mode uses tenant-scoped signing keys. Removed worker users
   are revoked in the account claim, and revoked public keys persist in Raft
   tenant state (format v8 migration).
+- Upgrading to tenant-first bus names resets task status and restart counts:
+  managers purge the old untenanted `node.<id>.…` status and assignment keys
+  on start, and desired state is rebuilt from Raft. An existing
+  `MINGA_EVENTS` stream moves to the new subjects automatically.
 - Tenant JetStream byte and age quotas apply to each tenant's logs, audit,
   status, usage and budget resources. Tenant audit is available at
   `/v{version}/audit`; cluster operators can read active tenants at

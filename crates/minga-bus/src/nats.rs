@@ -106,6 +106,11 @@ pub struct NatsBus {
     worker_node_id: Option<u64>,
     worker_tenant_id: Option<String>,
     system_client: tokio::sync::OnceCell<Client>,
+    /// Tenants whose buckets and streams this connection already set up, so
+    /// audited or rate-limited requests do not repeat the JetStream calls.
+    /// shortcut: assumes the server does not lose those resources while this
+    /// connection lives; evict on a "not found" error if that ever happens.
+    ensured_tenants: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 /// Turns a KV stream message into a put or delete event.
@@ -364,6 +369,9 @@ impl NatsBus {
     pub async fn ensure_tenant_resources(&self, tenant_id: &str) -> Result<()> {
         validate_tenant_id(tenant_id)?;
         self.require_manager("initialize tenant bus resources")?;
+        if self.ensured_tenants.lock().unwrap().contains(tenant_id) {
+            return Ok(());
+        }
         for (bucket, age) in [
             (format!("MINGA_STATUS_{tenant_id}"), Duration::ZERO),
             (
@@ -398,6 +406,10 @@ impl NatsBus {
             })
             .await
             .map_err(|error| BusError::Other(format!("{audit_name}: {error}")))?;
+        self.ensured_tenants
+            .lock()
+            .unwrap()
+            .insert(tenant_id.to_owned());
         Ok(())
     }
     pub async fn configure_tenant_quota(
@@ -591,6 +603,7 @@ impl NatsBus {
             worker_node_id: None,
             worker_tenant_id: None,
             system_client: tokio::sync::OnceCell::new(),
+            ensured_tenants: Default::default(),
         }))
     }
 
@@ -633,6 +646,7 @@ impl NatsBus {
             worker_node_id: None,
             worker_tenant_id: None,
             system_client: tokio::sync::OnceCell::new(),
+            ensured_tenants: Default::default(),
         }))
     }
 
@@ -665,6 +679,7 @@ impl NatsBus {
             worker_node_id: None,
             worker_tenant_id: None,
             system_client: tokio::sync::OnceCell::new(),
+            ensured_tenants: Default::default(),
         }))
     }
 
@@ -732,6 +747,7 @@ impl NatsBus {
             worker_node_id: None,
             worker_tenant_id: None,
             system_client: tokio::sync::OnceCell::new(),
+            ensured_tenants: Default::default(),
         }))
     }
 
@@ -783,6 +799,7 @@ impl NatsBus {
             worker_node_id: Some(node_id),
             worker_tenant_id: Some(tenant_id.to_owned()),
             system_client: tokio::sync::OnceCell::new(),
+            ensured_tenants: Default::default(),
         }))
     }
 
@@ -826,6 +843,10 @@ impl NatsBus {
         let status_kv = Self::setup_kv(js, "MINGA_STATUS", Duration::ZERO).await?;
         let assignments_kv = Self::setup_kv(js, "MINGA_ASSIGN", Duration::ZERO).await?;
         let leases_kv = Self::setup_kv(js, "MINGA_LEASES", lease_ttl).await?;
+        // Leases expire on their own; these two buckets keep keys forever.
+        for kv in [&status_kv, &assignments_kv] {
+            purge_legacy_keys(kv).await;
+        }
         Ok((status_kv, assignments_kv, leases_kv))
     }
 
@@ -1856,6 +1877,46 @@ fn now_millis() -> u64 {
 }
 
 /// Splits a comma-separated seed list into the URLs async-nats accepts.
+/// Whether `key` uses the layout from before tenant-first names
+/// (`node.<id>.…`). A tenant named `node` writes `node.node.<id>.…`, so the
+/// second segment being numeric tells them apart.
+fn is_legacy_key(key: &str) -> bool {
+    let mut parts = key.split('.');
+    parts.next() == Some("node")
+        && parts
+            .next()
+            .is_some_and(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// Purges keys no reader uses since tenant-first names: task status and
+/// assignments from before the upgrade would otherwise stay forever. This is
+/// housekeeping, so a failure is logged and the connection proceeds.
+async fn purge_legacy_keys(kv: &jetstream::kv::Store) {
+    let keys: Vec<String> = match kv.keys().await {
+        Ok(keys) => {
+            keys.filter_map(|key| async move { key.ok() })
+                .collect()
+                .await
+        }
+        Err(error) => {
+            tracing::warn!(bucket = %kv.name, %error, "cannot list keys to purge legacy entries");
+            return;
+        }
+    };
+    let mut purged = 0usize;
+    for key in keys.iter().filter(|key| is_legacy_key(key)) {
+        match kv.purge(key).await {
+            Ok(()) => purged += 1,
+            Err(error) => {
+                tracing::warn!(bucket = %kv.name, %key, %error, "cannot purge legacy key")
+            }
+        }
+    }
+    if purged > 0 {
+        tracing::info!(bucket = %kv.name, purged, "purged pre-tenant keys");
+    }
+}
+
 /// Worker connections use a tenant- and node-scoped inbox; their ACL denies
 /// the shared `_INBOX.>`.
 fn worker_options(
@@ -1931,6 +1992,22 @@ async fn reject(client: &Client, msg: &jetstream::Message, topic: &str, err: &Bu
 fn validate_tenant_id(tenant_id: &str) -> Result<()> {
     minga_state::types::Tenant::validate_id(tenant_id)
         .map_err(|error| BusError::Other(format!("invalid tenant ID: {error}")))
+}
+
+#[cfg(test)]
+mod legacy_key_tests {
+    use super::is_legacy_key;
+
+    #[test]
+    fn only_pre_tenant_node_keys_are_legacy() {
+        assert!(is_legacy_key("node.7.task.web"));
+        assert!(is_legacy_key("node.7"));
+        assert!(is_legacy_key("node.12.wg"));
+        assert!(!is_legacy_key("node.node.7.task.web"), "tenant named node");
+        assert!(!is_legacy_key("default.node.7.task.web"));
+        assert!(!is_legacy_key("internal.node-join.7"));
+        assert!(!is_legacy_key("node."));
+    }
 }
 
 #[cfg(test)]

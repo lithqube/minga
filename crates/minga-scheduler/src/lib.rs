@@ -284,8 +284,13 @@ impl Scheduler {
                     }
                 }
                 ReconcileAction::RemoveTask { task_id, .. } => {
+                    let Some(task) = tasks.iter().find(|task| &task.id == task_id) else {
+                        continue;
+                    };
                     tracing::info!(task = %task_id, "removing task");
-                    self.state.remove_task(task_id.clone()).await?;
+                    self.state
+                        .remove_task(task_id.clone(), &task.tenant_id)
+                        .await?;
                 }
             }
         }

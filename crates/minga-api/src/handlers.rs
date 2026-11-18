@@ -1230,10 +1230,14 @@ pub async fn delete_service(
         .iter()
         .filter(|task| task.tenant_id == tenant_id && task.service_id == svc.id)
     {
-        app.store.remove_task(task.id.clone()).await?;
+        app.store
+            .remove_task(task.id.clone(), &task.tenant_id)
+            .await?;
     }
 
-    app.store.remove_service(svc.id.clone()).await?;
+    app.store
+        .remove_service(svc.id.clone(), &svc.tenant_id)
+        .await?;
 
     tracing::info!(tenant = %tenant_id, service = %svc.id, "service removed via API");
 
@@ -1564,7 +1568,9 @@ pub async fn delete_network(
         .filter(|network| network.tenant_id == tenant_id)
         .ok_or_else(|| not_found("network", &id))?;
 
-    app.store.remove_network(net.id.clone()).await?;
+    app.store
+        .remove_network(net.id.clone(), &net.tenant_id)
+        .await?;
 
     tracing::info!(tenant = %tenant_id, network = %net.id, "network removed via API");
 
@@ -1672,7 +1678,9 @@ pub async fn delete_secret(
         .filter(|secret| secret.tenant_id == tenant_id)
         .ok_or_else(|| not_found("secret", &id))?;
 
-    app.store.remove_secret(secret.id.clone()).await?;
+    app.store
+        .remove_secret(secret.id.clone(), &secret.tenant_id)
+        .await?;
 
     tracing::info!(tenant = %tenant_id, secret = %secret.id, "secret removed via API");
 
@@ -1765,7 +1773,9 @@ pub async fn delete_config(
         .filter(|config| config.tenant_id == tenant_id)
         .ok_or_else(|| not_found("config", &id))?;
 
-    app.store.remove_config(config.id.clone()).await?;
+    app.store
+        .remove_config(config.id.clone(), &config.tenant_id)
+        .await?;
 
     tracing::info!(tenant = %tenant_id, config = %config.id, "config removed via API");
 

@@ -1316,6 +1316,18 @@ mod tests {
     #[tokio::test]
     async fn a_service_name_cannot_be_taken_over_by_another_tenant() {
         let (_router, store, _dir) = admin_router().await;
+        for id in ["tenant-a", "tenant-b"] {
+            store
+                .create_tenant(minga_state::types::Tenant {
+                    nats_revoked_user_public_keys: Vec::new(),
+                    id: id.into(),
+                    name: id.into(),
+                    quotas: Default::default(),
+                    created_at: 1,
+                })
+                .await
+                .unwrap();
+        }
         store
             .upsert_service(service_record("web", "tenant-a"))
             .await
@@ -1415,7 +1427,10 @@ mod tests {
         let (status, _) = send_request(router.clone(), req).await;
         assert_eq!(status, StatusCode::CONFLICT);
 
-        store.remove_volume("tenant-a-data".into()).await.unwrap();
+        store
+            .remove_volume("tenant-a-data".into(), "tenant-a")
+            .await
+            .unwrap();
         let req = Request::builder()
             .method("DELETE")
             .uri("/minga/tenants/tenant-a")

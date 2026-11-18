@@ -393,9 +393,12 @@ async fn tenant_crud_is_persisted_and_protects_owned_resources() {
         store.remove_tenant("tenant-a").await,
         Err(StateError::Conflict(_))
     ));
-    store.remove_volume("tenant-a-data".into()).await.unwrap();
+    store
+        .remove_volume("tenant-a-data".into(), "tenant-a")
+        .await
+        .unwrap();
 
-    let mut node = minga_state::types::ClusterNode {
+    let node = minga_state::types::ClusterNode {
         id: 42,
         address: "10.0.0.42:50051".into(),
         labels: Default::default(),
@@ -418,8 +421,8 @@ async fn tenant_crud_is_persisted_and_protects_owned_resources() {
         ),
         "a tenant that still owns nodes must not be deleted"
     );
-    node.tenant_id = "default".into();
-    store.upsert_node(node).await.unwrap();
+    // A node never moves between tenants in place; it is removed first.
+    store.remove_node(node.id).await.unwrap();
     store.remove_tenant("tenant-a").await.unwrap();
     assert!(store.get_tenant("tenant-a").await.unwrap().is_none());
     assert!(matches!(
@@ -650,5 +653,168 @@ async fn nats_public_key_update_preserves_node_and_missing_node_fails() {
             .await,
         Err(StateError::NotFound(id)) if id == "node 999"
     ));
+    store.shutdown().await.unwrap();
+}
+
+fn named_tenant(id: &str, quotas: TenantQuotas) -> Tenant {
+    Tenant {
+        nats_revoked_user_public_keys: Vec::new(),
+        id: id.into(),
+        name: id.into(),
+        quotas,
+        created_at: 1,
+    }
+}
+
+#[tokio::test]
+async fn writes_under_a_missing_tenant_are_refused_but_default_is_permanent() {
+    let (store, _dir) = test_store("missing-tenant").await;
+    let mut service = sample_service("ghost.web");
+    service.tenant_id = "ghost".into();
+    service.ports.clear();
+    assert!(matches!(
+        store.upsert_service(service).await,
+        Err(StateError::NotFound(_))
+    ));
+    let mut node = sample_node(9);
+    node.tenant_id = "ghost".into();
+    assert!(matches!(
+        store.upsert_node(node).await,
+        Err(StateError::NotFound(_))
+    ));
+    assert!(store.list_services().await.unwrap().is_empty());
+    store.upsert_node(sample_node(9)).await.unwrap();
+    store.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_node_keeps_its_tenant_and_removals_only_touch_the_owners_object() {
+    let (store, _dir) = test_store("owned-writes").await;
+    for id in ["tenant-a", "tenant-b"] {
+        store
+            .create_tenant(named_tenant(id, TenantQuotas::default()))
+            .await
+            .unwrap();
+    }
+    store.upsert_node(sample_node(4)).await.unwrap();
+    let mut takeover = sample_node(4);
+    takeover.tenant_id = "tenant-a".into();
+    assert!(matches!(
+        store.upsert_node(takeover).await,
+        Err(StateError::NameInUse)
+    ));
+    assert_eq!(
+        store.get_node(4).await.unwrap().unwrap().tenant_id,
+        "default"
+    );
+
+    let mut service = sample_service("shared.web");
+    service.tenant_id = "tenant-b".into();
+    service.ports.clear();
+    store.upsert_service(service).await.unwrap();
+    // A delayed removal by tenant A must not delete tenant B's object.
+    store
+        .remove_service("shared.web".into(), "tenant-a")
+        .await
+        .unwrap();
+    assert!(store.get_service("shared.web").await.unwrap().is_some());
+    store
+        .remove_service("shared.web".into(), "tenant-b")
+        .await
+        .unwrap();
+    assert!(store.get_service("shared.web").await.unwrap().is_none());
+    store.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn quotas_ignore_stopped_tasks_and_never_block_rewrites() {
+    let (store, _dir) = test_store("quota-rewrites").await;
+    store
+        .create_tenant(named_tenant(
+            "limited",
+            TenantQuotas {
+                tasks: Some(1),
+                ..TenantQuotas::default()
+            },
+        ))
+        .await
+        .unwrap();
+    let task = |id: &str, state: TaskState| {
+        let mut task = sample_task(id, "limited.web", 1);
+        task.tenant_id = "limited".into();
+        task.state = state;
+        task
+    };
+    store
+        .upsert_task(task("limited.web.1", TaskState::Running))
+        .await
+        .unwrap();
+    assert!(matches!(
+        store
+            .upsert_task(task("limited.web.2", TaskState::Pending))
+            .await,
+        Err(StateError::QuotaExceeded(_))
+    ));
+    // A status write on an existing task never grows the count.
+    store
+        .upsert_task(task("limited.web.1", TaskState::Failed))
+        .await
+        .unwrap();
+    // A failed task no longer holds a slot.
+    store
+        .upsert_task(task("limited.web.2", TaskState::Pending))
+        .await
+        .unwrap();
+
+    // Lowering the byte quota below current usage still lets an object be
+    // rewritten at the same size, but not grown.
+    let existing = store.list_tasks().await.unwrap();
+    let used: u64 = existing
+        .iter()
+        .map(|task| serde_json::to_vec(task).unwrap().len() as u64)
+        .sum();
+    store
+        .update_tenant(
+            "limited",
+            "limited".into(),
+            TenantQuotas {
+                tasks: Some(1),
+                desired_state_bytes: Some(used / 2),
+                ..TenantQuotas::default()
+            },
+        )
+        .await
+        .unwrap();
+    store
+        .upsert_task(task("limited.web.2", TaskState::Running))
+        .await
+        .unwrap();
+    let mut grown = task("limited.web.2", TaskState::Running);
+    grown.spec.image = "x".repeat(4096);
+    assert!(matches!(
+        store.upsert_task(grown).await,
+        Err(StateError::QuotaExceeded(_))
+    ));
+    store.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn importing_a_snapshot_keeps_existing_tenant_quotas() {
+    let (store, _dir) = test_store("import-quotas").await;
+    let quotas = TenantQuotas {
+        services: Some(3),
+        ..TenantQuotas::default()
+    };
+    store
+        .update_tenant("default", "Default".into(), quotas.clone())
+        .await
+        .unwrap();
+    // A pre-v8 snapshot carries no tenants, so import synthesizes `default`.
+    let mut snapshot = store.export().await.unwrap();
+    snapshot.tenants.clear();
+    store.import(snapshot, true).await.unwrap();
+    let default = store.get_tenant("default").await.unwrap().unwrap();
+    assert_eq!(default.quotas, quotas);
+    assert_eq!(default.name, "Default");
     store.shutdown().await.unwrap();
 }

@@ -22,7 +22,7 @@ use crate::codec::{
     check_format, FORMAT_KEY, FORMAT_VERSION, V2_FORMAT_VERSION, V3_FORMAT_VERSION,
     V4_FORMAT_VERSION, V5_FORMAT_VERSION, V6_FORMAT_VERSION, V7_FORMAT_VERSION,
 };
-use crate::command::{StateCommand, StateResponse};
+use crate::command::{ObjectKind, StateCommand, StateResponse};
 use crate::types::*;
 use crate::TypeConfig;
 use redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition};
@@ -143,11 +143,20 @@ fn owned_by_other_tenant<T: DeserializeOwned>(
 
 const NAME_IN_USE: &str = "name is already in use";
 
+/// The tenant field every tenant-owned record carries; JSON ignores the rest.
+#[derive(serde::Deserialize)]
+struct Owner {
+    tenant_id: String,
+}
+
+/// The tenant's quotas, or `None` when the tenant does not exist: a write
+/// under a removed tenant would otherwise land with no limits and no owner.
+/// `default` is permanent and may not be seeded yet while a cluster bootstraps.
 #[allow(clippy::result_large_err)]
 fn tenant_quota(
     tx: &redb::WriteTransaction,
     tenant_id: &str,
-) -> Result<TenantQuotas, StorageError<u64>> {
+) -> Result<Option<TenantQuotas>, StorageError<u64>> {
     let table = tx.open_table(TENANTS_TABLE).map_err(sm_io_err)?;
     let quotas = table
         .get(tenant_id)
@@ -155,30 +164,35 @@ fn tenant_quota(
         .map(|value| crate::codec::decode(value.value()))
         .transpose()
         .map_err(|e| sm_storage_err(ErrorSubject::Store, ErrorVerb::Read, e))?
-        .map_or_else(TenantQuotas::default, |tenant: Tenant| tenant.quotas);
-    Ok(quotas)
+        .map(|tenant: Tenant| tenant.quotas);
+    Ok(quotas.or_else(|| (tenant_id == DEFAULT_TENANT_ID).then(TenantQuotas::default)))
 }
 
 #[allow(clippy::result_large_err)]
+/// Rejects a new object past the tenant's count limit. Rewriting an object
+/// that already exists never grows the count, so it always passes: a lowered
+/// quota must not block status and rollout writes.
 fn enforce_count_quota<T: DeserializeOwned>(
     tx: &redb::WriteTransaction,
     table_definition: TableDefinition<&str, &[u8]>,
-    tenant_id: &str,
     id: &str,
     quota_name: &str,
     limit: Option<u64>,
-    tenant_of: impl Fn(&T) -> &str,
+    counted: impl Fn(&T) -> bool,
 ) -> Result<Option<String>, StorageError<u64>> {
     let Some(limit) = limit else {
         return Ok(None);
     };
     let table = tx.open_table(table_definition).map_err(sm_io_err)?;
+    if table.get(id).map_err(sm_io_err)?.is_some() {
+        return Ok(None);
+    }
     let mut count = 0u64;
     for row in table.iter().map_err(sm_io_err)? {
-        let (key, value) = row.map_err(sm_io_err)?;
+        let (_, value) = row.map_err(sm_io_err)?;
         let record: T = crate::codec::decode(value.value())
             .map_err(|e| sm_storage_err(ErrorSubject::Store, ErrorVerb::Read, e))?;
-        if key.value() != id && tenant_of(&record) == tenant_id {
+        if counted(&record) {
             count += 1;
         }
     }
@@ -220,15 +234,16 @@ fn enforce_job_quota(
 fn enforce_desired_state_bytes(
     tx: &redb::WriteTransaction,
     tenant_id: &str,
+    limit: Option<u64>,
     replaced_table: &str,
     replaced_id: &str,
     candidate_len: usize,
 ) -> Result<Option<String>, StorageError<u64>> {
-    let limit = tenant_quota(tx, tenant_id)?.desired_state_bytes;
     let Some(limit) = limit else {
         return Ok(None);
     };
     let mut total = 0u64;
+    let mut replaced_len = None;
     for (table_name, definition) in [
         ("services", SERVICES_TABLE),
         ("tasks", TASKS_TABLE),
@@ -258,10 +273,16 @@ fn enforce_desired_state_bytes(
                 _ => unreachable!(),
             }
             .map_err(|e| sm_storage_err(ErrorSubject::Store, ErrorVerb::Read, e))?;
-            if belongs && !(table_name == replaced_table && key.value() == replaced_id) {
+            if table_name == replaced_table && key.value() == replaced_id {
+                replaced_len = Some(bytes.len() as u64);
+            } else if belongs {
                 total = total.saturating_add(bytes.len() as u64);
             }
         }
+    }
+    // A rewrite that does not grow the record passes even over the limit.
+    if replaced_len.is_some_and(|old| candidate_len as u64 <= old) {
+        return Ok(None);
     }
     total = total.saturating_add(candidate_len as u64);
     if total > limit {
@@ -431,14 +452,25 @@ impl RedbStateMachine {
     ) -> Result<StateResponse, StorageError<u64>> {
         match cmd {
             StateCommand::UpsertNode(node) => {
+                if tenant_quota(tx, &node.tenant_id)?.is_none() {
+                    return Ok(StateResponse::NotFound);
+                }
                 let mut t = tx.open_table(NODES_TABLE).map_err(sm_io_err)?;
-                let stored_key = t
+                let stored = t
                     .get(node.id.to_string().as_str())
                     .map_err(sm_io_err)?
                     .map(|v| crate::codec::decode::<ClusterNode>(v.value()))
                     .transpose()
-                    .map_err(|e| sm_storage_err(ErrorSubject::Store, ErrorVerb::Read, e))?
-                    .and_then(|stored| stored.nats_user_public_key);
+                    .map_err(|e| sm_storage_err(ErrorSubject::Store, ErrorVerb::Read, e))?;
+                // Two creates of one node ID can both pass the API check; the
+                // node keeps its first tenant instead of moving without a drain.
+                if stored
+                    .as_ref()
+                    .is_some_and(|stored| stored.tenant_id != node.tenant_id)
+                {
+                    return Ok(StateResponse::Conflict(NAME_IN_USE.into()));
+                }
+                let stored_key = stored.and_then(|stored| stored.nats_user_public_key);
                 // Only SetNodeNatsUserPublicKey changes the key: a full record
                 // read before the key was set must not erase the handle that
                 // revokes the node's NATS credentials.
@@ -529,15 +561,16 @@ impl RedbStateMachine {
                     }
                 }
                 drop(t);
-                let quotas = tenant_quota(tx, &svc.tenant_id)?;
+                let Some(quotas) = tenant_quota(tx, &svc.tenant_id)? else {
+                    return Ok(StateResponse::NotFound);
+                };
                 if let Some(error) = enforce_count_quota::<Service>(
                     tx,
                     SERVICES_TABLE,
-                    &svc.tenant_id,
                     &svc.id,
                     "services",
                     quotas.services,
-                    |record| &record.tenant_id,
+                    |record| record.tenant_id == svc.tenant_id,
                 )? {
                     return Ok(StateResponse::Error(error));
                 }
@@ -551,6 +584,7 @@ impl RedbStateMachine {
                 if let Some(error) = enforce_desired_state_bytes(
                     tx,
                     &svc.tenant_id,
+                    quotas.desired_state_bytes,
                     "services",
                     &svc.id,
                     bytes.len(),
@@ -573,15 +607,16 @@ impl RedbStateMachine {
                 })? {
                     return Ok(StateResponse::Conflict(NAME_IN_USE.into()));
                 }
-                let quotas = tenant_quota(tx, &task.tenant_id)?;
+                let Some(quotas) = tenant_quota(tx, &task.tenant_id)? else {
+                    return Ok(StateResponse::NotFound);
+                };
                 if let Some(error) = enforce_count_quota::<Task>(
                     tx,
                     TASKS_TABLE,
-                    &task.tenant_id,
                     &task.id,
                     "tasks",
                     quotas.tasks,
-                    |record| &record.tenant_id,
+                    |record| record.tenant_id == task.tenant_id && !record.state.is_terminal(),
                 )? {
                     return Ok(StateResponse::Error(error));
                 }
@@ -590,6 +625,7 @@ impl RedbStateMachine {
                 if let Some(error) = enforce_desired_state_bytes(
                     tx,
                     &task.tenant_id,
+                    quotas.desired_state_bytes,
                     "tasks",
                     &task.id,
                     bytes.len(),
@@ -616,15 +652,16 @@ impl RedbStateMachine {
                 )? {
                     return Ok(StateResponse::Conflict(NAME_IN_USE.into()));
                 }
-                let quotas = tenant_quota(tx, &net.tenant_id)?;
+                let Some(quotas) = tenant_quota(tx, &net.tenant_id)? else {
+                    return Ok(StateResponse::NotFound);
+                };
                 if let Some(error) = enforce_count_quota::<Network>(
                     tx,
                     NETWORKS_TABLE,
-                    &net.tenant_id,
                     &net.id,
                     "networks",
                     quotas.networks,
-                    |record| &record.tenant_id,
+                    |record| record.tenant_id == net.tenant_id,
                 )? {
                     return Ok(StateResponse::Error(error));
                 }
@@ -633,6 +670,7 @@ impl RedbStateMachine {
                 if let Some(error) = enforce_desired_state_bytes(
                     tx,
                     &net.tenant_id,
+                    quotas.desired_state_bytes,
                     "networks",
                     &net.id,
                     bytes.len(),
@@ -659,15 +697,16 @@ impl RedbStateMachine {
                 )? {
                     return Ok(StateResponse::Conflict(NAME_IN_USE.into()));
                 }
-                let quotas = tenant_quota(tx, &vol.tenant_id)?;
+                let Some(quotas) = tenant_quota(tx, &vol.tenant_id)? else {
+                    return Ok(StateResponse::NotFound);
+                };
                 if let Some(error) = enforce_count_quota::<Volume>(
                     tx,
                     VOLUMES_TABLE,
-                    &vol.tenant_id,
                     &vol.id,
                     "volumes",
                     quotas.volumes,
-                    |record| &record.tenant_id,
+                    |record| record.tenant_id == vol.tenant_id,
                 )? {
                     return Ok(StateResponse::Error(error));
                 }
@@ -676,6 +715,7 @@ impl RedbStateMachine {
                 if let Some(error) = enforce_desired_state_bytes(
                     tx,
                     &vol.tenant_id,
+                    quotas.desired_state_bytes,
                     "volumes",
                     &vol.id,
                     bytes.len(),
@@ -698,23 +738,29 @@ impl RedbStateMachine {
                 })? {
                     return Ok(StateResponse::Conflict(NAME_IN_USE.into()));
                 }
-                let quotas = tenant_quota(tx, &s.tenant_id)?;
+                let Some(quotas) = tenant_quota(tx, &s.tenant_id)? else {
+                    return Ok(StateResponse::NotFound);
+                };
                 if let Some(error) = enforce_count_quota::<Secret>(
                     tx,
                     SECRETS_TABLE,
-                    &s.tenant_id,
                     &s.id,
                     "secrets",
                     quotas.secrets,
-                    |record| &record.tenant_id,
+                    |record| record.tenant_id == s.tenant_id,
                 )? {
                     return Ok(StateResponse::Error(error));
                 }
                 let bytes = crate::codec::encode(s)
                     .map_err(|e| sm_storage_err(ErrorSubject::Store, ErrorVerb::Write, e))?;
-                if let Some(error) =
-                    enforce_desired_state_bytes(tx, &s.tenant_id, "secrets", &s.id, bytes.len())?
-                {
+                if let Some(error) = enforce_desired_state_bytes(
+                    tx,
+                    &s.tenant_id,
+                    quotas.desired_state_bytes,
+                    "secrets",
+                    &s.id,
+                    bytes.len(),
+                )? {
                     return Ok(StateResponse::Error(error));
                 }
                 let mut t = tx.open_table(SECRETS_TABLE).map_err(sm_io_err)?;
@@ -733,23 +779,29 @@ impl RedbStateMachine {
                 })? {
                     return Ok(StateResponse::Conflict(NAME_IN_USE.into()));
                 }
-                let quotas = tenant_quota(tx, &c.tenant_id)?;
+                let Some(quotas) = tenant_quota(tx, &c.tenant_id)? else {
+                    return Ok(StateResponse::NotFound);
+                };
                 if let Some(error) = enforce_count_quota::<Config>(
                     tx,
                     CONFIGS_TABLE,
-                    &c.tenant_id,
                     &c.id,
                     "configs",
                     quotas.configs,
-                    |record| &record.tenant_id,
+                    |record| record.tenant_id == c.tenant_id,
                 )? {
                     return Ok(StateResponse::Error(error));
                 }
                 let bytes = crate::codec::encode(c)
                     .map_err(|e| sm_storage_err(ErrorSubject::Store, ErrorVerb::Write, e))?;
-                if let Some(error) =
-                    enforce_desired_state_bytes(tx, &c.tenant_id, "configs", &c.id, bytes.len())?
-                {
+                if let Some(error) = enforce_desired_state_bytes(
+                    tx,
+                    &c.tenant_id,
+                    quotas.desired_state_bytes,
+                    "configs",
+                    &c.id,
+                    bytes.len(),
+                )? {
                     return Ok(StateResponse::Error(error));
                 }
                 let mut t = tx.open_table(CONFIGS_TABLE).map_err(sm_io_err)?;
@@ -841,6 +893,34 @@ impl RedbStateMachine {
                         .map_err(sm_io_err)?;
                 }
                 Ok(StateResponse::Ok)
+            }
+            StateCommand::RemoveOwned {
+                kind,
+                id,
+                tenant_id,
+            } => {
+                let definition = match kind {
+                    ObjectKind::Service => SERVICES_TABLE,
+                    ObjectKind::Task => TASKS_TABLE,
+                    ObjectKind::Network => NETWORKS_TABLE,
+                    ObjectKind::Volume => VOLUMES_TABLE,
+                    ObjectKind::Secret => SECRETS_TABLE,
+                    ObjectKind::Config => CONFIGS_TABLE,
+                };
+                let mut t = tx.open_table(definition).map_err(sm_io_err)?;
+                let owner = t
+                    .get(id.as_str())
+                    .map_err(sm_io_err)?
+                    .map(|raw| crate::codec::decode::<Owner>(raw.value()))
+                    .transpose()
+                    .map_err(|e| sm_storage_err(ErrorSubject::Store, ErrorVerb::Read, e))?;
+                match owner {
+                    Some(owner) if owner.tenant_id == *tenant_id => {
+                        t.remove(id.as_str()).map_err(sm_io_err)?;
+                        Ok(StateResponse::Ok)
+                    }
+                    _ => Ok(StateResponse::NotFound),
+                }
             }
             StateCommand::RemoveTenant(id) => {
                 if id == DEFAULT_TENANT_ID {

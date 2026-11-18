@@ -23,7 +23,7 @@ use minga_state::types::{
     Secret, SecretRef, Service, ServiceMode, ServiceMount, Task, TaskSpec, TaskState, Tenant,
     TenantQuotas, UpdateOrder, UpdatePolicy, Volume, WorkloadKind,
 };
-use minga_state::{StateCommand, StateSnapshot, StateStore, TypeConfig};
+use minga_state::{ObjectKind, StateCommand, StateSnapshot, StateStore, TypeConfig};
 use openraft::{BasicNode, CommittedLeaderId, Entry, EntryPayload, LogId, Membership, Vote};
 use redb::{Database, ReadableTable, TableDefinition};
 use serde::de::DeserializeOwned;
@@ -551,6 +551,14 @@ fn command_fixtures() {
     check(
         "command_remove_task",
         &StateCommand::RemoveTask("shop.web.1".into()),
+    );
+    check(
+        "command_remove_owned",
+        &StateCommand::RemoveOwned {
+            kind: ObjectKind::Task,
+            id: "shop.web.1".into(),
+            tenant_id: "tenant-a".into(),
+        },
     );
 }
 

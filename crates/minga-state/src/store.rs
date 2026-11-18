@@ -11,7 +11,7 @@ use openraft::{BasicNode, Raft};
 use serde::{Deserialize, Serialize};
 use tokio::time::timeout;
 
-use crate::command::{StateCommand, StateResponse};
+use crate::command::{ObjectKind, StateCommand, StateResponse};
 use crate::error::StateError;
 use crate::log_store::RedbLogStore;
 use crate::network::{forward_write, serve_raft_rpc, RaftTlsConfig, TcpNetworkFactory};
@@ -592,8 +592,13 @@ impl StateStore {
     }
 
     pub async fn upsert_node(&self, node: ClusterNode) -> Result<(), StateError> {
-        self.propose(StateCommand::UpsertNode(node)).await?;
-        Ok(())
+        let tenant_id = node.tenant_id.clone();
+        match self.propose(StateCommand::UpsertNode(node)).await? {
+            StateResponse::Ok => Ok(()),
+            StateResponse::NotFound => Err(StateError::NotFound(format!("tenant {tenant_id}"))),
+            StateResponse::Conflict(_) => Err(StateError::NameInUse),
+            StateResponse::Error(message) => Err(command_error(message)),
+        }
     }
 
     pub async fn remove_node(&self, id: NodeId) -> Result<(), StateError> {
@@ -625,12 +630,28 @@ impl StateStore {
                 Err(command_error(message))
             }
             StateResponse::Error(message) => Err(StateError::PortConflict(message)),
-            StateResponse::NotFound => Err(StateError::NotFound("service".into())),
+            StateResponse::NotFound => Err(StateError::NotFound("tenant".into())),
         }
     }
 
-    pub async fn remove_service(&self, id: ServiceId) -> Result<(), StateError> {
-        self.propose(StateCommand::RemoveService(id)).await?;
+    /// Removes the service only while it still belongs to `tenant_id`;
+    /// one that is gone or owned by another tenant is left alone.
+    pub async fn remove_service(&self, id: ServiceId, tenant_id: &str) -> Result<(), StateError> {
+        self.remove_owned(ObjectKind::Service, id, tenant_id).await
+    }
+
+    async fn remove_owned(
+        &self,
+        kind: ObjectKind,
+        id: String,
+        tenant_id: &str,
+    ) -> Result<(), StateError> {
+        self.propose(StateCommand::RemoveOwned {
+            kind,
+            id,
+            tenant_id: tenant_id.to_owned(),
+        })
+        .await?;
         Ok(())
     }
 
@@ -639,13 +660,14 @@ impl StateStore {
             StateResponse::Ok => Ok(()),
             StateResponse::Conflict(_) => Err(StateError::NameInUse),
             StateResponse::Error(message) => Err(command_error(message)),
-            StateResponse::NotFound => Err(StateError::NotFound("task".into())),
+            StateResponse::NotFound => Err(StateError::NotFound("tenant".into())),
         }
     }
 
-    pub async fn remove_task(&self, id: TaskId) -> Result<(), StateError> {
-        self.propose(StateCommand::RemoveTask(id)).await?;
-        Ok(())
+    /// Removes the task only while it still belongs to `tenant_id`;
+    /// one that is gone or owned by another tenant is left alone.
+    pub async fn remove_task(&self, id: TaskId, tenant_id: &str) -> Result<(), StateError> {
+        self.remove_owned(ObjectKind::Task, id, tenant_id).await
     }
 
     pub async fn upsert_network(&self, network: Network) -> Result<(), StateError> {
@@ -653,13 +675,14 @@ impl StateStore {
             StateResponse::Ok => Ok(()),
             StateResponse::Conflict(_) => Err(StateError::NameInUse),
             StateResponse::Error(message) => Err(command_error(message)),
-            StateResponse::NotFound => Err(StateError::NotFound("network".into())),
+            StateResponse::NotFound => Err(StateError::NotFound("tenant".into())),
         }
     }
 
-    pub async fn remove_network(&self, id: NetworkId) -> Result<(), StateError> {
-        self.propose(StateCommand::RemoveNetwork(id)).await?;
-        Ok(())
+    /// Removes the network only while it still belongs to `tenant_id`;
+    /// one that is gone or owned by another tenant is left alone.
+    pub async fn remove_network(&self, id: NetworkId, tenant_id: &str) -> Result<(), StateError> {
+        self.remove_owned(ObjectKind::Network, id, tenant_id).await
     }
 
     pub async fn upsert_volume(&self, volume: Volume) -> Result<(), StateError> {
@@ -667,12 +690,13 @@ impl StateStore {
             StateResponse::Ok => Ok(()),
             StateResponse::Conflict(_) => Err(StateError::NameInUse),
             StateResponse::Error(message) => Err(command_error(message)),
-            StateResponse::NotFound => Err(StateError::NotFound("volume".into())),
+            StateResponse::NotFound => Err(StateError::NotFound("tenant".into())),
         }
     }
-    pub async fn remove_volume(&self, id: VolumeId) -> Result<(), StateError> {
-        self.propose(StateCommand::RemoveVolume(id)).await?;
-        Ok(())
+    /// Removes the volume only while it still belongs to `tenant_id`;
+    /// one that is gone or owned by another tenant is left alone.
+    pub async fn remove_volume(&self, id: VolumeId, tenant_id: &str) -> Result<(), StateError> {
+        self.remove_owned(ObjectKind::Volume, id, tenant_id).await
     }
 
     pub async fn upsert_secret(&self, secret: Secret) -> Result<(), StateError> {
@@ -680,13 +704,14 @@ impl StateStore {
             StateResponse::Ok => Ok(()),
             StateResponse::Conflict(_) => Err(StateError::NameInUse),
             StateResponse::Error(message) => Err(command_error(message)),
-            StateResponse::NotFound => Err(StateError::NotFound("secret".into())),
+            StateResponse::NotFound => Err(StateError::NotFound("tenant".into())),
         }
     }
 
-    pub async fn remove_secret(&self, id: SecretId) -> Result<(), StateError> {
-        self.propose(StateCommand::RemoveSecret(id)).await?;
-        Ok(())
+    /// Removes the secret only while it still belongs to `tenant_id`;
+    /// one that is gone or owned by another tenant is left alone.
+    pub async fn remove_secret(&self, id: SecretId, tenant_id: &str) -> Result<(), StateError> {
+        self.remove_owned(ObjectKind::Secret, id, tenant_id).await
     }
 
     pub async fn upsert_config(&self, config: StateConfig) -> Result<(), StateError> {
@@ -694,13 +719,14 @@ impl StateStore {
             StateResponse::Ok => Ok(()),
             StateResponse::Conflict(_) => Err(StateError::NameInUse),
             StateResponse::Error(message) => Err(command_error(message)),
-            StateResponse::NotFound => Err(StateError::NotFound("config".into())),
+            StateResponse::NotFound => Err(StateError::NotFound("tenant".into())),
         }
     }
 
-    pub async fn remove_config(&self, id: ConfigId) -> Result<(), StateError> {
-        self.propose(StateCommand::RemoveConfig(id)).await?;
-        Ok(())
+    /// Removes the config only while it still belongs to `tenant_id`;
+    /// one that is gone or owned by another tenant is left alone.
+    pub async fn remove_config(&self, id: ConfigId, tenant_id: &str) -> Result<(), StateError> {
+        self.remove_owned(ObjectKind::Config, id, tenant_id).await
     }
 
     // --- read operations (local reads from the state machine) -----------------
@@ -872,8 +898,13 @@ impl StateStore {
                 created_at: crate::types::unix_now(),
             });
         }
+        // Existing tenants keep their quotas and name: a snapshot (or a
+        // pre-v8 one with a synthesized `default`) only adds missing tenants.
         for tenant in tenants {
-            self.upsert_tenant(tenant).await?;
+            match self.create_tenant(tenant).await {
+                Ok(()) | Err(StateError::Conflict(_)) => {}
+                Err(error) => return Err(error),
+            }
         }
         for n in snapshot.networks {
             self.upsert_network(n).await?;

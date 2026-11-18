@@ -986,7 +986,10 @@ async fn reconcile_removes_tasks_when_service_deleted() {
     assert_eq!(store.list_tasks().await.unwrap().len(), 2);
 
     // Delete the service.
-    store.remove_service("app.web".to_string()).await.unwrap();
+    store
+        .remove_service("app.web".to_string(), minga_state::types::DEFAULT_TENANT_ID)
+        .await
+        .unwrap();
 
     // Second pass: removes both tasks.
     let actions = scheduler.reconcile_once().await.unwrap();

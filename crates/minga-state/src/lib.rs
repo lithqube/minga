@@ -56,7 +56,7 @@ pub mod types;
 
 use std::io::Cursor;
 
-pub use command::{StateCommand, StateResponse};
+pub use command::{ObjectKind, StateCommand, StateResponse};
 pub use error::StateError;
 pub use network::{serve_raft_rpc, StubNetworkFactory, TcpNetworkFactory};
 pub use store::{StateSnapshot, StateStore};
