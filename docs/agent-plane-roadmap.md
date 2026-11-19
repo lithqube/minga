@@ -1,7 +1,7 @@
 # Agent plane: roadmap beyond sandbox host capabilities
 
-- Status: Draft
-- Date: 2026-11-16
+- Status: Order 1 is complete on current `main` (PR #103, 2026-11-19); Order 2 remains in progress.
+- Date: 2026-11-19
 - Companion to [sandbox-host-capabilities-plan.md](sandbox-host-capabilities-plan.md)
 
 ## Why this exists
@@ -24,18 +24,17 @@ Every item is owned by one Minga **tenant** and follows [ADR 0008](adr/0008-mult
 
 ### A. Egress for every workload (highest value)
 
-1. **Container egress path.** Containers get the same per-task sandbox token that agents get, delivered as a file at `/run/minga/egress-token` and reached at a fixed address on the task bridge. With `x-minga-egress` declaring `required: true` and at least one named route, nftables on the task bridge drops all other outbound traffic, giving deny-by-default egress per service. This needs only per-host networking, which exists today.
-2. **Named upstream routes with failover.** Replace the single `--egress-upstream` with routes such as `anthropic`, `bedrock`, `mistral` or `local`:
-   - Each route has its own credential and auth scheme: bearer, `x-api-key`, and **AWS SigV4** for Bedrock.
-   - A route can list fallback routes. Failover happens only on connect errors, 429 or 5xx, never on 4xx, so a bad request does not fail open to another provider.
-   - Routes are tenant-owned desired state, and their credentials are secrets in that tenant's node secret store. One tenant's provider key is never used for another tenant.
-3. **Model and residency allow-list per service.** For example, `x-minga-egress: { models: [claude-haiku-*], routes: [bedrock-eu] }`. The proxy rejects any other model or route before forwarding. This is policy, not data-residency proof, and the docs say so.
-4. **Per-workload cache key.** Moved here from the sandbox plan, so containers get it too.
-5. **Streaming.** Today the proxy reads the whole request (`axum::body::to_bytes`, 10 MiB cap) and the whole upstream response (`upstream_resp.bytes()`), so a streamed (SSE) completion arrives all at once at the end, and tokens are guessed from the body length divided by 4. Pass the response through as a stream (`reqwest::Response::bytes_stream` into `axum::body::Body::from_stream`). Read the `usage` the provider reports in the final event (Anthropic `message_delta`, OpenAI `stream_options.include_usage`), and use length/4 only as a fallback. Streamed responses are not cached.
+Implemented on current `main` (PR #103 and preceding agent-plane changes):
+
+1. **Container egress path:** service opt-in egress with a task identity and deny-by-default outbound path when required.
+2. **Named routes with fallback:** tenant-owned routes, credentials from the node secret store, configured fallback behavior and destination safety checks. Redirects and proxy environment settings do not bypass the destination policy.
+3. **Model and route policy:** per-service route/model allow-lists reject unapproved requests before forwarding.
+4. **Per-workload cache key:** cache entries are isolated by workload and route.
+5. **Streaming and usage:** upstream response streams through; provider usage is recorded when available, with bounded fallback accounting. Streaming responses are not cached.
 
 ### B. Customer attribution, budgets and metering
 
-5. **Customer attribution.** The workload sends `X-Minga-Customer: <id>`. The service declares whether a customer is required, and optionally a pattern for valid IDs. The workload is trusted to name the customer it serves; Minga does not verify end users. The Minga tenant is never taken from a header: it comes from the task token.
+5. **Customer attribution (implemented):** usage events carry an optional customer ID supplied by the workload. It is attribution, not end-user authentication; the application is trusted to name its customer.
 6. **Atomic budgets per (tenant, service, customer, window).** One key per budget in `MINGA_BUDGET_<tenant>`:
    - The value is `{settled, reservations: [{id, tokens, expires_at}]}`. Each request adds a reservation for its worst case (`max_tokens`) with a revision-checked update (KV compare-and-swap), then settles it to the actual usage. Concurrent replicas on different nodes cannot overspend by more than one reservation each.
    - **A crashed proxy cannot leak budget.** Every update drops expired reservations, so an unsettled reservation stops counting after its expiry (the upstream timeout plus a margin). This needs no per-key TTL and no server feature newer than 2.10.
@@ -45,18 +44,9 @@ Every item is owned by one Minga **tenant** and follows [ADR 0008](adr/0008-mult
    - Crossing 80% and 100% publishes an event.
    - An agent's `token_budget` stays what the sandbox plan decided: a cap for one run. It applies alongside these windowed budgets, and whichever runs out first rejects the request.
 7. **Rate limits per (tenant, service, customer).** A token bucket per node, with the cluster-wide limit split evenly across nodes running the service. This is a documented shortcut until it needs to be exact.
-8. **Usage stream.** One event per request on `MINGA_USAGE_<tenant>`, subjects `minga.<tenant>.usage.<service>`.
-   - The subjects are not under `minga.egress.>`: `MINGA_EVENTS` already captures that prefix, and JetStream rejects streams with overlapping subjects.
-   - The request ID is the `Nats-Msg-Id`, so a retried publish is not counted twice.
-   - `max_age` and `max_bytes` come from the tenant's quota.
+8. **Usage stream (implemented):** events are emitted only for requests that reach usage finalization in `proxy_handler`. Early validation rejections and requests denied by `BudgetTracker::reserve` (429) produce no usage event and are excluded from totals. Published events use tenant-scoped `MINGA_USAGE_<tenant>` streams, request IDs for de-duplication and bounded retention from tenant quotas; they include route, requested/answered model, customer, token counts, cache hit, latency, status and cost, but no prompt or response body. Prometheus metrics and `minga-ctl agent usage` expose retained data; this CLI shows cluster totals by tenant.
 
-   Fields:
-   - request id, tenant, service, task, customer
-   - route, model requested and **model answered**
-   - tokens in and out, cache hit, latency, status
-   - cost from a price table the operator supplies
-
-   No prompt or response bodies. Usage is also exposed as Prometheus metrics on the existing telemetry endpoint, and `minga-ctl agent usage --customer C --since 30d` reads it for the caller's tenant. Cluster operators see totals per tenant only.
+**Still open:** B6 atomic cross-node budgets per `(tenant, service, customer, window)` and B7 request-rate limits. Current per-run/per-workload budget tracking is node-local and does not provide a cluster-wide customer spend limit.
 
 ### C. Workload identity and secrets
 
@@ -127,27 +117,24 @@ LLM egress handles few requests, each lasting seconds and dominated by the upstr
 
 ## Order
 
-| Order | Items | Why first |
+| Order | Items | Status / why |
 |---|---|---|
-| 0 | Verify the blockers below, and ADR 0008 T0 (nats-server upgrade) | They block adoption more than any new feature, and the bundled 2.10 server is out of support. |
-| 1 | A1, A2, A4, A5, B8, ADR 0008 T1–T2 | Every project can drop its own gateway, streaming works, and usage data arrives straight away. Tenant ownership and tenant-scoped API land together, so no item is built without an owner. |
-| 1b | ADR 0008 T3 | Dedicated nodes and per-tenant WireGuard peer sets, before cross-node networking ships. |
-| 2 | B5, B6, B7, A3, ADR 0008 T4–T5 | Budgets and residency, the most common open gap. Budgets live in tenant accounts and are bounded by tenant quotas. |
-| 3 | C9, C10 | Removes hand-rolled caller auth and restart-to-rotate. |
-| 4 | D13 | Jobs and deadlines, which agents and plain cron both need. |
-| 5 | D11, D12 | Agent-driven ops. |
-| 6 | E14, E15, then [the WASM sandbox plan](sandbox-host-capabilities-plan.md) | Offline AI, then hardening for agents that can be ported. |
+| 0 | NATS supported server line (T0) | Complete: NATS 2.15.3, CI matrix and store-upgrade proof. |
+| 1 | A1–A5, B5, B8, ADR 0008 T1–T2 | Complete on current `main`; PR #103 finishes named routes, policy, streaming, usage and operator usage query. |
+| 1b | ADR 0008 T3–T5 | Implementation complete (PR #98 and Phase 15); T3 live tenant-isolation proof remains deferred until release readiness. |
+| 2 | B6, then B7 | Next code work: distributed customer window budgets, then request-rate limits. |
+| 3 | C9, C10 | Workload identity tokens and credential reload without restart. |
+| 4 | D13 | Jobs and deadlines. |
+| 5 | D11, D12 | MCP and maker-checker change requests. |
+| 6 | E14, E15, then [the WASM sandbox plan](sandbox-host-capabilities-plan.md) | Artifact distribution and local-model route; then WASI host capabilities. |
 
-The independent runtime-hardening step (shared Wasmtime runtime, module cache,
-epoch timeout and memory cap) is implemented and verified on
-`feat/agent-sandbox-capabilities`. WASI grants, HTTP egress and logs remain
-sequenced after order 6.
+The shared Wasmtime engine, bounded module cache, epoch timeout, enforced
+memory limit and capability-grant schema/validation are already merged (PRs
+#101 and #102). WASI, guest HTTP egress and agent logs remain open.
 
-## Before any of this
+## Historical adoption survey
 
-The downstream projects also cite Minga adoption blockers. Their notes were last checked between 2026-10-27 and 2026-11-03, so some may already be fixed. Verify each one first:
+The adoption blockers below were recorded between 2026-10-27 and 2026-11-03.
+They predate Phases 12–15 and must not be treated as current feature status;
+use the implementation notes above and `docs/architecture.md`.
 
-- no log capture
-- no Docker unix socket or events route, which Traefik discovery needs
-- folded `command: >` scalars not split into arguments
-- no cross-node networking
