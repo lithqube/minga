@@ -168,7 +168,7 @@ option. See [ADR 0006](adr/0006-workers-leave-raft.md#11-bus-partitions-preserve
 - Use `--raft-tls-ca`, `--raft-tls-cert` and `--raft-tls-key` for manager
   Raft mTLS. Use route TLS on each clustered sidecar; `--nats-replicas 3`
   preserves event, status, lease and assignment data with one manager down.
-- `MINGA_LOGS` remains single-replica. Retained logs are unavailable while
+- Tenant log streams (`MINGA_LOGS_<tenant>`) remain single-replica. Retained logs are unavailable while
   their hosting NATS server is down; they become available again when it
   returns. Do not treat the log stream as HA storage.
 

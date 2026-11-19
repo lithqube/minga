@@ -6,7 +6,7 @@
 
 ## Context
 
-At the time this ADR was drafted, Minga created a bridge and network namespace per Compose network on each node, while WireGuard configuration was not applied and published ports were node-local. Phase 13 implemented the peer, route, relay and ingress plans below. See the implementation status at the end of this ADR for verified behavior and remaining scale limits.
+Minga currently creates a bridge and network namespace per Compose network on each node. A task's network is local to that host: a task on another node cannot be reached by its overlay IP or service name. WireGuard keys and peer configuration can be generated, but no interface is configured; the existing `OverlayManager` allocates a WireGuard port per network. Published ports are DNATed only on the task's node, and the Compose `ports[].mode` is parsed but not honored. Network `driver_opts` are currently dropped, which also violates the rule that unsupported Compose keys fail loudly.
 
 The Phase 12 managers-only Raft design supplies the needed control plane: managers own desired state and placement, and managers alone may write `MINGA_ASSIGN`. Each worker reads its own assignment projection. The mesh must not move Raft or NATS onto itself; that would make control-plane reachability depend on a data plane configured by that same control plane.
 
@@ -87,7 +87,7 @@ Do not silently discard `driver_opts`. Accept the `encrypted` option as a no-op 
 | **T3 HA site** | Nodes peer with managers; relay ownership moves when a manager lease expires. | Each manager must advertise a reachable UDP endpoint. Three or five managers retain the Phase 12 quorum model. |
 | **T4 Large on-prem** | Peer sets are on-demand and based on shared networks, not a worker-wide full mesh. | The plan's functional behavior does not establish 5,000-worker performance; measure before claiming that scale. |
 
-Cross-node container traffic is implemented and live-proofed for T2/T3. T4 scale remains unmeasured; IPv6 overlay and IPv6-only underlays remain out of scope.
+Cross-node container traffic remains unavailable until the peer, route and relay plans land. IPv6 overlay and IPv6-only underlays are out of scope for this ADR.
 
 ## Rejected alternatives
 
@@ -108,7 +108,7 @@ Cross-node container traffic is implemented and live-proofed for T2/T3. T4 scale
 
 ## Implementation status (2026-11-19)
 
-- Phase 13 implemented cluster-wide subnet allocation, node WireGuard interfaces, tenant-scoped peer/route assignments, NAT relay through managers, cross-network isolation and ingress publishing.
+- Phase 13 implemented cluster-wide subnet allocation, node WireGuard interfaces, tenant-scoped peer/route assignments, NAT relay through managers, cross-network isolation and ingress publishing. Since ADR 0008 the peer assignment key carries the tenant: `{tenant}.node.{id}.wg`.
 - T2/T3 live proof passed, including cross-node traffic, relay failover and ingress. Short iperf3 results are topology-specific measurements, not capacity estimates.
 - Multi-manager topologies require reachable manager UDP endpoints. A manager relaying between NAT-isolated workers decrypts and re-encrypts their packets and is a trusted observer.
 - T4 scale (~5,000 workers), IPv6 overlay and IPv6-only underlays are not verified/supported by this ADR.

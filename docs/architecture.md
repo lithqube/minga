@@ -29,8 +29,8 @@ flowchart LR
 | Node liveness and registration | `MINGA_LEASES` JetStream KV | Server-stamped leases expire after 30 seconds. The leader registers first sightings in Raft without overwriting operator labels or availability. |
 | Per-node task and network assignments | `MINGA_ASSIGN` JetStream KV | The leader projects placement; workers read only their own assignment keys. It is rebuilt from Raft after election. |
 | Tenant ownership and identity | Raft + API certificates | Tenant-owned resources are filtered before listing; workers use tenant-and-node-scoped NATS credentials. Cluster operators have cross-tenant administrative access, not workload access. |
-| Egress and usage | Worker-local proxy + tenant JetStream streams | Route/model policies and per-workload budgets are enforced at the proxy; usage events and metrics omit prompts and response bodies. |
-| Lifecycle events, logs and agent results | JetStream | `minga logs` reads the retained log backlog. `MINGA_LOGS` is single-replica; it is not HA storage. |
+| Egress and usage | Worker-local proxy + tenant JetStream streams | Opt-in per worker (`--egress-bind`, see [agent egress and usage](agent-usage.md)). Route/model policies are enforced at the proxy. Token budgets apply only to agent runs with `token_budget` and are checked at request admission, not as a cap on provider spend; routed containers are not token-limited yet. Usage events and metrics omit prompts and response bodies. |
+| Lifecycle events, logs and agent results | JetStream | `minga logs` reads the retained log backlog from the tenant's `MINGA_LOGS_<tenant>` stream; the unscoped `MINGA_LOGS` stream keeps only legacy records. Log streams are single-replica; they are not HA storage. |
 | Readiness | In-process | `/readyz` requires a known Raft leader and a responding bus. |
 
 ## Persisted format
@@ -75,8 +75,9 @@ T2/T3 live proofs passed, including relay failover and bidirectional task HTTP.
 
 Managers need reachable WireGuard endpoints in multi-manager clusters. When
 both workers are behind NAT, a manager relays by decrypting and re-encrypting
-packets, so it can inspect relayed container payloads. `MINGA_LOGS` remains
-single-replica and is unavailable while its hosting NATS server is down.
+packets, so it can inspect relayed container payloads. Tenant log streams
+(`MINGA_LOGS_<tenant>`) remain single-replica and are unavailable while their
+hosting NATS server is down.
 After test credential updates, one manager failed to restart with an NATS
 authorization violation; validate manager rejoin after credential changes
 before release.

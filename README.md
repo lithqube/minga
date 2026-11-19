@@ -14,7 +14,7 @@ Named after the [minga](https://en.wikipedia.org/wiki/Minga) of Chiloé, where a
 >
 > - **Multi-node networking (Phase 13):** kernel WireGuard overlay, manager relay for NAT-isolated workers, cross-node ingress and same-network task isolation. T2/T3 live proofs passed; T4 scale has not been measured.
 > - **Tenant isolation (Phase 15):** tenant-scoped API identities, resources, NATS permissions and quotas; worker enrollment binds nodes to tenants. T1–T5 implementation is merged. The end-to-end proof that tenant B cannot place on tenant A's node remains deferred until release readiness.
-> - **Agent egress and usage (PR #103):** named tenant-owned routes, route/model policy, per-workload cache, streaming, per-run budgets, usage events and `minga-ctl agent usage`.
+> - **Agent egress and usage (PR #103):** named tenant-owned routes, route/model policy, per-workload cache, streaming, per-run agent token budgets (routed containers are not token-limited yet), usage events and `minga-ctl agent usage`.
 > - **Sandbox status:** Wasmtime fuel, epoch timeout and memory limits are enforced. Agent capability grants are parsed and validated, but WASI host imports are not linked yet; WASM guests cannot use env, files, clocks, stdio or HTTP egress. Firecracker remains a stub.
 > - **Pre-release checks:** tenant-isolation proof, manager rejoin after NATS credential changes, and large-cluster scale measurement. VM tests remain deferred until release readiness.
 >
@@ -49,7 +49,7 @@ Minga ships as **one binary** (plus the `nats-server` it supervises). There's no
 - **Backup and restore.** `minga state export` writes services, networks, volumes and secret and config references to a 0600 file; `minga state import` restores them into a fresh cluster, where the scheduler places the tasks again. [docs/backup.md](docs/backup.md) lists what else to copy.
 - **Container networking:** deterministic per-task IPs from IPAM (each network gets its own /24 from `10.100.0.0/16`, or from `--overlay-supernet`, stored in Raft by the leader), one bridge per network, a netns and veth pair per task, embedded DNS (`<svc>`, `tasks.<svc>`, `<svc>.<stack>.minga.local`), and a node-level WireGuard mesh for cross-node traffic. Ingress ports answer on every node; `mode: host` stays node-local. Multi-manager clusters require reachable manager UDP endpoints; NAT workers relay through trusted managers. See [supported topologies](docs/topologies.md).
 - **Secrets and logs.** Secrets are external references staged per task and content-addressed, so rotation never changes a running task's files. `minga logs [-f]` shows separated stdout/stderr from a JetStream-retained backlog.
-- **Agent workloads.** `x-minga-agent` services run WASM modules under Wasmtime with fuel, interruptible timeouts and enforced memory limits. `x-minga-egress` configures named routes, route/model policy, per-workload caching, streaming and usage reporting for routed containers. Agent capability grants are validated but not yet linked to WASI imports, so a guest cannot access host I/O or the egress proxy. Per-run budgets are node-local; cross-node customer budgets and request-rate limits remain planned. Firecracker is a stub.
+- **Agent workloads.** `x-minga-agent` services run WASM modules under Wasmtime with fuel, interruptible timeouts and enforced memory limits. `x-minga-egress` configures named routes, route/model policy, per-workload caching, streaming and usage reporting for routed containers. The proxy is opt-in per worker (`--egress-bind`); see [agent egress and usage](docs/agent-usage.md), including `--egress-allow-cidr` for private destinations. Agent capability grants are validated but not yet linked to WASI imports, so a guest cannot access host I/O or the egress proxy. Token budgets apply only to agent runs with `token_budget`, are node-local and are checked when a request is admitted, not as a cap on provider spend; routed containers are not token-limited yet. Cross-node customer budgets and request-rate limits remain planned. Firecracker is a stub.
 - **Observability.** `/metrics`, `/healthz` and `/readyz` on the manager API, and on manager and worker nodes via `--metrics-bind`. JSON logs on stderr for long-running roles. A failed container task keeps its last error and exit code, returned in the Docker API's task status and shown by `minga-ctl service ps` and `service inspect`; an agent task records the error only when it fails to start.
 - **Air-gap friendly.** Release archives bundle a checksum-pinned `nats-server`, and `install.sh` verifies `SHA256SUMS`. A task pulls a missing image through containerd's Transfer API on the configured socket, with credentials from Docker credential helpers or inline `auths` that never appear on a command line; air-gapped sites preload images with `minga image pull` or `ctr` instead.
 
@@ -158,7 +158,7 @@ flowchart TB
 | Crate | Purpose |
 | --- | --- |
 | `minga-cli` | `minga` binary: manager/worker lifecycle, Compose validate/deploy, state export/import, logs, TLS/tenant enrollment utilities, networking, sandbox, agent, image and egress commands. |
-| `minga-ctl` | Operator workstation CLI: contexts, stack/service operations, health, metrics, images/secrets/registry, and tenant-scoped agent usage queries. |
+| `minga-ctl` | Operator workstation CLI: contexts, stack/service operations, health, metrics, images/secrets/registry, and operator agent-usage totals by tenant. |
 | `minga-compose` | Compose parser/validator, `x-minga-agent` and `x-minga-egress` extensions, interpolation, profiles, dependency and port checks. |
 | `minga-state` | Raft desired state, tenant-owned entities, persisted formats/migrations, manager membership and state forwarding. |
 | `minga-scheduler` | Compose translation, tenant-aware placement, IPAM, task/ingress/WireGuard projections and reconciliation. |
@@ -167,7 +167,7 @@ flowchart TB
 | `minga-bus` | Memory and NATS/JetStream event bus, tenant-scoped subjects/keys, worker ACLs, usage and audit events. |
 | `minga-net` | CIDR/IPAM, DNS records, node WireGuard interface/peer management and overlay routing. |
 | `minga-sandbox` | Wasmtime runtime, shared engine/module cache, fuel, epoch interruption and memory limits; Firecracker stub. |
-| `minga-egress` | Named-route proxy, destination policy, per-workload budgets/cache, streaming, usage accounting and secret redaction. |
+| `minga-egress` | Named-route proxy, destination policy, admission-time token budgets, per-workload cache, streaming, usage accounting and secret redaction. |
 | `minga-telemetry` | Prometheus metrics and `/metrics`, `/healthz`, `/readyz` endpoints with JSON logging. |
 
 ## Quick start: one Linux host
