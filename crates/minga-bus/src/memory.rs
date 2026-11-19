@@ -602,7 +602,7 @@ impl EventBus for MemoryBus {
     ) -> Result<Vec<crate::UsageEvent>> {
         minga_state::types::Tenant::validate_id(tenant_id)
             .map_err(|error| BusError::Other(format!("invalid usage tenant: {error}")))?;
-        Ok(self
+        let matching: Vec<_> = self
             .usage
             .lock()
             .unwrap()
@@ -612,9 +612,10 @@ impl EventBus for MemoryBus {
                     && event.occurred_at_unix_ms >= since_unix_ms
                     && customer.is_none_or(|customer| event.customer_id == customer)
             })
-            .take(limit)
             .cloned()
-            .collect())
+            .collect();
+        // Newest `limit` rows, oldest first, like the NATS bus.
+        Ok(matching[matching.len().saturating_sub(limit)..].to_vec())
     }
 
     async fn usage_totals(&self, since_unix_ms: u64) -> Result<Vec<(String, crate::UsageTotals)>> {
@@ -1476,6 +1477,14 @@ mod tests {
         assert_eq!(totals.len(), 2);
         assert_eq!(totals[0].0, "tenant-a");
         assert_eq!(totals[0].1.request_count, 2);
+
+        let newer = usage_event("req-4", "tenant-a", "customer-a", 200);
+        bus.publish_usage(&newer).await.unwrap();
+        let rows = bus
+            .usage_events("tenant-a", 100, Some("customer-a"), 1)
+            .await
+            .unwrap();
+        assert_eq!(rows, vec![newer], "limit keeps the newest rows");
     }
 
     #[test]

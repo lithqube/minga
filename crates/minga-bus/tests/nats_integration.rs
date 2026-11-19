@@ -352,3 +352,66 @@ async fn nats_watch_status_sees_existing_keys() {
         "watch_status should replay the existing task.watch-test key"
     );
 }
+
+fn usage_event(request_id: &str, tenant_id: &str, at: u64) -> minga_bus::UsageEvent {
+    minga_bus::UsageEvent {
+        request_id: request_id.into(),
+        tenant_id: tenant_id.into(),
+        service_id: "svc".into(),
+        task_id: "task".into(),
+        customer_id: "customer".into(),
+        route: "primary".into(),
+        requested_model: "m".into(),
+        answered_model: "m".into(),
+        input_tokens: 3,
+        output_tokens: 4,
+        cache_hit: false,
+        latency_ms: 1,
+        status: 200,
+        occurred_at_unix_ms: at,
+        cost_micros: None,
+    }
+}
+
+#[tokio::test]
+async fn nats_usage_skips_bad_records_and_keeps_newest() {
+    let Some(bus) = connect().await else {
+        return;
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    for (id, at) in [("u-1", now), ("u-2", now + 1)] {
+        bus.publish_usage(&usage_event(id, "usage-a", at))
+            .await
+            .expect("publish usage");
+    }
+    // A tenant worker can publish arbitrary bytes on its own usage subject.
+    let forged = serde_json::to_vec(&usage_event("u-3", "usage-b", now + 2)).unwrap();
+    for payload in [b"not json".to_vec(), forged] {
+        bus.jetstream()
+            .publish("minga.usage-a.usage.svc", payload.into())
+            .await
+            .unwrap()
+            .await
+            .unwrap();
+    }
+
+    let rows = bus.usage_events("usage-a", 0, None, 1).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].request_id, "u-2", "limit keeps the newest rows");
+    let rows = bus.usage_events("usage-a", now, None, 10).await.unwrap();
+    assert_eq!(rows.len(), 2);
+    let totals = bus.usage_totals(0).await.unwrap();
+    let (_, total) = totals
+        .iter()
+        .find(|(tenant, _)| tenant == "usage-a")
+        .expect("usage-a totals");
+    assert_eq!(total.request_count, 2);
+    assert!(bus
+        .usage_events("usage-none", 0, None, 10)
+        .await
+        .unwrap()
+        .is_empty());
+}

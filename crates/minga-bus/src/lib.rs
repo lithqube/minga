@@ -165,10 +165,13 @@ pub(crate) fn usage_subject(tenant_id: &str, service_id: &str) -> Result<String>
     let service_token = if valid_subject_token(service_id) {
         service_id.to_owned()
     } else {
+        // A fixed-length digest keeps any service ID inside one subject token.
+        use sha2::Digest as _;
         use std::fmt::Write as _;
-        let mut token = String::with_capacity(service_id.len().saturating_mul(2).saturating_add(3));
+        let digest = sha2::Sha256::digest(service_id.as_bytes());
+        let mut token = String::with_capacity(3 + 32);
         token.push_str("id-");
-        for byte in service_id.bytes() {
+        for byte in &digest[..16] {
             write!(token, "{byte:02x}").expect("writing to String cannot fail");
         }
         token
@@ -608,9 +611,13 @@ mod tests {
             "minga.tenant-a.usage.svc_1"
         );
         assert!(usage_subject("tenant.a", "svc").is_err());
+        let hashed = usage_subject("tenant-a", "svc.1").unwrap();
+        assert!(hashed.starts_with("minga.tenant-a.usage.id-"));
+        assert_eq!(hashed.len(), "minga.tenant-a.usage.id-".len() + 32);
         assert_eq!(
-            usage_subject("tenant-a", "svc.1").unwrap(),
-            "minga.tenant-a.usage.id-7376632e31"
+            usage_subject("tenant-a", &"x.".repeat(200)).unwrap().len(),
+            hashed.len()
         );
+        assert_ne!(hashed, usage_subject("tenant-a", "svc.2").unwrap());
     }
 }
