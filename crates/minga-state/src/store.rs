@@ -907,22 +907,66 @@ impl StateStore {
                 Err(error) => return Err(error),
             }
         }
-        for n in snapshot.networks {
-            self.upsert_network(n).await?;
+        // Re-encoding an older snapshot grows its records (v9 adds agent
+        // capabilities), so a tenant at its byte quota could not import its
+        // own data. Lift only that quota for the import, then restore it even
+        // when the import fails. Current-format imports stay fully enforced.
+        let legacy = snapshot.format_version < want;
+        let tenant_ids: BTreeSet<String> = snapshot
+            .networks
+            .iter()
+            .map(|n| n.tenant_id.clone())
+            .chain(snapshot.secrets.iter().map(|s| s.tenant_id.clone()))
+            .chain(snapshot.configs.iter().map(|c| c.tenant_id.clone()))
+            .chain(snapshot.volumes.iter().map(|v| v.tenant_id.clone()))
+            .chain(snapshot.services.iter().map(|s| s.tenant_id.clone()))
+            .collect();
+        let mut lifted = Vec::new();
+        let result = async {
+            if legacy {
+                for id in &tenant_ids {
+                    let Some(tenant) = self.get_tenant(id).await? else {
+                        continue;
+                    };
+                    if tenant.quotas.desired_state_bytes.is_none() {
+                        continue;
+                    }
+                    let quotas = TenantQuotas {
+                        desired_state_bytes: None,
+                        ..tenant.quotas.clone()
+                    };
+                    self.update_tenant(id, tenant.name.clone(), quotas).await?;
+                    lifted.push(tenant);
+                }
+            }
+            for n in snapshot.networks {
+                self.upsert_network(n).await?;
+            }
+            for s in snapshot.secrets {
+                self.upsert_secret(s).await?;
+            }
+            for c in snapshot.configs {
+                self.upsert_config(c).await?;
+            }
+            for v in snapshot.volumes {
+                self.upsert_volume(v).await?;
+            }
+            for s in snapshot.services {
+                self.upsert_service(s).await?;
+            }
+            Ok(())
         }
-        for s in snapshot.secrets {
-            self.upsert_secret(s).await?;
+        .await;
+        let mut restored = Ok(());
+        for tenant in lifted {
+            if let Err(error) = self
+                .update_tenant(&tenant.id, tenant.name, tenant.quotas)
+                .await
+            {
+                restored = restored.and(Err(error));
+            }
         }
-        for c in snapshot.configs {
-            self.upsert_config(c).await?;
-        }
-        for v in snapshot.volumes {
-            self.upsert_volume(v).await?;
-        }
-        for s in snapshot.services {
-            self.upsert_service(s).await?;
-        }
-        Ok(())
+        result.and(restored)
     }
 }
 

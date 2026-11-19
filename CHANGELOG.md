@@ -9,7 +9,9 @@
   coordinated. WASI access remains in later sandbox steps, so grants are
   validated but not yet enforced in the sandbox. Agents stored before v9 with
   an `env` map receive the `env` grant. The egress proxy token is now issued
-  only with the `http` grant.
+  only with the `http` grant. Importing an older snapshot lifts each affected
+  tenant's `desired_state_bytes` quota for the import and restores it after,
+  so records that grow on re-encoding still import.
 - The bundled NATS server moves from v2.10.22 to v2.15.3. External NATS is
   tested on v2.14.10 and v2.15.3; managers warn when JetStream `api.level` is
   below 4. A 2.10.22 store was verified through a direct upgrade to 2.15.3

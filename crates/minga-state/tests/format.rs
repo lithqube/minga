@@ -1457,6 +1457,73 @@ async fn importing_a_v8_portable_snapshot_grants_env_to_legacy_agents() {
     store.shutdown().await.unwrap();
 }
 
+/// Imports `snapshot` into an empty store whose `default` tenant has `limit`
+/// desired-state bytes, returning the result and the quota left afterwards.
+async fn import_with_byte_quota(
+    snapshot: StateSnapshot,
+    limit: u64,
+) -> (Result<(), minga_state::StateError>, Option<u64>) {
+    let dir = tempfile::tempdir().unwrap();
+    let store = StateStore::open(1, "127.0.0.1:0", &dir.path().join("data"), BTreeMap::new())
+        .await
+        .unwrap();
+    let tenant = store.get_tenant("default").await.unwrap().unwrap();
+    let quotas = TenantQuotas {
+        desired_state_bytes: Some(limit),
+        ..tenant.quotas
+    };
+    store
+        .update_tenant("default", tenant.name, quotas)
+        .await
+        .unwrap();
+    let result = store.import(snapshot, true).await;
+    let left = store
+        .get_tenant("default")
+        .await
+        .unwrap()
+        .unwrap()
+        .quotas
+        .desired_state_bytes;
+    store.shutdown().await.unwrap();
+    (result, left)
+}
+
+#[tokio::test]
+async fn a_v8_snapshot_imports_at_its_byte_quota_and_keeps_the_quota() {
+    let (_dir, path) = written_dir().await;
+    let store = StateStore::open(1, "127.0.0.1:0", &path, BTreeMap::new())
+        .await
+        .unwrap();
+    let current = store.export().await.unwrap();
+    store.shutdown().await.unwrap();
+
+    let mut old_json = serde_json::to_value(&current).unwrap();
+    old_json["format_version"] = serde_json::json!(V8_FORMAT_VERSION);
+    strip_agent_capabilities(&mut old_json);
+    let legacy: StateSnapshot = serde_json::from_value(old_json).unwrap();
+
+    // One byte short of what the decoded records re-encode to: the same data
+    // fit a v8 cluster, since its records had no `capabilities` key.
+    let v9_bytes: usize = legacy
+        .services
+        .iter()
+        .map(|s| serde_json::to_vec(s).unwrap().len())
+        .sum();
+    let limit = v9_bytes as u64 - 1;
+
+    let as_v9 = StateSnapshot {
+        format_version: FORMAT_VERSION,
+        ..legacy.clone()
+    };
+    let (result, left) = import_with_byte_quota(as_v9, limit).await;
+    assert!(result.is_err(), "a v9 import must stay quota-enforced");
+    assert_eq!(left, Some(limit));
+
+    let (result, left) = import_with_byte_quota(legacy, limit).await;
+    result.unwrap();
+    assert_eq!(left, Some(limit), "the lifted quota must be restored");
+}
+
 #[tokio::test]
 async fn importing_unsupported_portable_snapshot_versions_is_refused() {
     let (_dir, path) = written_dir().await;
