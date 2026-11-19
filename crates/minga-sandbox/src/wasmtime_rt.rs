@@ -42,6 +42,17 @@ const INPUT_OFFSET: usize = 1024;
 const OUTPUT_LEN_OFFSET: usize = 0;
 const OUTPUT_DATA_OFFSET: usize = 4;
 const DEFAULT_MEMORY_LIMIT_BYTES: u64 = 64 * 1024 * 1024;
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_OUTPUT_LIMIT_BYTES: usize = 1024 * 1024;
+// Node ceilings on tenant-supplied limits. Specs above them are refused, never clamped.
+/// Up to `available_parallelism` runs share an edge node's RAM at once.
+const MAX_MEMORY_LIMIT_BYTES: u64 = 512 * 1024 * 1024;
+/// A run holds one of `available_parallelism` run slots for its whole timeout.
+const MAX_TIMEOUT: Duration = Duration::from_secs(300);
+/// Agent output is published as one NATS log message (default `max_payload` 1 MiB).
+const MAX_OUTPUT_LIMIT_BYTES: usize = 1024 * 1024;
+/// Live sandboxes per runtime; each pins a compiled module of up to `MAX_MODULE_BYTES` input.
+const MAX_SANDBOXES: usize = 256;
 const EPOCH_TICK: Duration = Duration::from_millis(10);
 const MODULE_CACHE_CAPACITY: usize = 64;
 /// Largest module accepted for compilation; bounds Cranelift time and memory.
@@ -52,12 +63,14 @@ const MAX_TABLE_ELEMENTS: usize = 100_000;
 /// A sandbox runtime backed by wasmtime.
 pub struct WasmtimeRuntime {
     engine: Engine,
-    _epoch_ticker: EpochTicker,
+    /// Shared with in-flight runs: a guest without fuel stops only while the ticker runs.
+    epoch_ticker: Arc<EpochTicker>,
     module_cache: Arc<Mutex<LruCache<[u8; 32], Module>>>,
     sandboxes: Mutex<HashMap<String, WasmtimeSandbox>>,
-    counter: Mutex<u64>,
     /// Bounds concurrent runs so blocking threads and store memory stay finite.
     run_slots: Arc<Semaphore>,
+    /// Bounds concurrent Cranelift compiles of tenant modules.
+    compile_slots: Arc<Semaphore>,
 }
 
 /// Locks a mutex, recovering from poisoning: the guarded maps stay consistent
@@ -109,7 +122,46 @@ struct WasmtimeSandbox {
     status: SandboxStatus,
     created_at: Instant,
     fuel_consumed: u64,
-    spec: SandboxSpec,
+    limits: RunLimits,
+}
+
+/// Limits resolved from a spec at create. Module bytes are not kept: the
+/// compiled module is stored separately.
+#[derive(Clone, Copy)]
+struct RunLimits {
+    fuel: u64,
+    memory: usize,
+    timeout: Duration,
+    output: usize,
+}
+
+impl RunLimits {
+    fn from_spec(spec: &SandboxSpec) -> Result<Self, SandboxError> {
+        let memory = spec.memory_limit.unwrap_or(DEFAULT_MEMORY_LIMIT_BYTES);
+        if memory > MAX_MEMORY_LIMIT_BYTES {
+            return Err(SandboxError::Create(format!(
+                "memory_limit is {memory} bytes, node maximum is {MAX_MEMORY_LIMIT_BYTES}"
+            )));
+        }
+        let timeout = spec.timeout.unwrap_or(DEFAULT_TIMEOUT);
+        if timeout > MAX_TIMEOUT {
+            return Err(SandboxError::Create(format!(
+                "timeout is {timeout:?}, node maximum is {MAX_TIMEOUT:?}"
+            )));
+        }
+        let output = spec.output_limit.unwrap_or(DEFAULT_OUTPUT_LIMIT_BYTES);
+        if output > MAX_OUTPUT_LIMIT_BYTES {
+            return Err(SandboxError::Create(format!(
+                "output_limit is {output} bytes, node maximum is {MAX_OUTPUT_LIMIT_BYTES}"
+            )));
+        }
+        Ok(Self {
+            fuel: spec.fuel_limit.unwrap_or(u64::MAX),
+            memory: memory.try_into().unwrap_or(usize::MAX),
+            timeout,
+            output,
+        })
+    }
 }
 
 impl std::fmt::Debug for WasmtimeRuntime {
@@ -130,18 +182,17 @@ impl WasmtimeRuntime {
         config.epoch_interruption(true);
         let engine = Engine::new(&config)
             .map_err(|e| SandboxError::Other(format!("failed to create engine: {e}")))?;
-        let epoch_ticker = EpochTicker::new(engine.clone())?;
+        let epoch_ticker = Arc::new(EpochTicker::new(engine.clone())?);
+        let cpus = thread::available_parallelism().map_or(1, NonZeroUsize::get);
         Ok(Self {
             engine,
-            _epoch_ticker: epoch_ticker,
+            epoch_ticker,
             module_cache: Arc::new(Mutex::new(LruCache::new(
                 NonZeroUsize::new(MODULE_CACHE_CAPACITY).unwrap(),
             ))),
             sandboxes: Mutex::new(HashMap::new()),
-            counter: Mutex::new(0),
-            run_slots: Arc::new(Semaphore::new(
-                thread::available_parallelism().map_or(1, NonZeroUsize::get),
-            )),
+            run_slots: Arc::new(Semaphore::new(cpus)),
+            compile_slots: Arc::new(Semaphore::new(cpus)),
         })
     }
 
@@ -164,15 +215,23 @@ impl SandboxRuntime for WasmtimeRuntime {
                 spec.module.len()
             )));
         }
+        let limits = RunLimits::from_spec(spec)?;
 
         // Hashing and Cranelift compilation of tenant bytes are CPU-bound; keep
         // them off the async workers that serve heartbeats and the API.
         let engine = self.engine.clone();
         let cache = Arc::clone(&self.module_cache);
         let bytes = spec.module.clone();
-        let module = tokio::task::spawn_blocking(move || compile_cached(&engine, &cache, &bytes))
+        let permit = Arc::clone(&self.compile_slots)
+            .acquire_owned()
             .await
-            .map_err(|e| SandboxError::Create(format!("compile task failed: {e}")))??;
+            .map_err(|e| SandboxError::Create(format!("compile slots closed: {e}")))?;
+        let module = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            compile_cached(&engine, &cache, &bytes)
+        })
+        .await
+        .map_err(|e| SandboxError::Create(format!("compile task failed: {e}")))??;
         // Validate that the module exports what we need.
         let exports: Vec<_> = module
             .exports()
@@ -197,12 +256,14 @@ impl SandboxRuntime for WasmtimeRuntime {
             }
         }
 
-        let mut counter = lock(&self.counter);
-        *counter += 1;
-        let id = format!("wasm-{:04}", *counter);
-        drop(counter);
-
-        lock(&self.sandboxes).insert(
+        let mut sandboxes = lock(&self.sandboxes);
+        if sandboxes.len() >= MAX_SANDBOXES {
+            return Err(SandboxError::Create(format!(
+                "node already has {MAX_SANDBOXES} live sandboxes, the maximum"
+            )));
+        }
+        let id = format!("wasm-{:032x}", rand::random::<u128>());
+        sandboxes.insert(
             id.clone(),
             WasmtimeSandbox {
                 id: id.clone(),
@@ -210,9 +271,10 @@ impl SandboxRuntime for WasmtimeRuntime {
                 status: SandboxStatus::Ready,
                 created_at: Instant::now(),
                 fuel_consumed: 0,
-                spec: spec.clone(),
+                limits,
             },
         );
+        drop(sandboxes);
 
         tracing::info!(sandbox = %id, "wasmtime: created sandbox");
         Ok(id)
@@ -222,43 +284,33 @@ impl SandboxRuntime for WasmtimeRuntime {
         let start = Instant::now();
 
         // Clone what we need from the sandbox entry.
-        let (module, spec, fuel_limit) = {
+        let (module, limits) = {
             let sandboxes = lock(&self.sandboxes);
             let sbx = sandboxes
                 .get(sandbox_id)
                 .ok_or_else(|| SandboxError::NotFound(sandbox_id.to_string()))?;
-            (
-                sbx.module.clone(),
-                sbx.spec.clone(),
-                sbx.spec.fuel_limit.unwrap_or(u64::MAX),
-            )
+            (sbx.module.clone(), sbx.limits)
         };
 
-        let timeout = spec.timeout.unwrap_or(Duration::from_secs(30));
+        // Owned permit moves into the thread, so a dropped caller can't free
+        // the slot while the Wasm is still running. The queue wait counts
+        // toward the timeout.
+        let permit =
+            tokio::time::timeout(limits.timeout, Arc::clone(&self.run_slots).acquire_owned())
+                .await
+                .map_err(|_| SandboxError::Timeout(limits.timeout))?
+                .map_err(|e| SandboxError::Run(format!("run slots closed: {e}")))?;
 
         // The epoch deadline stops the blocking Wasm thread; an async timeout
         // alone would only abandon its JoinHandle.
+        let deadline = epoch_ticks(limits.timeout.saturating_sub(start.elapsed()));
         let engine = self.engine.clone();
-        let module_clone = module.clone();
+        let ticker = Arc::clone(&self.epoch_ticker);
         let input_owned = input.to_vec();
-        let timeout_copy = timeout;
-
-        // Owned permit moves into the thread, so a dropped caller can't free
-        // the slot while the Wasm is still running.
-        let permit = Arc::clone(&self.run_slots)
-            .acquire_owned()
-            .await
-            .map_err(|e| SandboxError::Run(format!("run slots closed: {e}")))?;
         let handle = tokio::task::spawn_blocking(move || {
+            let _ticker = ticker;
             let _permit = permit;
-            run_wasm(
-                &engine,
-                &module_clone,
-                &input_owned,
-                fuel_limit,
-                &spec,
-                timeout_copy,
-            )
+            run_wasm(&engine, &module, &input_owned, limits, deadline)
         });
 
         let result = match handle.await {
@@ -271,7 +323,7 @@ impl SandboxRuntime for WasmtimeRuntime {
                 res.duration = start.elapsed();
                 // Update fuel tracking.
                 if let Some(sbx) = lock(&self.sandboxes).get_mut(sandbox_id) {
-                    sbx.fuel_consumed += res.fuel_consumed;
+                    sbx.fuel_consumed = sbx.fuel_consumed.saturating_add(res.fuel_consumed);
                     sbx.status = if res.exit_code == 0 {
                         SandboxStatus::Completed
                     } else {
@@ -325,6 +377,9 @@ fn compile_cached(
     cache: &Mutex<LruCache<[u8; 32], Module>>,
     bytes: &[u8],
 ) -> Result<Module, SandboxError> {
+    // shortcut: keyed on bytes alone, so create latency shows whether this
+    // runtime already compiled identical bytes. Harmless while a node serves one
+    // tenant (ADR 0008); key on the tenant too once a runtime serves several.
     let key: [u8; 32] = Sha256::digest(bytes).into();
     if let Some(module) = lock(cache).get(&key).cloned() {
         return Ok(module);
@@ -335,9 +390,10 @@ fn compile_cached(
     Ok(module)
 }
 
-/// Converts an execution timeout into whole engine epoch ticks.
+/// Converts an execution timeout into whole engine epoch ticks, plus one: the
+/// first tick can land anywhere within its period.
 fn epoch_ticks(timeout: Duration) -> u64 {
-    let ticks = timeout.as_nanos().div_ceil(EPOCH_TICK.as_nanos()).max(1);
+    let ticks = timeout.as_nanos().div_ceil(EPOCH_TICK.as_nanos()) + 1;
     u64::try_from(ticks).unwrap_or(u64::MAX)
 }
 
@@ -354,15 +410,15 @@ fn run_wasm(
     engine: &Engine,
     module: &Module,
     input: &[u8],
-    fuel_limit: u64,
-    spec: &SandboxSpec,
-    timeout: Duration,
+    limits: RunLimits,
+    epoch_deadline: u64,
 ) -> Result<SandboxResult, SandboxError> {
-    let memory_limit = spec
-        .memory_limit
-        .unwrap_or(DEFAULT_MEMORY_LIMIT_BYTES)
-        .try_into()
-        .unwrap_or(usize::MAX);
+    let RunLimits {
+        fuel: fuel_limit,
+        memory: memory_limit,
+        timeout,
+        output: max_output,
+    } = limits;
     // `memory_size` caps each memory separately, so also cap how many memories,
     // tables and instances a tenant module may declare.
     let limits = StoreLimitsBuilder::new()
@@ -375,7 +431,7 @@ fn run_wasm(
         .build();
     let mut store = Store::new(engine, limits);
     store.limiter(|limits| limits);
-    store.set_epoch_deadline(epoch_ticks(timeout));
+    store.set_epoch_deadline(epoch_deadline);
 
     store
         .set_fuel(fuel_limit)
@@ -408,17 +464,22 @@ fn run_wasm(
         memory
             .read(&store, OUTPUT_LEN_OFFSET, &mut len_buf)
             .map_err(|e| SandboxError::Run(format!("failed to read output length: {e}")))?;
-        let output_len = i32::from_le_bytes(len_buf) as usize;
-
-        if output_len > 0 {
-            let max_output = spec.output_limit.unwrap_or(1024 * 1024);
-            let output_len = output_len.min(max_output);
-            let mut output_buf = vec![0u8; output_len];
-            memory
-                .read(&store, OUTPUT_DATA_OFFSET, &mut output_buf)
-                .map_err(|e| SandboxError::Run(format!("failed to read output: {e}")))?;
-            stdout = String::from_utf8_lossy(&output_buf).into_owned();
+        let output_len = i32::from_le_bytes(len_buf);
+        let output_len = usize::try_from(output_len)
+            .map_err(|_| SandboxError::Run(format!("negative output length {output_len}")))?;
+        if output_len > max_output {
+            return Err(SandboxError::Run(format!(
+                "output is {output_len} bytes, limit is {max_output}"
+            )));
         }
+        // Borrow guest memory rather than allocate a buffer the guest sized.
+        let output = memory
+            .data(&store)
+            .get(OUTPUT_DATA_OFFSET..OUTPUT_DATA_OFFSET + output_len)
+            .ok_or_else(|| {
+                SandboxError::Run(format!("output of {output_len} bytes exceeds guest memory"))
+            })?;
+        stdout = String::from_utf8_lossy(output).into_owned();
     } else if let Some(start) = start_func {
         start
             .call(&mut store, ())
@@ -787,5 +848,116 @@ mod tests {
         rt.create(&spec_with(echo_wat())).await.unwrap();
 
         assert_eq!(rt.module_cache.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn create_rejects_limits_over_node_maximum() {
+        let rt = WasmtimeRuntime::new().unwrap();
+        let over = [
+            SandboxSpec {
+                memory_limit: Some(MAX_MEMORY_LIMIT_BYTES + 1),
+                ..spec_with(echo_wat())
+            },
+            SandboxSpec {
+                timeout: Some(MAX_TIMEOUT + Duration::from_secs(1)),
+                ..spec_with(echo_wat())
+            },
+            SandboxSpec {
+                output_limit: Some(MAX_OUTPUT_LIMIT_BYTES + 1),
+                ..spec_with(echo_wat())
+            },
+        ];
+        for spec in &over {
+            let error = rt.create(spec).await.unwrap_err();
+            assert!(error.to_string().contains("node maximum"), "{error}");
+        }
+        assert_eq!(rt.sandbox_count(), 0);
+    }
+
+    /// A `run` that reports `len` output bytes without writing them.
+    fn output_len_wat(len: i32) -> Vec<u8> {
+        wat::parse_str(format!(
+            r#"(module
+                (memory (export "memory") 1)
+                (func (export "run") (param i32) (result i32)
+                    i32.const 0
+                    i32.const {len}
+                    i32.store
+                    i32.const 0))"#
+        ))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn run_rejects_bad_output_length() {
+        let rt = WasmtimeRuntime::new().unwrap();
+        // Negative, over `output_limit`, and past the 64 KiB guest memory.
+        for (len, output_limit) in [(-1, 1024), (2048, 1024), (128 * 1024, 1024 * 1024)] {
+            let mut spec = spec_with(output_len_wat(len));
+            spec.output_limit = Some(output_limit);
+            let id = rt.create(&spec).await.unwrap();
+            let error = rt.run(&id, b"").await.unwrap_err();
+            assert!(matches!(error, SandboxError::Run(_)), "{len}: {error:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn create_rejects_beyond_sandbox_cap() {
+        let rt = WasmtimeRuntime::new().unwrap();
+        for _ in 0..MAX_SANDBOXES {
+            rt.create(&spec_with(echo_wat())).await.unwrap();
+        }
+        let error = rt.create(&spec_with(echo_wat())).await.unwrap_err();
+        assert!(error.to_string().contains("maximum"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn queue_wait_counts_toward_timeout() {
+        let rt = WasmtimeRuntime::new().unwrap();
+        let mut spec = spec_with(echo_wat());
+        spec.timeout = Some(Duration::from_millis(50));
+        let id = rt.create(&spec).await.unwrap();
+        let slots = rt.run_slots.available_permits() as u32;
+        let _held = rt.run_slots.acquire_many(slots).await.unwrap();
+
+        let result = tokio::time::timeout(Duration::from_secs(1), rt.run(&id, b"")).await;
+        assert!(matches!(result, Ok(Err(SandboxError::Timeout(_)))));
+    }
+
+    #[tokio::test]
+    async fn in_flight_run_keeps_epoch_ticker_alive() {
+        let rt = WasmtimeRuntime::new().unwrap();
+        let module =
+            wat::parse_str(r#"(module (func (export "_start") (loop $forever br $forever)))"#)
+                .unwrap();
+        let spec = SandboxSpec {
+            module,
+            fuel_limit: None,
+            timeout: Some(Duration::from_millis(200)),
+            ..Default::default()
+        };
+        let id = rt.create(&spec).await.unwrap();
+        let slots = Arc::clone(&rt.run_slots);
+        let total = slots.available_permits();
+
+        // Abandon the run, then drop the runtime while the guest still spins.
+        let _ = tokio::time::timeout(Duration::from_millis(20), rt.run(&id, b"")).await;
+        assert_eq!(slots.available_permits(), total - 1);
+        drop(rt);
+
+        let start = Instant::now();
+        while slots.available_permits() < total {
+            assert!(
+                start.elapsed() < Duration::from_secs(2),
+                "guest never stopped"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[test]
+    fn epoch_deadline_adds_one_tick() {
+        assert_eq!(epoch_ticks(EPOCH_TICK), 2);
+        assert_eq!(epoch_ticks(Duration::ZERO), 1);
     }
 }
