@@ -737,6 +737,15 @@ impl ContainerdRuntime {
         }
     }
 
+    /// Undoes the network and log setup of a start that failed before its
+    /// container existed, and hands back the error.
+    async fn abort_start(&self, container_id: &str, error: RuntimeError) -> RuntimeError {
+        #[cfg(target_os = "linux")]
+        self.teardown_network(container_id).await;
+        self.teardown_logs(container_id).await;
+        error
+    }
+
     /// Tears down a task's network, tolerating its absence.
     #[cfg(target_os = "linux")]
     async fn teardown_network(&self, task_id: &str) {
@@ -1119,20 +1128,28 @@ impl Runtime for ContainerdRuntime {
         };
 
         let mut client = self.client.lock().await;
-        let config = image::load_image(&mut client, &image, &self.snapshotter)
-            .await
-            .map_err(RuntimeError::Start)?;
         let snapshot_key = format!("minga-{container_id}");
+        let prepared = async {
+            let config = image::load_image(&mut client, &image, &self.snapshotter)
+                .await
+                .map_err(RuntimeError::Start)?;
 
-        // A previous attempt at this task ID may have left a container, a
-        // task or a snapshot behind. Clear them before creating new ones.
-        Self::cleanup_existing(&mut client, &container_id, &snapshot_key, &self.snapshotter)
-            .await?;
+            // A previous attempt at this task ID may have left a container, a
+            // task or a snapshot behind. Clear them before creating new ones.
+            Self::cleanup_existing(&mut client, &container_id, &snapshot_key, &self.snapshotter)
+                .await?;
 
-        let mounts = client
-            .prepare_snapshot(&self.snapshotter, &snapshot_key, &config.parent_snapshot)
-            .await
-            .map_err(|error| RuntimeError::Start(format!("prepare snapshot: {error}")))?;
+            let mounts = client
+                .prepare_snapshot(&self.snapshotter, &snapshot_key, &config.parent_snapshot)
+                .await
+                .map_err(|error| RuntimeError::Start(format!("prepare snapshot: {error}")))?;
+            Ok((config, mounts))
+        }
+        .await;
+        let (config, mounts) = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => return Err(self.abort_start(&container_id, error).await),
+        };
 
         // A named user resolves against the image's own /etc/passwd, which
         // the snapshot's layer directories hold.
@@ -1161,56 +1178,65 @@ impl Runtime for ContainerdRuntime {
             }
         };
 
-        // Log capture: real FIFO destinations for stdout/stderr, drained
-        // into a bounded ring by a per-container reader.
-        let (mut stdout, mut stderr) = (String::new(), String::new());
-        if let Some(logs_dir) = &self.logs_dir {
-            tokio::fs::create_dir_all(logs_dir)
-                .await
-                .map_err(|e| RuntimeError::Start(format!("create logs dir: {e}")))?;
-            stdout = logs_dir
-                .join(format!("{container_id}.stdout.fifo"))
-                .display()
-                .to_string();
-            stderr = logs_dir
-                .join(format!("{container_id}.stderr.fifo"))
-                .display()
-                .to_string();
-            for fifo in [&stdout, &stderr] {
-                let path = PathBuf::from(fifo);
-                let _ = tokio::fs::remove_file(&path).await; // stale from a previous attempt
-                make_fifo(&path)
-                    .map_err(|e| RuntimeError::Start(format!("mkfifo {}: {e}", path.display())))?;
+        let staged = async {
+            // Log capture: real FIFO destinations for stdout/stderr, drained
+            // into a bounded ring by a per-container reader.
+            let (mut stdout, mut stderr) = (String::new(), String::new());
+            if let Some(logs_dir) = &self.logs_dir {
+                tokio::fs::create_dir_all(logs_dir)
+                    .await
+                    .map_err(|e| RuntimeError::Start(format!("create logs dir: {e}")))?;
+                stdout = logs_dir
+                    .join(format!("{container_id}.stdout.fifo"))
+                    .display()
+                    .to_string();
+                stderr = logs_dir
+                    .join(format!("{container_id}.stderr.fifo"))
+                    .display()
+                    .to_string();
+                for fifo in [&stdout, &stderr] {
+                    let path = PathBuf::from(fifo);
+                    let _ = tokio::fs::remove_file(&path).await; // stale from a previous attempt
+                    make_fifo(&path).map_err(|e| {
+                        RuntimeError::Start(format!("mkfifo {}: {e}", path.display()))
+                    })?;
+                }
+                let ring = Arc::new(LogRing::default());
+                self.log_rings
+                    .lock()
+                    .await
+                    .insert(container_id.clone(), ring.clone());
+                let out_path = PathBuf::from(&stdout);
+                let err_path = PathBuf::from(&stderr);
+                let out_ring = ring.clone();
+                let handle = tokio::spawn(async move {
+                    tokio::join!(
+                        fifo_reader(out_path, LogStream::Stdout, out_ring),
+                        fifo_reader(err_path, LogStream::Stderr, ring),
+                    );
+                });
+                self.log_readers
+                    .lock()
+                    .await
+                    .insert(container_id.clone(), handle);
             }
-            let ring = Arc::new(LogRing::default());
-            self.log_rings
-                .lock()
-                .await
-                .insert(container_id.clone(), ring.clone());
-            let out_path = PathBuf::from(&stdout);
-            let err_path = PathBuf::from(&stderr);
-            let out_ring = ring.clone();
-            let handle = tokio::spawn(async move {
-                tokio::join!(
-                    fifo_reader(out_path, LogStream::Stdout, out_ring),
-                    fifo_reader(err_path, LogStream::Stderr, ring),
-                );
-            });
-            self.log_readers
-                .lock()
-                .await
-                .insert(container_id.clone(), handle);
-        }
 
-        let oci_any = oci::spec_to_any_with_image(
-            &container_id,
-            &spec,
-            &secret_mounts,
-            &config,
-            user,
-            network.as_ref(),
-        )
-        .map_err(RuntimeError::Start)?;
+            let oci_any = oci::spec_to_any_with_image(
+                &container_id,
+                &spec,
+                &secret_mounts,
+                &config,
+                user,
+                network.as_ref(),
+            )
+            .map_err(RuntimeError::Start)?;
+            Ok((stdout, stderr, oci_any))
+        }
+        .await;
+        let (stdout, stderr, oci_any) = match staged {
+            Ok(staged) => staged,
+            Err(error) => return Err(self.abort_start(&container_id, error).await),
+        };
 
         let container = Container {
             id: container_id.clone(),

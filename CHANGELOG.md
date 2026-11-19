@@ -57,6 +57,9 @@
   keeps the task's network state so the next teardown retries it. The task
   network state file is replaced through a temporary file, so a failed write
   never truncates the records rollback needs to remove its port mappings.
+  A container start that fails after its network was set up (image load,
+  snapshot, log FIFOs, OCI spec) now tears that network and its egress
+  rules down instead of leaving them for a retry that may never come.
 - Routed containers and `http` agents register a budget in the proxy's
   tracker before they start, so their first request is no longer refused with
   429. Egress policies carry no token budget yet, so routed containers are not
