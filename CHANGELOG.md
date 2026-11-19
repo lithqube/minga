@@ -42,7 +42,12 @@
   loopback bind serves host-local agents only.
 - Required-egress nft rules now match what the inet hooks see under
   `br_netfilter` (the bridge plus the task's guarded source address), so they
-  block routed and same-bridge traffic; a real-kernel test covers it.
+  block routed and same-bridge traffic; a real-kernel test covers it. A
+  bridge-family rule on the task's own bridge ports drops every frame other
+  than IPv4 and ARP, so a container with `CAP_NET_RAW` cannot send IPv6 to
+  the host, its peers or past the forward hook. The old rules are replaced in
+  the same nft transaction, and a failed removal at teardown is returned and
+  keeps the task's network state so the next teardown retries it.
 - Routed containers and `http` agents register a budget in the proxy's
   tracker before they start, so their first request is no longer refused with
   429. Egress policies carry no token budget yet, so routed containers are not
