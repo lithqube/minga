@@ -206,6 +206,13 @@ services:
       module: /opt/minga/modules/researcher.wasm
       fuel_limit: 1000
       token_budget: 500
+      capabilities:
+        grants: [env, stdio]
+        dirs:
+          - host: /srv/datasets
+            guest: /data
+      env:
+        MODEL: small
 "#;
     let (ok, out) = run_deploy(compose, "mixed", &url, &[]);
     assert!(ok, "deploy should succeed:\n{out}");
@@ -230,6 +237,21 @@ services:
     assert_eq!(agent.module_ref, "/opt/minga/modules/researcher.wasm");
     assert_eq!(agent.fuel_limit, Some(1000));
     assert_eq!(agent.token_budget, Some(500));
+    assert!(agent
+        .capabilities
+        .grants
+        .contains(&minga_state::types::AgentGrant::Env));
+    assert!(agent
+        .capabilities
+        .grants
+        .contains(&minga_state::types::AgentGrant::Stdio));
+    assert_eq!(
+        agent.capabilities.dirs,
+        vec![minga_state::types::AgentDirGrant {
+            host: "/srv/datasets".to_string(),
+            guest: "/data".to_string(),
+        }]
+    );
     assert!(
         !researcher.labels.contains_key("minga.agent"),
         "the transport label is not a user label"

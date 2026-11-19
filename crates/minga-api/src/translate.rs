@@ -91,7 +91,8 @@ pub fn service_spec_to_state(spec: &models::ServiceSpec) -> Result<Service, Stri
             serde_json::from_str::<AgentSpec>(raw)
                 .map_err(|e| format!("service '{name}': invalid {AGENT_LABEL} label: {e}"))
         })
-        .transpose()?;
+        .transpose()?
+        .map(Box::new);
 
     if container.Image.is_empty() && agent.is_none() {
         return Err(format!("service '{name}': ContainerSpec.Image is required"));

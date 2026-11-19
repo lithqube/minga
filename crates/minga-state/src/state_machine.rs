@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::codec::{
     check_format, FORMAT_KEY, FORMAT_VERSION, V2_FORMAT_VERSION, V3_FORMAT_VERSION,
-    V4_FORMAT_VERSION, V5_FORMAT_VERSION, V6_FORMAT_VERSION, V7_FORMAT_VERSION,
+    V4_FORMAT_VERSION, V5_FORMAT_VERSION, V6_FORMAT_VERSION, V7_FORMAT_VERSION, V8_FORMAT_VERSION,
 };
 use crate::command::{ObjectKind, StateCommand, StateResponse};
 use crate::types::*;
@@ -51,14 +51,14 @@ const ENTITY_TABLES: [TableDefinition<&str, &[u8]>; 8] = [
     TENANTS_TABLE,
 ];
 
-/// Re-encodes entity records and advances the marker during the v8 migration.
+/// Re-encodes entity records and advances the marker during the v9 migration.
 ///
 /// The caller advances the marker in the same redb transaction, so a failure
 /// leaves both the old values and the old marker intact.
 #[allow(clippy::result_large_err)]
 fn migrate_state(tx: &redb::WriteTransaction) -> Result<(), StorageIOError<u64>> {
-    // Serde defaults fields introduced in later formats; re-encoding all
-    // records applies the new optional NATS identity shape.
+    // Serde defaults fields introduced in later formats; re-encoding applies
+    // the new agent capability shape as well as earlier additions.
     rewrite_state_table::<ClusterNode>(tx, NODES_TABLE)?;
     rewrite_state_table::<Tenant>(tx, TENANTS_TABLE)?;
     rewrite_state_table::<Service>(tx, SERVICES_TABLE)?;
@@ -381,6 +381,7 @@ impl RedbStateMachine {
             || stored.as_deref() == Some(&[V5_FORMAT_VERSION])
             || stored.as_deref() == Some(&[V6_FORMAT_VERSION])
             || stored.as_deref() == Some(&[V7_FORMAT_VERSION])
+            || stored.as_deref() == Some(&[V8_FORMAT_VERSION])
         {
             migrate_state(&tx)?;
         } else {

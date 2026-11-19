@@ -14,18 +14,59 @@
 //!       token_budget: 100000
 //!       egress_url: https://api.openai.com
 //!       prompt: "You are a research assistant"
+//!       capabilities:
+//!         grants: [env]
 //!       env:
 //!         MODEL: gpt-4o
 //!     deploy:
 //!       replicas: 2
 //! ```
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
+use std::path::{Component, Path, PathBuf};
 
 use serde::Deserialize;
 use serde_yaml::Value;
 
 use crate::model::Service;
+
+/// Host capabilities an agent may request in its Compose extension.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilityGrant {
+    /// Read the explicitly declared `env` map.
+    Env,
+    /// Read wall and monotonic clocks.
+    Clock,
+    /// Use the host random source.
+    Random,
+    /// Use standard input, output, and error streams.
+    Stdio,
+    /// Send HTTP through the node's configured egress proxy.
+    Http,
+}
+
+/// Capability grants attached to an agent workload.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentCapabilities {
+    /// Capabilities granted to the workload.
+    #[serde(default)]
+    pub grants: BTreeSet<CapabilityGrant>,
+    /// Read-only host directories mounted at guest paths.
+    #[serde(default)]
+    pub dirs: Vec<AgentDirGrant>,
+}
+
+/// A read-only directory grant.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentDirGrant {
+    /// Host path, restricted by node operator configuration.
+    pub host: String,
+    /// Absolute guest mount path.
+    pub guest: String,
+}
 
 /// The `x-minga-agent` extension block on a Compose service.
 ///
@@ -57,6 +98,9 @@ pub struct AgentExtension {
     /// Additional environment variables for the sandbox.
     #[serde(default)]
     pub env: HashMap<String, String>,
+    /// Explicit host capabilities. Omitted grants deny every host feature.
+    #[serde(default)]
+    pub capabilities: AgentCapabilities,
 }
 
 /// The extension key used in Compose files.
@@ -73,12 +117,72 @@ impl Service {
         };
         let ext: AgentExtension = serde_yaml::from_value(value.clone())
             .map_err(|e| format!("invalid {AGENT_EXTENSION_KEY}: {e}"))?;
+        ext.validate()
+            .map_err(|e| format!("invalid {AGENT_EXTENSION_KEY}: {e}"))?;
         Ok(Some(ext))
     }
 
     /// Returns `true` if this service declares an `x-minga-agent` extension.
     pub fn is_agent(&self) -> bool {
         self.extensions.contains_key(AGENT_EXTENSION_KEY)
+    }
+}
+
+impl AgentExtension {
+    fn validate(&self) -> Result<(), String> {
+        if !self.env.is_empty() && !self.capabilities.grants.contains(&CapabilityGrant::Env) {
+            return Err("env requires the `env` capability grant".into());
+        }
+
+        let mut guest_paths = BTreeSet::new();
+        for dir in &self.capabilities.dirs {
+            let host = Path::new(&dir.host);
+            if !host.is_absolute() {
+                return Err(format!(
+                    "directory host path `{}` must be absolute",
+                    dir.host
+                ));
+            }
+            if host
+                .components()
+                .any(|component| component == Component::ParentDir)
+            {
+                return Err(format!(
+                    "directory host path `{}` must not contain `..`",
+                    dir.host
+                ));
+            }
+
+            let guest = Path::new(&dir.guest);
+            if !guest.is_absolute() {
+                return Err(format!(
+                    "directory guest path `{}` must be absolute",
+                    dir.guest
+                ));
+            }
+            if guest
+                .components()
+                .any(|component| component == Component::ParentDir)
+            {
+                return Err(format!(
+                    "directory guest path `{}` must not contain `..`",
+                    dir.guest
+                ));
+            }
+            let normalized = guest
+                .components()
+                .fold(PathBuf::new(), |mut path, component| {
+                    path.push(component.as_os_str());
+                    path
+                });
+            if !guest_paths.insert(normalized) {
+                return Err(format!(
+                    "directory guest path `{}` is declared more than once",
+                    dir.guest
+                ));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -132,6 +236,8 @@ mod tests {
               token_budget: 100000
               egress_url: https://api.openai.com
               prompt: "You are helpful"
+              capabilities:
+                grants: [env]
               env:
                 MODEL: gpt-4o
                 TEMP: "0.7"
@@ -147,6 +253,7 @@ mod tests {
         assert_eq!(ext.prompt.as_deref(), Some("You are helpful"));
         assert_eq!(ext.env.get("MODEL").map(String::as_str), Some("gpt-4o"));
         assert_eq!(ext.env.get("TEMP").map(String::as_str), Some("0.7"));
+        assert!(ext.capabilities.grants.contains(&CapabilityGrant::Env));
     }
 
     #[test]
@@ -166,6 +273,65 @@ mod tests {
         assert!(ext.egress_url.is_none());
         assert!(ext.prompt.is_none());
         assert!(ext.env.is_empty());
+        assert!(ext.capabilities.grants.is_empty());
+        assert!(ext.capabilities.dirs.is_empty());
+    }
+    #[test]
+    fn invalid_capability_grants_and_directory_paths_are_rejected() {
+        for yaml in [
+            r#"
+            x-minga-agent:
+              module: ./agent.wasm
+              capabilities:
+                grants: [sockets]
+            "#,
+            r#"
+            x-minga-agent:
+              module: ./agent.wasm
+              env:
+                MODEL: local
+            "#,
+            r#"
+            x-minga-agent:
+              module: ./agent.wasm
+              capabilities:
+                dirs:
+                  - host: relative
+                    guest: /data
+            "#,
+            r#"
+            x-minga-agent:
+              module: ./agent.wasm
+              capabilities:
+                dirs:
+                  - host: /srv/data/../secrets
+                    guest: /data
+            "#,
+            r#"
+            x-minga-agent:
+              module: ./agent.wasm
+              capabilities:
+                dirs:
+                  - host: /srv/data
+                    guest: relative
+            "#,
+            r#"
+            x-minga-agent:
+              module: ./agent.wasm
+              capabilities:
+                dirs:
+                  - host: /srv/data
+                    guest: /data
+                  - host: /srv/other
+                    guest: /data/
+            "#,
+        ] {
+            let svc = make_service_with_ext(yaml);
+            assert!(
+                svc.agent_extension().is_err(),
+                "unexpectedly accepted:\n{yaml}"
+            );
+        }
     }
 
     #[test]
@@ -257,6 +423,8 @@ mod tests {
         let ext = AgentExtension::default();
         assert!(ext.module.is_empty());
         assert!(ext.fuel_limit.is_none());
+        assert!(ext.capabilities.grants.is_empty());
+        assert!(ext.capabilities.dirs.is_empty());
     }
 
     // Suppress unused import warning when IndexMap/Mapping aren't used in all configs

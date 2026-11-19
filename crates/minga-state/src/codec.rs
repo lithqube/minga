@@ -18,22 +18,25 @@
 //!
 //! Each redb file stores [`FORMAT_VERSION`] under [`FORMAT_KEY`] in its
 //! metadata table. A store with data and no marker was written by minga 1.0.2
-//! Formats v2 through v7 are migrated to v8 by the state and log stores.
+//! Formats v2 through v8 migrate to v9 on open; portable snapshots are
+//! migrated on import.
 //!
 //! # Wire frame
 //!
 //! A Raft message is `[u32 BE length][u8 FORMAT_VERSION][JSON]`, the length
 //! covering the version byte and the JSON. Since peers reject a different
-//! frame version, v8 requires a coordinated upgrade of every cluster node;
-//! mixed v7/v8 nodes cannot exchange Raft messages.
+//! frame version, v9 requires a coordinated upgrade of every cluster node;
+//! mixed v8/v9 nodes cannot exchange Raft messages.
 
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
 /// Version of the persisted and wire format. Bump it for every persisted
 /// field-shape change and add the corresponding migration.
-pub const FORMAT_VERSION: u8 = 8;
+pub const FORMAT_VERSION: u8 = 9;
 
+/// The persisted version immediately before agent capabilities were added.
+pub const V8_FORMAT_VERSION: u8 = 8;
 /// The persisted version immediately before tenant revocation records were added.
 pub const V7_FORMAT_VERSION: u8 = 7;
 /// The persisted version immediately before node NATS identity was added.

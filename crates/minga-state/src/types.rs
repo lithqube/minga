@@ -4,7 +4,7 @@
 //! deliberately simpler than the Compose model — the scheduler translates
 //! Compose services into these types before proposing them to Raft.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use serde::{Deserialize, Serialize};
 
@@ -312,7 +312,7 @@ pub struct Service {
     pub resources: ResourceSpec,
     /// Agent workload spec. `None` for container services.
     #[serde(default)]
-    pub agent: Option<AgentSpec>,
+    pub agent: Option<Box<AgentSpec>>,
     /// Restart policy for tasks of this service.
     #[serde(default)]
     pub restart_policy: RestartPolicy,
@@ -590,7 +590,43 @@ pub enum WorkloadKind {
     #[default]
     Container,
     /// An AI-agent workload running in a WASM sandbox.
-    Agent(AgentSpec),
+    Agent(Box<AgentSpec>),
+}
+
+/// Capabilities explicitly granted to an agent workload.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentCapabilities {
+    /// Host capabilities granted to the workload.
+    #[serde(default)]
+    pub grants: BTreeSet<AgentGrant>,
+    /// Read-only host directories exposed at guest paths.
+    #[serde(default)]
+    pub dirs: Vec<AgentDirGrant>,
+}
+
+/// A host capability available to an agent workload.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentGrant {
+    /// Access to the explicitly declared environment map.
+    Env,
+    /// Access to wall and monotonic clocks.
+    Clock,
+    /// Access to the host random source.
+    Random,
+    /// Access to standard input, output, and error streams.
+    Stdio,
+    /// Access to the node's configured outbound HTTP egress proxy.
+    Http,
+}
+
+/// A read-only directory granted to an agent.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentDirGrant {
+    /// Host directory path, checked against node operator roots.
+    pub host: String,
+    /// Absolute guest mount path.
+    pub guest: String,
 }
 
 /// Specification for an agent (WASM sandbox) workload.
@@ -611,9 +647,12 @@ pub struct AgentSpec {
     pub egress_url: Option<String>,
     /// Initial prompt / input for the agent.
     pub prompt: Option<String>,
-    /// Additional environment variables for the sandbox.
+    /// Additional environment variables, exposed only with the `env` grant.
     #[serde(default)]
     pub sandbox_env: HashMap<String, String>,
+    /// Explicit host capabilities; omitted from older persisted records.
+    #[serde(default)]
+    pub capabilities: AgentCapabilities,
 }
 
 /// An overlay network.
@@ -814,7 +853,7 @@ mod tests {
 
     #[test]
     fn workload_kind_roundtrip_agent() {
-        let kind = WorkloadKind::Agent(AgentSpec {
+        let kind = WorkloadKind::Agent(Box::new(AgentSpec {
             module_ref: "./agent.wasm".to_string(),
             fuel_limit: Some(1_000_000),
             memory_limit: Some(128 * 1024 * 1024),
@@ -823,7 +862,8 @@ mod tests {
             egress_url: Some("https://api.openai.com".to_string()),
             prompt: Some("hello".to_string()),
             sandbox_env: HashMap::from([("MODEL".to_string(), "gpt-4o".to_string())]),
-        });
+            capabilities: AgentCapabilities::default(),
+        }));
         let bytes = crate::codec::encode(&kind).unwrap();
         let back: WorkloadKind = crate::codec::decode(&bytes).unwrap();
         assert_eq!(back, kind);
@@ -836,10 +876,10 @@ mod tests {
             env: HashMap::new(),
             ports: vec![],
             resources: ResourceSpec::default(),
-            kind: WorkloadKind::Agent(AgentSpec {
+            kind: WorkloadKind::Agent(Box::new(AgentSpec {
                 module_ref: "./agent.wasm".to_string(),
                 ..Default::default()
-            }),
+            })),
             ..Default::default()
         };
         let bytes = crate::codec::encode(&spec).unwrap();
@@ -862,10 +902,10 @@ mod tests {
             ports: vec![],
             networks: vec![],
             resources: ResourceSpec::default(),
-            agent: Some(AgentSpec {
+            agent: Some(Box::new(AgentSpec {
                 module_ref: "./agent.wasm".to_string(),
                 ..Default::default()
-            }),
+            })),
             restart_policy: Default::default(),
             secrets: vec![SecretRef::new("stack_password", "/run/secrets/db_password")],
             command: vec![],
@@ -909,6 +949,13 @@ mod tests {
             egress_url: Some("https://api.anthropic.com".to_string()),
             prompt: Some("Summarize this".to_string()),
             sandbox_env: HashMap::new(),
+            capabilities: AgentCapabilities {
+                grants: BTreeSet::from([AgentGrant::Env, AgentGrant::Http]),
+                dirs: vec![AgentDirGrant {
+                    host: "/srv/data".into(),
+                    guest: "/data".into(),
+                }],
+            },
         };
         let json = serde_json::to_string(&spec).unwrap();
         let back: AgentSpec = serde_json::from_str(&json).unwrap();

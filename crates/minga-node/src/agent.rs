@@ -8,14 +8,14 @@
 //! - [`MockAgentExecutor`] — in-memory simulation for testing
 //! - [`WasmtimeAgentExecutor`] — real WASM execution via `minga-sandbox`
 
-use std::collections::HashMap;
-use std::path::Path;
+use std::collections::{BTreeSet, HashMap};
+use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use minga_sandbox::{SandboxResult, SandboxRuntime, SandboxSpec};
-use minga_state::types::{AgentSpec, TaskId};
+use minga_state::types::{AgentGrant, AgentSpec, TaskId};
 use thiserror::Error;
 
 // ---------------------------------------------------------------------------
@@ -231,6 +231,8 @@ pub struct WasmtimeAgentExecutor {
     results: Mutex<HashMap<String, AgentRunResult>>,
     statuses: Mutex<HashMap<String, AgentStatus>>,
     egress_tokens: Option<Arc<minga_egress::SandboxTokens>>,
+    allowed_dir_roots: Vec<PathBuf>,
+    egress_enabled: bool,
 }
 
 impl WasmtimeAgentExecutor {
@@ -247,6 +249,8 @@ impl WasmtimeAgentExecutor {
             results: Mutex::new(HashMap::new()),
             statuses: Mutex::new(HashMap::new()),
             egress_tokens: None,
+            allowed_dir_roots: Vec::new(),
+            egress_enabled: false,
         })
     }
 
@@ -254,6 +258,37 @@ impl WasmtimeAgentExecutor {
     /// executor starts, so the co-located proxy knows which task is calling.
     pub fn with_egress_tokens(mut self, tokens: Arc<minga_egress::SandboxTokens>) -> Self {
         self.egress_tokens = Some(tokens);
+        self
+    }
+
+    /// Restricts directory grants to canonicalized node operator roots.
+    pub fn with_agent_dir_roots<I, P>(mut self, roots: I) -> Result<Self, AgentError>
+    where
+        I: IntoIterator<Item = P>,
+        P: AsRef<Path>,
+    {
+        for root in roots {
+            let path = root.as_ref();
+            let canonical = path.canonicalize().map_err(|e| {
+                AgentError::Other(format!(
+                    "cannot resolve agent directory root `{}`: {e}",
+                    path.display()
+                ))
+            })?;
+            if !canonical.is_dir() {
+                return Err(AgentError::Other(format!(
+                    "agent directory root `{}` is not a directory",
+                    path.display()
+                )));
+            }
+            self.allowed_dir_roots.push(canonical);
+        }
+        Ok(self)
+    }
+
+    /// Indicates whether this node has an outbound egress proxy configured.
+    pub fn with_egress_enabled(mut self, enabled: bool) -> Self {
+        self.egress_enabled = enabled;
         self
     }
 
@@ -272,12 +307,92 @@ impl WasmtimeAgentExecutor {
     }
 }
 
+fn validate_agent_capabilities(
+    spec: &AgentSpec,
+    allowed_dir_roots: &[PathBuf],
+    egress_enabled: bool,
+) -> Result<(), AgentError> {
+    if !spec.sandbox_env.is_empty() && !spec.capabilities.grants.contains(&AgentGrant::Env) {
+        return Err(AgentError::Start(
+            "agent env requires the `env` capability grant".into(),
+        ));
+    }
+    if spec.capabilities.grants.contains(&AgentGrant::Http) && !egress_enabled {
+        return Err(AgentError::Start(
+            "agent requested `http` but this node has no `--egress-bind`".into(),
+        ));
+    }
+
+    let mut guest_paths = BTreeSet::new();
+    for dir in &spec.capabilities.dirs {
+        let host = Path::new(&dir.host);
+        if !host.is_absolute()
+            || host
+                .components()
+                .any(|component| component == Component::ParentDir)
+        {
+            return Err(AgentError::Start(format!(
+                "agent directory host path `{}` must be absolute and contain no `..`",
+                dir.host
+            )));
+        }
+
+        let guest = Path::new(&dir.guest);
+        if !guest.is_absolute()
+            || guest
+                .components()
+                .any(|component| component == Component::ParentDir)
+        {
+            return Err(AgentError::Start(format!(
+                "agent directory guest path `{}` must be absolute and contain no `..`",
+                dir.guest
+            )));
+        }
+        let normalized_guest = guest
+            .components()
+            .fold(PathBuf::new(), |mut path, component| {
+                path.push(component.as_os_str());
+                path
+            });
+        if !guest_paths.insert(normalized_guest) {
+            return Err(AgentError::Start(format!(
+                "agent directory guest path `{}` is declared more than once",
+                dir.guest
+            )));
+        }
+
+        let canonical_host = host.canonicalize().map_err(|e| {
+            AgentError::Start(format!(
+                "cannot resolve agent directory `{}`: {e}",
+                dir.host
+            ))
+        })?;
+        if !canonical_host.is_dir() {
+            return Err(AgentError::Start(format!(
+                "agent directory `{}` is not a directory",
+                dir.host
+            )));
+        }
+        if !allowed_dir_roots
+            .iter()
+            .any(|root| canonical_host.starts_with(root))
+        {
+            return Err(AgentError::Start(format!(
+                "agent directory `{}` is outside configured `--agent-dir-root` paths",
+                dir.host
+            )));
+        }
+    }
+    Ok(())
+}
+
 #[async_trait]
 impl AgentExecutor for WasmtimeAgentExecutor {
     async fn start(&self, task_id: &TaskId, spec: &AgentSpec) -> Result<String, AgentError> {
         let id = task_id.clone();
 
         // Read the WASM module from the filesystem.
+        validate_agent_capabilities(spec, &self.allowed_dir_roots, self.egress_enabled)?;
         let module_path = self.resolve_module_path(&spec.module_ref);
         let module_bytes = tokio::fs::read(&module_path)
             .await
@@ -425,6 +540,7 @@ pub fn shared_executor<E: AgentExecutor + 'static>(executor: E) -> Arc<dyn Agent
 #[cfg(test)]
 mod tests {
     use super::*;
+    use minga_state::types::AgentDirGrant;
 
     fn test_agent_spec(module: &str) -> AgentSpec {
         AgentSpec {
@@ -436,7 +552,74 @@ mod tests {
             egress_url: Some("https://api.openai.com".to_string()),
             prompt: Some("hello".to_string()),
             sandbox_env: HashMap::from([("KEY".to_string(), "value".to_string())]),
+            capabilities: minga_state::types::AgentCapabilities {
+                grants: BTreeSet::from([AgentGrant::Env]),
+                ..Default::default()
+            },
         }
+    }
+
+    #[test]
+    fn capability_validation_requires_env_grant_and_node_egress() {
+        let mut spec = AgentSpec::default();
+        spec.sandbox_env.insert("MODEL".into(), "local".into());
+        assert!(validate_agent_capabilities(&spec, &[], false)
+            .unwrap_err()
+            .to_string()
+            .contains("env"));
+
+        spec.capabilities.grants.insert(AgentGrant::Env);
+        assert!(validate_agent_capabilities(&spec, &[], false).is_ok());
+        spec.capabilities.grants.insert(AgentGrant::Http);
+        assert!(validate_agent_capabilities(&spec, &[], false)
+            .unwrap_err()
+            .to_string()
+            .contains("--egress-bind"));
+        assert!(validate_agent_capabilities(&spec, &[], true).is_ok());
+    }
+
+    #[test]
+    fn directory_grants_require_a_configured_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("allowed");
+        let data = root.join("datasets");
+        std::fs::create_dir_all(&data).unwrap();
+
+        let mut spec = AgentSpec::default();
+        spec.capabilities.dirs.push(AgentDirGrant {
+            host: data.display().to_string(),
+            guest: "/data".into(),
+        });
+        let canonical_root = root.canonicalize().unwrap();
+        assert!(
+            validate_agent_capabilities(&spec, std::slice::from_ref(&canonical_root), false)
+                .is_ok()
+        );
+        assert!(validate_agent_capabilities(&spec, &[], false)
+            .unwrap_err()
+            .to_string()
+            .contains("--agent-dir-root"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_grant_symlink_cannot_escape_configured_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("allowed");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("escape")).unwrap();
+
+        let mut spec = AgentSpec::default();
+        spec.capabilities.dirs.push(AgentDirGrant {
+            host: root.join("escape").display().to_string(),
+            guest: "/escape".into(),
+        });
+        let error = validate_agent_capabilities(&spec, &[root.canonicalize().unwrap()], false)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("outside configured"), "{error}");
     }
 
     // --- MockAgentExecutor tests -----------------------------------------------

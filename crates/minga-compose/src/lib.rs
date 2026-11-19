@@ -18,7 +18,9 @@ use std::path::Path;
 use indexmap::IndexMap;
 use serde_yaml::{Mapping, Value};
 
-pub use agent::{AgentExtension, AGENT_EXTENSION_KEY};
+pub use agent::{
+    AgentCapabilities, AgentDirGrant, AgentExtension, CapabilityGrant, AGENT_EXTENSION_KEY,
+};
 pub use error::{ComposeError, Errors};
 pub use interpolate::interpolate_str;
 pub use model::*;

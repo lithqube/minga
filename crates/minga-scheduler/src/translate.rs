@@ -13,11 +13,13 @@
 use std::collections::HashMap;
 
 use minga_compose::{
-    AgentExtension, DeployMode, DeviceCount, Project, StringOrList, DEFAULT_NETWORK,
+    AgentExtension, CapabilityGrant, DeployMode, DeviceCount, Project, StringOrList,
+    DEFAULT_NETWORK,
 };
 use minga_state::types::{
-    AgentSpec, Config as StateConfig, FailureAction, Network, ResourceSpec, Secret, Service,
-    ServiceMode, UpdateOrder, UpdatePolicy, Volume, DEFAULT_TENANT_ID,
+    AgentCapabilities, AgentDirGrant, AgentGrant, AgentSpec, Config as StateConfig, FailureAction,
+    Network, ResourceSpec, Secret, Service, ServiceMode, UpdateOrder, UpdatePolicy, Volume,
+    DEFAULT_TENANT_ID,
 };
 use thiserror::Error;
 
@@ -279,7 +281,7 @@ fn translate_service(
     }
 
     // Build the agent spec from the extension, if present.
-    let agent = agent_ext.map(agent_extension_to_spec);
+    let agent = agent_ext.map(agent_extension_to_spec).map(Box::new);
 
     // Caught here: on the node it fails every start, and a stop-first
     // update would already have removed the old task.
@@ -446,6 +448,29 @@ fn parse_duration_secs(s: &str) -> Option<u64> {
 
 /// Converts a Compose `x-minga-agent` extension into a state `AgentSpec`.
 fn agent_extension_to_spec(ext: AgentExtension) -> AgentSpec {
+    let capabilities = AgentCapabilities {
+        grants: ext
+            .capabilities
+            .grants
+            .into_iter()
+            .map(|grant| match grant {
+                CapabilityGrant::Env => AgentGrant::Env,
+                CapabilityGrant::Clock => AgentGrant::Clock,
+                CapabilityGrant::Random => AgentGrant::Random,
+                CapabilityGrant::Stdio => AgentGrant::Stdio,
+                CapabilityGrant::Http => AgentGrant::Http,
+            })
+            .collect(),
+        dirs: ext
+            .capabilities
+            .dirs
+            .into_iter()
+            .map(|dir| AgentDirGrant {
+                host: dir.host,
+                guest: dir.guest,
+            })
+            .collect(),
+    };
     AgentSpec {
         module_ref: ext.module,
         fuel_limit: ext.fuel_limit,
@@ -455,6 +480,7 @@ fn agent_extension_to_spec(ext: AgentExtension) -> AgentSpec {
         egress_url: ext.egress_url,
         prompt: ext.prompt,
         sandbox_env: ext.env,
+        capabilities,
     }
 }
 
@@ -715,6 +741,11 @@ mod tests {
               token_budget: 100000
               egress_url: https://api.openai.com
               prompt: "You are helpful"
+              capabilities:
+                grants: [env, http]
+                dirs:
+                  - host: /srv/datasets
+                    guest: /data
               env:
                 MODEL: gpt-4o
             deploy:
@@ -736,6 +767,15 @@ mod tests {
         assert_eq!(agent.token_budget, Some(100_000));
         assert_eq!(agent.egress_url.as_deref(), Some("https://api.openai.com"));
         assert_eq!(agent.prompt.as_deref(), Some("You are helpful"));
+        assert!(agent.capabilities.grants.contains(&AgentGrant::Env));
+        assert!(agent.capabilities.grants.contains(&AgentGrant::Http));
+        assert_eq!(
+            agent.capabilities.dirs,
+            vec![AgentDirGrant {
+                host: "/srv/datasets".to_string(),
+                guest: "/data".to_string(),
+            }]
+        );
         assert_eq!(
             agent.sandbox_env.get("MODEL").map(String::as_str),
             Some("gpt-4o")

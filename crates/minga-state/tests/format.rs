@@ -15,13 +15,14 @@ use std::path::PathBuf;
 
 use minga_state::codec::{
     self, FORMAT_KEY, FORMAT_VERSION, V2_FORMAT_VERSION, V3_FORMAT_VERSION, V4_FORMAT_VERSION,
-    V5_FORMAT_VERSION, V6_FORMAT_VERSION, V7_FORMAT_VERSION,
+    V5_FORMAT_VERSION, V6_FORMAT_VERSION, V7_FORMAT_VERSION, V8_FORMAT_VERSION,
 };
 use minga_state::types::{
-    AgentSpec, ClusterNode, Config, FailureAction, Healthcheck, MountKind, Network, NodeRole,
-    NodeStatus, PortMapping, PortMode, ReservedPort, ResourceSpec, RestartCondition, RestartPolicy,
-    Secret, SecretRef, Service, ServiceMode, ServiceMount, Task, TaskSpec, TaskState, Tenant,
-    TenantQuotas, UpdateOrder, UpdatePolicy, Volume, WorkloadKind,
+    AgentCapabilities, AgentDirGrant, AgentGrant, AgentSpec, ClusterNode, Config, FailureAction,
+    Healthcheck, MountKind, Network, NodeRole, NodeStatus, PortMapping, PortMode, ReservedPort,
+    ResourceSpec, RestartCondition, RestartPolicy, Secret, SecretRef, Service, ServiceMode,
+    ServiceMount, Task, TaskSpec, TaskState, Tenant, TenantQuotas, UpdateOrder, UpdatePolicy,
+    Volume, WorkloadKind,
 };
 use minga_state::{ObjectKind, StateCommand, StateSnapshot, StateStore, TypeConfig};
 use openraft::{BasicNode, CommittedLeaderId, Entry, EntryPayload, LogId, Membership, Vote};
@@ -83,14 +84,7 @@ fn a_fixture_accepts_added_fields_and_rejects_changed_ones() {
 
 /// Compares `value` with its fixture, and decodes the fixture back.
 fn check<T: Serialize + DeserializeOwned>(name: &str, value: &T) {
-    for version in [
-        V2_FORMAT_VERSION,
-        V3_FORMAT_VERSION,
-        V4_FORMAT_VERSION,
-        V5_FORMAT_VERSION,
-        V6_FORMAT_VERSION,
-        V7_FORMAT_VERSION,
-    ] {
+    for version in V2_FORMAT_VERSION..=V8_FORMAT_VERSION {
         let old_path = fixture_path_for_version(version, name);
         if old_path.exists() {
             let old = std::fs::read_to_string(&old_path).unwrap_or_else(|e| {
@@ -228,6 +222,13 @@ fn agent() -> AgentSpec {
         egress_url: Some("http://127.0.0.1:8088".into()),
         prompt: Some("Summarize".into()),
         sandbox_env: map(&[("MODEL", "small")]),
+        capabilities: AgentCapabilities {
+            grants: BTreeSet::from([AgentGrant::Env, AgentGrant::Http]),
+            dirs: vec![AgentDirGrant {
+                host: "/srv/data".into(),
+                guest: "/data".into(),
+            }],
+        },
     }
 }
 
@@ -277,7 +278,7 @@ fn service(id: &str) -> Service {
             memory_bytes: 268_435_456,
             gpus: 0,
         },
-        agent: Some(agent()),
+        agent: Some(Box::new(agent())),
         restart_policy: RestartPolicy {
             condition: RestartCondition::OnFailure,
             delay_secs: 5,
@@ -317,7 +318,7 @@ fn task_spec() -> TaskSpec {
             memory_bytes: 268_435_456,
             gpus: 0,
         },
-        kind: WorkloadKind::Agent(agent()),
+        kind: WorkloadKind::Agent(Box::new(agent())),
         restart_policy: RestartPolicy {
             condition: RestartCondition::Any,
             delay_secs: 2,
@@ -723,6 +724,23 @@ fn strip_tenant_revocations(value: &mut serde_json::Value) {
         _ => {}
     }
 }
+
+fn strip_agent_capabilities(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(object) => {
+            object.remove("capabilities");
+            for nested in object.values_mut() {
+                strip_agent_capabilities(nested);
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for nested in values {
+                strip_agent_capabilities(nested);
+            }
+        }
+        _ => {}
+    }
+}
 fn clear_tenants(tx: &redb::WriteTransaction) {
     let keys = {
         let table = tx.open_table(SM_TENANTS).unwrap();
@@ -780,6 +798,7 @@ fn downgrade_string_table(
             V5_FORMAT_VERSION => strip_node_tenant(&mut value),
             V6_FORMAT_VERSION => strip_node_nats_identity(&mut value),
             V7_FORMAT_VERSION => strip_tenant_revocations(&mut value),
+            V8_FORMAT_VERSION => strip_agent_capabilities(&mut value),
             _ => {}
         }
         let bytes = serde_json::to_vec(&value).unwrap();
@@ -810,6 +829,7 @@ fn downgrade_log_table(tx: &redb::WriteTransaction, version: u8) {
             V5_FORMAT_VERSION => strip_node_tenant(&mut value),
             V6_FORMAT_VERSION => strip_node_nats_identity(&mut value),
             V7_FORMAT_VERSION => strip_tenant_revocations(&mut value),
+            V8_FORMAT_VERSION => strip_agent_capabilities(&mut value),
             _ => {}
         }
         replace_tenant_commands(&mut value);
@@ -886,6 +906,18 @@ fn prepare_v7_state(file: &std::path::Path) {
         .unwrap();
     tx.commit().unwrap();
 }
+
+fn prepare_v8_state(file: &std::path::Path) {
+    let db = Database::create(file).unwrap();
+    let tx = db.begin_write().unwrap();
+    downgrade_string_table(&tx, SM_SERVICES, V8_FORMAT_VERSION);
+    downgrade_string_table(&tx, SM_TASKS, V8_FORMAT_VERSION);
+    tx.open_table(SM_META)
+        .unwrap()
+        .insert(FORMAT_KEY, [V8_FORMAT_VERSION].as_slice())
+        .unwrap();
+    tx.commit().unwrap();
+}
 fn prepare_v2_log(file: &std::path::Path) {
     let db = Database::create(file).unwrap();
     let tx = db.begin_write().unwrap();
@@ -950,6 +982,17 @@ fn prepare_v7_log(file: &std::path::Path) {
         .unwrap();
     tx.commit().unwrap();
 }
+
+fn prepare_v8_log(file: &std::path::Path) {
+    let db = Database::create(file).unwrap();
+    let tx = db.begin_write().unwrap();
+    downgrade_log_table(&tx, V8_FORMAT_VERSION);
+    tx.open_table(RAFT_META)
+        .unwrap()
+        .insert(FORMAT_KEY, [V8_FORMAT_VERSION].as_slice())
+        .unwrap();
+    tx.commit().unwrap();
+}
 fn read_marker(file: &std::path::Path, table: TableDefinition<&str, &[u8]>) -> Option<u8> {
     let db = Database::create(file).unwrap();
     let tx = db.begin_read().unwrap();
@@ -1003,6 +1046,20 @@ fn has_default_tenant(value: &serde_json::Value) -> bool {
                 || object.values().any(has_default_tenant)
         }
         serde_json::Value::Array(values) => values.iter().any(has_default_tenant),
+        _ => false,
+    }
+}
+
+fn has_agent_capabilities(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Object(object) => {
+            if object.contains_key("module_ref") {
+                return object.get("capabilities")
+                    == Some(&serde_json::json!({"grants": [], "dirs": []}));
+            }
+            object.values().any(has_agent_capabilities)
+        }
+        serde_json::Value::Array(values) => values.iter().any(has_agent_capabilities),
         _ => false,
     }
 }
@@ -1175,6 +1232,38 @@ async fn a_v7_state_and_log_file_migrate_tenant_revocation_records() {
     assert_eq!(read_marker(&state_file, SM_META), Some(FORMAT_VERSION));
     assert_eq!(read_marker(&log_file, RAFT_META), Some(FORMAT_VERSION));
 }
+
+#[tokio::test]
+async fn a_v8_state_and_log_file_migrate_agent_capabilities() {
+    let (_dir, path) = written_dir().await;
+    let state_file = path.join("state.redb");
+    let log_file = path.join("raft_log.redb");
+    prepare_v8_state(&state_file);
+    prepare_v8_log(&log_file);
+
+    let store = StateStore::open(1, "127.0.0.1:0", &path, BTreeMap::new())
+        .await
+        .unwrap();
+    let service = store.get_service("shop.web").await.unwrap().unwrap();
+    assert_eq!(
+        service.agent.unwrap().capabilities,
+        AgentCapabilities::default()
+    );
+    store.shutdown().await.unwrap();
+
+    assert_eq!(read_marker(&state_file, SM_META), Some(FORMAT_VERSION));
+    assert_eq!(read_marker(&log_file, RAFT_META), Some(FORMAT_VERSION));
+    assert_eq!(
+        read_state_value(&state_file, SM_SERVICES, "shop.web")["agent"]["capabilities"],
+        serde_json::json!({"grants": [], "dirs": []})
+    );
+    assert!(
+        read_log_values(&log_file)
+            .iter()
+            .any(|(_, entry)| has_agent_capabilities(entry)),
+        "migrated Raft log entries must include default capabilities"
+    );
+}
 #[tokio::test]
 async fn a_v2_log_file_rewrites_entries_and_preserves_indices() {
     let (_dir, path) = written_dir().await;
@@ -1336,6 +1425,28 @@ async fn importing_a_v4_portable_snapshot_seeds_default_tenant() {
 
     store.import(snapshot, true).await.unwrap();
     assert!(store.get_tenant("default").await.unwrap().is_some());
+    assert_eq!(store.export().await.unwrap().format_version, FORMAT_VERSION);
+    store.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn importing_a_v8_portable_snapshot_defaults_agent_capabilities() {
+    let (_dir, path) = written_dir().await;
+    let store = StateStore::open(1, "127.0.0.1:0", &path, BTreeMap::new())
+        .await
+        .unwrap();
+
+    let mut old_json = serde_json::to_value(store.export().await.unwrap()).unwrap();
+    old_json["format_version"] = serde_json::json!(V8_FORMAT_VERSION);
+    strip_agent_capabilities(&mut old_json);
+    let snapshot: StateSnapshot = serde_json::from_value(old_json).unwrap();
+
+    store.import(snapshot, true).await.unwrap();
+    let imported = store.get_service("shop.web").await.unwrap().unwrap();
+    assert_eq!(
+        imported.agent.unwrap().capabilities,
+        AgentCapabilities::default()
+    );
     assert_eq!(store.export().await.unwrap().format_version, FORMAT_VERSION);
     store.shutdown().await.unwrap();
 }

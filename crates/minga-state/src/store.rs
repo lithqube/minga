@@ -862,14 +862,15 @@ impl StateStore {
         let want = crate::codec::FORMAT_VERSION;
         match snapshot.format_version {
             crate::codec::FORMAT_VERSION
-            | crate::codec::V6_FORMAT_VERSION
+            | crate::codec::V8_FORMAT_VERSION
             | crate::codec::V7_FORMAT_VERSION
+            | crate::codec::V6_FORMAT_VERSION
             | crate::codec::V5_FORMAT_VERSION
             | crate::codec::V4_FORMAT_VERSION
             | crate::codec::V3_FORMAT_VERSION
             | crate::codec::V2_FORMAT_VERSION => {
-                // Legacy resource fields default to `default`; node records
-                // are not included in portable snapshots.
+                // Agent capabilities default to no grants; legacy resource
+                // fields default to `default`. Nodes are not in snapshots.
             }
             found => {
                 return Err(StateError::BadSnapshot(format!(
