@@ -8,9 +8,14 @@
   NAT64 (literal or resolved), unless `--egress-allow-cidr` allows
   them.
 - Egress budget admission reserves an upper bound and settles it to the
-  provider's counts, so concurrent requests cannot overspend: the request
-  body's byte length bounds the input, plus the `max_tokens` cap, and a
-  request without one holds the rest of a limited budget until it settles.
+  provider's counts, so concurrent requests are not admitted against the
+  same balance: the request body's byte length bounds the input, plus the
+  `max_tokens` cap, and a request without one holds the rest of a limited
+  budget until it settles. Admission is the guarantee: an uncapped response
+  can still overrun the balance, so a hard limit needs an output cap. A
+  reservation settles only against the budget registration that issued it,
+  so re-registering a workload mid-stream leaves the replacement's balance
+  untouched, and holds are kept exact so releasing one never frees another.
   A routed-egress container left from a previous worker process is never
   adopted with its lost token; a failed stop is retried before restarting. Upstream error
   bodies are buffered (64 KiB) and redacted whole instead of streamed;
