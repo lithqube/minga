@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- WASM agents share one node runtime and a bounded SHA-256 module cache. Epoch
+  interruption stops guest execution at its configured timeout; linear memory
+  is capped by the configured limit (64 MiB by default), with one memory, one
+  table of at most 100,000 elements and one instance per run. Modules over
+  16 MiB are refused and compile off the async runtime; concurrent runs are
+  bounded by CPU count. Input is no longer truncated to `output_limit`.
+  Wasmtime 50 raises the workspace MSRV to Rust 1.97.
 - Agent Compose specs can declare explicit environment, clock, random, stdio
   and HTTP grants plus read-only directory grants. Nodes validate these against
   `--agent-dir-root` and egress configuration. State format v9 migrates v8

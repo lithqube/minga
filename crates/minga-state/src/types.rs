@@ -165,7 +165,7 @@ pub fn validate_user(user: &str) -> Result<(), &'static str> {
         Some((name, group)) => (name, Some(group)),
         None => (user, None),
     };
-    if valid(name) && group.map_or(true, valid) {
+    if valid(name) && group.is_none_or(valid) {
         Ok(())
     } else {
         Err("expected `user[:group]`, each a number or a name of letters, digits, `.`, `_` or `-`")

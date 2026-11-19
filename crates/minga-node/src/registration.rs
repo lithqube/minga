@@ -459,11 +459,11 @@ async fn queue_node_registration_with_join(
     let key_ok = identity
         .wg_public_key
         .as_deref()
-        .map_or(true, minga_net::wireguard::validate_public_key);
+        .is_none_or(minga_net::wireguard::validate_public_key);
     let endpoint_ok = identity
         .wg_endpoint
         .as_deref()
-        .map_or(true, minga_net::wireguard::validate_endpoint);
+        .is_none_or(minga_net::wireguard::validate_endpoint);
     if !key_ok || !endpoint_ok {
         tracing::warn!(
             node_id,
@@ -532,7 +532,7 @@ async fn queue_node_registration_with_join(
         }
         if stored
             .as_ref()
-            .map_or(true, |node| node.tenant_id != claims.tenant_id)
+            .is_none_or(|node| node.tenant_id != claims.tenant_id)
         {
             tracing::warn!(
                 node_id,
