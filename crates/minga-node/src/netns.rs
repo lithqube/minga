@@ -741,6 +741,34 @@ fn netns_path(ns: &str) -> PathBuf {
     PathBuf::from(format!("/var/run/netns/{ns}"))
 }
 
+/// Whether nft confirms neither egress table of `table` exists: missing,
+/// or in a family this kernel cannot hold. No nft binary counts as absent;
+/// any other listing failure (a lost capability, say) leaves it unknown.
+async fn egress_tables_absent(table: &str) -> bool {
+    const ABSENT: [&str; 3] = [
+        "No such file or directory",
+        "Operation not supported",
+        "Address family not supported",
+    ];
+    for family in ["inet", "bridge"] {
+        match tokio::process::Command::new("nft")
+            .args(["list", "table", family, table])
+            .output()
+            .await
+        {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return true,
+            Ok(output) if !output.status.success() => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                if !ABSENT.iter().any(|reason| stderr.contains(reason)) {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+    true
+}
+
 impl NetworkSetup {
     /// The embedded DNS server listens on every bridge gateway on port 53,
     /// so 53 is always reserved.
@@ -1621,96 +1649,114 @@ impl NetworkSetup {
     pub async fn teardown_task(&self, task_id: &str) -> Result<(), NetError> {
         let ns = format!("minga-{task_id}");
         let state_path = self.state_dir.join(format!("{ns}.json"));
-        // A failed delete keeps the state file so `retry_stale_teardowns`
-        // retries it: stale drop rules would match a later task that reuses
-        // this bridge address. A table nft cannot list (no nft, an unused
-        // family, never created) has nothing to delete.
+        let marker = self.teardown_marker(task_id);
+        let state = match tokio::fs::read(&state_path).await {
+            Ok(raw) => serde_json::from_slice::<TaskNetState>(&raw).ok(),
+            Err(_) => None,
+        };
+        // A failed delete keeps the state file and leaves a marker so
+        // `retry_stale_teardowns` retries it: stale drop rules would match a
+        // later task that reuses this bridge address. Only a table nft
+        // confirms missing (or no nft for a task that never required
+        // egress) has nothing to delete; an unknown existence is retried.
         let table = egress_table_name(task_id);
-        let mut egress_error = None;
+        let mut teardown_error = None;
         if let Err(error) = run_nft_script(&egress_delete_script(&table)).await {
-            for family in ["inet", "bridge"] {
-                let listed = tokio::process::Command::new("nft")
-                    .args(["list", "table", family, &table])
-                    .output()
-                    .await
-                    .is_ok_and(|output| output.status.success());
-                if listed {
-                    egress_error = Some(error);
-                    break;
-                }
+            let required = state.as_ref().is_some_and(|state| state.required_egress);
+            if required || !egress_tables_absent(&table).await {
+                teardown_error = Some(error);
             }
         }
 
-        if let Ok(raw) = tokio::fs::read(&state_path).await {
-            if let Ok(state) = serde_json::from_slice::<TaskNetState>(&raw) {
-                for (veth, ip) in state.veths.iter().zip(&state.ips) {
-                    remove_task_source_rules(veth, *ip).await;
-                }
-                if let Some(ip) = state.ips.first() {
-                    for port in &state.ports {
-                        let Some(published) = port.published else {
-                            continue;
-                        };
-                        let to = format!("{}:{}", ip, port.target);
-                        // The current forms, plus the 1.0.2 PREROUTING form
-                        // that rules written by an older binary may still use.
-                        for chain in [Chain::PreroutingLocal, Chain::PreroutingAny, Chain::Output] {
-                            let rule = dnat_rule("-D", chain, &port.protocol, published, &to);
-                            run_tolerated("iptables", &as_strs(&rule)).await;
-                        }
+        if let Some(state) = &state {
+            for (veth, ip) in state.veths.iter().zip(&state.ips) {
+                remove_task_source_rules(veth, *ip).await;
+            }
+            if let Some(ip) = state.ips.first() {
+                for port in &state.ports {
+                    let Some(published) = port.published else {
+                        continue;
+                    };
+                    let to = format!("{}:{}", ip, port.target);
+                    // The current forms, plus the 1.0.2 PREROUTING form
+                    // that rules written by an older binary may still use.
+                    for chain in [Chain::PreroutingLocal, Chain::PreroutingAny, Chain::Output] {
+                        let rule = dnat_rule("-D", chain, &port.protocol, published, &to);
+                        run_tolerated("iptables", &as_strs(&rule)).await;
                     }
                 }
             }
         }
 
-        run_tolerated("ip", &["netns", "delete", &ns]).await;
+        if let Err(error) = run("ip", &["netns", "delete", &ns]).await {
+            if tokio::fs::try_exists(netns_path(&ns)).await.unwrap_or(true) {
+                teardown_error.get_or_insert(error);
+            }
+        }
 
         let resolv_conf = self.resolv_conf_path(&ns);
         // `runtime.rs` writes the task's hosts file beside the resolv.conf.
         let _ = tokio::fs::remove_file(resolv_conf.with_extension("hosts")).await;
         let _ = tokio::fs::remove_file(resolv_conf).await;
-        if let Some(error) = egress_error {
+        if let Some(error) = teardown_error {
+            tokio::fs::create_dir_all(&self.state_dir).await?;
+            tokio::fs::write(&marker, b"").await?;
             return Err(error);
         }
         let _ = tokio::fs::remove_file(&state_path).await;
+        let _ = tokio::fs::remove_file(&marker).await;
         Ok(())
     }
 
-    /// Retries the teardown of every task whose namespace is gone but whose
-    /// state file remains: a failed egress-table delete, or a crash mid-way.
+    /// Marks a task whose teardown failed, so its namespace, even if still
+    /// present, is retried and not treated as a live task.
+    fn teardown_marker(&self, task_id: &str) -> PathBuf {
+        self.state_dir.join(format!("minga-{task_id}.teardown"))
+    }
+
+    /// Retries the teardown of every task marked by a failed teardown, or
+    /// whose namespace is gone but whose state file remains (a crash mid-way).
     pub async fn retry_stale_teardowns(&self) -> Result<(), NetError> {
         let mut entries = match tokio::fs::read_dir(&self.state_dir).await {
             Ok(entries) => entries,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(error) => return Err(error.into()),
         };
-        let mut task_ids = Vec::new();
+        let mut with_state = Vec::new();
+        let mut marked = HashSet::new();
         while let Some(entry) = entries.next_entry().await? {
             let path = entry.path();
-            if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
-                continue;
-            }
-            if let Some(task_id) = path
+            let Some(task_id) = path
                 .file_stem()
                 .and_then(|name| name.to_str())
                 .and_then(|name| name.strip_prefix("minga-"))
-            {
-                task_ids.push(task_id.to_owned());
+                .map(str::to_owned)
+            else {
+                continue;
+            };
+            match path.extension().and_then(|extension| extension.to_str()) {
+                Some("json") => with_state.push(task_id),
+                Some("teardown") => {
+                    marked.insert(task_id);
+                }
+                _ => {}
             }
         }
         // Listed after the state files: a setup writes its state only once
-        // its namespace exists, so a live task is never torn down here.
+        // its namespace exists, so an unmarked live task is never torn down.
         let namespaces = output("ip", &["netns", "list"]).await?;
         let live: HashSet<&str> = namespaces
             .lines()
             .filter_map(|line| line.split_whitespace().next())
             .collect();
+        let orphaned = with_state
+            .into_iter()
+            .filter(|task_id| !live.contains(format!("minga-{task_id}").as_str()));
+        let pending: HashSet<String> = marked.into_iter().chain(orphaned).collect();
         let mut result = Ok(());
-        for task_id in task_ids {
-            if !live.contains(format!("minga-{task_id}").as_str()) {
-                if let Err(error) = self.teardown_task(&task_id).await {
-                    result = Err(error);
-                }
+        for task_id in pending {
+            if let Err(error) = self.teardown_task(&task_id).await {
+                result = Err(error);
             }
         }
         result
@@ -1753,6 +1799,15 @@ impl NetworkSetup {
                 continue;
             };
             if !untracked_namespaces.remove(namespace) {
+                continue;
+            }
+            // A failed teardown is retried by `retry_stale_teardowns`, never
+            // given its policy back.
+            let task_id = namespace.strip_prefix("minga-").unwrap_or(namespace);
+            if tokio::fs::try_exists(self.teardown_marker(task_id))
+                .await
+                .unwrap_or(false)
+            {
                 continue;
             }
             let raw = tokio::fs::read(&path).await?;
@@ -1811,7 +1866,6 @@ impl NetworkSetup {
                     ],
                 )
                 .await?;
-                let task_id = namespace.strip_prefix("minga-").unwrap_or(namespace);
                 run_nft_script(&egress_policy_script(
                     &egress_table_name(task_id),
                     &state.ips,
