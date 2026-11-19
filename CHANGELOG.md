@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- The built-in NATS sidecar's JetStream file store cap rose from 1GB to 8GB
+  (not preallocated). It shares the data volume with Raft and containerd, so
+  size that volume for it. Startup validation of a tenant signer's permission
+  template now also rejects duplicated entries that stand in for a missing one.
 - WASM agents share one node runtime and a bounded SHA-256 module cache. Epoch
   interruption stops guest execution at its configured timeout; linear memory
   is capped by the configured limit (64 MiB by default), with one memory, one
