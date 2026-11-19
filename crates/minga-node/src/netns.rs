@@ -32,7 +32,7 @@ use minga_state::types::{NetworkId, PortMapping};
 
 use crate::netns_rules::{
     egress_delete_args, egress_delete_script, egress_listener_script, egress_policy_script,
-    egress_table_name, EGRESS_LISTENER_TABLE,
+    egress_table_name, write_atomic, EGRESS_LISTENER_TABLE,
 };
 
 /// Errors from network setup. Always name the failing command.
@@ -1465,7 +1465,7 @@ impl NetworkSetup {
         ))
         .await?;
         state.required_egress = true;
-        tokio::fs::write(&state_path, serde_json::to_vec(&state)?).await?;
+        write_atomic(&state_path, &serde_json::to_vec(&state)?).await?;
         Ok(())
     }
 
@@ -1595,7 +1595,7 @@ impl NetworkSetup {
             required_egress: false,
         };
         let raw = serde_json::to_vec(&state)?;
-        tokio::fs::write(self.state_dir.join(format!("{ns}.json")), raw).await?;
+        write_atomic(&self.state_dir.join(format!("{ns}.json")), &raw).await?;
         for (veth, attachment) in state.veths.iter().zip(attachments) {
             ensure_task_source_rules(veth, attachment.ip).await?;
         }
@@ -1724,7 +1724,7 @@ impl NetworkSetup {
             if state.format_version != TASK_NET_STATE_FORMAT_VERSION {
                 state.format_version = TASK_NET_STATE_FORMAT_VERSION;
             }
-            tokio::fs::write(&path, serde_json::to_vec(&state)?).await?;
+            write_atomic(&path, &serde_json::to_vec(&state)?).await?;
             for (veth, ip) in state.veths.iter().zip(&state.ips) {
                 ensure_task_source_rules(veth, *ip).await?;
             }

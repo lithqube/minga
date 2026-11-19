@@ -1,8 +1,9 @@
-//! Plain helpers of the Linux-only `netns` module: nft script builders.
-//! They run no commands, so they live outside `netns` and their tests run
-//! on every host.
+//! Plain helpers of the Linux-only `netns` module: nft script builders and
+//! the task state-file writer. They run no commands, so they live outside
+//! `netns` and their tests run on every host.
 
 use std::net::Ipv4Addr;
+use std::path::Path;
 
 pub(crate) fn egress_table_name(task_id: &str) -> String {
     use sha2::{Digest, Sha256};
@@ -100,6 +101,27 @@ pub(crate) fn egress_delete_args(table: &str) -> [&str; 4] {
     ["delete", "table", "inet", table]
 }
 
+/// Replaces `path` with `contents` through a temporary file in the same
+/// directory, so a failed write never truncates the rollback state that
+/// teardown reads.
+pub(crate) async fn write_atomic(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = std::path::PathBuf::from(tmp);
+    let result = async {
+        let mut file = tokio::fs::File::create(&tmp).await?;
+        file.write_all(contents).await?;
+        file.sync_all().await?;
+        tokio::fs::rename(&tmp, path).await
+    }
+    .await;
+    if result.is_err() {
+        let _ = tokio::fs::remove_file(&tmp).await;
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -162,5 +184,22 @@ mod tests {
                 "add table {family} {table}\ndelete table {family} {table}\n"
             )));
         }
+    }
+
+    #[tokio::test]
+    async fn atomic_write_keeps_the_old_state_when_the_write_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("minga-t.json");
+        tokio::fs::write(&path, b"old").await.unwrap();
+        write_atomic(&path, b"new").await.unwrap();
+        assert_eq!(tokio::fs::read(&path).await.unwrap(), b"new");
+        assert!(!dir.path().join("minga-t.json.tmp").exists());
+
+        // A directory where the temporary file goes makes the write fail.
+        tokio::fs::create_dir(dir.path().join("minga-t.json.tmp"))
+            .await
+            .unwrap();
+        assert!(write_atomic(&path, b"newer").await.is_err());
+        assert_eq!(tokio::fs::read(&path).await.unwrap(), b"new");
     }
 }

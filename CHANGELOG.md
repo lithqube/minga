@@ -47,7 +47,9 @@
   than IPv4 and ARP, so a container with `CAP_NET_RAW` cannot send IPv6 to
   the host, its peers or past the forward hook. The old rules are replaced in
   the same nft transaction, and a failed removal at teardown is returned and
-  keeps the task's network state so the next teardown retries it.
+  keeps the task's network state so the next teardown retries it. The task
+  network state file is replaced through a temporary file, so a failed write
+  never truncates the records rollback needs to remove its port mappings.
 - Routed containers and `http` agents register a budget in the proxy's
   tracker before they start, so their first request is no longer refused with
   429. Egress policies carry no token budget yet, so routed containers are not
