@@ -1520,12 +1520,13 @@ async fn a_v8_snapshot_imports_at_its_byte_quota_and_keeps_the_quota() {
             copy
         })
         .collect();
-    let v8_bytes: usize = old_json["services"]
+    let v8_sizes: Vec<usize> = old_json["services"]
         .as_array()
         .unwrap()
         .iter()
         .map(|s| serde_json::to_vec(s).unwrap().len())
-        .sum();
+        .collect();
+    let v8_bytes: usize = v8_sizes.iter().sum();
     let legacy: StateSnapshot = serde_json::from_value(old_json).unwrap();
     let v9_bytes: usize = legacy
         .services
@@ -1546,6 +1547,21 @@ async fn a_v8_snapshot_imports_at_its_byte_quota_and_keeps_the_quota() {
         "a v8 import over its v8 size must be refused"
     );
     assert_eq!(left, Some(v8_bytes as u64 - 1));
+
+    // A repeated service id replaces its record, so its growth counts once.
+    let repeated = StateSnapshot {
+        services: vec![
+            legacy.services[0].clone(),
+            legacy.services[0].clone(),
+            legacy.services[1].clone(),
+        ],
+        ..legacy.clone()
+    };
+    let limit = (v8_sizes[0] + v8_sizes[1]) as u64;
+    let (result, _) = import_with_byte_quota(repeated.clone(), limit).await;
+    result.unwrap();
+    let (result, _) = import_with_byte_quota(repeated, limit - 1).await;
+    assert!(result.is_err(), "a repeated id must not add allowance");
 
     // The same records as a current-format snapshot get no allowance.
     let as_v9 = StateSnapshot {

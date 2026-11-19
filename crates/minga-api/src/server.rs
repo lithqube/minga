@@ -2519,11 +2519,25 @@ mod tests {
                 r#"{"format_version": 99, "services": "new shape"}"#,
             ))
             .unwrap();
-        let (status, json) = send_request(router, req).await;
+        let (status, json) = send_request(router.clone(), req).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(json["message"]
             .as_str()
             .unwrap()
             .contains("format version 99"));
+
+        // An older version the store migrates is accepted.
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1.41/state")
+            .header("Authorization", "Bearer s3cret")
+            .header("Content-Type", "application/json")
+            .body(Body::from(
+                r#"{"format_version": 8, "exported_at_unix": 0, "tenants": [], "services": [],
+                    "networks": [], "volumes": [], "secrets": [], "configs": []}"#,
+            ))
+            .unwrap();
+        let (status, json) = send_request(router, req).await;
+        assert!(status.is_success(), "{status}: {json}");
     }
 }

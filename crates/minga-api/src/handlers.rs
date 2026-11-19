@@ -436,12 +436,14 @@ pub async fn import_state(
 ) -> ApiResult<Json<serde_json::Value>> {
     let tenant_id = tenant_scope(&caller)?;
     // Check the version before the shape: a newer file may not parse as ours.
+    // Older versions the store migrates on import are accepted.
+    let oldest = minga_state::codec::V2_FORMAT_VERSION;
     let want = minga_state::codec::FORMAT_VERSION;
     match body.get("format_version").and_then(|v| v.as_u64()) {
-        Some(v) if v == u64::from(want) => {}
+        Some(v) if (u64::from(oldest)..=u64::from(want)).contains(&v) => {}
         other => {
             return Err(bad_request(format!(
-                "snapshot has format version {}, this build reads {want}",
+                "snapshot has format version {}, this build reads {oldest} to {want}",
                 other.map_or("none".to_string(), |v| v.to_string())
             )))
         }

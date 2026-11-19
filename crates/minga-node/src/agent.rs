@@ -570,7 +570,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_pre_v9_agent_with_env_still_starts() {
+    async fn a_migrated_v8_agent_with_env_still_starts() {
+        // State migration decodes each stored record and re-encodes it; do
+        // the same with the frozen v8 task record.
+        let v8 = include_str!("../../minga-state/tests/fixtures/v8/task.json");
+        let task: minga_state::types::Task = minga_state::codec::decode(v8.as_bytes()).unwrap();
+        let task: minga_state::types::Task =
+            minga_state::codec::decode(&minga_state::codec::encode(&task).unwrap()).unwrap();
+        let minga_state::types::WorkloadKind::Agent(spec) = task.spec.kind else {
+            panic!("the v8 task fixture is an agent task");
+        };
+        assert!(!spec.sandbox_env.is_empty(), "the fixture must carry env");
+
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("start.wat"),
@@ -578,12 +589,10 @@ mod tests {
         )
         .unwrap();
         let exec = WasmtimeAgentExecutor::new(dir.path()).await.unwrap();
-
-        // Shape of a v8 record: no `capabilities` key.
-        let spec: AgentSpec = serde_json::from_str(
-            r#"{"module_ref":"start.wat","fuel_limit":1000000,"sandbox_env":{"MODEL":"small"}}"#,
-        )
-        .unwrap();
+        let spec = AgentSpec {
+            module_ref: "start.wat".into(),
+            ..*spec
+        };
         let id = exec.start(&"task-legacy".to_string(), &spec).await.unwrap();
         assert_eq!(exec.status(&id).await, Some(AgentStatus::Completed));
     }

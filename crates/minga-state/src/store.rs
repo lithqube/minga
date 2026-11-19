@@ -929,12 +929,14 @@ impl StateStore {
         // own data. Each write carries that tenant's growth so far; the quota
         // itself never changes, and current-format imports get no allowance.
         let legacy = snapshot.format_version < want;
-        let mut growth: BTreeMap<String, u64> = BTreeMap::new();
+        // Keyed by service id: a repeated id replaces its record, so only its
+        // latest growth counts.
+        let mut growth: BTreeMap<String, BTreeMap<String, u64>> = BTreeMap::new();
         for s in snapshot.services {
             if legacy {
-                let allowance = growth.entry(s.tenant_id.clone()).or_default();
-                *allowance = allowance.saturating_add(v9_growth(&s)?);
-                let byte_allowance = *allowance;
+                let tenant = growth.entry(s.tenant_id.clone()).or_default();
+                tenant.insert(s.id.clone(), v9_growth(&s)?);
+                let byte_allowance = tenant.values().fold(0u64, |sum, g| sum.saturating_add(*g));
                 self.write_service(StateCommand::ImportService {
                     service: s,
                     byte_allowance,
