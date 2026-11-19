@@ -69,15 +69,19 @@ fn docker_update_config_to_policy(
 
 /// Makes a missing or null `capabilities` in agent JSON mean no grants. API
 /// input is v9 or later; only pre-v9 stored records get the implicit `env`.
-pub fn deny_omitted_capabilities(agent: &mut serde_json::Value) {
-    if let Some(agent) = agent.as_object_mut() {
-        let capabilities = agent
-            .entry("capabilities")
-            .or_insert(serde_json::Value::Null);
-        if capabilities.is_null() {
-            *capabilities = serde_json::json!({});
-        }
+/// Serde would also decode a JSON array by position and skip this, so only
+/// objects are accepted.
+pub fn deny_omitted_capabilities(agent: &mut serde_json::Value) -> Result<(), String> {
+    let agent = agent
+        .as_object_mut()
+        .ok_or_else(|| "agent spec must be a JSON object".to_owned())?;
+    let capabilities = agent
+        .entry("capabilities")
+        .or_insert(serde_json::Value::Null);
+    if capabilities.is_null() {
+        *capabilities = serde_json::json!({});
     }
+    Ok(())
 }
 
 /// Admission checks for an agent that need no node configuration. Caught here
@@ -122,7 +126,8 @@ pub fn service_spec_to_state(spec: &models::ServiceSpec) -> Result<Service, Stri
                 format!("service '{name}': invalid {AGENT_LABEL} label: {e}")
             };
             let mut value: serde_json::Value = serde_json::from_str(raw).map_err(invalid)?;
-            deny_omitted_capabilities(&mut value);
+            deny_omitted_capabilities(&mut value)
+                .map_err(|e| format!("service '{name}': invalid {AGENT_LABEL} label: {e}"))?;
             serde_json::from_value::<AgentSpec>(value).map_err(invalid)
         })
         .transpose()?
@@ -1227,6 +1232,19 @@ mod tests {
             let error = service_spec_to_state(&spec).unwrap_err();
             assert!(error.contains("unknown field"), "{label}: {error}");
         }
+    }
+
+    /// Serde decodes a struct from a JSON array by position, which would skip
+    /// the omitted-capabilities rule and grant `env` implicitly.
+    const POSITIONAL_AGENT: &str = r#"["a.wasm",null,null,null,null,null,null,{"K":"v"},null]"#;
+
+    #[test]
+    fn agent_label_must_be_a_json_object() {
+        let mut spec = sample_docker_spec();
+        spec.Labels
+            .insert(AGENT_LABEL.to_string(), POSITIONAL_AGENT.to_string());
+        let error = service_spec_to_state(&spec).unwrap_err();
+        assert!(error.contains("must be a JSON object"), "{error}");
     }
 
     #[test]

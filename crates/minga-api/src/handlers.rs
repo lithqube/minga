@@ -451,16 +451,23 @@ pub async fn import_state(
     // v9 snapshots always carry capabilities, so an omitted one means none,
     // as in the agent label; only older ones get the migration's `env`.
     if version > u64::from(minga_state::codec::V8_FORMAT_VERSION) {
-        fn deny_omitted(service: &mut serde_json::Value) {
-            if let Some(agent) = service.get_mut("agent") {
-                crate::translate::deny_omitted_capabilities(agent);
+        // Serde decodes arrays by position, so non-objects would skip this.
+        fn deny_omitted(service: &mut serde_json::Value) -> Result<(), String> {
+            let service = service
+                .as_object_mut()
+                .ok_or_else(|| "each service must be a JSON object".to_owned())?;
+            if let Some(agent) = service.get_mut("agent").filter(|a| !a.is_null()) {
+                crate::translate::deny_omitted_capabilities(agent)?;
             }
-            if let Some(previous) = service.get_mut("previous") {
-                deny_omitted(previous);
+            match service.get_mut("previous") {
+                Some(previous) if !previous.is_null() => deny_omitted(previous),
+                _ => Ok(()),
             }
         }
         if let Some(services) = body.get_mut("services").and_then(|s| s.as_array_mut()) {
-            services.iter_mut().for_each(deny_omitted);
+            for service in services {
+                deny_omitted(service).map_err(bad_request)?;
+            }
         }
     }
     let mut snapshot: minga_state::StateSnapshot = serde_json::from_value(body)?;

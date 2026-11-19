@@ -2562,6 +2562,30 @@ mod tests {
                 "{json}"
             );
         }
+
+        // Serde decodes arrays by position, so non-object services and
+        // agents are refused before the omitted-capabilities rule runs. This
+        // array would decode with `sandbox_env` set and capabilities omitted.
+        let positional: serde_json::Value =
+            serde_json::from_str(r#"["a.wasm",null,null,null,null,null,null,{"K":"v"},null]"#)
+                .unwrap();
+        let mut agent_array = exported.clone();
+        agent_array["services"][0]["agent"] = positional;
+        let mut previous_array = exported.clone();
+        previous_array["services"][0]["previous"] = serde_json::json!([]);
+        let mut service_array = exported.clone();
+        service_array["services"][0] = serde_json::json!([]);
+        for body in [agent_array, previous_array, service_array] {
+            let (status, json) = import(router.clone(), body).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
+            assert!(
+                json["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("must be a JSON object"),
+                "{json}"
+            );
+        }
     }
 
     #[tokio::test]
