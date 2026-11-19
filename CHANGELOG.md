@@ -21,7 +21,9 @@
   bodies are buffered (64 KiB) and redacted whole instead of streamed;
   non-streamed bodies are capped at 32 MiB; a failed body read is charged
   like a transport error; streams have an idle timeout and keep draining
-  after a client disconnects. Usage is read from the top-level JSON field,
+  after a client disconnects; a client that stops reading for the idle
+  timeout is cut off (its body ends in an error, never a clean end) while
+  the upstream is drained and the reservation settles. Usage is read from the top-level JSON field,
   cache keys carry a route revision (with a per-process keyed fingerprint of
   the route credentials, so a rotated credential never serves the old
   account's entries) and the forwarded `accept`, `anthropic-version` and

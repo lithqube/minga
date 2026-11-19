@@ -907,40 +907,46 @@ async fn proxy_handler(State(state): State<Arc<ProxyState>>, req: Request) -> Re
     let route = selected_route.map(|r| r.name.clone()).unwrap_or_default();
     let prices = route_prices(selected_route);
     let idle_timeout = state.config.stream_idle_timeout;
+    // Set when the client stopped reading: its body then ends in an error
+    // instead of a clean end of stream.
+    let stalled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let relay_stalled = Arc::clone(&stalled);
     tokio::spawn(async move {
         use futures_util::StreamExt;
         let mut parser = UsageParser::new(is_sse);
         let mut bytes_seen = 0_u64;
         let mut client = Some(sender);
+        let relay = |client: &Option<ClientSender>, item: ClientItem| {
+            relay_to_client(
+                client.clone(),
+                item,
+                idle_timeout,
+                Arc::clone(&relay_stalled),
+            )
+        };
         loop {
             let chunk = match tokio::time::timeout(idle_timeout, stream.next()).await {
                 Ok(Some(Ok(chunk))) => chunk,
                 Ok(None) => break,
                 Ok(Some(Err(error))) => {
-                    if let Some(client) = &client {
-                        let _ = client
-                            .send(Err(std::io::Error::other(error.to_string())))
-                            .await;
-                    }
+                    relay(&client, Err(std::io::Error::other(error.to_string()))).await;
                     break;
                 }
                 Err(_) => {
-                    if let Some(client) = &client {
-                        let _ = client
-                            .send(Err(std::io::Error::other("upstream stream idle timeout")))
-                            .await;
-                    }
+                    relay(
+                        &client,
+                        Err(std::io::Error::other("upstream stream idle timeout")),
+                    )
+                    .await;
                     break;
                 }
             };
             bytes_seen = bytes_seen.saturating_add(chunk.len() as u64);
             parser.push(&chunk);
-            // A client that hung up stops receiving, but the upstream is
-            // drained so its reported usage is still recorded.
-            if let Some(sender) = &client {
-                if sender.send(Ok(chunk)).await.is_err() {
-                    client = None;
-                }
+            // A client that hung up or stalled stops receiving, but the
+            // upstream is drained so its reported usage is still recorded.
+            if !relay(&client, Ok(chunk)).await {
+                client = None;
             }
         }
         // End the client body before waiting on usage publication.
@@ -979,11 +985,46 @@ async fn proxy_handler(State(state): State<Arc<ProxyState>>, req: Request) -> Re
     for (name, value) in &resp_headers {
         response = response.header(name, value);
     }
+    // A stalled client that resumes reads what was queued, then an error,
+    // so it never mistakes a cut-off body for a complete one.
+    use futures_util::StreamExt as _;
+    let cut_off = futures_util::stream::once(async move {
+        stalled
+            .load(std::sync::atomic::Ordering::SeqCst)
+            .then(|| Err(std::io::Error::other("client stopped reading the stream")))
+    })
+    .filter_map(std::future::ready);
     response
         .body(Body::from_stream(
-            tokio_stream::wrappers::ReceiverStream::new(receiver),
+            tokio_stream::wrappers::ReceiverStream::new(receiver).chain(cut_off),
         ))
         .unwrap_or_else(|_| Response::new(Body::empty()))
+}
+
+type ClientItem = Result<bytes::Bytes, std::io::Error>;
+type ClientSender = tokio::sync::mpsc::Sender<ClientItem>;
+
+/// Hands one item to the client body within `deadline`, so a client that
+/// stays connected but stops reading cannot hold the relay, and with it the
+/// reservation. Returns false when the client hung up or stalled; a stall
+/// also sets `stalled`, and the caller then drains the upstream, settles
+/// and publishes as for a client that hung up.
+async fn relay_to_client(
+    client: Option<ClientSender>,
+    item: ClientItem,
+    deadline: Duration,
+    stalled: Arc<std::sync::atomic::AtomicBool>,
+) -> bool {
+    let Some(client) = client else {
+        return false;
+    };
+    match tokio::time::timeout(deadline, client.send(item)).await {
+        Ok(result) => result.is_ok(),
+        Err(_) => {
+            stalled.store(true, std::sync::atomic::Ordering::SeqCst);
+            false
+        }
+    }
 }
 
 /// The base redactor plus every credential of the request's route chain.
@@ -1904,22 +1945,29 @@ mod tests {
         use bytes::Bytes;
         use futures_util::StreamExt;
 
+        // The second chunk waits for the test, so a proxy that buffers the
+        // body before sending headers never answers within the deadline.
+        let release = Arc::new(tokio::sync::Notify::new());
+        let upstream_release = Arc::clone(&release);
         let app = Router::new().route(
             "/*path",
-            any(|| async {
-                let (sender, receiver) =
-                    tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(2);
-                tokio::spawn(async move {
-                    let _ = sender.send(Ok(Bytes::from_static(b"first\n"))).await;
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                    let _ = sender.send(Ok(Bytes::from_static(b"second\n"))).await;
-                });
-                Response::builder()
-                    .header("content-type", "text/event-stream")
-                    .body(AxumBody::from_stream(
-                        tokio_stream::wrappers::ReceiverStream::new(receiver),
-                    ))
-                    .unwrap()
+            any(move || {
+                let release = Arc::clone(&upstream_release);
+                async move {
+                    let (sender, receiver) =
+                        tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(2);
+                    tokio::spawn(async move {
+                        let _ = sender.send(Ok(Bytes::from_static(b"first\n"))).await;
+                        release.notified().await;
+                        let _ = sender.send(Ok(Bytes::from_static(b"second\n"))).await;
+                    });
+                    Response::builder()
+                        .header("content-type", "text/event-stream")
+                        .body(AxumBody::from_stream(
+                            tokio_stream::wrappers::ReceiverStream::new(receiver),
+                        ))
+                        .unwrap()
+                }
             }),
         );
         let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1942,23 +1990,82 @@ mod tests {
             tokens,
         );
         let address = proxy.start("127.0.0.1:0").await.unwrap();
-        let response = reqwest::Client::new()
-            .post(format!("http://{address}/v1/chat"))
-            .header(SANDBOX_TOKEN_HEADER, token.as_str())
-            .body("{}")
-            .send()
-            .await
-            .unwrap();
-        let mut body = response.bytes_stream();
-        let first = tokio::time::timeout(Duration::from_millis(500), body.next())
-            .await
-            .expect("first chunk should not wait for upstream completion")
-            .unwrap()
-            .unwrap();
+        let (mut body, first) = tokio::time::timeout(Duration::from_secs(5), async {
+            let response = reqwest::Client::new()
+                .post(format!("http://{address}/v1/chat"))
+                .header(SANDBOX_TOKEN_HEADER, token.as_str())
+                .body("{}")
+                .send()
+                .await
+                .unwrap();
+            let mut body = response.bytes_stream();
+            let first = body.next().await.unwrap().unwrap();
+            (body, first)
+        })
+        .await
+        .expect("headers and the first chunk should not wait for upstream completion");
         assert_eq!(first.as_ref(), b"first\n");
+        release.notify_one();
         while body.next().await.is_some() {}
         assert_eq!(proxy.cache_stats().unwrap().stores, 0, "not cached at EOF");
         proxy.shutdown();
+    }
+
+    #[tokio::test]
+    async fn a_client_that_stops_reading_releases_the_reservation() {
+        use bytes::Bytes;
+        let app = Router::new().route(
+            "/*path",
+            any(|| async {
+                let chunks = (0..64).map(|_| Ok::<_, std::io::Error>(Bytes::from(vec![b'x'; 64])));
+                Response::builder()
+                    .header("content-type", "text/event-stream")
+                    .body(Body::from_stream(futures_util::stream::iter(chunks)))
+                    .unwrap()
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.ok() });
+        let budgets = Arc::new(BudgetTracker::new());
+        budgets.register("stalled", Budget::new(1_000_000, Duration::from_secs(3600)));
+        let config = EgressProxyConfig {
+            upstream_url: format!("http://{address}"),
+            stream_idle_timeout: Duration::from_millis(200),
+            ..Default::default()
+        };
+        let tokens = Arc::new(SandboxTokens::new());
+        let token = tokens.issue_standalone("stalled");
+        let state = Arc::new(ProxyState {
+            route_client: route_client(&config),
+            config,
+            budgets: Arc::clone(&budgets),
+            cache: None,
+            redactor: SecretRedactor::with_defaults(),
+            client: reqwest::Client::new(),
+            tokens,
+            bus: std::sync::OnceLock::new(),
+        });
+        // No output cap: the request holds the whole balance until it settles.
+        let response = proxy_handler(State(state), post(token.as_str(), "{}")).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        // The body is never read, so the relay's queue fills and stalls.
+        let settled = tokio::time::timeout(Duration::from_secs(5), async {
+            while budgets.status("stalled").unwrap().used >= 1_000_000 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(
+            settled.is_ok(),
+            "a stalled client still holds the reservation"
+        );
+        assert!(
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .is_err(),
+            "a cut-off body ends in an error, not a clean end of stream"
+        );
     }
 
     #[test]
