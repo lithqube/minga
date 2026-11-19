@@ -155,6 +155,11 @@ pub async fn restrict_egress_listener(port: u16) -> Result<(), NetError> {
     run_nft_script(&egress_listener_script(port)).await
 }
 
+/// Removes the egress listener restriction, if any. A missing table is fine.
+pub async fn remove_egress_listener() {
+    run_tolerated("nft", &egress_delete_args(EGRESS_LISTENER_TABLE)).await;
+}
+
 fn egress_delete_args(table: &str) -> [&str; 4] {
     ["delete", "table", "inet", table]
 }

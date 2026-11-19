@@ -22,11 +22,14 @@
   are capped at 256 bytes. `EgressProxy::with_event_bus` now returns a
   `Result` and works after `router()` was called.
 - The worker egress proxy is opt-in: `--egress-bind` has no default, so a
-  worker without it no longer takes port 8080. Any bind is accepted; tasks use
-  its port on their bridge gateway, and on Linux an nft table closes it to
-  everything but loopback and task bridges. Workers with the proxy carry the
-  reserved `com.minga.egress.proxy=true` label, which placement requires for
-  services with egress routes.
+  worker without it no longer takes port 8080. Port 0 is refused; tasks use
+  the bind's port on their bridge gateway. On Linux an nft table closes the
+  port to everything but loopback and task bridges; it is installed after the
+  socket binds and before it serves, and removed on shutdown, on a failed
+  start, and at start-up without a proxy. Only workers with a wildcard bind
+  (`0.0.0.0` or `[::]`) carry the reserved `com.minga.egress.proxy=true`
+  label, which placement requires for services with egress routes; a
+  loopback bind serves host-local agents only.
 - Required-egress nft rules now match what the inet hooks see under
   `br_netfilter` (the bridge plus the task's guarded source address), so they
   block routed and same-bridge traffic; a real-kernel test covers it.

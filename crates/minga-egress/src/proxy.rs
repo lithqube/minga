@@ -203,6 +203,12 @@ impl EgressProxy {
         let listener = tokio::net::TcpListener::bind(addr)
             .await
             .map_err(|e| EgressProxyError::Internal(format!("bind failed: {e}")))?;
+        self.serve(listener)
+    }
+
+    /// Serves on an already bound listener, so the caller can install a
+    /// firewall rule for the port between binding and serving.
+    pub fn serve(&mut self, listener: tokio::net::TcpListener) -> Result<String, EgressProxyError> {
         let local_addr = listener
             .local_addr()
             .map_err(|e| EgressProxyError::Internal(format!("local_addr failed: {e}")))?;
