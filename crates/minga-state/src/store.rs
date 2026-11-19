@@ -948,14 +948,24 @@ impl StateStore {
     }
 }
 
-/// Bytes a service gained over its v8 encoding: the agent `capabilities` key.
+/// Bytes a service gained over its v8 encoding: the agent `capabilities` key,
+/// including agents nested in `previous`.
 fn v9_growth(service: &Service) -> Result<u64, StateError> {
+    fn strip(value: &mut serde_json::Value) {
+        let Some(object) = value.as_object_mut() else {
+            return;
+        };
+        if let Some(agent) = object.get_mut("agent").and_then(|a| a.as_object_mut()) {
+            agent.remove("capabilities");
+        }
+        if let Some(previous) = object.get_mut("previous") {
+            strip(previous);
+        }
+    }
     let bad = |e: serde_json::Error| StateError::BadSnapshot(e.to_string());
     let mut value = serde_json::to_value(service).map_err(bad)?;
     let new = serde_json::to_vec(&value).map_err(bad)?.len();
-    if let Some(agent) = value.get_mut("agent").and_then(|a| a.as_object_mut()) {
-        agent.remove("capabilities");
-    }
+    strip(&mut value);
     let old = serde_json::to_vec(&value).map_err(bad)?.len();
     Ok((new - old) as u64)
 }

@@ -238,6 +238,7 @@ fn enforce_desired_state_bytes(
     replaced_table: &str,
     replaced_id: &str,
     candidate_len: usize,
+    allowance: u64,
 ) -> Result<Option<String>, StorageError<u64>> {
     let Some(limit) = limit else {
         return Ok(None);
@@ -284,7 +285,11 @@ fn enforce_desired_state_bytes(
     if replaced_len.is_some_and(|old| candidate_len as u64 <= old) {
         return Ok(None);
     }
-    total = total.saturating_add(candidate_len as u64);
+    // `allowance` discounts the whole total, not just this record: it covers
+    // growth of every record an older-format import has written so far.
+    total = total
+        .saturating_add(candidate_len as u64)
+        .saturating_sub(allowance);
     if total > limit {
         return Ok(Some(format!(
             "tenant quota exceeded: desired_state_bytes limit {limit}"
@@ -592,9 +597,8 @@ impl RedbStateMachine {
                     quotas.desired_state_bytes,
                     "services",
                     &svc.id,
-                    bytes
-                        .len()
-                        .saturating_sub(usize::try_from(byte_allowance).unwrap_or(usize::MAX)),
+                    bytes.len(),
+                    byte_allowance,
                 )? {
                     return Ok(StateResponse::Error(error));
                 }
@@ -636,6 +640,7 @@ impl RedbStateMachine {
                     "tasks",
                     &task.id,
                     bytes.len(),
+                    0,
                 )? {
                     return Ok(StateResponse::Error(error));
                 }
@@ -681,6 +686,7 @@ impl RedbStateMachine {
                     "networks",
                     &net.id,
                     bytes.len(),
+                    0,
                 )? {
                     return Ok(StateResponse::Error(error));
                 }
@@ -726,6 +732,7 @@ impl RedbStateMachine {
                     "volumes",
                     &vol.id,
                     bytes.len(),
+                    0,
                 )? {
                     return Ok(StateResponse::Error(error));
                 }
@@ -767,6 +774,7 @@ impl RedbStateMachine {
                     "secrets",
                     &s.id,
                     bytes.len(),
+                    0,
                 )? {
                     return Ok(StateResponse::Error(error));
                 }
@@ -808,6 +816,7 @@ impl RedbStateMachine {
                     "configs",
                     &c.id,
                     bytes.len(),
+                    0,
                 )? {
                     return Ok(StateResponse::Error(error));
                 }

@@ -1507,6 +1507,19 @@ async fn a_v8_snapshot_imports_at_its_byte_quota_and_keeps_the_quota() {
     let mut old_json = serde_json::to_value(&current).unwrap();
     old_json["format_version"] = serde_json::json!(V8_FORMAT_VERSION);
     strip_agent_capabilities(&mut old_json);
+    // Many agent services, each with an agent in `previous` too: their summed
+    // growth exceeds any one record, and nested agents grow as well.
+    let base = old_json["services"][0].clone();
+    old_json["services"] = (0..150)
+        .map(|i| {
+            let mut copy = base.clone();
+            copy["id"] = serde_json::json!(format!("shop.web{i}"));
+            copy["name"] = serde_json::json!(format!("web{i}"));
+            copy["ports"] = serde_json::json!([]);
+            copy["previous"] = base.clone();
+            copy
+        })
+        .collect();
     let v8_bytes: usize = old_json["services"]
         .as_array()
         .unwrap()
