@@ -18,7 +18,12 @@ Named after the [minga](https://en.wikipedia.org/wiki/Minga) of Chiloé, where a
 > - **Sandbox status:** Wasmtime fuel, epoch timeout and memory limits are enforced. Agent capability grants are parsed and validated, but WASI host imports are not linked yet; WASM guests cannot use env, files, clocks, stdio or HTTP egress. Firecracker remains a stub.
 > - **Pre-release checks:** tenant-isolation proof, manager rejoin after NATS credential changes, and large-cluster scale measurement. VM tests remain deferred until release readiness.
 >
-> **Not in tagged `v1.2.0`:** cross-node WireGuard networking, tenant isolation, API client-certificate roles and audit. Those are current-main features, not part of the v1.2.0 release.
+> **Not in `v1.2.0`:**
+> - Cross-node WireGuard networking.
+> - Tenant isolation.
+> - API client-certificate roles and audit.
+>
+> These are current-main features, not part of the v1.2.0 release.
 >
 > Other current limits: no seccomp profile; Raft TLS without mTLS still warns rather than refusing off-loopback; API TLS/mTLS is available on current main, while `minga-ctl` does not yet support client-certificate credentials in its context.
 >

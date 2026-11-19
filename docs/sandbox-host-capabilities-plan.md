@@ -56,7 +56,7 @@ The Compose parser and node validate the shape, without linking the grants:
 - Without `env`, the `env:` map is not exposed. Declaring `env:` without the grant is an error.
 - `dirs[].host` must be absolute with no `..`; `guest` must be absolute and unique. There is no write mode.
 - The node canonicalizes and checks directory roots under `minga worker --agent-dir-root PATH`, and requires the tenant-specific subdirectory. No root means no dirs are accepted. These checks do not mount a guest filesystem yet.
-- The `http` grant is accepted by the schema but has no guest host function yet; the planned runtime must require node egress before starting an HTTP-enabled run.
+- Node validation rejects an `http` grant when `--egress-bind` is absent. The grant still has no guest HTTP host function; the planned runtime must route guest HTTP through the egress proxy.
 - `egress_url` remains accepted for compatibility and is informational only.
 
 ## 3. State and transport

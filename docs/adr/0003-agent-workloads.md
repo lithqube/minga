@@ -140,7 +140,7 @@ New subcommand: `minga agent ls` — list running/completed agents.
 
 The egress proxy runs **on the worker node** (co-located with the agent executor), not as a separate service. This means:
 
-- Agent WASM modules reach the LLM API only through the local proxy (`127.0.0.1:PORT`).
+- Routed containers use the worker-local egress proxy. Current WASM guests have no HTTP host import and cannot reach it; the planned host function will route approved guest HTTP through this proxy.
 - Token budgets are enforced per-workload at the proxy, keyed by the workload the request's sandbox token was minted for (see Implementation status).
 - Secrets (API keys) never cross the bus or Raft, and agents never hold them: the proxy reads the provider key from the node secret store and injects it in transit.
 - In air-gapped deployments, the proxy can point at a local model server instead of a cloud API.

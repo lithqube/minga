@@ -157,10 +157,9 @@ certificate flags, or previous Raft data directory is needed.
 
 | Flag | Default | Notes |
 | --- | --- | --- |
-| `--api-bind <ADDR>` | `0.0.0.0:2375` | The manager's Docker API listener. Bind `127.0.0.1:2375` unless remote clients or containers must reach it; for remote access, configure `--api-token` or TLS with `--api-client-ca` and firewall the port. |
+| `--api-bind <ADDR>` | `0.0.0.0:2375` | Manager Docker API listener. For remote access, prefer an SSH tunnel or TLS/mTLS. `--api-token` over plain HTTP sends the token and API traffic unencrypted; firewalling limits reachability but does not encrypt traffic. |
 | `--api-token`, `MINGA_API_TOKEN` | none | Bearer token on API requests, or Basic-auth password for Traefik's Swarm provider. Prefer the environment (`EnvironmentFile`) over the flag so the token is not in process listings. Membership and tenant-administration endpoints require a cluster-operator identity (`O=*` client certificate or configured API token). |
-| `--api-tls-cert <PEM>`, `--api-tls-key <PEM>` | none | Enables TLS on the manager API listener. Supply both. |
-| `--api-client-ca <PEM>` | none | Requires client certificates signed by this CA and maps certificate caller, role and tenant to an API identity. |
+| `--api-tls-cert <PEM>`, `--api-tls-key <PEM>`, `--api-client-ca <PEM>` | none | Enables HTTPS with mandatory client-certificate authentication (mTLS). All three flags are required together; a partial set fails startup. |
 
 ### Client commands
 
@@ -252,7 +251,7 @@ Through the API:
 | `secret list` | Secret metadata; values never leave the nodes. |
 | `health [--stack STACK] [--timeout SECS]` | The API, and with `--stack` the stack's services and their health URLs. |
 | `metrics` | The Prometheus metrics the cluster reports. |
-| `agent usage [--customer ID] [--since 30d]` | Shows retained per-request token/cost usage for the caller's tenant; cluster operators see totals by tenant. This command is read-only. |
+| `agent usage [--customer ID] [--since 30d]` | Authenticates with the context API token as a cluster operator and reports usage totals by tenant. `minga-ctl` cannot present tenant client certificates, so it does not return per-tenant request rows; `--customer` is rejected for this caller. Read-only. |
 
 On the nodes, over SSH (`--ssh TARGET`, repeatable; by default the context's
 `--node` targets, else its `--ssh`, else this machine):
