@@ -544,18 +544,21 @@ pub async fn import_state(
     }
 
     for service in &snapshot.services {
-        for reference in &service.secrets {
-            let in_snapshot = snapshot
-                .secrets
-                .iter()
-                .any(|secret| secret.id == reference.secret_id);
+        let egress_secrets = service.egress.iter().flat_map(|policy| policy.secret_ids());
+        for secret_id in service
+            .secrets
+            .iter()
+            .map(|reference| reference.secret_id.as_str())
+            .chain(egress_secrets)
+        {
+            let in_snapshot = snapshot.secrets.iter().any(|secret| secret.id == secret_id);
             let in_store = app
                 .store
-                .get_secret(&reference.secret_id)
+                .get_secret(secret_id)
                 .await?
                 .is_some_and(|secret| secret.tenant_id == tenant_id);
             if !in_snapshot && !in_store {
-                return Err(not_found("secret", &reference.secret_id));
+                return Err(not_found("secret", secret_id));
             }
         }
         for network_id in &service.networks {
@@ -598,6 +601,33 @@ fn label_filters(filters: &Filters) -> Vec<String> {
 /// Checks if a name matches any of the name filters.
 fn name_matches(name: &str, filters: &[String]) -> bool {
     filters.is_empty() || filters.iter().any(|f| f == name)
+}
+
+/// Every secret a service names, in `secrets` or an egress route, must be
+/// declared and owned by the caller's tenant; another tenant's is a 404.
+async fn check_service_secrets(
+    app: &AppState,
+    tenant_id: &str,
+    svc: &StateService,
+) -> ApiResult<()> {
+    let egress_secrets = svc.egress.iter().flat_map(|policy| policy.secret_ids());
+    for secret_id in svc
+        .secrets
+        .iter()
+        .map(|reference| reference.secret_id.as_str())
+        .chain(egress_secrets)
+    {
+        match app.store.get_secret(secret_id).await? {
+            Some(secret) if secret.tenant_id == tenant_id => {}
+            Some(_) => return Err(not_found("secret", secret_id)),
+            None => {
+                return Err(bad_request(format!(
+                    "secret `{secret_id}` is not declared; create its metadata and provision it on eligible nodes first"
+                )))
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Deploy-time hard failure: rejects a service that would get zero tasks
@@ -1195,19 +1225,7 @@ pub async fn create_service(
     let tenant_id = tenant_scope(&caller)?;
     let mut svc = translate::service_spec_to_state(&spec).map_err(ApiError::BadRequest)?;
     svc.tenant_id = tenant_id.to_owned();
-    for reference in &svc.secrets {
-        let secret = app.store.get_secret(&reference.secret_id).await?;
-        match secret {
-            Some(secret) if secret.tenant_id == tenant_id => {}
-            Some(_) => return Err(not_found("secret", &reference.secret_id)),
-            None => {
-                return Err(bad_request(format!(
-                    "secret `{}` is not declared; create its metadata and provision it on eligible nodes first",
-                    reference.secret_id
-                )))
-            }
-        }
-    }
+    check_service_secrets(&app, tenant_id, &svc).await?;
     for network_id in &svc.networks {
         let network = app.store.get_network(network_id).await?;
         if !network.is_some_and(|network| network.tenant_id == tenant_id) {
@@ -1327,18 +1345,12 @@ pub async fn update_service(
 
     let mut svc = translate::service_spec_to_state(&spec).map_err(ApiError::BadRequest)?;
     svc.tenant_id = tenant_id.to_owned();
-    for reference in &svc.secrets {
-        match app.store.get_secret(&reference.secret_id).await? {
-            Some(secret) if secret.tenant_id == tenant_id => {}
-            Some(_) => return Err(not_found("secret", &reference.secret_id)),
-            None => {
-                return Err(bad_request(format!(
-                    "secret `{}` is not declared; create its metadata and provision it on eligible nodes first",
-                    reference.secret_id
-                )))
-            }
-        }
+    // A Docker client that drops the egress label must not drop the policy.
+    if svc.egress.is_none() {
+        svc.egress = existing.egress.clone();
+        translate::sync_required_egress_label(&mut svc);
     }
+    check_service_secrets(&app, tenant_id, &svc).await?;
     for network_id in &svc.networks {
         let network = app.store.get_network(network_id).await?;
         if !network.is_some_and(|network| network.tenant_id == tenant_id) {
@@ -2334,6 +2346,116 @@ mod tests {
         .await
         .unwrap_err();
         assert!(matches!(err, ApiError::BadRequest(_)), "{err:?}");
+    }
+
+    fn egress_policy(secret: &str) -> minga_state::types::EgressPolicy {
+        minga_state::types::EgressPolicy {
+            required: false,
+            routes: vec![minga_state::types::EgressRoute {
+                name: "primary".into(),
+                upstream_url: "https://api.example".into(),
+                auth: Some(minga_state::types::EgressAuth::AwsSigv4 {
+                    access_key_secret: "default-key".into(),
+                    secret_key_secret: "default-key".into(),
+                    session_token_secret: Some(secret.into()),
+                    region: "us-east-1".into(),
+                    service: "bedrock".into(),
+                }),
+                fallback: vec![],
+                input_price_micros_per_million: None,
+                output_price_micros_per_million: None,
+            }],
+            models: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn egress_route_secrets_of_another_tenant_are_not_found() {
+        let (app, _dir) = app_with_node(1.0).await;
+        app.store
+            .create_tenant(Tenant {
+                nats_revoked_user_public_keys: Vec::new(),
+                id: "acme".into(),
+                name: "Acme".into(),
+                quotas: Default::default(),
+                created_at: 1,
+            })
+            .await
+            .unwrap();
+        for (id, tenant_id) in [("default-key", "default"), ("acme-key", "acme")] {
+            app.store
+                .upsert_secret(minga_state::types::Secret {
+                    id: id.into(),
+                    tenant_id: tenant_id.into(),
+                    name: id.into(),
+                })
+                .await
+                .unwrap();
+        }
+
+        // Snapshot import.
+        let mut svc = translate::service_spec_to_state(&spec("web", 0)).unwrap();
+        svc.egress = Some(egress_policy("acme-key"));
+        let snapshot = |svc: &StateService| {
+            serde_json::to_value(minga_state::StateSnapshot {
+                format_version: minga_state::codec::FORMAT_VERSION,
+                exported_at_unix: 0,
+                tenants: vec![],
+                services: vec![svc.clone()],
+                networks: vec![],
+                volumes: vec![],
+                secrets: vec![],
+                configs: vec![],
+            })
+            .unwrap()
+        };
+        let err = import_state(
+            State(app.clone()),
+            default_caller(),
+            Query(ImportQuery { overwrite: false }),
+            Json(snapshot(&svc)),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, ApiError::NotFound(_)), "{err:?}");
+        assert!(app.store.get_service("web").await.unwrap().is_none());
+
+        // Docker API create carries the policy in its label.
+        let mut docker = translate::service_to_docker(&svc).Spec;
+        let err = create_service(State(app.clone()), default_caller(), Json(docker.clone()))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ApiError::NotFound(_)), "{err:?}");
+
+        // The caller's own secrets pass the ownership check.
+        svc.egress = Some(egress_policy("default-key"));
+        let _ = import_state(
+            State(app.clone()),
+            default_caller(),
+            Query(ImportQuery { overwrite: false }),
+            Json(snapshot(&svc)),
+        )
+        .await
+        .expect("own egress secrets import");
+
+        // An update without the egress label keeps the stored policy.
+        docker.Labels.remove(translate::EGRESS_LABEL);
+        let _ = update_service(
+            State(app.clone()),
+            default_caller(),
+            Path(("v1.41".to_string(), "web".to_string())),
+            Query(
+                serde_json::from_value::<models::ServiceUpdateQuery>(serde_json::json!({}))
+                    .unwrap(),
+            ),
+            Json(docker),
+        )
+        .await
+        .expect("update without the egress label");
+        assert_eq!(
+            app.store.get_service("web").await.unwrap().unwrap().egress,
+            svc.egress
+        );
     }
 
     #[tokio::test]

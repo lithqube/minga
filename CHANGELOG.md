@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- The Docker API carries a service's egress policy in the `minga.egress`
+  label (JSON, validated like Compose `x-minga-egress`), so `minga deploy`
+  keeps `x-minga-egress`. An update without the label keeps the stored
+  policy. Every secret ID in an egress route must belong to the caller's
+  tenant on create, update and state import; another tenant's is a 404.
+- Egress route names are capped at 256 bytes.
 - Service and task egress policies are persisted in state format v10. Format
   v10 migrates v2 through v9 state and Raft logs and accepts v9 snapshots;
   records written before v10 have no egress policy. Worker assignments carry

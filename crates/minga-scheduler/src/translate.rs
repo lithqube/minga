@@ -459,7 +459,16 @@ fn parse_duration_secs(s: &str) -> Option<u64> {
     Some(total)
 }
 
-/// Converts a Compose `x-minga-agent` extension into a state `AgentSpec`.
+/// Parses and validates an egress policy carried as JSON (the Docker API
+/// label), applying the same rules as Compose `x-minga-egress`.
+pub fn egress_policy_from_json(json: &str) -> Result<minga_state::types::EgressPolicy, String> {
+    let extension: minga_compose::EgressExtension =
+        serde_json::from_str(json).map_err(|error| error.to_string())?;
+    extension.validate()?;
+    Ok(egress_extension_to_policy(extension))
+}
+
+/// Converts a Compose `x-minga-egress` extension into a state policy.
 fn egress_extension_to_policy(
     extension: minga_compose::EgressExtension,
 ) -> minga_state::types::EgressPolicy {

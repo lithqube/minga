@@ -188,8 +188,12 @@ impl Service {
     }
 }
 
+/// Longest accepted egress route name, in bytes.
+pub const MAX_EGRESS_ROUTE_NAME_BYTES: usize = 256;
+
 impl EgressExtension {
-    fn validate(&self) -> Result<(), String> {
+    /// Checks route names, URLs, auth, prices and the fallback graph.
+    pub fn validate(&self) -> Result<(), String> {
         if self.routes.len() > 64 {
             return Err("at most 64 egress routes are allowed per service".into());
         }
@@ -208,6 +212,7 @@ impl EgressExtension {
         }
         for route in &self.routes {
             if route.name.is_empty()
+                || route.name.len() > MAX_EGRESS_ROUTE_NAME_BYTES
                 || !route
                     .name
                     .bytes()

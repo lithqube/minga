@@ -336,6 +336,31 @@ pub struct EgressPolicy {
     pub models: Vec<String>,
 }
 
+impl EgressPolicy {
+    /// Every secret ID the routes reference.
+    pub fn secret_ids(&self) -> impl Iterator<Item = &str> {
+        self.routes
+            .iter()
+            .filter_map(|route| route.auth.as_ref())
+            .flat_map(|auth| match auth {
+                EgressAuth::Bearer { secret } | EgressAuth::ApiKey { secret } => {
+                    vec![secret.as_str()]
+                }
+                EgressAuth::AwsSigv4 {
+                    access_key_secret,
+                    secret_key_secret,
+                    session_token_secret,
+                    ..
+                } => [Some(access_key_secret), Some(secret_key_secret)]
+                    .into_iter()
+                    .chain([session_token_secret.as_ref()])
+                    .flatten()
+                    .map(String::as_str)
+                    .collect(),
+            })
+    }
+}
+
 /// Egress policy bound to the task identity when placed.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EgressWorkload {
