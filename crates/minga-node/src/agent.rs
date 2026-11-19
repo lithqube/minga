@@ -414,8 +414,10 @@ impl AgentExecutor for WasmtimeAgentExecutor {
                 .env
                 .insert("MINGA_EGRESS_URL".to_string(), url.clone());
         }
-        // Revoked when `start` returns, i.e. when the run ends.
-        let _egress_token = self.egress_tokens.as_ref().map(|tokens| {
+        // Only an `http` grant gets a proxy token. Revoked when `start`
+        // returns, i.e. when the run ends.
+        let http = spec.capabilities.grants.contains(&AgentGrant::Http);
+        let _egress_token = self.egress_tokens.as_ref().filter(|_| http).map(|tokens| {
             let token = tokens.issue(&id);
             sandbox_spec
                 .env

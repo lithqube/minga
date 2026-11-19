@@ -631,6 +631,7 @@ pub struct AgentDirGrant {
 
 /// Specification for an agent (WASM sandbox) workload.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(from = "AgentSpecRecord")]
 pub struct AgentSpec {
     /// Path or reference to the WASM module on the node's filesystem.
     /// Resolved by the agent executor at start time.
@@ -650,9 +651,51 @@ pub struct AgentSpec {
     /// Additional environment variables, exposed only with the `env` grant.
     #[serde(default)]
     pub sandbox_env: HashMap<String, String>,
-    /// Explicit host capabilities; omitted from older persisted records.
-    #[serde(default)]
+    /// Explicit host capabilities. Records written before v9 omit them; see
+    /// [`AgentSpecRecord`].
     pub capabilities: AgentCapabilities,
+}
+
+/// Decoded shape of [`AgentSpec`]; `capabilities` is absent before format v9.
+#[derive(Deserialize)]
+struct AgentSpecRecord {
+    module_ref: String,
+    fuel_limit: Option<u64>,
+    memory_limit: Option<u64>,
+    timeout_secs: Option<u64>,
+    token_budget: Option<u64>,
+    egress_url: Option<String>,
+    prompt: Option<String>,
+    #[serde(default)]
+    sandbox_env: HashMap<String, String>,
+    capabilities: Option<AgentCapabilities>,
+}
+
+impl From<AgentSpecRecord> for AgentSpec {
+    fn from(record: AgentSpecRecord) -> Self {
+        // Before v9 the declared env map always reached the sandbox. Granting
+        // `env` to those records keeps upgraded agents starting; the tenant
+        // declared both the map and the agent, so nothing widens.
+        let capabilities = record.capabilities.unwrap_or_else(|| AgentCapabilities {
+            grants: if record.sandbox_env.is_empty() {
+                BTreeSet::new()
+            } else {
+                BTreeSet::from([AgentGrant::Env])
+            },
+            dirs: Vec::new(),
+        });
+        Self {
+            module_ref: record.module_ref,
+            fuel_limit: record.fuel_limit,
+            memory_limit: record.memory_limit,
+            timeout_secs: record.timeout_secs,
+            token_budget: record.token_budget,
+            egress_url: record.egress_url,
+            prompt: record.prompt,
+            sandbox_env: record.sandbox_env,
+            capabilities,
+        }
+    }
 }
 
 /// An overlay network.
@@ -849,6 +892,25 @@ mod tests {
         let bytes = crate::codec::encode(&kind).unwrap();
         let back: WorkloadKind = crate::codec::decode(&bytes).unwrap();
         assert_eq!(back, kind);
+    }
+
+    #[test]
+    fn only_pre_v9_agent_records_get_an_implicit_env_grant() {
+        let legacy: AgentSpec =
+            serde_json::from_str(r#"{"module_ref":"a.wasm","sandbox_env":{"K":"v"}}"#).unwrap();
+        assert_eq!(
+            legacy.capabilities.grants,
+            BTreeSet::from([AgentGrant::Env])
+        );
+
+        let explicit: AgentSpec = serde_json::from_str(
+            r#"{"module_ref":"a.wasm","sandbox_env":{"K":"v"},"capabilities":{}}"#,
+        )
+        .unwrap();
+        assert!(explicit.capabilities.grants.is_empty());
+
+        let no_env: AgentSpec = serde_json::from_str(r#"{"module_ref":"a.wasm"}"#).unwrap();
+        assert!(no_env.capabilities.grants.is_empty());
     }
 
     #[test]

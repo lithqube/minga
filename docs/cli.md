@@ -86,7 +86,7 @@ The API waits for catch-up before promotion. Remove it with
 | `--secret-store <DIR>` | `/var/lib/minga/secrets` | Secret values on this node. They never go through Raft or the bus. |
 | `--interval <SECS>` | `2` | Reconcile interval. |
 | `--sandbox-runtime <mock\|wasmtime>`, `--module-dir <DIR>` | none, `/var/lib/minga/modules` | `wasmtime` enables `x-minga-agent` tasks on this node. |
-| `--agent-dir-root <DIR>` (repeatable) | none | Canonicalized allowlist for agent directory grants; no configured root permits no directory grants. |
+| `--agent-dir-root <DIR>` (repeatable) | none | Canonicalized allowlist for agent directory grants; no configured root permits no directory grants. Grants are validated only: the sandbox mounts no directories and links no WASI yet. |
 | `--egress-bind`, `--egress-upstream`, `--egress-credential`, `--egress-credential-header` | none, `https://api.openai.com`, none, `authorization` | Starts the LLM egress proxy for agent tasks. The credential is a secret ID in `--secret-store`; agents never see the key. |
 Each node generates `<data_dir>/wg.key` once with mode `0600`; the private key
 stays local. Registration advertises only its public key and optional endpoint.

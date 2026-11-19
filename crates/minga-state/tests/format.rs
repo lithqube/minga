@@ -1055,7 +1055,7 @@ fn has_agent_capabilities(value: &serde_json::Value) -> bool {
         serde_json::Value::Object(object) => {
             if object.contains_key("module_ref") {
                 return object.get("capabilities")
-                    == Some(&serde_json::json!({"grants": [], "dirs": []}));
+                    == Some(&serde_json::json!({"grants": ["env"], "dirs": []}));
             }
             object.values().any(has_agent_capabilities)
         }
@@ -1234,7 +1234,7 @@ async fn a_v7_state_and_log_file_migrate_tenant_revocation_records() {
 }
 
 #[tokio::test]
-async fn a_v8_state_and_log_file_migrate_agent_capabilities() {
+async fn a_v8_state_and_log_file_grant_env_to_legacy_agents() {
     let (_dir, path) = written_dir().await;
     let state_file = path.join("state.redb");
     let log_file = path.join("raft_log.redb");
@@ -1247,7 +1247,10 @@ async fn a_v8_state_and_log_file_migrate_agent_capabilities() {
     let service = store.get_service("shop.web").await.unwrap().unwrap();
     assert_eq!(
         service.agent.unwrap().capabilities,
-        AgentCapabilities::default()
+        AgentCapabilities {
+            grants: BTreeSet::from([AgentGrant::Env]),
+            dirs: Vec::new(),
+        }
     );
     store.shutdown().await.unwrap();
 
@@ -1255,13 +1258,13 @@ async fn a_v8_state_and_log_file_migrate_agent_capabilities() {
     assert_eq!(read_marker(&log_file, RAFT_META), Some(FORMAT_VERSION));
     assert_eq!(
         read_state_value(&state_file, SM_SERVICES, "shop.web")["agent"]["capabilities"],
-        serde_json::json!({"grants": [], "dirs": []})
+        serde_json::json!({"grants": ["env"], "dirs": []})
     );
     assert!(
         read_log_values(&log_file)
             .iter()
             .any(|(_, entry)| has_agent_capabilities(entry)),
-        "migrated Raft log entries must include default capabilities"
+        "migrated Raft log entries must grant env to legacy agents"
     );
 }
 #[tokio::test]
@@ -1430,7 +1433,7 @@ async fn importing_a_v4_portable_snapshot_seeds_default_tenant() {
 }
 
 #[tokio::test]
-async fn importing_a_v8_portable_snapshot_defaults_agent_capabilities() {
+async fn importing_a_v8_portable_snapshot_grants_env_to_legacy_agents() {
     let (_dir, path) = written_dir().await;
     let store = StateStore::open(1, "127.0.0.1:0", &path, BTreeMap::new())
         .await
@@ -1445,7 +1448,10 @@ async fn importing_a_v8_portable_snapshot_defaults_agent_capabilities() {
     let imported = store.get_service("shop.web").await.unwrap().unwrap();
     assert_eq!(
         imported.agent.unwrap().capabilities,
-        AgentCapabilities::default()
+        AgentCapabilities {
+            grants: BTreeSet::from([AgentGrant::Env]),
+            dirs: Vec::new(),
+        }
     );
     assert_eq!(store.export().await.unwrap().format_version, FORMAT_VERSION);
     store.shutdown().await.unwrap();
