@@ -569,10 +569,18 @@ async fn proxy_handler(State(state): State<Arc<ProxyState>>, req: Request) -> Re
         .and_then(|value| value.get("stream"))
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
+    // OpenAI bills output for every one of `n` choices.
+    let choices = request_json
+        .as_ref()
+        .and_then(|value| value.get("n"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(1)
+        .max(1);
     let reservation = match max_output {
-        Some(cap) => state
-            .budgets
-            .reserve(workload, input_bound.saturating_add(cap)),
+        Some(cap) => state.budgets.reserve(
+            workload,
+            input_bound.saturating_add(cap.saturating_mul(choices)),
+        ),
         None => state.budgets.reserve_rest(workload, input_bound),
     };
     let reservation = match reservation {
@@ -2290,13 +2298,16 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_requests_cannot_spend_the_same_budget() {
-        // An output cap, no output cap at all, and an input that a bytes/4
+        // An output cap, no output cap at all, an input that a bytes/4
         // estimate would undercount (two 16-token holds fit in 100; two
-        // 61-byte bounds do not).
+        // 61-byte bounds do not), and `n` choices (two 23 + 60 holds do not
+        // fit; without `n` two 23 + 20 holds would).
         for body in [
             r#"{"max_tokens":60}"#.to_string(),
             "{}".to_string(),
             format!(r#"{{"max_tokens":1,"p":"{}"}}"#, "x".repeat(37)),
+            // Output is billed per choice: 3 x 20 plus the input must fit.
+            r#"{"max_tokens":20,"n":3}"#.to_string(),
         ] {
             concurrent_requests_cannot_spend_the_same_budget_with(&body).await;
         }

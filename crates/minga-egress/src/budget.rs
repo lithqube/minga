@@ -40,6 +40,11 @@ pub struct Budget {
     /// When the current window started (not serialized).
     #[serde(skip, default = "Instant::now")]
     pub window_start: Instant,
+    /// Tokens held by reservations that have not settled yet. They stay
+    /// counted across a window reset, so a reset cannot free a balance an
+    /// in-flight request is already using.
+    #[serde(skip)]
+    in_flight: u64,
 }
 
 impl Budget {
@@ -50,6 +55,7 @@ impl Budget {
             window_secs: window.as_secs(),
             used: 0,
             window_start: Instant::now(),
+            in_flight: 0,
         }
     }
 
@@ -84,7 +90,7 @@ impl Budget {
     /// Resets the window if it has elapsed.
     pub fn maybe_reset_window(&mut self) {
         if self.window_start.elapsed() >= self.window() {
-            self.used = 0;
+            self.used = self.in_flight;
             self.window_start = Instant::now();
         }
     }
@@ -114,7 +120,6 @@ pub struct Reservation {
     tracker: Arc<BudgetTracker>,
     workload: String,
     tokens: u64,
-    window_start: Instant,
     settled: bool,
 }
 
@@ -124,16 +129,14 @@ impl Reservation {
     /// when it took the workload past its limit.
     pub fn settle(mut self, actual: u64) -> bool {
         self.settled = true;
-        self.tracker
-            .adjust(&self.workload, self.window_start, self.tokens, actual)
+        self.tracker.adjust(&self.workload, self.tokens, actual)
     }
 }
 
 impl Drop for Reservation {
     fn drop(&mut self) {
         if !self.settled {
-            self.tracker
-                .adjust(&self.workload, self.window_start, self.tokens, 0);
+            self.tracker.adjust(&self.workload, self.tokens, 0);
         }
     }
 }
@@ -192,25 +195,25 @@ impl BudgetTracker {
         }
         let tokens = amount(budget).max(floor);
         budget.used = budget.used.saturating_add(tokens);
+        budget.in_flight = budget.in_flight.saturating_add(tokens);
         Ok(Reservation {
             tracker: Arc::clone(self),
             workload: workload.to_owned(),
             tokens,
-            window_start: budget.window_start,
             settled: false,
         })
     }
 
-    fn adjust(&self, workload: &str, window_start: Instant, reserved: u64, actual: u64) -> bool {
+    fn adjust(&self, workload: &str, reserved: u64, actual: u64) -> bool {
         let mut budgets = self.lock();
         let Some(budget) = budgets.get_mut(workload) else {
             return true;
         };
-        // A reservation from an elapsed window was already reset away.
-        if budget.window_start == window_start {
-            budget.used = budget.used.saturating_sub(reserved);
-        }
-        budget.used = budget.used.saturating_add(actual);
+        // Resets carry in-flight reservations forward, so the current window
+        // always holds this one; actual usage lands in the current window.
+        budget.maybe_reset_window();
+        budget.in_flight = budget.in_flight.saturating_sub(reserved);
+        budget.used = budget.used.saturating_sub(reserved).saturating_add(actual);
         budget.used <= budget.max_tokens
     }
 
@@ -387,6 +390,20 @@ mod tests {
         let status = tracker.status("agent-1").unwrap();
         assert_eq!(status.used, 600);
         assert_eq!(status.remaining, 400);
+    }
+
+    #[test]
+    fn a_window_reset_keeps_in_flight_reservations() {
+        let tracker = Arc::new(BudgetTracker::new());
+        // Windows are whole seconds.
+        tracker.register("w", Budget::new(100, Duration::from_secs(1)));
+        let held = tracker.reserve("w", 80).unwrap();
+        std::thread::sleep(Duration::from_millis(1100));
+        // The window rolled over, but the 80 in flight still count.
+        assert!(tracker.reserve("w", 30).is_err());
+        assert!(tracker.reserve("w", 20).is_ok_and(|r| r.settle(0)));
+        assert!(held.settle(10));
+        assert_eq!(tracker.status("w").unwrap().used, 10);
     }
 
     #[test]
