@@ -394,13 +394,14 @@ enum BodyError {
 }
 
 /// Tokens charged for a completion: provider counts when reported, else the
-/// request estimate plus the estimated output.
+/// request estimate for an unknown input plus the estimated output.
 fn charged_tokens(counts: &UsageCounts, estimated_input: u64) -> u64 {
-    if counts.estimated {
-        estimated_input.saturating_add(counts.output_tokens)
+    let input = if counts.estimated && counts.input_tokens == 0 {
+        estimated_input
     } else {
-        counts.input_tokens.saturating_add(counts.output_tokens)
-    }
+        counts.input_tokens
+    };
+    input.saturating_add(counts.output_tokens)
 }
 
 fn route_prices(route: Option<&ResolvedRoute>) -> Option<(Option<u64>, Option<u64>)> {
@@ -953,7 +954,8 @@ async fn proxy_handler(State(state): State<Arc<ProxyState>>, req: Request) -> Re
         drop(client);
         let (mut counts, answered_model) = parser.finish_with_model(bytes_seen);
         let answered_model = answered_model.unwrap_or_else(|| requested_model.clone());
-        if counts.estimated {
+        // A partial provider count keeps its known input.
+        if counts.estimated && counts.input_tokens == 0 {
             counts.input_tokens = estimated_tokens;
         }
         let charged = charged_tokens(&counts, estimated_tokens);
@@ -1329,6 +1331,9 @@ struct UsageParser {
     fields: TopLevelFields,
     answered_model: Option<String>,
     usage: Option<UsageCounts>,
+    /// Whether the output count came from a final usage report rather than
+    /// Anthropic's initial `message_start` count.
+    output_final: bool,
 }
 
 impl UsageParser {
@@ -1342,6 +1347,7 @@ impl UsageParser {
             fields: TopLevelFields::default(),
             answered_model: None,
             usage: None,
+            output_final: false,
         }
     }
 
@@ -1351,7 +1357,7 @@ impl UsageParser {
             if let Some(raw) = self.fields.usage.take() {
                 let value = serde_json::from_slice::<serde_json::Value>(&raw).ok();
                 if let Some(usage) = usage_counts(value.as_ref()) {
-                    self.record_usage(usage);
+                    self.record_usage(usage, true);
                 }
             }
             if let Some(raw) = self.fields.model.take() {
@@ -1385,7 +1391,8 @@ impl UsageParser {
         }
     }
 
-    fn record_usage(&mut self, next: UsageCounts) {
+    fn record_usage(&mut self, next: UsageCounts, output_final: bool) {
+        self.output_final |= output_final;
         let current = self.usage.get_or_insert(UsageCounts {
             input_tokens: 0,
             output_tokens: 0,
@@ -1409,8 +1416,8 @@ impl UsageParser {
                 if let Some(model) = find_answered_model(&self.event) {
                     self.answered_model = Some(model);
                 }
-                if let Some(usage) = find_usage(&self.event) {
-                    self.record_usage(usage);
+                if let Some((usage, output_final)) = find_event_usage(&self.event) {
+                    self.record_usage(usage, output_final);
                 }
             }
             self.event.clear();
@@ -1439,28 +1446,44 @@ impl UsageParser {
                 if let Some(model) = find_answered_model(&self.event) {
                     self.answered_model = Some(model);
                 }
-                if let Some(usage) = find_usage(&self.event) {
-                    self.record_usage(usage);
+                if let Some((usage, output_final)) = find_event_usage(&self.event) {
+                    self.record_usage(usage, output_final);
                 }
             }
         }
-        let usage = self.usage.unwrap_or(UsageCounts {
-            input_tokens: 0,
-            output_tokens: response_bytes / 4,
-            estimated: true,
-        });
+        let usage = match self.usage {
+            Some(usage) if self.output_final => usage,
+            // Cut before the final count: the input is known, the output is
+            // at least what the response bytes suggest.
+            Some(usage) => UsageCounts {
+                input_tokens: usage.input_tokens,
+                output_tokens: usage.output_tokens.max(response_bytes / 4),
+                estimated: true,
+            },
+            None => UsageCounts {
+                input_tokens: 0,
+                output_tokens: response_bytes / 4,
+                estimated: true,
+            },
+        };
         (usage, self.answered_model)
     }
 }
 
 fn find_usage(bytes: &[u8]) -> Option<UsageCounts> {
+    find_event_usage(bytes).map(|(usage, _)| usage)
+}
+
+/// Usage of one JSON document and whether its output count is final.
+/// Anthropic's `message_start` nests an initial count under `message`; a
+/// later top-level `usage` (`message_delta`) carries the final output.
+fn find_event_usage(bytes: &[u8]) -> Option<(UsageCounts, bool)> {
     let value: serde_json::Value = serde_json::from_slice(bytes).ok()?;
-    let usage = value.get("usage").or_else(|| {
-        value
-            .get("message")
-            .and_then(|message| message.get("usage"))
-    })?;
-    usage_counts(Some(usage))
+    if let Some(usage) = value.get("usage") {
+        return usage_counts(Some(usage)).map(|usage| (usage, true));
+    }
+    let usage = value.get("message")?.get("usage")?;
+    usage_counts(Some(usage)).map(|usage| (usage, false))
 }
 
 fn find_answered_model(bytes: &[u8]) -> Option<String> {
@@ -1845,6 +1868,30 @@ mod tests {
                 output_tokens: 3,
                 estimated: false,
             }
+        );
+    }
+
+    #[test]
+    fn an_anthropic_stream_cut_before_the_final_usage_estimates_the_output() {
+        let events = concat!(
+            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":18,\"output_tokens\":0}}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"a generated answer that the provider charged for\"}}\n\n",
+        );
+        let mut parser = UsageParser::new(true);
+        parser.push(events.as_bytes());
+        let counts = parser.finish_with_model(events.len() as u64).0;
+        assert_eq!(
+            counts,
+            UsageCounts {
+                input_tokens: 18,
+                output_tokens: events.len() as u64 / 4,
+                estimated: true,
+            }
+        );
+        assert_eq!(
+            charged_tokens(&counts, 999),
+            18 + events.len() as u64 / 4,
+            "the known input is kept"
         );
     }
 
