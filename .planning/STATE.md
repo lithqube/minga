@@ -15,7 +15,7 @@
   - **CI:** new job `NATS store upgrade 2.10.22 to 2.15.3`, which runs both modes on linux-amd64 with checksum-verified binaries.
 - **Follow-up (2026-11-17):** PRs #87, #88, #89 and #90 are all merged, so the 2.15.3 release gate is lifted. The NATS matrix and the fail-closed suites run in CI against 2.14.10 and 2.15.3, and the store-upgrade job runs on every push. Local verification passed: `cargo fmt --all --check`, `cargo clippy --all-targets -- -D warnings`, and `cargo test --workspace` (940 passed, 4 ignored) against NATS 2.15.3.
 
-**Current:** Phase 15 T1–T5 implementation is complete. Phase 13 is complete through 13-07: T2/T3 live VM proof, ingress, isolation and benchmark evidence are recorded below. Phase 15 T3 tenant-isolation end-to-end proof remains deferred until release readiness; no further VM tests before that gate. Phase 14 (PRs #87–#90) and Phase 12 (PR #76) are complete.
+**Current `main` checkpoint (2026-11-19, `02c578c`, PR #103):** Phases 12–14 are complete; Phase 13 includes the 13-07 T2/T3 live proof; Phase 15 T1–T5 implementation is merged, with only the T3 cross-tenant placement proof deferred until release readiness. PR #103 completes agent egress/usage Order 1. Sandbox plan steps 1–2 (shared Wasmtime engine/cache, enforced epoch timeout/memory limits, capability-grant schema and validation) are merged; WASI host imports, guest HTTP and agent logs are not. Next planned agent-plane implementation is B6 distributed tenant/service/customer window budgets, then B7 request-rate limits. No VM testing before release readiness.
 
 **Phase 15 tenant isolation (ADR 0008 T1–T2, 2026-11-17):**
 
