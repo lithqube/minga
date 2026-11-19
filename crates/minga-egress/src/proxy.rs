@@ -275,8 +275,14 @@ fn destination_allowed(ip: std::net::IpAddr, allowed: &[ipnet::IpNet]) -> bool {
     if allowed.iter().any(|net| net.contains(&ip)) {
         return true;
     }
+    // IPv4-mapped and NAT64 (64:ff9b::/96) addresses reach the embedded IPv4.
     let ip = match ip {
-        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(IpAddr::V6(v6), IpAddr::V4),
+        IpAddr::V6(v6) => match v6.segments() {
+            [0x64, 0xff9b, 0, 0, 0, 0, hi, lo] => IpAddr::V4(std::net::Ipv4Addr::from(
+                (u32::from(hi) << 16) | u32::from(lo),
+            )),
+            _ => v6.to_ipv4_mapped().map_or(IpAddr::V6(v6), IpAddr::V4),
+        },
         v4 => v4,
     };
     if allowed.iter().any(|net| net.contains(&ip)) {
@@ -284,7 +290,12 @@ fn destination_allowed(ip: std::net::IpAddr, allowed: &[ipnet::IpNet]) -> bool {
     }
     match ip {
         IpAddr::V4(v4) => {
-            !(v4.is_loopback()
+            let [first, second, ..] = v4.octets();
+            // 0.0.0.0/8 reaches local addresses on Linux; 100.64.0.0/10 is
+            // shared (CGNAT, overlay) address space.
+            !(first == 0
+                || (first == 100 && (64..128).contains(&second))
+                || v4.is_loopback()
                 || v4.is_link_local()
                 || v4.is_unspecified()
                 || v4.is_multicast()
@@ -2232,11 +2243,22 @@ mod tests {
             "10.1.2.3",
             "169.254.169.254",
             "0.0.0.0",
+            "0.1.2.3",
+            "100.64.0.1",
+            "100.127.255.254",
             "224.0.0.1",
         ] {
             assert!(!destination_allowed(ip.parse().unwrap(), &[]), "{ip}");
         }
-        for ip in ["::1", "fe80::1", "fd00::1", "::ffff:127.0.0.1"] {
+        assert!(destination_allowed("100.128.0.1".parse().unwrap(), &[]));
+        for ip in [
+            "::1",
+            "fe80::1",
+            "fd00::1",
+            "::ffff:127.0.0.1",
+            "64:ff9b::7f00:1",
+            "64:ff9b::a9fe:a9fe",
+        ] {
             assert!(!destination_allowed(ip.parse().unwrap(), &[]), "{ip}");
         }
         assert!(destination_allowed("8.8.8.8".parse().unwrap(), &[]));
