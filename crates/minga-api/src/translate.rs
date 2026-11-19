@@ -161,6 +161,12 @@ pub fn service_spec_to_state(spec: &models::ServiceSpec) -> Result<Service, Stri
                 .map_err(|e| format!("service '{name}': invalid {EGRESS_LABEL} label: {e}"))
         })
         .transpose()?;
+    if agent.is_some() && egress.is_some() {
+        return Err(format!(
+            "service '{name}': {}",
+            minga_state::types::AGENT_EGRESS_UNSUPPORTED
+        ));
+    }
 
     if container.Image.is_empty() && agent.is_none() {
         return Err(format!("service '{name}': ContainerSpec.Image is required"));
@@ -1648,6 +1654,13 @@ mod tests {
         spec.Labels
             .insert(EGRESS_LABEL.into(), r#"{"required":true,"extra":1}"#.into());
         assert!(service_spec_to_state(&spec).is_err(), "unknown keys fail");
+        let mut agent = svc.clone();
+        agent.agent = Some(Box::new(minga_state::types::AgentSpec::default()));
+        let err = service_spec_to_state(&service_to_docker(&agent).Spec).unwrap_err();
+        assert!(
+            err.contains(minga_state::types::AGENT_EGRESS_UNSUPPORTED),
+            "{err}"
+        );
     }
 
     #[test]

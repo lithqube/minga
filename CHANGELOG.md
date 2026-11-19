@@ -64,6 +64,10 @@
   is deleted, even if container cleanup then fails.
 - A required egress policy with no routes is refused at start instead of
   falling back to the node's legacy upstream.
+- An `x-minga-agent` service that declares `x-minga-egress` is refused at
+  admission (Compose, Docker API create and update, state import): agent
+  egress tokens carry no route policy, so the agent would otherwise run
+  without the declared routes and model allow-list.
 - The Docker API carries a service's egress policy in the `minga.egress`
   label (JSON, validated like Compose `x-minga-egress`), so `minga deploy`
   keeps `x-minga-egress`. An update without the label keeps the stored

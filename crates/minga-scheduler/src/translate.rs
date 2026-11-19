@@ -83,6 +83,12 @@ fn translate_service(
     let egress_ext = svc
         .egress_extension()
         .map_err(|e| TranslateError::Service(name.to_string(), e))?;
+    if agent_ext.is_some() && egress_ext.is_some() {
+        return Err(TranslateError::Service(
+            name.to_string(),
+            minga_state::types::AGENT_EGRESS_UNSUPPORTED.into(),
+        ));
+    }
 
     let image = match &agent_ext {
         Some(_) => String::new(), // agent services have no container image
@@ -1012,6 +1018,29 @@ mod tests {
         let result = translate_service("agent", &svc, "test", &empty_project(), None);
         assert!(result.is_err(), "invalid agent extension should fail");
     }
+    #[test]
+    fn agent_with_egress_policy_is_refused() {
+        let svc = make_compose_service(
+            r#"
+            x-minga-agent:
+              module: ./agent.wasm
+              capabilities:
+                grants: [http]
+            x-minga-egress:
+              required: true
+              routes:
+                - name: primary
+                  upstream_url: https://api.openai.com
+            "#,
+        );
+        let err = translate_service("bot", &svc, "test", &empty_project(), None).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains(minga_state::types::AGENT_EGRESS_UNSUPPORTED),
+            "{err}"
+        );
+    }
+
     #[test]
     fn required_egress_policy_survives_compose_translation() {
         let required = make_compose_service(

@@ -36,6 +36,8 @@ The proxy runs only on workers started with `--egress-bind` (for example `0.0.0.
 
 Supported auth schemes are `bearer`, `api_key`, and `aws_sigv4`. SigV4 uses the secret IDs `access_key_secret`, `secret_key_secret`, and optional `session_token_secret`, and the literal strings `region` and `service`. Every secret ID must belong to the service's tenant. Costs are integer microdollars per million input/output tokens and are omitted unless both prices are configured.
 
+`x-minga-egress` applies to container services only. An `x-minga-agent` service cannot declare it yet, because agent egress tokens carry no route policy: Compose translation, Docker API create and update (including a policy kept from the stored service) and state import refuse the combination instead of running the agent without the policy.
+
 Service and task egress policies are persisted from state format v10. Worker assignments carry the format version, so an older worker refuses a task with a policy instead of dropping it; upgrade every node together.
 
 `bearer` sets `Authorization: Bearer …`; `api_key` sets `x-api-key`. The proxy replaces any workload-supplied values for the selected auth headers.

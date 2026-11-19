@@ -576,6 +576,9 @@ pub async fn import_state(
                 crate::translate::check_agent(agent)
                     .map_err(|e| bad_request(format!("service '{}': {e}", service.id)))?;
             }
+            current
+                .check_agent_egress()
+                .map_err(|e| bad_request(format!("service '{}': {e}", service.id)))?;
             secret_ids.extend(
                 current
                     .secrets
@@ -1385,6 +1388,8 @@ pub async fn update_service(
         svc.egress = existing.egress.clone();
         translate::sync_required_egress_label(&mut svc);
     }
+    svc.check_agent_egress()
+        .map_err(|e| bad_request(format!("service '{id}': {e}")))?;
     check_service_secrets(&app, tenant_id, &svc).await?;
     for network_id in &svc.networks {
         let network = app.store.get_network(network_id).await?;
@@ -2497,6 +2502,46 @@ mod tests {
             app.store.get_service("web").await.unwrap().unwrap().egress,
             svc.egress
         );
+
+        // An agent cannot carry the policy, neither inherited on update nor
+        // imported.
+        let mut agent = svc.clone();
+        agent.agent = Some(Box::new(minga_state::types::AgentSpec::default()));
+        let mut docker = translate::service_to_docker(&agent).Spec;
+        docker.Labels.remove(translate::EGRESS_LABEL);
+        let err = update_service(
+            State(app.clone()),
+            default_caller(),
+            Path(("v1.41".to_string(), "web".to_string())),
+            Query(
+                serde_json::from_value::<models::ServiceUpdateQuery>(serde_json::json!({}))
+                    .unwrap(),
+            ),
+            Json(docker),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, ApiError::BadRequest(_)), "{err:?}");
+        assert!(app
+            .store
+            .get_service("web")
+            .await
+            .unwrap()
+            .unwrap()
+            .agent
+            .is_none());
+        agent.id = "bot".into();
+        agent.name = "bot".into();
+        let err = import_state(
+            State(app.clone()),
+            default_caller(),
+            Query(ImportQuery { overwrite: false }),
+            Json(snapshot(&agent)),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, ApiError::BadRequest(_)), "{err:?}");
+        assert!(app.store.get_service("bot").await.unwrap().is_none());
     }
 
     #[tokio::test]

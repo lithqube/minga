@@ -459,6 +459,21 @@ pub struct Service {
     pub previous: Option<Box<Service>>,
 }
 
+impl Service {
+    /// Agent egress tokens do not carry a route policy yet, so an agent
+    /// service with an egress policy is refused at admission instead of
+    /// running without it.
+    pub fn check_agent_egress(&self) -> Result<(), &'static str> {
+        if self.agent.is_some() && self.egress.is_some() {
+            return Err(AGENT_EGRESS_UNSUPPORTED);
+        }
+        Ok(())
+    }
+}
+
+/// Why an agent service cannot declare an egress policy.
+pub const AGENT_EGRESS_UNSUPPORTED: &str = "x-minga-egress is not supported on x-minga-agent services yet: agent egress tokens carry no route policy";
+
 /// A container healthcheck (Compose/Docker shape).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Healthcheck {
