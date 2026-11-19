@@ -33,7 +33,7 @@ compose.yaml (x-minga-agent)
 pub enum WorkloadKind {
     #[default]
     Container,
-    Agent(AgentSpec),
+    Agent(Box<AgentSpec>),
 }
 
 pub struct AgentSpec {
@@ -45,10 +45,11 @@ pub struct AgentSpec {
     pub egress_url: Option<String>,
     pub prompt: Option<String>,
     pub sandbox_env: HashMap<String, String>,
+    pub capabilities: AgentCapabilities,
 }
 ```
 
-`TaskSpec.kind: WorkloadKind` with `#[serde(default)]` — existing container tasks deserialize as `Container`. Uses externally-tagged serde representation (bincode-compatible with openraft).
+`TaskSpec.kind` is externally tagged in the JSON state codec and defaults to `Container`, so existing container tasks continue to deserialize. `AgentSpec` is boxed to keep common task records compact.
 
 ### 2. `x-minga-agent` Compose extension (minga-compose)
 
@@ -63,6 +64,8 @@ services:
       token_budget: 50000
       egress_url: https://api.openai.com
       prompt: "Analyze the dataset and summarize findings"
+      capabilities:
+        grants: [env]
       env:
         MODEL: gpt-4o
     # No `image:` required — agent services skip the image check
@@ -70,6 +73,7 @@ services:
 
 - Extension key: `x-minga-agent` (constant `AGENT_EXTENSION_KEY`).
 - `module` is required. All other fields optional with sensible defaults.
+- A non-empty `env` map requires the explicit `env` grant; capabilities default to deny.
 - String-or-number deserialization for numeric fields (`"10000000"` or `10000000`).
 - Agent services skip the `image` requirement in `check_services`.
 - `Service::is_agent()` and `Service::agent_extension()` accessors.

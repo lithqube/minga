@@ -1519,10 +1519,10 @@ mod assignment_tests {
     }
     fn agent_assignment(task_id: &str) -> TaskAssignment {
         let mut assignment = assignment(task_id);
-        assignment.spec.kind = WorkloadKind::Agent(minga_state::types::AgentSpec {
+        assignment.spec.kind = WorkloadKind::Agent(Box::new(minga_state::types::AgentSpec {
             module_ref: "./agent.wasm".to_string(),
             ..Default::default()
-        });
+        }));
         assignment
     }
     async fn setup_with_agent(

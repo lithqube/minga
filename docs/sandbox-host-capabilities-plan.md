@@ -1,8 +1,8 @@
 # Sandbox host capabilities: plan
 
-- Status: In progress (step 1 implemented and verified on this branch). Full host capabilities remain sequenced after order 6 (E14/E15) in [agent-plane-roadmap.md](agent-plane-roadmap.md); the independent runtime-hardening step is proceeding early by explicit priority.
+- Status: Step 1 is merged (PR #101); step 2 is in progress on this branch. Full host capabilities remain sequenced after order 6 (E14/E15) in [agent-plane-roadmap.md](agent-plane-roadmap.md).
 - Date: 2026-11-16
-- Branch: `feat/agent-sandbox-capabilities`
+- Branch: `feat/agent-sandbox-grants`
 - Closes structural limit 4 in [architecture.md](architecture.md) and the "Missing" items in [ADR 0003](adr/0003-agent-workloads.md).
 
 ## Decisions
@@ -58,7 +58,7 @@ Rules, checked in `minga-compose` and again on the node:
 
 ## 3. State and transport
 
-- `AgentSpec` gains `capabilities: AgentCapabilities { grants: BTreeSet<Grant>, dirs: Vec<DirGrant> }` with `#[serde(default)]`. No format-version bump. Add a new frozen fixture in `crates/minga-state/tests/fixtures/` for the new shape; old fixtures must still load as "no grants".
+- `AgentSpec` gains `capabilities: AgentCapabilities { grants: BTreeSet<Grant>, dirs: Vec<DirGrant> }` with `#[serde(default)]`. Format v9 migrates v8 state and Raft logs and accepts v8 portable snapshots; wire frames still require a coordinated cluster upgrade. Add a new v9 frozen fixture; never edit older fixtures.
 - The spec travels through the Docker API in the `minga.agent` label. Extend `deploy_e2e::deploy_keeps_restart_policy_and_agent_spec` to round-trip the capabilities.
 - Nothing new goes through Raft beyond the spec itself. Run output and logs stay on JetStream / the node.
 
@@ -120,7 +120,7 @@ One PR per step, each green on `cargo fmt --all`, `cargo clippy --all-targets --
 | Step | Content | Depends on |
 |---|---|---|
 | 1 | **Complete:** Wasmtime upgrade, shared engine + bounded module cache, epoch timeout, `StoreLimits` memory. Fixes the runaway-timeout bug on its own. | none |
-| 2 | Compose `capabilities` grammar, `AgentSpec` field, translation, label round trip, state fixture, node-side validation, `--agent-dir-root`. | none |
+| 2 | Compose `capabilities` grammar, `AgentSpec` field, translation, label round trip, v9 state/log migration, v8 snapshot import, node-side validation, `--agent-dir-root`. | none |
 | 3 | Core-module path: preview1 linker, `WasiCtx` from grants, stdio capture. | 1, 2 |
 | 4 | Component path: WASI 0.2 linker, `wasi:cli/run`, same grants. | 3 |
 | 5 | HTTP for both paths, host-attached token, per-run cap. | 3, 4, roadmap orders 1–2 |

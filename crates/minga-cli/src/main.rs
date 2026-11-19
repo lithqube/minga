@@ -401,6 +401,9 @@ struct NodeArgs {
     /// Base directory for resolving agent WASM module paths.
     #[arg(long, default_value = "/var/lib/minga/modules")]
     module_dir: String,
+    /// Repeatable roots that may be exposed read-only to agent sandboxes.
+    #[arg(long = "agent-dir-root", value_name = "DIR")]
+    agent_dir_roots: Vec<PathBuf>,
     /// Bind address for the LLM egress proxy (e.g. 127.0.0.1:18080).
     /// If set, the node starts an egress proxy for agent workloads.
     #[arg(long)]
@@ -2079,8 +2082,14 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
             }
             "wasmtime" => {
                 tracing::info!(module_dir = %args.module_dir, "using WasmtimeAgentExecutor");
-                match minga_node::WasmtimeAgentExecutor::new(&args.module_dir).await {
-                    Ok(exec) => Some(Arc::new(exec.with_egress_tokens(egress_tokens.clone()))),
+                match minga_node::WasmtimeAgentExecutor::new(&args.module_dir)
+                    .await
+                    .and_then(|exec| exec.with_agent_dir_roots(&args.agent_dir_roots))
+                {
+                    Ok(exec) => Some(Arc::new(
+                        exec.with_egress_enabled(args.egress_bind.is_some())
+                            .with_egress_tokens(egress_tokens.clone()),
+                    )),
                     Err(e) => {
                         eprintln!("error: cannot create wasmtime agent executor: {e}");
                         return ExitCode::FAILURE;
@@ -2954,6 +2963,30 @@ mod tests {
         assert!(worker_has_manager_only_flags(&args));
     }
 
+    #[test]
+    fn worker_accepts_repeatable_agent_directory_roots() {
+        let cli = Cli::try_parse_from([
+            "minga",
+            "worker",
+            "--node-id",
+            "7",
+            "--agent-dir-root",
+            "/srv/agents",
+            "--agent-dir-root",
+            "/mnt/datasets",
+        ])
+        .unwrap();
+        let Command::Worker(args) = cli.command else {
+            panic!("expected worker command");
+        };
+        assert_eq!(
+            args.agent_dir_roots,
+            [
+                std::path::PathBuf::from("/srv/agents"),
+                std::path::PathBuf::from("/mnt/datasets"),
+            ]
+        );
+    }
     #[test]
     fn managers_require_wireguard_endpoint_when_joining_or_multi_node() {
         assert!(manager_requires_wg_endpoint(true, true, false));

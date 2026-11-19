@@ -623,7 +623,12 @@ impl StateStore {
     }
 
     pub async fn upsert_service(&self, service: Service) -> Result<(), StateError> {
-        match self.propose(StateCommand::UpsertService(service)).await? {
+        self.write_service(StateCommand::UpsertService(service))
+            .await
+    }
+
+    async fn write_service(&self, command: StateCommand) -> Result<(), StateError> {
+        match self.propose(command).await? {
             StateResponse::Ok => Ok(()),
             StateResponse::Conflict(_) => Err(StateError::NameInUse),
             StateResponse::Error(message) if message.starts_with("tenant quota exceeded: ") => {
@@ -862,14 +867,15 @@ impl StateStore {
         let want = crate::codec::FORMAT_VERSION;
         match snapshot.format_version {
             crate::codec::FORMAT_VERSION
-            | crate::codec::V6_FORMAT_VERSION
+            | crate::codec::V8_FORMAT_VERSION
             | crate::codec::V7_FORMAT_VERSION
+            | crate::codec::V6_FORMAT_VERSION
             | crate::codec::V5_FORMAT_VERSION
             | crate::codec::V4_FORMAT_VERSION
             | crate::codec::V3_FORMAT_VERSION
             | crate::codec::V2_FORMAT_VERSION => {
-                // Legacy resource fields default to `default`; node records
-                // are not included in portable snapshots.
+                // Agent capabilities default to no grants; legacy resource
+                // fields default to `default`. Nodes are not in snapshots.
             }
             found => {
                 return Err(StateError::BadSnapshot(format!(
@@ -918,11 +924,52 @@ impl StateStore {
         for v in snapshot.volumes {
             self.upsert_volume(v).await?;
         }
+        // An older snapshot's services grow when re-encoded (v9 adds agent
+        // capabilities), so a tenant at its byte quota could not import its
+        // own data. Each write carries that tenant's growth so far; the quota
+        // itself never changes, and current-format imports get no allowance.
+        let legacy = snapshot.format_version < want;
+        // Keyed by service id: a repeated id replaces its record, so only its
+        // latest growth counts.
+        let mut growth: BTreeMap<String, BTreeMap<String, u64>> = BTreeMap::new();
         for s in snapshot.services {
-            self.upsert_service(s).await?;
+            if legacy {
+                let tenant = growth.entry(s.tenant_id.clone()).or_default();
+                tenant.insert(s.id.clone(), v9_growth(&s)?);
+                let byte_allowance = tenant.values().fold(0u64, |sum, g| sum.saturating_add(*g));
+                self.write_service(StateCommand::ImportService {
+                    service: s,
+                    byte_allowance,
+                })
+                .await?;
+            } else {
+                self.upsert_service(s).await?;
+            }
         }
         Ok(())
     }
+}
+
+/// Bytes a service gained over its v8 encoding: the agent `capabilities` key,
+/// including agents nested in `previous`.
+fn v9_growth(service: &Service) -> Result<u64, StateError> {
+    fn strip(value: &mut serde_json::Value) {
+        let Some(object) = value.as_object_mut() else {
+            return;
+        };
+        if let Some(agent) = object.get_mut("agent").and_then(|a| a.as_object_mut()) {
+            agent.remove("capabilities");
+        }
+        if let Some(previous) = object.get_mut("previous") {
+            strip(previous);
+        }
+    }
+    let bad = |e: serde_json::Error| StateError::BadSnapshot(e.to_string());
+    let mut value = serde_json::to_value(service).map_err(bad)?;
+    let new = serde_json::to_vec(&value).map_err(bad)?.len();
+    strip(&mut value);
+    let old = serde_json::to_vec(&value).map_err(bad)?.len();
+    Ok((new - old) as u64)
 }
 
 /// Makes the data directory 0700 and each store file 0600 before redb opens them.

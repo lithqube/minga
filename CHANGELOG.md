@@ -9,7 +9,17 @@
   16 MiB are refused and compile off the async runtime; concurrent runs are
   bounded by CPU count. Input is no longer truncated to `output_limit`.
   Wasmtime 50 raises the workspace MSRV to Rust 1.97.
-
+- Agent Compose specs can declare explicit environment, clock, random, stdio
+  and HTTP grants plus read-only directory grants. Nodes validate these against
+  `--agent-dir-root` and egress configuration. State format v9 migrates v8
+  state and Raft logs and accepts v8 snapshots; cluster wire upgrades must be
+  coordinated. WASI access remains in later sandbox steps, so grants are
+  validated but not yet enforced in the sandbox. Agents stored before v9 with
+  an `env` map receive the `env` grant. The egress proxy token is now issued
+  only with the `http` grant. Importing a v8 snapshot discounts each service
+  write by how much the tenant's imported services grew on re-encoding, so a
+  tenant at its `desired_state_bytes` quota can still import its own data;
+  the quota itself is never changed.
 - The bundled NATS server moves from v2.10.22 to v2.15.3. External NATS is
   tested on v2.14.10 and v2.15.3; managers warn when JetStream `api.level` is
   below 4. A 2.10.22 store was verified through a direct upgrade to 2.15.3
