@@ -354,7 +354,13 @@ fn tenant_scoped_path(path: &str) -> bool {
         && path.split('/').any(|segment| {
             matches!(
                 segment,
-                "services" | "tasks" | "networks" | "secrets" | "configs" | "audit" | "state"
+                "services"
+                    | "tasks"
+                    | "networks"
+                    | "secrets"
+                    | "configs"
+                    | "audit"
+                    | "state"
                     | "agent"
             )
         })

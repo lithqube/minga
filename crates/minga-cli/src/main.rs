@@ -2073,7 +2073,6 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
         }
     };
 
-
     // Construct the agent executor if --sandbox-runtime is set.
     let agent_executor: Option<Arc<dyn minga_node::AgentExecutor>> = match &args.sandbox_runtime {
         Some(rt) => match rt.as_str() {

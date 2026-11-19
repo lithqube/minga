@@ -8,3 +8,4 @@ pub mod registry;
 pub mod secret;
 pub mod service;
 pub mod stack;
+pub mod usage;
