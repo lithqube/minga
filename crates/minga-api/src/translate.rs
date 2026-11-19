@@ -67,6 +67,40 @@ fn docker_update_config_to_policy(
     })
 }
 
+/// Makes a missing or null `capabilities` in agent JSON mean no grants. API
+/// input is v9 or later; only pre-v9 stored records get the implicit `env`.
+/// Serde would also decode a JSON array by position and skip this, so only
+/// objects are accepted.
+pub fn deny_omitted_capabilities(agent: &mut serde_json::Value) -> Result<(), String> {
+    let agent = agent
+        .as_object_mut()
+        .ok_or_else(|| "agent spec must be a JSON object".to_owned())?;
+    let capabilities = agent
+        .entry("capabilities")
+        .or_insert(serde_json::Value::Null);
+    if capabilities.is_null() {
+        *capabilities = serde_json::json!({});
+    }
+    Ok(())
+}
+
+/// Admission checks for an agent that need no node configuration. Caught here
+/// like `user` below: the node refuses it on every start. `http` availability
+/// and directory roots depend on node configuration, so only the node can
+/// check them.
+pub fn check_agent(agent: &AgentSpec) -> Result<(), String> {
+    agent.capabilities.validate_dir_paths()?;
+    if !agent.sandbox_env.is_empty()
+        && !agent
+            .capabilities
+            .grants
+            .contains(&minga_state::types::AgentGrant::Env)
+    {
+        return Err("agent sets sandbox_env without the env grant".to_owned());
+    }
+    Ok(())
+}
+
 /// Translates a Docker `ServiceSpec` into a Minga `Service`.
 ///
 /// The Docker service `Name` (e.g. `mystack_web`) becomes the Minga
@@ -91,36 +125,15 @@ pub fn service_spec_to_state(spec: &models::ServiceSpec) -> Result<Service, Stri
             let invalid = |e: serde_json::Error| {
                 format!("service '{name}': invalid {AGENT_LABEL} label: {e}")
             };
-            let value: serde_json::Value = serde_json::from_str(raw).map_err(invalid)?;
-            // Missing capabilities mean "none" for API input; only pre-v9
-            // stored records get the implicit `env` grant.
-            let explicit = value.get("capabilities").is_some_and(|c| !c.is_null());
-            let mut agent = serde_json::from_value::<AgentSpec>(value).map_err(invalid)?;
-            if !explicit {
-                agent.capabilities = Default::default();
-            }
-            Ok::<_, String>(agent)
+            let mut value: serde_json::Value = serde_json::from_str(raw).map_err(invalid)?;
+            deny_omitted_capabilities(&mut value)
+                .map_err(|e| format!("service '{name}': invalid {AGENT_LABEL} label: {e}"))?;
+            serde_json::from_value::<AgentSpec>(value).map_err(invalid)
         })
         .transpose()?
         .map(Box::new);
-    // Caught here like `user` below: the node refuses it on every start.
-    // `http` availability and directory roots depend on node configuration,
-    // so only the node can check them.
     if let Some(agent) = &agent {
-        agent
-            .capabilities
-            .validate_dir_paths()
-            .map_err(|e| format!("service '{name}': {e}"))?;
-        if !agent.sandbox_env.is_empty()
-            && !agent
-                .capabilities
-                .grants
-                .contains(&minga_state::types::AgentGrant::Env)
-        {
-            return Err(format!(
-                "service '{name}': {AGENT_LABEL} sets sandbox_env without the env grant"
-            ));
-        }
+        check_agent(agent).map_err(|e| format!("service '{name}': {e}"))?;
     }
 
     if container.Image.is_empty() && agent.is_none() {
@@ -1204,6 +1217,74 @@ mod tests {
             let error = service_spec_to_state(&spec).unwrap_err();
             assert!(error.contains(expected), "{dirs}: {error}");
         }
+    }
+
+    #[test]
+    fn agent_label_with_unknown_keys_is_refused() {
+        let mut spec = sample_docker_spec();
+        for label in [
+            r#"{"module_ref":"a.wasm","capabilites":{"grants":["env"]}}"#,
+            r#"{"module_ref":"a.wasm","capabilities":{"grant":["env"]}}"#,
+            r#"{"module_ref":"a.wasm","capabilities":{"dirs":[{"host":"/srv","guest":"/d","rw":true}]}}"#,
+        ] {
+            spec.Labels
+                .insert(AGENT_LABEL.to_string(), label.to_string());
+            let error = service_spec_to_state(&spec).unwrap_err();
+            assert!(error.contains("unknown field"), "{label}: {error}");
+        }
+    }
+
+    /// Serde decodes a struct from a JSON array by position, which would skip
+    /// the omitted-capabilities rule and grant `env` implicitly.
+    const POSITIONAL_AGENT: &str = r#"["a.wasm",null,null,null,null,null,null,{"K":"v"},null]"#;
+
+    #[test]
+    fn agent_label_must_be_a_json_object() {
+        let mut spec = sample_docker_spec();
+        spec.Labels
+            .insert(AGENT_LABEL.to_string(), POSITIONAL_AGENT.to_string());
+        let error = service_spec_to_state(&spec).unwrap_err();
+        assert!(error.contains("must be a JSON object"), "{error}");
+    }
+
+    #[test]
+    fn agent_label_directory_grants_are_bounded() {
+        let mut spec = sample_docker_spec();
+        let many: Vec<_> = (0..=minga_state::types::AgentCapabilities::MAX_DIRS)
+            .map(|i| serde_json::json!({"host": "/srv", "guest": format!("/d{i}")}))
+            .collect();
+        let long = format!(
+            "/{}",
+            "a".repeat(minga_state::types::AgentCapabilities::MAX_PATH_LEN)
+        );
+        for (dirs, expected) in [
+            (serde_json::json!(many), "at most"),
+            (
+                serde_json::json!([{"host": long, "guest": "/d"}]),
+                "at most",
+            ),
+            (
+                serde_json::json!([{"host": "/srv", "guest": long}]),
+                "at most",
+            ),
+        ] {
+            spec.Labels.insert(
+                AGENT_LABEL.to_string(),
+                serde_json::json!({"module_ref": "a.wasm", "capabilities": {"dirs": dirs}})
+                    .to_string(),
+            );
+            let error = service_spec_to_state(&spec).unwrap_err();
+            assert!(error.contains(expected), "{error}");
+        }
+        let at_cap: Vec<_> = (0..minga_state::types::AgentCapabilities::MAX_DIRS)
+            .map(|i| serde_json::json!({"host": "/srv", "guest": format!("/d{i}")}))
+            .collect();
+        spec.Labels.insert(
+            AGENT_LABEL.to_string(),
+            serde_json::json!({"module_ref": "a.wasm", "capabilities": {"dirs": at_cap}})
+                .to_string(),
+        );
+        assert!(service_spec_to_state(&spec).is_ok());
     }
 
     #[test]

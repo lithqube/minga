@@ -52,7 +52,7 @@ Rules, checked in `minga-compose` and again on the node:
 - `grants` values: `env`, `clock`, `random`, `stdio`, `http`. Anything else is an error.
 - Without `env`, the `env:` map is not exposed. Declaring `env:` without the grant is an error, not a silent drop.
 - `dirs[].host` must be absolute with no `..`; `guest` must be absolute and unique. There is no write mode.
-- The node only mounts dirs under roots the operator allows (`minga worker --agent-dir-root PATH`, repeatable). The path is canonicalised before the prefix check, so a symlink cannot escape. No root configured means no dirs.
+- The node only mounts dirs under roots the operator allows (`minga worker --agent-dir-root PATH`, repeatable), and only inside `PATH/<tenant-id>/` for the node's tenant. The path is canonicalised before the prefix check, so a symlink cannot escape. No root configured means no dirs.
 - `http` needs egress on the node. A run that asks for it on a node without `--egress-bind` fails at start with that reason in `Task.last_error`.
 - `egress_url` stays accepted so existing files deploy unchanged; it is informational only and the docs say so.
 

@@ -31,6 +31,17 @@
   write by how much the tenant's imported services grew on re-encoding, so a
   tenant at its `desired_state_bytes` quota can still import its own data;
   the quota itself is never changed.
+- Agent grant review fixes. A pre-v9 snapshot whose agents (including
+  `previous`) carry capabilities other than the v8 migration's `env` grant is
+  refused, so a caller-chosen `format_version` can no longer store bytes
+  outside the tenant quota. `minga state import` runs the deploy-time agent
+  checks, and in v9 snapshots an omitted or null `capabilities` means no
+  grants, as in the `minga.agent` label. Unknown keys in agent specs,
+  capabilities and directory grants are refused. Agents may declare at most
+  64 directory grants with paths up to 4096 bytes. `--agent-dir-root` now
+  grants only `<DIR>/<tenant-id>/` to the node's tenant, so existing grants
+  directly under a root must move into the tenant's subdirectory.
+  `MINGA_EGRESS_URL` reaches the sandbox only with the `http` grant.
 - The bundled NATS server moves from v2.10.22 to v2.15.3. External NATS is
   tested on v2.14.10 and v2.15.3; managers warn when JetStream `api.level` is
   below 4. A 2.10.22 store was verified through a direct upgrade to 2.15.3

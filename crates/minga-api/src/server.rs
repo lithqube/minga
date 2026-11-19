@@ -2488,6 +2488,107 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn state_import_round_trips_v9_agents_and_runs_agent_admission() {
+        let (router, store, _dir) = admin_router().await;
+        let mut service = service_record("stack_agent", "default");
+        service.agent = Some(Box::new(
+            serde_json::from_str(
+                r#"{"module_ref":"a.wasm","sandbox_env":{"K":"v"},"capabilities":{"grants":["env"]}}"#,
+            )
+            .unwrap(),
+        ));
+        store.upsert_service(service).await.unwrap();
+
+        let export = |router: Router| async move {
+            let req = Request::builder()
+                .uri("/v1.41/state")
+                .header("Authorization", "Bearer admin-token")
+                .body(Body::empty())
+                .unwrap();
+            let (status, json) = send_request(router, req).await;
+            assert_eq!(status, StatusCode::OK, "{json}");
+            json
+        };
+        let import = |router: Router, body: serde_json::Value| async move {
+            let req = Request::builder()
+                .method("POST")
+                .uri("/v1.41/state?overwrite=true")
+                .header("Authorization", "Bearer admin-token")
+                .header("Content-Type", "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap();
+            send_request(router, req).await
+        };
+
+        // A genuine v9 export always carries `capabilities` and round-trips.
+        let exported = export(router.clone()).await;
+        let agent = &exported["services"][0]["agent"];
+        assert_eq!(agent["capabilities"]["grants"], serde_json::json!(["env"]));
+        let (status, json) = import(router.clone(), exported.clone()).await;
+        assert!(status.is_success(), "{status}: {json}");
+        assert_eq!(
+            export(router.clone()).await["services"],
+            exported["services"]
+        );
+
+        // In v9, an omitted or null capabilities means no grants, so the
+        // env map is refused as at deploy instead of getting an implicit env.
+        for capabilities in [None, Some(serde_json::Value::Null)] {
+            let mut body = exported.clone();
+            let agent = body["services"][0]["agent"].as_object_mut().unwrap();
+            match capabilities {
+                None => agent.remove("capabilities"),
+                Some(value) => agent.insert("capabilities".into(), value),
+            };
+            let (status, json) = import(router.clone(), body).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
+            assert!(json["message"].as_str().unwrap().contains("env grant"));
+        }
+
+        // Explicit capabilities get the same admission checks as a deploy.
+        for (capabilities, expected) in [
+            (serde_json::json!({"grants": []}), "env grant"),
+            (
+                serde_json::json!({"grants": ["env"], "dirs": [{"host": "srv", "guest": "/d"}]}),
+                "must be absolute",
+            ),
+        ] {
+            let mut body = exported.clone();
+            body["services"][0]["agent"]["capabilities"] = capabilities;
+            let (status, json) = import(router.clone(), body).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
+            assert!(
+                json["message"].as_str().unwrap().contains(expected),
+                "{json}"
+            );
+        }
+
+        // Serde decodes arrays by position, so non-object services and
+        // agents are refused before the omitted-capabilities rule runs. This
+        // array would decode with `sandbox_env` set and capabilities omitted.
+        let positional: serde_json::Value =
+            serde_json::from_str(r#"["a.wasm",null,null,null,null,null,null,{"K":"v"},null]"#)
+                .unwrap();
+        let mut agent_array = exported.clone();
+        agent_array["services"][0]["agent"] = positional;
+        let mut previous_array = exported.clone();
+        previous_array["services"][0]["previous"] = serde_json::json!([]);
+        let mut service_array = exported.clone();
+        service_array["services"][0] = serde_json::json!([]);
+        for body in [agent_array, previous_array, service_array] {
+            let (status, json) = import(router.clone(), body).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
+            assert!(
+                json["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("must be a JSON object"),
+                "{json}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn state_routes_need_the_token_and_check_version_first() {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(

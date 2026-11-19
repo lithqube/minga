@@ -595,6 +595,7 @@ pub enum WorkloadKind {
 
 /// Capabilities explicitly granted to an agent workload.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct AgentCapabilities {
     /// Host capabilities granted to the workload.
     #[serde(default)]
@@ -605,9 +606,28 @@ pub struct AgentCapabilities {
 }
 
 impl AgentCapabilities {
-    /// Checks the directory grants that need no node configuration: absolute
-    /// host and guest paths without `..`, and no guest path declared twice.
-    /// Roots and existence are checked on the node.
+    /// Most directory grants one agent may declare.
+    pub const MAX_DIRS: usize = 64;
+    /// Longest host or guest path, in bytes (Linux `PATH_MAX`).
+    pub const MAX_PATH_LEN: usize = 4096;
+
+    /// What the v8 to v9 migration grants a record that has no
+    /// capabilities: `env` when it declares an env map, nothing else.
+    pub fn v8_migrated(sandbox_env: &HashMap<String, String>) -> Self {
+        Self {
+            grants: if sandbox_env.is_empty() {
+                BTreeSet::new()
+            } else {
+                BTreeSet::from([AgentGrant::Env])
+            },
+            dirs: Vec::new(),
+        }
+    }
+
+    /// Checks the directory grants that need no node configuration: at most
+    /// [`Self::MAX_DIRS`], absolute host and guest paths of at most
+    /// [`Self::MAX_PATH_LEN`] bytes without `..`, and no guest path declared
+    /// twice. Roots and existence are checked on the node.
     pub fn validate_dir_paths(&self) -> Result<(), String> {
         fn plain_absolute(path: &std::path::Path) -> bool {
             path.is_absolute()
@@ -615,8 +635,21 @@ impl AgentCapabilities {
                     .components()
                     .any(|component| component == std::path::Component::ParentDir)
         }
+        if self.dirs.len() > Self::MAX_DIRS {
+            return Err(format!(
+                "agent declares {} directory grants, at most {} are allowed",
+                self.dirs.len(),
+                Self::MAX_DIRS
+            ));
+        }
         let mut guest_paths = BTreeSet::new();
         for dir in &self.dirs {
+            if dir.host.len() > Self::MAX_PATH_LEN || dir.guest.len() > Self::MAX_PATH_LEN {
+                return Err(format!(
+                    "agent directory paths must be at most {} bytes",
+                    Self::MAX_PATH_LEN
+                ));
+            }
             if !plain_absolute(std::path::Path::new(&dir.host)) {
                 return Err(format!(
                     "agent directory host path `{}` must be absolute and contain no `..`",
@@ -661,6 +694,7 @@ pub enum AgentGrant {
 
 /// A read-only directory granted to an agent.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct AgentDirGrant {
     /// Host directory path, checked against node operator roots.
     pub host: String,
@@ -696,7 +730,9 @@ pub struct AgentSpec {
 }
 
 /// Decoded shape of [`AgentSpec`]; `capabilities` is absent before format v9.
+/// No stored version ever had other keys, so unknown ones are refused.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct AgentSpecRecord {
     module_ref: String,
     fuel_limit: Option<u64>,
@@ -715,14 +751,9 @@ impl From<AgentSpecRecord> for AgentSpec {
         // Before v9 the declared env map always reached the sandbox. Granting
         // `env` to those records keeps upgraded agents starting; the tenant
         // declared both the map and the agent, so nothing widens.
-        let capabilities = record.capabilities.unwrap_or_else(|| AgentCapabilities {
-            grants: if record.sandbox_env.is_empty() {
-                BTreeSet::new()
-            } else {
-                BTreeSet::from([AgentGrant::Env])
-            },
-            dirs: Vec::new(),
-        });
+        let capabilities = record
+            .capabilities
+            .unwrap_or_else(|| AgentCapabilities::v8_migrated(&record.sandbox_env));
         Self {
             module_ref: record.module_ref,
             fuel_limit: record.fuel_limit,
