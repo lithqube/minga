@@ -8,29 +8,21 @@ A single-binary container and agent orchestrator for **edge, on-prem and air-gap
 
 Named after the [minga](https://en.wikipedia.org/wiki/Minga) of Chiloé, where a community moves a whole house together.
 
-> **Status: `v1.2.0`.** What works, verified by tests on macOS and in Linux CI (containerd suites and a real-kernel networking job); the [release notes](docs/release-1.2.0.md) say what was and was not run on a real node:
+> **Latest release: `v1.2.0`.** The release's capabilities and verification limits are in the [release notes](docs/release-1.2.0.md).
 >
-> - **Compose and deploy:** Compose parsing that fails loudly on unknown keys, and `minga deploy` through the Swarm-compatible Docker Engine API (v1.41, optional bearer token).
-> - **Control plane:** Raft consensus with mTLS and write forwarding, a scheduler, and self-registering nodes with membership leases.
-> - **Runtime and networking:** a node supervisor driving a **real containerd runtime**, per-task netns/bridge networking with IPAM and embedded DNS, ingress publishing, and cross-node WireGuard networking with NAT manager relays (Phase 13; live-verified, unreleased).
-> - **Platform:** NATS/JetStream with TLS, WASM sandboxes, an LLM egress proxy, and Prometheus metrics with health endpoints.
-> - **Updates:** rolling updates honoring `update_config`, enforced healthchecks, automatic rollback, and registry image pull through containerd's Transfer API with Docker credential helpers.
-> - **New in `v1.1.0`:** versioned state, so later upgrades keep it; `minga state export` and `import` for backup and restore ([guide](docs/backup.md)); a failed task records its last error and exit code, shown by the Docker API and `minga-ctl service ps` and `service inspect`; image pulls that keep the credential off the command line and read `credsStore`/`credHelpers`; published ports that only redirect traffic addressed to the node, with host-local and hairpin access; supplementary groups from the image. **Upgrading from 1.0.2 needs one last removal of the Raft files**: see the [release notes](docs/release-1.1.0.md#upgrade-notes).
-> - **Security fixes in `v1.2.0`**, from a source audit: TLS keys, Raft data and the NATS config are owner-only; the admin token is never sent through a proxy or redirect; tasks cannot reach other stacks' bridges or the node's loopback services, and a published port cannot take a node port; containers get Docker's masked and read-only `/proc` paths and a deny-all device rule; a bus Assign only starts what Raft assigns; the API and metrics listeners time out slow clients and cap connections; a tokenless API refuses browser-shaped requests. Plaintext Raft and a tokenless API off loopback log a warning. See the [upgrade notes](docs/release-1.2.0.md#upgrade-notes).
-> - **Fixed in `v1.1.1`:** relative bind mounts with the default `-c compose.yaml` resolve against the current directory, and the API refuses a relative bind source instead of letting the node guess.
-> - **`minga-ctl`**, the companion CLI for contexts, stacks, services, health and registry login over SSH (not in the release archive; `cargo install --locked --path crates/minga-ctl`, see [its plan](docs/minga-ctl-plan.md)).
-> - **Idle footprint, measured on `v1.0.1`:** the control plane (manager, API and the NATS sidecar) used 59 MB, against 101 MB for `dockerd` on a Docker Compose host and 311 MB on a Swarm manager; 119, 169 and 377 MB counting containerd; no `docker-proxy` processes, where the Compose host ran 4. One idle snapshot per host on Hetzner ARM64, workloads not matched, so part of the gap may come from the workload. [Method and caveats](docs/benchmark.md).
+> **Current `main` is unreleased** ([`02c578c`](https://github.com/lithqube/minga/commit/02c578c22295ad88148ca696ed7ee755821e3148), PR [#103](https://github.com/lithqube/minga/pull/103)). It contains:
 >
-> **Not in `v1.2.0`:**
+> - **Multi-node networking (Phase 13):** kernel WireGuard overlay, manager relay for NAT-isolated workers, cross-node ingress and same-network task isolation. T2/T3 live proofs passed; T4 scale has not been measured.
+> - **Tenant isolation (Phase 15):** tenant-scoped API identities, resources, NATS permissions and quotas; worker enrollment binds nodes to tenants. T1–T5 implementation is merged. The end-to-end proof that tenant B cannot place on tenant A's node remains deferred until release readiness.
+> - **Agent egress and usage (PR #103):** named tenant-owned routes, route/model policy, per-workload cache, streaming, per-run budgets, usage events and `minga-ctl agent usage`.
+> - **Sandbox status:** Wasmtime fuel, epoch timeout and memory limits are enforced. Agent capability grants are parsed and validated, but WASI host imports are not linked yet; WASM guests cannot use env, files, clocks, stdio or HTTP egress. Firecracker remains a stub.
+> - **Pre-release checks:** tenant-isolation proof, manager rejoin after NATS credential changes, and large-cluster scale measurement. VM tests remain deferred until release readiness.
 >
-> - Cross-node WireGuard networking is implemented and T2/T3 live-verified in unreleased Phase 13; it is not part of the `v1.2.0` release. Manager rejoin after test credential updates still needs release validation.
-> - Joining a node to a running cluster: Raft membership is fixed at bootstrap.
-> - API roles, TLS on the API listener and a server-side audit log: designed in [ADR 0005](docs/adr/0005-api-identity-and-roles.md) (Proposed), not built. The API has one shared token.
-> - A plain-HTTP registry on containerd 1.7 (the Transfer API has no plain-HTTP option there).
-> - A run of this build on a real staging node, on Talos, or against a hosted private registry: see [the release notes](docs/release-1.2.0.md#verification-status).
-> - A seccomp profile, and enforcement of Raft TLS off loopback (it only warns).
+> **Not in tagged `v1.2.0`:** cross-node WireGuard networking, tenant isolation, API client-certificate roles and audit. Those are current-main features, not part of the v1.2.0 release.
 >
-> Details: [changelog](CHANGELOG.md), [release notes](docs/release-1.2.0.md), [production-readiness plan](docs/production-readiness-plan.md), [architecture notes](docs/architecture.md).
+> Other current limits: no seccomp profile; Raft TLS without mTLS still warns rather than refusing off-loopback; API TLS/mTLS is available on current main, while `minga-ctl` does not yet support client-certificate credentials in its context.
+>
+> Details: [changelog](CHANGELOG.md), [release notes](docs/release-1.2.0.md), [architecture](docs/architecture.md), [supported topologies](docs/topologies.md), [CLI reference](docs/cli.md), [planning state](.planning/STATE.md).
 >
 > The Talos install is validated on a single docker-provisioned Talos v1.14 node, not on bare metal. FIPS, SOC 2, VS-NfD and NATO are **not assessed**, which is not the same as "not applicable".
 
@@ -52,7 +44,7 @@ Minga ships as **one binary** (plus the `nats-server` it supervises). There's no
 - **Backup and restore.** `minga state export` writes services, networks, volumes and secret and config references to a 0600 file; `minga state import` restores them into a fresh cluster, where the scheduler places the tasks again. [docs/backup.md](docs/backup.md) lists what else to copy.
 - **Container networking:** deterministic per-task IPs from IPAM (each network gets its own /24 from `10.100.0.0/16`, or from `--overlay-supernet`, stored in Raft by the leader), one bridge per network, a netns and veth pair per task, embedded DNS (`<svc>`, `tasks.<svc>`, `<svc>.<stack>.minga.local`), and a node-level WireGuard mesh for cross-node traffic. Ingress ports answer on every node; `mode: host` stays node-local. Multi-manager clusters require reachable manager UDP endpoints; NAT workers relay through trusted managers. See [supported topologies](docs/topologies.md).
 - **Secrets and logs.** Secrets are external references staged per task and content-addressed, so rotation never changes a running task's files. `minga logs [-f]` shows separated stdout/stderr from a JetStream-retained backlog.
-- **Agent workloads.** `x-minga-agent` Compose services run as WASM modules under wasmtime with fuel and timeout limits. An LLM egress proxy enforces per-workload token budgets, caches responses and redacts secrets. Today the WASM guest gets no host I/O: no WASI, no network, so it can't reach the proxy yet. Memory limits aren't enforced, and Firecracker is a stub.
+- **Agent workloads.** `x-minga-agent` services run WASM modules under Wasmtime with fuel, interruptible timeouts and enforced memory limits. `x-minga-egress` configures named routes, route/model policy, per-workload caching, streaming and usage reporting for routed containers. Agent capability grants are validated but not yet linked to WASI imports, so a guest cannot access host I/O or the egress proxy. Per-run budgets are node-local; cross-node customer budgets and request-rate limits remain planned. Firecracker is a stub.
 - **Observability.** `/metrics`, `/healthz` and `/readyz` on the manager API, and on manager and worker nodes via `--metrics-bind`. JSON logs on stderr for long-running roles. A failed container task keeps its last error and exit code, returned in the Docker API's task status and shown by `minga-ctl service ps` and `service inspect`; an agent task records the error only when it fails to start.
 - **Air-gap friendly.** Release archives bundle a checksum-pinned `nats-server`, and `install.sh` verifies `SHA256SUMS`. A task pulls a missing image through containerd's Transfer API on the configured socket, with credentials from Docker credential helpers or inline `auths` that never appear on a command line; air-gapped sites preload images with `minga image pull` or `ctr` instead.
 
@@ -160,17 +152,18 @@ flowchart TB
 
 | Crate | Purpose |
 | --- | --- |
-| `minga-cli` | The `minga` binary: `manager`, `worker`, `api`, `deploy`, `validate`, `logs`, `tls`, `net`, `wg`, `sandbox`, `egress`, `agent`. Also manages the NATS sidecar. |
-| `minga-compose` | Compose Specification parser and validator: interpolation, profiles, merge keys, `x-minga-agent`, cycle and port-conflict detection. |
-| `minga-state` | Cluster state: openraft + redb, a TCP transport with optional mTLS, write forwarding to the leader, and an atomic lease-renewal command. |
-| `minga-scheduler` | Compose → state translation, spread placement with constraints and capacity checks, per-task IP assignment, and the reconcile loop. |
-| `minga-api` | Docker Engine API v1.41 subset (axum) with bearer-token auth and two-way translation between Docker and state types. |
-| `minga-node` | Node supervisor. Containerd runtime over gRPC (OCI spec, FIFO log capture), netns/bridge/DNAT networking, embedded DNS, secret staging, restart policies, agent executor, self-registration. |
-| `minga-bus` | `EventBus` trait with `MemoryBus` and `NatsBus` (JetStream commands, events, logs, KV status, leases) and NATS TLS. |
-| `minga-net` | CIDR and IPAM, the DNS record store, WireGuard keys and `wg-quick` config generation (not applied yet). |
-| `minga-sandbox` | `SandboxRuntime` trait: `WasmtimeRuntime` (fuel, timeout), `WarmPool`, a `FirecrackerRuntime` stub. |
-| `minga-egress` | LLM egress proxy: per-workload token budgets, LRU response cache, secret redaction. |
-| `minga-telemetry` | Prometheus registry, `/metrics`, `/healthz`, `/readyz` router, JSON logging. |
+| `minga-cli` | `minga` binary: manager/worker lifecycle, Compose validate/deploy, state export/import, logs, TLS/tenant enrollment utilities, networking, sandbox, agent, image and egress commands. |
+| `minga-ctl` | Operator workstation CLI: contexts, stack/service operations, health, metrics, images/secrets/registry, and tenant-scoped agent usage queries. |
+| `minga-compose` | Compose parser/validator, `x-minga-agent` and `x-minga-egress` extensions, interpolation, profiles, dependency and port checks. |
+| `minga-state` | Raft desired state, tenant-owned entities, persisted formats/migrations, manager membership and state forwarding. |
+| `minga-scheduler` | Compose translation, tenant-aware placement, IPAM, task/ingress/WireGuard projections and reconciliation. |
+| `minga-api` | Docker Engine API subset, tenant/client identity and authorization, audit, quotas, manager/node enrollment and state translation. |
+| `minga-node` | Manager/worker supervisor, containerd, netns/iptables, secret staging, Wasmtime agent execution and egress-proxy integration. |
+| `minga-bus` | Memory and NATS/JetStream event bus, tenant-scoped subjects/keys, worker ACLs, usage and audit events. |
+| `minga-net` | CIDR/IPAM, DNS records, node WireGuard interface/peer management and overlay routing. |
+| `minga-sandbox` | Wasmtime runtime, shared engine/module cache, fuel, epoch interruption and memory limits; Firecracker stub. |
+| `minga-egress` | Named-route proxy, destination policy, per-workload budgets/cache, streaming, usage accounting and secret redaction. |
+| `minga-telemetry` | Prometheus metrics and `/metrics`, `/healthz`, `/readyz` endpoints with JSON logging. |
 
 ## Quick start: one Linux host
 

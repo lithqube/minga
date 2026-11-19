@@ -1,9 +1,9 @@
 # CLI reference
 
-Minga has two command-line tools. This page documents the current manager-only
-Raft CLI shape and describes what each command does, where it runs and which
-flags matter. For the exact flags in your build, run `minga <command> --help`
-and `minga-ctl <command> --help`.
+This page covers the current unreleased CLI on `main` as well as the latest
+tagged release. For exact flags in an installed build, run
+`minga <command> --help` and `minga-ctl <command> --help`. Do not assume a
+feature documented under current `main` exists in v1.2.0.
 
 | Tool | Runs on | What it does | Ships in |
 | --- | --- | --- | --- |
@@ -12,6 +12,11 @@ and `minga-ctl <command> --help`.
 
 Supported layouts (single host, multi-node, Talos, air-gapped) are in
 [topologies.md](topologies.md).
+
+Current-main tenant enrollment and egress behavior is not in the v1.2.0
+release. Tenant CRUD and worker join-token issuance are API endpoints; neither
+has a `minga-ctl` subcommand yet. The companion CLI does include
+`minga-ctl agent usage`.
 
 ## Which deploy command to use
 
@@ -86,9 +91,9 @@ The API waits for catch-up before promotion. Remove it with
 | `--secret-store <DIR>` | `/var/lib/minga/secrets` | Secret values on this node. They never go through Raft or the bus. |
 | `--interval <SECS>` | `2` | Reconcile interval. |
 | `--sandbox-runtime <mock\|wasmtime>`, `--module-dir <DIR>` | none, `/var/lib/minga/modules` | `wasmtime` enables `x-minga-agent` tasks on this node. |
-| `--agent-dir-root <DIR>` (repeatable) | none | Canonicalized allowlist for agent directory grants. A grant must resolve under `<DIR>/<tenant-id>/` for the node's `--tenant-id`, so one tenant cannot name another's directories; a symlinked tenant directory is refused. No configured root permits no directory grants. Grants are validated only: the sandbox mounts no directories and links no WASI yet. |
-| `--egress-bind`, `--egress-upstream`, `--egress-credential`, `--egress-credential-header` | none, `https://api.openai.com`, none, `authorization` | Opt-in. Starts the LLM egress proxy for agent and routed container tasks (for example `0.0.0.0:8080`); tasks reach it on their bridge gateway at the bind's port. On Linux a non-loopback bind installs the `minga_egress_listener` nft table, which closes that port to everything but `lo` and task bridges (not the WireGuard mesh). The node then carries the reserved `com.minga.egress.proxy=true` label, and services with egress routes are placed only on such nodes. The credential is a secret ID in `--secret-store`; agents never see the key. |
-| `--egress-allow-cidr <CIDR>` (repeatable) | none | Tenant egress routes refuse loopback, link-local (`169.254.0.0/16`, `fe80::/10`), shared (`100.64.0.0/10`), `0.0.0.0/8`, unspecified, multicast, broadcast and private or unique-local destinations, checked on literal addresses and on every DNS answer at connect time, including IPv4 reached through NAT64 (`64:ff9b::/96`). Each flag allows one such range, for example an on-prem model gateway at `10.20.0.0/24`. The operator's `--egress-upstream` is not filtered. |
+| `--agent-dir-root <DIR>` (repeatable) | none | Canonicalized allowlist for tenant-scoped agent directory grants. Grants are validated but not mounted yet; WASI imports are not linked. |
+| `--egress-bind`, `--egress-upstream`, `--egress-credential`, `--egress-credential-header` | none, `https://api.openai.com`, none, `authorization` | Opt-in proxy for routed containers and agent runs. The secret ID resolves from the node-local secret store. `x-minga-egress` selects named tenant-owned routes, models and required-egress behavior; unsafe route destinations are rejected unless allowed with `--egress-allow-cidr`. |
+| `--tenant-id <ID>`, `MINGA_TENANT_ID` (worker env only) | `default` | Tenant bound to the node's NATS credentials and leases. A non-default worker must be pre-registered and use its tenant-bound join token; managers accept the flag but do not host tenant workloads in multi-tenant clusters. |
 
 The built-in NATS sidecar caps JetStream file storage at 8GB (not preallocated). The MINGA account's JetStream disk limit must not exceed that cap. JetStream shares the data volume with Raft and containerd, so on nodes with less than about 8GB free, the volume fills before the cap applies.
 
@@ -120,6 +125,13 @@ credentials; manager connections use a Minga-account `.creds` file through
 `MINGA_NATS_CREDENTIALS_FILE`. The API join-token endpoint issues the
 tenant-and-node-scoped worker credentials.
 
+Tenant creation, quota changes and node enrollment are cluster-operator API
+operations under `/minga/tenants` and `/minga/nodes/{id}/join-token`.
+There is no `minga-ctl tenant` or `minga-ctl node join-token` command yet.
+See [ADR 0008](adr/0008-multi-tenancy.md) for the identity and enrollment
+contract. Treat returned join tokens as secrets: write them to an owner-only
+file and pass the file through `MINGA_NODE_JOIN_TOKEN_FILE`.
+
 Create the key once with `minga tls init-join-key --out FILE`, then copy it
 securely to every manager and set `MINGA_JOIN_TOKEN_KEY_FILE` to that
 owner-only 32-byte key.
@@ -145,8 +157,10 @@ certificate flags, or previous Raft data directory is needed.
 
 | Flag | Default | Notes |
 | --- | --- | --- |
-| `--api-bind <ADDR>` | `0.0.0.0:2375` | The manager's Docker API listener. Bind `127.0.0.1:2375` unless containers (Traefik) must reach it; when reachable beyond loopback, configure a token and firewall the port. |
-| `--api-token`, `MINGA_API_TOKEN` | none | Bearer token on API requests, or Basic-auth password for Traefik's Swarm provider. Prefer the environment (`EnvironmentFile`) over the flag so the token is not in process listings. Manager membership endpoints always require a configured token. |
+| `--api-bind <ADDR>` | `0.0.0.0:2375` | The manager's Docker API listener. Bind `127.0.0.1:2375` unless remote clients or containers must reach it; for remote access, configure `--api-token` or TLS with `--api-client-ca` and firewall the port. |
+| `--api-token`, `MINGA_API_TOKEN` | none | Bearer token on API requests, or Basic-auth password for Traefik's Swarm provider. Prefer the environment (`EnvironmentFile`) over the flag so the token is not in process listings. Membership and tenant-administration endpoints require a cluster-operator identity (`O=*` client certificate or configured API token). |
+| `--api-tls-cert <PEM>`, `--api-tls-key <PEM>` | none | Enables TLS on the manager API listener. Supply both. |
+| `--api-client-ca <PEM>` | none | Requires client certificates signed by this CA and maps certificate caller, role and tenant to an API identity. |
 
 ### Client commands
 
@@ -155,28 +169,29 @@ certificate flags, or previous Raft data directory is needed.
 | `minga validate [-c FILE] [-p PROFILE]` | Parses the Compose file offline, rejects unknown keys and prints the startup order. `-p '*'` enables every profile. | Anywhere |
 | `minga deploy [-c FILE] [-p PROFILE] [--wait SECS] STACK` | Deploys the file as a stack and waits for placement (30 s by default). | Anywhere that reaches the API |
 | `minga state export [-o FILE] [--force]` | Writes desired state (services, networks, volumes, secret and config references) to stdout or a 0600 file. Not secret values, volume data or TLS material; see [backup.md](backup.md). | Anywhere that reaches the API |
-| `minga state import FILE [--overwrite]` | Restores an export. Fails on an existing service unless `--overwrite`. Agents get the same checks as a deploy; a pre-v9 file may not declare agent capabilities, and in a v9 file an omitted `capabilities` grants nothing. | Anywhere that reaches the API |
-| `minga migrate-v1 --manager-id ID [--manager-id ID ...] [--apply]` | Lists the current voters and those to remove when migrating from v1.2.0. Dry-run by default; `--apply` commits one membership change. Requires the admin API token. | Anywhere that reaches the API |
-| `minga logs [-f] [--tail N] TASK_ID` | Prints a task's output from JetStream (`--nats-url`); `TASK_ID` is `<stack>.<service>.<n>`. | Anywhere that reaches NATS |
-| `minga image pull IMAGE` | Pulls into the `minga` containerd namespace. Credentials come from `$DOCKER_CONFIG/config.json`, else `~/.docker/config.json`, and go to containerd over its API. | On the node |
-| `minga secret put ID < value` | Writes or rotates a secret value in the node's store, read from stdin. `ID` is `<stack>_<compose secret key>`. | On every node that runs the service |
-| `minga tls init-ca --dir DIR` | Creates the cluster CA (`ca.pem`, `ca-key.pem`). | Anywhere; keep `ca-key.pem` off the nodes |
-| `minga tls issue-node --ca-dir DIR --out-dir DIR --node-id ID --role worker\|manager` | Issues a node certificate with the Raft SAN and role-bound NATS identity; manager certificates also include `localhost` for the manager's local sidecar TLS client. Keys are written 0600. | Anywhere; copy one pair to each node |
-| `minga agent ls` | Lists running agent tasks from the bus. | Anywhere that reaches NATS |
-| `minga sandbox run --module FILE [--input DATA] [--fuel N] [--timeout SECS]`, `minga sandbox info` | Runs a WASM module once; lists the sandbox runtimes. A `--timeout` over 300 is refused. | Anywhere |
-| `minga egress [--bind ADDR] ...` | A standalone egress proxy. `--bind` defaults to `0.0.0.0:8080`. | Anywhere |
+| `minga state import FILE [--overwrite]` | Restores an export. Fails on an existing service unless `--overwrite`; tenant and agent capabilities are validated against the caller and imported schema. | Anywhere that reaches the API |
+| `minga migrate-v1 --manager-id ID ... [--apply]` | Dry-runs or applies the v1.2.0 worker-voter migration. Requires an administrator API token. | Anywhere that reaches the API |
+| `minga logs [-f] [--tail N] TASK_ID` | Reads task output from JetStream; task IDs include `<stack>.<service>.<n>`. | Anywhere that reaches NATS |
+| `minga image pull IMAGE` | Pulls into the `minga` containerd namespace using Docker credential config. | On the node |
+| `minga secret put ID < value` | Writes/rotates a node-local secret from stdin. | On every node that may run the service |
+| `minga tls init-ca --dir DIR`, `tls init-join-key --out FILE` | Creates the cluster CA or the owner-only 32-byte join-token signing key. | Anywhere secure |
+| `minga tls issue-node ...`, `tls issue-client ... --tenant TENANT` | Issues node identity or API client certificates. Client certificates encode caller, role and tenant (`*` for cluster operators). | Anywhere secure |
+| `minga agent ls` | Lists agent tasks from the bus. | Anywhere that reaches NATS |
+| `minga sandbox run ...`, `minga sandbox info` | Runs a WASM module once or lists available runtimes. | Anywhere |
+| `minga egress ...` | Starts a standalone egress proxy. | Anywhere |
+| `minga net ...`, `minga wg ...` | Inspects/plans overlay addresses and WireGuard keys/config; these helpers do not change cluster state or configure a host interface. | Anywhere |
 
 `deploy` and `state` take `--api-url` (or `MINGA_API_URL`, default
 `http://127.0.0.1:2375`) and read the token from `MINGA_API_TOKEN`.
-
-### Planning utilities
 
 `minga net create` and `net inspect`, and `minga wg keygen`, `wg pubkey` and
 `wg config`, compute and print subnets, WireGuard keys and a sample interface
 config. **These commands change nothing**: they do not create a cluster
 network, configure an interface or write to Raft. Compose networks are created
-by `minga deploy`; cross-node networking becomes active when the peer-set plan
-lands.
+by `minga deploy`; on supported Linux nodes the manager projects WireGuard
+peers/routes through `MINGA_ASSIGN`, and the node supervisor configures the
+mesh. Multi-node operation requires the documented manager UDP endpoint and
+relay trust configuration; see [topologies.md](topologies.md).
 
 ## `minga-ctl`
 
@@ -237,6 +252,7 @@ Through the API:
 | `secret list` | Secret metadata; values never leave the nodes. |
 | `health [--stack STACK] [--timeout SECS]` | The API, and with `--stack` the stack's services and their health URLs. |
 | `metrics` | The Prometheus metrics the cluster reports. |
+| `agent usage [--customer ID] [--since 30d]` | Shows retained per-request token/cost usage for the caller's tenant; cluster operators see totals by tenant. This command is read-only. |
 
 On the nodes, over SSH (`--ssh TARGET`, repeatable; by default the context's
 `--node` targets, else its `--ssh`, else this machine):
@@ -257,6 +273,12 @@ Exit codes: `0` success, `1` usage or configuration error, `2` API, transport,
 SSH or authentication failure or a failed health check, `3` the named service,
 stack or context does not exist.
 
+Tenant operations are not yet exposed as `minga-ctl` subcommands. Use the
+cluster-operator API for tenant CRUD and node-bound join-token issuance;
+the `minga-ctl` context token must be a cluster-operator credential. The
+`--tls-cert` context setting trusts an HTTPS server CA; it is not a client
+certificate/key option.
+
 ## Environment variables
 
 | Variable | Read by | Meaning |
@@ -268,8 +290,15 @@ stack or context does not exist.
 | `MINGA_NATS_CREDENTIALS_FILE` | Manager/worker roles | Owner-only NATS user `.creds` file; requires mTLS. |
 | `MINGA_NATS_OPERATOR_JWT` | `minga manager` | Public operator JWT file; enables operator/JWT auth on the built-in sidecar. Set with the resolver directory. |
 | `MINGA_NATS_RESOLVER_DIR` | `minga manager` | Writable full-resolver directory for account JWTs; set with the operator JWT file. |
+| `MINGA_NATS_ACCOUNT_JWT_FILE` | `minga manager` | Owner-only control-plane NATS account JWT for operator/JWT mode. |
+| `MINGA_NATS_ACCOUNT_SEED_FILE` | `minga manager` | Owner-only control-plane NATS account signing seed. |
+| `MINGA_NATS_TENANT_SIGNER_DIR` | `minga manager` | Owner-only per-tenant account signer seed files. |
+| `MINGA_NATS_SYS_CREDENTIALS_FILE` | `minga manager` | Owner-only `.creds` file for the NATS system account. |
 | `MINGA_NATS_TLS_CA`, `MINGA_NATS_TLS_CERT`, `MINGA_NATS_TLS_KEY`, `MINGA_NATS_TLS_SERVER_NAME` | Everything that connects to NATS | Client certificate settings for a `tls://` URL. |
 | `MINGA_NATS_REPLICAS` | Node roles | Same as `--nats-replicas`. |
+| `MINGA_TENANT_ID` | `minga worker` | Tenant bound to this worker node (default `default`). |
+| `MINGA_NODE_JOIN_TOKEN_FILE` | `minga worker` | File containing the short-lived token for first enrollment of a non-default tenant worker. |
+| `MINGA_JOIN_TOKEN_KEY_FILE` | Managers | Shared owner-only HMAC key file used to issue/validate tenant-bound node join tokens. |
 | `MINGA_NATS_SERVER_BIN` | `minga manager` | The `nats-server` the sidecar runs, instead of the one next to `minga` or on `PATH`. |
 | `MINGA_METRICS_BIND` | Node roles | Same as `--metrics-bind`. |
 | `MINGA_LOG_LEVEL` | All `minga` processes | Log filter, such as `info` or `minga_node=debug` (default `info`). |

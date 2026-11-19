@@ -1,9 +1,8 @@
 # Sandbox host capabilities: plan
 
-- Status: Step 1 is merged (PR #101); step 2 is in progress on this branch. Full host capabilities remain sequenced after order 6 (E14/E15) in [agent-plane-roadmap.md](agent-plane-roadmap.md).
-- Date: 2026-11-16
-- Branch: `feat/agent-sandbox-grants`
-- Closes structural limit 4 in [architecture.md](architecture.md) and the "Missing" items in [ADR 0003](adr/0003-agent-workloads.md).
+- Status: Steps 1 and 2 are merged (PRs #101 and #102). Steps 3–7 remain open; host capabilities are sequenced after Order 6 (E14/E15) in [agent-plane-roadmap.md](agent-plane-roadmap.md).
+- Date: 2026-11-19
+- Closes structural limit 1 in [architecture.md](architecture.md) and updates the implementation status in [ADR 0003](adr/0003-agent-workloads.md).
 
 ## Decisions
 
@@ -16,50 +15,54 @@
 | `token_budget` | Per task run: registered when the run starts, removed when it ends. It applies on top of the roadmap's per-tenant windowed budgets (B6). |
 | Out of scope | Firecracker, module distribution, cluster-wide budget accounting, placement by node egress capability. |
 
-## 1. What the code does today
+## 1. Current implementation
 
-- `run_wasm` instantiates with `Instance::new(&mut store, module, &[])`: no imports, so any WASI module fails to instantiate (`crates/minga-sandbox/src/wasmtime_rt.rs`).
-- **The timeout does not stop the guest.** `tokio::time::timeout` wraps `spawn_blocking`; on expiry the caller gets `Timeout` but the wasm thread keeps running until fuel runs out, or forever without a fuel limit.
-- `memory_limit` is copied into `SandboxSpec` and never read. The runtime even grows memory itself to `MIN_MEMORY_PAGES`.
-- `MINGA_EGRESS_URL` and `MINGA_EGRESS_TOKEN` are put in an env the guest cannot read (`crates/minga-node/src/agent.rs`). Once env is granted, the guest could read the token.
-- The egress proxy registers no budgets on a node, so every request gets 429. Its response cache is keyed by method, path and body, not workload (`crates/minga-egress/src/proxy.rs`).
-- A fresh `WasmtimeRuntime` (and `Engine`) is built per task, so nothing is cached between runs.
-- wasmtime is pinned at 24. Stable `wasmtime-wasi` / `wasmtime-wasi-http` are on the 50.x line (51 is in RC).
+Current main has no WASI linker or guest HTTP host function. The capability
+grant schema and tenant-scoped directory-root validation are present, but
+grants are not mounted or exposed to guests. The shared Wasmtime engine,
+bounded module cache, epoch timeout and StoreLimits memory cap are enforced.
+The egress proxy has tenant-owned named routes, policy, streaming and usage;
+its per-workload budget tracking is node-local, not a distributed customer
+window budget. `MINGA_EGRESS_URL` / `MINGA_EGRESS_TOKEN` are not usable by a
+guest until a WASI environment is added.
+
+Step 2 introduced the capability field in the persisted format v9. Current
+main uses format v10 after subsequent tenancy changes; do not use the
+historical v9 format as the current version.
 
 ## 2. Compose grammar
 
-New optional `capabilities` block under `x-minga-agent`. `deny_unknown_fields` stays, so a misspelt grant fails the deploy.
+The optional `capabilities` block is implemented in the Compose schema. `deny_unknown_fields` remains, so a misspelt grant fails deploy validation. The grants are not linked into the guest runtime yet.
 
 ```yaml
 services:
   researcher:
     x-minga-agent:
       module: researcher.wasm        # core module or component, detected from the binary
-      memory_limit: 268435456        # now enforced
-      timeout: 120                   # now stops the guest
-      token_budget: 50000            # per run, at the node's egress proxy
+      memory_limit: 268435456        # enforced by StoreLimits
+      timeout: 120                   # enforced by epoch interruption
       env:
         MODEL: claude-sonnet-5-5
       capabilities:
-        grants: [env, clock, random, stdio, http]
+        grants: [env, clock, random, stdio, http] # schema-valid; not active in guests yet
         dirs:
           - host: /srv/minga/datasets/q3
-            guest: /data             # always read-only
+            guest: /data             # schema-valid; not mounted yet
 ```
 
-Rules, checked in `minga-compose` and again on the node:
+The Compose parser and node validate the shape, without linking the grants:
 
 - `grants` values: `env`, `clock`, `random`, `stdio`, `http`. Anything else is an error.
-- Without `env`, the `env:` map is not exposed. Declaring `env:` without the grant is an error, not a silent drop.
+- Without `env`, the `env:` map is not exposed. Declaring `env:` without the grant is an error.
 - `dirs[].host` must be absolute with no `..`; `guest` must be absolute and unique. There is no write mode.
-- The node only mounts dirs under roots the operator allows (`minga worker --agent-dir-root PATH`, repeatable), and only inside `PATH/<tenant-id>/` for the node's tenant. The path is canonicalised before the prefix check, so a symlink cannot escape. No root configured means no dirs.
-- `http` needs egress on the node. A run that asks for it on a node without `--egress-bind` fails at start with that reason in `Task.last_error`.
-- `egress_url` stays accepted so existing files deploy unchanged; it is informational only and the docs say so.
+- The node canonicalizes and checks directory roots under `minga worker --agent-dir-root PATH`, and requires the tenant-specific subdirectory. No root means no dirs are accepted. These checks do not mount a guest filesystem yet.
+- The `http` grant is accepted by the schema but has no guest host function yet; the planned runtime must require node egress before starting an HTTP-enabled run.
+- `egress_url` remains accepted for compatibility and is informational only.
 
 ## 3. State and transport
 
-- `AgentSpec` gains `capabilities: AgentCapabilities { grants: BTreeSet<Grant>, dirs: Vec<DirGrant> }` with `#[serde(default)]`. Format v9 migrates v8 state and Raft logs and accepts v8 portable snapshots; wire frames still require a coordinated cluster upgrade. Add a new v9 frozen fixture; never edit older fixtures.
-- The spec travels through the Docker API in the `minga.agent` label. Extend `deploy_e2e::deploy_keeps_restart_policy_and_agent_spec` to round-trip the capabilities.
+- The capability field was added in v9; current main's persisted format is v10 after later tenancy migrations. Legacy formats migrate through the documented current migration path; wire frames still require a coordinated cluster upgrade. Never edit frozen fixtures.
+- The spec travels through the Docker API in the `minga.agent` label. `deploy_e2e::deploy_keeps_restart_policy_and_agent_spec` covers the round trip.
 - Nothing new goes through Raft beyond the spec itself. Run output and logs stay on JetStream / the node.
 
 ## 4. Runtime (minga-sandbox)
@@ -119,15 +122,15 @@ One PR per step, each green on `cargo fmt --all`, `cargo clippy --all-targets --
 
 | Step | Content | Depends on |
 |---|---|---|
-| 1 | **Complete:** Wasmtime upgrade, shared engine + bounded module cache, epoch timeout, `StoreLimits` memory. Fixes the runaway-timeout bug on its own. | none |
-| 2 | Compose `capabilities` grammar, `AgentSpec` field, translation, label round trip, v9 state/log migration, v8 snapshot import, node-side validation, `--agent-dir-root`. | none |
+| 1 | **Complete (PR #101):** Wasmtime upgrade, shared engine + bounded module cache, epoch timeout and enforced `StoreLimits` memory. | none |
+| 2 | **Complete (PR #102):** Compose `capabilities` grammar, `AgentSpec` field, translation, label round trip, state migration, node-side validation and `--agent-dir-root`. | none |
 | 3 | Core-module path: preview1 linker, `WasiCtx` from grants, stdio capture. | 1, 2 |
 | 4 | Component path: WASI 0.2 linker, `wasi:cli/run`, same grants. | 3 |
 | 5 | HTTP for both paths, host-attached token, per-run cap. | 3, 4, roadmap orders 1–2 |
 | 6 | Agent logs through the existing logs surfaces. | 3 |
-| 7 | Docs: update ADR 0003 status, architecture.md limit 4, cli.md flags, example compose. | 5, 6 |
+| 7 | Docs and runnable examples for the implemented host capabilities. | 5, 6 |
 
-Steps 1 and 2 can run in parallel.
+Steps 1 and 2 are complete. Steps 3–7 remain; VM proof is not part of this work until release readiness.
 
 ### Test fixtures
 

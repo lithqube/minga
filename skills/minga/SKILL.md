@@ -5,20 +5,20 @@ description: Operate a Minga cluster (the single-binary Rust orchestrator that r
 
 # Operating Minga
 
-Minga runs Compose files on one binary: Raft holds desired state and placement, NATS/JetStream carries status, logs and liveness, containerd runs the containers. This skill is for operating it. For changing Minga's own code, follow the repository's `CLAUDE.md` instead.
+Minga runs Compose files on a single Rust binary: managers hold Raft desired state and placement, NATS/JetStream carries runtime status and events, and containerd runs containers. Workers are JetStream clients, not Raft voters. On multi-tenant clusters, each worker serves one tenant. For changing Minga's code, follow the repository's `CLAUDE.md`.
 
-Flags change between releases. Before running a command you have not run in this session, check `minga <cmd> --help` or `minga-ctl <cmd> -h` rather than trusting this file. Check the version first (`minga --version`, `minga-ctl --version`): this file is written for v1.2.0. A release candidate (`1.2.0-rc.N`) behaves as 1.2.0 here. A node on 1.1.0 or older does not have the 1.2.0 behaviour below, so say which version it runs before applying 1.2.0 advice.
+Version claims are release-specific. Check `minga --version` / `minga-ctl --version` and the target machine before acting. The latest tagged release is v1.2.0; current `main` includes unreleased multi-node WireGuard, tenant isolation, agent egress and usage changes. Do not describe current-main behavior as shipped in v1.2.0. For current status and verification gates, read `README.md`, `docs/architecture.md` and `.planning/STATE.md`.
 
 ## Two CLIs
 
 | Tool | What it is | Use it for |
 | --- | --- | --- |
-| `minga` | The orchestrator itself. Roles (`manager`, `worker`, `api`) plus client commands. | Running nodes, `validate`, `deploy`, `logs`, `image pull`, `state export` / `import`, `tls`, node-local `secret`. |
-| `minga-ctl` | Companion CLI on the operator's machine. Talks to `minga api`, usually through an SSH tunnel. | Contexts, stacks, services, scale / update / rollback, inspect, health, metrics, secrets and registry logins across nodes. |
+| `minga` | Node daemon and client commands; manager and worker roles. There is no separate `api` role. | Running nodes, `validate`, `deploy`, `logs`, `image pull`, `state export` / `import`, TLS and tenant-enrollment utilities, sandbox, agent and egress commands. |
+| `minga-ctl` | Companion CLI on the operator's machine. Talks to the manager API over SSH or HTTPS. | Contexts, stacks, services, health, metrics, images/secrets/registry and `agent usage`. |
 
-`minga-ctl` is not in the release archive: `cargo install --locked --path crates/minga-ctl` from a checkout of the release tag. It runs the `minga` binary **on the operator's machine** for `stack deploy` (through the tunnel), so `minga` must be on PATH there or `MINGA_BIN` set; the node only needs the API. Release archives are Linux only, so on macOS build it with `cargo install --locked --path crates/minga-cli`.
+`minga-ctl` is not in the release archive: install it from the matching source tag with `cargo install --locked --path crates/minga-ctl`. It runs the `minga` binary **on the operator's machine** for `stack deploy` (through the tunnel), so `minga` must be on PATH there or `MINGA_BIN` set; the node only needs the API.
 
-Which deploy command: `minga-ctl stack deploy` from a workstation (it saves specs for `service rollback` and has `--prune`); `minga deploy` on the node itself, in CI or in scripts (neither). `docs/cli.md` has every command, flag and environment variable; `docs/topologies.md` has the supported layouts and what each needs.
+Which deploy command: `minga-ctl stack deploy` from a workstation (it saves specs for `service rollback` and has `--prune`); `minga deploy` on the node itself, in CI or scripts. See `docs/cli.md` for commands and `docs/topologies.md` for supported layouts.
 
 ## Deploying a Compose file
 
@@ -88,7 +88,7 @@ Things that surprise people:
 - Tokens and secret values never go in arguments or config files, since both end up in process listings and shell history. `secret put` and `registry login` read stdin. The `minga-ctl` config has no token field on purpose; use `--remote-token-file`, `--token-command` or `MINGA_CTL_TOKEN`.
 - `service update --env-add` values are visible in process listings. Use Minga secrets for credentials.
 - Ask the user before `stack rm`, `stack deploy --prune`, `service rm`, `service rollback`, `image rm`, `registry logout`, `state import --overwrite`, removing Raft files, or anything that restarts a role. Do not pass `--yes` unless they said to.
-- Without `MINGA_API_TOKEN` on `minga api` the API is unauthenticated, and anything that reaches it can deploy privileged containers. Flag that if you see it. From 1.2.0 a tokenless API refuses requests with an `Origin` header or a DNS-name `Host`, which stops a browser page, but not a direct client. There are no roles yet: everyone with the token is an admin.
+- The manager API supports bearer-token authentication and optional TLS/mTLS client identities with caller, role and tenant. Do not assume every operator token is tenant-scoped: cluster-operator credentials have administrative access. `minga-ctl` currently supports bearer-token contexts and trusts an HTTPS server CA; it does not present a client certificate/key.
 - Raft without `--raft-tls-*` on a non-loopback bind lets anything that reaches the port rewrite cluster state, and Minga only logs a warning. Flag a multi-node cluster without Raft TLS.
 
 ## Troubleshooting
@@ -102,19 +102,19 @@ On the node itself, `minga-ctl` still needs a context: `minga-ctl context add lo
 | Deploy returns 409, or succeeds with no tasks placed | No eligible node. Check nodes are `Ready` / `active` (`GET /v1.41/nodes`), placement constraints, and capacity. A node advertises the labels it was started with (`--label key=value` on `manager` / `worker`), so a `node.labels.*` constraint needs a matching node. |
 | A service shows `0/1` with no obvious cause | `minga-ctl service inspect <stack>.<service>`. `exited with code N` is the process's own exit; `killed by signal 9` may be an OOM kill or an explicit kill (the runtime reports exit codes only, so this is inferred). A start error (image pull, user not in the image, secret, network) is recorded as text. No error and no logs usually means the task never started: check the node's journal. |
 | Node exits at start: `written by minga 1.0.2 or older` | Data directory from before 1.1.0. See "Backup, restore and upgrades": remove only `raft_log.redb` and `state.redb`, after asking. |
-| `/readyz` 503 `raft not ready` | No Raft leader. Every `--peer` must be up; membership is fixed at bootstrap. All nodes must run the same version. |
+| `/readyz` 503 `raft not ready` | No Raft leader. Check current manager peers and Raft connectivity; managers can be added or removed through the membership API. All nodes in a cluster must run a compatible version. |
 | `/readyz` 503 `bus not connected` | Check `--nats-url` and the `MINGA_NATS_TLS_*` environment. |
 | Image pull fails, or `401 Unauthorized` on pull | The daemon pulls (containerd's Transfer API), so containerd's network, proxy and CA trust apply, not the `minga` process's. Credentials come from `$DOCKER_CONFIG/config.json`, else `~/.docker/config.json`: `credHelpers`, then `credsStore`, then inline `auths`; a named helper must be on the manager's PATH. Credentialed pulls need containerd 1.7+, and a plain-HTTP registry cannot be reached on 1.7. Fix with `minga-ctl registry login`, or preload with `minga-ctl image pull` / `ctr -n minga images import`. |
-| Agent (`x-minga-agent`) task never runs | The node was not started with `--sandbox-runtime wasmtime`, or the `.wasm` module is not staged in `--module-dir`. |
+| Agent (`x-minga-agent`) task fails | The node needs `--sandbox-runtime wasmtime` and the module staged in `--module-dir`. Fuel, epoch timeout and memory limits are enforced. Capability grants are validated, but WASI host imports are not linked yet; guest env/files/clock/stdio/HTTP are unavailable. |
 | `cannot connect to containerd` | `--containerd-socket` takes a filesystem path, not a `unix://` URL. |
 | Tasks show `running` but no container exists (`ctr -n minga containers ls` is empty) | The node runs the default `--runtime mock`, which is in-memory. Start `manager` / `worker` with `--runtime containerd`; `scripts/minga.service` already passes it. |
 | `task already exists` after a state wipe | Stale containerd task: `ctr -n minga tasks delete --force <id>`. Ask first. |
-| Containers on different nodes cannot reach each other | Expected today: there is no cross-node mesh yet. |
+| Containers on different nodes cannot reach each other | Check Linux WireGuard support, node endpoint and manager UDP endpoint/relay configuration, peer assignment and cluster-wide network subnet. See `docs/topologies.md`; the T4 scale target remains unmeasured. |
 | `minga-ctl`: `rejected the credentials (401)` | Token source for the context is wrong. Check `remote_token_file` (a bare token, or an env file with `MINGA_API_TOKEN=`), `token_command`, `MINGA_CTL_TOKEN`. |
 | Task fails: `published port N/tcp is in use on this node (...)` | The port is reserved by the node itself or a host process listens on it (the text in brackets says which). Publish a different port; do not stop the node service holding it. |
 | Node exits: `private key ... has mode 644; it must not be readable by group or others (chmod 600)` | Raft key with loose permissions (1.2.0+). `chmod 600` it, after confirming the file is the node's own key. |
-| API answers 403: `request carries an Origin header` or `Host is a DNS name` | Tokenless API (1.2.0+). Set `MINGA_API_TOKEN` on `minga api` and give clients the token; Traefik sends it as its Basic-auth password. |
-| A task cannot reach a service on the node's `127.0.0.1`, or another stack's containers | Blocked on purpose from 1.2.0. Publish the service's port and use the node address. |
+| API answers 403: `request carries an Origin header` or `Host is a DNS name` | The v1.2.0 API blocks browser-style requests without a token. Set `MINGA_API_TOKEN` on `minga manager`; there is no separate `minga api` role. |
+| A task cannot reach a service on the node's `127.0.0.1`, or another stack's containers | Blocked by the host-network isolation rules. Publish the service's port and use the node address. |
 | A workload fails writing `/proc/sys/...`, or reading `/proc/kcore` | `/proc/sys` is read-only and Docker's sensitive paths are masked inside containers (1.2.0+). |
 | A stopped Minga task container is gone after a node restart | Expected from 1.2.0: at start the supervisor removes every container with a `minga/task_id` label that Raft does not assign to that node, running or exited, with its network and staged secrets, and adopts the ones Raft still assigns. The journal logs each removal. To keep a workload, deploy it through Minga. |
 | `stack deploy over ssh needs an API token for this context` | Add a token to the context (`--remote-token-file`, `--token-command` or `MINGA_CTL_TOKEN`). |
@@ -122,26 +122,40 @@ On the node itself, `minga-ctl` still needs a context: `minga-ctl context add lo
 
 ## Limits to state up front
 
-Say these before promising a design that depends on them, and confirm against the current README, since they are release-specific (written for v1.2.0):
+Confirm the version first. Current-main capabilities below are unreleased; the
+tagged v1.2.0 does not include Phase 13 mesh, Phase 15 tenants or agent usage.
 
-- Single host is the verified path. Multi-node schedules across nodes but has no cross-node container networking.
-- A node cannot join a running cluster. Every node is listed with `--peer` and started together, and all run the same version.
-- In multi-node, every manager and worker must point at one external NATS (`tls://`); a manager without `--nats-url` starts its own sidecar and splits the bus.
-- The API has one shared token: no per-operator identity, roles, TLS on the listener or server-side audit yet (`docs/adr/0005-api-identity-and-roles.md` is the proposed design).
-- Raft TLS is not enforced off loopback (a warning only), and containers have no seccomp profile yet.
+- T2/T3 multi-node WireGuard mesh and cross-node ingress are implemented and
+  live-proofed. T4 scale (~5,000 workers) is not measured; multi-manager
+  deployments need reachable UDP endpoints, and a relay manager can inspect
+  relayed plaintext traffic.
+- Phase 15 T1–T5 implementation is merged. The tenant B cannot place on tenant
+  A's node proof is deferred until release readiness; do not run VM tests
+  before then.
+- Agent egress routes, policy, streaming and usage reporting are implemented.
+  Per-workload budgets are node-local; distributed customer window budgets and
+  request-rate limits remain planned.
+- Wasmtime fuel, epoch timeout and memory limits are enforced. Capability
+  grants are parsed and validated, but WASI host imports are not linked, so
+  guest I/O and HTTP egress are unavailable. Firecracker remains a stub.
+- No seccomp profile. Raft TLS without mTLS warns rather than refusing
+  off-loopback binds.
 
 ## Where to read more
 
 In a checkout of https://github.com/lithqube/minga these are local files; read the one that matches the task instead of guessing.
 
-- `README.md`: status, quick start, role flags, topologies, air-gapped install.
-- `docs/cli.md`: every `minga` and `minga-ctl` command, its flags and defaults, environment variables, exit codes, and which deploy command to use.
-- `docs/topologies.md`: single host, workstation, air-gapped, Talos, container image and multi-node; ports, what stays per node, and how far each is verified.
-- `docs/release-1.2.0.md`: the security changes, upgrade checks and what was verified; `docs/release-1.1.0.md` for upgrades from 1.0.2.
-- `docs/backup.md`: export, import, what else to copy, cold copy.
-- `docs/minga-ctl-plan.md`: every `minga-ctl` command with examples, error texts, known limits (sections 4, 5 and 7).
-- `docs/talos-deployment.md`: Talos install and its troubleshooting table.
-- `docs/hetzner-arm-staging.md`: a real 8-service stack with Traefik and private images, plus a pre-deploy checklist.
-- `docs/architecture.md` and `docs/adr/`: why Raft holds only desired state and JetStream the rest, and the persisted-format rules.
+- `README.md`: release versus current-main status, quick start and crate map.
+- `docs/cli.md`: `minga` / `minga-ctl` commands, flags, environment and API-only tenant operations.
+- `docs/topologies.md`: single host, air-gapped, Talos and multi-node requirements/evidence.
+- `docs/architecture.md`: current control/data plane, tenant boundaries and limits.
+- `docs/agent-plane-roadmap.md`: completed egress/usage work and remaining agent features.
+- `docs/sandbox-host-capabilities-plan.md`: enforced Wasmtime limits and pending WASI/HTTP/log support.
+- `.planning/STATE.md` and `.planning/ROADMAP.md`: current phase status and release gates.
+- `docs/release-1.2.0.md`: tagged release security changes and upgrade checks.
+- `docs/backup.md`: export/import scope and what else to copy.
+- `docs/minga-ctl-plan.md`: companion CLI design and remaining gaps.
+- `docs/talos-deployment.md`, `docs/hetzner-arm-staging.md`: deployment-specific evidence and limits.
+- `docs/adr/`: settled design decisions and implementation status.
 
 For NATS / JetStream internals (streams, consumers, retention), use a JetStream skill if one is installed; this skill only covers how Minga uses the bus.

@@ -151,10 +151,16 @@ As in `docs/minga-ctl-plan.md` section 2.4: SOC 2 attests an organisation's cont
 - `minga tls`: every key file it writes is mode 0600 (`stat`); `issue-client --days 31` fails.
 - Revisions (after step C): a stale `?version=` returns 409; `?rollback=previous` restores `last_settled`; a pre-C state file without the new fields still loads.
 
-## Implementation status (2026-11-12)
-Proposed; nothing in this ADR is implemented. The current state is the "Context" section above. Planned in `docs/production-readiness-plan.md`:
+## Implementation status (2026-11-19)
 
-- **F1** — this ADR, reviewed before F2 starts.
-- **F2** — TLS listener, role middleware, audit line, `minga tls issue-client`, 0600 key files, the start-up refusal, the Raft peer-name check.
-- **F3** — server-side revisions and the 409; after step C (versioned state format).
-- **F4** — minga-ctl `client_cert` and `client_key` context keys; `service rollback` prefers the server's revision.
+The original proposal is only partially implemented; the ADR remains proposed.
+Current main has optional TLS and client-CA validation on the manager API,
+client certificates carrying caller/role/tenant identity, role-aware API
+authorization, and audit events for tenant-scoped state changes (see
+[ADR 0008](0008-multi-tenancy.md)). Bearer-token authentication remains the
+cluster-operator compatibility path.
+
+Still open from this proposal: server-side service revisions/conflict
+detection and client-certificate/key support in `minga-ctl` contexts. The
+current CLI uses bearer tokens and can trust an HTTPS server CA, but cannot
+present an API client certificate.
