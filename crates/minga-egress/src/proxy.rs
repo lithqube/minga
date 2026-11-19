@@ -1246,8 +1246,9 @@ impl TopLevelFields {
     }
 
     fn key_byte(&mut self, byte: u8) {
-        // Longer keys are never `usage` or `model`.
-        if self.key.len() <= 8 {
+        // A five-character key takes at most 30 escaped bytes (`\u0075`
+        // each), so anything longer is never `usage` or `model`.
+        if self.key.len() <= 30 {
             self.key.push(byte);
         }
     }
@@ -1271,9 +1272,11 @@ impl TopLevelFields {
                 self.in_string = false;
                 if self.reading_key {
                     self.reading_key = false;
-                    self.pending = match self.key.as_slice() {
-                        b"usage" => Some(Field::Usage),
-                        b"model" => Some(Field::Model),
+                    // Match the decoded key, as the buffered path does.
+                    let quoted = [b"\"", self.key.as_slice(), b"\""].concat();
+                    self.pending = match serde_json::from_slice::<String>(&quoted).as_deref() {
+                        Ok("usage") => Some(Field::Usage),
+                        Ok("model") => Some(Field::Model),
                         _ => None,
                     };
                     self.key.clear();
@@ -1369,7 +1372,7 @@ impl UsageParser {
             if let Some(raw) = self.fields.model.take() {
                 if let Some(model) = serde_json::from_slice::<String>(&raw)
                     .ok()
-                    .filter(|model| !model.is_empty())
+                    .filter(|model| reported_model_fits(model))
                 {
                     self.answered_model = Some(model);
                 }
@@ -1502,8 +1505,14 @@ fn find_answered_model(bytes: &[u8]) -> Option<String> {
                 .and_then(|message| message.get("model"))
         })
         .and_then(serde_json::Value::as_str)
-        .filter(|model| !model.is_empty())
+        .filter(|model| reported_model_fits(model))
         .map(str::to_owned)
+}
+
+/// A provider-reported model is kept for accounting only within the request
+/// identifier limit; otherwise the requested model stands in for it.
+fn reported_model_fits(model: &str) -> bool {
+    !model.is_empty() && model.len() <= MAX_IDENTIFIER_BYTES
 }
 
 fn usage_counts(usage: Option<&serde_json::Value>) -> Option<UsageCounts> {
@@ -2021,6 +2030,48 @@ mod tests {
             assert_eq!(model.as_deref(), Some("m-1"));
         }
         assert_eq!(find_usage(body.as_bytes()), Some(want));
+    }
+
+    #[test]
+    fn json_usage_parser_matches_escaped_top_level_keys() {
+        let body =
+            br#"{"\u006dodel":"m-2","us\u0061ge":{"prompt_tokens":3,"completion_tokens":4}}"#;
+        for chunk in [1, body.len()] {
+            let mut parser = UsageParser::new(false);
+            for part in body.chunks(chunk) {
+                parser.push(part);
+            }
+            let (counts, model) = parser.finish_with_model(body.len() as u64);
+            assert_eq!(
+                counts,
+                UsageCounts {
+                    input_tokens: 3,
+                    output_tokens: 4,
+                    estimated: false,
+                },
+                "chunk size {chunk}"
+            );
+            assert_eq!(model.as_deref(), Some("m-2"));
+        }
+        assert_eq!(
+            find_usage(body),
+            find_usage(br#"{"usage":{"prompt_tokens":3,"completion_tokens":4}}"#)
+        );
+    }
+
+    #[test]
+    fn oversized_reported_models_fall_back_to_the_requested_one() {
+        let long = "m".repeat(MAX_IDENTIFIER_BYTES + 1);
+        let body = format!(r#"{{"model":"{long}"}}"#);
+        assert_eq!(find_answered_model(body.as_bytes()), None);
+        let mut parser = UsageParser::new(false);
+        parser.push(body.as_bytes());
+        assert_eq!(parser.finish_with_model(body.len() as u64).1, None);
+        let fits = "m".repeat(MAX_IDENTIFIER_BYTES);
+        assert_eq!(
+            find_answered_model(format!(r#"{{"model":"{fits}"}}"#).as_bytes()),
+            Some(fits)
+        );
     }
 
     #[test]

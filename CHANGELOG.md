@@ -26,7 +26,9 @@
   like a transport error; streams have an idle timeout and keep draining
   after a client disconnects; a client that stops reading for the idle
   timeout is cut off (its body ends in an error, never a clean end) while
-  the upstream is drained and the reservation settles. Usage is read from the top-level JSON field,
+  the upstream is drained and the reservation settles. Usage is read from the top-level JSON field
+  (streamed keys are matched after JSON unescaping, like buffered ones, and a
+  provider-reported model over 256 bytes is replaced by the requested one),
   cache keys carry a route revision (with a per-process keyed fingerprint of
   the route credentials, so a rotated credential never serves the old
   account's entries) and the forwarded `accept`, `anthropic-version` and
