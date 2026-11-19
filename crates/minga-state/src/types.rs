@@ -604,6 +604,45 @@ pub struct AgentCapabilities {
     pub dirs: Vec<AgentDirGrant>,
 }
 
+impl AgentCapabilities {
+    /// Checks the directory grants that need no node configuration: absolute
+    /// host and guest paths without `..`, and no guest path declared twice.
+    /// Roots and existence are checked on the node.
+    pub fn validate_dir_paths(&self) -> Result<(), String> {
+        fn plain_absolute(path: &std::path::Path) -> bool {
+            path.is_absolute()
+                && !path
+                    .components()
+                    .any(|component| component == std::path::Component::ParentDir)
+        }
+        let mut guest_paths = BTreeSet::new();
+        for dir in &self.dirs {
+            if !plain_absolute(std::path::Path::new(&dir.host)) {
+                return Err(format!(
+                    "agent directory host path `{}` must be absolute and contain no `..`",
+                    dir.host
+                ));
+            }
+            let guest = std::path::Path::new(&dir.guest);
+            if !plain_absolute(guest) {
+                return Err(format!(
+                    "agent directory guest path `{}` must be absolute and contain no `..`",
+                    dir.guest
+                ));
+            }
+            // Components drop `.` and repeated separators.
+            let normalized: std::path::PathBuf = guest.components().collect();
+            if !guest_paths.insert(normalized) {
+                return Err(format!(
+                    "agent directory guest path `{}` is declared more than once",
+                    dir.guest
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// A host capability available to an agent workload.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]

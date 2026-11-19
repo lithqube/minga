@@ -8,8 +8,8 @@
 //! - [`MockAgentExecutor`] — in-memory simulation for testing
 //! - [`WasmtimeAgentExecutor`] — real WASM execution via `minga-sandbox`
 
-use std::collections::{BTreeSet, HashMap};
-use std::path::{Component, Path, PathBuf};
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -323,44 +323,11 @@ fn validate_agent_capabilities(
         ));
     }
 
-    let mut guest_paths = BTreeSet::new();
+    spec.capabilities
+        .validate_dir_paths()
+        .map_err(AgentError::Start)?;
     for dir in &spec.capabilities.dirs {
         let host = Path::new(&dir.host);
-        if !host.is_absolute()
-            || host
-                .components()
-                .any(|component| component == Component::ParentDir)
-        {
-            return Err(AgentError::Start(format!(
-                "agent directory host path `{}` must be absolute and contain no `..`",
-                dir.host
-            )));
-        }
-
-        let guest = Path::new(&dir.guest);
-        if !guest.is_absolute()
-            || guest
-                .components()
-                .any(|component| component == Component::ParentDir)
-        {
-            return Err(AgentError::Start(format!(
-                "agent directory guest path `{}` must be absolute and contain no `..`",
-                dir.guest
-            )));
-        }
-        let normalized_guest = guest
-            .components()
-            .fold(PathBuf::new(), |mut path, component| {
-                path.push(component.as_os_str());
-                path
-            });
-        if !guest_paths.insert(normalized_guest) {
-            return Err(AgentError::Start(format!(
-                "agent directory guest path `{}` is declared more than once",
-                dir.guest
-            )));
-        }
-
         let canonical_host = host.canonicalize().map_err(|e| {
             AgentError::Start(format!(
                 "cannot resolve agent directory `{}`: {e}",
@@ -543,6 +510,7 @@ pub fn shared_executor<E: AgentExecutor + 'static>(executor: E) -> Arc<dyn Agent
 mod tests {
     use super::*;
     use minga_state::types::AgentDirGrant;
+    use std::collections::BTreeSet;
 
     fn test_agent_spec(module: &str) -> AgentSpec {
         AgentSpec {
@@ -603,13 +571,23 @@ mod tests {
             .contains("--agent-dir-root"));
     }
 
-    #[test]
-    fn a_pre_v9_agent_with_env_still_passes_start_validation() {
+    #[tokio::test]
+    async fn a_pre_v9_agent_with_env_still_starts() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("start.wat"),
+            r#"(module (memory (export "memory") 1) (func (export "_start")))"#,
+        )
+        .unwrap();
+        let exec = WasmtimeAgentExecutor::new(dir.path()).await.unwrap();
+
         // Shape of a v8 record: no `capabilities` key.
-        let spec: AgentSpec =
-            serde_json::from_str(r#"{"module_ref":"a.wasm","sandbox_env":{"MODEL":"small"}}"#)
-                .unwrap();
-        validate_agent_capabilities(&spec, &[], false).unwrap();
+        let spec: AgentSpec = serde_json::from_str(
+            r#"{"module_ref":"start.wat","fuel_limit":1000000,"sandbox_env":{"MODEL":"small"}}"#,
+        )
+        .unwrap();
+        let id = exec.start(&"task-legacy".to_string(), &spec).await.unwrap();
+        assert_eq!(exec.status(&id).await, Some(AgentStatus::Completed));
     }
 
     #[cfg(unix)]

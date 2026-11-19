@@ -88,15 +88,29 @@ pub fn service_spec_to_state(spec: &models::ServiceSpec) -> Result<Service, Stri
         .Labels
         .get(AGENT_LABEL)
         .map(|raw| {
-            serde_json::from_str::<AgentSpec>(raw)
-                .map_err(|e| format!("service '{name}': invalid {AGENT_LABEL} label: {e}"))
+            let invalid = |e: serde_json::Error| {
+                format!("service '{name}': invalid {AGENT_LABEL} label: {e}")
+            };
+            let value: serde_json::Value = serde_json::from_str(raw).map_err(invalid)?;
+            // Missing capabilities mean "none" for API input; only pre-v9
+            // stored records get the implicit `env` grant.
+            let explicit = value.get("capabilities").is_some_and(|c| !c.is_null());
+            let mut agent = serde_json::from_value::<AgentSpec>(value).map_err(invalid)?;
+            if !explicit {
+                agent.capabilities = Default::default();
+            }
+            Ok::<_, String>(agent)
         })
         .transpose()?
         .map(Box::new);
     // Caught here like `user` below: the node refuses it on every start.
-    // `http` and directory grants depend on node configuration, so only the
-    // node can check them.
+    // `http` availability and directory roots depend on node configuration,
+    // so only the node can check them.
     if let Some(agent) = &agent {
+        agent
+            .capabilities
+            .validate_dir_paths()
+            .map_err(|e| format!("service '{name}': {e}"))?;
         if !agent.sandbox_env.is_empty()
             && !agent
                 .capabilities
@@ -1149,12 +1163,47 @@ mod tests {
         let error = service_spec_to_state(&spec).unwrap_err();
         assert!(error.contains("env grant"), "{error}");
 
+        // Omitted or null capabilities are no grants at the API, unlike
+        // pre-v9 stored records.
+        for label in [
+            r#"{"module_ref":"a.wasm","sandbox_env":{"K":"v"}}"#,
+            r#"{"module_ref":"a.wasm","sandbox_env":{"K":"v"},"capabilities":null}"#,
+        ] {
+            spec.Labels
+                .insert(AGENT_LABEL.to_string(), label.to_string());
+            let error = service_spec_to_state(&spec).unwrap_err();
+            assert!(error.contains("env grant"), "{label}: {error}");
+        }
+
         spec.Labels.insert(
             AGENT_LABEL.to_string(),
             r#"{"module_ref":"a.wasm","sandbox_env":{"K":"v"},"capabilities":{"grants":["env"]}}"#
                 .to_string(),
         );
         assert!(service_spec_to_state(&spec).is_ok());
+    }
+
+    #[test]
+    fn agent_label_with_an_invalid_directory_path_is_refused() {
+        let mut spec = sample_docker_spec();
+        for (dirs, expected) in [
+            (r#"[{"host":"srv","guest":"/data"}]"#, "must be absolute"),
+            (
+                r#"[{"host":"/srv/../etc","guest":"/data"}]"#,
+                "must be absolute",
+            ),
+            (
+                r#"[{"host":"/srv/a","guest":"/data"},{"host":"/srv/b","guest":"/data/"}]"#,
+                "more than once",
+            ),
+        ] {
+            spec.Labels.insert(
+                AGENT_LABEL.to_string(),
+                format!(r#"{{"module_ref":"a.wasm","capabilities":{{"dirs":{dirs}}}}}"#),
+            );
+            let error = service_spec_to_state(&spec).unwrap_err();
+            assert!(error.contains(expected), "{dirs}: {error}");
+        }
     }
 
     #[test]
