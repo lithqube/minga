@@ -197,27 +197,41 @@ impl ResponseCache {
         path: &str,
         body: &[u8],
     ) -> String {
-        Self::compute_key_for_workload_route(workload, "", method, path, body)
+        Self::compute_key_for_workload_route(workload, "", "", method, path, body)
     }
 
-    /// Computes a workload cache key isolated by route and complete path/query.
+    /// Computes a workload cache key isolated by end customer, route and
+    /// complete path/query.
+    ///
+    /// Every field goes length-prefixed into one SHA-256 digest: the body is
+    /// chosen by the caller, and a cheap collision would serve one customer
+    /// another customer's cached response.
     pub fn compute_key_for_workload_route(
         workload: &str,
+        customer: &str,
         route: &str,
         method: &str,
         path_and_query: &str,
         body: &[u8],
     ) -> String {
-        let mut hash = fnv1a(body);
-        for b in workload
-            .bytes()
-            .chain(route.bytes())
-            .chain(method.bytes())
-            .chain(path_and_query.bytes())
-        {
-            hash = (hash ^ (b as u64)).wrapping_mul(0x100000001b3);
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        for field in [
+            workload.as_bytes(),
+            customer.as_bytes(),
+            route.as_bytes(),
+            method.as_bytes(),
+            path_and_query.as_bytes(),
+            body,
+        ] {
+            hasher.update((field.len() as u64).to_le_bytes());
+            hasher.update(field);
         }
-        format!("{workload}:{route}:{method}:{path_and_query}:{hash:016x}")
+        hasher
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
     }
 
     /// Returns current cache statistics.
@@ -253,16 +267,6 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
-/// FNV-1a hash of a byte slice.
-fn fnv1a(data: &[u8]) -> u64 {
-    let mut hash: u64 = 0xcbf29ce484222325;
-    for &b in data {
-        hash ^= b as u64;
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    hash
 }
 
 // ---------------------------------------------------------------------------
@@ -319,9 +323,31 @@ mod tests {
     }
 
     #[test]
+    fn customers_never_share_entries() {
+        let cache = ResponseCache::new(test_config());
+        let key = |customer, route| {
+            ResponseCache::compute_key_for_workload_route(
+                "task",
+                customer,
+                route,
+                "POST",
+                "/v1/chat",
+                b"same prompt",
+            )
+        };
+        cache.put(&key("alice", "primary"), 200, vec![], b"for alice".to_vec());
+        assert!(cache.get(&key("bob", "primary")).is_none());
+        assert!(cache.get(&key("", "primary")).is_none());
+        assert!(cache.get(&key("alice", "primary")).is_some());
+        // Length prefixes keep fields apart: no shifting bytes between them.
+        assert_ne!(key("ab", "c"), key("a", "bc"));
+        assert_eq!(key("alice", "primary").len(), 64);
+    }
+
+    #[test]
     fn route_and_query_isolate_cache_keys() {
         let key = |route, path| {
-            ResponseCache::compute_key_for_workload_route("task", route, "POST", path, b"body")
+            ResponseCache::compute_key_for_workload_route("task", "", route, "POST", path, b"body")
         };
         assert_ne!(
             key("primary", "/v1/chat?x=1"),

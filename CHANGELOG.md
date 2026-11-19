@@ -30,7 +30,10 @@
   cache keys carry a route revision (with a per-process keyed fingerprint of
   the route credentials, so a rotated credential never serves the old
   account's entries) and the forwarded `accept`, `anthropic-version` and
-  `anthropic-beta` values, the cache is bounded by bytes, usage
+  `anthropic-beta` values, the key is a SHA-256 digest that also covers the
+  `x-minga-customer` value and the request body (a 64-bit FNV body hash let
+  one end customer craft a prompt that collides with another's), the cache
+  is bounded by bytes, usage
   publication is bounded and retried, and customer, model and route names
   are capped at 256 bytes. `EgressProxy::with_event_bus` now returns a
   `Result` and works after `router()` was called.

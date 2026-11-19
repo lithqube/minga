@@ -606,6 +606,7 @@ async fn proxy_handler(State(state): State<Arc<ProxyState>>, req: Request) -> Re
     };
     let cache_key = ResponseCache::compute_key_for_workload_route(
         workload,
+        &customer_id,
         &cache_route,
         method.as_str(),
         &cache_path,
@@ -2671,6 +2672,46 @@ mod tests {
             2,
             "a repeated variant is still a cache hit"
         );
+    }
+
+    #[tokio::test]
+    async fn customers_do_not_share_cached_responses() {
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let upstream_hits = Arc::clone(&hits);
+        let app = Router::new().route(
+            "/*path",
+            any(move || {
+                let hits = Arc::clone(&upstream_hits);
+                async move {
+                    let n = hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                    format!("answer {n}")
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.ok() });
+        let state = test_state();
+        let token = routed_token(
+            &state,
+            "test-agent",
+            route_policy("primary", format!("http://{address}")),
+        );
+        for (customer, want) in [
+            ("alice", "answer 1"),
+            ("bob", "answer 2"),
+            ("alice", "answer 1"),
+        ] {
+            let mut request = post(token.as_str(), "{}");
+            request
+                .headers_mut()
+                .insert("x-minga-customer", customer.parse().unwrap());
+            let response = proxy_handler(State(Arc::clone(&state)), request).await;
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert_eq!(&body[..], want.as_bytes(), "customer {customer}");
+        }
     }
 
     #[tokio::test]
