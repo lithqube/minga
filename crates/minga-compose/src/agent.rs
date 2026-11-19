@@ -13,9 +13,9 @@
 //!       timeout: 60
 //!       token_budget: 100000
 //!       egress_url: https://api.openai.com
-//!       prompt: "You are a research assistant"
 //!       capabilities:
-//!         grants: [env]
+//!         grants: [env, http]
+//!       prompt: "You are a research assistant"
 //!       env:
 //!         MODEL: gpt-4o
 //!     deploy:

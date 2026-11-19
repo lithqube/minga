@@ -484,6 +484,8 @@ fn agent_service_full_pipeline() {
               timeout: 120
               token_budget: 500000
               egress_url: https://api.openai.com
+              capabilities:
+                grants: [env, http]
               prompt: "You are a research assistant"
               env:
                 MODEL: gpt-4o
