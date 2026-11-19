@@ -58,5 +58,5 @@ tower = { version = "0.5", features = ["util"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 prometheus = "0.13"
-wasmtime = "50"
+wasmtime = { version = "50", default-features = false, features = ["cranelift", "runtime", "std", "parallel-compilation", "wat"] }
 x25519-dalek = { version = "2", features = ["static_secrets"] }
