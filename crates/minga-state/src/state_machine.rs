@@ -531,7 +531,11 @@ impl RedbStateMachine {
                     .map_err(sm_io_err)?;
                 Ok(StateResponse::Ok)
             }
-            StateCommand::UpsertService(svc) => {
+            StateCommand::UpsertService(svc) | StateCommand::ImportService { service: svc, .. } => {
+                let byte_allowance = match cmd {
+                    StateCommand::ImportService { byte_allowance, .. } => *byte_allowance,
+                    _ => 0,
+                };
                 // Two API writes can both pass admission before either
                 // commits; this check, inside the write, decides exclusivity.
                 let t = tx.open_table(SERVICES_TABLE).map_err(sm_io_err)?;
@@ -588,7 +592,9 @@ impl RedbStateMachine {
                     quotas.desired_state_bytes,
                     "services",
                     &svc.id,
-                    bytes.len(),
+                    bytes
+                        .len()
+                        .saturating_sub(usize::try_from(byte_allowance).unwrap_or(usize::MAX)),
                 )? {
                     return Ok(StateResponse::Error(error));
                 }

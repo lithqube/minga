@@ -623,7 +623,12 @@ impl StateStore {
     }
 
     pub async fn upsert_service(&self, service: Service) -> Result<(), StateError> {
-        match self.propose(StateCommand::UpsertService(service)).await? {
+        self.write_service(StateCommand::UpsertService(service))
+            .await
+    }
+
+    async fn write_service(&self, command: StateCommand) -> Result<(), StateError> {
+        match self.propose(command).await? {
             StateResponse::Ok => Ok(()),
             StateResponse::Conflict(_) => Err(StateError::NameInUse),
             StateResponse::Error(message) if message.starts_with("tenant quota exceeded: ") => {
@@ -907,67 +912,52 @@ impl StateStore {
                 Err(error) => return Err(error),
             }
         }
-        // Re-encoding an older snapshot grows its records (v9 adds agent
+        for n in snapshot.networks {
+            self.upsert_network(n).await?;
+        }
+        for s in snapshot.secrets {
+            self.upsert_secret(s).await?;
+        }
+        for c in snapshot.configs {
+            self.upsert_config(c).await?;
+        }
+        for v in snapshot.volumes {
+            self.upsert_volume(v).await?;
+        }
+        // An older snapshot's services grow when re-encoded (v9 adds agent
         // capabilities), so a tenant at its byte quota could not import its
-        // own data. Lift only that quota for the import, then restore it even
-        // when the import fails. Current-format imports stay fully enforced.
+        // own data. Each write carries that tenant's growth so far; the quota
+        // itself never changes, and current-format imports get no allowance.
         let legacy = snapshot.format_version < want;
-        let tenant_ids: BTreeSet<String> = snapshot
-            .networks
-            .iter()
-            .map(|n| n.tenant_id.clone())
-            .chain(snapshot.secrets.iter().map(|s| s.tenant_id.clone()))
-            .chain(snapshot.configs.iter().map(|c| c.tenant_id.clone()))
-            .chain(snapshot.volumes.iter().map(|v| v.tenant_id.clone()))
-            .chain(snapshot.services.iter().map(|s| s.tenant_id.clone()))
-            .collect();
-        let mut lifted = Vec::new();
-        let result = async {
+        let mut growth: BTreeMap<String, u64> = BTreeMap::new();
+        for s in snapshot.services {
             if legacy {
-                for id in &tenant_ids {
-                    let Some(tenant) = self.get_tenant(id).await? else {
-                        continue;
-                    };
-                    if tenant.quotas.desired_state_bytes.is_none() {
-                        continue;
-                    }
-                    let quotas = TenantQuotas {
-                        desired_state_bytes: None,
-                        ..tenant.quotas.clone()
-                    };
-                    self.update_tenant(id, tenant.name.clone(), quotas).await?;
-                    lifted.push(tenant);
-                }
-            }
-            for n in snapshot.networks {
-                self.upsert_network(n).await?;
-            }
-            for s in snapshot.secrets {
-                self.upsert_secret(s).await?;
-            }
-            for c in snapshot.configs {
-                self.upsert_config(c).await?;
-            }
-            for v in snapshot.volumes {
-                self.upsert_volume(v).await?;
-            }
-            for s in snapshot.services {
+                let allowance = growth.entry(s.tenant_id.clone()).or_default();
+                *allowance = allowance.saturating_add(v9_growth(&s)?);
+                let byte_allowance = *allowance;
+                self.write_service(StateCommand::ImportService {
+                    service: s,
+                    byte_allowance,
+                })
+                .await?;
+            } else {
                 self.upsert_service(s).await?;
             }
-            Ok(())
         }
-        .await;
-        let mut restored = Ok(());
-        for tenant in lifted {
-            if let Err(error) = self
-                .update_tenant(&tenant.id, tenant.name, tenant.quotas)
-                .await
-            {
-                restored = restored.and(Err(error));
-            }
-        }
-        result.and(restored)
+        Ok(())
     }
+}
+
+/// Bytes a service gained over its v8 encoding: the agent `capabilities` key.
+fn v9_growth(service: &Service) -> Result<u64, StateError> {
+    let bad = |e: serde_json::Error| StateError::BadSnapshot(e.to_string());
+    let mut value = serde_json::to_value(service).map_err(bad)?;
+    let new = serde_json::to_vec(&value).map_err(bad)?.len();
+    if let Some(agent) = value.get_mut("agent").and_then(|a| a.as_object_mut()) {
+        agent.remove("capabilities");
+    }
+    let old = serde_json::to_vec(&value).map_err(bad)?.len();
+    Ok((new - old) as u64)
 }
 
 /// Makes the data directory 0700 and each store file 0600 before redb opens them.

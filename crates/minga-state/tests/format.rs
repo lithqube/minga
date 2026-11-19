@@ -536,6 +536,13 @@ fn command_fixtures() {
         &StateCommand::UpsertService(service("shop.web")),
     );
     check(
+        "command_import_service",
+        &StateCommand::ImportService {
+            service: service("shop.web"),
+            byte_allowance: 41,
+        },
+    );
+    check(
         "command_renew_node_lease",
         &StateCommand::RenewNodeLease {
             id: 3,
@@ -1500,28 +1507,40 @@ async fn a_v8_snapshot_imports_at_its_byte_quota_and_keeps_the_quota() {
     let mut old_json = serde_json::to_value(&current).unwrap();
     old_json["format_version"] = serde_json::json!(V8_FORMAT_VERSION);
     strip_agent_capabilities(&mut old_json);
+    let v8_bytes: usize = old_json["services"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| serde_json::to_vec(s).unwrap().len())
+        .sum();
     let legacy: StateSnapshot = serde_json::from_value(old_json).unwrap();
-
-    // One byte short of what the decoded records re-encode to: the same data
-    // fit a v8 cluster, since its records had no `capabilities` key.
     let v9_bytes: usize = legacy
         .services
         .iter()
         .map(|s| serde_json::to_vec(s).unwrap().len())
         .sum();
-    let limit = v9_bytes as u64 - 1;
+    assert!(v9_bytes > v8_bytes, "the fixture must grow on re-encoding");
 
+    // At exactly the v8 size, the data fit its v8 cluster and imports.
+    let (result, left) = import_with_byte_quota(legacy.clone(), v8_bytes as u64).await;
+    result.unwrap();
+    assert_eq!(left, Some(v8_bytes as u64));
+
+    // The allowance covers only the re-encoding growth, not more data.
+    let (result, left) = import_with_byte_quota(legacy.clone(), v8_bytes as u64 - 1).await;
+    assert!(
+        result.is_err(),
+        "a v8 import over its v8 size must be refused"
+    );
+    assert_eq!(left, Some(v8_bytes as u64 - 1));
+
+    // The same records as a current-format snapshot get no allowance.
     let as_v9 = StateSnapshot {
         format_version: FORMAT_VERSION,
-        ..legacy.clone()
+        ..legacy
     };
-    let (result, left) = import_with_byte_quota(as_v9, limit).await;
+    let (result, _) = import_with_byte_quota(as_v9, v9_bytes as u64 - 1).await;
     assert!(result.is_err(), "a v9 import must stay quota-enforced");
-    assert_eq!(left, Some(limit));
-
-    let (result, left) = import_with_byte_quota(legacy, limit).await;
-    result.unwrap();
-    assert_eq!(left, Some(limit), "the lifted quota must be restored");
 }
 
 #[tokio::test]

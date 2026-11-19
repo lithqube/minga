@@ -18,6 +18,14 @@ pub enum StateCommand {
     },
 
     UpsertService(Service),
+    /// An [`StateCommand::UpsertService`] from a snapshot import whose byte
+    /// quota check discounts `byte_allowance`: how much this import's records
+    /// for the tenant grew when re-encoded from an older format. It is scoped
+    /// to the one write, so nothing outlives the import.
+    ImportService {
+        service: Service,
+        byte_allowance: u64,
+    },
     RemoveService(ServiceId),
 
     UpsertTask(Task),
