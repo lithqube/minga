@@ -154,18 +154,14 @@ async fn visit_usage(
         }
         Err(error) => return Err(BusError::Subscribe(format!("get {name}: {error}"))),
     };
-    let deliver_policy = if since_unix_ms == 0 {
-        DeliverPolicy::All
-    } else {
-        async_nats::datetime::from_nanos(i128::from(since_unix_ms) * 1_000_000)
-            .map(|start_time| DeliverPolicy::ByStartTime { start_time })
-            .unwrap_or(DeliverPolicy::All)
-    };
+    // Not `ByStartTime`: it cuts by the server's storage time, and a worker
+    // clock ahead of the server would hide events whose own time qualifies.
+    // The stream keeps a day at most, and the payload filter below decides.
     let mut consumer = stream
         .create_consumer(PullConsumerConfig {
             filter_subjects: vec![format!("minga.{tenant_id}.usage.>")],
             ack_policy: AckPolicy::None,
-            deliver_policy,
+            deliver_policy: DeliverPolicy::All,
             ..Default::default()
         })
         .await

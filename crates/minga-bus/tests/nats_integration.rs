@@ -374,6 +374,27 @@ fn usage_event(request_id: &str, tenant_id: &str, at: u64) -> minga_bus::UsageEv
 }
 
 #[tokio::test]
+async fn nats_usage_cutoff_uses_event_time_not_storage_time() {
+    let Some(bus) = connect().await else {
+        return;
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    // A worker clock a minute ahead of the server stores the event before
+    // its own timestamp.
+    bus.publish_usage(&usage_event("skew-1", "usage-skew", now + 60_000))
+        .await
+        .expect("publish usage");
+    let rows = bus
+        .usage_events("usage-skew", now + 30_000, None, 10)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1, "the event's own time qualifies it");
+}
+
+#[tokio::test]
 async fn nats_usage_skips_bad_records_and_keeps_newest() {
     let Some(bus) = connect().await else {
         return;

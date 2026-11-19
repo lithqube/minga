@@ -75,6 +75,9 @@
   admission (Compose, Docker API create and update, state import): agent
   egress tokens carry no route policy, so the agent would otherwise run
   without the declared routes and model allow-list.
+- NATS usage queries read the tenant's retained usage records and filter
+  them by event time; the JetStream start-time cutoff used storage time, so a
+  worker clock ahead of the server hid qualifying events.
 - `minga state import` validates each service's egress policy, rollback
   targets included, with the same rules as Compose `x-minga-egress` and the
   `minga.egress` label, so an import can no longer store a policy that
