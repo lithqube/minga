@@ -95,6 +95,12 @@ pub trait Runtime: Send + Sync {
     /// Lists all containers known to this runtime.
     async fn list(&self) -> Vec<ContainerInfo>;
 
+    /// Like [`Runtime::list`], but a failed inventory is an error instead of
+    /// an empty list, for callers that must not act on an unknown state.
+    async fn try_list(&self) -> Result<Vec<ContainerInfo>, RuntimeError> {
+        Ok(self.list().await)
+    }
+
     /// Establish runtime safeguards before startup cleanup or task recovery.
     async fn prepare_startup(&self) -> Result<(), RuntimeError> {
         Ok(())
@@ -147,6 +153,8 @@ pub struct MockRuntime {
     pub fail_starts: Mutex<bool>,
     /// If true, `stop()` returns an error (to test failed cleanup).
     pub fail_stops: Mutex<bool>,
+    /// If true, the inventory fails: `try_list()` errors, `list()` is empty.
+    pub fail_lists: Mutex<bool>,
     /// Container IDs that should report as `Failed` status.
     pub failed_containers: Mutex<HashSet<String>>,
     /// Exit codes for containers marked as failed. Defaults to 1.
@@ -249,7 +257,17 @@ impl Runtime for MockRuntime {
     }
 
     async fn list(&self) -> Vec<ContainerInfo> {
-        self.containers
+        self.try_list().await.unwrap_or_default()
+    }
+
+    async fn try_list(&self) -> Result<Vec<ContainerInfo>, RuntimeError> {
+        if *self.fail_lists.lock().unwrap() {
+            return Err(RuntimeError::Other(
+                "mock runtime: inventory disabled".into(),
+            ));
+        }
+        Ok(self
+            .containers
             .lock()
             .unwrap()
             .values()
@@ -259,7 +277,7 @@ impl Runtime for MockRuntime {
                 image: c.image.clone(),
                 status: c.status,
             })
-            .collect()
+            .collect())
     }
 
     async fn status(&self, container_id: &str) -> Option<ContainerStatus> {

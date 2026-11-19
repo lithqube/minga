@@ -17,7 +17,10 @@
   so re-registering a workload mid-stream leaves the replacement's balance
   untouched, and holds are kept exact so releasing one never frees another.
   A routed-egress container left from a previous worker process is never
-  adopted with its lost token; a failed stop is retried before restarting. Upstream error
+  adopted with its lost token; a failed stop is retried by container ID on
+  every pass, even after its assignment is removed, and the task restarts
+  only once the old container is gone. A failed container inventory no
+  longer looks empty: routed containers do not start in that pass. Upstream error
   bodies are buffered (64 KiB) and redacted whole instead of streamed;
   non-streamed bodies are capped at 32 MiB; a failed body read is charged
   like a transport error; streams have an idle timeout and keep draining

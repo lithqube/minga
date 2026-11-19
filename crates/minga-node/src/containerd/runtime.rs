@@ -1404,6 +1404,10 @@ impl Runtime for ContainerdRuntime {
     }
 
     async fn list(&self) -> Vec<ContainerInfo> {
+        self.try_list().await.unwrap_or_default()
+    }
+
+    async fn try_list(&self) -> Result<Vec<ContainerInfo>, RuntimeError> {
         #[cfg(target_os = "linux")]
         let source_filter_error = if let Some(networking) = &self.networking {
             if self.networking_blocked.load(Ordering::Acquire) {
@@ -1419,7 +1423,9 @@ impl Runtime for ContainerdRuntime {
                             "failed to stop running tasks after firewall setup failed"
                         );
                     }
-                    return Vec::new();
+                    return Err(RuntimeError::Other(
+                        "task networking could not be blocked for source-filter recovery".into(),
+                    ));
                 }
                 match networking.reconcile_task_source_filters().await {
                     Ok(()) => {
@@ -1439,7 +1445,9 @@ impl Runtime for ContainerdRuntime {
                                     "failed to stop running tasks after firewall setup failed"
                                 );
                             }
-                            return Vec::new();
+                            return Err(RuntimeError::Other(
+                                "task networking block could not be restored after source-filter failure".into(),
+                            ));
                         }
                         Some(error.to_string())
                     }
@@ -1460,7 +1468,7 @@ impl Runtime for ContainerdRuntime {
             Ok(cs) => cs,
             Err(e) => {
                 tracing::error!(error = %e, "containerd: failed to list containers");
-                return vec![];
+                return Err(RuntimeError::Other(format!("list containers: {e}")));
             }
         };
         drop(client);
@@ -1513,7 +1521,7 @@ impl Runtime for ContainerdRuntime {
                 status,
             });
         }
-        infos
+        Ok(infos)
     }
 
     /// Kill and delete every task in the minga namespace that is in a stopped
