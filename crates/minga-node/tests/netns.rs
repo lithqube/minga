@@ -10,7 +10,9 @@
 //! - a task -> a NON-local address on the published port is NOT redirected;
 //! - a task on another network cannot reach the task's IP directly, but can
 //!   reach its published port through the node address;
-//! - publishing a node-owned port (53, the embedded DNS) is refused.
+//! - publishing a node-owned port (53, the embedded DNS) is refused;
+//! - a required-egress task reaches only the proxy on its gateway, and the
+//!   proxy listener is closed to non-bridge interfaces (needs nft).
 //!
 //! The "node address" is 198.51.100.7 added to `lo` (a LOCAL address that
 //! needs no real NIC); the "external host" is a namespace behind a veth at
@@ -572,4 +574,206 @@ async fn ingress_port_reaches_each_backend_on_another_node() {
     let _ = sh("ip", &["link", "del", &bridge_name(INGRESS_NETWORK)]);
 
     result.expect("ingress backend routing");
+}
+
+const EGRESS_NETWORK: &str = "netns_test_egress";
+const EGRESS_PROXY: u16 = 18090;
+const EGRESS_OTHER_HOST_PORT: u16 = 18092;
+const EGRESS_EXT_NS: &str = "minga-nsegress-ext";
+const EGRESS_EXT_HOST: &str = "203.0.114.1";
+const EGRESS_EXT_ADDR: &str = "203.0.114.9";
+
+/// Runs a python server on the host itself; killed on drop.
+fn host_server(port: u16, word: &str) -> Server {
+    Server(
+        Command::new("python3")
+            .args(["-c", SERVER, &port.to_string(), word])
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("spawn host server"),
+    )
+}
+
+fn refused(what: &str, ns: &str, addr: &str, port: u16) -> Result<(), String> {
+    match sh(
+        "ip",
+        &[
+            "netns",
+            "exec",
+            ns,
+            "python3",
+            "-c",
+            CLIENT,
+            addr,
+            &port.to_string(),
+        ],
+    ) {
+        Err(_) => {
+            eprintln!("ok: {what} is refused");
+            Ok(())
+        }
+        Ok(body) => Err(format!("{what} was not refused: {body:?}")),
+    }
+}
+
+async fn egress_scenario(setup: &NetworkSetup) -> Result<(), String> {
+    let subnet = Cidr::parse("10.233.7.0/24").unwrap();
+    let gateway = "10.233.7.1";
+    let attach = |ip: &str| {
+        vec![TaskNetAttachment {
+            network_id: EGRESS_NETWORK.into(),
+            ip: ip.parse().unwrap(),
+            subnet,
+        }]
+    };
+    sh("ip", &["netns", "add", EGRESS_EXT_NS])?;
+    sh(
+        "ip",
+        &[
+            "link", "add", "nsegh", "type", "veth", "peer", "name", "nsegc",
+        ],
+    )?;
+    sh("ip", &["link", "set", "nsegc", "netns", EGRESS_EXT_NS])?;
+    sh(
+        "ip",
+        &[
+            "addr",
+            "add",
+            &format!("{EGRESS_EXT_HOST}/24"),
+            "dev",
+            "nsegh",
+        ],
+    )?;
+    sh("ip", &["link", "set", "nsegh", "up"])?;
+    sh("ip", &["-n", EGRESS_EXT_NS, "link", "set", "lo", "up"])?;
+    sh("ip", &["-n", EGRESS_EXT_NS, "link", "set", "nsegc", "up"])?;
+    sh(
+        "ip",
+        &[
+            "-n",
+            EGRESS_EXT_NS,
+            "addr",
+            "add",
+            &format!("{EGRESS_EXT_ADDR}/24"),
+            "dev",
+            "nsegc",
+        ],
+    )?;
+    sh(
+        "ip",
+        &[
+            "-n",
+            EGRESS_EXT_NS,
+            "route",
+            "add",
+            "default",
+            "via",
+            EGRESS_EXT_HOST,
+        ],
+    )?;
+
+    for (task, ip) in [
+        ("nsegress-task", "10.233.7.10"),
+        ("nsegress-peer", "10.233.7.11"),
+    ] {
+        setup
+            .setup_task(task, &attach(ip), &[], &[])
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    setup
+        .require_task_egress("nsegress-task")
+        .await
+        .map_err(|e| e.to_string())?;
+    minga_node::netns::restrict_egress_listener(EGRESS_PROXY)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let _proxy = host_server(EGRESS_PROXY, "proxy");
+    let _other = host_server(EGRESS_OTHER_HOST_PORT, "host");
+    let _task = Server::start("minga-nsegress-task", TARGET, "task");
+    let _peer = Server::start("minga-nsegress-peer", TARGET, "peer");
+    let _ext = Server::start(EGRESS_EXT_NS, TARGET, "external");
+
+    // Controls: without the policy the same paths work.
+    expect(
+        "peer -> external host",
+        fetch(Some("minga-nsegress-peer"), EGRESS_EXT_ADDR, TARGET),
+        "external",
+    )?;
+    expect(
+        "peer -> gateway host port",
+        fetch(Some("minga-nsegress-peer"), gateway, EGRESS_OTHER_HOST_PORT),
+        "host",
+    )?;
+
+    expect(
+        "required-egress task -> gateway proxy",
+        fetch(Some("minga-nsegress-task"), gateway, EGRESS_PROXY),
+        "proxy",
+    )?;
+    expect(
+        "peer -> required-egress task (reply path)",
+        fetch(Some("minga-nsegress-peer"), "10.233.7.10", TARGET),
+        "task",
+    )?;
+    refused(
+        "required-egress task -> external host",
+        "minga-nsegress-task",
+        EGRESS_EXT_ADDR,
+        TARGET,
+    )?;
+    refused(
+        "required-egress task -> same-bridge peer",
+        "minga-nsegress-task",
+        "10.233.7.11",
+        TARGET,
+    )?;
+    refused(
+        "required-egress task -> other gateway port",
+        "minga-nsegress-task",
+        gateway,
+        EGRESS_OTHER_HOST_PORT,
+    )?;
+    refused(
+        "external host -> egress proxy listener",
+        EGRESS_EXT_NS,
+        EGRESS_EXT_HOST,
+        EGRESS_PROXY,
+    )?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn required_egress_reaches_only_the_gateway_proxy() {
+    let why = unavailable().or_else(|| {
+        Command::new("nft")
+            .arg("-v")
+            .output()
+            .is_err()
+            .then(|| "nft is not installed".to_string())
+    });
+    if let Some(why) = why {
+        assert!(
+            std::env::var_os("MINGA_REQUIRE_NETNS").is_none(),
+            "required netns test cannot run: {why}"
+        );
+        eprintln!("SKIP: {why}");
+        return;
+    }
+
+    let state = tempfile::tempdir().unwrap();
+    let setup = NetworkSetup::new(state.path()).with_egress_proxy_port(EGRESS_PROXY);
+    let result = egress_scenario(&setup).await;
+
+    for task in ["nsegress-task", "nsegress-peer"] {
+        let _ = setup.teardown_task(task).await;
+    }
+    let _ = sh("nft", &["delete", "table", "inet", "minga_egress_listener"]);
+    let _ = sh("ip", &["netns", "delete", EGRESS_EXT_NS]);
+    let _ = sh("ip", &["link", "del", "nsegh"]);
+    let _ = sh("ip", &["link", "del", &bridge_name(EGRESS_NETWORK)]);
+
+    result.expect("required-egress paths");
 }
