@@ -569,9 +569,10 @@ fn validate_manager_endpoints(nodes: &[ClusterNode]) -> Result<(), SchedulerErro
     if nodes.len() > 1
         && nodes.iter().any(|node| {
             node.role == NodeRole::Manager
-                && node.wg_endpoint.as_deref().map_or(true, |endpoint| {
-                    !minga_net::wireguard::validate_endpoint(endpoint)
-                })
+                && node
+                    .wg_endpoint
+                    .as_deref()
+                    .is_none_or(|endpoint| !minga_net::wireguard::validate_endpoint(endpoint))
         })
     {
         return Err(SchedulerError::ManagerEndpointUnavailable);

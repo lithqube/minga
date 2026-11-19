@@ -60,7 +60,7 @@ impl Default for SandboxSpec {
         Self {
             module: Vec::new(),
             fuel_limit: Some(1_000_000_000),
-            memory_limit: Some(128 * 1024 * 1024), // 128 MiB
+            memory_limit: Some(64 * 1024 * 1024), // 64 MiB
             timeout: Some(std::time::Duration::from_secs(30)),
             env: HashMap::new(),
             output_limit: Some(1024 * 1024), // 1 MiB
@@ -378,7 +378,7 @@ mod tests {
     async fn spec_default() {
         let s = SandboxSpec::default();
         assert_eq!(s.fuel_limit, Some(1_000_000_000));
-        assert_eq!(s.memory_limit, Some(128 * 1024 * 1024));
+        assert_eq!(s.memory_limit, Some(64 * 1024 * 1024));
         assert_eq!(s.timeout, Some(std::time::Duration::from_secs(30)));
     }
 

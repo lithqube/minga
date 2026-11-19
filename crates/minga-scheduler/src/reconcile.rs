@@ -44,7 +44,7 @@ fn has_failed(task: &Task) -> bool {
 /// Whether a task has been up for at least `secs`.
 fn has_run_for(task: &Task, secs: u64, now_unix: u64) -> bool {
     task.running_since_unix
-        .map_or(true, |since| since + secs <= now_unix)
+        .is_none_or(|since| since + secs <= now_unix)
 }
 
 fn remove_action(task: &Task) -> ReconcileAction {

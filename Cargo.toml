@@ -5,7 +5,7 @@ members = ["crates/*"]
 [workspace.package]
 version = "1.2.0"
 edition = "2021"
-rust-version = "1.80"
+rust-version = "1.97"
 license = "MIT"
 repository = "https://github.com/lithqube/minga"
 
@@ -58,5 +58,5 @@ tower = { version = "0.5", features = ["util"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 prometheus = "0.13"
-wasmtime = "24"
+wasmtime = "50"
 x25519-dalek = { version = "2", features = ["static_secrets"] }

@@ -222,12 +222,13 @@ impl AgentExecutor for MockAgentExecutor {
 ///
 /// Each `start()` call:
 /// 1. Reads the WASM module from `spec.module_ref` (resolved relative to `module_dir`)
-/// 2. Creates a wasmtime sandbox and runs the agent with the prompt as input
+/// 2. Creates a sandbox and runs the agent with the prompt as input
 /// 3. Stores the result for later retrieval via `result()`
 ///
-/// A warm pool integration (for module compilation caching) is a follow-up.
+/// The runtime and its compiled-module cache are shared for this node.
 pub struct WasmtimeAgentExecutor {
     module_dir: std::path::PathBuf,
+    runtime: minga_sandbox::WasmtimeRuntime,
     results: Mutex<HashMap<String, AgentRunResult>>,
     statuses: Mutex<HashMap<String, AgentStatus>>,
     egress_tokens: Option<Arc<minga_egress::SandboxTokens>>,
@@ -238,12 +239,12 @@ impl WasmtimeAgentExecutor {
     ///
     /// `module_dir` is the base directory for resolving relative module paths.
     pub async fn new(module_dir: impl AsRef<Path>) -> Result<Self, AgentError> {
-        // Verify wasmtime is available.
-        minga_sandbox::WasmtimeRuntime::new()
+        let runtime = minga_sandbox::WasmtimeRuntime::new()
             .map_err(|e| AgentError::Other(format!("cannot create wasmtime runtime: {e}")))?;
 
         Ok(Self {
             module_dir: module_dir.as_ref().to_path_buf(),
+            runtime,
             results: Mutex::new(HashMap::new()),
             statuses: Mutex::new(HashMap::new()),
             egress_tokens: None,
@@ -321,22 +322,19 @@ impl AgentExecutor for WasmtimeAgentExecutor {
             .unwrap()
             .insert(id.clone(), AgentStatus::Running);
 
-        // Run the sandbox. We create a fresh runtime per task for isolation.
-        // The warm pool is used for module compilation caching in a future phase.
-        let runtime = minga_sandbox::WasmtimeRuntime::new()
-            .map_err(|e| AgentError::Sandbox(e.to_string()))?;
-
-        let sandbox_id = runtime
+        let sandbox_id = self
+            .runtime
             .create(&sandbox_spec)
             .await
             .map_err(|e| AgentError::Sandbox(e.to_string()))?;
 
-        let run_result = runtime
+        let run_result = self
+            .runtime
             .run(&sandbox_id, &input)
             .await
             .map_err(|e| AgentError::Sandbox(e.to_string()));
 
-        let _ = runtime.destroy(&sandbox_id).await;
+        let _ = self.runtime.destroy(&sandbox_id).await;
 
         match run_result {
             Ok(SandboxResult {

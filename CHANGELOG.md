@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- WASM agents share one node runtime and a bounded SHA-256 module cache. Epoch
+  interruption stops guest execution at its configured timeout; linear memory
+  is capped by the configured limit (64 MiB by default). Wasmtime 50 raises the
+  workspace MSRV to Rust 1.97.
+
 - The bundled NATS server moves from v2.10.22 to v2.15.3. External NATS is
   tested on v2.14.10 and v2.15.3; managers warn when JetStream `api.level` is
   below 4. A 2.10.22 store was verified through a direct upgrade to 2.15.3

@@ -1,8 +1,8 @@
 # Sandbox host capabilities: plan
 
-- Status: Draft. Scheduled after orders 1–2 of [agent-plane-roadmap.md](agent-plane-roadmap.md), because every agent we surveyed runs as a container, and container egress, budgets and metering come first.
+- Status: In progress (step 1 implemented and verified on this branch). Full host capabilities remain sequenced after order 6 (E14/E15) in [agent-plane-roadmap.md](agent-plane-roadmap.md); the independent runtime-hardening step is proceeding early by explicit priority.
 - Date: 2026-11-16
-- Branch: `feat/sandbox-host-capabilities`
+- Branch: `feat/agent-sandbox-capabilities`
 - Closes structural limit 4 in [architecture.md](architecture.md) and the "Missing" items in [ADR 0003](adr/0003-agent-workloads.md).
 
 ## Decisions
@@ -67,9 +67,9 @@ Rules, checked in `minga-compose` and again on the node:
 ### 4.1 Engine and limits
 
 - Upgrade `wasmtime` to the latest 50.x and add `wasmtime-wasi` and `wasmtime-wasi-http` at the same version in `[workspace.dependencies]`. Handle API churn from 24 in the same change.
-- One shared `Engine` per node (async support, fuel, **epoch interruption**), held by `WasmtimeAgentExecutor`, plus a `Module`/`Component` cache keyed by the module's sha256.
-- Timeout: a node-wide ticker calls `engine.increment_epoch()`; each store sets an epoch deadline from `timeout`. Expiry traps the guest and frees the thread. Test: an infinite loop with no fuel limit ends within timeout + one tick.
-- Memory: `StoreLimitsBuilder::memory_size(memory_limit)` with `trap_on_grow_failure`. Default when unset stays at a fixed node default (64 MiB) instead of unlimited. Remove the runtime's own `memory.grow`; the `run` contract states the module's minimum memory instead.
+- Wasmtime's default features include async APIs for later WASI integration; step 1's core execution remains synchronous. One shared `Engine` per node (fuel, epoch interruption), held by `WasmtimeAgentExecutor`, plus a bounded 64-entry `Module`/`Component` cache keyed by module sha256.
+- Timeout: a node-wide 10 ms ticker calls `engine.increment_epoch()`; each store sets an epoch deadline from `timeout`. Expiry traps the guest and frees its blocking thread. Test: an infinite loop with no fuel limit ends within timeout + one tick.
+- Memory: `StoreLimitsBuilder::memory_size(memory_limit)` with `trap_on_grow_failure`. Default when unset is 64 MiB. The runtime does not grow core-module memory; the module declares enough minimum memory for its input and output.
 - Stdio: bounded pipes (`MemoryOutputPipe` with a cap, 1 MiB default), drained into the task's log buffer.
 
 ### 4.2 Two guest paths
@@ -119,7 +119,7 @@ One PR per step, each green on `cargo fmt --all`, `cargo clippy --all-targets --
 
 | Step | Content | Depends on |
 |---|---|---|
-| 1 | wasmtime upgrade, shared engine + module cache, epoch timeout, `StoreLimits` memory. Fixes the runaway-timeout bug on its own. | none |
+| 1 | **Complete:** Wasmtime upgrade, shared engine + bounded module cache, epoch timeout, `StoreLimits` memory. Fixes the runaway-timeout bug on its own. | none |
 | 2 | Compose `capabilities` grammar, `AgentSpec` field, translation, label round trip, state fixture, node-side validation, `--agent-dir-root`. | none |
 | 3 | Core-module path: preview1 linker, `WasiCtx` from grants, stdio capture. | 1, 2 |
 | 4 | Component path: WASI 0.2 linker, `wasi:cli/run`, same grants. | 3 |
@@ -137,7 +137,8 @@ Steps 1 and 2 can run in parallel.
 
 ## 8. Risks
 
-- **wasmtime upgrade size.** 24 to 50 is a big jump; step 1 isolates it so the rest stays reviewable. It will also probably raise the workspace `rust-version` (1.80 today), so check wasmtime's MSRV first.
+- **wasmtime upgrade size.** Step 1 upgrades 24 to stable 50.x, which requires Rust 1.97; the workspace MSRV is raised accordingly. The release workflow already builds with Rust 1.99.0.
+- **Timeout scope.** Epoch interruption stops guest code, not a blocked host call. WASI host operations must be asynchronous and bounded by an external task deadline.
 - **Toolchain friction.** Rust's `wasm32-wasip1` std needs random at startup; a module built that way traps without the `random` grant. The error must name the missing grant.
 - **No egress-aware placement.** An `http` agent placed on a node without egress fails at start, clearly, but is not rescheduled elsewhere. Operators use node labels and constraints until placement learns about it.
 - **Budgets are per node, per run.** A service with many replicas or restarts can spend more than `token_budget` in total. This is the decision taken, and the docs must state it.

@@ -5,29 +5,33 @@
 //!
 //! # Module contract
 //!
-//! A sandbox WASM module must export:
-//!
-//! - `memory` — linear memory (min 1 page = 64 KiB).
+//! - `memory` — exported linear memory with a declared minimum large enough for
+//!   the workload's input and output; the host does not grow it.
 //! - `run(input_len: i32) -> i32` — entry point. Called with the input
 //!   length. Returns an exit code (0 = success).
 //!
 //! Input/output convention:
-//! - The runtime writes input bytes to memory at offset 0.
-//! - The module reads input from `ptr=0, len=input_len`.
-//! - The module writes output to memory at offset 0 (overwriting input):
-//!   first 4 bytes = output length (i32 LE), followed by output bytes.
-//! - The runtime reads the output length from offset 0, then reads
-//!   that many bytes from offset 4.
+//! - The runtime writes input bytes to memory at offset 1024.
+//! - The module reads input from `ptr=1024, len=input_len`.
+//! - The module writes output length at offset 0 (i32 LE), followed by output
+//!   bytes at offset 4.
+//! - The runtime reads the output length from offset 0, then reads that many
+//!   bytes from offset 4.
 //!
 //! If the module only exports `_start() -> ()` (WASI-style), the runtime
 //! calls it with no input and captures no output.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::num::NonZeroUsize;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use wasmtime::{Config, Engine, Instance, Module, Store};
+use lru::LruCache;
+use sha2::{Digest, Sha256};
+use wasmtime::{Config, Engine, Instance, Module, Store, StoreLimitsBuilder, Trap};
 
 use crate::runtime::{
     SandboxError, SandboxInfo, SandboxResult, SandboxRuntime, SandboxSpec, SandboxStatus,
@@ -36,13 +40,54 @@ use crate::runtime::{
 const INPUT_OFFSET: usize = 1024;
 const OUTPUT_LEN_OFFSET: usize = 0;
 const OUTPUT_DATA_OFFSET: usize = 4;
-const MIN_MEMORY_PAGES: u64 = 16; // 1 MiB minimum
+const DEFAULT_MEMORY_LIMIT_BYTES: u64 = 64 * 1024 * 1024;
+const EPOCH_TICK: Duration = Duration::from_millis(10);
+const MODULE_CACHE_CAPACITY: usize = 64;
 
 /// A sandbox runtime backed by wasmtime.
 pub struct WasmtimeRuntime {
     engine: Engine,
+    _epoch_ticker: EpochTicker,
+    module_cache: Mutex<LruCache<[u8; 32], Module>>,
     sandboxes: Mutex<HashMap<String, WasmtimeSandbox>>,
     counter: Mutex<u64>,
+}
+
+struct EpochTicker {
+    stop: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl EpochTicker {
+    fn new(engine: Engine) -> Result<Self, SandboxError> {
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
+        let thread = thread::Builder::new()
+            .name("minga-wasmtime-epoch".into())
+            .spawn(move || {
+                while !thread_stop.load(Ordering::Acquire) {
+                    thread::sleep(EPOCH_TICK);
+                    if !thread_stop.load(Ordering::Acquire) {
+                        engine.increment_epoch();
+                    }
+                }
+            })
+            .map_err(|e| SandboxError::Other(format!("failed to start epoch ticker: {e}")))?;
+
+        Ok(Self {
+            stop,
+            thread: Some(thread),
+        })
+    }
+}
+
+impl Drop for EpochTicker {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
 }
 
 struct WasmtimeSandbox {
@@ -61,7 +106,7 @@ impl std::fmt::Debug for WasmtimeRuntime {
 }
 
 impl WasmtimeRuntime {
-    /// Creates a new wasmtime runtime with fuel metering enabled.
+    /// Creates a new wasmtime runtime with fuel metering and epoch interruption enabled.
     pub fn new() -> Result<Self, SandboxError> {
         Self::with_config(Config::new())
     }
@@ -69,10 +114,16 @@ impl WasmtimeRuntime {
     /// Creates a new wasmtime runtime with a custom config.
     pub fn with_config(mut config: Config) -> Result<Self, SandboxError> {
         config.consume_fuel(true);
+        config.epoch_interruption(true);
         let engine = Engine::new(&config)
             .map_err(|e| SandboxError::Other(format!("failed to create engine: {e}")))?;
+        let epoch_ticker = EpochTicker::new(engine.clone())?;
         Ok(Self {
             engine,
+            _epoch_ticker: epoch_ticker,
+            module_cache: Mutex::new(LruCache::new(
+                NonZeroUsize::new(MODULE_CACHE_CAPACITY).unwrap(),
+            )),
             sandboxes: Mutex::new(HashMap::new()),
             counter: Mutex::new(0),
         })
@@ -91,10 +142,20 @@ impl SandboxRuntime for WasmtimeRuntime {
             return Err(SandboxError::Create("empty WASM module".into()));
         }
 
-        // Compile the module.
-        let module = Module::new(&self.engine, &spec.module)
-            .map_err(|e| SandboxError::Create(format!("failed to compile module: {e}")))?;
-
+        let module_key: [u8; 32] = Sha256::digest(&spec.module).into();
+        let cached_module = { self.module_cache.lock().unwrap().get(&module_key).cloned() };
+        let module = match cached_module {
+            Some(module) => module,
+            None => {
+                let module = Module::new(&self.engine, &spec.module)
+                    .map_err(|e| SandboxError::Create(format!("failed to compile module: {e}")))?;
+                self.module_cache
+                    .lock()
+                    .unwrap()
+                    .put(module_key, module.clone());
+                module
+            }
+        };
         // Validate that the module exports what we need.
         let exports: Vec<_> = module
             .exports()
@@ -163,22 +224,29 @@ impl SandboxRuntime for WasmtimeRuntime {
             input
         };
 
-        // Determine timeout.
         let timeout = spec.timeout.unwrap_or(Duration::from_secs(30));
 
-        // Run in a blocking task with timeout.
+        // The epoch deadline stops the blocking Wasm thread; an async timeout
+        // alone would only abandon its JoinHandle.
         let engine = self.engine.clone();
         let module_clone = module.clone();
         let input_owned = input.to_vec();
+        let timeout_copy = timeout;
 
         let handle = tokio::task::spawn_blocking(move || {
-            run_wasm(&engine, &module_clone, &input_owned, fuel_limit, &spec)
+            run_wasm(
+                &engine,
+                &module_clone,
+                &input_owned,
+                fuel_limit,
+                &spec,
+                timeout_copy,
+            )
         });
 
-        let result = match tokio::time::timeout(timeout, handle).await {
-            Ok(Ok(r)) => r,
-            Ok(Err(e)) => return Err(SandboxError::Run(format!("join error: {e}"))),
-            Err(_) => return Err(SandboxError::Timeout(timeout)),
+        let result = match handle.await {
+            Ok(result) => result,
+            Err(e) => return Err(SandboxError::Run(format!("join error: {e}"))),
         };
 
         match result {
@@ -244,6 +312,20 @@ impl SandboxRuntime for WasmtimeRuntime {
     }
 }
 
+/// Converts an execution timeout into whole engine epoch ticks.
+fn epoch_ticks(timeout: Duration) -> u64 {
+    let ticks = timeout.as_nanos().div_ceil(EPOCH_TICK.as_nanos()).max(1);
+    u64::try_from(ticks).unwrap_or(u64::MAX)
+}
+
+fn execution_error(error: wasmtime::Error, timeout: Duration, context: &str) -> SandboxError {
+    if matches!(error.downcast_ref::<Trap>(), Some(Trap::Interrupt)) {
+        SandboxError::Timeout(timeout)
+    } else {
+        SandboxError::Run(format!("{context}: {error}"))
+    }
+}
+
 /// Synchronous WASM execution. Runs in a blocking thread.
 fn run_wasm(
     engine: &Engine,
@@ -251,21 +333,28 @@ fn run_wasm(
     input: &[u8],
     fuel_limit: u64,
     spec: &SandboxSpec,
+    timeout: Duration,
 ) -> Result<SandboxResult, SandboxError> {
-    let mut store = Store::new(engine, ());
+    let memory_limit = spec
+        .memory_limit
+        .unwrap_or(DEFAULT_MEMORY_LIMIT_BYTES)
+        .try_into()
+        .unwrap_or(usize::MAX);
+    let limits = StoreLimitsBuilder::new()
+        .memory_size(memory_limit)
+        .trap_on_grow_failure(true)
+        .build();
+    let mut store = Store::new(engine, limits);
+    store.limiter(|limits| limits);
+    store.set_epoch_deadline(epoch_ticks(timeout));
 
-    // Set fuel.
-    if fuel_limit != u64::MAX {
-        store
-            .set_fuel(fuel_limit)
-            .map_err(|e| SandboxError::Run(format!("failed to set fuel: {e}")))?;
-    }
+    store
+        .set_fuel(fuel_limit)
+        .map_err(|e| SandboxError::Run(format!("failed to set fuel: {e}")))?;
 
-    // Instantiate.
     let instance = Instance::new(&mut store, module, &[])
-        .map_err(|e| SandboxError::Run(format!("failed to instantiate: {e}")))?;
+        .map_err(|e| execution_error(e, timeout, "failed to instantiate"))?;
 
-    // Check if the module exports `run` (our contract) or `_start` (WASI).
     let run_func = instance.get_typed_func::<i32, i32>(&mut store, "run").ok();
     let start_func = instance.get_typed_func::<(), ()>(&mut store, "_start").ok();
 
@@ -273,34 +362,19 @@ fn run_wasm(
     let mut exit_code = 0i32;
 
     if let Some(run) = run_func {
-        // Our contract: write input to memory, call run(input_len), read output.
         let memory = instance
             .get_memory(&mut store, "memory")
             .ok_or_else(|| SandboxError::Run("module must export `memory`".into()))?;
 
-        // Write input to memory at INPUT_OFFSET.
         let input_len = input.len() as i32;
         memory
             .write(&mut store, INPUT_OFFSET, input)
             .map_err(|e| SandboxError::Run(format!("failed to write input to memory: {e}")))?;
 
-        // Ensure memory is large enough for input + output.
-        let required_bytes = INPUT_OFFSET + input.len() + 4096;
-        let required_pages: u64 = (required_bytes / 65536 + 1) as u64;
-        let current_pages = memory.size(&store);
-        let min_pages: u64 = MIN_MEMORY_PAGES;
-        if current_pages < required_pages.max(min_pages) {
-            memory
-                .grow(&mut store, required_pages.max(min_pages) - current_pages)
-                .map_err(|e| SandboxError::Run(format!("failed to grow memory: {e}")))?;
-        }
-
-        // Call run(input_len).
         exit_code = run
             .call(&mut store, input_len)
-            .map_err(|e| SandboxError::Run(format!("execution failed: {e}")))?;
+            .map_err(|e| execution_error(e, timeout, "execution failed"))?;
 
-        // Read output: first 4 bytes = output length (i32 LE), then output data.
         let mut len_buf = [0u8; 4];
         memory
             .read(&store, OUTPUT_LEN_OFFSET, &mut len_buf)
@@ -317,17 +391,15 @@ fn run_wasm(
             stdout = String::from_utf8_lossy(&output_buf).into_owned();
         }
     } else if let Some(start) = start_func {
-        // WASI-style: just call _start().
         start
             .call(&mut store, ())
-            .map_err(|e| SandboxError::Run(format!("execution failed: {e}")))?;
+            .map_err(|e| execution_error(e, timeout, "execution failed"))?;
     } else {
         return Err(SandboxError::Run(
             "module must export `run` or `_start`".into(),
         ));
     }
 
-    // Get fuel consumed.
     let fuel_consumed = if fuel_limit != u64::MAX {
         match store.get_fuel() {
             Ok(remaining) => fuel_limit.saturating_sub(remaining),
@@ -342,7 +414,7 @@ fn run_wasm(
         stderr: String::new(),
         exit_code,
         fuel_consumed,
-        duration: Duration::ZERO, // set by caller
+        duration: Duration::ZERO,
     })
 }
 
@@ -585,5 +657,58 @@ mod tests {
         let id = rt.create(&spec_with(fail_wat())).await.unwrap();
         rt.run(&id, b"test").await.unwrap();
         assert_eq!(rt.status(&id).await, Some(SandboxStatus::Failed));
+    }
+
+    #[tokio::test]
+    async fn epoch_deadline_stops_unmetered_infinite_loop() {
+        let rt = WasmtimeRuntime::new().unwrap();
+        let module =
+            wat::parse_str(r#"(module (func (export "_start") (loop $forever br $forever)))"#)
+                .unwrap();
+        let spec = SandboxSpec {
+            module,
+            fuel_limit: None,
+            timeout: Some(Duration::from_millis(30)),
+            ..Default::default()
+        };
+        let id = rt.create(&spec).await.unwrap();
+
+        let start = Instant::now();
+        let result = tokio::time::timeout(Duration::from_secs(1), rt.run(&id, b""))
+            .await
+            .expect("epoch interruption must release the blocking task");
+
+        assert!(matches!(result, Err(SandboxError::Timeout(_))));
+        assert!(start.elapsed() < Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn store_limits_memory_growth() {
+        let module = wat::parse_str(
+            r#"(module
+                (memory (export "memory") 1)
+                (func (export "run") (param i32) (result i32)
+                    i32.const 1
+                    memory.grow
+                    drop
+                    i32.const 0))"#,
+        )
+        .unwrap();
+        let mut spec = spec_with(module);
+        spec.memory_limit = Some(64 * 1024);
+
+        let rt = WasmtimeRuntime::new().unwrap();
+        let id = rt.create(&spec).await.unwrap();
+
+        assert!(matches!(rt.run(&id, b"").await, Err(SandboxError::Run(_))));
+    }
+
+    #[tokio::test]
+    async fn same_module_reuses_cached_compilation() {
+        let rt = WasmtimeRuntime::new().unwrap();
+        rt.create(&spec_with(echo_wat())).await.unwrap();
+        rt.create(&spec_with(echo_wat())).await.unwrap();
+
+        assert_eq!(rt.module_cache.lock().unwrap().len(), 1);
     }
 }

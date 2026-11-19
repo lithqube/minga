@@ -640,14 +640,14 @@ pub async fn get_info(
         .list_services()
         .await?
         .into_iter()
-        .filter(|service| tenant_id.map_or(true, |tenant_id| service.tenant_id == tenant_id))
+        .filter(|service| tenant_id.is_none_or(|tenant_id| service.tenant_id == tenant_id))
         .collect();
     let tasks: Vec<_> = app
         .store
         .list_tasks()
         .await?
         .into_iter()
-        .filter(|task| tenant_id.map_or(true, |tenant_id| task.tenant_id == tenant_id))
+        .filter(|task| tenant_id.is_none_or(|tenant_id| task.tenant_id == tenant_id))
         .collect();
     let statuses = app.task_statuses().await?;
 
