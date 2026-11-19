@@ -593,7 +593,12 @@ async fn proxy_handler(State(state): State<Arc<ProxyState>>, req: Request) -> Re
         Ok(reservation) => reservation,
         Err(e) => return error_response(&state, StatusCode::TOO_MANY_REQUESTS, &e.to_string()),
     };
-    let cache_path = format!("{path}{query}\0{requested_model}");
+    // Forwarded headers (API version, beta flags, accept) change the
+    // response, so each value is part of the key; escaping keeps it injective.
+    let mut cache_path = format!("{path}{query}\0{requested_model}");
+    for (name, value) in &forwarded {
+        cache_path.push_str(&format!("\0{name}={}", value.escape_ascii()));
+    }
     let cache_route = match policy {
         Some(policy) => format!("{route_name}\0{:016x}", policy.revision()),
         None => route_name.clone(),
@@ -2461,6 +2466,57 @@ mod tests {
                 .unwrap();
             assert_eq!(&body[..], want.as_bytes());
         }
+    }
+
+    #[tokio::test]
+    async fn forwarded_variant_headers_are_part_of_the_cache_key() {
+        use axum::http::HeaderMap;
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let upstream_hits = Arc::clone(&hits);
+        let app = Router::new().route(
+            "/*path",
+            any(move |headers: HeaderMap| {
+                let hits = Arc::clone(&upstream_hits);
+                async move {
+                    hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let version = headers
+                        .get("anthropic-version")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("")
+                        .to_owned();
+                    format!("version {version}")
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.ok() });
+        let state = test_state();
+        let token = routed_token(
+            &state,
+            "test-agent",
+            route_policy("primary", format!("http://{address}")),
+        );
+        for (version, want) in [
+            ("2023-06-01", "version 2023-06-01"),
+            ("2024-01-01", "version 2024-01-01"),
+            ("2023-06-01", "version 2023-06-01"),
+        ] {
+            let mut request = post(token.as_str(), "{}");
+            request
+                .headers_mut()
+                .insert("anthropic-version", version.parse().unwrap());
+            let response = proxy_handler(State(Arc::clone(&state)), request).await;
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert_eq!(&body[..], want.as_bytes());
+        }
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "a repeated variant is still a cache hit"
+        );
     }
 
     #[tokio::test]

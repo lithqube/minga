@@ -22,7 +22,10 @@
   non-streamed bodies are capped at 32 MiB; a failed body read is charged
   like a transport error; streams have an idle timeout and keep draining
   after a client disconnects. Usage is read from the top-level JSON field,
-  cache keys carry a route revision, the cache is bounded by bytes, usage
+  cache keys carry a route revision (with a per-process keyed fingerprint of
+  the route credentials, so a rotated credential never serves the old
+  account's entries) and the forwarded `accept`, `anthropic-version` and
+  `anthropic-beta` values, the cache is bounded by bytes, usage
   publication is bounded and retried, and customer, model and route names
   are capped at 256 bytes. `EgressProxy::with_event_bus` now returns a
   `Result` and works after `router()` was called.
