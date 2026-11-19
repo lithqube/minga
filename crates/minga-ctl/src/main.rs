@@ -57,6 +57,15 @@ enum Command {
     /// Log nodes in to private container registries.
     #[command(subcommand)]
     Registry(cmd::registry::RegistryCommand),
+    /// Query agent request usage.
+    #[command(subcommand)]
+    Agent(AgentCommand),
+}
+
+#[derive(Debug, Subcommand)]
+enum AgentCommand {
+    /// Show retained per-request token and cost usage.
+    Usage(cmd::usage::UsageArgs),
 }
 
 /// The output format after `--json` is folded in.
@@ -134,6 +143,10 @@ fn run(cli: &Cli) -> Result<(), CtlError> {
             let conn = connect(cli).await?;
             cmd::metrics::run(&conn, format, quiet).await
         }),
+        Command::Agent(AgentCommand::Usage(args)) => api::block_on(async {
+            let conn = connect(cli).await?;
+            cmd::usage::run(args, &conn, format, quiet).await
+        }),
         Command::Registry(cmd) => api::block_on(cmd::registry::run(
             cmd,
             &resolve_target(cli)?,
@@ -204,5 +217,23 @@ mod tests {
     fn the_output_format_defaults_to_table() {
         let cli = Cli::parse_from(["minga-ctl", "context", "list"]);
         assert_eq!(cli.format(), Format::Table);
+    }
+
+    #[test]
+    fn agent_usage_accepts_customer_and_relative_since() {
+        let cli = Cli::try_parse_from([
+            "minga-ctl",
+            "agent",
+            "usage",
+            "--customer",
+            "acme",
+            "--since",
+            "30d",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Agent(AgentCommand::Usage(_))
+        ));
     }
 }

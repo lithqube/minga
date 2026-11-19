@@ -1,0 +1,7 @@
+{
+  "RemoveOwned": {
+    "id": "shop.web.1",
+    "kind": "Task",
+    "tenant_id": "tenant-a"
+  }
+}

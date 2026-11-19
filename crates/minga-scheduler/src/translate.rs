@@ -80,6 +80,9 @@ fn translate_service(
     let agent_ext = svc
         .agent_extension()
         .map_err(|e| TranslateError::Service(name.to_string(), e))?;
+    let egress_ext = svc
+        .egress_extension()
+        .map_err(|e| TranslateError::Service(name.to_string(), e))?;
 
     let image = match &agent_ext {
         Some(_) => String::new(), // agent services have no container image
@@ -214,6 +217,15 @@ fn translate_service(
         .map(|(k, v)| (k.clone(), v.clone().unwrap_or_default()))
         .collect();
     labels.insert("com.docker.stack.namespace".to_string(), stack.to_string());
+    if egress_ext
+        .as_ref()
+        .is_some_and(|extension| extension.required)
+    {
+        labels.insert(
+            minga_state::types::REQUIRED_EGRESS_LABEL.to_string(),
+            "true".to_string(),
+        );
+    }
 
     // Healthcheck: durations are Go-style ("30s", "1m30s").
     let healthcheck = svc
@@ -323,6 +335,7 @@ fn translate_service(
         resources,
         agent,
         restart_policy,
+        egress: egress_ext.map(egress_extension_to_policy),
         secrets,
         command,
         entrypoint,
@@ -446,7 +459,55 @@ fn parse_duration_secs(s: &str) -> Option<u64> {
     Some(total)
 }
 
-/// Converts a Compose `x-minga-agent` extension into a state `AgentSpec`.
+/// Parses and validates an egress policy carried as JSON (the Docker API
+/// label), applying the same rules as Compose `x-minga-egress`.
+pub fn egress_policy_from_json(json: &str) -> Result<minga_state::types::EgressPolicy, String> {
+    let extension: minga_compose::EgressExtension =
+        serde_json::from_str(json).map_err(|error| error.to_string())?;
+    extension.validate()?;
+    Ok(egress_extension_to_policy(extension))
+}
+
+/// Converts a Compose `x-minga-egress` extension into a state policy.
+fn egress_extension_to_policy(
+    extension: minga_compose::EgressExtension,
+) -> minga_state::types::EgressPolicy {
+    use minga_state::types::{EgressAuth, EgressPolicy, EgressRoute};
+
+    EgressPolicy {
+        required: extension.required,
+        routes: extension
+            .routes
+            .into_iter()
+            .map(|route| EgressRoute {
+                name: route.name,
+                upstream_url: route.upstream_url,
+                auth: route.auth.map(|auth| match auth {
+                    minga_compose::EgressAuth::Bearer { secret } => EgressAuth::Bearer { secret },
+                    minga_compose::EgressAuth::ApiKey { secret } => EgressAuth::ApiKey { secret },
+                    minga_compose::EgressAuth::AwsSigv4 {
+                        access_key_secret,
+                        secret_key_secret,
+                        session_token_secret,
+                        region,
+                        service,
+                    } => EgressAuth::AwsSigv4 {
+                        access_key_secret,
+                        secret_key_secret,
+                        session_token_secret,
+                        region,
+                        service,
+                    },
+                }),
+                fallback: route.fallback,
+                input_price_micros_per_million: route.input_price_micros_per_million,
+                output_price_micros_per_million: route.output_price_micros_per_million,
+            })
+            .collect(),
+        models: extension.models,
+    }
+}
+
 fn agent_extension_to_spec(ext: AgentExtension) -> AgentSpec {
     let capabilities = AgentCapabilities {
         grants: ext
@@ -950,6 +1011,29 @@ mod tests {
         );
         let result = translate_service("agent", &svc, "test", &empty_project(), None);
         assert!(result.is_err(), "invalid agent extension should fail");
+    }
+    #[test]
+    fn required_egress_policy_survives_compose_translation() {
+        let required = make_compose_service(
+            "image: alpine\nx-minga-egress:\n  required: true\n  routes:\n    - name: primary\n      upstream_url: https://api.openai.com\n",
+        );
+        let translated =
+            translate_service("worker", &required, "test", &empty_project(), None).unwrap();
+        assert_eq!(
+            translated
+                .labels
+                .get(minga_state::types::REQUIRED_EGRESS_LABEL)
+                .map(String::as_str),
+            Some("true")
+        );
+        let policy = translated.egress.as_ref().unwrap();
+        assert_eq!(policy.routes[0].name, "primary");
+        let unrestricted = make_compose_service("image: alpine\n");
+        let translated =
+            translate_service("worker", &unrestricted, "test", &empty_project(), None).unwrap();
+        assert!(!translated
+            .labels
+            .contains_key(minga_state::types::REQUIRED_EGRESS_LABEL));
     }
 
     // -- Restart policy tests --------------------------------------------------

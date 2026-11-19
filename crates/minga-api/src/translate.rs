@@ -26,6 +26,23 @@ use crate::models;
 /// Service label that carries an agent workload's spec (JSON) through the
 /// Docker API, which has no field for it. Stripped from state labels.
 pub const AGENT_LABEL: &str = "minga.agent";
+/// Service label that carries the service egress policy (JSON) through the
+/// Docker API. Stripped from state labels.
+pub const EGRESS_LABEL: &str = "minga.egress";
+
+/// Keeps the reserved required-egress label in step with the policy.
+pub fn sync_required_egress_label(svc: &mut Service) {
+    let label = minga_state::types::REQUIRED_EGRESS_LABEL;
+    match &svc.egress {
+        Some(policy) if policy.required => {
+            svc.labels.insert(label.to_owned(), "true".to_owned());
+        }
+        Some(_) => {
+            svc.labels.remove(label);
+        }
+        None => {}
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Inbound: Docker → Minga
@@ -135,6 +152,15 @@ pub fn service_spec_to_state(spec: &models::ServiceSpec) -> Result<Service, Stri
     if let Some(agent) = &agent {
         check_agent(agent).map_err(|e| format!("service '{name}': {e}"))?;
     }
+
+    let egress = spec
+        .Labels
+        .get(EGRESS_LABEL)
+        .map(|raw| {
+            minga_scheduler::egress_policy_from_json(raw)
+                .map_err(|e| format!("service '{name}': invalid {EGRESS_LABEL} label: {e}"))
+        })
+        .transpose()?;
 
     if container.Image.is_empty() && agent.is_none() {
         return Err(format!("service '{name}': ContainerSpec.Image is required"));
@@ -384,7 +410,7 @@ pub fn service_spec_to_state(spec: &models::ServiceSpec) -> Result<Service, Stri
         }
     }
 
-    Ok(Service {
+    let mut service = Service {
         id: name.clone(),
         tenant_id: DEFAULT_TENANT_ID.to_owned(),
         name,
@@ -398,6 +424,7 @@ pub fn service_spec_to_state(spec: &models::ServiceSpec) -> Result<Service, Stri
         networks,
         resources,
         agent,
+        egress,
         restart_policy,
         secrets,
         command,
@@ -405,7 +432,7 @@ pub fn service_spec_to_state(spec: &models::ServiceSpec) -> Result<Service, Stri
         labels: spec
             .Labels
             .iter()
-            .filter(|(k, _)| k.as_str() != AGENT_LABEL)
+            .filter(|(k, _)| k.as_str() != AGENT_LABEL && k.as_str() != EGRESS_LABEL)
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect(),
         healthcheck,
@@ -415,7 +442,9 @@ pub fn service_spec_to_state(spec: &models::ServiceSpec) -> Result<Service, Stri
         update,
         rollback,
         previous: None,
-    })
+    };
+    sync_required_egress_label(&mut service);
+    Ok(service)
 }
 
 /// Translates a Docker `NetworkCreateRequest` into a Minga `Network`.
@@ -475,6 +504,12 @@ pub fn service_to_docker(svc: &Service) -> models::Service {
         labels.insert(
             AGENT_LABEL.to_string(),
             serde_json::to_string(agent).expect("AgentSpec has only JSON-safe fields"),
+        );
+    }
+    if let Some(egress) = &svc.egress {
+        labels.insert(
+            EGRESS_LABEL.to_string(),
+            serde_json::to_string(egress).expect("EgressPolicy has only JSON-safe fields"),
         );
     }
 
@@ -1540,6 +1575,82 @@ mod tests {
     }
 
     #[test]
+    fn egress_policy_survives_the_docker_api_round_trip_and_is_validated() {
+        let svc = Service {
+            id: "web".to_string(),
+            tenant_id: DEFAULT_TENANT_ID.to_owned(),
+            name: "web".to_string(),
+            image: "nginx".to_string(),
+            replicas: 1,
+            mode: ServiceMode::Replicated,
+            is_job: false,
+            constraints: vec![],
+            env: HashMap::new(),
+            ports: vec![],
+            networks: vec![],
+            resources: ResourceSpec::default(),
+            agent: None,
+            egress: None,
+            restart_policy: Default::default(),
+            secrets: vec![],
+            command: vec![],
+            entrypoint: vec![],
+            labels: HashMap::new(),
+            healthcheck: None,
+            mounts: vec![],
+            user: Some("0".to_string()),
+            update: UpdatePolicy {
+                parallelism: 2,
+                order: UpdateOrder::StartFirst,
+                ..Default::default()
+            },
+            rollback: None,
+            previous: None,
+            extra_hosts: vec![
+                ("db".to_string(), "10.0.0.5".to_string()),
+                (
+                    "host.docker.internal".to_string(),
+                    "host-gateway".to_string(),
+                ),
+            ],
+        };
+        use minga_state::types::{EgressAuth, EgressPolicy, EgressRoute};
+        let mut svc = svc;
+        svc.egress = Some(EgressPolicy {
+            required: true,
+            routes: vec![EgressRoute {
+                name: "primary".into(),
+                upstream_url: "https://api.example".into(),
+                auth: Some(EgressAuth::Bearer {
+                    secret: "key".into(),
+                }),
+                fallback: vec![],
+                input_price_micros_per_million: None,
+                output_price_micros_per_million: None,
+            }],
+            models: vec![],
+        });
+        let docker = service_to_docker(&svc);
+        let back = service_spec_to_state(&docker.Spec).unwrap();
+        assert_eq!(back.egress, svc.egress);
+        assert!(!back.labels.contains_key(EGRESS_LABEL));
+        assert_eq!(
+            back.labels
+                .get(minga_state::types::REQUIRED_EGRESS_LABEL)
+                .map(String::as_str),
+            Some("true")
+        );
+
+        let mut long = svc.clone();
+        long.egress.as_mut().unwrap().routes[0].name = "r".repeat(257);
+        assert!(service_spec_to_state(&service_to_docker(&long).Spec).is_err());
+        let mut spec = service_to_docker(&svc).Spec;
+        spec.Labels
+            .insert(EGRESS_LABEL.into(), r#"{"required":true,"extra":1}"#.into());
+        assert!(service_spec_to_state(&spec).is_err(), "unknown keys fail");
+    }
+
+    #[test]
     fn user_and_update_policy_survive_the_docker_api_round_trip() {
         let svc = Service {
             id: "web".to_string(),
@@ -1555,6 +1666,7 @@ mod tests {
             networks: vec![],
             resources: ResourceSpec::default(),
             agent: None,
+            egress: None,
             restart_policy: Default::default(),
             secrets: vec![],
             command: vec![],
@@ -1642,6 +1754,7 @@ mod tests {
             networks: vec![],
             resources: ResourceSpec::default(),
             agent: None,
+            egress: None,
             restart_policy: Default::default(),
             secrets: vec![],
             command: vec![],

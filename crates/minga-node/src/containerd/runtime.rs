@@ -332,11 +332,175 @@ pub struct ContainerdRuntime {
     log_rings: Arc<Mutex<HashMap<String, Arc<LogRing>>>>,
     /// Reader task handles, aborted on stop.
     log_readers: Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>>,
+    egress_tokens: Option<Arc<minga_egress::SandboxTokens>>,
+    egress_budgets: Option<Arc<minga_egress::BudgetTracker>>,
+    active_egress_tokens: Arc<Mutex<HashMap<String, minga_egress::SandboxToken>>>,
     /// Network setup; assignment records carry the subnet metadata.
     #[cfg(target_os = "linux")]
     networking: Option<Arc<crate::netns::NetworkSetup>>,
     #[cfg(target_os = "linux")]
     networking_blocked: AtomicBool,
+}
+
+/// The resolved route policy of a task that uses the egress proxy, `None`
+/// for one that does not. Every routed task goes through the resolver, so
+/// a required policy without routes is refused instead of reaching the
+/// legacy upstream.
+fn task_egress_policy(
+    spec: &TaskSpec,
+    secret_store: Option<&SecretStore>,
+) -> Result<Option<minga_egress::ResolvedEgressPolicy>, RuntimeError> {
+    let required_label = spec
+        .labels
+        .get(minga_state::types::REQUIRED_EGRESS_LABEL)
+        .is_some_and(|value| value == "true");
+    let workload = spec.egress.as_ref();
+    if required_label != workload.is_some_and(|workload| workload.policy.required) {
+        return Err(RuntimeError::Start(
+            "required-egress label and route policy disagree".into(),
+        ));
+    }
+    if !spec.uses_egress_proxy() {
+        return Ok(None);
+    }
+    let workload = workload
+        .ok_or_else(|| RuntimeError::Start("required egress has no workload identity".into()))?;
+    resolve_egress_policy(secret_store, workload).map(Some)
+}
+
+fn resolve_egress_policy(
+    secret_store: Option<&SecretStore>,
+    workload: &minga_state::types::EgressWorkload,
+) -> Result<minga_egress::ResolvedEgressPolicy, RuntimeError> {
+    use minga_egress::{ResolvedAuth, ResolvedEgressPolicy, ResolvedRoute};
+    use minga_state::types::EgressAuth;
+
+    let policy = &workload.policy;
+    if policy.required && policy.routes.is_empty() {
+        return Err(RuntimeError::Start(
+            "required egress has no named routes".into(),
+        ));
+    }
+    let mut routes = HashMap::with_capacity(policy.routes.len());
+    for route in &policy.routes {
+        let auth = match &route.auth {
+            None => None,
+            Some(EgressAuth::Bearer { secret }) => {
+                let store = secret_store.ok_or_else(|| {
+                    RuntimeError::Start("egress route credential has no node secret store".into())
+                })?;
+                let value = store.read_value(secret).map_err(|error| {
+                    RuntimeError::Start(format!(
+                        "cannot resolve egress route secret `{secret}`: {error}"
+                    ))
+                })?;
+                Some(ResolvedAuth::Bearer(value))
+            }
+            Some(EgressAuth::ApiKey { secret }) => {
+                let store = secret_store.ok_or_else(|| {
+                    RuntimeError::Start("egress route credential has no node secret store".into())
+                })?;
+                let value = store.read_value(secret).map_err(|error| {
+                    RuntimeError::Start(format!(
+                        "cannot resolve egress route secret `{secret}`: {error}"
+                    ))
+                })?;
+                Some(ResolvedAuth::ApiKey(value))
+            }
+            Some(EgressAuth::AwsSigv4 {
+                access_key_secret,
+                secret_key_secret,
+                session_token_secret,
+                region,
+                service,
+            }) => {
+                let store = secret_store.ok_or_else(|| {
+                    RuntimeError::Start("egress route credential has no node secret store".into())
+                })?;
+                let access_key = store.read_value(access_key_secret).map_err(|error| {
+                    RuntimeError::Start(format!(
+                        "cannot resolve egress route secret `{access_key_secret}`: {error}"
+                    ))
+                })?;
+                let secret_key = store.read_value(secret_key_secret).map_err(|error| {
+                    RuntimeError::Start(format!(
+                        "cannot resolve egress route secret `{secret_key_secret}`: {error}"
+                    ))
+                })?;
+                let session_token = session_token_secret
+                    .as_deref()
+                    .map(|secret| {
+                        store.read_value(secret).map_err(|error| {
+                            RuntimeError::Start(format!(
+                                "cannot resolve egress route secret `{secret}`: {error}"
+                            ))
+                        })
+                    })
+                    .transpose()?;
+                Some(ResolvedAuth::AwsSigv4 {
+                    access_key,
+                    secret_key,
+                    session_token,
+                    region: region.clone(),
+                    service: service.clone(),
+                })
+            }
+        };
+        let resolved = ResolvedRoute {
+            name: route.name.clone(),
+            upstream_url: route.upstream_url.clone(),
+            auth,
+            fallback: route.fallback.clone(),
+            input_price_micros_per_million: route.input_price_micros_per_million,
+            output_price_micros_per_million: route.output_price_micros_per_million,
+        };
+        if routes.insert(route.name.clone(), resolved).is_some() {
+            return Err(RuntimeError::Start(format!(
+                "duplicate egress route `{}`",
+                route.name
+            )));
+        }
+    }
+    for route in routes.values() {
+        for fallback in &route.fallback {
+            if !routes.contains_key(fallback) || fallback == &route.name {
+                return Err(RuntimeError::Start(format!(
+                    "egress route `{}` has invalid fallback `{fallback}`",
+                    route.name
+                )));
+            }
+        }
+    }
+    Ok(ResolvedEgressPolicy {
+        routes,
+        models: policy.models.clone(),
+    })
+}
+
+/// Budget of a routed container. Egress policies carry no token budget
+/// yet, so routed containers are not token-limited: the proxy still
+/// reserves and records every request, and usage events are published.
+fn routed_task_budget() -> minga_egress::Budget {
+    minga_egress::Budget::new(u64::MAX, std::time::Duration::from_secs(3600))
+}
+
+struct PendingEgressToken {
+    store: SecretStore,
+    task_id: String,
+    token: Option<minga_egress::SandboxToken>,
+    budgets: Option<Arc<minga_egress::BudgetTracker>>,
+    committed: bool,
+}
+
+impl Drop for PendingEgressToken {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.store.cleanup_task(&self.task_id);
+            if let Some(budgets) = &self.budgets {
+                budgets.unregister(&self.task_id);
+            }
+        }
+    }
 }
 
 impl ContainerdRuntime {
@@ -364,6 +528,9 @@ impl ContainerdRuntime {
             networking: None,
             #[cfg(target_os = "linux")]
             networking_blocked: AtomicBool::new(false),
+            egress_tokens: None,
+            egress_budgets: None,
+            active_egress_tokens: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -375,6 +542,26 @@ impl ContainerdRuntime {
     pub fn with_secret_store(mut self, store: SecretStore) -> Self {
         self.secret_store = Some(store);
         self
+    }
+    /// Shares workload identity tokens with the local egress proxy.
+    pub fn with_egress_tokens(mut self, tokens: Arc<minga_egress::SandboxTokens>) -> Self {
+        self.egress_tokens = Some(tokens);
+        self
+    }
+
+    /// Shares the local egress proxy's budget tracker. Each routed task is
+    /// registered before it starts; see [`routed_task_budget`].
+    pub fn with_egress_budgets(mut self, budgets: Arc<minga_egress::BudgetTracker>) -> Self {
+        self.egress_budgets = Some(budgets);
+        self
+    }
+
+    /// Revokes a task's egress token and drops its budget.
+    async fn revoke_egress(&self, container_id: &str) {
+        self.active_egress_tokens.lock().await.remove(container_id);
+        if let Some(budgets) = &self.egress_budgets {
+            budgets.unregister(container_id);
+        }
     }
 
     /// Resolve and stage the task's secret references into mounts.
@@ -422,7 +609,6 @@ impl ContainerdRuntime {
             })
             .collect())
     }
-
     /// Attach node networking: tasks with IP assignments get a prepared
     /// netns (bridge + veth + published ports + resolv.conf).
     ///
@@ -441,9 +627,32 @@ impl ContainerdRuntime {
     async fn prepare_network(
         &self,
         task_id: &str,
-        spec: &TaskSpec,
+        spec: &mut TaskSpec,
         networks: &[minga_state::types::Network],
     ) -> Result<Option<oci::NetworkSpec>, RuntimeError> {
+        let required_egress = spec
+            .labels
+            .get(minga_state::types::REQUIRED_EGRESS_LABEL)
+            .is_some_and(|value| value == "true");
+        let policy_required = spec
+            .egress
+            .as_ref()
+            .is_some_and(|workload| workload.policy.required);
+        let has_routes = spec
+            .egress
+            .as_ref()
+            .is_some_and(|workload| !workload.policy.routes.is_empty());
+        if required_egress != policy_required {
+            return Err(RuntimeError::Start(
+                "required-egress label and route policy disagree".into(),
+            ));
+        }
+        let proxy_egress = required_egress || has_routes;
+        if spec.ips.is_empty() && proxy_egress {
+            return Err(RuntimeError::Start(
+                "egress task has no network assignment".into(),
+            ));
+        }
         if spec.ips.is_empty() {
             return Ok(None);
         }
@@ -481,6 +690,21 @@ impl ContainerdRuntime {
             .setup_task(task_id, &attachments, &spec.ports, &search)
             .await
             .map_err(|e| RuntimeError::Start(format!("network setup: {e}")))?;
+        if required_egress {
+            if let Err(error) = setup.require_task_egress(task_id).await {
+                let _ = setup.teardown_task(task_id).await;
+                return Err(RuntimeError::Start(format!("egress policy setup: {error}")));
+            }
+        }
+        if proxy_egress {
+            let gateway = crate::netns::gateway_of(&attachments[0].subnet).ok_or_else(|| {
+                RuntimeError::Start("task network attachment has no gateway".into())
+            })?;
+            spec.env.insert(
+                "MINGA_EGRESS_URL".into(),
+                format!("http://{gateway}:{}", setup.egress_proxy_port()),
+            );
+        }
         let hosts_path = if spec.extra_hosts.is_empty() {
             None
         } else {
@@ -832,18 +1056,62 @@ impl Runtime for ContainerdRuntime {
             self.networking_blocked.store(false, Ordering::Release);
         }
         let container_id = task_id.clone();
-        let secret_mounts = self.resolve_secrets(&container_id, spec)?;
-        let spec = &self.resolve_mounts(spec).await?;
-        check_extra_hosts_have_network(spec)?;
+        let workload = spec.egress.as_ref();
+        let resolved_policy = task_egress_policy(spec, self.secret_store.as_ref())?;
+        let should_issue_token = resolved_policy.is_some();
+        let mut secret_mounts = self.resolve_secrets(&container_id, spec)?;
+        let mut egress_token = None;
+        if should_issue_token {
+            let tokens = self.egress_tokens.as_ref().ok_or_else(|| {
+                RuntimeError::Start("egress routes need a node started with --egress-bind".into())
+            })?;
+            let workload = workload.ok_or_else(|| {
+                RuntimeError::Start("required egress has no workload identity".into())
+            })?;
+            let store = self.secret_store.as_ref().ok_or_else(|| {
+                RuntimeError::Start("required egress has no node secret store configured".into())
+            })?;
+            if let Some(budgets) = &self.egress_budgets {
+                budgets.register(&container_id, routed_task_budget());
+            }
+            let token = tokens.issue_identity(minga_egress::WorkloadIdentity {
+                workload_id: container_id.clone(),
+                tenant_id: workload.tenant_id.clone(),
+                service_id: workload.service_id.clone(),
+                policy: resolved_policy,
+            });
+            let pending = PendingEgressToken {
+                store: store.clone(),
+                task_id: container_id.clone(),
+                token: Some(token),
+                budgets: self.egress_budgets.clone(),
+                committed: false,
+            };
+            let source = store
+                .stage_egress_token(&container_id, pending.token.as_ref().unwrap().as_str())
+                .map_err(|_| RuntimeError::Start("failed to stage egress token".into()))?;
+            secret_mounts.push(oci::SecretMount {
+                source,
+                target: "/run/minga/egress-token".to_string(),
+            });
+            egress_token = Some(pending);
+        }
+        #[cfg(target_os = "linux")]
+        let mut spec = self.resolve_mounts(spec).await?;
+        #[cfg(not(target_os = "linux"))]
+        let spec = self.resolve_mounts(spec).await?;
+        check_extra_hosts_have_network(&spec)?;
         let image_ref = image::normalize_ref(&spec.image);
         let image = self.ensure_image(&image_ref).await?;
         #[cfg(target_os = "linux")]
-        let network = self.prepare_network(&container_id, spec, networks).await?;
+        let network = self
+            .prepare_network(&container_id, &mut spec, networks)
+            .await?;
         #[cfg(not(target_os = "linux"))]
         let network: Option<oci::NetworkSpec> = {
-            if !spec.ips.is_empty() {
+            if should_issue_token || !spec.ips.is_empty() {
                 return Err(RuntimeError::Start(
-                    "task networking requires Linux (netns + bridges)".into(),
+                    "task networking and egress require Linux (netns + bridges)".into(),
                 ));
             }
             let _ = networks;
@@ -868,7 +1136,7 @@ impl Runtime for ContainerdRuntime {
 
         // A named user resolves against the image's own /etc/passwd, which
         // the snapshot's layer directories hold.
-        let user = oci::task_user(spec, &config, &oci::rootfs_dirs(&mounts))
+        let user = oci::task_user(&spec, &config, &oci::rootfs_dirs(&mounts))
             .map_err(RuntimeError::Start)
             .and_then(|user| chown_secrets(&secret_mounts, user.uid, user.gid).map(|()| user));
         let user = match user {
@@ -936,7 +1204,7 @@ impl Runtime for ContainerdRuntime {
 
         let oci_any = oci::spec_to_any_with_image(
             &container_id,
-            spec,
+            &spec,
             &secret_mounts,
             &config,
             user,
@@ -1015,6 +1283,15 @@ impl Runtime for ContainerdRuntime {
 
         drop(client);
         self.containers.lock().await.insert(container_id.clone());
+        if let Some(mut pending) = egress_token {
+            let mut active_tokens = self.active_egress_tokens.lock().await;
+            let token = pending
+                .token
+                .take()
+                .expect("pending egress token is present until committed");
+            pending.committed = true;
+            active_tokens.insert(container_id.clone(), token);
+        }
 
         tracing::info!(
             task_id = %task_id,
@@ -1084,6 +1361,9 @@ impl Runtime for ContainerdRuntime {
                 )));
             }
         }
+        // The process is gone: its egress token must stop working even if
+        // the container cleanup below fails and is retried.
+        self.revoke_egress(container_id).await;
 
         // 4. Delete the container.
         match client.delete_container(container_id).await {
@@ -1402,6 +1682,32 @@ impl Runtime for ContainerdRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn required_egress_without_routes_is_refused_not_sent_upstream() {
+        use minga_state::types::{EgressPolicy, EgressWorkload, REQUIRED_EGRESS_LABEL};
+        let mut spec = TaskSpec::default();
+        assert!(task_egress_policy(&spec, None).unwrap().is_none());
+
+        spec.egress = Some(EgressWorkload {
+            tenant_id: "acme".into(),
+            service_id: "acme.web".into(),
+            policy: EgressPolicy::default(),
+        });
+        assert!(
+            task_egress_policy(&spec, None).unwrap().is_none(),
+            "no routes and not required keeps the no-token path"
+        );
+
+        spec.egress.as_mut().unwrap().policy.required = true;
+        spec.labels
+            .insert(REQUIRED_EGRESS_LABEL.into(), "true".into());
+        let error = task_egress_policy(&spec, None).unwrap_err();
+        assert!(error.to_string().contains("no named routes"), "{error}");
+
+        spec.labels.remove(REQUIRED_EGRESS_LABEL);
+        assert!(task_egress_policy(&spec, None).is_err(), "label must match");
+    }
 
     #[test]
     fn extra_hosts_without_a_network_refuse_to_start() {

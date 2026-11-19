@@ -289,6 +289,109 @@ impl SecretRef {
     }
 }
 
+/// Reserved state label for Compose's deny-by-default egress policy.
+pub const REQUIRED_EGRESS_LABEL: &str = "com.minga.egress.required";
+/// Reserved node label set when the worker runs its egress proxy
+/// (`--egress-bind`). Services with egress routes are placed only there.
+pub const EGRESS_PROXY_NODE_LABEL: &str = "com.minga.egress.proxy";
+/// Provider authentication reference for a named egress route.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "scheme", rename_all = "snake_case", deny_unknown_fields)]
+pub enum EgressAuth {
+    Bearer {
+        secret: String,
+    },
+    ApiKey {
+        secret: String,
+    },
+    AwsSigv4 {
+        access_key_secret: String,
+        secret_key_secret: String,
+        #[serde(default)]
+        session_token_secret: Option<String>,
+        region: String,
+        service: String,
+    },
+}
+
+/// One tenant-owned upstream route. Secret fields are IDs, never values.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct EgressRoute {
+    pub name: String,
+    pub upstream_url: String,
+    #[serde(default)]
+    pub auth: Option<EgressAuth>,
+    #[serde(default)]
+    pub fallback: Vec<String>,
+    #[serde(default)]
+    pub input_price_micros_per_million: Option<u64>,
+    #[serde(default)]
+    pub output_price_micros_per_million: Option<u64>,
+}
+
+/// Route and model allow-lists for one service.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct EgressPolicy {
+    pub required: bool,
+    pub routes: Vec<EgressRoute>,
+    pub models: Vec<String>,
+}
+
+impl EgressPolicy {
+    /// Every secret ID the routes reference.
+    pub fn secret_ids(&self) -> impl Iterator<Item = &str> {
+        self.routes
+            .iter()
+            .filter_map(|route| route.auth.as_ref())
+            .flat_map(|auth| match auth {
+                EgressAuth::Bearer { secret } | EgressAuth::ApiKey { secret } => {
+                    vec![secret.as_str()]
+                }
+                EgressAuth::AwsSigv4 {
+                    access_key_secret,
+                    secret_key_secret,
+                    session_token_secret,
+                    ..
+                } => [Some(access_key_secret), Some(secret_key_secret)]
+                    .into_iter()
+                    .chain([session_token_secret.as_ref()])
+                    .flatten()
+                    .map(String::as_str)
+                    .collect(),
+            })
+    }
+}
+
+impl TaskSpec {
+    /// Whether the task talks to the node egress proxy with a minted token:
+    /// it requires egress or names at least one route.
+    pub fn uses_egress_proxy(&self) -> bool {
+        self.labels
+            .get(REQUIRED_EGRESS_LABEL)
+            .is_some_and(|value| value == "true")
+            || self.egress.as_ref().is_some_and(|workload| {
+                workload.policy.required || !workload.policy.routes.is_empty()
+            })
+    }
+}
+
+impl EgressPolicy {
+    /// Whether placement needs a node running the egress proxy.
+    pub fn needs_proxy(&self) -> bool {
+        self.required || !self.routes.is_empty()
+    }
+}
+
+/// Egress policy bound to the task identity when placed.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EgressWorkload {
+    pub tenant_id: TenantId,
+    pub service_id: ServiceId,
+    pub policy: EgressPolicy,
+}
+
 /// A desired service, translated from a Compose service.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Service {
@@ -313,6 +416,9 @@ pub struct Service {
     /// Agent workload spec. `None` for container services.
     #[serde(default)]
     pub agent: Option<Box<AgentSpec>>,
+    /// Tenant-owned container egress routes and model policy.
+    #[serde(default)]
+    pub egress: Option<EgressPolicy>,
     /// Restart policy for tasks of this service.
     #[serde(default)]
     pub restart_policy: RestartPolicy,
@@ -529,6 +635,9 @@ pub struct TaskSpec {
     /// response (Traefik's swarm provider reads them).
     #[serde(default)]
     pub labels: HashMap<String, String>,
+    /// Egress policy and tenant/service identity attached by placement.
+    #[serde(default)]
+    pub egress: Option<EgressWorkload>,
     /// Container healthcheck, carried for inspection.
     #[serde(default)]
     pub healthcheck: Option<Healthcheck>,
@@ -893,6 +1002,7 @@ mod tests {
         Service {
             id: id.to_owned(),
             tenant_id: tenant_id.to_owned(),
+            egress: None,
             name: id.to_owned(),
             image: "nginx".to_owned(),
             replicas: 1,
@@ -1024,6 +1134,7 @@ mod tests {
         let svc = Service {
             id: "stack.agent".to_string(),
             tenant_id: "default".to_string(),
+            egress: None,
             name: "agent".to_string(),
             image: String::new(),
             replicas: 1,

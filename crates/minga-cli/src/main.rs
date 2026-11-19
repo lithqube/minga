@@ -405,10 +405,17 @@ struct NodeArgs {
     /// read-only to this node's agent sandboxes.
     #[arg(long = "agent-dir-root", value_name = "DIR")]
     agent_dir_roots: Vec<PathBuf>,
-    /// Bind address for the LLM egress proxy (e.g. 127.0.0.1:18080).
-    /// If set, the node starts an egress proxy for agent workloads.
+    /// Runs the egress proxy on this address (opt-in, e.g. 0.0.0.0:8080).
+    /// Tasks reach it on their bridge gateway at this port; on Linux an nft
+    /// rule closes the port to everything but loopback and task bridges.
+    /// Services with egress routes are placed only on nodes that set it.
     #[arg(long)]
     egress_bind: Option<String>,
+    /// Repeatable CIDR a tenant egress route may reach although it is
+    /// loopback, link-local, private, unspecified or multicast (refused by
+    /// default), e.g. an on-prem model gateway.
+    #[arg(long = "egress-allow-cidr", value_name = "CIDR")]
+    egress_allow_cidrs: Vec<ipnet::IpNet>,
     /// Upstream LLM API URL for the egress proxy.
     #[arg(long, default_value = "https://api.openai.com")]
     egress_upstream: String,
@@ -1660,13 +1667,32 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
     // Announce this node to the cluster and keep the membership lease
     // renewed. Without this the scheduler cannot see the node and every
     // deploy would place zero tasks.
-    let labels = match parse_labels(&args.labels) {
+    let mut labels = match parse_labels(&args.labels) {
         Ok(l) => l,
         Err(e) => {
             eprintln!("error: {e}");
             return ExitCode::FAILURE;
         }
     };
+    // Reserved: placement sends routed-egress services only to nodes that
+    // really run the proxy.
+    labels.remove(minga_state::types::EGRESS_PROXY_NODE_LABEL);
+    let egress_port = match args.egress_bind.as_deref() {
+        None => None,
+        Some(bind) => match port_of(bind) {
+            Some(port) => Some(port),
+            None => {
+                eprintln!("error: --egress-bind {bind:?} has no port");
+                return ExitCode::FAILURE;
+            }
+        },
+    };
+    if egress_port.is_some() {
+        labels.insert(
+            minga_state::types::EGRESS_PROXY_NODE_LABEL.to_string(),
+            "true".to_string(),
+        );
+    }
     // Publish every Minga-owned listener with the node lease so ingress
     // admission can reject ports that are unavailable on any cluster node.
     let mut node_tcp_reserved: Vec<(u16, String)> = [
@@ -2021,12 +2047,18 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
         Some(Arc::new(
             minga_node::NetworkSetup::new(format!("{}/net", args.data_dir))
                 .with_reserved_tcp_ports(node_tcp_reserved.clone())
-                .with_reserved_udp_ports([(args.wg_listen, "WireGuard".to_string())]),
+                .with_reserved_udp_ports([(args.wg_listen, "WireGuard".to_string())])
+                .with_egress_proxy_port(
+                    egress_port.unwrap_or(minga_node::netns::EGRESS_PROXY_PORT),
+                ),
         ))
     } else {
         None
     };
 
+    // Shared by container workloads, agents and the egress proxy.
+    let egress_tokens = Arc::new(minga_egress::SandboxTokens::new());
+    let egress_budgets = Arc::new(minga_egress::BudgetTracker::new());
     // Construct the container runtime based on --runtime flag.
     let runtime: Arc<dyn minga_node::Runtime> = match args.runtime.as_str() {
         "mock" => {
@@ -2051,9 +2083,14 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
                             .clone()
                             .expect("containerd runtime has networking"),
                     );
-                    let rt = rt
+                    let mut rt = rt
                         .with_volume_dir(format!("{}/volumes", args.data_dir))
                         .with_logs_dir(format!("{}/logs", args.data_dir));
+                    if egress_port.is_some() {
+                        rt = rt
+                            .with_egress_tokens(egress_tokens.clone())
+                            .with_egress_budgets(egress_budgets.clone());
+                    }
                     Arc::new(rt.with_secret_store(store))
                 }
                 Err(e) => {
@@ -2071,9 +2108,6 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
         }
     };
 
-    // Shared by the agent executor (mints) and the egress proxy (checks).
-    let egress_tokens = Arc::new(minga_egress::SandboxTokens::new());
-
     // Construct the agent executor if --sandbox-runtime is set.
     let agent_executor: Option<Arc<dyn minga_node::AgentExecutor>> = match &args.sandbox_runtime {
         Some(rt) => match rt.as_str() {
@@ -2090,7 +2124,8 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
                     }) {
                     Ok(exec) => Some(Arc::new(
                         exec.with_egress_enabled(args.egress_bind.is_some())
-                            .with_egress_tokens(egress_tokens.clone()),
+                            .with_egress_tokens(egress_tokens.clone())
+                            .with_egress_budgets(egress_budgets.clone()),
                     )),
                     Err(e) => {
                         eprintln!("error: cannot create wasmtime agent executor: {e}");
@@ -2112,7 +2147,14 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
     let _egress_proxy: Option<minga_egress::EgressProxy> = if let Some(ref bind) = args.egress_bind
     {
         tracing::info!(bind = %bind, upstream = %args.egress_upstream, "starting egress proxy");
-        let budgets = Arc::new(minga_egress::BudgetTracker::new());
+        #[cfg(target_os = "linux")]
+        if !is_loopback_bind(bind) {
+            let port = egress_port.unwrap_or(minga_node::netns::EGRESS_PROXY_PORT);
+            if let Err(e) = minga_node::netns::restrict_egress_listener(port).await {
+                eprintln!("error: cannot restrict the egress proxy port to task bridges: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
         let upstream_auth = match load_upstream_auth(
             &args.secret_store,
             args.egress_credential.as_deref(),
@@ -2130,8 +2172,19 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
             cache_config: Some(minga_egress::CacheConfig::default()),
             redact_errors: true,
             upstream_auth,
+            allowed_route_cidrs: args.egress_allow_cidrs.clone(),
+            ..Default::default()
         };
-        let mut proxy = minga_egress::EgressProxy::new(config, budgets, egress_tokens.clone());
+        let proxy =
+            minga_egress::EgressProxy::new(config, egress_budgets.clone(), egress_tokens.clone())
+                .with_event_bus(bus.clone());
+        let mut proxy = match proxy {
+            Ok(proxy) => proxy,
+            Err(e) => {
+                eprintln!("error: cannot configure egress proxy: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
         match proxy.start(bind).await {
             Ok(addr) => {
                 println!("LLM egress proxy listening on http://{addr}");
@@ -2640,11 +2693,12 @@ async fn run_egress(args: EgressArgs) -> ExitCode {
         },
         redact_errors: true,
         upstream_auth,
+        ..Default::default()
     };
 
     // No agent executor here to mint tokens, so mint one for "default".
     let tokens = Arc::new(minga_egress::SandboxTokens::new());
-    let default_token = tokens.issue("default");
+    let default_token = tokens.issue_standalone("default");
     let mut proxy = minga_egress::EgressProxy::new(config, budgets, tokens);
 
     let addr = match proxy.start(&args.bind).await {
@@ -2658,7 +2712,6 @@ async fn run_egress(args: EgressArgs) -> ExitCode {
     println!("LLM egress proxy listening on http://{addr}");
     println!("  upstream:  {}", args.upstream);
     println!("  health:    http://{addr}/health");
-    println!("  budgets:   http://{addr}/budgets");
     println!("  proxy:     http://{addr}/v1/chat/completions");
     println!(
         "  identity:  send X-Minga-Sandbox-Token: {}",

@@ -309,7 +309,7 @@ fn authorize(
     method: &axum::http::Method,
     path: &str,
 ) -> Result<(), axum::response::Response> {
-    if tenant_scoped_path(path) && caller.tenant_id.is_none() {
+    if tenant_scoped_path(path) && caller.tenant_id.is_none() && !agent_usage_path(path) {
         return Err(auth_forbidden(
             "a certificate for a specific tenant is required to access tenant resources",
         ));
@@ -336,13 +336,32 @@ fn auth_forbidden(message: &str) -> axum::response::Response {
     )
         .into_response()
 }
+fn agent_usage_path(path: &str) -> bool {
+    let mut segments = path.trim_matches('/').split('/');
+    matches!(
+        (
+            segments.next(),
+            segments.next(),
+            segments.next(),
+            segments.next()
+        ),
+        (Some(_), Some("agent"), Some("usage"), None)
+    )
+}
 
 fn tenant_scoped_path(path: &str) -> bool {
     !path.starts_with("/minga/")
         && path.split('/').any(|segment| {
             matches!(
                 segment,
-                "services" | "tasks" | "networks" | "secrets" | "configs" | "audit" | "state"
+                "services"
+                    | "tasks"
+                    | "networks"
+                    | "secrets"
+                    | "configs"
+                    | "audit"
+                    | "state"
+                    | "agent"
             )
         })
 }
@@ -526,6 +545,7 @@ fn build_router_with_app_state(
         .route("/:version/version", get(handlers::get_version))
         .route("/:version/info", get(handlers::get_info))
         .route("/:version/audit", get(handlers::list_audit))
+        .route("/:version/agent/usage", get(handlers::agent_usage))
         // Nodes.
         .route(
             "/:version/nodes",
@@ -1077,6 +1097,7 @@ mod tests {
                 gpus: 0,
             },
             agent: None,
+            egress: None,
             restart_policy: Default::default(),
             secrets: vec![],
             command: vec![],
@@ -1518,6 +1539,31 @@ mod tests {
             .role = Some(ApiRole::Admin);
         let (status, _) = send_request(router, operator).await;
         assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn tenant_admin_reaches_audit_and_usage_routes() {
+        let (router, store, _dir) = admin_router().await;
+        store
+            .upsert_tenant(minga_state::types::Tenant {
+                nats_revoked_user_public_keys: Vec::new(),
+                id: "tenant-a".into(),
+                name: "tenant-a".into(),
+                quotas: Default::default(),
+                created_at: 1,
+            })
+            .await
+            .unwrap();
+        for uri in ["/v1.41/audit", "/v1.41/agent/usage"] {
+            let mut request = Request::builder().uri(uri).body(Body::empty()).unwrap();
+            request.extensions_mut().insert(ClientIdentity {
+                name: "tenant-admin".into(),
+                role: Some(ApiRole::Admin),
+                tenant: Some("tenant-a".into()),
+            });
+            let (status, body) = send_request(router.clone(), request).await;
+            assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+        }
     }
 
     #[tokio::test]

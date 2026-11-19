@@ -120,6 +120,65 @@ pub struct BusRequest {
     pub payload: Vec<u8>,
 }
 
+/// One body-free accounting record for a completed agent-model request.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UsageEvent {
+    pub request_id: String,
+    pub tenant_id: String,
+    pub service_id: String,
+    pub task_id: String,
+    pub customer_id: String,
+    pub route: String,
+    pub requested_model: String,
+    pub answered_model: String,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_hit: bool,
+    pub latency_ms: u64,
+    pub status: u16,
+    pub occurred_at_unix_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_micros: Option<u64>,
+}
+
+/// Totals that contain no customer, task, request, or service identifiers.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UsageTotals {
+    pub request_count: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cost_micros: u64,
+}
+pub(crate) fn valid_subject_token(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
+pub(crate) fn usage_subject(tenant_id: &str, service_id: &str) -> Result<String> {
+    if !valid_subject_token(tenant_id) || service_id.is_empty() || service_id.len() > 400 {
+        return Err(BusError::Other(
+            "usage tenant or service ID is invalid".to_string(),
+        ));
+    }
+    let service_token = if valid_subject_token(service_id) {
+        service_id.to_owned()
+    } else {
+        // A fixed-length digest keeps any service ID inside one subject token.
+        use sha2::Digest as _;
+        use std::fmt::Write as _;
+        let digest = sha2::Sha256::digest(service_id.as_bytes());
+        let mut token = String::with_capacity(3 + 32);
+        token.push_str("id-");
+        for byte in &digest[..16] {
+            write!(token, "{byte:02x}").expect("writing to String cannot fail");
+        }
+        token
+    };
+    Ok(format!("minga.{tenant_id}.usage.{service_token}"))
+}
+
 /// Stream of events.
 pub type EventStream = Pin<Box<dyn Stream<Item = BusEvent> + Send>>;
 
@@ -438,6 +497,21 @@ pub trait EventBus: Send + Sync {
         window_start: u64,
         limit: u64,
     ) -> Result<bool>;
+
+    /// Persist one usage event on the tenant's durable JetStream stream.
+    async fn publish_usage(&self, event: &UsageEvent) -> Result<()>;
+
+    /// Read matching usage rows within a tenant and bound the response.
+    async fn usage_events(
+        &self,
+        tenant_id: &str,
+        since_unix_ms: u64,
+        customer: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<UsageEvent>>;
+
+    /// Aggregate usage by tenant without returning customer-level records.
+    async fn usage_totals(&self, since_unix_ms: u64) -> Result<Vec<(String, UsageTotals)>>;
     /// Send a reply to a request.
     async fn reply(&self, reply_subject: &str, payload: &[u8]) -> Result<()>;
 
@@ -528,5 +602,22 @@ mod tests {
         assert!(!assignment_prefix_matches("node.7.wg", "node.7.wg.extra"));
         assert_eq!(assignment_watch_filter("node.7.task."), "node.7.task.>");
         assert_eq!(assignment_watch_filter("node.7.wg"), "node.7.wg");
+    }
+
+    #[test]
+    fn usage_subject_is_tenant_and_service_qualified() {
+        assert_eq!(
+            usage_subject("tenant-a", "svc_1").unwrap(),
+            "minga.tenant-a.usage.svc_1"
+        );
+        assert!(usage_subject("tenant.a", "svc").is_err());
+        let hashed = usage_subject("tenant-a", "svc.1").unwrap();
+        assert!(hashed.starts_with("minga.tenant-a.usage.id-"));
+        assert_eq!(hashed.len(), "minga.tenant-a.usage.id-".len() + 32);
+        assert_eq!(
+            usage_subject("tenant-a", &"x.".repeat(200)).unwrap().len(),
+            hashed.len()
+        );
+        assert_ne!(hashed, usage_subject("tenant-a", "svc.2").unwrap());
     }
 }

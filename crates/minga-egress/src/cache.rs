@@ -18,6 +18,8 @@ pub struct CacheConfig {
     pub max_entries: usize,
     /// How long a cached entry is valid before it expires.
     pub ttl: Duration,
+    /// Upper bound on the summed size of cached bodies and headers.
+    pub max_bytes: usize,
 }
 
 impl Default for CacheConfig {
@@ -25,6 +27,7 @@ impl Default for CacheConfig {
         Self {
             max_entries: 1000,
             ttl: Duration::from_secs(3600), // 1 hour
+            max_bytes: 64 * 1024 * 1024,
         }
     }
 }
@@ -36,6 +39,24 @@ struct CacheEntry {
     headers: Vec<(String, String)>,
     body: Vec<u8>,
     cached_at: std::time::Instant,
+}
+
+impl CacheEntry {
+    fn size(&self, key: &str) -> usize {
+        key.len()
+            + self.body.len()
+            + self
+                .headers
+                .iter()
+                .map(|(name, value)| name.len() + value.len())
+                .sum::<usize>()
+    }
+}
+
+/// The LRU and the summed size of its entries.
+struct Entries {
+    lru: LruCache<String, CacheEntry>,
+    bytes: usize,
 }
 
 /// Statistics about the response cache.
@@ -66,7 +87,7 @@ pub type CachedResponse = (u16, Vec<(String, String)>, Vec<u8>);
 
 /// An LRU cache for LLM API responses.
 pub struct ResponseCache {
-    cache: Mutex<LruCache<String, CacheEntry>>,
+    cache: Mutex<Entries>,
     config: CacheConfig,
     stats: Mutex<CacheStats>,
 }
@@ -84,7 +105,10 @@ impl ResponseCache {
     pub fn new(config: CacheConfig) -> Self {
         let capacity = NonZeroUsize::new(config.max_entries.max(1)).unwrap();
         Self {
-            cache: Mutex::new(LruCache::new(capacity)),
+            cache: Mutex::new(Entries {
+                lru: LruCache::new(capacity),
+                bytes: 0,
+            }),
             config,
             stats: Mutex::new(CacheStats::default()),
         }
@@ -95,24 +119,26 @@ impl ResponseCache {
     /// Returns `None` if the entry is not cached or has expired.
     /// Expired entries are removed and counted as expirations.
     pub fn get(&self, key: &str) -> Option<CachedResponse> {
-        let mut cache = self.cache.lock().unwrap();
-        match cache.get(key) {
+        let mut cache = lock(&self.cache);
+        match cache.lru.get(key) {
             Some(entry) => {
                 if entry.cached_at.elapsed() >= self.config.ttl {
-                    cache.pop(key);
-                    let mut stats = self.stats.lock().unwrap();
+                    if let Some(entry) = cache.lru.pop(key) {
+                        cache.bytes = cache.bytes.saturating_sub(entry.size(key));
+                    }
+                    let mut stats = lock(&self.stats);
                     stats.expirations += 1;
-                    stats.size = cache.len();
+                    stats.size = cache.lru.len();
                     drop(stats);
                     drop(cache);
-                    self.stats.lock().unwrap().misses += 1;
+                    lock(&self.stats).misses += 1;
                     return None;
                 }
-                self.stats.lock().unwrap().hits += 1;
+                lock(&self.stats).hits += 1;
                 Some((entry.status, entry.headers.clone(), entry.body.clone()))
             }
             None => {
-                self.stats.lock().unwrap().misses += 1;
+                lock(&self.stats).misses += 1;
                 None
             }
         }
@@ -135,57 +161,98 @@ impl ResponseCache {
             cached_at: std::time::Instant::now(),
         };
 
-        let mut cache = self.cache.lock().unwrap();
-        // Check if we're at capacity before inserting (for eviction counting).
-        let was_full = cache.len() >= self.config.max_entries;
-        let had_key = cache.contains(key);
-        cache.put(key.to_string(), entry);
-        if was_full && !had_key {
-            self.stats.lock().unwrap().evictions += 1;
+        let size = entry.size(key);
+        if size > self.config.max_bytes {
+            return;
         }
-        let mut stats = self.stats.lock().unwrap();
+        let mut cache = lock(&self.cache);
+        if let Some(old) = cache.lru.pop(key) {
+            cache.bytes = cache.bytes.saturating_sub(old.size(key));
+        }
+        let mut evictions = 0;
+        while cache.bytes + size > self.config.max_bytes
+            || cache.lru.len() >= self.config.max_entries.max(1)
+        {
+            let Some((old_key, old)) = cache.lru.pop_lru() else {
+                break;
+            };
+            cache.bytes = cache.bytes.saturating_sub(old.size(&old_key));
+            evictions += 1;
+        }
+        cache.lru.put(key.to_string(), entry);
+        cache.bytes += size;
+        let mut stats = lock(&self.stats);
+        stats.evictions += evictions;
         stats.stores += 1;
-        stats.size = cache.len();
+        stats.size = cache.lru.len();
     }
 
-    /// Computes a cache key from a request method, path, and body.
+    /// Computes a cache key scoped to an authenticated workload.
     ///
-    /// Uses a simple hash (FNV-1a) of the body to generate a compact key.
-    pub fn compute_key(method: &str, path: &str, body: &[u8]) -> String {
+    /// The workload identity is mixed into the key so identical prompts from
+    /// different workloads cannot share responses.
+    pub fn compute_key_for_workload(
+        workload: &str,
+        method: &str,
+        path: &str,
+        body: &[u8],
+    ) -> String {
+        Self::compute_key_for_workload_route(workload, "", method, path, body)
+    }
+
+    /// Computes a workload cache key isolated by route and complete path/query.
+    pub fn compute_key_for_workload_route(
+        workload: &str,
+        route: &str,
+        method: &str,
+        path_and_query: &str,
+        body: &[u8],
+    ) -> String {
         let mut hash = fnv1a(body);
-        // Mix in method and path for uniqueness.
-        for b in method.as_bytes() {
-            hash = (hash ^ (*b as u64)).wrapping_mul(0x100000001b3);
+        for b in workload
+            .bytes()
+            .chain(route.bytes())
+            .chain(method.bytes())
+            .chain(path_and_query.bytes())
+        {
+            hash = (hash ^ (b as u64)).wrapping_mul(0x100000001b3);
         }
-        for b in path.as_bytes() {
-            hash = (hash ^ (*b as u64)).wrapping_mul(0x100000001b3);
-        }
-        format!("{method}:{path}:{hash:016x}")
+        format!("{workload}:{route}:{method}:{path_and_query}:{hash:016x}")
     }
 
     /// Returns current cache statistics.
     pub fn stats(&self) -> CacheStats {
-        let mut stats = self.stats.lock().unwrap();
-        stats.size = self.cache.lock().unwrap().len();
+        let mut stats = lock(&self.stats);
+        stats.size = lock(&self.cache).lru.len();
         stats.clone()
     }
 
     /// Clears all cached entries.
     pub fn clear(&self) {
-        self.cache.lock().unwrap().clear();
-        let mut stats = self.stats.lock().unwrap();
+        {
+            let mut cache = lock(&self.cache);
+            cache.lru.clear();
+            cache.bytes = 0;
+        }
+        let mut stats = lock(&self.stats);
         stats.size = 0;
     }
 
     /// Returns the number of entries in the cache.
     pub fn len(&self) -> usize {
-        self.cache.lock().unwrap().len()
+        lock(&self.cache).lru.len()
     }
 
     /// Returns true if the cache is empty.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// FNV-1a hash of a byte slice.
@@ -210,13 +277,33 @@ mod tests {
         CacheConfig {
             max_entries: 10,
             ttl: Duration::from_secs(60),
+            max_bytes: 1 << 20,
         }
+    }
+
+    #[test]
+    fn cache_is_bounded_by_bytes() {
+        let cache = ResponseCache::new(CacheConfig {
+            max_entries: 100,
+            ttl: Duration::from_secs(60),
+            max_bytes: 100,
+        });
+        for key in ["a", "b", "c"] {
+            cache.put(key, 200, vec![], vec![0; 40]);
+        }
+        assert!(cache.get("a").is_none(), "oldest entry evicted for space");
+        assert!(cache.get("c").is_some());
+        cache.put("huge", 200, vec![], vec![0; 101]);
+        assert!(
+            cache.get("huge").is_none(),
+            "an entry over the bound is skipped"
+        );
     }
 
     #[test]
     fn put_and_get() {
         let cache = ResponseCache::new(test_config());
-        let key = ResponseCache::compute_key("POST", "/v1/chat", b"hello");
+        let key = ResponseCache::compute_key_for_workload("task-a", "POST", "/v1/chat", b"hello");
         cache.put(
             &key,
             200,
@@ -229,6 +316,21 @@ mod tests {
         assert_eq!(status, 200);
         assert_eq!(body, b"response");
         assert_eq!(headers.len(), 1);
+    }
+
+    #[test]
+    fn route_and_query_isolate_cache_keys() {
+        let key = |route, path| {
+            ResponseCache::compute_key_for_workload_route("task", route, "POST", path, b"body")
+        };
+        assert_ne!(
+            key("primary", "/v1/chat?x=1"),
+            key("fallback", "/v1/chat?x=1")
+        );
+        assert_ne!(
+            key("primary", "/v1/chat?x=1"),
+            key("primary", "/v1/chat?x=2")
+        );
     }
 
     #[test]
@@ -256,6 +358,7 @@ mod tests {
         let config = CacheConfig {
             max_entries: 2,
             ttl: Duration::from_secs(60),
+            max_bytes: 1 << 20,
         };
         let cache = ResponseCache::new(config);
         cache.put("a", 200, vec![], b"1".to_vec());
@@ -272,6 +375,7 @@ mod tests {
         let config = CacheConfig {
             max_entries: 10,
             ttl: Duration::from_millis(10),
+            max_bytes: 1 << 20,
         };
         let cache = ResponseCache::new(config);
         cache.put("key", 200, vec![], b"data".to_vec());
@@ -297,18 +401,28 @@ mod tests {
     }
 
     #[test]
-    fn compute_key_deterministic() {
-        let k1 = ResponseCache::compute_key("POST", "/v1/chat", b"hello");
-        let k2 = ResponseCache::compute_key("POST", "/v1/chat", b"hello");
+    fn workload_cache_keys_are_isolated() {
+        let cache = ResponseCache::new(test_config());
+        let first = ResponseCache::compute_key_for_workload("task-a", "POST", "/v1/chat", b"same");
+        let second = ResponseCache::compute_key_for_workload("task-b", "POST", "/v1/chat", b"same");
+        assert_ne!(first, second);
+        cache.put(&first, 200, vec![], b"task-a response".to_vec());
+        assert!(cache.get(&second).is_none());
+    }
+
+    #[test]
+    fn compute_key_for_workload_deterministic() {
+        let k1 = ResponseCache::compute_key_for_workload("task-a", "POST", "/v1/chat", b"hello");
+        let k2 = ResponseCache::compute_key_for_workload("task-a", "POST", "/v1/chat", b"hello");
         assert_eq!(k1, k2);
     }
 
     #[test]
-    fn compute_key_different_inputs() {
-        let k1 = ResponseCache::compute_key("POST", "/v1/chat", b"hello");
-        let k2 = ResponseCache::compute_key("POST", "/v1/chat", b"world");
-        let k3 = ResponseCache::compute_key("GET", "/v1/chat", b"hello");
-        let k4 = ResponseCache::compute_key("POST", "/v1/other", b"hello");
+    fn compute_key_for_workload_varies_with_request() {
+        let k1 = ResponseCache::compute_key_for_workload("task-a", "POST", "/v1/chat", b"hello");
+        let k2 = ResponseCache::compute_key_for_workload("task-a", "POST", "/v1/chat", b"world");
+        let k3 = ResponseCache::compute_key_for_workload("task-a", "GET", "/v1/chat", b"hello");
+        let k4 = ResponseCache::compute_key_for_workload("task-a", "POST", "/v1/other", b"hello");
         assert_ne!(k1, k2);
         assert_ne!(k1, k3);
         assert_ne!(k1, k4);
@@ -340,6 +454,7 @@ mod tests {
         let config = CacheConfig {
             max_entries: 2,
             ttl: Duration::from_secs(60),
+            max_bytes: 1 << 20,
         };
         let cache = ResponseCache::new(config);
         cache.put("a", 200, vec![], b"1".to_vec());
@@ -356,6 +471,7 @@ mod tests {
         let config = CacheConfig {
             max_entries: 10,
             ttl: Duration::from_millis(10),
+            max_bytes: 1 << 20,
         };
         let cache = ResponseCache::new(config);
         cache.put("key", 200, vec![], b"data".to_vec());

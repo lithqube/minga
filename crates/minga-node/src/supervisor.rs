@@ -184,6 +184,8 @@ struct RestartState {
     next_retry: std::time::Instant,
     /// The task spec (needed to restart).
     spec: TaskSpec,
+    /// Owning service, for the restarted agent's egress identity.
+    service_id: String,
 }
 
 /// Tracks restart state per task ID.
@@ -522,12 +524,12 @@ impl Supervisor {
                     .map(|s| matches!(s, AgentStatus::Completed))
                     .unwrap_or(false);
 
-                let spec = match self.task_assignments.lock().await.get(&task_id) {
-                    Some(assignment) => assignment.spec.clone(),
+                let (spec, service_id) = match self.task_assignments.lock().await.get(&task_id) {
+                    Some(assignment) => (assignment.spec.clone(), assignment.service_id.clone()),
                     None => {
                         let states = self.restart_states.lock().await;
                         match states.get(&task_id) {
-                            Some(rs) => rs.spec.clone(),
+                            Some(rs) => (rs.spec.clone(), rs.service_id.clone()),
                             None => continue,
                         }
                     }
@@ -559,6 +561,7 @@ impl Supervisor {
                             attempts: 0,
                             next_retry: std::time::Instant::now(),
                             spec: spec.clone(),
+                            service_id: service_id.clone(),
                         });
 
                     if let Some(max) = policy.max_attempts {
@@ -591,7 +594,10 @@ impl Supervisor {
                     continue;
                 };
 
-                match exec.start(&task_id, agent_spec).await {
+                match exec
+                    .start(&task_id, &self.tenant_id, &service_id, agent_spec)
+                    .await
+                {
                     Ok(agent_id) => {
                         minga_telemetry::METRICS.task_restarts_total.inc();
                         tracing::info!(
@@ -652,12 +658,12 @@ impl Supervisor {
                 None => None,
             };
             let failure = failure::exit(exit_code, prior_error.as_deref());
-            let spec = match assignment {
-                Some(assignment) => assignment.spec,
+            let (spec, service_id) = match assignment {
+                Some(assignment) => (assignment.spec, assignment.service_id),
                 None => {
                     let states = self.restart_states.lock().await;
                     match states.get(&task_id) {
-                        Some(rs) => rs.spec.clone(),
+                        Some(rs) => (rs.spec.clone(), rs.service_id.clone()),
                         None => continue,
                     }
                 }
@@ -699,7 +705,7 @@ impl Supervisor {
             self.record_failure(&task_id, failure, true).await;
 
             // Determine if we should restart, and compute backoff.
-            let (attempt, new_spec) = {
+            let (attempt, new_spec, service_id) = {
                 let mut states = self.restart_states.lock().await;
                 let state = states
                     .entry(task_id.clone())
@@ -707,6 +713,7 @@ impl Supervisor {
                         attempts: 0,
                         next_retry: std::time::Instant::now(),
                         spec: spec.clone(),
+                        service_id: service_id.clone(),
                     });
 
                 if let Some(max) = policy.max_attempts {
@@ -733,7 +740,7 @@ impl Supervisor {
                 let attempt = state.attempts;
                 let backoff_secs = policy.delay_secs * (1u64 << (attempt - 1).min(10));
                 state.next_retry = std::time::Instant::now() + Duration::from_secs(backoff_secs);
-                (attempt, state.spec.clone())
+                (attempt, state.spec.clone(), state.service_id.clone())
             };
 
             // Restart the task.
@@ -784,7 +791,10 @@ impl Supervisor {
                         );
                         continue;
                     };
-                    match exec.start(&task_id, agent_spec).await {
+                    match exec
+                        .start(&task_id, &self.tenant_id, &service_id, agent_spec)
+                        .await
+                    {
                         Ok(agent_id) => {
                             minga_telemetry::METRICS.task_restarts_total.inc();
                             tracing::info!(
@@ -1278,13 +1288,43 @@ impl Supervisor {
         let mut agents = self.running_agents.lock().await;
         if running.is_empty() && agents.is_empty() {
             for container in self.runtime.list().await {
+                let routed = current
+                    .get(&container.task_id)
+                    .is_some_and(|assignment| assignment.spec.uses_egress_proxy());
                 if desired.contains(&container.task_id)
                     && container.status == ContainerStatus::Running
+                    && !routed
                 {
                     running.insert(container.task_id, container.id);
                 } else if self.runtime.stop(&container.id).await.is_ok() {
                     actions += 1;
                     minga_telemetry::METRICS.task_stops_total.inc();
+                }
+            }
+        }
+        // A routed-egress container this process did not start holds a token
+        // that died with the previous process (startup recovery may have
+        // missed it, or its stop failed). Stop it before starting a fresh
+        // one; if the stop fails, retry next pass instead of starting.
+        let mut stale_routed = HashSet::new();
+        if current.values().any(|assignment| {
+            assignment.spec.uses_egress_proxy()
+                && !running.contains_key(&assignment.task_id)
+                && !agents.contains(&assignment.task_id)
+        }) {
+            for container in self.runtime.list().await {
+                let routed = current
+                    .get(&container.task_id)
+                    .is_some_and(|assignment| assignment.spec.uses_egress_proxy());
+                if !routed || running.contains_key(&container.task_id) {
+                    continue;
+                }
+                if self.runtime.stop(&container.id).await.is_ok() {
+                    actions += 1;
+                    minga_telemetry::METRICS.task_stops_total.inc();
+                } else {
+                    tracing::warn!(task = %container.task_id, container = %container.id, "cannot stop a stale routed-egress container; retrying next pass");
+                    stale_routed.insert(container.task_id);
                 }
             }
         }
@@ -1296,6 +1336,7 @@ impl Supervisor {
             if running.contains_key(task_id)
                 || agents.contains(task_id)
                 || backing_off.contains(task_id)
+                || stale_routed.contains(task_id)
             {
                 continue;
             }
@@ -1330,7 +1371,10 @@ impl Supervisor {
                         tracing::error!(task = %task_id, "agent assignment without agent executor");
                         continue;
                     };
-                    match exec.start(task_id, agent_spec).await {
+                    match exec
+                        .start(task_id, &self.tenant_id, &assignment.service_id, agent_spec)
+                        .await
+                    {
                         Ok(_) => {
                             minga_telemetry::METRICS.task_starts_total.inc();
                             agents.insert(task_id.clone());
@@ -1392,7 +1436,11 @@ impl Supervisor {
         let mut stopped = 0;
         for container in containers {
             if let Some(assignment) = assigned.get(&container.task_id) {
-                if container.status == ContainerStatus::Running {
+                // A routed-egress token lives only in memory, so the old one
+                // is gone: stop the task and let reconcile restart it.
+                if container.status == ContainerStatus::Running
+                    && !assignment.spec.uses_egress_proxy()
+                {
                     tracing::info!(task = %container.task_id, container = %container.id, "adopted running container");
                     self.running
                         .lock()
@@ -1402,7 +1450,6 @@ impl Supervisor {
                     // Reconcile will start its current assignment after cleanup.
                     let _ = self.runtime.stop(&container.id).await;
                 }
-                let _ = assignment;
                 continue;
             }
             if self.runtime.stop(&container.id).await.is_ok() {
@@ -1586,6 +1633,29 @@ mod assignment_tests {
         ) -> minga_bus::Result<Vec<minga_bus::AuditRecord>> {
             self.inner.list_audit(tenant_id, limit).await
         }
+        async fn publish_usage(&self, event: &minga_bus::UsageEvent) -> minga_bus::Result<()> {
+            self.inner.publish_usage(event).await
+        }
+
+        async fn usage_events(
+            &self,
+            tenant_id: &str,
+            since_unix_ms: u64,
+            customer: Option<&str>,
+            limit: usize,
+        ) -> minga_bus::Result<Vec<minga_bus::UsageEvent>> {
+            self.inner
+                .usage_events(tenant_id, since_unix_ms, customer, limit)
+                .await
+        }
+
+        async fn usage_totals(
+            &self,
+            since_unix_ms: u64,
+        ) -> minga_bus::Result<Vec<(String, minga_bus::UsageTotals)>> {
+            self.inner.usage_totals(since_unix_ms).await
+        }
+
         async fn update_account_claim(&self, account_jwt: &str) -> minga_bus::Result<()> {
             self.inner.update_account_claim(account_jwt).await
         }
@@ -1857,6 +1927,90 @@ mod assignment_tests {
         assert_eq!(supervisor.reconcile_once().await.unwrap(), 1);
         assert_eq!(runtime.container_count(), 0);
     }
+    #[tokio::test]
+    async fn startup_restarts_routed_egress_containers_instead_of_adopting() {
+        let (supervisor, runtime, bus) = setup(7).await;
+        runtime
+            .start(&"routed".to_string(), &TaskSpec::default())
+            .await
+            .unwrap();
+        let mut routed = assignment("routed");
+        routed.spec.labels.insert(
+            minga_state::types::REQUIRED_EGRESS_LABEL.to_string(),
+            "true".to_string(),
+        );
+        write_assignment(&bus, &routed).await;
+
+        supervisor.recover_running_containers().await;
+        // Its in-memory egress token is gone, so it is not adopted.
+        assert!(supervisor.running_tasks().await.is_empty());
+        assert_eq!(runtime.container_count(), 0);
+    }
+
+    fn routed_assignment(task_id: &str) -> TaskAssignment {
+        let mut routed = assignment(task_id);
+        routed.spec.labels.insert(
+            minga_state::types::REQUIRED_EGRESS_LABEL.to_string(),
+            "true".to_string(),
+        );
+        routed
+    }
+
+    async fn container_of(runtime: &MockRuntime, task_id: &str) -> Vec<String> {
+        runtime
+            .list()
+            .await
+            .into_iter()
+            .filter(|container| container.task_id == task_id)
+            .map(|container| container.id)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn reconcile_restarts_a_routed_container_that_startup_recovery_missed() {
+        let (supervisor, runtime, bus) = setup(7).await;
+        let old = runtime
+            .start(&"routed".to_string(), &TaskSpec::default())
+            .await
+            .unwrap();
+        // Startup recovery could not read assignments, so nothing was adopted.
+        write_assignment(&bus, &routed_assignment("routed")).await;
+
+        supervisor.reconcile_once().await.unwrap();
+        let now = container_of(&runtime, "routed").await;
+        assert_eq!(now.len(), 1);
+        assert_ne!(now[0], old, "the stale-token container must not be adopted");
+    }
+
+    #[tokio::test]
+    async fn reconcile_retries_a_failed_routed_stop_before_restarting() {
+        let (supervisor, runtime, bus) = setup(7).await;
+        let old = runtime
+            .start(&"routed".to_string(), &TaskSpec::default())
+            .await
+            .unwrap();
+        runtime
+            .start(&"plain".to_string(), &TaskSpec::default())
+            .await
+            .unwrap();
+        write_assignment(&bus, &routed_assignment("routed")).await;
+        write_assignment(&bus, &assignment("plain")).await;
+
+        *runtime.fail_stops.lock().unwrap() = true;
+        supervisor.recover_running_containers().await;
+        // The plain task is adopted; the routed stop failed, so it must not
+        // be adopted or started next to its stale container.
+        supervisor.reconcile_once().await.unwrap();
+        assert_eq!(container_of(&runtime, "routed").await, vec![old.clone()]);
+        assert_eq!(supervisor.running_tasks().await, vec!["plain".to_string()]);
+
+        *runtime.fail_stops.lock().unwrap() = false;
+        supervisor.reconcile_once().await.unwrap();
+        let now = container_of(&runtime, "routed").await;
+        assert_eq!(now.len(), 1);
+        assert_ne!(now[0], old);
+    }
+
     #[tokio::test]
     async fn assignment_from_older_format_version_is_refused_loudly() {
         let bus = MemoryBus::new();

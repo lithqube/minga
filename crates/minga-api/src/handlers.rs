@@ -13,13 +13,15 @@ use axum::{
     http::StatusCode,
     Json,
 };
-use minga_bus::{subjects, AuditRecord, EventBus, TaskActualState, TaskStatusReport};
+use minga_bus::{
+    subjects, AuditRecord, EventBus, TaskActualState, TaskStatusReport, UsageEvent, UsageTotals,
+};
 use minga_state::types::{
     unix_now, ClusterNode, NodeStatus as MingaNodeStatus, ResourceSpec, Service as StateService,
     Task, Tenant, TenantQuotas,
 };
 use minga_state::{join_token::JoinTokenKey, StateStore};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::{
     auth::Caller,
@@ -328,6 +330,68 @@ pub async fn list_audit(
     Ok(Json(records))
 }
 
+#[derive(Debug, Deserialize)]
+pub(crate) struct AgentUsageQuery {
+    customer: Option<String>,
+    since_unix_ms: Option<u64>,
+    limit: Option<usize>,
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+pub(crate) enum AgentUsageResponse {
+    Tenant { events: Vec<UsageEvent> },
+    Cluster { tenants: Vec<TenantUsageTotal> },
+}
+
+#[derive(Serialize)]
+pub(crate) struct TenantUsageTotal {
+    tenant_id: String,
+    #[serde(flatten)]
+    totals: UsageTotals,
+}
+
+/// `GET /v{version}/agent/usage` — tenant events or operator totals.
+///
+/// Tenant identity is resolved from the authenticated caller, never from a
+/// query parameter. Cluster operators receive aggregates without task,
+/// customer, or request-level data.
+pub(crate) async fn agent_usage(
+    State(app): State<Arc<AppState>>,
+    Extension(caller): Extension<Caller>,
+    Query(query): Query<AgentUsageQuery>,
+) -> ApiResult<Json<AgentUsageResponse>> {
+    let bus = app
+        .bus
+        .as_ref()
+        .ok_or_else(|| ApiError::Unavailable("agent usage service is not configured".into()))?;
+    let since_unix_ms = query.since_unix_ms.unwrap_or(0);
+    if caller.cluster_operator {
+        if query.customer.is_some() {
+            return Err(bad_request(
+                "cluster operators can query tenant totals only, not customer usage",
+            ));
+        }
+        let tenants = bus
+            .usage_totals(since_unix_ms)
+            .await
+            .map_err(|error| ApiError::Unavailable(format!("agent usage query failed: {error}")))?
+            .into_iter()
+            .map(|(tenant_id, totals)| TenantUsageTotal { tenant_id, totals })
+            .collect();
+        return Ok(Json(AgentUsageResponse::Cluster { tenants }));
+    }
+
+    let tenant_id = tenant_scope(&caller)?;
+    let limit = query.limit.unwrap_or(100).clamp(1, 1000);
+    let mut events = bus
+        .usage_events(tenant_id, since_unix_ms, query.customer.as_deref(), limit)
+        .await
+        .map_err(|error| ApiError::Unavailable(format!("agent usage query failed: {error}")))?;
+    events.truncate(limit);
+    Ok(Json(AgentUsageResponse::Tenant { events }))
+}
+
 /// `GET /minga/audit` — list the cluster audit trail for operators.
 pub async fn list_cluster_audit(
     State(app): State<Arc<AppState>>,
@@ -503,27 +567,33 @@ pub async fn import_state(
 
     for service in &snapshot.services {
         // The same admission checks as a deploy, so a bad agent is refused
-        // here instead of crash-looping on its node.
+        // here instead of crash-looping on its node. Rollback targets in
+        // `previous` are checked too, secrets and route secrets included.
+        let mut secret_ids = Vec::new();
         let mut spec = Some(service);
         while let Some(current) = spec {
             if let Some(agent) = &current.agent {
                 crate::translate::check_agent(agent)
                     .map_err(|e| bad_request(format!("service '{}': {e}", service.id)))?;
             }
+            secret_ids.extend(
+                current
+                    .secrets
+                    .iter()
+                    .map(|reference| reference.secret_id.as_str()),
+            );
+            secret_ids.extend(current.egress.iter().flat_map(|policy| policy.secret_ids()));
             spec = current.previous.as_deref();
         }
-        for reference in &service.secrets {
-            let in_snapshot = snapshot
-                .secrets
-                .iter()
-                .any(|secret| secret.id == reference.secret_id);
+        for secret_id in secret_ids {
+            let in_snapshot = snapshot.secrets.iter().any(|secret| secret.id == secret_id);
             let in_store = app
                 .store
-                .get_secret(&reference.secret_id)
+                .get_secret(secret_id)
                 .await?
                 .is_some_and(|secret| secret.tenant_id == tenant_id);
             if !in_snapshot && !in_store {
-                return Err(not_found("secret", &reference.secret_id));
+                return Err(not_found("secret", secret_id));
             }
         }
         for network_id in &service.networks {
@@ -566,6 +636,33 @@ fn label_filters(filters: &Filters) -> Vec<String> {
 /// Checks if a name matches any of the name filters.
 fn name_matches(name: &str, filters: &[String]) -> bool {
     filters.is_empty() || filters.iter().any(|f| f == name)
+}
+
+/// Every secret a service names, in `secrets` or an egress route, must be
+/// declared and owned by the caller's tenant; another tenant's is a 404.
+async fn check_service_secrets(
+    app: &AppState,
+    tenant_id: &str,
+    svc: &StateService,
+) -> ApiResult<()> {
+    let egress_secrets = svc.egress.iter().flat_map(|policy| policy.secret_ids());
+    for secret_id in svc
+        .secrets
+        .iter()
+        .map(|reference| reference.secret_id.as_str())
+        .chain(egress_secrets)
+    {
+        match app.store.get_secret(secret_id).await? {
+            Some(secret) if secret.tenant_id == tenant_id => {}
+            Some(_) => return Err(not_found("secret", secret_id)),
+            None => {
+                return Err(bad_request(format!(
+                    "secret `{secret_id}` is not declared; create its metadata and provision it on eligible nodes first"
+                )))
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Deploy-time hard failure: rejects a service that would get zero tasks
@@ -1163,19 +1260,7 @@ pub async fn create_service(
     let tenant_id = tenant_scope(&caller)?;
     let mut svc = translate::service_spec_to_state(&spec).map_err(ApiError::BadRequest)?;
     svc.tenant_id = tenant_id.to_owned();
-    for reference in &svc.secrets {
-        let secret = app.store.get_secret(&reference.secret_id).await?;
-        match secret {
-            Some(secret) if secret.tenant_id == tenant_id => {}
-            Some(_) => return Err(not_found("secret", &reference.secret_id)),
-            None => {
-                return Err(bad_request(format!(
-                    "secret `{}` is not declared; create its metadata and provision it on eligible nodes first",
-                    reference.secret_id
-                )))
-            }
-        }
-    }
+    check_service_secrets(&app, tenant_id, &svc).await?;
     for network_id in &svc.networks {
         let network = app.store.get_network(network_id).await?;
         if !network.is_some_and(|network| network.tenant_id == tenant_id) {
@@ -1295,18 +1380,12 @@ pub async fn update_service(
 
     let mut svc = translate::service_spec_to_state(&spec).map_err(ApiError::BadRequest)?;
     svc.tenant_id = tenant_id.to_owned();
-    for reference in &svc.secrets {
-        match app.store.get_secret(&reference.secret_id).await? {
-            Some(secret) if secret.tenant_id == tenant_id => {}
-            Some(_) => return Err(not_found("secret", &reference.secret_id)),
-            None => {
-                return Err(bad_request(format!(
-                    "secret `{}` is not declared; create its metadata and provision it on eligible nodes first",
-                    reference.secret_id
-                )))
-            }
-        }
+    // A Docker client that drops the egress label must not drop the policy.
+    if svc.egress.is_none() {
+        svc.egress = existing.egress.clone();
+        translate::sync_required_egress_label(&mut svc);
     }
+    check_service_secrets(&app, tenant_id, &svc).await?;
     for network_id in &svc.networks {
         let network = app.store.get_network(network_id).await?;
         if !network.is_some_and(|network| network.tenant_id == tenant_id) {
@@ -1900,6 +1979,95 @@ mod tests {
         assert_eq!(records[0].tenant_id, "acme");
     }
 
+    #[tokio::test]
+    async fn agent_usage_is_tenant_scoped_and_operator_output_is_aggregate_only() {
+        let (app, _dir) = app_with_node(1.0).await;
+        let bus = app.bus.as_ref().unwrap();
+        for (tenant_id, customer_id, request_id) in [
+            ("default", "customer-a", "request-a"),
+            ("acme", "customer-b", "request-b"),
+        ] {
+            bus.publish_usage(&UsageEvent {
+                request_id: request_id.into(),
+                tenant_id: tenant_id.into(),
+                service_id: "inference".into(),
+                task_id: format!("{tenant_id}.task"),
+                customer_id: customer_id.into(),
+                route: "primary".into(),
+                requested_model: "model-a".into(),
+                answered_model: "model-a".into(),
+                input_tokens: 3,
+                output_tokens: 5,
+                cache_hit: false,
+                latency_ms: 10,
+                status: 200,
+                occurred_at_unix_ms: 100,
+                cost_micros: Some(7),
+            })
+            .await
+            .unwrap();
+        }
+
+        let tenant_caller = Extension(Caller {
+            name: "tenant".into(),
+            role: crate::auth::ApiRole::Admin,
+            tenant_id: Some("default".into()),
+            cluster_operator: false,
+        });
+        let Json(AgentUsageResponse::Tenant { events }) = agent_usage(
+            State(app.clone()),
+            tenant_caller,
+            Query(AgentUsageQuery {
+                customer: None,
+                since_unix_ms: Some(0),
+                limit: Some(100),
+            }),
+        )
+        .await
+        .unwrap() else {
+            panic!("tenant caller must receive usage events");
+        };
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].tenant_id, "default");
+
+        let operator = Extension(Caller {
+            name: "operator".into(),
+            role: crate::auth::ApiRole::Admin,
+            tenant_id: None,
+            cluster_operator: true,
+        });
+        let Json(AgentUsageResponse::Cluster { tenants }) = agent_usage(
+            State(app.clone()),
+            operator.clone(),
+            Query(AgentUsageQuery {
+                customer: None,
+                since_unix_ms: Some(0),
+                limit: None,
+            }),
+        )
+        .await
+        .unwrap() else {
+            panic!("cluster operator must receive aggregate totals");
+        };
+        assert_eq!(tenants.len(), 2);
+        let json = serde_json::to_value(&tenants[0]).unwrap();
+        assert!(json.get("request_count").is_some());
+        assert!(json.get("totals").is_none());
+        assert!(json.get("customer_id").is_none());
+
+        assert!(agent_usage(
+            State(app),
+            operator,
+            Query(AgentUsageQuery {
+                customer: Some("customer-a".into()),
+                since_unix_ms: Some(0),
+                limit: None,
+            }),
+        )
+        .await
+        .is_err());
+    }
+
     fn spec(name: &str, nano_cpus: i64) -> models::ServiceSpec {
         serde_json::from_value(serde_json::json!({
             "Name": name,
@@ -2213,6 +2381,122 @@ mod tests {
         .await
         .unwrap_err();
         assert!(matches!(err, ApiError::BadRequest(_)), "{err:?}");
+    }
+
+    fn egress_policy(secret: &str) -> minga_state::types::EgressPolicy {
+        minga_state::types::EgressPolicy {
+            required: false,
+            routes: vec![minga_state::types::EgressRoute {
+                name: "primary".into(),
+                upstream_url: "https://api.example".into(),
+                auth: Some(minga_state::types::EgressAuth::AwsSigv4 {
+                    access_key_secret: "default-key".into(),
+                    secret_key_secret: "default-key".into(),
+                    session_token_secret: Some(secret.into()),
+                    region: "us-east-1".into(),
+                    service: "bedrock".into(),
+                }),
+                fallback: vec![],
+                input_price_micros_per_million: None,
+                output_price_micros_per_million: None,
+            }],
+            models: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn egress_route_secrets_of_another_tenant_are_not_found() {
+        let (app, _dir) = app_with_node(1.0).await;
+        let mut node = app.store.get_node(1).await.unwrap().unwrap();
+        node.labels.insert(
+            minga_state::types::EGRESS_PROXY_NODE_LABEL.into(),
+            "true".into(),
+        );
+        app.store.upsert_node(node).await.unwrap();
+        app.store
+            .create_tenant(Tenant {
+                nats_revoked_user_public_keys: Vec::new(),
+                id: "acme".into(),
+                name: "Acme".into(),
+                quotas: Default::default(),
+                created_at: 1,
+            })
+            .await
+            .unwrap();
+        for (id, tenant_id) in [("default-key", "default"), ("acme-key", "acme")] {
+            app.store
+                .upsert_secret(minga_state::types::Secret {
+                    id: id.into(),
+                    tenant_id: tenant_id.into(),
+                    name: id.into(),
+                })
+                .await
+                .unwrap();
+        }
+
+        // Snapshot import.
+        let mut svc = translate::service_spec_to_state(&spec("web", 0)).unwrap();
+        svc.egress = Some(egress_policy("acme-key"));
+        let snapshot = |svc: &StateService| {
+            serde_json::to_value(minga_state::StateSnapshot {
+                format_version: minga_state::codec::FORMAT_VERSION,
+                exported_at_unix: 0,
+                tenants: vec![],
+                services: vec![svc.clone()],
+                networks: vec![],
+                volumes: vec![],
+                secrets: vec![],
+                configs: vec![],
+            })
+            .unwrap()
+        };
+        let err = import_state(
+            State(app.clone()),
+            default_caller(),
+            Query(ImportQuery { overwrite: false }),
+            Json(snapshot(&svc)),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, ApiError::NotFound(_)), "{err:?}");
+        assert!(app.store.get_service("web").await.unwrap().is_none());
+
+        // Docker API create carries the policy in its label.
+        let mut docker = translate::service_to_docker(&svc).Spec;
+        let err = create_service(State(app.clone()), default_caller(), Json(docker.clone()))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ApiError::NotFound(_)), "{err:?}");
+
+        // The caller's own secrets pass the ownership check.
+        svc.egress = Some(egress_policy("default-key"));
+        let _ = import_state(
+            State(app.clone()),
+            default_caller(),
+            Query(ImportQuery { overwrite: false }),
+            Json(snapshot(&svc)),
+        )
+        .await
+        .expect("own egress secrets import");
+
+        // An update without the egress label keeps the stored policy.
+        docker.Labels.remove(translate::EGRESS_LABEL);
+        let _ = update_service(
+            State(app.clone()),
+            default_caller(),
+            Path(("v1.41".to_string(), "web".to_string())),
+            Query(
+                serde_json::from_value::<models::ServiceUpdateQuery>(serde_json::json!({}))
+                    .unwrap(),
+            ),
+            Json(docker),
+        )
+        .await
+        .expect("update without the egress label");
+        assert_eq!(
+            app.store.get_service("web").await.unwrap().unwrap().egress,
+            svc.egress
+        );
     }
 
     #[tokio::test]

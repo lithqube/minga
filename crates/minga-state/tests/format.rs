@@ -15,14 +15,14 @@ use std::path::PathBuf;
 
 use minga_state::codec::{
     self, FORMAT_KEY, FORMAT_VERSION, V2_FORMAT_VERSION, V3_FORMAT_VERSION, V4_FORMAT_VERSION,
-    V5_FORMAT_VERSION, V6_FORMAT_VERSION, V7_FORMAT_VERSION, V8_FORMAT_VERSION,
+    V5_FORMAT_VERSION, V6_FORMAT_VERSION, V7_FORMAT_VERSION, V8_FORMAT_VERSION, V9_FORMAT_VERSION,
 };
 use minga_state::types::{
-    AgentCapabilities, AgentDirGrant, AgentGrant, AgentSpec, ClusterNode, Config, FailureAction,
-    Healthcheck, MountKind, Network, NodeRole, NodeStatus, PortMapping, PortMode, ReservedPort,
-    ResourceSpec, RestartCondition, RestartPolicy, Secret, SecretRef, Service, ServiceMode,
-    ServiceMount, Task, TaskSpec, TaskState, Tenant, TenantQuotas, UpdateOrder, UpdatePolicy,
-    Volume, WorkloadKind,
+    AgentCapabilities, AgentDirGrant, AgentGrant, AgentSpec, ClusterNode, Config, EgressAuth,
+    EgressPolicy, EgressRoute, EgressWorkload, FailureAction, Healthcheck, MountKind, Network,
+    NodeRole, NodeStatus, PortMapping, PortMode, ReservedPort, ResourceSpec, RestartCondition,
+    RestartPolicy, Secret, SecretRef, Service, ServiceMode, ServiceMount, Task, TaskSpec,
+    TaskState, Tenant, TenantQuotas, UpdateOrder, UpdatePolicy, Volume, WorkloadKind,
 };
 use minga_state::{ObjectKind, StateCommand, StateSnapshot, StateStore, TypeConfig};
 use openraft::{BasicNode, CommittedLeaderId, Entry, EntryPayload, LogId, Membership, Vote};
@@ -84,7 +84,7 @@ fn a_fixture_accepts_added_fields_and_rejects_changed_ones() {
 
 /// Compares `value` with its fixture, and decodes the fixture back.
 fn check<T: Serialize + DeserializeOwned>(name: &str, value: &T) {
-    for version in V2_FORMAT_VERSION..=V8_FORMAT_VERSION {
+    for version in V2_FORMAT_VERSION..=V9_FORMAT_VERSION {
         let old_path = fixture_path_for_version(version, name);
         if old_path.exists() {
             let old = std::fs::read_to_string(&old_path).unwrap_or_else(|e| {
@@ -232,6 +232,49 @@ fn agent() -> AgentSpec {
     }
 }
 
+fn egress_policy() -> EgressPolicy {
+    EgressPolicy {
+        required: true,
+        routes: vec![
+            EgressRoute {
+                name: "openai".into(),
+                upstream_url: "https://api.openai.com".into(),
+                auth: Some(EgressAuth::Bearer {
+                    secret: "openai_key".into(),
+                }),
+                fallback: vec!["claude".into(), "bedrock".into()],
+                input_price_micros_per_million: Some(2_500_000),
+                output_price_micros_per_million: Some(10_000_000),
+            },
+            EgressRoute {
+                name: "claude".into(),
+                upstream_url: "https://api.anthropic.com".into(),
+                auth: Some(EgressAuth::ApiKey {
+                    secret: "anthropic_key".into(),
+                }),
+                fallback: Vec::new(),
+                input_price_micros_per_million: None,
+                output_price_micros_per_million: None,
+            },
+            EgressRoute {
+                name: "bedrock".into(),
+                upstream_url: "https://bedrock-runtime.eu-west-1.amazonaws.com".into(),
+                auth: Some(EgressAuth::AwsSigv4 {
+                    access_key_secret: "aws_access".into(),
+                    secret_key_secret: "aws_secret".into(),
+                    session_token_secret: Some("aws_session".into()),
+                    region: "eu-west-1".into(),
+                    service: "bedrock".into(),
+                }),
+                fallback: Vec::new(),
+                input_price_micros_per_million: None,
+                output_price_micros_per_million: None,
+            },
+        ],
+        models: vec!["gpt-4o*".into(), "claude-sonnet".into()],
+    }
+}
+
 fn healthcheck() -> Healthcheck {
     Healthcheck {
         test: vec!["CMD".into(), "true".into()],
@@ -279,6 +322,7 @@ fn service(id: &str) -> Service {
             gpus: 0,
         },
         agent: Some(Box::new(agent())),
+        egress: Some(egress_policy()),
         restart_policy: RestartPolicy {
             condition: RestartCondition::OnFailure,
             delay_secs: 5,
@@ -333,6 +377,11 @@ fn task_spec() -> TaskSpec {
         mounts: vec![mount()],
         user: Some("101".into()),
         extra_hosts: vec![("db".into(), "host-gateway".into())],
+        egress: Some(EgressWorkload {
+            tenant_id: "default".into(),
+            service_id: "shop.web".into(),
+            policy: egress_policy(),
+        }),
     }
 }
 
@@ -436,6 +485,7 @@ fn tenant_owned_resource_fixtures() {
 fn legacy_json<T: Serialize>(value: &T) -> serde_json::Value {
     let mut value = serde_json::to_value(value).unwrap();
     strip_tenant_fields(&mut value);
+    strip_egress(&mut value);
     value
 }
 
@@ -748,6 +798,23 @@ fn strip_agent_capabilities(value: &mut serde_json::Value) {
         _ => {}
     }
 }
+fn strip_egress(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(object) => {
+            object.remove("egress");
+            for nested in object.values_mut() {
+                strip_egress(nested);
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for nested in values {
+                strip_egress(nested);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn clear_tenants(tx: &redb::WriteTransaction) {
     let keys = {
         let table = tx.open_table(SM_TENANTS).unwrap();
@@ -805,7 +872,11 @@ fn downgrade_string_table(
             V5_FORMAT_VERSION => strip_node_tenant(&mut value),
             V6_FORMAT_VERSION => strip_node_nats_identity(&mut value),
             V7_FORMAT_VERSION => strip_tenant_revocations(&mut value),
-            V8_FORMAT_VERSION => strip_agent_capabilities(&mut value),
+            V8_FORMAT_VERSION => {
+                strip_agent_capabilities(&mut value);
+                strip_egress(&mut value);
+            }
+            V9_FORMAT_VERSION => strip_egress(&mut value),
             _ => {}
         }
         let bytes = serde_json::to_vec(&value).unwrap();
@@ -836,7 +907,11 @@ fn downgrade_log_table(tx: &redb::WriteTransaction, version: u8) {
             V5_FORMAT_VERSION => strip_node_tenant(&mut value),
             V6_FORMAT_VERSION => strip_node_nats_identity(&mut value),
             V7_FORMAT_VERSION => strip_tenant_revocations(&mut value),
-            V8_FORMAT_VERSION => strip_agent_capabilities(&mut value),
+            V8_FORMAT_VERSION => {
+                strip_agent_capabilities(&mut value);
+                strip_egress(&mut value);
+            }
+            V9_FORMAT_VERSION => strip_egress(&mut value),
             _ => {}
         }
         replace_tenant_commands(&mut value);
@@ -925,6 +1000,29 @@ fn prepare_v8_state(file: &std::path::Path) {
         .unwrap();
     tx.commit().unwrap();
 }
+fn prepare_v9_state(file: &std::path::Path) {
+    let db = Database::create(file).unwrap();
+    let tx = db.begin_write().unwrap();
+    downgrade_string_table(&tx, SM_SERVICES, V9_FORMAT_VERSION);
+    downgrade_string_table(&tx, SM_TASKS, V9_FORMAT_VERSION);
+    tx.open_table(SM_META)
+        .unwrap()
+        .insert(FORMAT_KEY, [V9_FORMAT_VERSION].as_slice())
+        .unwrap();
+    tx.commit().unwrap();
+}
+
+fn prepare_v9_log(file: &std::path::Path) {
+    let db = Database::create(file).unwrap();
+    let tx = db.begin_write().unwrap();
+    downgrade_log_table(&tx, V9_FORMAT_VERSION);
+    tx.open_table(RAFT_META)
+        .unwrap()
+        .insert(FORMAT_KEY, [V9_FORMAT_VERSION].as_slice())
+        .unwrap();
+    tx.commit().unwrap();
+}
+
 fn prepare_v2_log(file: &std::path::Path) {
     let db = Database::create(file).unwrap();
     let tx = db.begin_write().unwrap();
@@ -1275,6 +1373,38 @@ async fn a_v8_state_and_log_file_grant_env_to_legacy_agents() {
     );
 }
 #[tokio::test]
+async fn a_v9_state_and_log_file_migrate_without_egress_policy() {
+    let (_dir, path) = written_dir().await;
+    let state_file = path.join("state.redb");
+    let log_file = path.join("raft_log.redb");
+    prepare_v9_state(&state_file);
+    prepare_v9_log(&log_file);
+    assert!(read_state_value(&state_file, SM_SERVICES, "shop.web")
+        .get("egress")
+        .is_none());
+
+    let store = StateStore::open(1, "127.0.0.1:0", &path, BTreeMap::new())
+        .await
+        .unwrap();
+    let service = store.get_service("shop.web").await.unwrap().unwrap();
+    assert_eq!(service.egress, None);
+    store.shutdown().await.unwrap();
+
+    assert_eq!(read_marker(&state_file, SM_META), Some(FORMAT_VERSION));
+    assert_eq!(read_marker(&log_file, RAFT_META), Some(FORMAT_VERSION));
+    assert_eq!(
+        read_state_value(&state_file, SM_SERVICES, "shop.web").get("egress"),
+        Some(&serde_json::Value::Null)
+    );
+    assert!(
+        read_log_values(&log_file)
+            .iter()
+            .any(|(_, entry)| entry.to_string().contains("\"egress\":null")),
+        "migrated Raft log entries must carry the v10 egress shape"
+    );
+}
+
+#[tokio::test]
 async fn a_v2_log_file_rewrites_entries_and_preserves_indices() {
     let (_dir, path) = written_dir().await;
     let log_file = path.join("raft_log.redb");
@@ -1390,6 +1520,7 @@ async fn importing_a_v2_portable_snapshot_defaults_fields_and_exports_current() 
     old_json["format_version"] = serde_json::json!(V2_FORMAT_VERSION);
     strip_v3_fields(&mut old_json);
     strip_agent_capabilities(&mut old_json);
+    strip_egress(&mut old_json);
     let snapshot: StateSnapshot = serde_json::from_value(old_json).unwrap();
     assert_eq!(snapshot.services[0].ports[0].mode, PortMode::Ingress);
 
@@ -1412,6 +1543,7 @@ async fn importing_a_v3_portable_snapshot_defaults_tenant() {
     old_json["format_version"] = serde_json::json!(V3_FORMAT_VERSION);
     strip_tenant_fields(&mut old_json);
     strip_agent_capabilities(&mut old_json);
+    strip_egress(&mut old_json);
     let snapshot: StateSnapshot = serde_json::from_value(old_json).unwrap();
     assert_eq!(snapshot.services[0].tenant_id, "default");
 
@@ -1433,6 +1565,7 @@ async fn importing_a_v4_portable_snapshot_seeds_default_tenant() {
     old_json["format_version"] = serde_json::json!(V4_FORMAT_VERSION);
     old_json.as_object_mut().unwrap().remove("tenants");
     strip_agent_capabilities(&mut old_json);
+    strip_egress(&mut old_json);
     let snapshot: StateSnapshot = serde_json::from_value(old_json).unwrap();
     assert!(snapshot.tenants.is_empty());
 
@@ -1452,6 +1585,7 @@ async fn importing_a_v8_portable_snapshot_grants_env_to_legacy_agents() {
     let mut old_json = serde_json::to_value(store.export().await.unwrap()).unwrap();
     old_json["format_version"] = serde_json::json!(V8_FORMAT_VERSION);
     strip_agent_capabilities(&mut old_json);
+    strip_egress(&mut old_json);
     let snapshot: StateSnapshot = serde_json::from_value(old_json).unwrap();
 
     store.import(snapshot, true).await.unwrap();
@@ -1510,6 +1644,7 @@ async fn a_v8_snapshot_imports_at_its_byte_quota_and_keeps_the_quota() {
     let mut old_json = serde_json::to_value(&current).unwrap();
     old_json["format_version"] = serde_json::json!(V8_FORMAT_VERSION);
     strip_agent_capabilities(&mut old_json);
+    strip_egress(&mut old_json);
     // Many agent services, each with an agent in `previous` too: their summed
     // growth exceeds any one record, and nested agents grow as well.
     let base = old_json["services"][0].clone();
@@ -1576,6 +1711,31 @@ async fn a_v8_snapshot_imports_at_its_byte_quota_and_keeps_the_quota() {
 }
 
 #[tokio::test]
+async fn a_v9_snapshot_imports_at_its_byte_quota_without_egress() {
+    let (_dir, path) = written_dir().await;
+    let store = StateStore::open(1, "127.0.0.1:0", &path, BTreeMap::new())
+        .await
+        .unwrap();
+    let mut old_json = serde_json::to_value(store.export().await.unwrap()).unwrap();
+    store.shutdown().await.unwrap();
+    old_json["format_version"] = serde_json::json!(V9_FORMAT_VERSION);
+    strip_egress(&mut old_json);
+    let v9_bytes = serde_json::to_vec(&old_json["services"][0]).unwrap().len() as u64;
+    let legacy: StateSnapshot = serde_json::from_value(old_json).unwrap();
+    assert_eq!(legacy.services[0].egress, None);
+    let v10_bytes = serde_json::to_vec(&legacy.services[0]).unwrap().len() as u64;
+    assert!(v10_bytes > v9_bytes, "the egress key must grow the record");
+
+    let (result, _) = import_with_byte_quota(legacy.clone(), v9_bytes).await;
+    result.unwrap();
+    let (result, _) = import_with_byte_quota(legacy, v9_bytes - 1).await;
+    assert!(
+        result.is_err(),
+        "a v9 import over its v9 size must be refused"
+    );
+}
+
+#[tokio::test]
 async fn a_v8_labelled_snapshot_cannot_smuggle_capabilities_past_the_quota() {
     let (_dir, path) = written_dir().await;
     let store = StateStore::open(1, "127.0.0.1:0", &path, BTreeMap::new())
@@ -1585,6 +1745,7 @@ async fn a_v8_labelled_snapshot_cannot_smuggle_capabilities_past_the_quota() {
     store.shutdown().await.unwrap();
     old_json["format_version"] = serde_json::json!(V8_FORMAT_VERSION);
     strip_agent_capabilities(&mut old_json);
+    strip_egress(&mut old_json);
     let base = old_json["services"][0].clone();
     let v8_bytes = serde_json::to_vec(&base).unwrap().len() as u64;
 
@@ -1648,6 +1809,38 @@ async fn importing_unsupported_portable_snapshot_versions_is_refused() {
         assert!(store.import(snapshot, false).await.is_err());
     }
     store.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_v9_labelled_snapshot_cannot_smuggle_an_egress_policy_past_the_quota() {
+    let (_dir, path) = written_dir().await;
+    let store = StateStore::open(1, "127.0.0.1:0", &path, BTreeMap::new())
+        .await
+        .unwrap();
+    let mut old_json = serde_json::to_value(store.export().await.unwrap()).unwrap();
+    store.shutdown().await.unwrap();
+    old_json["format_version"] = serde_json::json!(V9_FORMAT_VERSION);
+    // The fixture's egress policy is what a v9 snapshot cannot carry.
+    assert!(!old_json["services"][0]["egress"].is_null());
+    let snapshot: StateSnapshot = serde_json::from_value(old_json.clone()).unwrap();
+    let (result, _) = import_with_byte_quota(snapshot, u64::MAX / 2).await;
+    assert!(
+        matches!(result, Err(minga_state::StateError::BadSnapshot(ref m)) if m.contains("egress")),
+        "{result:?}"
+    );
+    // Nested in a rollback target too.
+    strip_egress(&mut old_json);
+    let mut service = old_json["services"][0].clone();
+    let mut previous = service.clone();
+    previous["egress"] = serde_json::to_value(egress_policy()).unwrap();
+    service["previous"] = previous;
+    old_json["services"] = serde_json::json!([service]);
+    let snapshot: StateSnapshot = serde_json::from_value(old_json).unwrap();
+    let (result, _) = import_with_byte_quota(snapshot, u64::MAX / 2).await;
+    assert!(
+        matches!(result, Err(minga_state::StateError::BadSnapshot(ref m)) if m.contains("egress")),
+        "{result:?}"
+    );
 }
 
 #[tokio::test]

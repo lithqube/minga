@@ -5,7 +5,7 @@
 //! rejects requests that would exceed the budget.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -40,6 +40,11 @@ pub struct Budget {
     /// When the current window started (not serialized).
     #[serde(skip, default = "Instant::now")]
     pub window_start: Instant,
+    /// Tokens held by reservations that have not settled yet. They stay
+    /// counted across a window reset, so a reset cannot free a balance an
+    /// in-flight request is already using.
+    #[serde(skip)]
+    in_flight: u64,
 }
 
 impl Budget {
@@ -50,6 +55,7 @@ impl Budget {
             window_secs: window.as_secs(),
             used: 0,
             window_start: Instant::now(),
+            in_flight: 0,
         }
     }
 
@@ -64,7 +70,7 @@ impl Budget {
 
     /// Returns true if the budget allows consuming `tokens` more tokens.
     pub fn allows(&self, tokens: u64) -> bool {
-        self.used + tokens <= self.max_tokens
+        self.used.saturating_add(tokens) <= self.max_tokens
     }
 
     /// Records token usage. Returns an error if it would exceed the budget.
@@ -84,7 +90,7 @@ impl Budget {
     /// Resets the window if it has elapsed.
     pub fn maybe_reset_window(&mut self) {
         if self.window_start.elapsed() >= self.window() {
-            self.used = 0;
+            self.used = self.in_flight;
             self.window_start = Instant::now();
         }
     }
@@ -107,7 +113,113 @@ pub struct BudgetTracker {
     budgets: Mutex<HashMap<String, Budget>>,
 }
 
+/// Tokens held for one in-flight request. Dropping it releases them;
+/// [`Reservation::settle`] replaces them with the request's actual usage.
+#[derive(Debug)]
+pub struct Reservation {
+    tracker: Arc<BudgetTracker>,
+    workload: String,
+    tokens: u64,
+    settled: bool,
+}
+
+impl Reservation {
+    /// Charges `actual` tokens in place of the reservation. The provider has
+    /// already served them, so the charge always lands; returns `false`
+    /// when it took the workload past its limit.
+    pub fn settle(mut self, actual: u64) -> bool {
+        self.settled = true;
+        self.tracker.adjust(&self.workload, self.tokens, actual)
+    }
+}
+
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        if !self.settled {
+            self.tracker.adjust(&self.workload, self.tokens, 0);
+        }
+    }
+}
+
 impl BudgetTracker {
+    fn lock(&self) -> MutexGuard<'_, HashMap<String, Budget>> {
+        self.budgets.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Holds `tokens` of the workload's budget for an in-flight request, so
+    /// concurrent requests cannot spend the same balance.
+    pub fn reserve(
+        self: &Arc<Self>,
+        workload: &str,
+        tokens: u64,
+    ) -> Result<Reservation, BudgetTrackerError> {
+        self.reserve_with(workload, tokens, |_| tokens)
+    }
+
+    /// Reserves the whole remaining balance, and at least `floor`, for a
+    /// request whose output has no cap: nothing smaller bounds it, so no
+    /// concurrent request may spend that balance until this one settles. An
+    /// unlimited budget has nothing to protect and reserves `floor` only.
+    pub fn reserve_rest(
+        self: &Arc<Self>,
+        workload: &str,
+        floor: u64,
+    ) -> Result<Reservation, BudgetTrackerError> {
+        self.reserve_with(workload, floor, |budget| {
+            if budget.max_tokens == u64::MAX {
+                floor
+            } else {
+                budget.remaining()
+            }
+        })
+    }
+
+    fn reserve_with(
+        self: &Arc<Self>,
+        workload: &str,
+        floor: u64,
+        amount: impl FnOnce(&Budget) -> u64,
+    ) -> Result<Reservation, BudgetTrackerError> {
+        let mut budgets = self.lock();
+        let budget = budgets
+            .get_mut(workload)
+            .ok_or_else(|| BudgetTrackerError::NotFound(workload.to_string()))?;
+        budget.maybe_reset_window();
+        // Every request reaches the provider, so even an empty one needs a
+        // token of headroom; a fully held budget admits nothing.
+        let floor = floor.max(1);
+        if !budget.allows(floor) {
+            return Err(BudgetTrackerError::Exceeded {
+                workload: workload.to_string(),
+                used: budget.used,
+                requested: floor,
+                limit: budget.max_tokens,
+            });
+        }
+        let tokens = amount(budget).max(floor);
+        budget.used = budget.used.saturating_add(tokens);
+        budget.in_flight = budget.in_flight.saturating_add(tokens);
+        Ok(Reservation {
+            tracker: Arc::clone(self),
+            workload: workload.to_owned(),
+            tokens,
+            settled: false,
+        })
+    }
+
+    fn adjust(&self, workload: &str, reserved: u64, actual: u64) -> bool {
+        let mut budgets = self.lock();
+        let Some(budget) = budgets.get_mut(workload) else {
+            return true;
+        };
+        // Resets carry in-flight reservations forward, so the current window
+        // always holds this one; actual usage lands in the current window.
+        budget.maybe_reset_window();
+        budget.in_flight = budget.in_flight.saturating_sub(reserved);
+        budget.used = budget.used.saturating_sub(reserved).saturating_add(actual);
+        budget.used <= budget.max_tokens
+    }
+
     /// Creates a new empty budget tracker.
     pub fn new() -> Self {
         Self::default()
@@ -116,21 +228,18 @@ impl BudgetTracker {
     /// Registers a budget for a workload. Overwrites any existing budget.
     pub fn register(&self, workload: &str, budget: Budget) {
         let max_tokens = budget.max_tokens;
-        self.budgets
-            .lock()
-            .unwrap()
-            .insert(workload.to_string(), budget);
+        self.lock().insert(workload.to_string(), budget);
         tracing::info!(workload, max_tokens, "budget registered");
     }
 
     /// Removes a workload's budget.
     pub fn unregister(&self, workload: &str) -> bool {
-        self.budgets.lock().unwrap().remove(workload).is_some()
+        self.lock().remove(workload).is_some()
     }
 
     /// Checks if a workload can consume `tokens` tokens without recording.
     pub fn check(&self, workload: &str, tokens: u64) -> Result<(), BudgetTrackerError> {
-        let mut budgets = self.budgets.lock().unwrap();
+        let mut budgets = self.lock();
         let budget = budgets
             .get_mut(workload)
             .ok_or_else(|| BudgetTrackerError::NotFound(workload.to_string()))?;
@@ -149,7 +258,7 @@ impl BudgetTracker {
     /// Records token usage for a workload. Returns an error if it would
     /// exceed the budget.
     pub fn record(&self, workload: &str, tokens: u64) -> Result<(), BudgetTrackerError> {
-        let mut budgets = self.budgets.lock().unwrap();
+        let mut budgets = self.lock();
         let budget = budgets
             .get_mut(workload)
             .ok_or_else(|| BudgetTrackerError::NotFound(workload.to_string()))?;
@@ -162,14 +271,14 @@ impl BudgetTracker {
                 limit: budget.max_tokens,
             });
         }
-        budget.used += tokens;
+        budget.used = budget.used.saturating_add(tokens);
         tracing::debug!(workload, tokens, used = budget.used, "tokens recorded");
         Ok(())
     }
 
     /// Returns the budget status for a workload.
     pub fn status(&self, workload: &str) -> Option<BudgetStatus> {
-        let mut budgets = self.budgets.lock().unwrap();
+        let mut budgets = self.lock();
         budgets.get_mut(workload).map(|b| {
             b.maybe_reset_window();
             let elapsed = b.window_start.elapsed();
@@ -186,7 +295,7 @@ impl BudgetTracker {
 
     /// Returns the status of all registered workloads.
     pub fn list(&self) -> Vec<BudgetStatus> {
-        let mut budgets = self.budgets.lock().unwrap();
+        let mut budgets = self.lock();
         budgets
             .iter_mut()
             .map(|(workload, b)| {
@@ -206,7 +315,7 @@ impl BudgetTracker {
 
     /// Returns the number of registered workloads.
     pub fn len(&self) -> usize {
-        self.budgets.lock().unwrap().len()
+        self.lock().len()
     }
 
     /// Returns true if no workloads are registered.
@@ -284,6 +393,62 @@ mod tests {
         let status = tracker.status("agent-1").unwrap();
         assert_eq!(status.used, 600);
         assert_eq!(status.remaining, 400);
+    }
+
+    #[test]
+    fn a_window_reset_keeps_in_flight_reservations() {
+        let tracker = Arc::new(BudgetTracker::new());
+        // Windows are whole seconds.
+        tracker.register("w", Budget::new(100, Duration::from_secs(1)));
+        let held = tracker.reserve("w", 80).unwrap();
+        std::thread::sleep(Duration::from_millis(1100));
+        // The window rolled over, but the 80 in flight still count.
+        assert!(tracker.reserve("w", 30).is_err());
+        assert!(tracker.reserve("w", 20).is_ok_and(|r| r.settle(0)));
+        assert!(held.settle(10));
+        assert_eq!(tracker.status("w").unwrap().used, 10);
+    }
+
+    #[test]
+    fn an_uncapped_reservation_holds_the_rest_of_a_limited_budget() {
+        let tracker = Arc::new(BudgetTracker::new());
+        tracker.register("limited", Budget::new(100, Duration::from_secs(60)));
+        let held = tracker.reserve_rest("limited", 10).unwrap();
+        assert!(tracker.reserve("limited", 1).is_err());
+        // An empty body bounds its input at zero; it must still be refused.
+        assert!(tracker.reserve_rest("limited", 0).is_err());
+        assert!(tracker.reserve("limited", 0).is_err());
+        assert!(held.settle(30));
+        assert_eq!(tracker.status("limited").unwrap().used, 30);
+        // Unlimited budgets reserve only the floor, so uncapped requests overlap.
+        tracker.register("unlimited", Budget::new(u64::MAX, Duration::from_secs(60)));
+        let _first = tracker.reserve_rest("unlimited", 10).unwrap();
+        assert!(tracker.reserve_rest("unlimited", 10).is_ok());
+    }
+
+    #[test]
+    fn reservations_hold_balance_until_settled_or_dropped() {
+        let tracker = Arc::new(BudgetTracker::new());
+        tracker.register("a", Budget::new(100, Duration::from_secs(60)));
+        let first = tracker.reserve("a", 60).unwrap();
+        assert!(
+            tracker.reserve("a", 60).is_err(),
+            "held balance is not reusable"
+        );
+        drop(first);
+        let second = tracker.reserve("a", 60).unwrap();
+        assert!(second.settle(30));
+        assert_eq!(tracker.status("a").unwrap().used, 30);
+        let third = tracker.reserve("a", 70).unwrap();
+        assert!(!third.settle(90), "actual usage past the limit is charged");
+        assert_eq!(tracker.status("a").unwrap().used, 120);
+
+        tracker.register("unlimited", Budget::new(u64::MAX, Duration::from_secs(60)));
+        assert!(tracker.reserve("unlimited", u64::MAX).unwrap().settle(5));
+        assert!(
+            tracker.check("unlimited", u64::MAX - 5).is_ok(),
+            "no overflow"
+        );
     }
 
     #[test]

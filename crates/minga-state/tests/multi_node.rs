@@ -93,6 +93,7 @@ fn sample_service(id: &str) -> Service {
         networks: vec!["default".to_string()],
         resources: ResourceSpec::default(),
         agent: None,
+        egress: None,
         restart_policy: Default::default(),
         secrets: vec![],
         command: vec![],

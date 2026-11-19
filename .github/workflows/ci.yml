@@ -218,7 +218,7 @@ jobs:
       - name: Install WireGuard test tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y wireguard-tools iputils-ping kmod
+          sudo apt-get install -y wireguard-tools iputils-ping kmod nftables
           sudo modprobe wireguard
           sudo modprobe br_netfilter
       - name: Network-namespace suite (fails closed when it cannot run)

@@ -89,6 +89,119 @@ async fn output(program: &str, args: &[&str]) -> Result<String, NetError> {
     }
     Ok(String::from_utf8_lossy(&result.stdout).into_owned())
 }
+fn egress_table_name(task_id: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(task_id.as_bytes());
+    format!(
+        "minga_egr_{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        digest[0], digest[1], digest[2], digest[3], digest[4], digest[5], digest[6], digest[7]
+    )
+}
+
+/// Per-task nft rules for a required-egress task.
+///
+/// With `br_netfilter` (always loaded by the task source guard) the inet
+/// hooks see the bridge, not the task's veth, as the input interface, for
+/// routed and same-bridge IPv4 alike. The source guard pins each veth to
+/// the task's own address, so bridge plus source address identifies the
+/// task. Only DNS and the proxy on the gateway are open; replies to
+/// connections made *to* the task stay allowed.
+fn egress_policy_script(
+    table: &str,
+    ips: &[Ipv4Addr],
+    bridges: &[String],
+    gateways: &[Ipv4Addr],
+    proxy_port: u16,
+) -> String {
+    let mut script = format!(
+        "add table inet {table}\n\
+         add chain inet {table} input {{ type filter hook input priority filter; policy accept; }}\n\
+         add chain inet {table} forward {{ type filter hook forward priority filter; policy accept; }}\n"
+    );
+    for ((ip, bridge), gateway) in ips.iter().zip(bridges).zip(gateways) {
+        script.push_str(&format!(
+            "add rule inet {table} input iifname \"{bridge}\" ip saddr {ip} ip daddr {gateway} udp dport 53 accept\n\
+             add rule inet {table} input iifname \"{bridge}\" ip saddr {ip} ip daddr {gateway} tcp dport 53 accept\n\
+             add rule inet {table} input iifname \"{bridge}\" ip saddr {ip} ip daddr {gateway} tcp dport {proxy_port} accept\n\
+             add rule inet {table} input iifname \"{bridge}\" ip saddr {ip} ct state established,related accept\n\
+             add rule inet {table} input iifname \"{bridge}\" ip saddr {ip} drop\n\
+             add rule inet {table} forward iifname \"{bridge}\" ip saddr {ip} ct state established,related accept\n\
+             add rule inet {table} forward iifname \"{bridge}\" ip saddr {ip} drop\n"
+        ));
+    }
+    script
+}
+
+/// Host table that limits the egress proxy port to loopback and task
+/// bridges, so the listener is not reachable from the LAN or the mesh.
+const EGRESS_LISTENER_TABLE: &str = "minga_egress_listener";
+
+fn egress_listener_script(port: u16) -> String {
+    let t = EGRESS_LISTENER_TABLE;
+    format!(
+        "add table inet {t}\n\
+         add chain inet {t} input {{ type filter hook input priority filter; policy accept; }}\n\
+         add rule inet {t} input tcp dport {port} iifname \"lo\" accept\n\
+         add rule inet {t} input tcp dport {port} iifname \"{wg}\" drop\n\
+         add rule inet {t} input tcp dport {port} iifname \"minga-*\" accept\n\
+         add rule inet {t} input tcp dport {port} drop\n",
+        wg = minga_net::wireguard::WG_INTERFACE_NAME,
+    )
+}
+
+/// Installs (or replaces) the egress listener restriction for `port`.
+pub async fn restrict_egress_listener(port: u16) -> Result<(), NetError> {
+    run_tolerated("nft", &egress_delete_args(EGRESS_LISTENER_TABLE)).await;
+    run_nft_script(&egress_listener_script(port)).await
+}
+
+fn egress_delete_args(table: &str) -> [&str; 4] {
+    ["delete", "table", "inet", table]
+}
+
+async fn run_nft_script(script: &str) -> Result<(), NetError> {
+    use tokio::io::AsyncWriteExt;
+    let mut child = tokio::process::Command::new("nft")
+        .args(["-f", "-"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|error| NetError::Command {
+            cmd: "nft -f -".into(),
+            stderr: error.to_string(),
+        })?;
+    let mut stdin = child.stdin.take().ok_or_else(|| NetError::Command {
+        cmd: "nft -f -".into(),
+        stderr: "stdin was not piped".into(),
+    })?;
+    stdin
+        .write_all(script.as_bytes())
+        .await
+        .map_err(|error| NetError::Command {
+            cmd: "nft -f -".into(),
+            stderr: error.to_string(),
+        })?;
+    drop(stdin);
+    let result = child
+        .wait_with_output()
+        .await
+        .map_err(|error| NetError::Command {
+            cmd: "nft -f -".into(),
+            stderr: error.to_string(),
+        })?;
+    if result.status.success() {
+        Ok(())
+    } else {
+        Err(NetError::Command {
+            cmd: "nft -f -".into(),
+            stderr: String::from_utf8_lossy(&result.stderr).trim().to_string(),
+        })
+    }
+}
+
+/// Default bridge-gateway port of the egress proxy.
+pub const EGRESS_PROXY_PORT: u16 = 8080;
 
 async fn minga_bridges() -> Result<Vec<String>, NetError> {
     Ok(output("ip", &["-o", "link", "show", "type", "bridge"])
@@ -573,6 +686,12 @@ struct TaskNetState {
     ports: Vec<PortMapping>,
     #[serde(default)]
     veths: Vec<String>,
+    #[serde(default)]
+    bridges: Vec<String>,
+    #[serde(default)]
+    gateways: Vec<Ipv4Addr>,
+    #[serde(default)]
+    required_egress: bool,
 }
 fn task_veth_for_ip(
     task_links: &str,
@@ -654,6 +773,8 @@ pub struct NetworkSetup {
     reserved: Vec<(String, u16, String)>,
     /// Legacy v2 task DNAT is removed once during the v3 transition.
     legacy_ingress_cleaned: std::sync::Mutex<bool>,
+    /// Gateway port that required-egress tasks may reach the proxy on.
+    egress_proxy_port: u16,
 }
 /// The netns handle path. `/var/run/netns` is the one location every tool
 /// (`ip`, runc, `nsenter`) agrees on; `IPNETNS_DIR` indirection proved
@@ -672,7 +793,19 @@ impl NetworkSetup {
                 .map(|p| (p.to_string(), 53, "embedded DNS".to_string()))
                 .to_vec(),
             legacy_ingress_cleaned: std::sync::Mutex::new(false),
+            egress_proxy_port: EGRESS_PROXY_PORT,
         }
+    }
+
+    /// Sets the gateway port of the node's egress proxy (`--egress-bind`).
+    pub fn with_egress_proxy_port(mut self, port: u16) -> Self {
+        self.egress_proxy_port = port;
+        self
+    }
+
+    /// Gateway port of the node's egress proxy.
+    pub fn egress_proxy_port(&self) -> u16 {
+        self.egress_proxy_port
     }
 
     /// Adds node-owned TCP ports (Raft, NATS sidecar, metrics, egress).
@@ -1348,6 +1481,48 @@ impl NetworkSetup {
         }
         result
     }
+    pub async fn require_task_egress(&self, task_id: &str) -> Result<(), NetError> {
+        let state_path = self.state_dir.join(format!("minga-{task_id}.json"));
+        let mut state: TaskNetState = serde_json::from_slice(&tokio::fs::read(&state_path).await?)?;
+        if state.ips.is_empty()
+            || state.ips.len() != state.bridges.len()
+            || state.ips.len() != state.gateways.len()
+            || state.ips.len() != state.veths.len()
+        {
+            return Err(NetError::Command {
+                cmd: "nft egress policy".into(),
+                stderr: "task network state is incomplete".into(),
+            });
+        }
+        let namespace = format!("minga-{task_id}");
+        run(
+            "ip",
+            &[
+                "netns",
+                "exec",
+                &namespace,
+                "sysctl",
+                "-q",
+                "-w",
+                "net.ipv6.conf.all.disable_ipv6=1",
+                "net.ipv6.conf.default.disable_ipv6=1",
+            ],
+        )
+        .await?;
+        let table = egress_table_name(task_id);
+        run_tolerated("nft", &egress_delete_args(&table)).await;
+        run_nft_script(&egress_policy_script(
+            &table,
+            &state.ips,
+            &state.bridges,
+            &state.gateways,
+            self.egress_proxy_port,
+        ))
+        .await?;
+        state.required_egress = true;
+        tokio::fs::write(&state_path, serde_json::to_vec(&state)?).await?;
+        Ok(())
+    }
 
     async fn setup_task_inner(
         &self,
@@ -1364,6 +1539,7 @@ impl NetworkSetup {
 
         let mut first = true;
         let mut task_veths = Vec::with_capacity(attachments.len());
+        let mut task_gateways = Vec::with_capacity(attachments.len());
         for att in attachments {
             if !att.subnet.contains(att.ip) {
                 return Err(NetError::IpOutsideSubnet(
@@ -1375,6 +1551,7 @@ impl NetworkSetup {
 
             let br = bridge_name(&att.network_id);
             let gw = gateway_of(&att.subnet).expect("bridge ensured => gateway exists");
+            task_gateways.push(gw);
             let prefix = att.subnet.prefix_len();
             let (vh, vc) = veth_names(task_id, &att.network_id);
             task_veths.push(vh.clone());
@@ -1465,6 +1642,12 @@ impl NetworkSetup {
             ips: attachments.iter().map(|a| a.ip).collect(),
             ports: ports.to_vec(),
             veths: task_veths,
+            bridges: attachments
+                .iter()
+                .map(|a| bridge_name(&a.network_id))
+                .collect(),
+            gateways: task_gateways,
+            required_egress: false,
         };
         let raw = serde_json::to_vec(&state)?;
         tokio::fs::write(self.state_dir.join(format!("{ns}.json")), raw).await?;
@@ -1481,6 +1664,8 @@ impl NetworkSetup {
     pub async fn teardown_task(&self, task_id: &str) -> Result<(), NetError> {
         let ns = format!("minga-{task_id}");
         let state_path = self.state_dir.join(format!("{ns}.json"));
+        let table = egress_table_name(task_id);
+        run_tolerated("nft", &egress_delete_args(&table)).await;
 
         if let Ok(raw) = tokio::fs::read(&state_path).await {
             if let Ok(state) = serde_json::from_slice::<TaskNetState>(&raw) {
@@ -1584,6 +1769,42 @@ impl NetworkSetup {
             tokio::fs::write(&path, serde_json::to_vec(&state)?).await?;
             for (veth, ip) in state.veths.iter().zip(&state.ips) {
                 ensure_task_source_rules(veth, *ip).await?;
+            }
+            if state.required_egress {
+                if state.ips.len() != state.bridges.len()
+                    || state.ips.len() != state.gateways.len()
+                    || state.ips.len() != state.veths.len()
+                {
+                    return Err(NetError::Command {
+                        cmd: format!("nft egress policy for {namespace}"),
+                        stderr: "required-egress state is incomplete".into(),
+                    });
+                }
+                run(
+                    "ip",
+                    &[
+                        "netns",
+                        "exec",
+                        namespace,
+                        "sysctl",
+                        "-q",
+                        "-w",
+                        "net.ipv6.conf.all.disable_ipv6=1",
+                        "net.ipv6.conf.default.disable_ipv6=1",
+                    ],
+                )
+                .await?;
+                let task_id = namespace.strip_prefix("minga-").unwrap_or(namespace);
+                let table = egress_table_name(task_id);
+                run_tolerated("nft", &egress_delete_args(&table)).await;
+                run_nft_script(&egress_policy_script(
+                    &table,
+                    &state.ips,
+                    &state.bridges,
+                    &state.gateways,
+                    self.egress_proxy_port,
+                ))
+                .await?;
             }
         }
         if let Some(namespace) = untracked_namespaces.into_iter().next() {
@@ -1702,6 +1923,28 @@ pub fn system_upstream_resolver() -> Option<std::net::SocketAddr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn required_egress_rules_allow_proxy_only_and_cleanup_is_task_scoped() {
+        let ip = Ipv4Addr::new(10, 44, 1, 7);
+        let gateway = Ipv4Addr::new(10, 44, 1, 1);
+        let bridge = "minga-abcd".to_string();
+        let table = egress_table_name("stack.web.1");
+        let script = egress_policy_script(&table, &[ip], &[bridge], &[gateway], EGRESS_PROXY_PORT);
+        assert!(script.contains("daddr 10.44.1.1 tcp dport 8080 accept"));
+        assert!(script.contains("udp dport 53 accept"));
+        // br_netfilter shows the bridge, not the veth, to the inet hooks.
+        assert!(script.contains("forward iifname \"minga-abcd\" ip saddr 10.44.1.7 drop"));
+        assert!(script.contains("input iifname \"minga-abcd\" ip saddr 10.44.1.7 drop"));
+        assert!(!script.contains("veth"));
+        let listener = egress_listener_script(9090);
+        assert!(listener.contains("tcp dport 9090 iifname \"minga-wg0\" drop"));
+        assert!(listener.ends_with("tcp dport 9090 drop\n"));
+        assert_ne!(table, egress_table_name("stack.web.2"));
+        assert_eq!(
+            egress_delete_args(&table),
+            ["delete", "table", "inet", table.as_str()]
+        );
+    }
 
     #[test]
     fn ingress_forward_admits_only_local_backend_ports() {

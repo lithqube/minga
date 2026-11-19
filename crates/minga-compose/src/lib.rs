@@ -19,7 +19,8 @@ use indexmap::IndexMap;
 use serde_yaml::{Mapping, Value};
 
 pub use agent::{
-    AgentCapabilities, AgentDirGrant, AgentExtension, CapabilityGrant, AGENT_EXTENSION_KEY,
+    AgentCapabilities, AgentDirGrant, AgentExtension, CapabilityGrant, EgressAuth, EgressExtension,
+    EgressRoute, AGENT_EXTENSION_KEY, EGRESS_EXTENSION_KEY,
 };
 pub use error::{ComposeError, Errors};
 pub use interpolate::interpolate_str;

@@ -2,6 +2,58 @@
 
 ## Unreleased
 
+- Tenant egress routes no longer follow redirects or system proxies and
+  refuse loopback, link-local, private, shared (`100.64.0.0/10`),
+  `0.0.0.0/8`, unspecified and multicast destinations, including through
+  NAT64 (literal or resolved), unless `--egress-allow-cidr` allows
+  them.
+- Egress budget admission reserves an upper bound and settles it to the
+  provider's counts, so concurrent requests cannot overspend: the request
+  body's byte length bounds the input, plus the `max_tokens` cap, and a
+  request without one holds the rest of a limited budget until it settles.
+  A routed-egress container left from a previous worker process is never
+  adopted with its lost token; a failed stop is retried before restarting. Upstream error
+  bodies are buffered (64 KiB) and redacted whole instead of streamed;
+  non-streamed bodies are capped at 32 MiB; a failed body read is charged
+  like a transport error; streams have an idle timeout and keep draining
+  after a client disconnects. Usage is read from the top-level JSON field,
+  cache keys carry a route revision, the cache is bounded by bytes, usage
+  publication is bounded and retried, and customer, model and route names
+  are capped at 256 bytes. `EgressProxy::with_event_bus` now returns a
+  `Result` and works after `router()` was called.
+- The worker egress proxy is opt-in: `--egress-bind` has no default, so a
+  worker without it no longer takes port 8080. Any bind is accepted; tasks use
+  its port on their bridge gateway, and on Linux an nft table closes it to
+  everything but loopback and task bridges. Workers with the proxy carry the
+  reserved `com.minga.egress.proxy=true` label, which placement requires for
+  services with egress routes.
+- Required-egress nft rules now match what the inet hooks see under
+  `br_netfilter` (the bridge plus the task's guarded source address), so they
+  block routed and same-bridge traffic; a real-kernel test covers it.
+- Routed containers and `http` agents register a budget in the proxy's
+  tracker before they start, so their first request is no longer refused with
+  429. Egress policies carry no token budget yet, so routed containers are not
+  token-limited; agents use `token_budget` per run.
+- WASM agent egress tokens carry the assignment's tenant and service instead
+  of the default tenant and the task ID.
+- After a worker restart, routed-egress containers are restarted with a fresh
+  token instead of adopted. A stopped task's token is revoked once its task
+  is deleted, even if container cleanup then fails.
+- A required egress policy with no routes is refused at start instead of
+  falling back to the node's legacy upstream.
+- The Docker API carries a service's egress policy in the `minga.egress`
+  label (JSON, validated like Compose `x-minga-egress`), so `minga deploy`
+  keeps `x-minga-egress`. An update without the label keeps the stored
+  policy. Every secret ID in an egress route must belong to the caller's
+  tenant on create, update and state import; another tenant's is a 404.
+- Egress route names are capped at 256 bytes.
+- Service and task egress policies are persisted in state format v10. Format
+  v10 migrates v2 through v9 state and Raft logs and accepts v9 snapshots;
+  records written before v10 have no egress policy. Worker assignments carry
+  the format byte, so a v9 worker refuses a v10 task instead of running a
+  required-egress workload without its policy: upgrade every node together.
+  Importing a v9 snapshot discounts each service write by its re-encoding
+  growth, as for v8.
 - The built-in NATS sidecar's JetStream file store cap rose from 1GB to 8GB
   (not preallocated). It shares the data volume with Raft and containerd, so
   size that volume for it. Startup validation of a tenant signer's permission

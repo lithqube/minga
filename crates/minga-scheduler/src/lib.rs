@@ -58,7 +58,9 @@ use thiserror::Error;
 pub use constraints::{evaluate, matches_str, parse_constraint, Constraint, ConstraintOp};
 pub use placement::{check_placeable, place_service, PlacementError};
 pub use reconcile::{plan, ReconcileAction};
-pub use translate::{parse_memory, translate_project, TranslateError, TranslatedStack};
+pub use translate::{
+    egress_policy_from_json, parse_memory, translate_project, TranslateError, TranslatedStack,
+};
 
 #[derive(Debug, Error)]
 pub enum SchedulerError {

@@ -829,6 +829,7 @@ mod tests {
             networks: Vec::new(),
             resources: ResourceSpec::default(),
             agent: None,
+            egress: None,
             restart_policy: Default::default(),
             secrets: Vec::new(),
             command: Vec::new(),
