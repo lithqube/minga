@@ -579,6 +579,14 @@ pub async fn import_state(
             current
                 .check_agent_egress()
                 .map_err(|e| bad_request(format!("service '{}': {e}", service.id)))?;
+            if let Some(policy) = &current.egress {
+                crate::translate::check_egress_policy(policy).map_err(|e| {
+                    bad_request(format!(
+                        "service '{}': invalid egress policy: {e}",
+                        service.id
+                    ))
+                })?;
+            }
             secret_ids.extend(
                 current
                     .secrets
@@ -2530,6 +2538,22 @@ mod tests {
             .unwrap()
             .agent
             .is_none());
+        // Import applies the deploy rules to the policy itself.
+        let mut long = svc.clone();
+        long.id = "long".into();
+        long.name = "long".into();
+        long.egress.as_mut().unwrap().routes[0].name = "r".repeat(257);
+        let err = import_state(
+            State(app.clone()),
+            default_caller(),
+            Query(ImportQuery { overwrite: false }),
+            Json(snapshot(&long)),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, ApiError::BadRequest(_)), "{err:?}");
+        assert!(app.store.get_service("long").await.unwrap().is_none());
+
         agent.id = "bot".into();
         agent.name = "bot".into();
         let err = import_state(

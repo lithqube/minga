@@ -68,6 +68,10 @@
   admission (Compose, Docker API create and update, state import): agent
   egress tokens carry no route policy, so the agent would otherwise run
   without the declared routes and model allow-list.
+- `minga state import` validates each service's egress policy, rollback
+  targets included, with the same rules as Compose `x-minga-egress` and the
+  `minga.egress` label, so an import can no longer store a policy that
+  deploy refuses.
 - The Docker API carries a service's egress policy in the `minga.egress`
   label (JSON, validated like Compose `x-minga-egress`), so `minga deploy`
   keeps `x-minga-egress`. An update without the label keeps the stored

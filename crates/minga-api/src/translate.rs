@@ -30,6 +30,14 @@ pub const AGENT_LABEL: &str = "minga.agent";
 /// Docker API. Stripped from state labels.
 pub const EGRESS_LABEL: &str = "minga.egress";
 
+/// Applies the Compose `x-minga-egress` rules to a policy that did not
+/// come through Compose or the label (a state import). The stored form
+/// round-trips through the label's JSON.
+pub fn check_egress_policy(policy: &minga_state::types::EgressPolicy) -> Result<(), String> {
+    let json = serde_json::to_string(policy).map_err(|e| e.to_string())?;
+    minga_scheduler::egress_policy_from_json(&json).map(drop)
+}
+
 /// Keeps the reserved required-egress label in step with the policy.
 pub fn sync_required_egress_label(svc: &mut Service) {
     let label = minga_state::types::REQUIRED_EGRESS_LABEL;
