@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Service and task egress policies are persisted in state format v10. Format
+  v10 migrates v2 through v9 state and Raft logs and accepts v9 snapshots;
+  records written before v10 have no egress policy. Worker assignments carry
+  the format byte, so a v9 worker refuses a v10 task instead of running a
+  required-egress workload without its policy: upgrade every node together.
+  Importing a v9 snapshot discounts each service write by its re-encoding
+  growth, as for v8.
 - WASM agents share one node runtime and a bounded SHA-256 module cache. Epoch
   interruption stops guest execution at its configured timeout; linear memory
   is capped by the configured limit (64 MiB by default), with one memory, one

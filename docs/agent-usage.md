@@ -36,4 +36,6 @@ The proxy listens at `0.0.0.0:8080`; the runtime sets `MINGA_EGRESS_URL` to its 
 
 Supported auth schemes are `bearer`, `api_key`, and `aws_sigv4`. SigV4 uses `access_key_secret`, `secret_key_secret`, optional `session_token_secret`, `region`, and `service`; all are secret IDs. Costs are integer microdollars per million input/output tokens and are omitted unless both prices are configured.
 
+Service and task egress policies are persisted from state format v10. Worker assignments carry the format version, so an older worker refuses a task with a policy instead of dropping it; upgrade every node together.
+
 `bearer` sets `Authorization: Bearer …`; `api_key` sets `x-api-key`. The proxy replaces any workload-supplied values for the selected auth headers.

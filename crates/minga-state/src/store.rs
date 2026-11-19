@@ -867,6 +867,7 @@ impl StateStore {
         let want = crate::codec::FORMAT_VERSION;
         match snapshot.format_version {
             crate::codec::FORMAT_VERSION
+            | crate::codec::V9_FORMAT_VERSION
             | crate::codec::V8_FORMAT_VERSION
             | crate::codec::V7_FORMAT_VERSION
             | crate::codec::V6_FORMAT_VERSION
@@ -874,8 +875,9 @@ impl StateStore {
             | crate::codec::V4_FORMAT_VERSION
             | crate::codec::V3_FORMAT_VERSION
             | crate::codec::V2_FORMAT_VERSION => {
-                // Agent capabilities default to no grants; legacy resource
-                // fields default to `default`. Nodes are not in snapshots.
+                // Egress policy defaults to none, agent capabilities to no
+                // grants, legacy resource fields to `default`. Nodes are not
+                // in snapshots.
             }
             found => {
                 return Err(StateError::BadSnapshot(format!(
@@ -925,7 +927,7 @@ impl StateStore {
             self.upsert_volume(v).await?;
         }
         // An older snapshot's services grow when re-encoded (v9 adds agent
-        // capabilities), so a tenant at its byte quota could not import its
+        // capabilities, v10 the egress policy), so a tenant at its byte quota could not import its
         // own data. Each write carries that tenant's growth so far; the quota
         // itself never changes, and current-format imports get no allowance.
         let legacy = snapshot.format_version < want;
@@ -935,7 +937,7 @@ impl StateStore {
         for s in snapshot.services {
             if legacy {
                 let tenant = growth.entry(s.tenant_id.clone()).or_default();
-                tenant.insert(s.id.clone(), v9_growth(&s)?);
+                tenant.insert(s.id.clone(), legacy_growth(&s, snapshot.format_version)?);
                 let byte_allowance = tenant.values().fold(0u64, |sum, g| sum.saturating_add(*g));
                 self.write_service(StateCommand::ImportService {
                     service: s,
@@ -950,24 +952,28 @@ impl StateStore {
     }
 }
 
-/// Bytes a service gained over its v8 encoding: the agent `capabilities` key,
-/// including agents nested in `previous`.
-fn v9_growth(service: &Service) -> Result<u64, StateError> {
-    fn strip(value: &mut serde_json::Value) {
+/// Bytes a service gained over its encoding at `from_version`: the `egress`
+/// key added in v10 and, before v9, the agent `capabilities` key, including
+/// in the specs nested in `previous`.
+fn legacy_growth(service: &Service, from_version: u8) -> Result<u64, StateError> {
+    fn strip(value: &mut serde_json::Value, from_version: u8) {
         let Some(object) = value.as_object_mut() else {
             return;
         };
-        if let Some(agent) = object.get_mut("agent").and_then(|a| a.as_object_mut()) {
-            agent.remove("capabilities");
+        object.remove("egress");
+        if from_version < crate::codec::V9_FORMAT_VERSION {
+            if let Some(agent) = object.get_mut("agent").and_then(|a| a.as_object_mut()) {
+                agent.remove("capabilities");
+            }
         }
         if let Some(previous) = object.get_mut("previous") {
-            strip(previous);
+            strip(previous, from_version);
         }
     }
     let bad = |e: serde_json::Error| StateError::BadSnapshot(e.to_string());
     let mut value = serde_json::to_value(service).map_err(bad)?;
     let new = serde_json::to_vec(&value).map_err(bad)?.len();
-    strip(&mut value);
+    strip(&mut value, from_version);
     let old = serde_json::to_vec(&value).map_err(bad)?.len();
     Ok((new - old) as u64)
 }
