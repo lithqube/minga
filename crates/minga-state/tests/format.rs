@@ -1389,6 +1389,7 @@ async fn importing_a_v2_portable_snapshot_defaults_fields_and_exports_current() 
     let mut old_json = serde_json::to_value(store.export().await.unwrap()).unwrap();
     old_json["format_version"] = serde_json::json!(V2_FORMAT_VERSION);
     strip_v3_fields(&mut old_json);
+    strip_agent_capabilities(&mut old_json);
     let snapshot: StateSnapshot = serde_json::from_value(old_json).unwrap();
     assert_eq!(snapshot.services[0].ports[0].mode, PortMode::Ingress);
 
@@ -1410,6 +1411,7 @@ async fn importing_a_v3_portable_snapshot_defaults_tenant() {
     let mut old_json = serde_json::to_value(store.export().await.unwrap()).unwrap();
     old_json["format_version"] = serde_json::json!(V3_FORMAT_VERSION);
     strip_tenant_fields(&mut old_json);
+    strip_agent_capabilities(&mut old_json);
     let snapshot: StateSnapshot = serde_json::from_value(old_json).unwrap();
     assert_eq!(snapshot.services[0].tenant_id, "default");
 
@@ -1430,6 +1432,7 @@ async fn importing_a_v4_portable_snapshot_seeds_default_tenant() {
     let mut old_json = serde_json::to_value(store.export().await.unwrap()).unwrap();
     old_json["format_version"] = serde_json::json!(V4_FORMAT_VERSION);
     old_json.as_object_mut().unwrap().remove("tenants");
+    strip_agent_capabilities(&mut old_json);
     let snapshot: StateSnapshot = serde_json::from_value(old_json).unwrap();
     assert!(snapshot.tenants.is_empty());
 
@@ -1570,6 +1573,58 @@ async fn a_v8_snapshot_imports_at_its_byte_quota_and_keeps_the_quota() {
     };
     let (result, _) = import_with_byte_quota(as_v9, v9_bytes as u64 - 1).await;
     assert!(result.is_err(), "a v9 import must stay quota-enforced");
+}
+
+#[tokio::test]
+async fn a_v8_labelled_snapshot_cannot_smuggle_capabilities_past_the_quota() {
+    let (_dir, path) = written_dir().await;
+    let store = StateStore::open(1, "127.0.0.1:0", &path, BTreeMap::new())
+        .await
+        .unwrap();
+    let mut old_json = serde_json::to_value(store.export().await.unwrap()).unwrap();
+    store.shutdown().await.unwrap();
+    old_json["format_version"] = serde_json::json!(V8_FORMAT_VERSION);
+    strip_agent_capabilities(&mut old_json);
+    let base = old_json["services"][0].clone();
+    let v8_bytes = serde_json::to_vec(&base).unwrap().len() as u64;
+
+    // Valid dir grants, large enough that uncounted they would be a bypass.
+    let big = serde_json::json!({
+        "grants": ["env"],
+        "dirs": (0..AgentCapabilities::MAX_DIRS)
+            .map(|i| serde_json::json!({
+                "host": format!("/srv/{i}/{}", "a".repeat(1000)),
+                "guest": format!("/d{i}"),
+            }))
+            .collect::<Vec<_>>(),
+    });
+    let mut top = base.clone();
+    top["agent"]["capabilities"] = big.clone();
+    let mut nested = base.clone();
+    nested["previous"] = base.clone();
+    nested["previous"]["agent"]["capabilities"] = big;
+    // Even a single extra grant is more than the migration produces.
+    let mut http = base.clone();
+    http["agent"]["capabilities"] = serde_json::json!({"grants": ["env", "http"]});
+
+    for service in [top, nested, http] {
+        let mut json = old_json.clone();
+        json["services"] = serde_json::json!([service]);
+        let snapshot: StateSnapshot = serde_json::from_value(json).unwrap();
+        let (result, _) = import_with_byte_quota(snapshot, v8_bytes).await;
+        assert!(
+            matches!(result, Err(minga_state::StateError::BadSnapshot(ref m)) if m.contains("capabilities")),
+            "{result:?}"
+        );
+    }
+
+    // Exactly what the migration produces is accepted.
+    let mut migrated = base;
+    migrated["agent"]["capabilities"] = serde_json::json!({"grants": ["env"], "dirs": []});
+    old_json["services"] = serde_json::json!([migrated]);
+    let snapshot: StateSnapshot = serde_json::from_value(old_json).unwrap();
+    let (result, _) = import_with_byte_quota(snapshot, v8_bytes).await;
+    result.unwrap();
 }
 
 #[tokio::test]

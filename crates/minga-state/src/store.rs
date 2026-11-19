@@ -17,8 +17,9 @@ use crate::log_store::RedbLogStore;
 use crate::network::{forward_write, serve_raft_rpc, RaftTlsConfig, TcpNetworkFactory};
 use crate::state_machine::RedbStateMachine;
 use crate::types::{
-    ClusterNode, Config as StateConfig, ConfigId, Network, NetworkId, NodeId, Secret, SecretId,
-    Service, ServiceId, Task, TaskId, Tenant, TenantQuotas, Volume, VolumeId, DEFAULT_TENANT_ID,
+    AgentCapabilities, ClusterNode, Config as StateConfig, ConfigId, Network, NetworkId, NodeId,
+    Secret, SecretId, Service, ServiceId, Task, TaskId, Tenant, TenantQuotas, Volume, VolumeId,
+    DEFAULT_TENANT_ID,
 };
 use crate::TypeConfig;
 
@@ -874,13 +875,20 @@ impl StateStore {
             | crate::codec::V4_FORMAT_VERSION
             | crate::codec::V3_FORMAT_VERSION
             | crate::codec::V2_FORMAT_VERSION => {
-                // Agent capabilities default to no grants; legacy resource
-                // fields default to `default`. Nodes are not in snapshots.
+                // Pre-v9 agents get the v8 migration's grants; legacy
+                // resource fields default to `default`. Nodes are not in
+                // snapshots.
             }
             found => {
                 return Err(StateError::BadSnapshot(format!(
                     "snapshot has format version {found}, this build reads {want}"
                 )));
+            }
+        }
+        let legacy = snapshot.format_version < want;
+        if legacy {
+            for s in &snapshot.services {
+                check_v8_capabilities(s)?;
             }
         }
         if !overwrite {
@@ -928,7 +936,6 @@ impl StateStore {
         // capabilities), so a tenant at its byte quota could not import its
         // own data. Each write carries that tenant's growth so far; the quota
         // itself never changes, and current-format imports get no allowance.
-        let legacy = snapshot.format_version < want;
         // Keyed by service id: a repeated id replaces its record, so only its
         // latest growth counts.
         let mut growth: BTreeMap<String, BTreeMap<String, u64>> = BTreeMap::new();
@@ -948,6 +955,24 @@ impl StateStore {
         }
         Ok(())
     }
+}
+
+/// Refuses a pre-v9 service whose agents (nested `previous` included) carry
+/// capabilities other than what the v8 migration grants. The snapshot's
+/// version is caller-chosen, so this keeps [`v9_growth`] to migration growth.
+fn check_v8_capabilities(service: &Service) -> Result<(), StateError> {
+    if let Some(agent) = &service.agent {
+        if agent.capabilities != AgentCapabilities::v8_migrated(&agent.sandbox_env) {
+            return Err(StateError::BadSnapshot(format!(
+                "service `{}`: a pre-v9 snapshot cannot declare agent capabilities",
+                service.id
+            )));
+        }
+    }
+    service
+        .previous
+        .as_deref()
+        .map_or(Ok(()), check_v8_capabilities)
 }
 
 /// Bytes a service gained over its v8 encoding: the agent `capabilities` key,

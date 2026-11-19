@@ -401,7 +401,8 @@ struct NodeArgs {
     /// Base directory for resolving agent WASM module paths.
     #[arg(long, default_value = "/var/lib/minga/modules")]
     module_dir: String,
-    /// Repeatable roots that may be exposed read-only to agent sandboxes.
+    /// Repeatable roots whose `<DIR>/<tenant-id>/` subtree may be exposed
+    /// read-only to this node's agent sandboxes.
     #[arg(long = "agent-dir-root", value_name = "DIR")]
     agent_dir_roots: Vec<PathBuf>,
     /// Bind address for the LLM egress proxy (e.g. 127.0.0.1:18080).
@@ -2084,8 +2085,9 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
                 tracing::info!(module_dir = %args.module_dir, "using WasmtimeAgentExecutor");
                 match minga_node::WasmtimeAgentExecutor::new(&args.module_dir)
                     .await
-                    .and_then(|exec| exec.with_agent_dir_roots(&args.agent_dir_roots))
-                {
+                    .and_then(|exec| {
+                        exec.with_agent_dir_roots(&args.agent_dir_roots, &args.tenant_id)
+                    }) {
                     Ok(exec) => Some(Arc::new(
                         exec.with_egress_enabled(args.egress_bind.is_some())
                             .with_egress_tokens(egress_tokens.clone()),

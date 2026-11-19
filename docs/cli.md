@@ -86,7 +86,7 @@ The API waits for catch-up before promotion. Remove it with
 | `--secret-store <DIR>` | `/var/lib/minga/secrets` | Secret values on this node. They never go through Raft or the bus. |
 | `--interval <SECS>` | `2` | Reconcile interval. |
 | `--sandbox-runtime <mock\|wasmtime>`, `--module-dir <DIR>` | none, `/var/lib/minga/modules` | `wasmtime` enables `x-minga-agent` tasks on this node. |
-| `--agent-dir-root <DIR>` (repeatable) | none | Canonicalized allowlist for agent directory grants; no configured root permits no directory grants. Grants are validated only: the sandbox mounts no directories and links no WASI yet. |
+| `--agent-dir-root <DIR>` (repeatable) | none | Canonicalized allowlist for agent directory grants. A grant must resolve under `<DIR>/<tenant-id>/` for the node's `--tenant-id`, so one tenant cannot name another's directories; a symlinked tenant directory is refused. No configured root permits no directory grants. Grants are validated only: the sandbox mounts no directories and links no WASI yet. |
 | `--egress-bind`, `--egress-upstream`, `--egress-credential`, `--egress-credential-header` | none, `https://api.openai.com`, none, `authorization` | Starts the LLM egress proxy for agent tasks. The credential is a secret ID in `--secret-store`; agents never see the key. |
 
 The built-in NATS sidecar caps JetStream file storage at 8GB (not preallocated). The MINGA account's JetStream disk limit must not exceed that cap. JetStream shares the data volume with Raft and containerd, so on nodes with less than about 8GB free, the volume fills before the cap applies.
@@ -154,7 +154,7 @@ certificate flags, or previous Raft data directory is needed.
 | `minga validate [-c FILE] [-p PROFILE]` | Parses the Compose file offline, rejects unknown keys and prints the startup order. `-p '*'` enables every profile. | Anywhere |
 | `minga deploy [-c FILE] [-p PROFILE] [--wait SECS] STACK` | Deploys the file as a stack and waits for placement (30 s by default). | Anywhere that reaches the API |
 | `minga state export [-o FILE] [--force]` | Writes desired state (services, networks, volumes, secret and config references) to stdout or a 0600 file. Not secret values, volume data or TLS material; see [backup.md](backup.md). | Anywhere that reaches the API |
-| `minga state import FILE [--overwrite]` | Restores an export. Fails on an existing service unless `--overwrite`. | Anywhere that reaches the API |
+| `minga state import FILE [--overwrite]` | Restores an export. Fails on an existing service unless `--overwrite`. Agents get the same checks as a deploy; a pre-v9 file may not declare agent capabilities, and in a v9 file an omitted `capabilities` grants nothing. | Anywhere that reaches the API |
 | `minga migrate-v1 --manager-id ID [--manager-id ID ...] [--apply]` | Lists the current voters and those to remove when migrating from v1.2.0. Dry-run by default; `--apply` commits one membership change. Requires the admin API token. | Anywhere that reaches the API |
 | `minga logs [-f] [--tail N] TASK_ID` | Prints a task's output from JetStream (`--nats-url`); `TASK_ID` is `<stack>.<service>.<n>`. | Anywhere that reaches NATS |
 | `minga image pull IMAGE` | Pulls into the `minga` containerd namespace. Credentials come from `$DOCKER_CONFIG/config.json`, else `~/.docker/config.json`, and go to containerd over its API. | On the node |

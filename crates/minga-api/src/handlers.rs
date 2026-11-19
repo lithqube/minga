@@ -432,20 +432,35 @@ pub async fn import_state(
     State(app): State<Arc<AppState>>,
     Extension(caller): Extension<Caller>,
     Query(q): Query<ImportQuery>,
-    Json(body): Json<serde_json::Value>,
+    Json(mut body): Json<serde_json::Value>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let tenant_id = tenant_scope(&caller)?;
     // Check the version before the shape: a newer file may not parse as ours.
     // Older versions the store migrates on import are accepted.
     let oldest = minga_state::codec::V2_FORMAT_VERSION;
     let want = minga_state::codec::FORMAT_VERSION;
-    match body.get("format_version").and_then(|v| v.as_u64()) {
-        Some(v) if (u64::from(oldest)..=u64::from(want)).contains(&v) => {}
+    let version = match body.get("format_version").and_then(|v| v.as_u64()) {
+        Some(v) if (u64::from(oldest)..=u64::from(want)).contains(&v) => v,
         other => {
             return Err(bad_request(format!(
                 "snapshot has format version {}, this build reads {oldest} to {want}",
                 other.map_or("none".to_string(), |v| v.to_string())
             )))
+        }
+    };
+    // v9 snapshots always carry capabilities, so an omitted one means none,
+    // as in the agent label; only older ones get the migration's `env`.
+    if version > u64::from(minga_state::codec::V8_FORMAT_VERSION) {
+        fn deny_omitted(service: &mut serde_json::Value) {
+            if let Some(agent) = service.get_mut("agent") {
+                crate::translate::deny_omitted_capabilities(agent);
+            }
+            if let Some(previous) = service.get_mut("previous") {
+                deny_omitted(previous);
+            }
+        }
+        if let Some(services) = body.get_mut("services").and_then(|s| s.as_array_mut()) {
+            services.iter_mut().for_each(deny_omitted);
         }
     }
     let mut snapshot: minga_state::StateSnapshot = serde_json::from_value(body)?;
@@ -480,6 +495,16 @@ pub async fn import_state(
     }
 
     for service in &snapshot.services {
+        // The same admission checks as a deploy, so a bad agent is refused
+        // here instead of crash-looping on its node.
+        let mut spec = Some(service);
+        while let Some(current) = spec {
+            if let Some(agent) = &current.agent {
+                crate::translate::check_agent(agent)
+                    .map_err(|e| bad_request(format!("service '{}': {e}", service.id)))?;
+            }
+            spec = current.previous.as_deref();
+        }
         for reference in &service.secrets {
             let in_snapshot = snapshot
                 .secrets
