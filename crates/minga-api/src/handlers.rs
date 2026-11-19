@@ -1422,6 +1422,14 @@ pub async fn update_service(
             ..existing.clone()
         }))
     };
+    // A spec this update would refuse cannot become its rollback target.
+    if svc
+        .previous
+        .as_deref()
+        .is_some_and(|previous| previous.check_agent_egress().is_err())
+    {
+        svc.previous = None;
+    }
 
     ensure_placeable(&app, &svc, Some(&svc.id)).await?;
 
@@ -2629,6 +2637,37 @@ mod tests {
         )
         .await
         .expect("update may reuse the capacity of the task it replaces");
+        assert!(
+            app.store
+                .get_service("web")
+                .await
+                .unwrap()
+                .unwrap()
+                .previous
+                .is_some(),
+            "a compliant spec stays the rollback target"
+        );
+
+        // A stored agent with an egress policy (admitted before the check)
+        // must not become the rollback target of a compliant update.
+        let mut legacy = app.store.get_service("web").await.unwrap().unwrap();
+        legacy.agent = Some(Box::default());
+        legacy.egress = Some(Default::default());
+        app.store.upsert_service(legacy).await.unwrap();
+        let _ = update_service(
+            State(app.clone()),
+            default_caller(),
+            Path(("v1.41".to_string(), "web".to_string())),
+            Query(
+                serde_json::from_value::<models::ServiceUpdateQuery>(serde_json::json!({}))
+                    .unwrap(),
+            ),
+            Json(spec("web", 800_000_000)),
+        )
+        .await
+        .expect("the new spec has no agent");
+        let updated = app.store.get_service("web").await.unwrap().unwrap();
+        assert!(updated.agent.is_none() && updated.previous.is_none());
 
         // But not more than the whole node.
         let err = update_service(

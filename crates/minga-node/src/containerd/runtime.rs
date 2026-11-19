@@ -1434,6 +1434,14 @@ impl Runtime for ContainerdRuntime {
     }
 
     async fn try_list(&self) -> Result<Vec<ContainerInfo>, RuntimeError> {
+        // Every supervisor tick lists, so a teardown that failed after its
+        // container was removed is retried here until it succeeds.
+        #[cfg(target_os = "linux")]
+        if let Some(networking) = &self.networking {
+            if let Err(error) = networking.retry_stale_teardowns().await {
+                tracing::warn!(%error, "retrying stale task network teardown failed");
+            }
+        }
         #[cfg(target_os = "linux")]
         let source_filter_error = if let Some(networking) = &self.networking {
             if self.networking_blocked.load(Ordering::Acquire) {

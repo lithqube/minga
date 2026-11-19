@@ -704,6 +704,64 @@ async fn rollout_uses_failed_status_from_bus_kv() {
 }
 
 #[tokio::test]
+async fn rollout_refuses_to_restore_an_agent_with_an_egress_policy() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(
+        StateStore::open(1, "127.0.0.1:0", dir.path(), BTreeMap::new())
+            .await
+            .unwrap(),
+    );
+    let node = make_node(1, 8.0, 1 << 34);
+    store.upsert_node(node.clone()).await.unwrap();
+
+    let mut previous = make_service("app.web", 1);
+    previous.agent = Some(Box::default());
+    previous.egress = Some(Default::default());
+    let mut service = make_service("app.web", 1);
+    service.image = "nginx:2".to_string();
+    service.update.failure_action = FailureAction::Rollback;
+    service.previous = Some(Box::new(previous));
+    let task = minga_scheduler::place_service(&service, &[node], &[], &[], 0).remove(0);
+    store.upsert_service(service).await.unwrap();
+    store.upsert_task(task.clone()).await.unwrap();
+
+    let bus = MemoryBus::new();
+    bus.refresh_lease(1, b"registration").await.unwrap();
+    let status = TaskStatusReport {
+        task_id: task.id.clone(),
+        node_id: 1,
+        state: TaskActualState::Failed,
+        container_id: None,
+        observed_at: 1,
+        restarts: 0,
+        last_error: Some("image pull failed".to_string()),
+        last_exit_code: None,
+        running_since_unix: None,
+    };
+    bus.put_tenant_status(
+        "default",
+        &subjects::kv_node_task_status(task.node_id, &task.id),
+        &status.to_bytes().unwrap(),
+    )
+    .await
+    .unwrap();
+
+    let scheduler = Scheduler::with_bus(store.clone(), bus);
+    scheduler.reconcile_once().await.unwrap();
+    let kept = store.list_services().await.unwrap().remove(0);
+    assert_eq!(kept.image, "nginx:2", "the current spec stays");
+    assert!(kept.agent.is_none() && kept.previous.is_none());
+
+    drop(scheduler);
+    Arc::try_unwrap(store)
+        .ok()
+        .expect("scheduler dropped")
+        .shutdown()
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
 async fn reconcile_creates_tasks_for_service() {
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(

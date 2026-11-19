@@ -55,8 +55,10 @@
   bridge-family rule on the task's own bridge ports drops every frame other
   than IPv4 and ARP, so a container with `CAP_NET_RAW` cannot send IPv6 to
   the host, its peers or past the forward hook. The old rules are replaced in
-  the same nft transaction, and a failed removal at teardown is returned and
-  keeps the task's network state so the next teardown retries it. The task
+  the same nft transaction. A failed removal of a table that still exists is
+  returned and keeps the task's network state, and the node retries that
+  teardown on every supervisor tick until it succeeds; a task without egress
+  tables never fails to start on an nft that lacks a family it does not use. The task
   network state file is replaced through a temporary file, so a failed write
   never truncates the records rollback needs to remove its port mappings.
   A container start that fails after its network was set up (image load,

@@ -262,6 +262,20 @@ impl Scheduler {
                     let Some(previous) = current.previous.clone() else {
                         continue;
                     };
+                    // An agent with an egress policy would run without its
+                    // route policy: drop the rollback target and keep the
+                    // current spec instead.
+                    if let Err(reason) = previous.check_agent_egress() {
+                        tracing::warn!(service = %service_id, reason, "rollout failed; refusing to roll back");
+                        let kept = Service {
+                            previous: None,
+                            ..current.clone()
+                        };
+                        if let Err(error) = self.state.upsert_service(kept).await {
+                            skip_quota_error(error, service_id)?;
+                        }
+                        continue;
+                    }
                     tracing::warn!(service = %service_id, "rollout failed, rolling back");
                     let mut rolled_back = *previous;
                     rolled_back.rollback = current.rollback;

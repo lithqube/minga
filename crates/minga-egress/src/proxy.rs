@@ -1489,7 +1489,11 @@ fn find_usage(bytes: &[u8]) -> Option<UsageCounts> {
 fn find_event_usage(bytes: &[u8]) -> Option<(UsageCounts, bool)> {
     let value: serde_json::Value = serde_json::from_slice(bytes).ok()?;
     if let Some(usage) = value.get("usage") {
-        return usage_counts(Some(usage)).map(|usage| (usage, true));
+        // An input-only report leaves the output open; an explicit 0 is final.
+        let output_final = ["completion_tokens", "output_tokens"]
+            .iter()
+            .any(|key| usage.get(key).is_some_and(serde_json::Value::is_u64));
+        return usage_counts(Some(usage)).map(|usage| (usage, output_final));
     }
     let usage = value.get("message")?.get("usage")?;
     usage_counts(Some(usage)).map(|usage| (usage, false))
@@ -1950,6 +1954,35 @@ mod tests {
             charged_tokens(&counts, 999),
             18 + events.len() as u64 / 4,
             "the known input is kept"
+        );
+    }
+
+    #[test]
+    fn a_top_level_input_only_usage_does_not_finalize_the_output() {
+        let events = concat!(
+            "data: {\"usage\":{\"input_tokens\":18}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"a generated answer that the provider charged for\"}}\n\n",
+        );
+        let mut parser = UsageParser::new(true);
+        parser.push(events.as_bytes());
+        assert_eq!(
+            parser.finish_with_model(events.len() as u64).0,
+            UsageCounts {
+                input_tokens: 18,
+                output_tokens: events.len() as u64 / 4,
+                estimated: true,
+            }
+        );
+        let explicit_zero = "data: {\"usage\":{\"input_tokens\":18,\"output_tokens\":0}}\n\n";
+        let mut parser = UsageParser::new(true);
+        parser.push(explicit_zero.as_bytes());
+        assert_eq!(
+            parser.finish_with_model(explicit_zero.len() as u64).0,
+            UsageCounts {
+                input_tokens: 18,
+                output_tokens: 0,
+                estimated: false,
+            }
         );
     }
 

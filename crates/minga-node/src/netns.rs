@@ -1621,19 +1621,23 @@ impl NetworkSetup {
     pub async fn teardown_task(&self, task_id: &str) -> Result<(), NetError> {
         let ns = format!("minga-{task_id}");
         let state_path = self.state_dir.join(format!("{ns}.json"));
-        // A failed delete keeps everything, state file included, so the next
-        // teardown retries it: stale rules would match a later task that
-        // reuses this bridge address.
-        if let Err(error) = run_nft_script(&egress_delete_script(&egress_table_name(task_id))).await
-        {
-            // Without nft no egress table can exist.
-            if tokio::process::Command::new("nft")
-                .arg("-v")
-                .output()
-                .await
-                .is_ok()
-            {
-                return Err(error);
+        // A failed delete keeps the state file so `retry_stale_teardowns`
+        // retries it: stale drop rules would match a later task that reuses
+        // this bridge address. A table nft cannot list (no nft, an unused
+        // family, never created) has nothing to delete.
+        let table = egress_table_name(task_id);
+        let mut egress_error = None;
+        if let Err(error) = run_nft_script(&egress_delete_script(&table)).await {
+            for family in ["inet", "bridge"] {
+                let listed = tokio::process::Command::new("nft")
+                    .args(["list", "table", family, &table])
+                    .output()
+                    .await
+                    .is_ok_and(|output| output.status.success());
+                if listed {
+                    egress_error = Some(error);
+                    break;
+                }
             }
         }
 
@@ -1665,8 +1669,51 @@ impl NetworkSetup {
         // `runtime.rs` writes the task's hosts file beside the resolv.conf.
         let _ = tokio::fs::remove_file(resolv_conf.with_extension("hosts")).await;
         let _ = tokio::fs::remove_file(resolv_conf).await;
+        if let Some(error) = egress_error {
+            return Err(error);
+        }
         let _ = tokio::fs::remove_file(&state_path).await;
         Ok(())
+    }
+
+    /// Retries the teardown of every task whose namespace is gone but whose
+    /// state file remains: a failed egress-table delete, or a crash mid-way.
+    pub async fn retry_stale_teardowns(&self) -> Result<(), NetError> {
+        let mut entries = match tokio::fs::read_dir(&self.state_dir).await {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        let mut task_ids = Vec::new();
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+                continue;
+            }
+            if let Some(task_id) = path
+                .file_stem()
+                .and_then(|name| name.to_str())
+                .and_then(|name| name.strip_prefix("minga-"))
+            {
+                task_ids.push(task_id.to_owned());
+            }
+        }
+        // Listed after the state files: a setup writes its state only once
+        // its namespace exists, so a live task is never torn down here.
+        let namespaces = output("ip", &["netns", "list"]).await?;
+        let live: HashSet<&str> = namespaces
+            .lines()
+            .filter_map(|line| line.split_whitespace().next())
+            .collect();
+        let mut result = Ok(());
+        for task_id in task_ids {
+            if !live.contains(format!("minga-{task_id}").as_str()) {
+                if let Err(error) = self.teardown_task(&task_id).await {
+                    result = Err(error);
+                }
+            }
+        }
+        result
     }
     /// Reinstalls source-IP guards for tasks that survived a node restart.
     pub async fn reconcile_task_source_filters(&self) -> Result<(), NetError> {
