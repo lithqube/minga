@@ -298,12 +298,21 @@ impl WasmtimeAgentExecutor {
         self
     }
 
-    /// Restricts directory grants to canonicalized node operator roots.
-    pub fn with_agent_dir_roots<I, P>(mut self, roots: I) -> Result<Self, AgentError>
+    /// Restricts directory grants to `<root>/<tenant_id>` under each
+    /// canonicalized node operator root, so a tenant never reaches another
+    /// tenant's directories.
+    pub fn with_agent_dir_roots<I, P>(
+        mut self,
+        roots: I,
+        tenant_id: &str,
+    ) -> Result<Self, AgentError>
     where
         I: IntoIterator<Item = P>,
         P: AsRef<Path>,
     {
+        // A valid tenant ID is one plain path component.
+        minga_state::types::Tenant::validate_id(tenant_id)
+            .map_err(|e| AgentError::Other(format!("invalid tenant `{tenant_id}`: {e}")))?;
         for root in roots {
             let path = root.as_ref();
             let canonical = path.canonicalize().map_err(|e| {
@@ -318,7 +327,9 @@ impl WasmtimeAgentExecutor {
                     path.display()
                 )));
             }
-            self.allowed_dir_roots.push(canonical);
+            // Not canonicalized: a symlinked tenant directory resolves
+            // elsewhere, so its grants fail the prefix check (fail closed).
+            self.allowed_dir_roots.push(canonical.join(tenant_id));
         }
         Ok(self)
     }
@@ -424,6 +435,19 @@ fn validate_agent_capabilities(
     Ok(())
 }
 
+/// The declared env map, plus the egress URL only with the `http` grant.
+fn sandbox_env(spec: &AgentSpec) -> HashMap<String, String> {
+    let mut env = spec.sandbox_env.clone();
+    if let Some(url) = spec
+        .egress_url
+        .as_ref()
+        .filter(|_| spec.capabilities.grants.contains(&AgentGrant::Http))
+    {
+        env.insert("MINGA_EGRESS_URL".to_string(), url.clone());
+    }
+    env
+}
+
 #[async_trait]
 impl AgentExecutor for WasmtimeAgentExecutor {
     async fn start(
@@ -448,16 +472,10 @@ impl AgentExecutor for WasmtimeAgentExecutor {
             fuel_limit: spec.fuel_limit,
             memory_limit: spec.memory_limit,
             timeout: spec.timeout_secs.map(Duration::from_secs),
-            env: spec.sandbox_env.clone(),
+            env: sandbox_env(spec),
             ..Default::default()
         };
 
-        // Add egress URL to env if configured.
-        if let Some(ref url) = spec.egress_url {
-            sandbox_spec
-                .env
-                .insert("MINGA_EGRESS_URL".to_string(), url.clone());
-        }
         // Only an `http` grant gets a proxy token. Revoked when `start`
         // returns, i.e. when the run ends.
         let _egress_run = self
@@ -643,6 +661,68 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("--agent-dir-root"));
+    }
+
+    #[test]
+    fn egress_url_reaches_the_sandbox_only_with_the_http_grant() {
+        let mut spec = test_agent_spec("a.wasm");
+        assert!(!sandbox_env(&spec).contains_key("MINGA_EGRESS_URL"));
+        spec.capabilities.grants.insert(AgentGrant::Http);
+        assert_eq!(
+            sandbox_env(&spec)
+                .get("MINGA_EGRESS_URL")
+                .map(String::as_str),
+            Some("https://api.openai.com")
+        );
+    }
+
+    #[tokio::test]
+    async fn directory_grants_are_scoped_to_the_node_tenant() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("agents");
+        for tenant in ["tenant-a", "tenant-b"] {
+            std::fs::create_dir_all(root.join(tenant).join("data")).unwrap();
+        }
+        let dir_spec = |tenant: &str| {
+            let mut spec = AgentSpec::default();
+            spec.capabilities.dirs.push(AgentDirGrant {
+                host: root.join(tenant).join("data").display().to_string(),
+                guest: "/data".into(),
+            });
+            spec
+        };
+        for (own, other) in [("tenant-a", "tenant-b"), ("tenant-b", "tenant-a")] {
+            let exec = WasmtimeAgentExecutor::new(temp.path())
+                .await
+                .unwrap()
+                .with_agent_dir_roots([&root], own)
+                .unwrap();
+            assert!(
+                validate_agent_capabilities(&dir_spec(own), &exec.allowed_dir_roots, false).is_ok()
+            );
+            let error =
+                validate_agent_capabilities(&dir_spec(other), &exec.allowed_dir_roots, false)
+                    .unwrap_err()
+                    .to_string();
+            assert!(error.contains("outside configured"), "{error}");
+        }
+        // The bare root, shared by every tenant, is not grantable either.
+        let mut spec = AgentSpec::default();
+        spec.capabilities.dirs.push(AgentDirGrant {
+            host: root.display().to_string(),
+            guest: "/data".into(),
+        });
+        let exec = WasmtimeAgentExecutor::new(temp.path())
+            .await
+            .unwrap()
+            .with_agent_dir_roots([&root], "tenant-a")
+            .unwrap();
+        assert!(validate_agent_capabilities(&spec, &exec.allowed_dir_roots, false).is_err());
+        assert!(WasmtimeAgentExecutor::new(temp.path())
+            .await
+            .unwrap()
+            .with_agent_dir_roots([&root], "../tenant-a")
+            .is_err());
     }
 
     #[tokio::test]

@@ -86,11 +86,11 @@ The API waits for catch-up before promotion. Remove it with
 | `--secret-store <DIR>` | `/var/lib/minga/secrets` | Secret values on this node. They never go through Raft or the bus. |
 | `--interval <SECS>` | `2` | Reconcile interval. |
 | `--sandbox-runtime <mock\|wasmtime>`, `--module-dir <DIR>` | none, `/var/lib/minga/modules` | `wasmtime` enables `x-minga-agent` tasks on this node. |
-| `--agent-dir-root <DIR>` (repeatable) | none | Canonicalized allowlist for agent directory grants; no configured root permits no directory grants. Grants are validated only: the sandbox mounts no directories and links no WASI yet. |
+| `--agent-dir-root <DIR>` (repeatable) | none | Canonicalized allowlist for agent directory grants. A grant must resolve under `<DIR>/<tenant-id>/` for the node's `--tenant-id`, so one tenant cannot name another's directories; a symlinked tenant directory is refused. No configured root permits no directory grants. Grants are validated only: the sandbox mounts no directories and links no WASI yet. |
 | `--egress-bind`, `--egress-upstream`, `--egress-credential`, `--egress-credential-header` | none, `https://api.openai.com`, none, `authorization` | Opt-in. Starts the LLM egress proxy for agent and routed container tasks (for example `0.0.0.0:8080`); tasks reach it on their bridge gateway at the bind's port. On Linux a non-loopback bind installs the `minga_egress_listener` nft table, which closes that port to everything but `lo` and task bridges (not the WireGuard mesh). The node then carries the reserved `com.minga.egress.proxy=true` label, and services with egress routes are placed only on such nodes. The credential is a secret ID in `--secret-store`; agents never see the key. |
-| `--egress-allow-cidr <CIDR>` (repeatable) | none | Tenant egress routes refuse loopback, link-local (`169.254.0.0/16`, `fe80::/10`), unspecified, multicast, broadcast and private or unique-local destinations, checked on literal addresses and on every DNS answer at connect time. Each flag allows one such range, for example an on-prem model gateway at `10.20.0.0/24`. The operator's `--egress-upstream` is not filtered. |
+| `--egress-allow-cidr <CIDR>` (repeatable) | none | Tenant egress routes refuse loopback, link-local (`169.254.0.0/16`, `fe80::/10`), shared (`100.64.0.0/10`), `0.0.0.0/8`, unspecified, multicast, broadcast and private or unique-local destinations, checked on literal addresses and on every DNS answer at connect time, including IPv4 reached through NAT64 (`64:ff9b::/96`). Each flag allows one such range, for example an on-prem model gateway at `10.20.0.0/24`. The operator's `--egress-upstream` is not filtered. |
 
-The built-in NATS sidecar caps JetStream file storage at 8GB (not preallocated). The MINGA account's JetStream disk limit must not exceed that cap.
+The built-in NATS sidecar caps JetStream file storage at 8GB (not preallocated). The MINGA account's JetStream disk limit must not exceed that cap. JetStream shares the data volume with Raft and containerd, so on nodes with less than about 8GB free, the volume fills before the cap applies.
 
 Each node generates `<data_dir>/wg.key` once with mode `0600`; the private key
 stays local. Registration advertises only its public key and optional endpoint.
@@ -155,7 +155,7 @@ certificate flags, or previous Raft data directory is needed.
 | `minga validate [-c FILE] [-p PROFILE]` | Parses the Compose file offline, rejects unknown keys and prints the startup order. `-p '*'` enables every profile. | Anywhere |
 | `minga deploy [-c FILE] [-p PROFILE] [--wait SECS] STACK` | Deploys the file as a stack and waits for placement (30 s by default). | Anywhere that reaches the API |
 | `minga state export [-o FILE] [--force]` | Writes desired state (services, networks, volumes, secret and config references) to stdout or a 0600 file. Not secret values, volume data or TLS material; see [backup.md](backup.md). | Anywhere that reaches the API |
-| `minga state import FILE [--overwrite]` | Restores an export. Fails on an existing service unless `--overwrite`. | Anywhere that reaches the API |
+| `minga state import FILE [--overwrite]` | Restores an export. Fails on an existing service unless `--overwrite`. Agents get the same checks as a deploy; a pre-v9 file may not declare agent capabilities, and in a v9 file an omitted `capabilities` grants nothing. | Anywhere that reaches the API |
 | `minga migrate-v1 --manager-id ID [--manager-id ID ...] [--apply]` | Lists the current voters and those to remove when migrating from v1.2.0. Dry-run by default; `--apply` commits one membership change. Requires the admin API token. | Anywhere that reaches the API |
 | `minga logs [-f] [--tail N] TASK_ID` | Prints a task's output from JetStream (`--nats-url`); `TASK_ID` is `<stack>.<service>.<n>`. | Anywhere that reaches NATS |
 | `minga image pull IMAGE` | Pulls into the `minga` containerd namespace. Credentials come from `$DOCKER_CONFIG/config.json`, else `~/.docker/config.json`, and go to containerd over its API. | On the node |
@@ -163,7 +163,7 @@ certificate flags, or previous Raft data directory is needed.
 | `minga tls init-ca --dir DIR` | Creates the cluster CA (`ca.pem`, `ca-key.pem`). | Anywhere; keep `ca-key.pem` off the nodes |
 | `minga tls issue-node --ca-dir DIR --out-dir DIR --node-id ID --role worker\|manager` | Issues a node certificate with the Raft SAN and role-bound NATS identity; manager certificates also include `localhost` for the manager's local sidecar TLS client. Keys are written 0600. | Anywhere; copy one pair to each node |
 | `minga agent ls` | Lists running agent tasks from the bus. | Anywhere that reaches NATS |
-| `minga sandbox run --module FILE [--input DATA] [--fuel N] [--timeout SECS]`, `minga sandbox info` | Runs a WASM module once; lists the sandbox runtimes. | Anywhere |
+| `minga sandbox run --module FILE [--input DATA] [--fuel N] [--timeout SECS]`, `minga sandbox info` | Runs a WASM module once; lists the sandbox runtimes. A `--timeout` over 300 is refused. | Anywhere |
 | `minga egress [--bind ADDR] ...` | A standalone egress proxy. `--bind` defaults to `0.0.0.0:8080`. | Anywhere |
 
 `deploy` and `state` take `--api-url` (or `MINGA_API_URL`, default

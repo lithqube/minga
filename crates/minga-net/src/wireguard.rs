@@ -94,7 +94,7 @@ pub struct Peer {
     /// Persistent keepalive in seconds (0 = disabled).
     pub keepalive: u16,
 }
-/// A node-scoped peer assignment stored at `node.{id}.wg` in MINGA_ASSIGN.
+/// A node-scoped peer assignment stored at `{tenant}.node.{id}.wg` in MINGA_ASSIGN.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WireGuardPeerAssignment {
     pub node_id: u64,

@@ -17,8 +17,9 @@ use crate::log_store::RedbLogStore;
 use crate::network::{forward_write, serve_raft_rpc, RaftTlsConfig, TcpNetworkFactory};
 use crate::state_machine::RedbStateMachine;
 use crate::types::{
-    ClusterNode, Config as StateConfig, ConfigId, Network, NetworkId, NodeId, Secret, SecretId,
-    Service, ServiceId, Task, TaskId, Tenant, TenantQuotas, Volume, VolumeId, DEFAULT_TENANT_ID,
+    AgentCapabilities, ClusterNode, Config as StateConfig, ConfigId, Network, NetworkId, NodeId,
+    Secret, SecretId, Service, ServiceId, Task, TaskId, Tenant, TenantQuotas, Volume, VolumeId,
+    DEFAULT_TENANT_ID,
 };
 use crate::TypeConfig;
 
@@ -875,14 +876,20 @@ impl StateStore {
             | crate::codec::V4_FORMAT_VERSION
             | crate::codec::V3_FORMAT_VERSION
             | crate::codec::V2_FORMAT_VERSION => {
-                // Egress policy defaults to none, agent capabilities to no
-                // grants, legacy resource fields to `default`. Nodes are not
-                // in snapshots.
+                // Egress policy defaults to none; pre-v9 agents get the v8
+                // migration's grants; legacy resource fields default to
+                // `default`. Nodes are not in snapshots.
             }
             found => {
                 return Err(StateError::BadSnapshot(format!(
                     "snapshot has format version {found}, this build reads {want}"
                 )));
+            }
+        }
+        let legacy = snapshot.format_version < want;
+        if legacy {
+            for s in &snapshot.services {
+                check_legacy_shape(s, snapshot.format_version)?;
             }
         }
         if !overwrite {
@@ -927,10 +934,9 @@ impl StateStore {
             self.upsert_volume(v).await?;
         }
         // An older snapshot's services grow when re-encoded (v9 adds agent
-        // capabilities, v10 the egress policy), so a tenant at its byte quota could not import its
-        // own data. Each write carries that tenant's growth so far; the quota
+        // capabilities, v10 the egress policy), so a tenant at its byte
+        // quota could not import its own data. Each write carries that tenant's growth so far; the quota
         // itself never changes, and current-format imports get no allowance.
-        let legacy = snapshot.format_version < want;
         // Keyed by service id: a repeated id replaces its record, so only its
         // latest growth counts.
         let mut growth: BTreeMap<String, BTreeMap<String, u64>> = BTreeMap::new();
@@ -950,6 +956,33 @@ impl StateStore {
         }
         Ok(())
     }
+}
+
+/// Refuses a legacy service (nested `previous` included) carrying fields its
+/// version could not have: an egress policy before v10, or agent
+/// capabilities other than the v8 migration's before v9. The snapshot's
+/// version is caller-chosen, so this keeps [`legacy_growth`] to migration
+/// growth.
+fn check_legacy_shape(service: &Service, from_version: u8) -> Result<(), StateError> {
+    if from_version < crate::codec::FORMAT_VERSION && service.egress.is_some() {
+        return Err(StateError::BadSnapshot(format!(
+            "service `{}`: a pre-v10 snapshot cannot declare an egress policy",
+            service.id
+        )));
+    }
+    if from_version < crate::codec::V9_FORMAT_VERSION {
+        if let Some(agent) = &service.agent {
+            if agent.capabilities != AgentCapabilities::v8_migrated(&agent.sandbox_env) {
+                return Err(StateError::BadSnapshot(format!(
+                    "service `{}`: a pre-v9 snapshot cannot declare agent capabilities",
+                    service.id
+                )));
+            }
+        }
+    }
+    service.previous.as_deref().map_or(Ok(()), |previous| {
+        check_legacy_shape(previous, from_version)
+    })
 }
 
 /// Bytes a service gained over its encoding at `from_version`: the `egress`

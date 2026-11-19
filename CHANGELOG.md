@@ -3,11 +3,16 @@
 ## Unreleased
 
 - Tenant egress routes no longer follow redirects or system proxies and
-  refuse loopback, link-local, private, unspecified and multicast
-  destinations (literal or resolved) unless `--egress-allow-cidr` allows
+  refuse loopback, link-local, private, shared (`100.64.0.0/10`),
+  `0.0.0.0/8`, unspecified and multicast destinations, including through
+  NAT64 (literal or resolved), unless `--egress-allow-cidr` allows
   them.
-- Egress budget admission reserves estimated tokens and settles them to the
-  provider's counts, so concurrent requests cannot overspend. Upstream error
+- Egress budget admission reserves an upper bound and settles it to the
+  provider's counts, so concurrent requests cannot overspend: the request
+  body's byte length bounds the input, plus the `max_tokens` cap, and a
+  request without one holds the rest of a limited budget until it settles.
+  A routed-egress container left from a previous worker process is never
+  adopted with its lost token; a failed stop is retried before restarting. Upstream error
   bodies are buffered (64 KiB) and redacted whole instead of streamed;
   non-streamed bodies are capped at 32 MiB; a failed body read is charged
   like a transport error; streams have an idle timeout and keep draining
@@ -49,6 +54,10 @@
   required-egress workload without its policy: upgrade every node together.
   Importing a v9 snapshot discounts each service write by its re-encoding
   growth, as for v8.
+- The built-in NATS sidecar's JetStream file store cap rose from 1GB to 8GB
+  (not preallocated). It shares the data volume with Raft and containerd, so
+  size that volume for it. Startup validation of a tenant signer's permission
+  template now also rejects duplicated entries that stand in for a missing one.
 - WASM agents share one node runtime and a bounded SHA-256 module cache. Epoch
   interruption stops guest execution at its configured timeout; linear memory
   is capped by the configured limit (64 MiB by default), with one memory, one
@@ -56,6 +65,13 @@
   16 MiB are refused and compile off the async runtime; concurrent runs are
   bounded by CPU count. Input is no longer truncated to `output_limit`.
   Wasmtime 50 raises the workspace MSRV to Rust 1.97.
+- Nodes refuse WASM sandboxes whose `timeout` exceeds 300 s, `memory_limit`
+  512 MiB or output limit 1 MiB, instead of running them. Output longer than
+  the limit, a negative output length or one past guest memory now fails the
+  run rather than being truncated. Time spent waiting for a run slot counts
+  toward the timeout, and a run abandoned by its caller still stops at its
+  deadline. A node holds at most 256 live sandboxes, compiles at most one
+  module per CPU at a time, and sandbox ids are random.
 - Agent Compose specs can declare explicit environment, clock, random, stdio
   and HTTP grants plus read-only directory grants. Nodes validate these against
   `--agent-dir-root` and egress configuration. State format v9 migrates v8
@@ -67,6 +83,17 @@
   write by how much the tenant's imported services grew on re-encoding, so a
   tenant at its `desired_state_bytes` quota can still import its own data;
   the quota itself is never changed.
+- Agent grant review fixes. A pre-v9 snapshot whose agents (including
+  `previous`) carry capabilities other than the v8 migration's `env` grant is
+  refused, so a caller-chosen `format_version` can no longer store bytes
+  outside the tenant quota. `minga state import` runs the deploy-time agent
+  checks, and in v9 snapshots an omitted or null `capabilities` means no
+  grants, as in the `minga.agent` label. Unknown keys in agent specs,
+  capabilities and directory grants are refused. Agents may declare at most
+  64 directory grants with paths up to 4096 bytes. `--agent-dir-root` now
+  grants only `<DIR>/<tenant-id>/` to the node's tenant, so existing grants
+  directly under a root must move into the tenant's subdirectory.
+  `MINGA_EGRESS_URL` reaches the sandbox only with the `http` grant.
 - The bundled NATS server moves from v2.10.22 to v2.15.3. External NATS is
   tested on v2.14.10 and v2.15.3; managers warn when JetStream `api.level` is
   below 4. A 2.10.22 store was verified through a direct upgrade to 2.15.3

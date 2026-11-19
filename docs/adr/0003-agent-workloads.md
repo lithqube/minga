@@ -73,6 +73,7 @@ services:
 
 - Extension key: `x-minga-agent` (constant `AGENT_EXTENSION_KEY`).
 - `module` is required. All other fields optional with sensible defaults.
+- Nodes refuse a `timeout` over 300 s or a `memory_limit` over 512 MiB when the sandbox is created; limits are never clamped.
 - A non-empty `env` map requires the explicit `env` grant; capabilities default to deny.
 - String-or-number deserialization for numeric fields (`"10000000"` or `10000000`).
 - Agent services skip the `image` requirement in `check_services`.
