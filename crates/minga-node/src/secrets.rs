@@ -104,52 +104,59 @@ impl SecretStore {
         if refs.is_empty() {
             return Ok(Vec::new());
         }
-        let resolved = self.resolve_all(refs)?;
-
-        let staged_dir = self.root.join("staged").join(task_id);
-        std::fs::create_dir_all(&staged_dir).map_err(|e| SecretResolveError::Unreadable {
-            name: format!("staged/{task_id}"),
-            reason: e.to_string(),
-        })?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&staged_dir, std::fs::Permissions::from_mode(0o700));
-        }
-
-        let mut out = Vec::with_capacity(resolved.len());
-        for (secret_ref, source) in resolved {
-            let content = std::fs::read(&source).map_err(|e| SecretResolveError::Unreadable {
-                name: secret_ref.secret_id.clone(),
+        let staged = (|| {
+            let resolved = self.resolve_all(refs)?;
+            let staged_dir = self.root.join("staged").join(task_id);
+            std::fs::create_dir_all(&staged_dir).map_err(|e| SecretResolveError::Unreadable {
+                name: format!("staged/{task_id}"),
                 reason: e.to_string(),
             })?;
-            let version = format!("{:x}", Sha256::digest(&content));
-            let staged_path = staged_dir.join(&version);
-            if !staged_path.exists() {
-                std::fs::write(&staged_path, &content).map_err(|e| {
-                    SecretResolveError::Unreadable {
-                        name: secret_ref.secret_id.clone(),
-                        reason: format!("stage: {e}"),
-                    }
-                })?;
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    let _ = std::fs::set_permissions(
-                        &staged_path,
-                        std::fs::Permissions::from_mode(0o400),
-                    );
-                }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ =
+                    std::fs::set_permissions(&staged_dir, std::fs::Permissions::from_mode(0o700));
             }
-            out.push(StagedSecret {
-                secret_ref: SecretRef {
-                    version: Some(version),
-                    ..secret_ref
-                },
-                staged_path,
-            });
+
+            let mut out = Vec::with_capacity(resolved.len());
+            for (secret_ref, source) in resolved {
+                let content =
+                    std::fs::read(&source).map_err(|e| SecretResolveError::Unreadable {
+                        name: secret_ref.secret_id.clone(),
+                        reason: e.to_string(),
+                    })?;
+                let version = format!("{:x}", Sha256::digest(&content));
+                let staged_path = staged_dir.join(&version);
+                if !staged_path.exists() {
+                    std::fs::write(&staged_path, &content).map_err(|e| {
+                        SecretResolveError::Unreadable {
+                            name: secret_ref.secret_id.clone(),
+                            reason: format!("stage: {e}"),
+                        }
+                    })?;
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        let _ = std::fs::set_permissions(
+                            &staged_path,
+                            std::fs::Permissions::from_mode(0o400),
+                        );
+                    }
+                }
+                out.push(StagedSecret {
+                    secret_ref: SecretRef {
+                        version: Some(version),
+                        ..secret_ref
+                    },
+                    staged_path,
+                });
+            }
+            Ok::<_, SecretResolveError>(out)
+        })();
+        if staged.is_err() {
+            self.cleanup_task(task_id);
         }
-        Ok(out)
+        staged
     }
 
     /// Removes a task's staged secrets. Idempotent.
@@ -160,6 +167,25 @@ impl SecretStore {
                 tracing::warn!(task = %task_id, error = %e, "secret staging cleanup failed");
             }
         }
+    }
+    /// Stages the task's ephemeral egress token as a read-only file.
+    #[cfg(unix)]
+    pub fn stage_egress_token(&self, task_id: &str, token: &str) -> std::io::Result<PathBuf> {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+        let dir = self.root.join("staged").join(task_id);
+        std::fs::create_dir_all(&dir)?;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+        let path = dir.join("egress-token");
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o400)
+            .open(&path)?;
+        std::io::Write::write_all(&mut file, token.as_bytes())?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400))?;
+        Ok(path)
     }
 }
 
@@ -634,5 +660,23 @@ mod staging_tests {
         store.cleanup_task("task.b");
         assert!(!staged_b[0].staged_path.exists());
         assert!(staged_a[0].staged_path.exists());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn egress_token_file_is_read_only_and_removed_with_task_staging() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = SecretStore::new(dir.path());
+        let path = store
+            .stage_egress_token("task.a", "sensitive-token")
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "sensitive-token");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o400
+        );
+        store.cleanup_task("task.a");
+        assert!(!path.exists());
     }
 }

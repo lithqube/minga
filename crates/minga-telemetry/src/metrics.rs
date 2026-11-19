@@ -37,6 +37,12 @@ pub struct Metrics {
     pub agent_pool_busy: Gauge,
     pub agent_pool_total: Gauge,
 
+    // Agent usage is aggregated by tenant only, never by request/customer/task.
+    pub agent_usage_requests_total: CounterVec,
+    pub agent_usage_input_tokens_total: CounterVec,
+    pub agent_usage_output_tokens_total: CounterVec,
+    pub agent_usage_cost_micros_total: CounterVec,
+
     // Containerd gRPC metrics
     pub containerd_grpc_latency_seconds: HistogramVec,
 }
@@ -160,6 +166,51 @@ impl Metrics {
             .register(Box::new(containerd_grpc_latency_seconds.clone()))
             .expect("register containerd_grpc_latency_seconds");
 
+        let agent_usage_requests_total = CounterVec::new(
+            prometheus::Opts::new(
+                "minga_agent_usage_requests_total",
+                "Agent requests by tenant",
+            ),
+            &["tenant"],
+        )
+        .expect("minga_agent_usage_requests_total");
+        registry
+            .register(Box::new(agent_usage_requests_total.clone()))
+            .expect("register agent_usage_requests_total");
+        let agent_usage_input_tokens_total = CounterVec::new(
+            prometheus::Opts::new(
+                "minga_agent_usage_input_tokens_total",
+                "Agent input tokens by tenant",
+            ),
+            &["tenant"],
+        )
+        .expect("minga_agent_usage_input_tokens_total");
+        registry
+            .register(Box::new(agent_usage_input_tokens_total.clone()))
+            .expect("register agent_usage_input_tokens_total");
+        let agent_usage_output_tokens_total = CounterVec::new(
+            prometheus::Opts::new(
+                "minga_agent_usage_output_tokens_total",
+                "Agent output tokens by tenant",
+            ),
+            &["tenant"],
+        )
+        .expect("minga_agent_usage_output_tokens_total");
+        registry
+            .register(Box::new(agent_usage_output_tokens_total.clone()))
+            .expect("register agent_usage_output_tokens_total");
+        let agent_usage_cost_micros_total = CounterVec::new(
+            prometheus::Opts::new(
+                "minga_agent_usage_cost_micros_total",
+                "Agent cost in micros by tenant",
+            ),
+            &["tenant"],
+        )
+        .expect("minga_agent_usage_cost_micros_total");
+        registry
+            .register(Box::new(agent_usage_cost_micros_total.clone()))
+            .expect("register agent_usage_cost_micros_total");
+
         Self {
             registry,
             tasks_total,
@@ -174,8 +225,34 @@ impl Metrics {
             agent_pool_idle,
             agent_pool_busy,
             agent_pool_total,
+            agent_usage_requests_total,
+            agent_usage_input_tokens_total,
+            agent_usage_output_tokens_total,
+            agent_usage_cost_micros_total,
             containerd_grpc_latency_seconds,
         }
+    }
+
+    /// Add usage counters grouped only by tenant.
+    pub fn record_agent_usage(
+        &self,
+        tenant_id: &str,
+        input_tokens: u64,
+        output_tokens: u64,
+        cost_micros: u64,
+    ) {
+        self.agent_usage_requests_total
+            .with_label_values(&[tenant_id])
+            .inc();
+        self.agent_usage_input_tokens_total
+            .with_label_values(&[tenant_id])
+            .inc_by(input_tokens as f64);
+        self.agent_usage_output_tokens_total
+            .with_label_values(&[tenant_id])
+            .inc_by(output_tokens as f64);
+        self.agent_usage_cost_micros_total
+            .with_label_values(&[tenant_id])
+            .inc_by(cost_micros as f64);
     }
 
     /// Get the Prometheus registry for `/metrics` endpoint.
@@ -196,5 +273,22 @@ impl Metrics {
 impl Default for Metrics {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn usage_counters_export_only_tenant_label() {
+        let metrics = Metrics::new();
+        metrics.record_agent_usage("tenant-a", 3, 5, 7);
+        let exposition = metrics.gather().unwrap();
+        assert!(exposition.contains("minga_agent_usage_requests_total{tenant=\"tenant-a\"} 1"));
+        assert!(exposition.contains("minga_agent_usage_input_tokens_total{tenant=\"tenant-a\"} 3"));
+        assert!(!exposition.contains("customer="));
+        assert!(!exposition.contains("request_id="));
+        assert!(!exposition.contains("task_id="));
     }
 }

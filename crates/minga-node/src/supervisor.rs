@@ -1586,6 +1586,29 @@ mod assignment_tests {
         ) -> minga_bus::Result<Vec<minga_bus::AuditRecord>> {
             self.inner.list_audit(tenant_id, limit).await
         }
+        async fn publish_usage(&self, event: &minga_bus::UsageEvent) -> minga_bus::Result<()> {
+            self.inner.publish_usage(event).await
+        }
+
+        async fn usage_events(
+            &self,
+            tenant_id: &str,
+            since_unix_ms: u64,
+            customer: Option<&str>,
+            limit: usize,
+        ) -> minga_bus::Result<Vec<minga_bus::UsageEvent>> {
+            self.inner
+                .usage_events(tenant_id, since_unix_ms, customer, limit)
+                .await
+        }
+
+        async fn usage_totals(
+            &self,
+            since_unix_ms: u64,
+        ) -> minga_bus::Result<Vec<(String, minga_bus::UsageTotals)>> {
+            self.inner.usage_totals(since_unix_ms).await
+        }
+
         async fn update_account_claim(&self, account_jwt: &str) -> minga_bus::Result<()> {
             self.inner.update_account_claim(account_jwt).await
         }

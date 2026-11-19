@@ -241,6 +241,14 @@ pub fn place_service(
         command: service.command.clone(),
         entrypoint: service.entrypoint.clone(),
         labels: service.labels.clone(),
+        egress: service
+            .egress
+            .as_ref()
+            .map(|policy| minga_state::types::EgressWorkload {
+                tenant_id: service.tenant_id.clone(),
+                service_id: service.id.clone(),
+                policy: policy.clone(),
+            }),
         healthcheck: service.healthcheck.clone(),
         mounts: service.mounts.clone(),
         user: service.user.clone(),
@@ -435,6 +443,7 @@ mod tests {
             networks: vec!["test_default".to_string()],
             resources: ResourceSpec::default(),
             agent: None,
+            egress: None,
             restart_policy: Default::default(),
             secrets: vec![],
             command: vec![],
@@ -448,6 +457,31 @@ mod tests {
             previous: None,
             extra_hosts: vec![],
         }
+    }
+
+    #[test]
+    fn egress_policy_and_tenant_service_identity_reach_placed_task() {
+        let mut worker = node(1, 4.0, 1 << 30, 0, &[]);
+        worker.tenant_id = "tenant-a".to_string();
+        let mut service = svc("plant.inference", 1, ServiceMode::Replicated);
+        service.tenant_id = "tenant-a".to_string();
+        service.egress = Some(minga_state::types::EgressPolicy {
+            required: true,
+            routes: vec![minga_state::types::EgressRoute {
+                name: "primary".to_string(),
+                upstream_url: "https://api.example".to_string(),
+                auth: None,
+                fallback: Vec::new(),
+                input_price_micros_per_million: None,
+                output_price_micros_per_million: None,
+            }],
+            models: vec!["model-*".to_string()],
+        });
+        let tasks = place_service(&service, &[worker], &[], &[], 0);
+        let identity = tasks[0].spec.egress.as_ref().unwrap();
+        assert_eq!(identity.tenant_id, "tenant-a");
+        assert_eq!(identity.service_id, "plant.inference");
+        assert_eq!(identity.policy.models, vec!["model-*".to_string()]);
     }
 
     #[test]

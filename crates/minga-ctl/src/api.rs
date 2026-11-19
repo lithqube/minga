@@ -137,6 +137,34 @@ impl ApiClient {
         classify(&self.root, status, &body)
     }
 
+    /// `GET /v1.41/<path>` with explicit query parameters.
+    pub async fn get_query(&self, path: &str, query: &[(&str, String)]) -> Result<Value, CtlError> {
+        let url = format!("{}/{API_VERSION}/{path}", self.root);
+        let mut request = self.http.get(&url).query(query);
+        if let Some(token) = &self.token {
+            request = request.bearer_auth(token);
+        }
+        let response = request
+            .send()
+            .await
+            .map_err(|error| CtlError::Unreachable {
+                endpoint: self.root.clone(),
+                detail: reqwest_detail(&error),
+            })?;
+        let status = response.status().as_u16();
+        if self.debug {
+            eprintln!("debug: GET /{API_VERSION}/{path} -> {status}");
+        }
+        let body = response
+            .text()
+            .await
+            .map_err(|error| CtlError::Unreachable {
+                endpoint: self.root.clone(),
+                detail: reqwest_detail(&error),
+            })?;
+        expect_found(classify(&self.root, status, &body)?, path)
+    }
+
     /// `POST /v1.41/<path>` with a JSON body. An empty response body is `null`.
     pub async fn post(&self, path: &str, body: &Value) -> Result<Value, CtlError> {
         let (status, text) = self.send(Method::POST, path, None, Some(body)).await?;

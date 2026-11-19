@@ -148,19 +148,37 @@ impl ResponseCache {
         stats.size = cache.len();
     }
 
-    /// Computes a cache key from a request method, path, and body.
+    /// Computes a cache key scoped to an authenticated workload.
     ///
-    /// Uses a simple hash (FNV-1a) of the body to generate a compact key.
-    pub fn compute_key(method: &str, path: &str, body: &[u8]) -> String {
+    /// The workload identity is mixed into the key so identical prompts from
+    /// different workloads cannot share responses.
+    pub fn compute_key_for_workload(
+        workload: &str,
+        method: &str,
+        path: &str,
+        body: &[u8],
+    ) -> String {
+        Self::compute_key_for_workload_route(workload, "", method, path, body)
+    }
+
+    /// Computes a workload cache key isolated by route and complete path/query.
+    pub fn compute_key_for_workload_route(
+        workload: &str,
+        route: &str,
+        method: &str,
+        path_and_query: &str,
+        body: &[u8],
+    ) -> String {
         let mut hash = fnv1a(body);
-        // Mix in method and path for uniqueness.
-        for b in method.as_bytes() {
-            hash = (hash ^ (*b as u64)).wrapping_mul(0x100000001b3);
+        for b in workload
+            .bytes()
+            .chain(route.bytes())
+            .chain(method.bytes())
+            .chain(path_and_query.bytes())
+        {
+            hash = (hash ^ (b as u64)).wrapping_mul(0x100000001b3);
         }
-        for b in path.as_bytes() {
-            hash = (hash ^ (*b as u64)).wrapping_mul(0x100000001b3);
-        }
-        format!("{method}:{path}:{hash:016x}")
+        format!("{workload}:{route}:{method}:{path_and_query}:{hash:016x}")
     }
 
     /// Returns current cache statistics.
@@ -216,7 +234,7 @@ mod tests {
     #[test]
     fn put_and_get() {
         let cache = ResponseCache::new(test_config());
-        let key = ResponseCache::compute_key("POST", "/v1/chat", b"hello");
+        let key = ResponseCache::compute_key_for_workload("task-a", "POST", "/v1/chat", b"hello");
         cache.put(
             &key,
             200,
@@ -229,6 +247,21 @@ mod tests {
         assert_eq!(status, 200);
         assert_eq!(body, b"response");
         assert_eq!(headers.len(), 1);
+    }
+
+    #[test]
+    fn route_and_query_isolate_cache_keys() {
+        let key = |route, path| {
+            ResponseCache::compute_key_for_workload_route("task", route, "POST", path, b"body")
+        };
+        assert_ne!(
+            key("primary", "/v1/chat?x=1"),
+            key("fallback", "/v1/chat?x=1")
+        );
+        assert_ne!(
+            key("primary", "/v1/chat?x=1"),
+            key("primary", "/v1/chat?x=2")
+        );
     }
 
     #[test]
@@ -297,18 +330,28 @@ mod tests {
     }
 
     #[test]
-    fn compute_key_deterministic() {
-        let k1 = ResponseCache::compute_key("POST", "/v1/chat", b"hello");
-        let k2 = ResponseCache::compute_key("POST", "/v1/chat", b"hello");
+    fn workload_cache_keys_are_isolated() {
+        let cache = ResponseCache::new(test_config());
+        let first = ResponseCache::compute_key_for_workload("task-a", "POST", "/v1/chat", b"same");
+        let second = ResponseCache::compute_key_for_workload("task-b", "POST", "/v1/chat", b"same");
+        assert_ne!(first, second);
+        cache.put(&first, 200, vec![], b"task-a response".to_vec());
+        assert!(cache.get(&second).is_none());
+    }
+
+    #[test]
+    fn compute_key_for_workload_deterministic() {
+        let k1 = ResponseCache::compute_key_for_workload("task-a", "POST", "/v1/chat", b"hello");
+        let k2 = ResponseCache::compute_key_for_workload("task-a", "POST", "/v1/chat", b"hello");
         assert_eq!(k1, k2);
     }
 
     #[test]
-    fn compute_key_different_inputs() {
-        let k1 = ResponseCache::compute_key("POST", "/v1/chat", b"hello");
-        let k2 = ResponseCache::compute_key("POST", "/v1/chat", b"world");
-        let k3 = ResponseCache::compute_key("GET", "/v1/chat", b"hello");
-        let k4 = ResponseCache::compute_key("POST", "/v1/other", b"hello");
+    fn compute_key_for_workload_varies_with_request() {
+        let k1 = ResponseCache::compute_key_for_workload("task-a", "POST", "/v1/chat", b"hello");
+        let k2 = ResponseCache::compute_key_for_workload("task-a", "POST", "/v1/chat", b"world");
+        let k3 = ResponseCache::compute_key_for_workload("task-a", "GET", "/v1/chat", b"hello");
+        let k4 = ResponseCache::compute_key_for_workload("task-a", "POST", "/v1/other", b"hello");
         assert_ne!(k1, k2);
         assert_ne!(k1, k3);
         assert_ne!(k1, k4);

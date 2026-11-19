@@ -583,6 +583,7 @@ async fn worker_certificate_cannot_write_assignments_or_other_nodes_status_and_l
     for stream_name in [
         "MINGA_LOGS_beta",
         "MINGA_AUDIT_beta",
+        "MINGA_USAGE_beta",
         "KV_MINGA_STATUS_beta",
         "KV_MINGA_USAGE_beta",
         "KV_MINGA_BUDGET_beta",

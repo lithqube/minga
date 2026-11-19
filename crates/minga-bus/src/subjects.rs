@@ -200,6 +200,7 @@ pub fn worker_acl(tenant_id: &str, node_id: u64) -> crate::Result<(Vec<String>, 
         own_lease.clone(),
         own_status.clone(),
         format!("{PREFIX}.{tenant_id}.log.node.{node_id}.*"),
+        format!("{PREFIX}.{tenant_id}.usage.>"),
         "$JS.API.STREAM.INFO.KV_MINGA_ASSIGN".into(),
         format!("$JS.API.STREAM.INFO.KV_{status_bucket}"),
         "$JS.API.STREAM.INFO.KV_MINGA_LEASES".into(),
@@ -292,6 +293,7 @@ mod tests {
     fn worker_acl_is_tenant_and_node_scoped() {
         let (publish, subscribe) = worker_acl("tenant_a", 7).unwrap();
         assert!(publish.contains(&"$KV.MINGA_LEASES.tenant_a.lease.node.7".to_string()));
+        assert!(publish.contains(&"minga.tenant_a.usage.>".to_string()));
         assert!(subscribe.contains(&"$JS.ACK.KV_MINGA_ASSIGN.>".to_string()));
         assert!(subscribe.contains(&"_INBOX.tenant_a.7.>".to_string()));
         assert!(!subscribe.iter().any(|subject| subject == "_INBOX.>"));

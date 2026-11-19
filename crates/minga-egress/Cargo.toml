@@ -8,6 +8,14 @@ license.workspace = true
 
 [dependencies]
 axum.workspace = true
+futures-util.workspace = true
+bytes.workspace = true
+tokio-stream.workspace = true
+aws-credential-types.workspace = true
+aws-sigv4.workspace = true
+aws-smithy-runtime-api.workspace = true
+minga-bus = { path = "../minga-bus" }
+minga-state = { path = "../minga-state" }
 minga-telemetry = { path = "../minga-telemetry" }
 lru.workspace = true
 rand.workspace = true

@@ -42,13 +42,14 @@ use async_nats::jetstream::stream::{Config as StreamConfig, RetentionPolicy};
 use async_nats::jetstream::AckKind;
 use async_nats::jetstream::{self, Context as JetStream};
 use async_nats::Client;
+use async_nats::HeaderMap;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::StreamExt;
 
 use crate::{
     subjects, BusError, BusEvent, BusRequest, EventBus, EventStream, KvEvent, KvOp, KvStream,
-    LogEntry, LogEventStream, RequestStream, Result,
+    LogEntry, LogEventStream, RequestStream, Result, UsageEvent, UsageTotals,
 };
 
 /// Default lease TTL: 30 seconds.
@@ -127,6 +128,69 @@ fn kv_event(prefix_subject: &str, message: &jetstream::Message) -> Option<KvEven
         (KvOp::Put, Some(message.payload.to_vec()))
     };
     Some(KvEvent { key, value, op })
+}
+
+async fn tenant_usage_totals(
+    js: &JetStream,
+    tenant_id: &str,
+    since_unix_ms: u64,
+) -> Result<UsageTotals> {
+    let name = format!("MINGA_USAGE_{tenant_id}");
+    let stream = js
+        .get_stream(&name)
+        .await
+        .map_err(|error| BusError::Subscribe(format!("get {name}: {error}")))?;
+    let mut consumer = stream
+        .create_consumer(PullConsumerConfig {
+            filter_subjects: vec![format!("minga.{tenant_id}.usage.>")],
+            deliver_policy: DeliverPolicy::All,
+            ..Default::default()
+        })
+        .await
+        .map_err(|error| BusError::Subscribe(format!("usage consumer: {error}")))?;
+    let mut pending = consumer
+        .info()
+        .await
+        .map_err(|error| BusError::Subscribe(format!("usage consumer info: {error}")))?
+        .num_pending as usize;
+    let mut total = UsageTotals::default();
+    while pending > 0 {
+        let mut batch = consumer
+            .fetch()
+            .max_messages(pending.min(200))
+            .expires(Duration::from_secs(5))
+            .messages()
+            .await
+            .map_err(|error| BusError::Subscribe(format!("usage fetch: {error}")))?;
+        let mut received = 0usize;
+        while let Some(message) = batch.next().await {
+            let message =
+                message.map_err(|error| BusError::Subscribe(format!("usage message: {error}")))?;
+            received += 1;
+            let event: UsageEvent = serde_json::from_slice(&message.payload)
+                .map_err(|error| BusError::Serialization(error.to_string()))?;
+            if event.tenant_id != tenant_id {
+                return Err(BusError::Subscribe("usage event tenant mismatch".into()));
+            }
+            if event.occurred_at_unix_ms >= since_unix_ms {
+                total.request_count = total.request_count.saturating_add(1);
+                total.input_tokens = total.input_tokens.saturating_add(event.input_tokens);
+                total.output_tokens = total.output_tokens.saturating_add(event.output_tokens);
+                total.cost_micros = total
+                    .cost_micros
+                    .saturating_add(event.cost_micros.unwrap_or_default());
+            }
+            message
+                .ack()
+                .await
+                .map_err(|error| BusError::Subscribe(format!("usage ack: {error}")))?;
+        }
+        if received == 0 {
+            break;
+        }
+        pending = pending.saturating_sub(received);
+    }
+    Ok(total)
 }
 
 const MIN_SUPPORTED_JS_API_LEVEL: usize = 4;
@@ -406,6 +470,19 @@ impl NatsBus {
             })
             .await
             .map_err(|error| BusError::Other(format!("{audit_name}: {error}")))?;
+        let usage_name = format!("MINGA_USAGE_{tenant_id}");
+        self.js
+            .get_or_create_stream(StreamConfig {
+                name: usage_name.clone(),
+                subjects: vec![format!("minga.{tenant_id}.usage.>")],
+                retention: RetentionPolicy::Limits,
+                max_bytes: DEFAULT_TENANT_STREAM_MAX_BYTES,
+                max_age: DEFAULT_TENANT_STREAM_MAX_AGE,
+                duplicate_window: Duration::from_secs(120),
+                ..Default::default()
+            })
+            .await
+            .map_err(|error| BusError::Other(format!("{usage_name}: {error}")))?;
         self.ensured_tenants
             .lock()
             .unwrap()
@@ -436,6 +513,12 @@ impl NatsBus {
                 format!("MINGA_AUDIT_{tenant_id}"),
                 64 * 1024 * 1024,
                 Duration::from_secs(365 * 24 * 3600),
+                false,
+            ),
+            (
+                format!("MINGA_USAGE_{tenant_id}"),
+                DEFAULT_TENANT_STREAM_MAX_BYTES,
+                DEFAULT_TENANT_STREAM_MAX_AGE,
                 false,
             ),
             (
@@ -471,7 +554,7 @@ impl NatsBus {
                 .clone();
             config.max_bytes = bytes.unwrap_or(default_bytes);
             config.max_age = age.unwrap_or(default_age);
-            if kv {
+            if kv || name.starts_with("MINGA_USAGE_") {
                 config.duplicate_window = if config.max_age > Duration::ZERO {
                     config.max_age.min(Duration::from_secs(120))
                 } else {
@@ -1007,6 +1090,144 @@ impl EventBus for NatsBus {
         Ok(())
     }
 
+    async fn publish_usage(&self, event: &UsageEvent) -> Result<()> {
+        validate_tenant_id(&event.tenant_id)?;
+        if event.service_id.is_empty()
+            || event.request_id.is_empty()
+            || event
+                .request_id
+                .bytes()
+                .any(|byte| matches!(byte, b'\r' | b'\n'))
+        {
+            return Err(BusError::Publish(
+                "invalid usage service or request ID".into(),
+            ));
+        }
+        match self.worker_tenant_id.as_deref() {
+            Some(worker_tenant) if worker_tenant == event.tenant_id => {}
+            Some(_) => {
+                return Err(BusError::Publish(
+                    "worker cannot publish usage for another tenant".into(),
+                ));
+            }
+            None => self.ensure_tenant_resources(&event.tenant_id).await?,
+        }
+        let subject = crate::usage_subject(&event.tenant_id, &event.service_id)?;
+        let payload = serde_json::to_vec(event)
+            .map_err(|error| BusError::Serialization(error.to_string()))?;
+        let mut headers = HeaderMap::new();
+        headers.insert("Nats-Msg-Id", event.request_id.as_str());
+        let ack = self
+            .js
+            .publish_with_headers(subject, headers, Bytes::from(payload))
+            .await
+            .map_err(|error| BusError::Publish(error.to_string()))?
+            .await
+            .map_err(|error| BusError::Publish(format!("usage ack: {error}")))?;
+        if !ack.duplicate {
+            minga_telemetry::METRICS.record_agent_usage(
+                &event.tenant_id,
+                event.input_tokens,
+                event.output_tokens,
+                event.cost_micros.unwrap_or_default(),
+            );
+        }
+        Ok(())
+    }
+
+    async fn usage_events(
+        &self,
+        tenant_id: &str,
+        since_unix_ms: u64,
+        customer: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<UsageEvent>> {
+        validate_tenant_id(tenant_id)?;
+        self.require_manager("query usage")?;
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let name = format!("MINGA_USAGE_{tenant_id}");
+        let stream = self
+            .js
+            .get_stream(&name)
+            .await
+            .map_err(|error| BusError::Subscribe(format!("get {name}: {error}")))?;
+        let mut consumer = stream
+            .create_consumer(PullConsumerConfig {
+                filter_subjects: vec![format!("minga.{tenant_id}.usage.>")],
+                deliver_policy: DeliverPolicy::All,
+                ..Default::default()
+            })
+            .await
+            .map_err(|error| BusError::Subscribe(format!("usage consumer: {error}")))?;
+        let mut pending = consumer
+            .info()
+            .await
+            .map_err(|error| BusError::Subscribe(format!("usage consumer info: {error}")))?
+            .num_pending as usize;
+        let mut events = Vec::with_capacity(limit.min(pending));
+        while pending > 0 && events.len() < limit {
+            let mut batch = consumer
+                .fetch()
+                .max_messages(pending.min(200))
+                .expires(Duration::from_secs(5))
+                .messages()
+                .await
+                .map_err(|error| BusError::Subscribe(format!("usage fetch: {error}")))?;
+            let mut received = 0usize;
+            while let Some(message) = batch.next().await {
+                let message = message
+                    .map_err(|error| BusError::Subscribe(format!("usage message: {error}")))?;
+                received += 1;
+                let event: UsageEvent = serde_json::from_slice(&message.payload)
+                    .map_err(|error| BusError::Serialization(error.to_string()))?;
+                if event.tenant_id != tenant_id {
+                    return Err(BusError::Subscribe("usage event tenant mismatch".into()));
+                }
+                if event.occurred_at_unix_ms >= since_unix_ms
+                    && customer.is_none_or(|customer| event.customer_id == customer)
+                {
+                    events.push(event);
+                }
+                message
+                    .ack()
+                    .await
+                    .map_err(|error| BusError::Subscribe(format!("usage ack: {error}")))?;
+                if events.len() >= limit {
+                    break;
+                }
+            }
+            if received == 0 {
+                break;
+            }
+            pending = pending.saturating_sub(received);
+        }
+        Ok(events)
+    }
+
+    async fn usage_totals(&self, since_unix_ms: u64) -> Result<Vec<(String, UsageTotals)>> {
+        self.require_manager("aggregate usage")?;
+        use futures::TryStreamExt;
+
+        let mut streams = self.js.streams();
+        let mut totals = Vec::new();
+        while let Some(info) = streams
+            .try_next()
+            .await
+            .map_err(|error| BusError::Subscribe(format!("list streams: {error}")))?
+        {
+            let Some(tenant_id) = info.config.name.strip_prefix("MINGA_USAGE_") else {
+                continue;
+            };
+            if validate_tenant_id(tenant_id).is_err() {
+                continue;
+            }
+            let total = tenant_usage_totals(&self.js, tenant_id, since_unix_ms).await?;
+            totals.push((tenant_id.to_owned(), total));
+        }
+        Ok(totals)
+    }
     async fn subscribe_events(&self, patterns: &[&str]) -> Result<EventStream> {
         self.require_manager("subscribe to events")?;
         let stream = self

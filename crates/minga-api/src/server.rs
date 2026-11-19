@@ -309,7 +309,7 @@ fn authorize(
     method: &axum::http::Method,
     path: &str,
 ) -> Result<(), axum::response::Response> {
-    if tenant_scoped_path(path) && caller.tenant_id.is_none() {
+    if tenant_scoped_path(path) && caller.tenant_id.is_none() && !agent_usage_path(path) {
         return Err(auth_forbidden(
             "a certificate for a specific tenant is required to access tenant resources",
         ));
@@ -336,6 +336,18 @@ fn auth_forbidden(message: &str) -> axum::response::Response {
     )
         .into_response()
 }
+fn agent_usage_path(path: &str) -> bool {
+    let mut segments = path.trim_matches('/').split('/');
+    matches!(
+        (
+            segments.next(),
+            segments.next(),
+            segments.next(),
+            segments.next()
+        ),
+        (Some(_), Some("agent"), Some("usage"), None)
+    )
+}
 
 fn tenant_scoped_path(path: &str) -> bool {
     !path.starts_with("/minga/")
@@ -343,6 +355,7 @@ fn tenant_scoped_path(path: &str) -> bool {
             matches!(
                 segment,
                 "services" | "tasks" | "networks" | "secrets" | "configs" | "audit" | "state"
+                    | "agent"
             )
         })
 }
@@ -525,7 +538,7 @@ fn build_router_with_app_state(
         // Versioned endpoints: /{version}/...
         .route("/:version/version", get(handlers::get_version))
         .route("/:version/info", get(handlers::get_info))
-        .route("/:version/audit", get(handlers::list_audit))
+        .route("/:version/agent/usage", get(handlers::agent_usage))
         // Nodes.
         .route(
             "/:version/nodes",
@@ -1077,6 +1090,7 @@ mod tests {
                 gpus: 0,
             },
             agent: None,
+            egress: None,
             restart_policy: Default::default(),
             secrets: vec![],
             command: vec![],

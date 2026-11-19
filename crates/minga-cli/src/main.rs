@@ -404,9 +404,9 @@ struct NodeArgs {
     /// Repeatable roots that may be exposed read-only to agent sandboxes.
     #[arg(long = "agent-dir-root", value_name = "DIR")]
     agent_dir_roots: Vec<PathBuf>,
-    /// Bind address for the LLM egress proxy (e.g. 127.0.0.1:18080).
-    /// If set, the node starts an egress proxy for agent workloads.
-    #[arg(long)]
+    /// Fixed listener on the task-bridge gateway port.
+    /// Required egress tasks use the node's bridge gateway at port 8080.
+    #[arg(long, default_value = "0.0.0.0:8080")]
     egress_bind: Option<String>,
     /// Upstream LLM API URL for the egress proxy.
     #[arg(long, default_value = "https://api.openai.com")]
@@ -2026,6 +2026,8 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
         None
     };
 
+    // Shared by container workloads, agents and the egress proxy.
+    let egress_tokens = Arc::new(minga_egress::SandboxTokens::new());
     // Construct the container runtime based on --runtime flag.
     let runtime: Arc<dyn minga_node::Runtime> = match args.runtime.as_str() {
         "mock" => {
@@ -2052,7 +2054,8 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
                     );
                     let rt = rt
                         .with_volume_dir(format!("{}/volumes", args.data_dir))
-                        .with_logs_dir(format!("{}/logs", args.data_dir));
+                        .with_logs_dir(format!("{}/logs", args.data_dir))
+                        .with_egress_tokens(egress_tokens.clone());
                     Arc::new(rt.with_secret_store(store))
                 }
                 Err(e) => {
@@ -2070,8 +2073,6 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
         }
     };
 
-    // Shared by the agent executor (mints) and the egress proxy (checks).
-    let egress_tokens = Arc::new(minga_egress::SandboxTokens::new());
 
     // Construct the agent executor if --sandbox-runtime is set.
     let agent_executor: Option<Arc<dyn minga_node::AgentExecutor>> = match &args.sandbox_runtime {
@@ -2106,6 +2107,14 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
         None => None,
     };
 
+    if args
+        .egress_bind
+        .as_deref()
+        .is_some_and(|bind| bind != "0.0.0.0:8080")
+    {
+        eprintln!("error: --egress-bind must be 0.0.0.0:8080 for task bridge egress");
+        return ExitCode::FAILURE;
+    }
     // Start the egress proxy if --egress-bind is set.
     let _egress_proxy: Option<minga_egress::EgressProxy> = if let Some(ref bind) = args.egress_bind
     {
@@ -2129,7 +2138,8 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
             redact_errors: true,
             upstream_auth,
         };
-        let mut proxy = minga_egress::EgressProxy::new(config, budgets, egress_tokens.clone());
+        let mut proxy = minga_egress::EgressProxy::new(config, budgets, egress_tokens.clone())
+            .with_event_bus(bus.clone());
         match proxy.start(bind).await {
             Ok(addr) => {
                 println!("LLM egress proxy listening on http://{addr}");
@@ -2656,7 +2666,6 @@ async fn run_egress(args: EgressArgs) -> ExitCode {
     println!("LLM egress proxy listening on http://{addr}");
     println!("  upstream:  {}", args.upstream);
     println!("  health:    http://{addr}/health");
-    println!("  budgets:   http://{addr}/budgets");
     println!("  proxy:     http://{addr}/v1/chat/completions");
     println!(
         "  identity:  send X-Minga-Sandbox-Token: {}",

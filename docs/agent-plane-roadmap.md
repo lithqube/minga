@@ -24,7 +24,7 @@ Every item is owned by one Minga **tenant** and follows [ADR 0008](adr/0008-mult
 
 ### A. Egress for every workload (highest value)
 
-1. **Container egress path.** Containers get the same per-task sandbox token that agents get, delivered as a file at `/run/minga/egress-token` and reached at a fixed address on the task bridge. With `x-minga-egress: { required: true }`, nftables on the task bridge drops all other outbound traffic, giving deny-by-default egress per service. This needs only per-host networking, which exists today.
+1. **Container egress path.** Containers get the same per-task sandbox token that agents get, delivered as a file at `/run/minga/egress-token` and reached at a fixed address on the task bridge. With `x-minga-egress` declaring `required: true` and at least one named route, nftables on the task bridge drops all other outbound traffic, giving deny-by-default egress per service. This needs only per-host networking, which exists today.
 2. **Named upstream routes with failover.** Replace the single `--egress-upstream` with routes such as `anthropic`, `bedrock`, `mistral` or `local`:
    - Each route has its own credential and auth scheme: bearer, `x-api-key`, and **AWS SigV4** for Bedrock.
    - A route can list fallback routes. Failover happens only on connect errors, 429 or 5xx, never on 4xx, so a bad request does not fail open to another provider.

@@ -13,13 +13,15 @@ use axum::{
     http::StatusCode,
     Json,
 };
-use minga_bus::{subjects, AuditRecord, EventBus, TaskActualState, TaskStatusReport};
+use minga_bus::{
+    subjects, AuditRecord, EventBus, TaskActualState, TaskStatusReport, UsageEvent, UsageTotals,
+};
 use minga_state::types::{
     unix_now, ClusterNode, NodeStatus as MingaNodeStatus, ResourceSpec, Service as StateService,
     Task, Tenant, TenantQuotas,
 };
 use minga_state::{join_token::JoinTokenKey, StateStore};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::{
     auth::Caller,
@@ -326,6 +328,68 @@ pub async fn list_audit(
         .await
         .map_err(|error| ApiError::Unavailable(format!("tenant audit query failed: {error}")))?;
     Ok(Json(records))
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct AgentUsageQuery {
+    customer: Option<String>,
+    since_unix_ms: Option<u64>,
+    limit: Option<usize>,
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+pub(crate) enum AgentUsageResponse {
+    Tenant { events: Vec<UsageEvent> },
+    Cluster { tenants: Vec<TenantUsageTotal> },
+}
+
+#[derive(Serialize)]
+pub(crate) struct TenantUsageTotal {
+    tenant_id: String,
+    #[serde(flatten)]
+    totals: UsageTotals,
+}
+
+/// `GET /v{version}/agent/usage` — tenant events or operator totals.
+///
+/// Tenant identity is resolved from the authenticated caller, never from a
+/// query parameter. Cluster operators receive aggregates without task,
+/// customer, or request-level data.
+pub(crate) async fn agent_usage(
+    State(app): State<Arc<AppState>>,
+    Extension(caller): Extension<Caller>,
+    Query(query): Query<AgentUsageQuery>,
+) -> ApiResult<Json<AgentUsageResponse>> {
+    let bus = app
+        .bus
+        .as_ref()
+        .ok_or_else(|| ApiError::Unavailable("agent usage service is not configured".into()))?;
+    let since_unix_ms = query.since_unix_ms.unwrap_or(0);
+    if caller.cluster_operator {
+        if query.customer.is_some() {
+            return Err(bad_request(
+                "cluster operators can query tenant totals only, not customer usage",
+            ));
+        }
+        let tenants = bus
+            .usage_totals(since_unix_ms)
+            .await
+            .map_err(|error| ApiError::Unavailable(format!("agent usage query failed: {error}")))?
+            .into_iter()
+            .map(|(tenant_id, totals)| TenantUsageTotal { tenant_id, totals })
+            .collect();
+        return Ok(Json(AgentUsageResponse::Cluster { tenants }));
+    }
+
+    let tenant_id = tenant_scope(&caller)?;
+    let limit = query.limit.unwrap_or(100).clamp(1, 1000);
+    let mut events = bus
+        .usage_events(tenant_id, since_unix_ms, query.customer.as_deref(), limit)
+        .await
+        .map_err(|error| ApiError::Unavailable(format!("agent usage query failed: {error}")))?;
+    events.truncate(limit);
+    Ok(Json(AgentUsageResponse::Tenant { events }))
 }
 
 /// `GET /minga/audit` — list the cluster audit trail for operators.
@@ -1866,6 +1930,95 @@ mod tests {
             .unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].tenant_id, "acme");
+    }
+
+    #[tokio::test]
+    async fn agent_usage_is_tenant_scoped_and_operator_output_is_aggregate_only() {
+        let (app, _dir) = app_with_node(1.0).await;
+        let bus = app.bus.as_ref().unwrap();
+        for (tenant_id, customer_id, request_id) in [
+            ("default", "customer-a", "request-a"),
+            ("acme", "customer-b", "request-b"),
+        ] {
+            bus.publish_usage(&UsageEvent {
+                request_id: request_id.into(),
+                tenant_id: tenant_id.into(),
+                service_id: "inference".into(),
+                task_id: format!("{tenant_id}.task"),
+                customer_id: customer_id.into(),
+                route: "primary".into(),
+                requested_model: "model-a".into(),
+                answered_model: "model-a".into(),
+                input_tokens: 3,
+                output_tokens: 5,
+                cache_hit: false,
+                latency_ms: 10,
+                status: 200,
+                occurred_at_unix_ms: 100,
+                cost_micros: Some(7),
+            })
+            .await
+            .unwrap();
+        }
+
+        let tenant_caller = Extension(Caller {
+            name: "tenant".into(),
+            role: crate::auth::ApiRole::Admin,
+            tenant_id: Some("default".into()),
+            cluster_operator: false,
+        });
+        let Json(AgentUsageResponse::Tenant { events }) = agent_usage(
+            State(app.clone()),
+            tenant_caller,
+            Query(AgentUsageQuery {
+                customer: None,
+                since_unix_ms: Some(0),
+                limit: Some(100),
+            }),
+        )
+        .await
+        .unwrap() else {
+            panic!("tenant caller must receive usage events");
+        };
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].tenant_id, "default");
+
+        let operator = Extension(Caller {
+            name: "operator".into(),
+            role: crate::auth::ApiRole::Admin,
+            tenant_id: None,
+            cluster_operator: true,
+        });
+        let Json(AgentUsageResponse::Cluster { tenants }) = agent_usage(
+            State(app.clone()),
+            operator.clone(),
+            Query(AgentUsageQuery {
+                customer: None,
+                since_unix_ms: Some(0),
+                limit: None,
+            }),
+        )
+        .await
+        .unwrap() else {
+            panic!("cluster operator must receive aggregate totals");
+        };
+        assert_eq!(tenants.len(), 2);
+        let json = serde_json::to_value(&tenants[0]).unwrap();
+        assert!(json.get("request_count").is_some());
+        assert!(json.get("totals").is_none());
+        assert!(json.get("customer_id").is_none());
+
+        assert!(agent_usage(
+            State(app),
+            operator,
+            Query(AgentUsageQuery {
+                customer: Some("customer-a".into()),
+                since_unix_ms: Some(0),
+                limit: None,
+            }),
+        )
+        .await
+        .is_err());
     }
 
     fn spec(name: &str, nano_cpus: i64) -> models::ServiceSpec {

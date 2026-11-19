@@ -72,6 +72,7 @@ fn sample_service(id: &str) -> Service {
             gpus: 0,
         },
         agent: None,
+        egress: None,
         restart_policy: Default::default(),
         secrets: vec![],
         command: vec![],

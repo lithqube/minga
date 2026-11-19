@@ -279,6 +279,7 @@ fn service(id: &str) -> Service {
             gpus: 0,
         },
         agent: Some(Box::new(agent())),
+        egress: None,
         restart_policy: RestartPolicy {
             condition: RestartCondition::OnFailure,
             delay_secs: 5,
@@ -333,6 +334,7 @@ fn task_spec() -> TaskSpec {
         mounts: vec![mount()],
         user: Some("101".into()),
         extra_hosts: vec![("db".into(), "host-gateway".into())],
+        egress: None,
     }
 }
 

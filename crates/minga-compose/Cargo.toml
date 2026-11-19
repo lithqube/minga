@@ -12,3 +12,4 @@ serde.workspace = true
 serde_path_to_error.workspace = true
 serde_yaml.workspace = true
 thiserror.workspace = true
+url.workspace = true
