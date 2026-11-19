@@ -67,7 +67,7 @@ Sequential implementation for one developer: B (NATS TLS/transport boundary) →
 **Requirements:** WG-ADR, WG-SUBNET, WG-KEYS, WG-PEERS, WG-NAT, WG-ISOL, WG-INGRESS, WG-PROOF
 **Plans:** `.planning/phases/13-wireguard-mesh/13-PLAN.md`
 **Mode:** standard
-- **Status:** In progress — code complete through 13-06 (PRs #81, #83, #86); 13-07 live VM proof and iperf3 measurements are deferred until release readiness. Cross-node networking remains unsupported until that proof.
+- **Status:** Complete (PRs #81, #83, #86 and 13-07 live proof).
 
 - [x] 13-01 — ADR 0007: WireGuard mesh and routing mesh (no code)
 - [x] 13-02 — Unique subnets and strict network `driver_opts` (independent of Phase 12)
@@ -75,7 +75,7 @@ Sequential implementation for one developer: B (NATS TLS/transport boundary) →
 - [x] 13-04 — Peer sets, /32 routes, proxy ARP, cross-node isolation
 - [x] 13-05 — NAT traversal by relay through managers
 - [x] 13-06 — Routing mesh (`mode: ingress` as in Swarm, cluster-wide port reservation)
-- [ ] 13-07 — Live VM proof, iperf3 numbers, docs, CHANGELOG, site roadmap (deferred until release readiness; no VM tests during Phase 15)
+- [x] 13-07 — T2/T3 live proof, iperf3 measurements, docs, CHANGELOG and site roadmap (completed; T4 scale remains unmeasured)
 
 ## Phase 14: Supported NATS server line (tenancy T0)
 **Goal:** Bundle nats-server 2.15.3 instead of the out-of-support 2.10.22, prove the bus on both supported lines (2.14, 2.15) in CI that fails closed, prove an existing cluster's JetStream data survives the upgrade, and read the server's `api.level` on managers (warn below 2.14).
@@ -110,3 +110,5 @@ Sequential implementation for one developer: B (NATS TLS/transport boundary) →
 - [ ] T3 verification — End-to-end proof that tenant B cannot place on tenant A's node (deferred until release readiness; no VM tests during Phase 15)
 - [x] T4 — Tenant-first bus subjects and keys, per-tenant worker ACL, streams and buckets, operator/JWT mode with scoped signing keys per tenant
 - [x] T5 — Quota enforcement and the per-tenant audit trail
+
+**Next planned code work:** Agent Plane Order 2: B6 distributed tenant/service/customer window budgets, then B7 request-rate limits. Phase 15 T3 live proof remains a release-readiness gate; no VM testing before that gate.

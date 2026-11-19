@@ -8,32 +8,38 @@
 
 ## Architecture decision records
 
-- [ADR 0001: Language split](adr/0001-language-split.md): Rust everywhere, Go only as a separate process
+- [ADR 0001: Language split](adr/0001-language-split.md): Rust on the hot path; Go components run as separate processes
 - [ADR 0002: Event bus: NATS/JetStream](adr/0002-event-bus-nats.md)
-- [ADR 0003: Agent workloads](adr/0003-agent-workloads.md)
+- [ADR 0003: Agent workloads](adr/0003-agent-workloads.md): WASM execution and remaining host-capability limits
 - [ADR 0004: Observability](adr/0004-observability.md)
-- [ADR 0005: API identity, roles and audit](adr/0005-api-identity-and-roles.md) (proposed)
+- [ADR 0005: API identity, roles and audit](adr/0005-api-identity-and-roles.md): partially implemented; server revisions and client-certificate support in `minga-ctl` remain open
+- [ADR 0006: Workers leave Raft](adr/0006-workers-leave-raft.md)
+- [ADR 0007: WireGuard and routing mesh](adr/0007-wireguard-mesh.md): implemented in Phase 13; scale limits remain
+- [ADR 0008: Multi-tenancy and isolation](adr/0008-multi-tenancy.md): T1–T5 implementation complete; T3 live proof remains open
 
-Each ADR ends with an *Implementation status* section saying what shipped and where the code deviates.
+Implementation-status notes distinguish what is merged from what remains proposed or unverified.
 
 ## Plans
 
-- [minga-ctl design plan](minga-ctl-plan.md): the companion CLI; SSH-only transport implemented (phase 1), mutual TLS and server-side audit next
-- [Production-readiness plan](production-readiness-plan.md): what blocked single-node production after v1.0.2, what v1.1.0 fixed, and what is left
-- [Resource benchmark](benchmark.md): idle memory, CPU and process counts against Docker Compose and Swarm, with the caveats
+- [Agent-plane roadmap](agent-plane-roadmap.md): Order 1 is merged; remaining cross-node budgets/rate limits and later agent features
+- [Sandbox host-capabilities plan](sandbox-host-capabilities-plan.md): Wasmtime runtime limits and grant schema landed; WASI host support remains open
+- [Planning state](../.planning/STATE.md) and [roadmap](../.planning/ROADMAP.md): phases and verification gates on `main`
+- [minga-ctl design plan](minga-ctl-plan.md): operator CLI design and implementation boundaries
+- [Production-readiness plan](production-readiness-plan.md): historical single-node readiness work
+- [Resource benchmark](benchmark.md): measured resource comparisons and caveats
 - [Release notes: v1.2.0](release-1.2.0.md)
 - [Release notes: v1.1.0](release-1.1.0.md)
 - [Release notes: v1.0.2](release-1.0.2.md)
 
 ## Deployment
 
-- [Supported topologies](topologies.md): single host, from a workstation, air-gapped, Talos, container image and multi-node, with what each needs and how far it is verified
-- [CLI reference](cli.md): every `minga` and `minga-ctl` command, its flags and environment variables, and which deploy command to use
-- [Backup and restore](backup.md): `minga state export`/`import`, what it leaves out (secret values, volume data, TLS, NATS), and the cold-copy alternative
-- [Quick start: one Linux host](../README.md#quick-start-one-linux-host): the verified path
+- [Supported topologies](topologies.md): single host, workstation, air-gapped, Talos, container image and multi-node; requirements, proof and limits
+- [CLI reference](cli.md): `minga` and `minga-ctl` commands, environment, tenant enrollment and agent usage
+- [Backup and restore](backup.md): state export/import scope and the data it leaves out
+- [Quick start: one Linux host](../README.md#quick-start-one-linux-host)
 - [systemd unit](../scripts/minga.service) and [environment example](../scripts/minga.env.example)
-- [Talos Linux](talos-deployment.md): validated single-node install on Talos v1.14 through workload start, with no system extension. Bare metal and multi-node are not validated.
-- [Hetzner ARM staging stack](hetzner-arm-staging.md): an 8-service stack with Traefik, private GHCR images and named users on one CAX21 node
+- [Talos Linux](talos-deployment.md): one docker-provisioned Talos v1.14 node through workload start; bare metal and multi-node remain unvalidated
+- [Hetzner ARM staging stack](hetzner-arm-staging.md): example deployment; verify host-specific claims against current status
 
 ## History and research
 
