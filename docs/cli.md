@@ -162,7 +162,7 @@ certificate flags, or previous Raft data directory is needed.
 | `minga tls init-ca --dir DIR` | Creates the cluster CA (`ca.pem`, `ca-key.pem`). | Anywhere; keep `ca-key.pem` off the nodes |
 | `minga tls issue-node --ca-dir DIR --out-dir DIR --node-id ID --role worker\|manager` | Issues a node certificate with the Raft SAN and role-bound NATS identity; manager certificates also include `localhost` for the manager's local sidecar TLS client. Keys are written 0600. | Anywhere; copy one pair to each node |
 | `minga agent ls` | Lists running agent tasks from the bus. | Anywhere that reaches NATS |
-| `minga sandbox run --module FILE [--input DATA] [--fuel N] [--timeout SECS]`, `minga sandbox info` | Runs a WASM module once; lists the sandbox runtimes. | Anywhere |
+| `minga sandbox run --module FILE [--input DATA] [--fuel N] [--timeout SECS]`, `minga sandbox info` | Runs a WASM module once; lists the sandbox runtimes. A `--timeout` over 300 is refused. | Anywhere |
 | `minga egress [--bind ADDR] ...` | A standalone egress proxy. `--bind` defaults to `0.0.0.0:8080`. | Anywhere |
 
 `deploy` and `state` take `--api-url` (or `MINGA_API_URL`, default

@@ -13,6 +13,13 @@
   16 MiB are refused and compile off the async runtime; concurrent runs are
   bounded by CPU count. Input is no longer truncated to `output_limit`.
   Wasmtime 50 raises the workspace MSRV to Rust 1.97.
+- Nodes refuse WASM sandboxes whose `timeout` exceeds 300 s, `memory_limit`
+  512 MiB or output limit 1 MiB, instead of running them. Output longer than
+  the limit, a negative output length or one past guest memory now fails the
+  run rather than being truncated. Time spent waiting for a run slot counts
+  toward the timeout, and a run abandoned by its caller still stops at its
+  deadline. A node holds at most 256 live sandboxes, compiles at most one
+  module per CPU at a time, and sandbox ids are random.
 - Agent Compose specs can declare explicit environment, clock, random, stdio
   and HTTP grants plus read-only directory grants. Nodes validate these against
   `--agent-dir-root` and egress configuration. State format v9 migrates v8
