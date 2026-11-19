@@ -1495,6 +1495,10 @@ impl NetworkSetup {
             ],
         )
         .await?;
+        // Recorded before the rules exist, so a teardown never mistakes a
+        // task whose tables may be installed for one that never had them.
+        state.required_egress = true;
+        write_atomic(&state_path, &serde_json::to_vec(&state)?).await?;
         run_nft_script(&egress_policy_script(
             &egress_table_name(task_id),
             &state.ips,
@@ -1504,8 +1508,6 @@ impl NetworkSetup {
             self.egress_proxy_port,
         ))
         .await?;
-        state.required_egress = true;
-        write_atomic(&state_path, &serde_json::to_vec(&state)?).await?;
         Ok(())
     }
 
