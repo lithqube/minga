@@ -552,8 +552,10 @@ async fn proxy_handler(State(state): State<Arc<ProxyState>>, req: Request) -> Re
         );
     }
     let estimated_tokens = body_bytes.len() as u64 / 4;
-    // Hold the input estimate plus any requested output cap, so concurrent
-    // requests cannot spend the same balance.
+    // Reserve an upper bound so concurrent requests cannot spend the same
+    // balance: a token covers at least one byte, so the body length bounds
+    // the input, and without an output cap the request holds the rest.
+    let input_bound = body_bytes.len() as u64;
     let max_output = request_json
         .as_ref()
         .and_then(|value| {
@@ -561,17 +563,19 @@ async fn proxy_handler(State(state): State<Arc<ProxyState>>, req: Request) -> Re
                 .get("max_tokens")
                 .or_else(|| value.get("max_completion_tokens"))
         })
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(0);
+        .and_then(serde_json::Value::as_u64);
     let request_stream = request_json
         .as_ref()
         .and_then(|value| value.get("stream"))
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
-    let reservation = match state
-        .budgets
-        .reserve(workload, estimated_tokens.saturating_add(max_output))
-    {
+    let reservation = match max_output {
+        Some(cap) => state
+            .budgets
+            .reserve(workload, input_bound.saturating_add(cap)),
+        None => state.budgets.reserve_rest(workload, input_bound),
+    };
+    let reservation = match reservation {
         Ok(reservation) => reservation,
         Err(e) => return error_response(&state, StatusCode::TOO_MANY_REQUESTS, &e.to_string()),
     };
@@ -2193,12 +2197,12 @@ mod tests {
         })
     }
 
-    fn post(token: &str, body: &'static str) -> Request {
+    fn post(token: &str, body: impl Into<String>) -> Request {
         Request::builder()
             .method("POST")
             .uri("/v1/chat")
             .header(SANDBOX_TOKEN_HEADER, token)
-            .body(Body::from(body))
+            .body(Body::from(body.into()))
             .unwrap()
     }
 
@@ -2286,6 +2290,19 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_requests_cannot_spend_the_same_budget() {
+        // An output cap, no output cap at all, and an input that a bytes/4
+        // estimate would undercount (two 16-token holds fit in 100; two
+        // 61-byte bounds do not).
+        for body in [
+            r#"{"max_tokens":60}"#.to_string(),
+            "{}".to_string(),
+            format!(r#"{{"max_tokens":1,"p":"{}"}}"#, "x".repeat(37)),
+        ] {
+            concurrent_requests_cannot_spend_the_same_budget_with(&body).await;
+        }
+    }
+
+    async fn concurrent_requests_cannot_spend_the_same_budget_with(body: &str) {
         let (release, released) = tokio::sync::watch::channel(false);
         let (arrived_tx, mut arrived) = tokio::sync::mpsc::channel::<()>(4);
         let app = Router::new().route(
@@ -2313,8 +2330,6 @@ mod tests {
             "pair",
             route_policy("primary", format!("http://{address}")),
         );
-        // Each request holds its 60-token output cap while in flight.
-        let body = r#"{"max_tokens":60}"#;
         let first = tokio::spawn(proxy_handler(
             State(Arc::clone(&state)),
             post(token.as_str(), body),

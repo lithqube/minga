@@ -145,6 +145,8 @@ pub struct MockRuntime {
     counter: Mutex<u64>,
     /// If true, `start()` returns an error (to test failure handling).
     pub fail_starts: Mutex<bool>,
+    /// If true, `stop()` returns an error (to test failed cleanup).
+    pub fail_stops: Mutex<bool>,
     /// Container IDs that should report as `Failed` status.
     pub failed_containers: Mutex<HashSet<String>>,
     /// Exit codes for containers marked as failed. Defaults to 1.
@@ -231,6 +233,9 @@ impl Runtime for MockRuntime {
     }
 
     async fn stop(&self, container_id: &str) -> Result<(), RuntimeError> {
+        if *self.fail_stops.lock().unwrap() {
+            return Err(RuntimeError::Stop("mock runtime: stops disabled".into()));
+        }
         let mut containers = self.containers.lock().unwrap();
         match containers.get_mut(container_id) {
             Some(c) => {

@@ -150,19 +150,47 @@ impl BudgetTracker {
         workload: &str,
         tokens: u64,
     ) -> Result<Reservation, BudgetTrackerError> {
+        self.reserve_with(workload, tokens, |_| tokens)
+    }
+
+    /// Reserves the whole remaining balance, and at least `floor`, for a
+    /// request whose output has no cap: nothing smaller bounds it, so no
+    /// concurrent request may spend that balance until this one settles. An
+    /// unlimited budget has nothing to protect and reserves `floor` only.
+    pub fn reserve_rest(
+        self: &Arc<Self>,
+        workload: &str,
+        floor: u64,
+    ) -> Result<Reservation, BudgetTrackerError> {
+        self.reserve_with(workload, floor, |budget| {
+            if budget.max_tokens == u64::MAX {
+                floor
+            } else {
+                budget.remaining()
+            }
+        })
+    }
+
+    fn reserve_with(
+        self: &Arc<Self>,
+        workload: &str,
+        floor: u64,
+        amount: impl FnOnce(&Budget) -> u64,
+    ) -> Result<Reservation, BudgetTrackerError> {
         let mut budgets = self.lock();
         let budget = budgets
             .get_mut(workload)
             .ok_or_else(|| BudgetTrackerError::NotFound(workload.to_string()))?;
         budget.maybe_reset_window();
-        if !budget.allows(tokens) {
+        if !budget.allows(floor) {
             return Err(BudgetTrackerError::Exceeded {
                 workload: workload.to_string(),
                 used: budget.used,
-                requested: tokens,
+                requested: floor,
                 limit: budget.max_tokens,
             });
         }
+        let tokens = amount(budget).max(floor);
         budget.used = budget.used.saturating_add(tokens);
         Ok(Reservation {
             tracker: Arc::clone(self),
@@ -359,6 +387,20 @@ mod tests {
         let status = tracker.status("agent-1").unwrap();
         assert_eq!(status.used, 600);
         assert_eq!(status.remaining, 400);
+    }
+
+    #[test]
+    fn an_uncapped_reservation_holds_the_rest_of_a_limited_budget() {
+        let tracker = Arc::new(BudgetTracker::new());
+        tracker.register("limited", Budget::new(100, Duration::from_secs(60)));
+        let held = tracker.reserve_rest("limited", 10).unwrap();
+        assert!(tracker.reserve("limited", 1).is_err());
+        assert!(held.settle(30));
+        assert_eq!(tracker.status("limited").unwrap().used, 30);
+        // Unlimited budgets reserve only the floor, so uncapped requests overlap.
+        tracker.register("unlimited", Budget::new(u64::MAX, Duration::from_secs(60)));
+        let _first = tracker.reserve_rest("unlimited", 10).unwrap();
+        assert!(tracker.reserve_rest("unlimited", 10).is_ok());
     }
 
     #[test]
