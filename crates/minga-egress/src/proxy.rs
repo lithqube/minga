@@ -53,6 +53,11 @@ pub struct EgressProxyConfig {
     pub redact_errors: bool,
     /// Provider credential the proxy injects into every upstream request.
     pub upstream_auth: Option<UpstreamAuth>,
+    /// Destinations a tenant route may reach although they are loopback,
+    /// link-local, private, unspecified or multicast (`--egress-allow-cidr`).
+    pub allowed_route_cidrs: Vec<ipnet::IpNet>,
+    /// Longest wait for the next chunk of a streamed upstream response.
+    pub stream_idle_timeout: Duration,
 }
 
 /// A provider credential and the header it travels in.
@@ -94,6 +99,8 @@ impl Default for EgressProxyConfig {
             cache_config: Some(CacheConfig::default()),
             redact_errors: true,
             upstream_auth: None,
+            allowed_route_cidrs: Vec::new(),
+            stream_idle_timeout: Duration::from_secs(60),
         }
     }
 }
@@ -104,9 +111,13 @@ struct ProxyState {
     budgets: Arc<BudgetTracker>,
     cache: Option<Arc<ResponseCache>>,
     redactor: SecretRedactor,
+    /// Client for the operator's upstream.
     client: reqwest::Client,
+    /// Client for tenant routes: no redirects, no proxy, and DNS answers
+    /// filtered to allowed destinations. `None` if it could not be built.
+    route_client: Option<reqwest::Client>,
     tokens: Arc<SandboxTokens>,
-    bus: Option<Arc<dyn EventBus>>,
+    bus: std::sync::OnceLock<Arc<dyn EventBus>>,
 }
 
 /// An HTTP reverse proxy for LLM API egress control.
@@ -135,8 +146,10 @@ impl EgressProxy {
     ) -> Self {
         let client = reqwest::Client::builder()
             .timeout(config.timeout)
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
+        let route_client = route_client(&config);
 
         let cache = config
             .cache_config
@@ -155,20 +168,23 @@ impl EgressProxy {
                 cache,
                 redactor,
                 client,
+                route_client,
                 tokens,
-                bus: None,
+                bus: std::sync::OnceLock::new(),
             }),
             addr: None,
             shutdown: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
-    /// Configures durable usage event publishing.
-    pub fn with_event_bus(mut self, bus: Arc<dyn EventBus>) -> Self {
-        if let Some(state) = Arc::get_mut(&mut self.state) {
-            state.bus = Some(bus);
-        }
-        self
+    /// Configures durable usage event publishing. Routers built earlier
+    /// share the state, so they publish too; a second bus is refused.
+    pub fn with_event_bus(self, bus: Arc<dyn EventBus>) -> Result<Self, EgressProxyError> {
+        self.state
+            .bus
+            .set(bus)
+            .map_err(|_| EgressProxyError::Internal("usage event bus is already set".into()))?;
+        Ok(self)
     }
 
     /// Builds the axum router for the proxy.
@@ -235,6 +251,174 @@ async fn health_handler() -> &'static str {
     "OK"
 }
 
+/// Longest accepted model, customer and route name, in bytes.
+const MAX_IDENTIFIER_BYTES: usize = 256;
+/// Largest upstream body the proxy buffers when it does not stream.
+const MAX_UPSTREAM_BODY_BYTES: usize = 32 * 1024 * 1024;
+/// Largest upstream error body buffered for redaction.
+const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
+/// Per-attempt deadline and attempts for publishing one usage event.
+const USAGE_PUBLISH_TIMEOUT: Duration = Duration::from_secs(5);
+const USAGE_PUBLISH_ATTEMPTS: u32 = 3;
+
+fn header_str<'a>(req: &'a Request, name: &str) -> Option<&'a str> {
+    req.headers()
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+}
+
+/// Whether a tenant route may connect to `ip`. Loopback, link-local,
+/// unspecified, multicast, broadcast and private or unique-local addresses
+/// are refused unless an operator CIDR allows them.
+fn destination_allowed(ip: std::net::IpAddr, allowed: &[ipnet::IpNet]) -> bool {
+    use std::net::IpAddr;
+    if allowed.iter().any(|net| net.contains(&ip)) {
+        return true;
+    }
+    let ip = match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(IpAddr::V6(v6), IpAddr::V4),
+        v4 => v4,
+    };
+    if allowed.iter().any(|net| net.contains(&ip)) {
+        return true;
+    }
+    match ip {
+        IpAddr::V4(v4) => {
+            !(v4.is_loopback()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_multicast()
+                || v4.is_broadcast()
+                || v4.is_private())
+        }
+        IpAddr::V6(v6) => {
+            !(v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                || v6.is_unicast_link_local()
+                || v6.is_unique_local())
+        }
+    }
+}
+
+/// Refuses a route URL whose host is a literal address that is not allowed;
+/// hostnames are checked after DNS by [`RouteResolver`].
+fn literal_destination_allowed(url: &str, allowed: &[ipnet::IpNet]) -> bool {
+    let Ok(url) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    let host = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    host.parse::<std::net::IpAddr>()
+        .map_or(true, |ip| destination_allowed(ip, allowed))
+}
+
+/// Resolves route hostnames and keeps only allowed addresses, so a name
+/// cannot point a tenant route at the node or its private networks.
+struct RouteResolver {
+    allowed: Arc<[ipnet::IpNet]>,
+}
+
+impl reqwest::dns::Resolve for RouteResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let allowed = Arc::clone(&self.allowed);
+        let host = name.as_str().to_owned();
+        Box::pin(async move {
+            let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host.as_str(), 0))
+                .await?
+                .filter(|addr| destination_allowed(addr.ip(), &allowed))
+                .collect();
+            if addrs.is_empty() {
+                return Err("egress route destination is not allowed".into());
+            }
+            Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs)
+        })
+    }
+}
+
+fn route_client(config: &EgressProxyConfig) -> Option<reqwest::Client> {
+    reqwest::Client::builder()
+        .timeout(config.timeout)
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+        .dns_resolver(Arc::new(RouteResolver {
+            allowed: config.allowed_route_cidrs.clone().into(),
+        }))
+        .build()
+        .ok()
+}
+
+/// Reads at most `limit` body bytes.
+async fn read_bounded(
+    response: reqwest::Response,
+    limit: usize,
+) -> Result<bytes::Bytes, BodyError> {
+    use futures_util::StreamExt;
+    let mut stream = response.bytes_stream();
+    let mut body = bytes::BytesMut::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|_| BodyError::Read)?;
+        if body.len() + chunk.len() > limit {
+            return Err(BodyError::TooLarge);
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body.freeze())
+}
+
+enum BodyError {
+    Read,
+    TooLarge,
+}
+
+/// Tokens charged for a completion: provider counts when reported, else the
+/// request estimate plus the estimated output.
+fn charged_tokens(counts: &UsageCounts, estimated_input: u64) -> u64 {
+    if counts.estimated {
+        estimated_input.saturating_add(counts.output_tokens)
+    } else {
+        counts.input_tokens.saturating_add(counts.output_tokens)
+    }
+}
+
+fn route_prices(route: Option<&ResolvedRoute>) -> Option<(Option<u64>, Option<u64>)> {
+    route.map(|route| {
+        (
+            route.input_price_micros_per_million,
+            route.output_price_micros_per_million,
+        )
+    })
+}
+
+/// Settles the reservation and publishes usage in the background, so a
+/// slow bus never delays the response.
+fn finish_usage(
+    state: &ProxyState,
+    identity: &Arc<WorkloadIdentity>,
+    reservation: crate::budget::Reservation,
+    estimated_input: u64,
+    usage: UsagePublication,
+) {
+    let charged = charged_tokens(&usage.counts, estimated_input);
+    if !reservation.settle(charged) {
+        tracing::warn!(
+            workload = identity.workload_id.as_str(),
+            charged,
+            "egress usage took the workload past its token budget"
+        );
+    }
+    tokio::spawn(publish_event(
+        state.bus.get().cloned(),
+        Arc::clone(identity),
+        usage,
+    ));
+}
+
 async fn proxy_handler(State(state): State<Arc<ProxyState>>, req: Request) -> Response {
     let started = std::time::Instant::now();
     let method = req.method().clone();
@@ -244,11 +428,9 @@ async fn proxy_handler(State(state): State<Arc<ProxyState>>, req: Request) -> Re
         .query()
         .map(|q| format!("?{q}"))
         .unwrap_or_default();
-    let token = req
-        .headers()
-        .get(SANDBOX_TOKEN_HEADER)
-        .and_then(|v| v.to_str().ok());
-    let Some(identity) = token.and_then(|t| state.tokens.identity(t)) else {
+    let Some(identity) =
+        header_str(&req, SANDBOX_TOKEN_HEADER).and_then(|t| state.tokens.identity(t))
+    else {
         return error_response(
             &state,
             StatusCode::UNAUTHORIZED,
@@ -270,36 +452,38 @@ async fn proxy_handler(State(state): State<Arc<ProxyState>>, req: Request) -> Re
             "workload identity does not match sandbox token",
         );
     }
-    let customer_id = req
-        .headers()
-        .get("x-minga-customer")
-        .and_then(|value| value.to_str().ok())
+    let customer_id = header_str(&req, "x-minga-customer")
         .unwrap_or("")
         .to_owned();
+    let mut requested_model = header_str(&req, "x-minga-model").unwrap_or("").to_owned();
+    let selected_header = header_str(&req, "x-minga-route").map(str::to_owned);
+    if [
+        customer_id.as_str(),
+        requested_model.as_str(),
+        selected_header.as_deref().unwrap_or(""),
+    ]
+    .iter()
+    .any(|value| value.len() > MAX_IDENTIFIER_BYTES)
+    {
+        return error_response(
+            &state,
+            StatusCode::BAD_REQUEST,
+            "customer, model and route names are limited to 256 bytes",
+        );
+    }
     let workload = identity.workload_id.as_str();
     let forwarded: Vec<(&str, Vec<u8>)> = FORWARDED_HEADERS
         .iter()
         .filter_map(|&n| req.headers().get(n).map(|v| (n, v.as_bytes().to_vec())))
         .collect();
-    let mut requested_model = req
-        .headers()
-        .get("x-minga-model")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_owned();
     let policy = identity.policy.as_ref();
     let mut route_chain: Vec<&ResolvedRoute> = Vec::new();
     let route_name = if let Some(policy) = policy {
-        let selected = req
-            .headers()
-            .get("x-minga-route")
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_owned)
-            .or_else(|| {
-                (policy.routes.len() == 1)
-                    .then(|| policy.routes.keys().next().cloned())
-                    .flatten()
-            });
+        let selected = selected_header.or_else(|| {
+            (policy.routes.len() == 1)
+                .then(|| policy.routes.keys().next().cloned())
+                .flatten()
+        });
         let Some(selected) = selected else {
             return error_response(
                 &state,
@@ -332,6 +516,13 @@ async fn proxy_handler(State(state): State<Arc<ProxyState>>, req: Request) -> Re
         .as_ref()
         .and_then(|value| value.get("model"))
         .and_then(serde_json::Value::as_str);
+    if body_model.is_some_and(|model| model.len() > MAX_IDENTIFIER_BYTES) {
+        return error_response(
+            &state,
+            StatusCode::BAD_REQUEST,
+            "customer, model and route names are limited to 256 bytes",
+        );
+    }
     if policy.is_some_and(|policy| !policy.models.is_empty()) && body_model.is_none() {
         return error_response(
             &state,
@@ -350,42 +541,55 @@ async fn proxy_handler(State(state): State<Arc<ProxyState>>, req: Request) -> Re
         );
     }
     let estimated_tokens = body_bytes.len() as u64 / 4;
+    // Hold the input estimate plus any requested output cap, so concurrent
+    // requests cannot spend the same balance.
+    let max_output = request_json
+        .as_ref()
+        .and_then(|value| {
+            value
+                .get("max_tokens")
+                .or_else(|| value.get("max_completion_tokens"))
+        })
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
     let request_stream = request_json
         .as_ref()
         .and_then(|value| value.get("stream"))
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
-    if let Err(e) = state.budgets.check(workload, estimated_tokens) {
-        return error_response(&state, StatusCode::TOO_MANY_REQUESTS, &e.to_string());
-    }
+    let reservation = match state
+        .budgets
+        .reserve(workload, estimated_tokens.saturating_add(max_output))
+    {
+        Ok(reservation) => reservation,
+        Err(e) => return error_response(&state, StatusCode::TOO_MANY_REQUESTS, &e.to_string()),
+    };
     let cache_path = format!("{path}{query}\0{requested_model}");
+    let cache_route = match policy {
+        Some(policy) => format!("{route_name}\0{:016x}", policy.revision()),
+        None => route_name.clone(),
+    };
     let cache_key = ResponseCache::compute_key_for_workload_route(
         workload,
-        &route_name,
+        &cache_route,
         method.as_str(),
         &cache_path,
         &body_bytes,
     );
     if let Some(cache) = &state.cache {
         if let Some((status, headers, body)) = cache.get(&cache_key) {
-            let counts = find_usage_fragment(&body).unwrap_or(UsageCounts {
+            let counts = find_usage(&body).unwrap_or(UsageCounts {
                 input_tokens: estimated_tokens,
                 output_tokens: body.len() as u64 / 4,
                 estimated: true,
             });
-            let total = if counts.estimated {
-                estimated_tokens.saturating_add(counts.output_tokens)
-            } else {
-                counts.input_tokens.saturating_add(counts.output_tokens)
-            };
-            if let Err(error) = state.budgets.record(workload, total) {
-                tracing::warn!(workload, error = %error, "budget exceeded after cache hit");
-            }
             let answered_model =
                 find_answered_model(&body).unwrap_or_else(|| requested_model.clone());
-            publish_usage(
+            finish_usage(
                 &state,
-                Arc::clone(&identity),
+                &identity,
+                reservation,
+                estimated_tokens,
                 UsagePublication {
                     customer_id,
                     route: route_name,
@@ -395,15 +599,9 @@ async fn proxy_handler(State(state): State<Arc<ProxyState>>, req: Request) -> Re
                     status: StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
                     latency_ms: started.elapsed().as_millis() as u64,
                     cache_hit: true,
-                    prices: route_chain.first().map(|route| {
-                        (
-                            route.input_price_micros_per_million,
-                            route.output_price_micros_per_million,
-                        )
-                    }),
+                    prices: route_prices(route_chain.first().copied()),
                 },
-            )
-            .await;
+            );
             let mut response = Response::builder().status(status);
             for (name, value) in headers {
                 response = response.header(name, value);
@@ -427,7 +625,26 @@ async fn proxy_handler(State(state): State<Arc<ProxyState>>, req: Request) -> Re
             || format!("{}{}{}", state.config.upstream_url, path, query),
             |r| format!("{}{}{}", r.upstream_url.trim_end_matches('/'), path, query),
         );
-        let mut builder = state.client.request(
+        let client = if route.is_some() {
+            if !literal_destination_allowed(&upstream_url, &state.config.allowed_route_cidrs) {
+                return error_response(
+                    &state,
+                    StatusCode::FORBIDDEN,
+                    "egress route destination is not allowed",
+                );
+            }
+            let Some(client) = &state.route_client else {
+                return error_response(
+                    &state,
+                    StatusCode::BAD_GATEWAY,
+                    "egress route client is unavailable",
+                );
+            };
+            client
+        } else {
+            &state.client
+        };
+        let mut builder = client.request(
             reqwest::Method::from_bytes(method.as_str().as_bytes()).unwrap_or(reqwest::Method::GET),
             &upstream_url,
         );
@@ -484,7 +701,7 @@ async fn proxy_handler(State(state): State<Arc<ProxyState>>, req: Request) -> Re
                 );
             }
         }
-        match state.client.execute(request).await {
+        match client.execute(request).await {
             Ok(response) => {
                 let retry = response.status() == StatusCode::TOO_MANY_REQUESTS
                     || response.status().is_server_error();
@@ -504,40 +721,51 @@ async fn proxy_handler(State(state): State<Arc<ProxyState>>, req: Request) -> Re
             }
         }
     }
+    // The provider may have processed a request whose response never fully
+    // arrived: charge the estimate and record it as a gateway failure.
+    let failed = |state: &ProxyState,
+                  reservation: crate::budget::Reservation,
+                  route: Option<&ResolvedRoute>,
+                  route_name: String,
+                  customer_id: String,
+                  requested_model: String,
+                  message: &str| {
+        let answered_model = requested_model.clone();
+        finish_usage(
+            state,
+            &identity,
+            reservation,
+            estimated_tokens,
+            UsagePublication {
+                customer_id,
+                route: route.map_or(route_name, |route| route.name.clone()),
+                requested_model,
+                answered_model,
+                counts: UsageCounts {
+                    input_tokens: estimated_tokens,
+                    output_tokens: 0,
+                    estimated: true,
+                },
+                status: StatusCode::BAD_GATEWAY,
+                latency_ms: started.elapsed().as_millis() as u64,
+                cache_hit: false,
+                prices: route_prices(route),
+            },
+        );
+        error_response(state, StatusCode::BAD_GATEWAY, message)
+    };
     let upstream_resp = match result {
         Some(Ok(response)) => response,
         _ => {
-            if let Err(error) = state.budgets.record(workload, estimated_tokens) {
-                tracing::warn!(workload, error = %error, "budget exceeded after failed upstream request");
-            }
-            let route = selected_route.map_or(route_name, |route| route.name.clone());
-            let answered_model = requested_model.clone();
-            publish_usage(
+            return failed(
                 &state,
-                Arc::clone(&identity),
-                UsagePublication {
-                    customer_id,
-                    route,
-                    requested_model,
-                    answered_model,
-                    counts: UsageCounts {
-                        input_tokens: estimated_tokens,
-                        output_tokens: 0,
-                        estimated: true,
-                    },
-                    status: StatusCode::BAD_GATEWAY,
-                    latency_ms: started.elapsed().as_millis() as u64,
-                    cache_hit: false,
-                    prices: selected_route.map(|route| {
-                        (
-                            route.input_price_micros_per_million,
-                            route.output_price_micros_per_million,
-                        )
-                    }),
-                },
+                reservation,
+                selected_route,
+                route_name,
+                customer_id,
+                requested_model,
+                "upstream request failed",
             )
-            .await;
-            return error_response(&state, StatusCode::BAD_GATEWAY, "upstream request failed");
         }
     };
     let status = upstream_resp.status();
@@ -557,61 +785,47 @@ async fn proxy_handler(State(state): State<Arc<ProxyState>>, req: Request) -> Re
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .is_some_and(|v| v.to_ascii_lowercase().contains("text/event-stream"));
-    let mut redactor = state.redactor.clone();
-    for route in &route_chain {
-        if let Some(auth) = &route.auth {
-            match auth {
-                ResolvedAuth::Bearer(secret) | ResolvedAuth::ApiKey(secret) => {
-                    redactor = redactor.with_literal("route-credential", secret)
-                }
-                ResolvedAuth::AwsSigv4 {
-                    access_key,
-                    secret_key,
-                    session_token,
-                    ..
-                } => {
-                    redactor = redactor
-                        .with_literal("route-access-key", access_key)
-                        .with_literal("route-secret-key", secret_key);
-                    if let Some(secret) = session_token {
-                        redactor = redactor.with_literal("route-session-token", secret);
-                    }
-                }
-            }
-        }
-    }
-    if !is_sse && !request_stream {
-        let raw = match upstream_resp.bytes().await {
-            Ok(b) => b,
-            Err(_) => {
-                return error_response(
+    let redact =
+        state.config.redact_errors && (status.is_client_error() || status.is_server_error());
+    // Error bodies are buffered and redacted whole: a credential split
+    // across two streamed chunks would escape per-chunk redaction.
+    if redact || (!is_sse && !request_stream) {
+        let limit = if redact {
+            MAX_ERROR_BODY_BYTES
+        } else {
+            MAX_UPSTREAM_BODY_BYTES
+        };
+        let raw = match read_bounded(upstream_resp, limit).await {
+            Ok(raw) => raw,
+            Err(error) => {
+                let message = match error {
+                    BodyError::Read => "failed to read upstream response",
+                    BodyError::TooLarge => "upstream response is too large",
+                };
+                return failed(
                     &state,
-                    StatusCode::BAD_GATEWAY,
-                    "failed to read upstream response",
-                )
+                    reservation,
+                    selected_route,
+                    route_name,
+                    customer_id,
+                    requested_model,
+                    message,
+                );
             }
         };
-        let counts = find_usage_fragment(&raw).unwrap_or(UsageCounts {
+        let counts = find_usage(&raw).unwrap_or(UsageCounts {
             input_tokens: estimated_tokens,
             output_tokens: raw.len() as u64 / 4,
             estimated: true,
         });
         let answered_model = find_answered_model(&raw).unwrap_or_else(|| requested_model.clone());
-        let body = if (status.is_client_error() || status.is_server_error())
-            && state.config.redact_errors
-        {
-            redactor.redact(&String::from_utf8_lossy(&raw)).into_bytes()
+        let body = if redact {
+            route_redactor(&state.redactor, &route_chain)
+                .redact(&String::from_utf8_lossy(&raw))
+                .into_bytes()
         } else {
             raw.to_vec()
         };
-        let total = if counts.estimated {
-            estimated_tokens.saturating_add(counts.output_tokens)
-        } else {
-            counts.input_tokens.saturating_add(counts.output_tokens)
-        };
-        if let Err(error) = state.budgets.record(workload, total) {
-            tracing::warn!(workload, error = %error, "budget exceeded after upstream call");
-        }
         let used_requested_route = match (selected_route, route_chain.first()) {
             (Some(selected), Some(requested)) => selected.name == requested.name,
             (None, None) => true,
@@ -627,9 +841,11 @@ async fn proxy_handler(State(state): State<Arc<ProxyState>>, req: Request) -> Re
                 );
             }
         }
-        publish_usage(
+        finish_usage(
             &state,
-            Arc::clone(&identity),
+            &identity,
+            reservation,
+            estimated_tokens,
             UsagePublication {
                 customer_id,
                 route: selected_route.map_or_else(String::new, |route| route.name.clone()),
@@ -639,15 +855,9 @@ async fn proxy_handler(State(state): State<Arc<ProxyState>>, req: Request) -> Re
                 status,
                 latency_ms: started.elapsed().as_millis() as u64,
                 cache_hit: false,
-                prices: selected_route.map(|route| {
-                    (
-                        route.input_price_micros_per_million,
-                        route.output_price_micros_per_million,
-                    )
-                }),
+                prices: route_prices(selected_route),
             },
-        )
-        .await;
+        );
         let mut response = Response::builder().status(status);
         for (name, value) in &resp_headers {
             response = response.header(name, value);
@@ -658,74 +868,61 @@ async fn proxy_handler(State(state): State<Arc<ProxyState>>, req: Request) -> Re
     }
     let mut stream = upstream_resp.bytes_stream();
     let (sender, receiver) = tokio::sync::mpsc::channel(8);
-    let budgets = Arc::clone(&state.budgets);
-    let workload = workload.to_owned();
     let identity = Arc::clone(&identity);
-    let customer_id = customer_id.clone();
-    let event_bus = state.bus.clone();
+    let event_bus = state.bus.get().cloned();
     let route = selected_route.map(|r| r.name.clone()).unwrap_or_default();
-    let prices = selected_route.map(|r| {
-        (
-            r.input_price_micros_per_million,
-            r.output_price_micros_per_million,
-        )
-    });
-    let redact =
-        state.config.redact_errors && (status.is_client_error() || status.is_server_error());
-    let stream_redactor = redactor.clone();
+    let prices = route_prices(selected_route);
+    let idle_timeout = state.config.stream_idle_timeout;
     tokio::spawn(async move {
         use futures_util::StreamExt;
         let mut parser = UsageParser::new(is_sse);
         let mut bytes_seen = 0_u64;
-        let mut tail = Vec::new();
-        while let Some(item) = stream.next().await {
-            let chunk = match item {
-                Ok(chunk) => chunk,
-                Err(error) => {
-                    let _ = sender
-                        .send(Err(std::io::Error::other(error.to_string())))
-                        .await;
+        let mut client = Some(sender);
+        loop {
+            let chunk = match tokio::time::timeout(idle_timeout, stream.next()).await {
+                Ok(Some(Ok(chunk))) => chunk,
+                Ok(None) => break,
+                Ok(Some(Err(error))) => {
+                    if let Some(client) = &client {
+                        let _ = client
+                            .send(Err(std::io::Error::other(error.to_string())))
+                            .await;
+                    }
+                    break;
+                }
+                Err(_) => {
+                    if let Some(client) = &client {
+                        let _ = client
+                            .send(Err(std::io::Error::other("upstream stream idle timeout")))
+                            .await;
+                    }
                     break;
                 }
             };
             bytes_seen = bytes_seen.saturating_add(chunk.len() as u64);
             parser.push(&chunk);
-            if redact {
-                tail.extend_from_slice(&chunk);
-                if tail.len() > 8192 {
-                    let mut split = tail.len() - 8192;
-                    while split > 0 && tail[split] & 0b1100_0000 == 0b1000_0000 {
-                        split -= 1;
-                    }
-                    let safe = String::from_utf8_lossy(&tail[..split]);
-                    let output = stream_redactor.redact(&safe);
-                    if sender.send(Ok(bytes::Bytes::from(output))).await.is_err() {
-                        break;
-                    }
-                    tail.drain(..split);
+            // A client that hung up stops receiving, but the upstream is
+            // drained so its reported usage is still recorded.
+            if let Some(sender) = &client {
+                if sender.send(Ok(chunk)).await.is_err() {
+                    client = None;
                 }
-            } else if sender.send(Ok(chunk)).await.is_err() {
-                break;
             }
         }
-        if redact && !tail.is_empty() {
-            let safe = String::from_utf8_lossy(&tail);
-            let _ = sender
-                .send(Ok(bytes::Bytes::from(stream_redactor.redact(&safe))))
-                .await;
-        }
+        // End the client body before waiting on usage publication.
+        drop(client);
         let (mut counts, answered_model) = parser.finish_with_model(bytes_seen);
         let answered_model = answered_model.unwrap_or_else(|| requested_model.clone());
         if counts.estimated {
             counts.input_tokens = estimated_tokens;
         }
-        let total = if counts.estimated {
-            estimated_tokens.saturating_add(counts.output_tokens)
-        } else {
-            counts.input_tokens.saturating_add(counts.output_tokens)
-        };
-        if let Err(error) = budgets.record(&workload, total) {
-            tracing::warn!(workload, error = %error, "budget exceeded after upstream call");
+        let charged = charged_tokens(&counts, estimated_tokens);
+        if !reservation.settle(charged) {
+            tracing::warn!(
+                workload = identity.workload_id.as_str(),
+                charged,
+                "egress usage took the workload past its token budget"
+            );
         }
         publish_event(
             event_bus,
@@ -755,6 +952,33 @@ async fn proxy_handler(State(state): State<Arc<ProxyState>>, req: Request) -> Re
         .unwrap_or_else(|_| Response::new(Body::empty()))
 }
 
+/// The base redactor plus every credential of the request's route chain.
+fn route_redactor(base: &SecretRedactor, route_chain: &[&ResolvedRoute]) -> SecretRedactor {
+    let mut redactor = base.clone();
+    for route in route_chain {
+        match &route.auth {
+            None => {}
+            Some(ResolvedAuth::Bearer(secret) | ResolvedAuth::ApiKey(secret)) => {
+                redactor = redactor.with_literal("route-credential", secret)
+            }
+            Some(ResolvedAuth::AwsSigv4 {
+                access_key,
+                secret_key,
+                session_token,
+                ..
+            }) => {
+                redactor = redactor
+                    .with_literal("route-access-key", access_key)
+                    .with_literal("route-secret-key", secret_key);
+                if let Some(secret) = session_token {
+                    redactor = redactor.with_literal("route-session-token", secret);
+                }
+            }
+        }
+    }
+    redactor
+}
+
 fn safe_request_id() -> String {
     let bytes: [u8; 16] = rand::random();
     let mut id = String::with_capacity(32);
@@ -775,14 +999,6 @@ struct UsagePublication {
     latency_ms: u64,
     cache_hit: bool,
     prices: Option<(Option<u64>, Option<u64>)>,
-}
-
-async fn publish_usage(
-    state: &ProxyState,
-    identity: Arc<WorkloadIdentity>,
-    usage: UsagePublication,
-) {
-    publish_event(state.bus.clone(), identity, usage).await;
 }
 
 async fn publish_event(
@@ -821,8 +1037,16 @@ async fn publish_event(
             .as_millis() as u64,
         cost_micros,
     };
-    if let Err(error) = bus.publish_usage(&event).await {
-        tracing::warn!(error = %error, "failed to publish egress usage event");
+    // The request ID is the JetStream dedup key, so a retry after a lost
+    // acknowledgement is not counted twice.
+    for attempt in 1..=USAGE_PUBLISH_ATTEMPTS {
+        match tokio::time::timeout(USAGE_PUBLISH_TIMEOUT, bus.publish_usage(&event)).await {
+            Ok(Ok(())) => return,
+            Ok(Err(error)) => {
+                tracing::warn!(attempt, error = %error, "failed to publish egress usage event")
+            }
+            Err(_) => tracing::warn!(attempt, "egress usage event publish timed out"),
+        }
     }
 }
 
@@ -894,16 +1118,140 @@ pub struct UsageCounts {
 
 const MAX_USAGE_EVENT_BYTES: usize = 64 * 1024;
 
+/// Which top-level JSON field a [`TopLevelFields`] capture belongs to.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Field {
+    Usage,
+    Model,
+}
+
+/// Streams JSON objects byte by byte and keeps the raw value of each
+/// object's top-level `usage` and `model` fields, so a `"usage"` inside a
+/// string or a nested object is never mistaken for the provider's counts.
+/// State stays bounded: a value longer than [`MAX_USAGE_EVENT_BYTES`] is
+/// dropped, whatever the transport's chunk sizes.
+#[derive(Default)]
+struct TopLevelFields {
+    depth: u32,
+    in_string: bool,
+    escaped: bool,
+    expect_key: bool,
+    reading_key: bool,
+    key: Vec<u8>,
+    pending: Option<Field>,
+    capture: Option<Field>,
+    value: Vec<u8>,
+    value_overflow: bool,
+    usage: Option<Vec<u8>>,
+    model: Option<Vec<u8>>,
+}
+
+impl TopLevelFields {
+    fn push(&mut self, chunk: &[u8]) {
+        for &byte in chunk {
+            self.push_byte(byte);
+        }
+    }
+
+    fn capture_byte(&mut self, byte: u8) {
+        if self.value.len() == MAX_USAGE_EVENT_BYTES {
+            self.value_overflow = true;
+            self.value.clear();
+        } else if !self.value_overflow {
+            self.value.push(byte);
+        }
+    }
+
+    fn key_byte(&mut self, byte: u8) {
+        // Longer keys are never `usage` or `model`.
+        if self.key.len() <= 8 {
+            self.key.push(byte);
+        }
+    }
+
+    fn push_byte(&mut self, byte: u8) {
+        if self.in_string {
+            if self.capture.is_some() {
+                self.capture_byte(byte);
+            }
+            if self.escaped {
+                self.escaped = false;
+                if self.reading_key {
+                    self.key_byte(byte);
+                }
+            } else if byte == b'\\' {
+                self.escaped = true;
+                if self.reading_key {
+                    self.key_byte(byte);
+                }
+            } else if byte == b'"' {
+                self.in_string = false;
+                if self.reading_key {
+                    self.reading_key = false;
+                    self.pending = match self.key.as_slice() {
+                        b"usage" => Some(Field::Usage),
+                        b"model" => Some(Field::Model),
+                        _ => None,
+                    };
+                    self.key.clear();
+                }
+            } else if self.reading_key {
+                self.key_byte(byte);
+            }
+            return;
+        }
+        if let Some(field) = self.capture {
+            if self.depth == 1 && matches!(byte, b',' | b'}') {
+                let value = std::mem::take(&mut self.value);
+                if !std::mem::take(&mut self.value_overflow) {
+                    match field {
+                        Field::Usage => self.usage = Some(value),
+                        Field::Model => self.model = Some(value),
+                    }
+                }
+                self.capture = None;
+            } else {
+                self.capture_byte(byte);
+                match byte {
+                    b'"' => self.in_string = true,
+                    b'{' | b'[' => self.depth += 1,
+                    b'}' | b']' => self.depth = self.depth.saturating_sub(1),
+                    _ => {}
+                }
+                return;
+            }
+        }
+        match byte {
+            b'"' => {
+                self.in_string = true;
+                if self.depth == 1 && self.expect_key {
+                    self.expect_key = false;
+                    self.reading_key = true;
+                }
+            }
+            b'{' => {
+                self.depth += 1;
+                self.expect_key = self.depth == 1;
+            }
+            b'[' => self.depth += 1,
+            b'}' | b']' => self.depth = self.depth.saturating_sub(1),
+            b',' if self.depth == 1 => {
+                self.expect_key = true;
+                self.pending = None;
+            }
+            b':' if self.depth == 1 => self.capture = self.pending.take(),
+            _ => {}
+        }
+    }
+}
+
 struct UsageParser {
     is_sse: bool,
     line: Vec<u8>,
     event: Vec<u8>,
     line_overflow: bool,
     discard_event: bool,
-    json_scan: Vec<u8>,
-    json_usage_disabled: bool,
-    model_scan: Vec<u8>,
-    model_scan_disabled: bool,
+    fields: TopLevelFields,
     answered_model: Option<String>,
     usage: Option<UsageCounts>,
 }
@@ -916,69 +1264,47 @@ impl UsageParser {
             event: Vec::new(),
             line_overflow: false,
             discard_event: false,
-            json_scan: Vec::new(),
-            json_usage_disabled: false,
-            model_scan: Vec::new(),
-            model_scan_disabled: false,
+            fields: TopLevelFields::default(),
             answered_model: None,
             usage: None,
         }
     }
 
     fn push(&mut self, chunk: &[u8]) {
-        if !self.is_sse && self.answered_model.is_none() && !self.model_scan_disabled {
-            if chunk.len() > MAX_USAGE_EVENT_BYTES.saturating_sub(self.model_scan.len()) {
-                self.model_scan.clear();
-                self.model_scan_disabled = true;
-            } else {
-                self.model_scan.extend_from_slice(chunk);
-                self.answered_model = find_answered_model(&self.model_scan);
-                if self.answered_model.is_some() {
-                    self.model_scan.clear();
-                }
-            }
-        }
-        if self.is_sse {
-            for &byte in chunk {
-                if byte == b'\n' {
-                    if self.line_overflow {
-                        self.line_overflow = false;
-                        self.line.clear();
-                    } else {
-                        self.process_sse_line();
-                    }
-                } else if !self.line_overflow {
-                    if self.line.len() == MAX_USAGE_EVENT_BYTES {
-                        self.line.clear();
-                        self.event.clear();
-                        self.line_overflow = true;
-                        self.discard_event = true;
-                    } else {
-                        self.line.push(byte);
-                    }
-                }
-            }
-        } else if !self.json_usage_disabled && self.usage.is_none() {
-            if chunk.len() > MAX_USAGE_EVENT_BYTES.saturating_sub(self.json_scan.len()) {
-                self.json_scan.clear();
-                self.json_usage_disabled = true;
-                self.usage = None;
-            } else {
-                self.json_scan.extend_from_slice(chunk);
-                if let Some(usage) = find_usage_fragment(&self.json_scan) {
+        if !self.is_sse {
+            self.fields.push(chunk);
+            if let Some(raw) = self.fields.usage.take() {
+                let value = serde_json::from_slice::<serde_json::Value>(&raw).ok();
+                if let Some(usage) = usage_counts(value.as_ref()) {
                     self.record_usage(usage);
-                    self.json_scan.clear();
-                } else if let Some(marker) = self
-                    .json_scan
-                    .windows(b"\"usage\"".len())
-                    .position(|window| window == b"\"usage\"")
+                }
+            }
+            if let Some(raw) = self.fields.model.take() {
+                if let Some(model) = serde_json::from_slice::<String>(&raw)
+                    .ok()
+                    .filter(|model| !model.is_empty())
                 {
-                    if marker > 0 {
-                        self.json_scan.drain(..marker);
-                    }
-                } else if self.json_scan.len() > 16 {
-                    let keep_from = self.json_scan.len() - 16;
-                    self.json_scan.drain(..keep_from);
+                    self.answered_model = Some(model);
+                }
+            }
+            return;
+        }
+        for &byte in chunk {
+            if byte == b'\n' {
+                if self.line_overflow {
+                    self.line_overflow = false;
+                    self.line.clear();
+                } else {
+                    self.process_sse_line();
+                }
+            } else if !self.line_overflow {
+                if self.line.len() == MAX_USAGE_EVENT_BYTES {
+                    self.line.clear();
+                    self.event.clear();
+                    self.line_overflow = true;
+                    self.discard_event = true;
+                } else {
+                    self.line.push(byte);
                 }
             }
         }
@@ -1076,46 +1402,6 @@ fn find_answered_model(bytes: &[u8]) -> Option<String> {
         .map(str::to_owned)
 }
 
-fn find_usage_fragment(bytes: &[u8]) -> Option<UsageCounts> {
-    let marker = bytes
-        .windows(b"\"usage\"".len())
-        .position(|w| w == b"\"usage\"")?;
-    let open = bytes[marker + b"\"usage\"".len()..]
-        .iter()
-        .position(|byte| *byte == b'{')?
-        + marker
-        + b"\"usage\"".len();
-    let mut depth = 0_u32;
-    let mut in_string = false;
-    let mut escaped = false;
-    for (offset, &byte) in bytes[open..].iter().enumerate() {
-        if in_string {
-            if escaped {
-                escaped = false;
-            } else if byte == b'\\' {
-                escaped = true;
-            } else if byte == b'"' {
-                in_string = false;
-            }
-            continue;
-        }
-        match byte {
-            b'"' => in_string = true,
-            b'{' => depth += 1,
-            b'}' => {
-                depth -= 1;
-                if depth == 0 {
-                    let usage: serde_json::Value =
-                        serde_json::from_slice(&bytes[open..=open + offset]).ok()?;
-                    return usage_counts(Some(&usage));
-                }
-            }
-            _ => {}
-        }
-    }
-    None
-}
-
 fn usage_counts(usage: Option<&serde_json::Value>) -> Option<UsageCounts> {
     let usage = usage?;
     let input = usage
@@ -1168,14 +1454,20 @@ mod tests {
             Budget::new(1_000_000, Duration::from_secs(3600)),
         );
         budgets.register("limited-agent", Budget::new(10, Duration::from_secs(3600)));
+        // Test upstreams listen on loopback, which routes refuse by default.
+        let config = EgressProxyConfig {
+            allowed_route_cidrs: vec!["127.0.0.0/8".parse().unwrap()],
+            ..Default::default()
+        };
         Arc::new(ProxyState {
-            config: EgressProxyConfig::default(),
+            route_client: route_client(&config),
+            config,
             budgets,
             cache: Some(Arc::new(ResponseCache::new(CacheConfig::default()))),
             redactor: SecretRedactor::with_defaults(),
             client: reqwest::Client::new(),
             tokens: Arc::new(SandboxTokens::new()),
-            bus: None,
+            bus: std::sync::OnceLock::new(),
         })
     }
 
@@ -1414,7 +1706,7 @@ mod tests {
     fn parses_openai_and_anthropic_json_usage() {
         let openai = br#"{"usage":{"prompt_tokens":12,"completion_tokens":7,"total_tokens":19}}"#;
         assert_eq!(
-            find_usage_fragment(openai),
+            find_usage(openai),
             Some(UsageCounts {
                 input_tokens: 12,
                 output_tokens: 7,
@@ -1519,13 +1811,13 @@ mod tests {
     }
 
     #[test]
-    fn json_usage_parser_disables_oversized_usage_and_falls_back() {
+    fn json_usage_parser_drops_an_oversized_usage_value_and_falls_back() {
         let mut parser = UsageParser::new(false);
         parser.push(br#"{"usage":{"#);
-        let oversized = vec![b' '; MAX_USAGE_EVENT_BYTES];
+        let oversized = vec![b' '; MAX_USAGE_EVENT_BYTES + 1];
         parser.push(&oversized);
-        assert!(parser.json_usage_disabled);
-        assert!(parser.json_scan.is_empty());
+        parser.push(br#""prompt_tokens":1}}"#);
+        assert!(parser.fields.value.len() <= MAX_USAGE_EVENT_BYTES);
         assert_eq!(
             parser.finish_with_model(40).0,
             UsageCounts {
@@ -1534,6 +1826,30 @@ mod tests {
                 estimated: true,
             }
         );
+    }
+
+    #[test]
+    fn json_usage_parser_reads_only_the_top_level_field_in_any_chunking() {
+        // A choice whose text is "usage" and a nested usage object come first.
+        let filler = "x".repeat(MAX_USAGE_EVENT_BYTES * 2);
+        let body = format!(
+            r#"{{"choices":[{{"text":"\"usage\":{{\"prompt_tokens\":99}}","usage":{{"prompt_tokens":98}}}},{{"text":"{filler}"}}],"model":"m-1","usage":{{"prompt_tokens":12,"completion_tokens":7}}}}"#
+        );
+        let want = UsageCounts {
+            input_tokens: 12,
+            output_tokens: 7,
+            estimated: false,
+        };
+        for chunk in [1, 7, body.len()] {
+            let mut parser = UsageParser::new(false);
+            for part in body.as_bytes().chunks(chunk) {
+                parser.push(part);
+            }
+            let (counts, model) = parser.finish_with_model(body.len() as u64);
+            assert_eq!(counts, want, "chunk size {chunk}");
+            assert_eq!(model.as_deref(), Some("m-1"));
+        }
+        assert_eq!(find_usage(body.as_bytes()), Some(want));
     }
 
     #[test]
@@ -1561,7 +1877,7 @@ mod tests {
                     tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(2);
                 tokio::spawn(async move {
                     let _ = sender.send(Ok(Bytes::from_static(b"first\n"))).await;
-                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    tokio::time::sleep(Duration::from_secs(1)).await;
                     let _ = sender.send(Ok(Bytes::from_static(b"second\n"))).await;
                 });
                 Response::builder()
@@ -1606,7 +1922,8 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(first.as_ref(), b"first\n");
-        assert_eq!(proxy.cache_stats().unwrap().stores, 0);
+        while body.next().await.is_some() {}
+        assert_eq!(proxy.cache_stats().unwrap().stores, 0, "not cached at EOF");
         proxy.shutdown();
     }
 
@@ -1632,8 +1949,9 @@ mod tests {
             cache: None,
             redactor: SecretRedactor::with_defaults(),
             client: reqwest::Client::new(),
+            route_client: None,
             tokens: Arc::new(SandboxTokens::new()),
-            bus: None,
+            bus: std::sync::OnceLock::new(),
         });
         let resp = error_response(&state, StatusCode::BAD_REQUEST, "plain error");
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
@@ -1833,5 +2151,291 @@ mod tests {
             ..Default::default()
         };
         assert!(!format!("{config:?}").contains("provider-key"));
+    }
+
+    fn route_policy(name: &str, upstream: String) -> crate::routes::ResolvedEgressPolicy {
+        let mut policy = crate::routes::ResolvedEgressPolicy::default();
+        policy.routes.insert(
+            name.into(),
+            ResolvedRoute {
+                name: name.into(),
+                upstream_url: upstream,
+                auth: None,
+                fallback: Vec::new(),
+                input_price_micros_per_million: None,
+                output_price_micros_per_million: None,
+            },
+        );
+        policy
+    }
+
+    fn routed_token(
+        state: &Arc<ProxyState>,
+        workload: &str,
+        policy: crate::routes::ResolvedEgressPolicy,
+    ) -> crate::identity::SandboxToken {
+        state.tokens.issue_identity(WorkloadIdentity {
+            workload_id: workload.into(),
+            tenant_id: "default".into(),
+            service_id: workload.into(),
+            policy: Some(policy),
+        })
+    }
+
+    fn post(token: &str, body: &'static str) -> Request {
+        Request::builder()
+            .method("POST")
+            .uri("/v1/chat")
+            .header(SANDBOX_TOKEN_HEADER, token)
+            .body(Body::from(body))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn routes_refuse_private_destinations_and_redirects_unless_allowed() {
+        let app = Router::new()
+            .route(
+                "/v1/redirect",
+                any(|| async {
+                    Response::builder()
+                        .status(StatusCode::FOUND)
+                        .header("location", "http://169.254.169.254/latest")
+                        .body(Body::empty())
+                        .unwrap()
+                }),
+            )
+            .route("/v1/chat", any(|| async { "ok" }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.ok() });
+
+        // Default config: a literal loopback upstream is refused.
+        let mut denied = test_state();
+        Arc::get_mut(&mut denied)
+            .unwrap()
+            .config
+            .allowed_route_cidrs
+            .clear();
+        let token = routed_token(
+            &denied,
+            "test-agent",
+            route_policy("primary", format!("http://{address}")),
+        );
+        assert_eq!(
+            proxy_handler(State(Arc::clone(&denied)), post(token.as_str(), "{}"))
+                .await
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        for ip in [
+            "127.0.0.1",
+            "10.1.2.3",
+            "169.254.169.254",
+            "0.0.0.0",
+            "224.0.0.1",
+        ] {
+            assert!(!destination_allowed(ip.parse().unwrap(), &[]), "{ip}");
+        }
+        for ip in ["::1", "fe80::1", "fd00::1", "::ffff:127.0.0.1"] {
+            assert!(!destination_allowed(ip.parse().unwrap(), &[]), "{ip}");
+        }
+        assert!(destination_allowed("8.8.8.8".parse().unwrap(), &[]));
+
+        // An allowlisted CIDR works, and a redirect is returned, not followed.
+        let allowed = test_state();
+        let token = routed_token(
+            &allowed,
+            "test-agent",
+            route_policy("primary", format!("http://{address}")),
+        );
+        let response = proxy_handler(State(Arc::clone(&allowed)), post(token.as_str(), "{}")).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let redirect = Request::builder()
+            .method("POST")
+            .uri("/v1/redirect")
+            .header(SANDBOX_TOKEN_HEADER, token.as_str())
+            .body(Body::from("{}"))
+            .unwrap();
+        assert_eq!(
+            proxy_handler(State(allowed), redirect).await.status(),
+            StatusCode::FOUND
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_requests_cannot_spend_the_same_budget() {
+        let (release, released) = tokio::sync::watch::channel(false);
+        let (arrived_tx, mut arrived) = tokio::sync::mpsc::channel::<()>(4);
+        let app = Router::new().route(
+            "/*path",
+            any(move || {
+                let mut released = released.clone();
+                let arrived = arrived_tx.clone();
+                async move {
+                    let _ = arrived.send(()).await;
+                    let _ = released.wait_for(|go| *go).await;
+                    r#"{"usage":{"prompt_tokens":3,"completion_tokens":2}}"#
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.ok() });
+
+        let state = test_state();
+        state
+            .budgets
+            .register("pair", Budget::new(100, Duration::from_secs(3600)));
+        let token = routed_token(
+            &state,
+            "pair",
+            route_policy("primary", format!("http://{address}")),
+        );
+        // Each request holds its 60-token output cap while in flight.
+        let body = r#"{"max_tokens":60}"#;
+        let first = tokio::spawn(proxy_handler(
+            State(Arc::clone(&state)),
+            post(token.as_str(), body),
+        ));
+        arrived.recv().await.unwrap();
+        let second = proxy_handler(State(Arc::clone(&state)), post(token.as_str(), body)).await;
+        assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+        release.send(true).unwrap();
+        assert_eq!(first.await.unwrap().status(), StatusCode::OK);
+        // The reservation settled to the provider's counts.
+        assert_eq!(state.budgets.status("pair").unwrap().used, 5);
+    }
+
+    #[tokio::test]
+    async fn upstream_error_streams_are_buffered_and_redacted_whole() {
+        let key = "route-key-Zq9";
+        let app = Router::new().route(
+            "/*path",
+            any(move || async move {
+                // The key straddles two chunks of an event stream.
+                let (sender, receiver) =
+                    tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(2);
+                tokio::spawn(async move {
+                    let _ = sender
+                        .send(Ok(bytes::Bytes::from(format!("bad {}", &key[..5]))))
+                        .await;
+                    let _ = sender
+                        .send(Ok(bytes::Bytes::from(key[5..].to_string())))
+                        .await;
+                });
+                Response::builder()
+                    .status(StatusCode::UNAUTHORIZED)
+                    .header("content-type", "text/event-stream")
+                    .body(Body::from_stream(
+                        tokio_stream::wrappers::ReceiverStream::new(receiver),
+                    ))
+                    .unwrap()
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.ok() });
+        let state = test_state();
+        let mut policy = route_policy("primary", format!("http://{address}"));
+        policy.routes.get_mut("primary").unwrap().auth = Some(ResolvedAuth::ApiKey(key.into()));
+        let token = routed_token(&state, "test-agent", policy);
+        let response =
+            proxy_handler(State(state), post(token.as_str(), r#"{"stream":true}"#)).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&body);
+        assert!(!body.contains(key), "key leaked: {body}");
+        assert!(body.contains("***REDACTED***"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn oversized_identifiers_are_rejected() {
+        let state = test_state();
+        let token = routed_token(
+            &state,
+            "test-agent",
+            route_policy("primary", "http://127.0.0.1:1".into()),
+        );
+        let long = "m".repeat(257);
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat")
+            .header(SANDBOX_TOKEN_HEADER, token.as_str())
+            .header("x-minga-customer", long.as_str())
+            .body(Body::from("{}"))
+            .unwrap();
+        assert_eq!(
+            proxy_handler(State(Arc::clone(&state)), request)
+                .await
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+        let body: &'static str = Box::leak(format!(r#"{{"model":"{long}"}}"#).into_boxed_str());
+        assert_eq!(
+            proxy_handler(State(state), post(token.as_str(), body))
+                .await
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[tokio::test]
+    async fn a_changed_route_does_not_hit_the_old_cache_entry() {
+        let mut addresses = Vec::new();
+        for answer in ["old provider", "new provider"] {
+            let app = Router::new().route("/*path", any(move || async move { answer }));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            addresses.push(listener.local_addr().unwrap());
+            tokio::spawn(async move { axum::serve(listener, app).await.ok() });
+        }
+        let state = test_state();
+        for (address, want) in addresses.iter().zip(["old provider", "new provider"]) {
+            // Same task ID and route name, restarted with a new upstream.
+            let token = routed_token(
+                &state,
+                "test-agent",
+                route_policy("primary", format!("http://{address}")),
+            );
+            let response =
+                proxy_handler(State(Arc::clone(&state)), post(token.as_str(), "{}")).await;
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert_eq!(&body[..], want.as_bytes());
+        }
+    }
+
+    #[tokio::test]
+    async fn registered_routed_task_first_request_is_admitted() {
+        let app = Router::new().route("/*path", any(|| async { "ok" }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.ok() });
+        let state = test_state();
+        let token = routed_token(
+            &state,
+            "fresh-task",
+            route_policy("primary", format!("http://{address}")),
+        );
+        assert_eq!(
+            proxy_handler(State(Arc::clone(&state)), post(token.as_str(), "{}"))
+                .await
+                .status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "an unregistered workload has no budget"
+        );
+        // What the node runtime registers before a routed task starts.
+        state.budgets.register(
+            "fresh-task",
+            Budget::new(u64::MAX, Duration::from_secs(3600)),
+        );
+        assert_eq!(
+            proxy_handler(State(state), post(token.as_str(), "{}"))
+                .await
+                .status(),
+            StatusCode::OK
+        );
     }
 }

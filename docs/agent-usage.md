@@ -34,8 +34,20 @@ services:
 
 The proxy runs only on workers started with `--egress-bind` (for example `0.0.0.0:8080`), and services with routes are placed only on those workers. The runtime sets `MINGA_EGRESS_URL` to the task's bridge gateway at the bind's port. Tokens live only in worker memory: after a worker restart, routed containers are stopped and restarted with a fresh token instead of being adopted, and a stopped task's token is revoked as soon as its process is gone. Each workload reads its token from `/run/minga/egress-token` and sends it as `X-Minga-Sandbox-Token`. Select a route with `X-Minga-Route`; if exactly one route is configured, the header is optional. Model allow-list patterns are exact names or a single trailing `*`; when configured, requests must include a top-level JSON `model` field. Failover occurs only on connect errors, HTTP 429, and 5xx responses. A required policy blocks other direct task egress, including same-bridge peers, while allowing the node's bridge DNS and proxy and replies to connections made to the task. The nft rules match the task bridge and the task's own source address, which the per-veth source guard pins, because with `br_netfilter` the inet hooks see the bridge rather than the veth. Model allow-lists are policy checks, not proof of data residency.
 
-Supported auth schemes are `bearer`, `api_key`, and `aws_sigv4`. SigV4 uses `access_key_secret`, `secret_key_secret`, optional `session_token_secret`, `region`, and `service`; all are secret IDs. Costs are integer microdollars per million input/output tokens and are omitted unless both prices are configured.
+Supported auth schemes are `bearer`, `api_key`, and `aws_sigv4`. SigV4 uses the secret IDs `access_key_secret`, `secret_key_secret`, and optional `session_token_secret`, and the literal strings `region` and `service`. Every secret ID must belong to the service's tenant. Costs are integer microdollars per million input/output tokens and are omitted unless both prices are configured.
 
 Service and task egress policies are persisted from state format v10. Worker assignments carry the format version, so an older worker refuses a task with a policy instead of dropping it; upgrade every node together.
 
 `bearer` sets `Authorization: Bearer …`; `api_key` sets `x-api-key`. The proxy replaces any workload-supplied values for the selected auth headers.
+
+### Proxy limits
+
+- Route destinations: tenant routes never follow redirects, ignore system proxy settings, and refuse loopback, link-local, unspecified, multicast, broadcast and private or unique-local addresses, both as literal hosts and in DNS answers at connect time, unless the worker allows the range with `--egress-allow-cidr`.
+- Request identifiers: `x-minga-customer`, `x-minga-model`, `x-minga-route` and the body `model` are limited to 256 bytes (400 otherwise); Compose route names are limited to 256 bytes too.
+- Bodies: a non-streamed upstream response is buffered up to 32 MiB (502 beyond). An upstream error response is buffered whole, up to 64 KiB, and redacted before any byte reaches the caller; larger error bodies become a generic 502. Success streams stay incremental, and a stream that is idle for 60 seconds ends.
+- Budgets: admission reserves the input estimate (body bytes / 4) plus any `max_tokens` or `max_completion_tokens`, so concurrent requests cannot spend the same balance. The reservation settles to the provider's counts when the response ends and is released if the request fails before reaching the provider. A client that disconnects mid-stream does not stop the upstream read, so provider-reported usage is still recorded.
+- Usage counts are read from the top-level JSON `usage` field (or `message.usage` in Anthropic events), never from a `"usage"` string elsewhere in the body.
+- Cache entries are keyed by workload, route and an opaque revision of the route settings (no credential values), and the cache is bounded by entry count and by 64 MiB of cached bytes.
+- Usage events are published after the response ends, with a 5-second deadline and up to three attempts under the same `Nats-Msg-Id`.
+
+Usage totals are not billing-grade: prices come from the tenant's own Compose file and token counts from the upstream the tenant chose. When the usage stream reaches its byte or age limit, JetStream drops the oldest events.

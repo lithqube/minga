@@ -64,6 +64,38 @@ impl ResolvedEgressPolicy {
             })
     }
 
+    /// An opaque revision of the policy's non-secret settings. Cache keys
+    /// carry it, so a task restarted with a changed route never sees the
+    /// old provider's entries. Credential values are not part of it.
+    pub fn revision(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        let mut names: Vec<&String> = self.routes.keys().collect();
+        names.sort();
+        for name in names {
+            let route = &self.routes[name];
+            route.name.hash(&mut hasher);
+            route.upstream_url.hash(&mut hasher);
+            route.fallback.hash(&mut hasher);
+            route.input_price_micros_per_million.hash(&mut hasher);
+            route.output_price_micros_per_million.hash(&mut hasher);
+            match &route.auth {
+                None => 0u8.hash(&mut hasher),
+                Some(ResolvedAuth::Bearer(_)) => 1u8.hash(&mut hasher),
+                Some(ResolvedAuth::ApiKey(_)) => 2u8.hash(&mut hasher),
+                Some(ResolvedAuth::AwsSigv4 {
+                    region, service, ..
+                }) => {
+                    3u8.hash(&mut hasher);
+                    region.hash(&mut hasher);
+                    service.hash(&mut hasher);
+                }
+            }
+        }
+        self.models.hash(&mut hasher);
+        hasher.finish()
+    }
+
     /// Resolve a route name and all fallback names without cycles.
     pub fn route_chain(&self, first: &str) -> Result<Vec<&ResolvedRoute>, String> {
         let mut names = vec![first.to_string()];

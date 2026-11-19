@@ -30,7 +30,7 @@ mod proxy;
 mod redact;
 mod routes;
 
-pub use budget::{Budget, BudgetStatus, BudgetTracker, BudgetTrackerError};
+pub use budget::{Budget, BudgetStatus, BudgetTracker, BudgetTrackerError, Reservation};
 pub use cache::{CacheConfig, CacheStats, ResponseCache};
 pub use identity::{SandboxToken, SandboxTokens, SANDBOX_TOKEN_HEADER};
 pub use proxy::{EgressProxy, EgressProxyConfig, EgressProxyError, UpstreamAuth, UsageCounts};

@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- Tenant egress routes no longer follow redirects or system proxies and
+  refuse loopback, link-local, private, unspecified and multicast
+  destinations (literal or resolved) unless `--egress-allow-cidr` allows
+  them.
+- Egress budget admission reserves estimated tokens and settles them to the
+  provider's counts, so concurrent requests cannot overspend. Upstream error
+  bodies are buffered (64 KiB) and redacted whole instead of streamed;
+  non-streamed bodies are capped at 32 MiB; a failed body read is charged
+  like a transport error; streams have an idle timeout and keep draining
+  after a client disconnects. Usage is read from the top-level JSON field,
+  cache keys carry a route revision, the cache is bounded by bytes, usage
+  publication is bounded and retried, and customer, model and route names
+  are capped at 256 bytes. `EgressProxy::with_event_bus` now returns a
+  `Result` and works after `router()` was called.
 - The worker egress proxy is opt-in: `--egress-bind` has no default, so a
   worker without it no longer takes port 8080. Any bind is accepted; tasks use
   its port on their bridge gateway, and on Linux an nft table closes it to

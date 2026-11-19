@@ -410,6 +410,11 @@ struct NodeArgs {
     /// Services with egress routes are placed only on nodes that set it.
     #[arg(long)]
     egress_bind: Option<String>,
+    /// Repeatable CIDR a tenant egress route may reach although it is
+    /// loopback, link-local, private, unspecified or multicast (refused by
+    /// default), e.g. an on-prem model gateway.
+    #[arg(long = "egress-allow-cidr", value_name = "CIDR")]
+    egress_allow_cidrs: Vec<ipnet::IpNet>,
     /// Upstream LLM API URL for the egress proxy.
     #[arg(long, default_value = "https://api.openai.com")]
     egress_upstream: String,
@@ -2165,10 +2170,19 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
             cache_config: Some(minga_egress::CacheConfig::default()),
             redact_errors: true,
             upstream_auth,
+            allowed_route_cidrs: args.egress_allow_cidrs.clone(),
+            ..Default::default()
         };
-        let mut proxy =
+        let proxy =
             minga_egress::EgressProxy::new(config, egress_budgets.clone(), egress_tokens.clone())
                 .with_event_bus(bus.clone());
+        let mut proxy = match proxy {
+            Ok(proxy) => proxy,
+            Err(e) => {
+                eprintln!("error: cannot configure egress proxy: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
         match proxy.start(bind).await {
             Ok(addr) => {
                 println!("LLM egress proxy listening on http://{addr}");
@@ -2677,6 +2691,7 @@ async fn run_egress(args: EgressArgs) -> ExitCode {
         },
         redact_errors: true,
         upstream_auth,
+        ..Default::default()
     };
 
     // No agent executor here to mint tokens, so mint one for "default".

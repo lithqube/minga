@@ -17,6 +17,7 @@ aws-smithy-runtime-api.workspace = true
 minga-bus = { path = "../minga-bus" }
 minga-state = { path = "../minga-state" }
 minga-telemetry = { path = "../minga-telemetry" }
+ipnet.workspace = true
 lru.workspace = true
 rand.workspace = true
 regex.workspace = true
