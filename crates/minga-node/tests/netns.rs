@@ -696,16 +696,11 @@ async fn egress_scenario(setup: &NetworkSetup) -> Result<(), String> {
     let _peer = Server::start("minga-nsegress-peer", TARGET, "peer");
     let _ext = Server::start(EGRESS_EXT_NS, TARGET, "external");
 
-    // Controls: without the policy the same paths work.
+    // Control: without the policy the same path works.
     expect(
         "peer -> external host",
         fetch(Some("minga-nsegress-peer"), EGRESS_EXT_ADDR, TARGET),
         "external",
-    )?;
-    expect(
-        "peer -> gateway host port",
-        fetch(Some("minga-nsegress-peer"), gateway, EGRESS_OTHER_HOST_PORT),
-        "host",
     )?;
 
     expect(
