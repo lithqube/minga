@@ -3,7 +3,7 @@ phase: 13
 title: WireGuard mesh and routing mesh
 depends_on: ["12"]
 requirements: [WG-ADR, WG-SUBNET, WG-KEYS, WG-PEERS, WG-NAT, WG-ISOL, WG-INGRESS, WG-PROOF]
-status: in_progress
+status: complete
 ---
 
 # Phase 13 — WireGuard mesh and routing mesh
@@ -63,16 +63,16 @@ status: in_progress
 Order: 13-01 first. 13-02 is independent of Phase 12 and can start any time. 13-03 → 13-04 → 13-05 need Phase 12's 12-02 (registration) and 12-04 (`MINGA_ASSIGN` and its write permissions). 13-06 needs 13-04. 13-07 comes last.
 
 ### 13-01 — ADR 0007: WireGuard mesh and routing mesh
-- [ ] Write `docs/adr/0007-wireguard-mesh.md` with decisions 1–11, the rejected options (VXLAN over WireGuard, a full mesh, IPVS, the userspace data path), and the relay trust statement.
+- [x] Write `docs/adr/0007-wireguard-mesh.md` with decisions 1–11, the rejected options (VXLAN over WireGuard, a full mesh, IPVS, the userspace data path), and the relay trust statement.
 - **Done when:** the ADR is merged. No code changes in this plan.
 
 ### 13-02 — Unique subnets and strict network options (WG-SUBNET)
-- [ ] The leader allocates a free /24 when a network is created, on every path: Compose translate and the API's network create. It's stored in `Network.subnet`.
-- [ ] A Compose `ipam` subnet that overlaps another network gets a 409 with both names. The node no longer calls `allocate_subnet` for a network whose subnet isn't in Raft; it reports an error instead.
-- [ ] At startup, report existing colliding networks with the fix.
-- [ ] Add `--overlay-supernet`, refused when it overlaps the node's host routes.
-- [ ] Network `driver_opts`: accept `encrypted`, and fail loudly on anything else.
-- [ ] Tests: 300 networks get 256 distinct subnets and then a clear "supernet exhausted" error; an overlapping `ipam` subnet is refused; existing Compose fixtures still deploy unchanged.
+- [x] The leader allocates a free /24 when a network is created, on every path: Compose translate and the API's network create. It's stored in `Network.subnet`.
+- [x] A Compose `ipam` subnet that overlaps another network gets a 409 with both names. The node no longer calls `allocate_subnet` for a network whose subnet isn't in Raft; it reports an error instead.
+- [x] At startup, report existing colliding networks with the fix.
+- [x] Add `--overlay-supernet`, refused when it overlaps the node's host routes.
+- [x] Network `driver_opts`: accept `encrypted`, and fail loudly on anything else.
+- [x] Tests: 300 networks get 256 distinct subnets and then a clear "supernet exhausted" error; an overlapping `ipam` subnet is refused; existing Compose fixtures still deploy unchanged.
 - **Done when:** no code path can give two networks the same subnet.
 
 ### 13-03 — Node keys and the WireGuard interface (WG-KEYS)
@@ -84,27 +84,26 @@ Order: 13-01 first. 13-02 is independent of Phase 12 and can start any time. 13-
 - [x] Tests: key file mode, stable public key across restarts, and old `ClusterNode` rows decoding with no WireGuard fields.
 
 ### 13-04 — Peer sets, routes and cross-node isolation (WG-PEERS, WG-ISOL)
-- [ ] The leader computes each node's peer set (decision 4) from Raft placement, and writes `node.{id}.wg` when a placement or node changes. On election it re-derives the whole set, as 12-04 does for assignments.
-- [ ] The node applies a diff: peers, `AllowedIPs`, /32 routes, `proxy_arp` on overlay bridges, the MTU, MSS clamping, and the `minga-wg0 → bridge` FORWARD rules from decision 6. Teardown removes all of it.
-- [ ] DNS: records already include every task of a service (from cluster state through the 12-04 `net.{id}` data), so remote IPs resolve with no change. Check this with a test.
-- [ ] Tests in the real-kernel CI job, with three network namespaces acting as nodes, each with its own `minga-wg0`:
-  - Same-network ping and HTTP across "nodes", by name.
-  - A different-network task across "nodes" is blocked.
-  - A packet spoofing another node's task IP is dropped.
-  - A 64 KiB payload crosses without fragmentation errors.
-  - Removing a task removes its /32 everywhere.
+- [x] The leader computes each node's peer set (decision 4) from Raft placement, and writes `node.{id}.wg` when a placement or node changes. On election it re-derives the whole set, as 12-04 does for assignments.
+- [x] The node applies a diff: peers, `AllowedIPs`, /32 routes, `proxy_arp` on overlay bridges, the MTU, MSS clamping, and the `minga-wg0 → bridge` FORWARD rules from decision 6. Teardown removes all of it.
+- [x] DNS: records already include every task of a service (from cluster state through the 12-04 `net.{id}` data), so remote IPs resolve with no change. Check this with a test.
+- [x] Tests in the real-kernel CI job, with three network namespaces acting as nodes, each with its own `minga-wg0`:
+  - [x] Same-network ping and HTTP across "nodes", by name.
+  - [x] A different-network task across "nodes" is blocked.
+  - [x] A packet spoofing another node's task IP is dropped.
+  - [x] A 64 KiB payload crosses without fragmentation errors.
+  - [x] Removing a task removes its /32 everywhere.
 - **Done when:** the CI job proves all of the above, and never skips silently, like the existing real-kernel job.
 
 ### 13-05 — NAT traversal by relay (WG-NAT)
-- [ ] Keepalive from nodes without an endpoint. A manager in a multi-node cluster refuses to start without `--wg-endpoint`.
-- [ ] The leader marks each pair direct or relayed, and picks a home manager for each NAT'ed worker. That manager carries the relayed /32s, with `ip_forward` on and a FORWARD rule `minga-wg0 → minga-wg0` for overlay subnets only.
-- [ ] Failover: when the home manager's lease expires, the leader moves the relay to the next manager.
-- [ ] Tests in the same real-kernel job, with two "workers" behind iptables MASQUERADE that have no inbound path:
-  - Worker ↔ manager is direct.
-  - Worker ↔ worker relays through the home manager.
-  - Killing the home manager moves the relay within one lease TTL plus one handshake.
-  - A NAT'ed worker ↔ a reachable worker goes direct after the NAT'ed side's first handshake.
-
+- [x] Keepalive from nodes without an endpoint. A manager in a multi-node cluster refuses to start without `--wg-endpoint`.
+- [x] The leader marks each pair direct or relayed, and picks a home manager for each NAT'ed worker. That manager carries the relayed /32s, with `ip_forward` on and a FORWARD rule `minga-wg0 → minga-wg0` for overlay subnets only.
+- [x] Failover: when the home manager's lease expires, the leader moves the relay to the next manager.
+- [x] Tests in the same real-kernel job, with two "workers" behind iptables MASQUERADE that have no inbound path:
+  - [x] Worker ↔ manager is direct.
+  - [x] Worker ↔ worker relays through the home manager.
+  - [x] Killing the home manager moves the relay within one lease TTL plus one handshake.
+  - [x] A NAT'ed worker ↔ a reachable worker goes direct after the NAT'ed side's first handshake.
 ### 13-06 — Routing mesh (WG-INGRESS)
 - [x] Honor `ports[].mode`: `ingress` is the default, as in Swarm, and `host` keeps today's DNAT path.
 - [x] The scheduler reserves ingress ports cluster-wide and returns a 409 on conflict, including with ports a node reserves.
@@ -117,28 +116,27 @@ Order: 13-01 first. 13-02 is independent of Phase 12 and can start any time. 13-
   - [x] A port conflict returns a 409.
   - [x] Backends update when a task moves.
 - [x] The CHANGELOG states the behaviour change plainly: existing stacks with short-syntax ports now publish on every node.
-**Tenancy checklist (ADR 0008).** T1–T3 are implemented. T4 bus isolation and T5 quotas/audit remain open; these notes describe ingress behavior and remaining tenancy constraints.
-1. **Owner.** An ingress assignment is derived from the service that publishes the port. Port/protocol reservations are currently cluster-wide; the assignment keys still lack a tenant segment, which T4 must add.
-2. **Access.** The tenant-scoped service API and state-machine commit path return a generic cross-tenant port conflict without naming the other tenant's service. Same-tenant conflicts retain the service name.
-3. **Bus.** Only the leader writes assignments, and a worker reads its node's keys. The current node-only ACL is not tenant-scoped; T4 must add the tenant segment and constrain workers to their tenant.
-4. **Node.** T3 scopes WireGuard peers and routes by tenant and excludes managers from tenant workload placement in multi-tenant clusters. The ingress mesh still needs tenant-scoped port opening and backend exposure; cross-node behavior remains unsupported until the deferred VM proof passes.
-5. **Shared plane.** Writes are bounded by the number of published ingress ports (one assignment per node and port). There is no per-tenant port quota yet, so one tenant could claim the shared port space; tenancy needs a quota. A node's registered reserved ports are capped at 32 and validated.
-6. **Audit.** Assignment writes come from the leader's reconcile loop, not a user request. T5 still needs per-tenant audit records.
-7. **Test.** The T3 scheduler integration test covers tenant placement and WireGuard peer projection; no two-tenant ingress isolation test exists. Multi-VM proof remains deferred until release readiness.
+**Tenancy checklist (ADR 0008).** Phase 15 T1–T5 implementation is complete; Phase 15 T3 end-to-end tenant-isolation proof remains deferred until release readiness. See `.planning/STATE.md`.
+1. **Owner.** Ingress assignments derive from the publishing service; same-tenant conflicts retain the service name, while cross-tenant conflicts do not disclose the owning service.
+2. **Access.** Tenant-scoped service APIs return a generic cross-tenant port conflict.
+3. **Bus.** Tenant-first subjects, keys and worker ACLs are implemented; the Phase 15 state records the authorization scope.
+4. **Node.** T3 scopes WireGuard peers and routes by tenant and excludes managers from tenant workload placement in multi-tenant clusters.
+5. **Shared plane.** Ingress reservations remain cluster-wide; no per-tenant port quota is enforced.
+6. **Audit.** Per-tenant audit records and quotas are implemented by Phase 15 T5.
+7. **Test.** Scheduler tests cover tenant placement and WireGuard peer projection. End-to-end tenant placement and two-tenant ingress isolation still need release-readiness proof.
 
 ### 13-07 — Live proof, numbers and docs (WG-PROOF)
-Deferred until release readiness by user instruction. Do not run VM tests during Phase 15. The implementation through 13-06 is complete; cross-node networking remains unsupported until this proof passes.
-On separate VMs (OrbStack Ubuntu and others), with Raft mTLS and NATS mTLS:
-- [ ] **T2:** 1 manager plus 2 workers, one of them behind NAT (iptables MASQUERADE on its VM, no inbound path). Cross-node calls by name work in every direction, worker ↔ worker relays through the manager, and cutting the NAT'ed worker's network for 2 minutes recovers on its own.
-- [ ] **T3:** 3 managers plus 2 workers. Killing the home manager moves the relay, and traffic resumes.
-- [ ] Traefik on node A routes to a service whose only task is on node B, both through its swarm provider and through an ingress-published port.
-- [ ] Isolation: a task on network X on node A can't reach network Y on node B. A spoofed source is dropped.
-- [ ] Numbers: iperf3 throughput and latency between tasks over the mesh, compared with the underlay, both direct and relayed, recorded in `docs/benchmark.md`.
-- [ ] Docs:
-  - `docs/topologies.md`: cross-node traffic becomes supported, with the NAT and relay requirements, the open UDP port, the relay trust statement, and ingress versus host mode.
-  - `docs/architecture.md`: remove limit 5.
-  - CHANGELOG: known limits stated honestly.
-  - `site/src/data/roadmap.ts`: move the WireGuard mesh to shipped.
+The earlier deferral was lifted by the user's request to fully finish 13-07 after Phase 15 merged. Use isolated local OrbStack Ubuntu VMs; do not provision paid cloud infrastructure. Run with Raft mTLS and NATS mTLS.
+- [x] **T2:** One manager and two NAT-isolated workers with inbound UDP/51820 blocked. Worker-to-worker DNS and HTTP passed through the manager relay; ingress and Traefik routing reached the remote task. A 120-second network cut recovered without restarting the worker. Direct mode was separately measured with a reachable worker endpoint and covered in real-kernel CI.
+- [x] **T3:** Three managers and two NAT-only workers. Stopping home manager 1 moved the relay to manager 4; bidirectional task HTTP passed after WireGuard handshakes re-established.
+- [x] Traefik on node A routes to a service whose only task is on node B, both through its swarm provider and through an ingress-published port.
+- [x] Isolation: a task on network X on node A can't reach network Y on node B. A spoofed source is dropped.
+- [x] Numbers: iperf3 throughput and latency between tasks over the mesh, compared with the underlay, both direct and relayed, recorded in `docs/benchmark.md`.
+- [x] Docs:
+  - [x] `docs/topologies.md`: cross-node traffic becomes supported, with the NAT and relay requirements, the open UDP port, the relay trust statement, and ingress versus host mode.
+  - [x] `docs/architecture.md`: remove limit 5.
+  - [x] CHANGELOG: known limits stated honestly.
+  - [x] `site/src/data/roadmap.ts`: move the WireGuard mesh to shipped.
 - **Done when:** the evidence for each item above is recorded in `.planning/STATE.md`.
 
 ## Cross-cutting constraints

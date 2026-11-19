@@ -395,3 +395,23 @@ v1.0.2 (see above).
 - **Hardening costs** were not measured.
 - The Docker Compose and Swarm figures are from the original run on other
   hosts, not re-measured.
+
+## WireGuard multi-node live proof (2026-11-18)
+
+One OrbStack Ubuntu 24.04 arm64 run measured the direct and relayed WireGuard
+paths between worker task namespaces. Underlay was measured from the worker
+host to the other VM. Each iperf3 run lasted 10 seconds; RTT is the mean of
+20 ping samples.
+
+| Path | Throughput | Mean RTT | Setup |
+| --- | ---: | ---: | --- |
+| Direct WireGuard | 2.359 Gbit/s | 1.629 ms | Reachable worker endpoint; temporary direct mode |
+| Manager relay | 4.013 Gbit/s | 2.378 ms | Both workers behind NAT; relay via manager 4 during manager 1 outage |
+| Underlay | 74.411 Gbit/s | 0.157 ms | Host-to-host, outside task namespaces |
+
+These are single short samples from virtualized OrbStack networking, not
+hardware capacity estimates or statistically meaningful comparisons. The
+virtual NIC can report throughput far above physical network rates; do not use
+these values for capacity planning. The later relay rerun recovered after
+WireGuard handshakes re-established and carried HTTP in both worker-initiated
+directions. No equivalent production hardware or cloud benchmark was run.

@@ -89,12 +89,17 @@
   real v1.2.0 cluster migrated with its service and running container intact;
   the upgraded worker adopted the same task after joining as a bus client.
   See [supported topologies](docs/topologies.md) for evidence and limits.
-- Cross-node task networking now uses leader-projected WireGuard peer sets,
-  per-task `/32` routes and network isolation. Known limits: the live proof with
-  a worker behind NAT on separate VMs is still open, so cross-node traffic is
-  not yet a supported claim; T4’s roughly 5,000-worker scale has not been
-  load-tested; `MINGA_LOGS` remains single-replica and is unavailable while its
-  hosting server is down.
+- Cross-node task networking uses leader-projected WireGuard peer sets, per-task
+  `/32` routes and network isolation. OrbStack Ubuntu 24.04 T2/T3 live proofs
+  exercised NAT worker relays, manager relay failover, cross-network isolation,
+  anti-spoofing, Traefik Swarm-provider routing and ingress publishing.
+  Bidirectional task HTTP passed after relay handshakes re-established.
+  Relays decrypt and re-encrypt traffic and can inspect container payloads.
+  Manager rejoin after test credential updates failed with an NATS
+  authorization violation and needs release validation; T4 scale is untested
+  and `MINGA_LOGS` remains single-replica. See
+  [supported topologies](docs/topologies.md) and
+  [benchmark](docs/benchmark.md#wireguard-multi-node-live-proof-2026-11-18).
 - Network subnets are allocated by the Raft leader from the configurable
   `--overlay-supernet`; overlapping explicit IPAM ranges and unsupported
   network `driver_opts` fail loudly (`encrypted` remains a no-op).

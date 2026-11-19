@@ -74,9 +74,9 @@ The API waits for catch-up before promotion. Remove it with
 | `--nats-token`, `MINGA_NATS_TOKEN` | none | Development-only plaintext-loopback token authentication. Mutually exclusive with NATS JWT credentials. |
 | `MINGA_NATS_CREDENTIALS_FILE` | none | Owner-only NATS user `.creds` file for operator/JWT authentication; requires mTLS. |
 | `--nats-replicas <N>` | `1` | Copies of the event, status, lease, and assignment streams/buckets. Set 3 or 5 on a cluster with at least that many servers. Works with external NATS or route-TLS sidecars. |
+
 | `--nats-cluster-route <URL>` | none | Repeat for existing sidecar routes, e.g. `nats://manager-1:6222`. Requires route TLS. |
 | `--nats-cluster-cert`, `--nats-cluster-key`, `--nats-cluster-ca` | none | Route certificate, key, and peer CA for the built-in sidecar; required together and separate from client-facing TLS. `--nats-cluster-port` defaults to `6222`. |
-| `--nats-worker-id <ID>` | none | Worker IDs authorized by this sidecar's client-certificate mapping. |
 | `--label <KEY=VALUE>` | none | Advertised to the cluster; matched by `node.labels.KEY` placement constraints. |
 | `--overlay-supernet <CIDR>`, `MINGA_OVERLAY_SUPERNET` | `10.100.0.0/16` | Manager subnet-allocation range; must contain `/24`s and avoid host routes. Use the same range on every cluster node. |
 | `--wg-listen <PORT>` | `51820` | UDP listen port for this node's WireGuard interface. |
@@ -88,6 +88,9 @@ The API waits for catch-up before promotion. Remove it with
 | `--sandbox-runtime <mock\|wasmtime>`, `--module-dir <DIR>` | none, `/var/lib/minga/modules` | `wasmtime` enables `x-minga-agent` tasks on this node. |
 | `--agent-dir-root <DIR>` (repeatable) | none | Canonicalized allowlist for agent directory grants; no configured root permits no directory grants. Grants are validated only: the sandbox mounts no directories and links no WASI yet. |
 | `--egress-bind`, `--egress-upstream`, `--egress-credential`, `--egress-credential-header` | none, `https://api.openai.com`, none, `authorization` | Starts the LLM egress proxy for agent tasks. The credential is a secret ID in `--secret-store`; agents never see the key. |
+
+The built-in NATS sidecar caps JetStream file storage at 8GB (not preallocated). The MINGA account's JetStream disk limit must not exceed that cap.
+
 Each node generates `<data_dir>/wg.key` once with mode `0600`; the private key
 stays local. Registration advertises only its public key and optional endpoint.
 Delete `wg.key` and restart the node to rotate its key; its next lease updates
@@ -107,9 +110,14 @@ on workers, use the manager hostname from the URL (for example,
 If NATS user JWT authentication is enabled, also set
 `MINGA_NATS_CREDENTIALS_FILE` to an owner-only `.creds` file. JWT credentials
 require TLS and cannot be combined with `--nats-token` or `MINGA_NATS_TOKEN`.
-For the built-in sidecar, configure `MINGA_NATS_OPERATOR_JWT` and
-`MINGA_NATS_RESOLVER_DIR` on every manager. Add each client's account JWT to
-the resolver with the required NATS permissions.
+Every manager in operator/JWT mode needs owner-only operator JWT, account JWT
+and account seed files, a tenant signer directory and a full-resolver directory
+via `MINGA_NATS_OPERATOR_JWT`, `MINGA_NATS_ACCOUNT_JWT_FILE`,
+`MINGA_NATS_ACCOUNT_SEED_FILE`, `MINGA_NATS_TENANT_SIGNER_DIR` and
+`MINGA_NATS_RESOLVER_DIR`. Pass `--nats-sys-credentials-file` with SYS-user
+credentials; manager connections use a Minga-account `.creds` file through
+`MINGA_NATS_CREDENTIALS_FILE`. The API join-token endpoint issues the
+tenant-and-node-scoped worker credentials.
 
 Create the key once with `minga tls init-join-key --out FILE`, then copy it
 securely to every manager and set `MINGA_JOIN_TOKEN_KEY_FILE` to that

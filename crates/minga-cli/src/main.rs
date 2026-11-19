@@ -2188,6 +2188,7 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
             _ = minga_node::run_wireguard_assignments(
                 bus.clone(),
                 args.node_id,
+                &args.tenant_id,
                 wg_key_path.clone(),
                 args.wg_listen,
                 args.wg_mtu,
@@ -2206,6 +2207,7 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
             _ = minga_node::run_wireguard_assignments(
                 bus.clone(),
                 args.node_id,
+                &args.tenant_id,
                 wg_key_path,
                 args.wg_listen,
                 args.wg_mtu,

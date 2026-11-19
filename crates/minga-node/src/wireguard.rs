@@ -256,16 +256,21 @@ fn remove_interface() -> Result<(), WireGuardError> {
     Ok(())
 }
 
+fn wireguard_assignment_key(tenant_id: &str, node_id: u64) -> String {
+    format!("{tenant_id}.node.{node_id}.wg")
+}
 /// Watches this node's peer assignment and reconciles its WireGuard mesh.
 pub async fn run_wireguard_assignments(
     bus: Arc<dyn EventBus>,
     node_id: u64,
+    tenant_id: &str,
     key_path: PathBuf,
     listen_port: u16,
     mtu: u16,
 ) {
-    let key = format!("node.{node_id}.wg");
+    let key = wireguard_assignment_key(tenant_id, node_id);
     let mut current = None;
+
     loop {
         let mut assignments = match bus.watch_assignments(&key).await {
             Ok(assignments) => assignments,
@@ -695,6 +700,11 @@ fn apply_routes(set: &minga_net::wireguard::WireGuardPeerSet) -> Result<(), Wire
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wireguard_assignment_key_is_tenant_scoped() {
+        assert_eq!(wireguard_assignment_key("acme", 2), "acme.node.2.wg");
+    }
 
     #[test]
     fn generated_key_is_private_and_stable_across_restarts() {

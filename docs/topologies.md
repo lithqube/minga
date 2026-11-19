@@ -11,11 +11,10 @@ reference](cli.md).
 | [Air-gapped single host](#air-gapped) | Supported | The same binaries and steps as a single host; no separate validation run is recorded |
 | [Talos Linux, single node](#talos-linux) | Supported | Docker-provisioned Talos v1.14.5 (arm64) through workload start; bare metal not validated |
 | [Container image](#container-image) | Supported | Image verified on arm64 |
-| [Multi-node](#multi-node) | **Supported; T2 and T3 live-verified** | Raft mTLS, NATS client/route mTLS, worker partition/rejoin, manager failover and runtime membership changes on Ubuntu VMs. T4 scale remains untested. |
+| [Multi-node](#multi-node) | **Supported; T2 and T3 live-verified** | Raft mTLS, NATS client/route mTLS, worker partition/rejoin, cross-node ingress, isolation and manager-relay failover on OrbStack Ubuntu VMs. T4 scale remains untested. |
 
-Not supported: containers on different nodes reaching each other, nodes running
-different versions, and TLS on the API listener. See
-[what is not supported](#not-supported).
+Not supported: nodes running different versions and TLS on the API listener.
+See [what is not supported](#not-supported) for alternatives and limits.
 
 ## Single host
 
@@ -115,9 +114,12 @@ host, the installer is the simpler path.
 
 ## Multi-node
 
-Managers-only Raft and JetStream workers support T2–T4 cluster shapes. Services
-that communicate with each other still need to stay on one node: cross-node
-container networking is not available until the WireGuard mesh lands.
+Managers-only Raft, JetStream workers and cross-node container networking
+support T2–T4 cluster shapes. T2 and T3 have live VM evidence; T4 has not
+been load-tested. Cross-node tasks retain their network names and addresses
+over a node-level WireGuard L3 mesh. After test credential updates, a later
+manager-1 restart failed with an NATS authorization violation; verify rejoin
+after credential changes before release.
 
 ```mermaid
 flowchart TB
@@ -142,6 +144,19 @@ running a task while its replacement starts elsewhere. Both copies can run
 until the old worker reconnects and observes the smaller assignment set. This
 is intentional; there is no per-service “never reschedule on lease loss”
 option. See [ADR 0006](adr/0006-workers-leave-raft.md#11-bus-partitions-preserve-running-tasks).
+
+**WireGuard mesh and routing mesh**
+
+- Every manager in a multi-manager cluster needs a reachable UDP endpoint,
+  normally `--wg-endpoint <address>:51820`. Workers may omit an endpoint and
+  remain behind NAT; they keep outbound WireGuard sessions to managers.
+- Worker pairs connect directly when at least one endpoint is reachable.
+  Otherwise, the lowest-ID healthy manager relays their overlay traffic.
+  Relays decrypt and re-encrypt packets, so managers can inspect relayed
+  container payloads; treat managers as trusted.
+- Ingress-published ports answer on every node and route to task backends
+  across the mesh. `mode: host` remains node-local and preserves the client
+  address. The mesh does not implement UDP hole punching.
 
 **Managers**
 
@@ -188,14 +203,17 @@ option. See [ADR 0006](adr/0006-workers-leave-raft.md#11-bus-partitions-preserve
 - Named volumes live under that node’s `--data-dir/volumes`; a task moved to
   another node starts with an empty volume. Pin stateful services with a
   placement constraint.
-- Cross-node container networking is not available until the WireGuard mesh
-  lands. Keep communicating services on one node with placement constraints.
+- Cross-node networking requires WireGuard support in the Linux kernel and
+  the `wg` tool. Managers in a multi-manager cluster need reachable UDP
+  endpoints; NAT-isolated workers use manager relays. Keep manager hosts
+  trusted because relay traffic is visible. Verify manager rejoin after test
+  credential changes before release.
 
 ## Not supported
 
 | Currently unsupported | What to do instead |
 | --- | --- |
-| Containers on different nodes reaching each other | Keep services that talk to each other on one node with placement constraints. |
+| A multi-manager cluster with a manager lacking a reachable WireGuard endpoint | Configure `--wg-endpoint` and allow its UDP listen port (default 51820) from every node. |
 | Nodes on different Minga versions | Upgrade all nodes together. |
 | TLS on the API listener | Reach the API through SSH (`minga-ctl`) or keep it on a trusted network with a token. |
 | Read-only or per-user API access | One shared token; [ADR 0005](adr/0005-api-identity-and-roles.md) is the proposed design. |

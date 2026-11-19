@@ -602,6 +602,10 @@ async fn read_task_statuses(
             }
             continue;
         }
+        if !key.starts_with("node.") || !key.contains(".task.") {
+            continue;
+        }
+
         match TaskStatusReport::from_bytes(&bytes) {
             Ok(report) if key == subjects::kv_node_task_status(report.node_id, &report.task_id) => {
                 statuses.insert((tenant_id, report.task_id.clone()), report);
