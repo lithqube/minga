@@ -138,6 +138,11 @@ LLM egress handles few requests, each lasting seconds and dominated by the upstr
 | 5 | D11, D12 | Agent-driven ops. |
 | 6 | E14, E15, then [the WASM sandbox plan](sandbox-host-capabilities-plan.md) | Offline AI, then hardening for agents that can be ported. |
 
+The independent runtime-hardening step (shared Wasmtime runtime, module cache,
+epoch timeout and memory cap) is implemented and verified on
+`feat/agent-sandbox-capabilities`. WASI grants, HTTP egress and logs remain
+sequenced after order 6.
+
 ## Before any of this
 
 The downstream projects also cite Minga adoption blockers. Their notes were last checked between 2026-10-27 and 2026-11-03, so some may already be fixed. Verify each one first:

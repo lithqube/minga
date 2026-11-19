@@ -10,7 +10,7 @@ Be direct, be kind, assume good intent. Disagree with ideas, not people. Harassm
 
 ### Prerequisites
 
-- **Rust 1.80+** (stable) with the `rustfmt` and `clippy` components:
+- **Rust 1.97+** (stable) with the `rustfmt` and `clippy` components:
 
   ```bash
   rustup update stable
