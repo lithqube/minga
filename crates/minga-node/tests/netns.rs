@@ -11,8 +11,9 @@
 //! - a task on another network cannot reach the task's IP directly, but can
 //!   reach its published port through the node address;
 //! - publishing a node-owned port (53, the embedded DNS) is refused;
-//! - a required-egress task reaches only the proxy on its gateway, and the
-//!   proxy listener is closed to non-bridge interfaces (needs nft).
+//! - a required-egress task reaches only the proxy on its gateway, over
+//!   IPv4 and IPv6, and the proxy listener is closed to non-bridge
+//!   interfaces (needs nft).
 //!
 //! The "node address" is 198.51.100.7 added to `lo` (a LOCAL address that
 //! needs no real NIC); the "external host" is a namespace behind a veth at
@@ -25,6 +26,8 @@
 //!
 //! Cleanup removes the namespaces, the node address and the bridge; the
 //! bridge-level iptables rules (named after the bridge) are left behind.
+//! The egress scenario uses per-run names and removes the host-wide
+//! `minga_egress_listener` table only if it created it.
 
 #![cfg(target_os = "linux")]
 
@@ -45,11 +48,16 @@ const NETWORK: &str = "netns_test_default";
 const NETWORK2: &str = "netns_test_other";
 const EXT_NS: &str = "minga-nstest-ext";
 
+/// Args: port, word and an optional `6` for an IPv6-only listener.
 const SERVER: &str = r#"
 import socket, sys
 port, word = int(sys.argv[1]), sys.argv[2].encode()
-s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-s.bind(("0.0.0.0", port)); s.listen(8)
+v6 = sys.argv[3:] == ["6"]
+s = socket.socket(socket.AF_INET6 if v6 else socket.AF_INET)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+if v6:
+    s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+s.bind(("::" if v6 else "0.0.0.0", port)); s.listen(8)
 while True:
     c, _ = s.accept(); c.sendall(word); c.close()
 "#;
@@ -100,10 +108,18 @@ struct Server(Child);
 
 impl Server {
     fn start(ns: &str, port: u16, word: &str) -> Self {
+        Self::spawn(ns, port, word, "4")
+    }
+
+    fn start_v6(ns: &str, port: u16, word: &str) -> Self {
+        Self::spawn(ns, port, word, "6")
+    }
+
+    fn spawn(ns: &str, port: u16, word: &str, family: &str) -> Self {
         Server(
             Command::new("ip")
                 .args(["netns", "exec", ns, "python3", "-c", SERVER])
-                .args([&port.to_string(), word])
+                .args([&port.to_string(), word, family])
                 .stdout(Stdio::null())
                 .stderr(Stdio::inherit())
                 .spawn()
@@ -576,18 +592,81 @@ async fn ingress_port_reaches_each_backend_on_another_node() {
     result.expect("ingress backend routing");
 }
 
-const EGRESS_NETWORK: &str = "netns_test_egress";
 const EGRESS_PROXY: u16 = 18090;
 const EGRESS_OTHER_HOST_PORT: u16 = 18092;
-const EGRESS_EXT_NS: &str = "minga-nsegress-ext";
 const EGRESS_EXT_HOST: &str = "203.0.114.1";
 const EGRESS_EXT_ADDR: &str = "203.0.114.9";
+const EGRESS_GATEWAY6: &str = "fd00:233:7::1";
+const EGRESS_TASK6: &str = "fd00:233:7::10";
+const EGRESS_PEER6: &str = "fd00:233:7::11";
+
+/// Prints `blocked` only when the TCP connect fails; any other failure
+/// (no namespace, no python) fails the command instead.
+const CONNECT: &str = r#"
+import socket, sys
+try:
+    socket.create_connection((sys.argv[1], int(sys.argv[2])), timeout=3).close()
+except OSError:
+    print("blocked")
+else:
+    print("connected")
+"#;
+
+/// Per-run names, so cleanup never removes another run's fixtures, plus
+/// whether this run installed the host-wide listener table.
+struct EgressFixture {
+    network: String,
+    ext_ns: String,
+    host_veth: String,
+    ns_veth: String,
+    task: String,
+    peer: String,
+    owns_listener: bool,
+}
+
+impl EgressFixture {
+    fn new() -> Self {
+        let run = std::process::id();
+        Self {
+            network: format!("netns_test_egress_{run}"),
+            ext_ns: format!("minga-nsegress-ext-{run}"),
+            // IFNAMSIZ: at most 5 + 7 pid digits.
+            host_veth: format!("nsegh{run}"),
+            ns_veth: format!("nsegc{run}"),
+            task: format!("nsegress-task-{run}"),
+            peer: format!("nsegress-peer-{run}"),
+            owns_listener: false,
+        }
+    }
+
+    fn task_ns(&self) -> String {
+        format!("minga-{}", self.task)
+    }
+
+    fn peer_ns(&self) -> String {
+        format!("minga-{}", self.peer)
+    }
+
+    /// Removes what this run may have created; every name is unique to the
+    /// run, so a missing one is the only possible miss.
+    async fn cleanup(&self, setup: &NetworkSetup) {
+        for task in [&self.task, &self.peer] {
+            let _ = setup.teardown_task(task).await;
+        }
+        if self.owns_listener {
+            minga_node::netns::remove_egress_listener().await;
+        }
+        let _ = sh("ip", &["netns", "delete", &self.ext_ns]);
+        let _ = sh("ip", &["link", "del", &self.host_veth]);
+        let _ = sh("ip", &["link", "del", &bridge_name(&self.network)]);
+    }
+}
 
 /// Runs a python server on the host itself; killed on drop.
-fn host_server(port: u16, word: &str) -> Server {
+fn host_server(port: u16, word: &str, family: &str) -> Server {
     Server(
         Command::new("python3")
-            .args(["-c", SERVER, &port.to_string(), word])
+            .args(["-c", SERVER, &port.to_string(), word, family])
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
             .spawn()
@@ -604,37 +683,56 @@ fn refused(what: &str, ns: &str, addr: &str, port: u16) -> Result<(), String> {
             ns,
             "python3",
             "-c",
-            CLIENT,
+            CONNECT,
             addr,
             &port.to_string(),
         ],
     ) {
-        Err(_) => {
+        Ok(out) if out == "blocked" => {
             eprintln!("ok: {what} is refused");
             Ok(())
         }
-        Ok(body) => Err(format!("{what} was not refused: {body:?}")),
+        other => Err(format!("{what} was not refused: {other:?}")),
     }
 }
 
-async fn egress_scenario(setup: &NetworkSetup) -> Result<(), String> {
+/// The task's interface inside its namespace.
+fn ns_veth(ns: &str) -> Result<String, String> {
+    let links = sh("ip", &["-n", ns, "-o", "link", "show", "type", "veth"])?;
+    links
+        .lines()
+        .next()
+        .and_then(|line| line.split(": ").nth(1))
+        .and_then(|name| name.split('@').next())
+        .map(str::to_owned)
+        .ok_or_else(|| format!("no veth in {ns}: {links:?}"))
+}
+
+async fn egress_scenario(setup: &NetworkSetup, f: &mut EgressFixture) -> Result<(), String> {
     let subnet = Cidr::parse("10.233.7.0/24").unwrap();
     let gateway = "10.233.7.1";
     let attach = |ip: &str| {
         vec![TaskNetAttachment {
-            network_id: EGRESS_NETWORK.into(),
+            network_id: f.network.clone(),
             ip: ip.parse().unwrap(),
             subnet,
         }]
     };
-    sh("ip", &["netns", "add", EGRESS_EXT_NS])?;
+    sh("ip", &["netns", "add", &f.ext_ns])?;
     sh(
         "ip",
         &[
-            "link", "add", "nsegh", "type", "veth", "peer", "name", "nsegc",
+            "link",
+            "add",
+            &f.host_veth,
+            "type",
+            "veth",
+            "peer",
+            "name",
+            &f.ns_veth,
         ],
     )?;
-    sh("ip", &["link", "set", "nsegc", "netns", EGRESS_EXT_NS])?;
+    sh("ip", &["link", "set", &f.ns_veth, "netns", &f.ext_ns])?;
     sh(
         "ip",
         &[
@@ -642,29 +740,29 @@ async fn egress_scenario(setup: &NetworkSetup) -> Result<(), String> {
             "add",
             &format!("{EGRESS_EXT_HOST}/24"),
             "dev",
-            "nsegh",
+            &f.host_veth,
         ],
     )?;
-    sh("ip", &["link", "set", "nsegh", "up"])?;
-    sh("ip", &["-n", EGRESS_EXT_NS, "link", "set", "lo", "up"])?;
-    sh("ip", &["-n", EGRESS_EXT_NS, "link", "set", "nsegc", "up"])?;
+    sh("ip", &["link", "set", &f.host_veth, "up"])?;
+    sh("ip", &["-n", &f.ext_ns, "link", "set", "lo", "up"])?;
+    sh("ip", &["-n", &f.ext_ns, "link", "set", &f.ns_veth, "up"])?;
     sh(
         "ip",
         &[
             "-n",
-            EGRESS_EXT_NS,
+            &f.ext_ns,
             "addr",
             "add",
             &format!("{EGRESS_EXT_ADDR}/24"),
             "dev",
-            "nsegc",
+            &f.ns_veth,
         ],
     )?;
     sh(
         "ip",
         &[
             "-n",
-            EGRESS_EXT_NS,
+            &f.ext_ns,
             "route",
             "add",
             "default",
@@ -673,69 +771,178 @@ async fn egress_scenario(setup: &NetworkSetup) -> Result<(), String> {
         ],
     )?;
 
-    for (task, ip) in [
-        ("nsegress-task", "10.233.7.10"),
-        ("nsegress-peer", "10.233.7.11"),
-    ] {
+    for (task, ip) in [(&f.task, "10.233.7.10"), (&f.peer, "10.233.7.11")] {
         setup
             .setup_task(task, &attach(ip), &[], &[])
             .await
             .map_err(|e| e.to_string())?;
     }
     setup
-        .require_task_egress("nsegress-task")
+        .require_task_egress(&f.task)
         .await
         .map_err(|e| e.to_string())?;
-    minga_node::netns::restrict_egress_listener(EGRESS_PROXY)
-        .await
-        .map_err(|e| e.to_string())?;
+    // The listener table is host-wide: never replace one this run did not
+    // create.
+    let listener_preexists = sh("nft", &["list", "table", "inet", "minga_egress_listener"]).is_ok();
+    if listener_preexists {
+        eprintln!("SKIP: listener check, minga_egress_listener already exists on this host");
+    } else {
+        f.owns_listener = true;
+        minga_node::netns::restrict_egress_listener(EGRESS_PROXY)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
 
-    let _proxy = host_server(EGRESS_PROXY, "proxy");
-    let _other = host_server(EGRESS_OTHER_HOST_PORT, "host");
-    let _task = Server::start("minga-nsegress-task", TARGET, "task");
-    let _peer = Server::start("minga-nsegress-peer", TARGET, "peer");
-    let _ext = Server::start(EGRESS_EXT_NS, TARGET, "external");
-
-    // Control: without the policy the same path works.
-    expect(
-        "peer -> external host",
-        fetch(Some("minga-nsegress-peer"), EGRESS_EXT_ADDR, TARGET),
-        "external",
-    )?;
+    let task_ns = f.task_ns();
+    let peer_ns = f.peer_ns();
+    let _proxy = host_server(EGRESS_PROXY, "proxy", "4");
+    let _other = host_server(EGRESS_OTHER_HOST_PORT, "host", "4");
+    let _task = Server::start(&task_ns, TARGET, "task");
+    let _peer = Server::start(&peer_ns, TARGET, "peer");
+    let _ext = Server::start(&f.ext_ns, TARGET, "external");
 
     expect(
         "required-egress task -> gateway proxy",
-        fetch(Some("minga-nsegress-task"), gateway, EGRESS_PROXY),
+        fetch(Some(task_ns.as_str()), gateway, EGRESS_PROXY),
         "proxy",
     )?;
     expect(
         "peer -> required-egress task (reply path)",
-        fetch(Some("minga-nsegress-peer"), "10.233.7.10", TARGET),
+        fetch(Some(peer_ns.as_str()), "10.233.7.10", TARGET),
         "task",
+    )?;
+    // Each refusal follows a control: the same target answers an allowed
+    // source, so only the policy can refuse it.
+    expect(
+        "peer -> external host",
+        fetch(Some(peer_ns.as_str()), EGRESS_EXT_ADDR, TARGET),
+        "external",
     )?;
     refused(
         "required-egress task -> external host",
-        "minga-nsegress-task",
+        &task_ns,
         EGRESS_EXT_ADDR,
         TARGET,
     )?;
+    expect("host -> peer", fetch(None, "10.233.7.11", TARGET), "peer")?;
     refused(
         "required-egress task -> same-bridge peer",
-        "minga-nsegress-task",
+        &task_ns,
         "10.233.7.11",
         TARGET,
     )?;
+    expect(
+        "peer -> other gateway port",
+        fetch(Some(peer_ns.as_str()), gateway, EGRESS_OTHER_HOST_PORT),
+        "host",
+    )?;
     refused(
         "required-egress task -> other gateway port",
-        "minga-nsegress-task",
+        &task_ns,
         gateway,
         EGRESS_OTHER_HOST_PORT,
     )?;
+    if !listener_preexists {
+        expect(
+            "external host -> other host port",
+            fetch(
+                Some(f.ext_ns.as_str()),
+                EGRESS_EXT_HOST,
+                EGRESS_OTHER_HOST_PORT,
+            ),
+            "host",
+        )?;
+        refused(
+            "external host -> egress proxy listener",
+            &f.ext_ns,
+            EGRESS_EXT_HOST,
+            EGRESS_PROXY,
+        )?;
+    }
+    ipv6_scenario(f).await
+}
+
+/// IPv6 is disabled in the task netns, but a container with `CAP_NET_RAW`
+/// can still put IPv6 frames on its veth. Re-enabling IPv6 in the netns
+/// stands in for those frames.
+async fn ipv6_scenario(f: &EgressFixture) -> Result<(), String> {
+    let bridge = bridge_name(&f.network);
+    if let Err(e) = sh(
+        "ip",
+        &[
+            "-6",
+            "addr",
+            "add",
+            &format!("{EGRESS_GATEWAY6}/64"),
+            "dev",
+            &bridge,
+            "nodad",
+        ],
+    ) {
+        eprintln!("SKIP: IPv6 checks, the host has no IPv6 on the bridge: {e}");
+        return Ok(());
+    }
+    let task_ns = f.task_ns();
+    let peer_ns = f.peer_ns();
+    for (ns, addr) in [(&task_ns, EGRESS_TASK6), (&peer_ns, EGRESS_PEER6)] {
+        let veth = ns_veth(ns)?;
+        for key in ["all".to_string(), veth.clone()] {
+            sh(
+                "ip",
+                &[
+                    "netns",
+                    "exec",
+                    ns,
+                    "sysctl",
+                    "-q",
+                    "-w",
+                    &format!("net.ipv6.conf.{key}.disable_ipv6=0"),
+                ],
+            )?;
+        }
+        sh(
+            "ip",
+            &[
+                "-n",
+                ns,
+                "-6",
+                "addr",
+                "add",
+                &format!("{addr}/64"),
+                "dev",
+                &veth,
+                "nodad",
+            ],
+        )?;
+    }
+    let _peer6 = Server::start_v6(&peer_ns, TARGET, "peer6");
+    let _host6 = host_server(EGRESS_OTHER_HOST_PORT, "host6", "6");
+
+    expect(
+        "host -> peer over IPv6",
+        fetch(None, EGRESS_PEER6, TARGET),
+        "peer6",
+    )?;
     refused(
-        "external host -> egress proxy listener",
-        EGRESS_EXT_NS,
-        EGRESS_EXT_HOST,
-        EGRESS_PROXY,
+        "required-egress task -> same-bridge peer over IPv6",
+        &task_ns,
+        EGRESS_PEER6,
+        TARGET,
+    )?;
+    expect(
+        "peer -> host over IPv6",
+        fetch(
+            Some(peer_ns.as_str()),
+            EGRESS_GATEWAY6,
+            EGRESS_OTHER_HOST_PORT,
+        ),
+        "host6",
+    )?;
+    refused(
+        "required-egress task -> host over IPv6",
+        &task_ns,
+        EGRESS_GATEWAY6,
+        EGRESS_OTHER_HOST_PORT,
     )?;
     Ok(())
 }
@@ -760,15 +967,9 @@ async fn required_egress_reaches_only_the_gateway_proxy() {
 
     let state = tempfile::tempdir().unwrap();
     let setup = NetworkSetup::new(state.path()).with_egress_proxy_port(EGRESS_PROXY);
-    let result = egress_scenario(&setup).await;
-
-    for task in ["nsegress-task", "nsegress-peer"] {
-        let _ = setup.teardown_task(task).await;
-    }
-    let _ = sh("nft", &["delete", "table", "inet", "minga_egress_listener"]);
-    let _ = sh("ip", &["netns", "delete", EGRESS_EXT_NS]);
-    let _ = sh("ip", &["link", "del", "nsegh"]);
-    let _ = sh("ip", &["link", "del", &bridge_name(EGRESS_NETWORK)]);
+    let mut fixture = EgressFixture::new();
+    let result = egress_scenario(&setup, &mut fixture).await;
+    fixture.cleanup(&setup).await;
 
     result.expect("required-egress paths");
 }

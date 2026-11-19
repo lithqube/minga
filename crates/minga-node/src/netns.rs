@@ -30,6 +30,11 @@ use std::path::PathBuf;
 use minga_net::Cidr;
 use minga_state::types::{NetworkId, PortMapping};
 
+use crate::netns_rules::{
+    egress_delete_args, egress_delete_script, egress_listener_script, egress_policy_script,
+    egress_table_name, write_atomic, EGRESS_LISTENER_TABLE,
+};
+
 /// Errors from network setup. Always name the failing command.
 #[derive(Debug, thiserror::Error)]
 pub enum NetError {
@@ -89,74 +94,15 @@ async fn output(program: &str, args: &[&str]) -> Result<String, NetError> {
     }
     Ok(String::from_utf8_lossy(&result.stdout).into_owned())
 }
-fn egress_table_name(task_id: &str) -> String {
-    use sha2::{Digest, Sha256};
-    let digest = Sha256::digest(task_id.as_bytes());
-    format!(
-        "minga_egr_{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-        digest[0], digest[1], digest[2], digest[3], digest[4], digest[5], digest[6], digest[7]
-    )
-}
-
-/// Per-task nft rules for a required-egress task.
-///
-/// With `br_netfilter` (always loaded by the task source guard) the inet
-/// hooks see the bridge, not the task's veth, as the input interface, for
-/// routed and same-bridge IPv4 alike. The source guard pins each veth to
-/// the task's own address, so bridge plus source address identifies the
-/// task. Only DNS and the proxy on the gateway are open; replies to
-/// connections made *to* the task stay allowed.
-fn egress_policy_script(
-    table: &str,
-    ips: &[Ipv4Addr],
-    bridges: &[String],
-    gateways: &[Ipv4Addr],
-    proxy_port: u16,
-) -> String {
-    let mut script = format!(
-        "add table inet {table}\n\
-         add chain inet {table} input {{ type filter hook input priority filter; policy accept; }}\n\
-         add chain inet {table} forward {{ type filter hook forward priority filter; policy accept; }}\n"
-    );
-    for ((ip, bridge), gateway) in ips.iter().zip(bridges).zip(gateways) {
-        script.push_str(&format!(
-            "add rule inet {table} input iifname \"{bridge}\" ip saddr {ip} ip daddr {gateway} udp dport 53 accept\n\
-             add rule inet {table} input iifname \"{bridge}\" ip saddr {ip} ip daddr {gateway} tcp dport 53 accept\n\
-             add rule inet {table} input iifname \"{bridge}\" ip saddr {ip} ip daddr {gateway} tcp dport {proxy_port} accept\n\
-             add rule inet {table} input iifname \"{bridge}\" ip saddr {ip} ct state established,related accept\n\
-             add rule inet {table} input iifname \"{bridge}\" ip saddr {ip} drop\n\
-             add rule inet {table} forward iifname \"{bridge}\" ip saddr {ip} ct state established,related accept\n\
-             add rule inet {table} forward iifname \"{bridge}\" ip saddr {ip} drop\n"
-        ));
-    }
-    script
-}
-
-/// Host table that limits the egress proxy port to loopback and task
-/// bridges, so the listener is not reachable from the LAN or the mesh.
-const EGRESS_LISTENER_TABLE: &str = "minga_egress_listener";
-
-fn egress_listener_script(port: u16) -> String {
-    let t = EGRESS_LISTENER_TABLE;
-    format!(
-        "add table inet {t}\n\
-         add chain inet {t} input {{ type filter hook input priority filter; policy accept; }}\n\
-         add rule inet {t} input tcp dport {port} iifname \"lo\" accept\n\
-         add rule inet {t} input tcp dport {port} iifname \"{wg}\" drop\n\
-         add rule inet {t} input tcp dport {port} iifname \"minga-*\" accept\n\
-         add rule inet {t} input tcp dport {port} drop\n",
-        wg = minga_net::wireguard::WG_INTERFACE_NAME,
-    )
-}
-
 /// Installs (or replaces) the egress listener restriction for `port`.
 pub async fn restrict_egress_listener(port: u16) -> Result<(), NetError> {
     run_tolerated("nft", &egress_delete_args(EGRESS_LISTENER_TABLE)).await;
     run_nft_script(&egress_listener_script(port)).await
 }
 
-fn egress_delete_args(table: &str) -> [&str; 4] {
-    ["delete", "table", "inet", table]
+/// Removes the egress listener restriction, if any. A missing table is fine.
+pub async fn remove_egress_listener() {
+    run_tolerated("nft", &egress_delete_args(EGRESS_LISTENER_TABLE)).await;
 }
 
 async fn run_nft_script(script: &str) -> Result<(), NetError> {
@@ -321,19 +267,31 @@ async fn move_filter_jump_first(hook: &str, chain: &str) -> Result<(), NetError>
             stderr,
         });
     }
-    let hooked = tokio::process::Command::new("iptables")
-        .args(["-w", "5", "-t", "filter", "-C", hook, "-j", chain])
-        .output()
-        .await
-        .is_ok_and(|o| o.status.success());
-    // Delete and re-insert in one transaction so the jump (source
-    // validation among them) is never missing from the hook.
-    let mut batch = String::from("*filter\n");
-    if hooked {
-        batch.push_str(&format!("-D {hook} -j {chain}\n"));
+    // With the nf_tables backend a concurrent mover can commit first and
+    // delete the rule this batch was built against (RULE_DELETE: No such
+    // file or directory), so re-read the hook and retry.
+    let mut attempt = 0;
+    loop {
+        let hooked = tokio::process::Command::new("iptables")
+            .args(["-w", "5", "-t", "filter", "-C", hook, "-j", chain])
+            .output()
+            .await
+            .is_ok_and(|o| o.status.success());
+        // Delete and re-insert in one transaction so the jump (source
+        // validation among them) is never missing from the hook.
+        let mut batch = String::from("*filter\n");
+        if hooked {
+            batch.push_str(&format!("-D {hook} -j {chain}\n"));
+        }
+        batch.push_str(&format!("-I {hook} 1 -j {chain}\nCOMMIT\n"));
+        match iptables_restore(&batch).await {
+            Err(_) if attempt < 4 => {
+                attempt += 1;
+                tokio::time::sleep(std::time::Duration::from_millis(20 * attempt)).await;
+            }
+            result => return result,
+        }
     }
-    batch.push_str(&format!("-I {hook} 1 -j {chain}\nCOMMIT\n"));
-    iptables_restore(&batch).await
 }
 
 /// Applies `iptables-restore --noflush` input as one atomic commit.
@@ -781,6 +739,34 @@ pub struct NetworkSetup {
 /// unreliable (the nsfs mount and the OCI spec path diverged).
 fn netns_path(ns: &str) -> PathBuf {
     PathBuf::from(format!("/var/run/netns/{ns}"))
+}
+
+/// Whether nft confirms neither egress table of `table` exists: missing,
+/// or in a family this kernel cannot hold. No nft binary counts as absent;
+/// any other listing failure (a lost capability, say) leaves it unknown.
+async fn egress_tables_absent(table: &str) -> bool {
+    const ABSENT: [&str; 3] = [
+        "No such file or directory",
+        "Operation not supported",
+        "Address family not supported",
+    ];
+    for family in ["inet", "bridge"] {
+        match tokio::process::Command::new("nft")
+            .args(["list", "table", family, table])
+            .output()
+            .await
+        {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return true,
+            Ok(output) if !output.status.success() => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                if !ABSENT.iter().any(|reason| stderr.contains(reason)) {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+    true
 }
 
 impl NetworkSetup {
@@ -1509,18 +1495,19 @@ impl NetworkSetup {
             ],
         )
         .await?;
-        let table = egress_table_name(task_id);
-        run_tolerated("nft", &egress_delete_args(&table)).await;
+        // Recorded before the rules exist, so a teardown never mistakes a
+        // task whose tables may be installed for one that never had them.
+        state.required_egress = true;
+        write_atomic(&state_path, &serde_json::to_vec(&state)?).await?;
         run_nft_script(&egress_policy_script(
-            &table,
+            &egress_table_name(task_id),
             &state.ips,
             &state.bridges,
             &state.gateways,
+            &state.veths,
             self.egress_proxy_port,
         ))
         .await?;
-        state.required_egress = true;
-        tokio::fs::write(&state_path, serde_json::to_vec(&state)?).await?;
         Ok(())
     }
 
@@ -1650,7 +1637,7 @@ impl NetworkSetup {
             required_egress: false,
         };
         let raw = serde_json::to_vec(&state)?;
-        tokio::fs::write(self.state_dir.join(format!("{ns}.json")), raw).await?;
+        write_atomic(&self.state_dir.join(format!("{ns}.json")), &raw).await?;
         for (veth, attachment) in state.veths.iter().zip(attachments) {
             ensure_task_source_rules(veth, attachment.ip).await?;
         }
@@ -1664,39 +1651,117 @@ impl NetworkSetup {
     pub async fn teardown_task(&self, task_id: &str) -> Result<(), NetError> {
         let ns = format!("minga-{task_id}");
         let state_path = self.state_dir.join(format!("{ns}.json"));
+        let marker = self.teardown_marker(task_id);
+        let state = match tokio::fs::read(&state_path).await {
+            Ok(raw) => serde_json::from_slice::<TaskNetState>(&raw).ok(),
+            Err(_) => None,
+        };
+        // A failed delete keeps the state file and leaves a marker so
+        // `retry_stale_teardowns` retries it: stale drop rules would match a
+        // later task that reuses this bridge address. Only a table nft
+        // confirms missing (or no nft for a task that never required
+        // egress) has nothing to delete; an unknown existence is retried.
         let table = egress_table_name(task_id);
-        run_tolerated("nft", &egress_delete_args(&table)).await;
+        let mut teardown_error = None;
+        if let Err(error) = run_nft_script(&egress_delete_script(&table)).await {
+            let required = state.as_ref().is_some_and(|state| state.required_egress);
+            if required || !egress_tables_absent(&table).await {
+                teardown_error = Some(error);
+            }
+        }
 
-        if let Ok(raw) = tokio::fs::read(&state_path).await {
-            if let Ok(state) = serde_json::from_slice::<TaskNetState>(&raw) {
-                for (veth, ip) in state.veths.iter().zip(&state.ips) {
-                    remove_task_source_rules(veth, *ip).await;
-                }
-                if let Some(ip) = state.ips.first() {
-                    for port in &state.ports {
-                        let Some(published) = port.published else {
-                            continue;
-                        };
-                        let to = format!("{}:{}", ip, port.target);
-                        // The current forms, plus the 1.0.2 PREROUTING form
-                        // that rules written by an older binary may still use.
-                        for chain in [Chain::PreroutingLocal, Chain::PreroutingAny, Chain::Output] {
-                            let rule = dnat_rule("-D", chain, &port.protocol, published, &to);
-                            run_tolerated("iptables", &as_strs(&rule)).await;
-                        }
+        if let Some(state) = &state {
+            for (veth, ip) in state.veths.iter().zip(&state.ips) {
+                remove_task_source_rules(veth, *ip).await;
+            }
+            if let Some(ip) = state.ips.first() {
+                for port in &state.ports {
+                    let Some(published) = port.published else {
+                        continue;
+                    };
+                    let to = format!("{}:{}", ip, port.target);
+                    // The current forms, plus the 1.0.2 PREROUTING form
+                    // that rules written by an older binary may still use.
+                    for chain in [Chain::PreroutingLocal, Chain::PreroutingAny, Chain::Output] {
+                        let rule = dnat_rule("-D", chain, &port.protocol, published, &to);
+                        run_tolerated("iptables", &as_strs(&rule)).await;
                     }
                 }
             }
         }
 
-        run_tolerated("ip", &["netns", "delete", &ns]).await;
+        if let Err(error) = run("ip", &["netns", "delete", &ns]).await {
+            if tokio::fs::try_exists(netns_path(&ns)).await.unwrap_or(true) {
+                teardown_error.get_or_insert(error);
+            }
+        }
 
         let resolv_conf = self.resolv_conf_path(&ns);
         // `runtime.rs` writes the task's hosts file beside the resolv.conf.
         let _ = tokio::fs::remove_file(resolv_conf.with_extension("hosts")).await;
         let _ = tokio::fs::remove_file(resolv_conf).await;
+        if let Some(error) = teardown_error {
+            tokio::fs::create_dir_all(&self.state_dir).await?;
+            tokio::fs::write(&marker, b"").await?;
+            return Err(error);
+        }
         let _ = tokio::fs::remove_file(&state_path).await;
+        let _ = tokio::fs::remove_file(&marker).await;
         Ok(())
+    }
+
+    /// Marks a task whose teardown failed, so its namespace, even if still
+    /// present, is retried and not treated as a live task.
+    fn teardown_marker(&self, task_id: &str) -> PathBuf {
+        self.state_dir.join(format!("minga-{task_id}.teardown"))
+    }
+
+    /// Retries the teardown of every task marked by a failed teardown, or
+    /// whose namespace is gone but whose state file remains (a crash mid-way).
+    pub async fn retry_stale_teardowns(&self) -> Result<(), NetError> {
+        let mut entries = match tokio::fs::read_dir(&self.state_dir).await {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        let mut with_state = Vec::new();
+        let mut marked = HashSet::new();
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            let Some(task_id) = path
+                .file_stem()
+                .and_then(|name| name.to_str())
+                .and_then(|name| name.strip_prefix("minga-"))
+                .map(str::to_owned)
+            else {
+                continue;
+            };
+            match path.extension().and_then(|extension| extension.to_str()) {
+                Some("json") => with_state.push(task_id),
+                Some("teardown") => {
+                    marked.insert(task_id);
+                }
+                _ => {}
+            }
+        }
+        // Listed after the state files: a setup writes its state only once
+        // its namespace exists, so an unmarked live task is never torn down.
+        let namespaces = output("ip", &["netns", "list"]).await?;
+        let live: HashSet<&str> = namespaces
+            .lines()
+            .filter_map(|line| line.split_whitespace().next())
+            .collect();
+        let orphaned = with_state
+            .into_iter()
+            .filter(|task_id| !live.contains(format!("minga-{task_id}").as_str()));
+        let pending: HashSet<String> = marked.into_iter().chain(orphaned).collect();
+        let mut result = Ok(());
+        for task_id in pending {
+            if let Err(error) = self.teardown_task(&task_id).await {
+                result = Err(error);
+            }
+        }
+        result
     }
     /// Reinstalls source-IP guards for tasks that survived a node restart.
     pub async fn reconcile_task_source_filters(&self) -> Result<(), NetError> {
@@ -1738,6 +1803,15 @@ impl NetworkSetup {
             if !untracked_namespaces.remove(namespace) {
                 continue;
             }
+            // A failed teardown is retried by `retry_stale_teardowns`, never
+            // given its policy back.
+            let task_id = namespace.strip_prefix("minga-").unwrap_or(namespace);
+            if tokio::fs::try_exists(self.teardown_marker(task_id))
+                .await
+                .unwrap_or(false)
+            {
+                continue;
+            }
             let raw = tokio::fs::read(&path).await?;
             let mut state: TaskNetState = serde_json::from_slice(&raw)?;
             if state.format_version > TASK_NET_STATE_FORMAT_VERSION {
@@ -1766,7 +1840,7 @@ impl NetworkSetup {
             if state.format_version != TASK_NET_STATE_FORMAT_VERSION {
                 state.format_version = TASK_NET_STATE_FORMAT_VERSION;
             }
-            tokio::fs::write(&path, serde_json::to_vec(&state)?).await?;
+            write_atomic(&path, &serde_json::to_vec(&state)?).await?;
             for (veth, ip) in state.veths.iter().zip(&state.ips) {
                 ensure_task_source_rules(veth, *ip).await?;
             }
@@ -1794,14 +1868,12 @@ impl NetworkSetup {
                     ],
                 )
                 .await?;
-                let task_id = namespace.strip_prefix("minga-").unwrap_or(namespace);
-                let table = egress_table_name(task_id);
-                run_tolerated("nft", &egress_delete_args(&table)).await;
                 run_nft_script(&egress_policy_script(
-                    &table,
+                    &egress_table_name(task_id),
                     &state.ips,
                     &state.bridges,
                     &state.gateways,
+                    &state.veths,
                     self.egress_proxy_port,
                 ))
                 .await?;
@@ -1923,29 +1995,6 @@ pub fn system_upstream_resolver() -> Option<std::net::SocketAddr> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn required_egress_rules_allow_proxy_only_and_cleanup_is_task_scoped() {
-        let ip = Ipv4Addr::new(10, 44, 1, 7);
-        let gateway = Ipv4Addr::new(10, 44, 1, 1);
-        let bridge = "minga-abcd".to_string();
-        let table = egress_table_name("stack.web.1");
-        let script = egress_policy_script(&table, &[ip], &[bridge], &[gateway], EGRESS_PROXY_PORT);
-        assert!(script.contains("daddr 10.44.1.1 tcp dport 8080 accept"));
-        assert!(script.contains("udp dport 53 accept"));
-        // br_netfilter shows the bridge, not the veth, to the inet hooks.
-        assert!(script.contains("forward iifname \"minga-abcd\" ip saddr 10.44.1.7 drop"));
-        assert!(script.contains("input iifname \"minga-abcd\" ip saddr 10.44.1.7 drop"));
-        assert!(!script.contains("veth"));
-        let listener = egress_listener_script(9090);
-        assert!(listener.contains("tcp dport 9090 iifname \"minga-wg0\" drop"));
-        assert!(listener.ends_with("tcp dport 9090 drop\n"));
-        assert_ne!(table, egress_table_name("stack.web.2"));
-        assert_eq!(
-            egress_delete_args(&table),
-            ["delete", "table", "inet", table.as_str()]
-        );
-    }
-
     #[test]
     fn ingress_forward_admits_only_local_backend_ports() {
         let backend = |node_id, ip: &str| minga_state::types::IngressBackend {

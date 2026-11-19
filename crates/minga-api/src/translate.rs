@@ -30,6 +30,14 @@ pub const AGENT_LABEL: &str = "minga.agent";
 /// Docker API. Stripped from state labels.
 pub const EGRESS_LABEL: &str = "minga.egress";
 
+/// Applies the Compose `x-minga-egress` rules to a policy that did not
+/// come through Compose or the label (a state import). The stored form
+/// round-trips through the label's JSON.
+pub fn check_egress_policy(policy: &minga_state::types::EgressPolicy) -> Result<(), String> {
+    let json = serde_json::to_string(policy).map_err(|e| e.to_string())?;
+    minga_scheduler::egress_policy_from_json(&json).map(drop)
+}
+
 /// Keeps the reserved required-egress label in step with the policy.
 pub fn sync_required_egress_label(svc: &mut Service) {
     let label = minga_state::types::REQUIRED_EGRESS_LABEL;
@@ -161,6 +169,12 @@ pub fn service_spec_to_state(spec: &models::ServiceSpec) -> Result<Service, Stri
                 .map_err(|e| format!("service '{name}': invalid {EGRESS_LABEL} label: {e}"))
         })
         .transpose()?;
+    if agent.is_some() && egress.is_some() {
+        return Err(format!(
+            "service '{name}': {}",
+            minga_state::types::AGENT_EGRESS_UNSUPPORTED
+        ));
+    }
 
     if container.Image.is_empty() && agent.is_none() {
         return Err(format!("service '{name}': ContainerSpec.Image is required"));
@@ -1648,6 +1662,13 @@ mod tests {
         spec.Labels
             .insert(EGRESS_LABEL.into(), r#"{"required":true,"extra":1}"#.into());
         assert!(service_spec_to_state(&spec).is_err(), "unknown keys fail");
+        let mut agent = svc.clone();
+        agent.agent = Some(Box::new(minga_state::types::AgentSpec::default()));
+        let err = service_spec_to_state(&service_to_docker(&agent).Spec).unwrap_err();
+        assert!(
+            err.contains(minga_state::types::AGENT_EGRESS_UNSUPPORTED),
+            "{err}"
+        );
     }
 
     #[test]

@@ -8,28 +8,62 @@
   NAT64 (literal or resolved), unless `--egress-allow-cidr` allows
   them.
 - Egress budget admission reserves an upper bound and settles it to the
-  provider's counts, so concurrent requests cannot overspend: the request
-  body's byte length bounds the input, plus the `max_tokens` cap, and a
-  request without one holds the rest of a limited budget until it settles.
+  provider's counts, so concurrent requests are not admitted against the
+  same balance: the request body's byte length bounds the input, plus the
+  `max_tokens` cap, and a request without one holds the rest of a limited
+  budget until it settles. Admission is the guarantee: an uncapped response
+  can still overrun the balance, so a hard limit needs an output cap. A
+  reservation settles only against the budget registration that issued it,
+  so re-registering a workload mid-stream leaves the replacement's balance
+  untouched, and holds are kept exact so releasing one never frees another.
   A routed-egress container left from a previous worker process is never
-  adopted with its lost token; a failed stop is retried before restarting. Upstream error
+  adopted with its lost token; a failed stop is retried by container ID on
+  every pass, even after its assignment is removed, and the task restarts
+  only once the old container is gone. A failed container inventory no
+  longer looks empty: routed containers do not start in that pass. Upstream error
   bodies are buffered (64 KiB) and redacted whole instead of streamed;
   non-streamed bodies are capped at 32 MiB; a failed body read is charged
   like a transport error; streams have an idle timeout and keep draining
-  after a client disconnects. Usage is read from the top-level JSON field,
-  cache keys carry a route revision, the cache is bounded by bytes, usage
-  publication is bounded and retried, and customer, model and route names
-  are capped at 256 bytes. `EgressProxy::with_event_bus` now returns a
+  after a client disconnects; a client that stops reading for the idle
+  timeout is cut off (its body ends in an error, never a clean end) while
+  the upstream is drained and the reservation settles. Usage is read from the top-level JSON field
+  (streamed keys are matched after JSON unescaping, like buffered ones, and a
+  provider-reported model over 256 bytes is replaced by the requested one),
+  cache keys carry a route revision (with a per-process keyed fingerprint of
+  the route credentials, so a rotated credential never serves the old
+  account's entries) and the forwarded `accept`, `anthropic-version` and
+  `anthropic-beta` values, the key is a SHA-256 digest that also covers the
+  `x-minga-customer` value and the request body (a 64-bit FNV body hash let
+  one end customer craft a prompt that collides with another's), the cache
+  is bounded by bytes, usage publication is bounded and retried (an event
+  dropped after its retries counts in
+  `minga_agent_usage_events_dropped_total`), and customer, model and route
+  names are capped at 256 bytes. `EgressProxy::with_event_bus` now returns a
   `Result` and works after `router()` was called.
 - The worker egress proxy is opt-in: `--egress-bind` has no default, so a
-  worker without it no longer takes port 8080. Any bind is accepted; tasks use
-  its port on their bridge gateway, and on Linux an nft table closes it to
-  everything but loopback and task bridges. Workers with the proxy carry the
-  reserved `com.minga.egress.proxy=true` label, which placement requires for
-  services with egress routes.
+  worker without it no longer takes port 8080. Port 0 is refused; tasks use
+  the bind's port on their bridge gateway. On Linux an nft table closes the
+  port to everything but loopback and task bridges; it is installed after the
+  socket binds and before it serves, and removed on shutdown, on a failed
+  start, and at start-up without a proxy. Only workers with a wildcard bind
+  (`0.0.0.0` or `[::]`) carry the reserved `com.minga.egress.proxy=true`
+  label, which placement requires for services with egress routes; a
+  loopback bind serves host-local agents only.
 - Required-egress nft rules now match what the inet hooks see under
   `br_netfilter` (the bridge plus the task's guarded source address), so they
-  block routed and same-bridge traffic; a real-kernel test covers it.
+  block routed and same-bridge traffic; a real-kernel test covers it. A
+  bridge-family rule on the task's own bridge ports drops every frame other
+  than IPv4 and ARP, so a container with `CAP_NET_RAW` cannot send IPv6 to
+  the host, its peers or past the forward hook. The old rules are replaced in
+  the same nft transaction. A failed removal of a table that still exists is
+  returned and keeps the task's network state, and the node retries that
+  teardown on every supervisor tick until it succeeds; a task without egress
+  tables never fails to start on an nft that lacks a family it does not use. The task
+  network state file is replaced through a temporary file, so a failed write
+  never truncates the records rollback needs to remove its port mappings.
+  A container start that fails after its network was set up (image load,
+  snapshot, log FIFOs, OCI spec) now tears that network and its egress
+  rules down instead of leaving them for a retry that may never come.
 - Routed containers and `http` agents register a budget in the proxy's
   tracker before they start, so their first request is no longer refused with
   429. Egress policies carry no token budget yet, so routed containers are not
@@ -41,6 +75,17 @@
   is deleted, even if container cleanup then fails.
 - A required egress policy with no routes is refused at start instead of
   falling back to the node's legacy upstream.
+- An `x-minga-agent` service that declares `x-minga-egress` is refused at
+  admission (Compose, Docker API create and update, state import): agent
+  egress tokens carry no route policy, so the agent would otherwise run
+  without the declared routes and model allow-list.
+- NATS usage queries read the tenant's retained usage records and filter
+  them by event time; the JetStream start-time cutoff used storage time, so a
+  worker clock ahead of the server hid qualifying events.
+- `minga state import` validates each service's egress policy, rollback
+  targets included, with the same rules as Compose `x-minga-egress` and the
+  `minga.egress` label, so an import can no longer store a policy that
+  deploy refuses.
 - The Docker API carries a service's egress policy in the `minga.egress`
   label (JSON, validated like Compose `x-minga-egress`), so `minga deploy`
   keeps `x-minga-egress`. An update without the label keeps the stored

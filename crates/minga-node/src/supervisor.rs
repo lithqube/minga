@@ -268,6 +268,10 @@ pub struct Supervisor {
     finished: Arc<Mutex<HashSet<TaskId>>>,
     task_assignments: Arc<Mutex<HashMap<TaskId, TaskAssignment>>>,
     health: Arc<Mutex<HashMap<TaskId, Health>>>,
+    /// Routed-egress containers from a previous process whose stop failed,
+    /// by container ID. Retried every pass, even after their assignment is
+    /// gone; their task does not start again until they are.
+    stale_routed: Mutex<HashMap<String, TaskId>>,
     #[cfg(target_os = "linux")]
     networking: Option<SupervisorNetworking>,
 }
@@ -355,6 +359,7 @@ impl Supervisor {
             finished: Arc::new(Mutex::new(HashSet::new())),
             task_assignments: Arc::new(Mutex::new(HashMap::new())),
             health: Arc::new(Mutex::new(HashMap::new())),
+            stale_routed: Mutex::new(HashMap::new()),
             #[cfg(target_os = "linux")]
             networking: None,
         }
@@ -1305,29 +1310,54 @@ impl Supervisor {
         // A routed-egress container this process did not start holds a token
         // that died with the previous process (startup recovery may have
         // missed it, or its stop failed). Stop it before starting a fresh
-        // one; if the stop fails, retry next pass instead of starting.
-        let mut stale_routed = HashSet::new();
-        if current.values().any(|assignment| {
-            assignment.spec.uses_egress_proxy()
-                && !running.contains_key(&assignment.task_id)
-                && !agents.contains(&assignment.task_id)
-        }) {
-            for container in self.runtime.list().await {
-                let routed = current
-                    .get(&container.task_id)
-                    .is_some_and(|assignment| assignment.spec.uses_egress_proxy());
-                if !routed || running.contains_key(&container.task_id) {
-                    continue;
+        // one; if the stop fails or the inventory is unknown, retry next pass
+        // instead of starting.
+        let mut stale_routed = self.stale_routed.lock().await;
+        let mut blocked: HashSet<TaskId> = HashSet::new();
+        let unstarted_routed = || {
+            current.values().filter(|assignment| {
+                assignment.spec.uses_egress_proxy()
+                    && !running.contains_key(&assignment.task_id)
+                    && !agents.contains(&assignment.task_id)
+            })
+        };
+        if !stale_routed.is_empty() || unstarted_routed().next().is_some() {
+            match self.runtime.try_list().await {
+                Err(error) => {
+                    tracing::warn!(%error, "container inventory unavailable; not starting routed-egress tasks this pass");
+                    blocked.extend(
+                        unstarted_routed()
+                            .filter(|assignment| {
+                                matches!(assignment.spec.kind, WorkloadKind::Container)
+                            })
+                            .map(|assignment| assignment.task_id.clone()),
+                    );
                 }
-                if self.runtime.stop(&container.id).await.is_ok() {
-                    actions += 1;
-                    minga_telemetry::METRICS.task_stops_total.inc();
-                } else {
-                    tracing::warn!(task = %container.task_id, container = %container.id, "cannot stop a stale routed-egress container; retrying next pass");
-                    stale_routed.insert(container.task_id);
+                Ok(containers) => {
+                    // A tracked container missing from the inventory is gone.
+                    stale_routed.retain(|id, _| containers.iter().any(|c| &c.id == id));
+                    for container in containers {
+                        let tracked = stale_routed.contains_key(&container.id);
+                        let routed = current
+                            .get(&container.task_id)
+                            .is_some_and(|assignment| assignment.spec.uses_egress_proxy());
+                        if !tracked && (!routed || running.contains_key(&container.task_id)) {
+                            continue;
+                        }
+                        if self.runtime.stop(&container.id).await.is_ok() {
+                            stale_routed.remove(&container.id);
+                            actions += 1;
+                            minga_telemetry::METRICS.task_stops_total.inc();
+                        } else {
+                            tracing::warn!(task = %container.task_id, container = %container.id, "cannot stop a stale routed-egress container; retrying next pass");
+                            stale_routed.insert(container.id, container.task_id);
+                        }
+                    }
                 }
             }
         }
+        blocked.extend(stale_routed.values().cloned());
+        drop(stale_routed);
         for assignment in current.values() {
             let task_id = &assignment.task_id;
             if self.finished.lock().await.contains(task_id) {
@@ -1336,7 +1366,7 @@ impl Supervisor {
             if running.contains_key(task_id)
                 || agents.contains(task_id)
                 || backing_off.contains(task_id)
-                || stale_routed.contains(task_id)
+                || blocked.contains(task_id)
             {
                 continue;
             }
@@ -1446,9 +1476,15 @@ impl Supervisor {
                         .lock()
                         .await
                         .insert(container.task_id, container.id);
-                } else {
+                } else if self.runtime.stop(&container.id).await.is_ok() {
                     // Reconcile will start its current assignment after cleanup.
-                    let _ = self.runtime.stop(&container.id).await;
+                    stopped += 1;
+                    minga_telemetry::METRICS.task_stops_total.inc();
+                } else if assignment.spec.uses_egress_proxy() {
+                    self.stale_routed
+                        .lock()
+                        .await
+                        .insert(container.id, container.task_id);
                 }
                 continue;
             }
@@ -1941,7 +1977,8 @@ mod assignment_tests {
         );
         write_assignment(&bus, &routed).await;
 
-        supervisor.recover_running_containers().await;
+        // The stop counts like any other startup cleanup.
+        assert_eq!(supervisor.recover_running_containers().await, 1);
         // Its in-memory egress token is gone, so it is not adopted.
         assert!(supervisor.running_tasks().await.is_empty());
         assert_eq!(runtime.container_count(), 0);
@@ -2009,6 +2046,55 @@ mod assignment_tests {
         let now = container_of(&runtime, "routed").await;
         assert_eq!(now.len(), 1);
         assert_ne!(now[0], old);
+    }
+
+    #[tokio::test]
+    async fn reconcile_does_not_start_a_routed_task_while_the_inventory_is_unknown() {
+        let (supervisor, runtime, bus) = setup(7).await;
+        let old = runtime
+            .start(&"routed".to_string(), &TaskSpec::default())
+            .await
+            .unwrap();
+        write_assignment(&bus, &routed_assignment("routed")).await;
+
+        *runtime.fail_lists.lock().unwrap() = true;
+        supervisor.reconcile_once().await.unwrap();
+        *runtime.fail_lists.lock().unwrap() = false;
+        // An empty inventory would have hidden the stale container.
+        assert_eq!(container_of(&runtime, "routed").await, vec![old.clone()]);
+
+        supervisor.reconcile_once().await.unwrap();
+        let now = container_of(&runtime, "routed").await;
+        assert_eq!(now.len(), 1);
+        assert_ne!(now[0], old);
+    }
+
+    #[tokio::test]
+    async fn reconcile_keeps_retrying_a_failed_routed_stop_after_its_assignment_is_gone() {
+        let (supervisor, runtime, bus) = setup(7).await;
+        let old = runtime
+            .start(&"routed".to_string(), &TaskSpec::default())
+            .await
+            .unwrap();
+        runtime
+            .start(&"plain".to_string(), &TaskSpec::default())
+            .await
+            .unwrap();
+        write_assignment(&bus, &routed_assignment("routed")).await;
+        write_assignment(&bus, &assignment("plain")).await;
+
+        *runtime.fail_stops.lock().unwrap() = true;
+        supervisor.recover_running_containers().await;
+        supervisor.reconcile_once().await.unwrap();
+        assert_eq!(container_of(&runtime, "routed").await, vec![old]);
+
+        bus.delete_assignment(&subjects::kv_assignment_task("default", 7, "routed"))
+            .await
+            .unwrap();
+        *runtime.fail_stops.lock().unwrap() = false;
+        supervisor.reconcile_once().await.unwrap();
+        assert!(container_of(&runtime, "routed").await.is_empty());
+        assert_eq!(supervisor.running_tasks().await, vec!["plain".to_string()]);
     }
 
     #[tokio::test]

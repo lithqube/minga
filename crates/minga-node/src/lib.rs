@@ -24,6 +24,8 @@ pub(crate) mod failure;
 pub(crate) mod health;
 #[cfg(target_os = "linux")]
 pub mod netns;
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+mod netns_rules;
 pub mod registration;
 pub mod runtime;
 pub mod secrets;

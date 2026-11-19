@@ -64,11 +64,15 @@ impl ResolvedEgressPolicy {
             })
     }
 
-    /// An opaque revision of the policy's non-secret settings. Cache keys
-    /// carry it, so a task restarted with a changed route never sees the
-    /// old provider's entries. Credential values are not part of it.
+    /// An opaque revision of the policy. Cache keys carry it, so a task
+    /// restarted with a changed route or a rotated credential never sees the
+    /// old provider's or account's entries. Credentials enter only as a
+    /// fingerprint keyed with a random per-process key, never as values.
     pub fn revision(&self) -> u64 {
-        use std::hash::{Hash, Hasher};
+        use std::collections::hash_map::RandomState;
+        use std::hash::{BuildHasher, Hash, Hasher};
+        static CREDENTIAL_KEY: std::sync::OnceLock<RandomState> = std::sync::OnceLock::new();
+        let mut credentials = CREDENTIAL_KEY.get_or_init(RandomState::new).build_hasher();
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         let mut names: Vec<&String> = self.routes.keys().collect();
         names.sort();
@@ -81,18 +85,32 @@ impl ResolvedEgressPolicy {
             route.output_price_micros_per_million.hash(&mut hasher);
             match &route.auth {
                 None => 0u8.hash(&mut hasher),
-                Some(ResolvedAuth::Bearer(_)) => 1u8.hash(&mut hasher),
-                Some(ResolvedAuth::ApiKey(_)) => 2u8.hash(&mut hasher),
+                Some(ResolvedAuth::Bearer(key)) => {
+                    1u8.hash(&mut hasher);
+                    key.hash(&mut credentials);
+                }
+                Some(ResolvedAuth::ApiKey(key)) => {
+                    2u8.hash(&mut hasher);
+                    key.hash(&mut credentials);
+                }
                 Some(ResolvedAuth::AwsSigv4 {
-                    region, service, ..
+                    access_key,
+                    secret_key,
+                    session_token,
+                    region,
+                    service,
                 }) => {
                     3u8.hash(&mut hasher);
                     region.hash(&mut hasher);
                     service.hash(&mut hasher);
+                    access_key.hash(&mut credentials);
+                    secret_key.hash(&mut credentials);
+                    session_token.hash(&mut credentials);
                 }
             }
         }
         self.models.hash(&mut hasher);
+        credentials.finish().hash(&mut hasher);
         hasher.finish()
     }
 
@@ -135,5 +153,47 @@ impl WorkloadIdentity {
             service_id: workload_id.to_owned(),
             policy: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn policy(auth: ResolvedAuth) -> ResolvedEgressPolicy {
+        let mut policy = ResolvedEgressPolicy::default();
+        policy.routes.insert(
+            "main".into(),
+            ResolvedRoute {
+                name: "main".into(),
+                upstream_url: "https://api.example.com".into(),
+                auth: Some(auth),
+                fallback: Vec::new(),
+                input_price_micros_per_million: None,
+                output_price_micros_per_million: None,
+            },
+        );
+        policy
+    }
+
+    fn sigv4(secret: &str) -> ResolvedAuth {
+        ResolvedAuth::AwsSigv4 {
+            access_key: "access".into(),
+            secret_key: secret.into(),
+            session_token: None,
+            region: "us-east-1".into(),
+            service: "bedrock".into(),
+        }
+    }
+
+    #[test]
+    fn a_rotated_credential_changes_the_revision() {
+        let bearer = |key: &str| policy(ResolvedAuth::Bearer(key.into())).revision();
+        assert_eq!(bearer("account-a"), bearer("account-a"));
+        assert_ne!(bearer("account-a"), bearer("account-b"));
+        let api_key = |key: &str| policy(ResolvedAuth::ApiKey(key.into())).revision();
+        assert_ne!(api_key("account-a"), api_key("account-b"));
+        assert_ne!(bearer("account-a"), api_key("account-a"));
+        assert_ne!(policy(sigv4("a")).revision(), policy(sigv4("b")).revision());
     }
 }

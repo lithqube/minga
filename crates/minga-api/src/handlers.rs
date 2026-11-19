@@ -576,6 +576,17 @@ pub async fn import_state(
                 crate::translate::check_agent(agent)
                     .map_err(|e| bad_request(format!("service '{}': {e}", service.id)))?;
             }
+            current
+                .check_agent_egress()
+                .map_err(|e| bad_request(format!("service '{}': {e}", service.id)))?;
+            if let Some(policy) = &current.egress {
+                crate::translate::check_egress_policy(policy).map_err(|e| {
+                    bad_request(format!(
+                        "service '{}': invalid egress policy: {e}",
+                        service.id
+                    ))
+                })?;
+            }
             secret_ids.extend(
                 current
                     .secrets
@@ -1385,6 +1396,8 @@ pub async fn update_service(
         svc.egress = existing.egress.clone();
         translate::sync_required_egress_label(&mut svc);
     }
+    svc.check_agent_egress()
+        .map_err(|e| bad_request(format!("service '{id}': {e}")))?;
     check_service_secrets(&app, tenant_id, &svc).await?;
     for network_id in &svc.networks {
         let network = app.store.get_network(network_id).await?;
@@ -1409,6 +1422,14 @@ pub async fn update_service(
             ..existing.clone()
         }))
     };
+    // A spec this update would refuse cannot become its rollback target.
+    if svc
+        .previous
+        .as_deref()
+        .is_some_and(|previous| previous.check_agent_egress().is_err())
+    {
+        svc.previous = None;
+    }
 
     ensure_placeable(&app, &svc, Some(&svc.id)).await?;
 
@@ -2497,6 +2518,62 @@ mod tests {
             app.store.get_service("web").await.unwrap().unwrap().egress,
             svc.egress
         );
+
+        // An agent cannot carry the policy, neither inherited on update nor
+        // imported.
+        let mut agent = svc.clone();
+        agent.agent = Some(Box::new(minga_state::types::AgentSpec::default()));
+        let mut docker = translate::service_to_docker(&agent).Spec;
+        docker.Labels.remove(translate::EGRESS_LABEL);
+        let err = update_service(
+            State(app.clone()),
+            default_caller(),
+            Path(("v1.41".to_string(), "web".to_string())),
+            Query(
+                serde_json::from_value::<models::ServiceUpdateQuery>(serde_json::json!({}))
+                    .unwrap(),
+            ),
+            Json(docker),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, ApiError::BadRequest(_)), "{err:?}");
+        assert!(app
+            .store
+            .get_service("web")
+            .await
+            .unwrap()
+            .unwrap()
+            .agent
+            .is_none());
+        // Import applies the deploy rules to the policy itself.
+        let mut long = svc.clone();
+        long.id = "long".into();
+        long.name = "long".into();
+        long.egress.as_mut().unwrap().routes[0].name = "r".repeat(257);
+        let err = import_state(
+            State(app.clone()),
+            default_caller(),
+            Query(ImportQuery { overwrite: false }),
+            Json(snapshot(&long)),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, ApiError::BadRequest(_)), "{err:?}");
+        assert!(app.store.get_service("long").await.unwrap().is_none());
+
+        agent.id = "bot".into();
+        agent.name = "bot".into();
+        let err = import_state(
+            State(app.clone()),
+            default_caller(),
+            Query(ImportQuery { overwrite: false }),
+            Json(snapshot(&agent)),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, ApiError::BadRequest(_)), "{err:?}");
+        assert!(app.store.get_service("bot").await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -2560,6 +2637,37 @@ mod tests {
         )
         .await
         .expect("update may reuse the capacity of the task it replaces");
+        assert!(
+            app.store
+                .get_service("web")
+                .await
+                .unwrap()
+                .unwrap()
+                .previous
+                .is_some(),
+            "a compliant spec stays the rollback target"
+        );
+
+        // A stored agent with an egress policy (admitted before the check)
+        // must not become the rollback target of a compliant update.
+        let mut legacy = app.store.get_service("web").await.unwrap().unwrap();
+        legacy.agent = Some(Box::default());
+        legacy.egress = Some(Default::default());
+        app.store.upsert_service(legacy).await.unwrap();
+        let _ = update_service(
+            State(app.clone()),
+            default_caller(),
+            Path(("v1.41".to_string(), "web".to_string())),
+            Query(
+                serde_json::from_value::<models::ServiceUpdateQuery>(serde_json::json!({}))
+                    .unwrap(),
+            ),
+            Json(spec("web", 800_000_000)),
+        )
+        .await
+        .expect("the new spec has no agent");
+        let updated = app.store.get_service("web").await.unwrap().unwrap();
+        assert!(updated.agent.is_none() && updated.previous.is_none());
 
         // But not more than the whole node.
         let err = update_service(

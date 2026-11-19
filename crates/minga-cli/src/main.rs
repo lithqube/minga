@@ -405,10 +405,12 @@ struct NodeArgs {
     /// read-only to this node's agent sandboxes.
     #[arg(long = "agent-dir-root", value_name = "DIR")]
     agent_dir_roots: Vec<PathBuf>,
-    /// Runs the egress proxy on this address (opt-in, e.g. 0.0.0.0:8080).
-    /// Tasks reach it on their bridge gateway at this port; on Linux an nft
-    /// rule closes the port to everything but loopback and task bridges.
-    /// Services with egress routes are placed only on nodes that set it.
+    /// Runs the egress proxy on this address (opt-in, e.g. 0.0.0.0:8080;
+    /// the port must be fixed and nonzero). With a wildcard bind tasks reach
+    /// it on their bridge gateway at this port; on Linux an nft rule closes
+    /// the port to everything but loopback and task bridges. Services with
+    /// egress routes are placed only on nodes with a wildcard bind; a
+    /// loopback bind serves host-local agents only.
     #[arg(long)]
     egress_bind: Option<String>,
     /// Repeatable CIDR a tenant egress route may reach although it is
@@ -1677,9 +1679,17 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
     // Reserved: placement sends routed-egress services only to nodes that
     // really run the proxy.
     labels.remove(minga_state::types::EGRESS_PROXY_NODE_LABEL);
+    // Read only by Linux networking; parsed everywhere to refuse bad binds.
+    #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
     let egress_port = match args.egress_bind.as_deref() {
         None => None,
         Some(bind) => match port_of(bind) {
+            // Port 0 binds a random port that the firewall and the task
+            // gateway endpoint would never match.
+            Some(0) => {
+                eprintln!("error: --egress-bind {bind:?} needs a fixed nonzero port");
+                return ExitCode::FAILURE;
+            }
             Some(port) => Some(port),
             None => {
                 eprintln!("error: --egress-bind {bind:?} has no port");
@@ -1687,7 +1697,18 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
             }
         },
     };
-    if egress_port.is_some() {
+    // Routed containers reach the proxy on their bridge gateway, which only
+    // a wildcard bind covers; a loopback or single-address bind serves
+    // host-local agents only.
+    let routed_egress = args.egress_bind.as_deref().is_some_and(is_wildcard_bind);
+    if let Some(bind) = args.egress_bind.as_deref().filter(|_| !routed_egress) {
+        tracing::warn!(
+            bind,
+            "--egress-bind is not a wildcard address: host-local agents can use the proxy, \
+             routed-egress containers are not placed on this node"
+        );
+    }
+    if routed_egress {
         labels.insert(
             minga_state::types::EGRESS_PROXY_NODE_LABEL.to_string(),
             "true".to_string(),
@@ -2086,7 +2107,7 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
                     let mut rt = rt
                         .with_volume_dir(format!("{}/volumes", args.data_dir))
                         .with_logs_dir(format!("{}/logs", args.data_dir));
-                    if egress_port.is_some() {
+                    if routed_egress {
                         rt = rt
                             .with_egress_tokens(egress_tokens.clone())
                             .with_egress_budgets(egress_budgets.clone());
@@ -2143,18 +2164,21 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
         None => None,
     };
 
+    // Only a reachable non-loopback proxy port gets the listener firewall.
+    #[cfg(target_os = "linux")]
+    let restrict_egress_listener = args
+        .egress_bind
+        .as_deref()
+        .is_some_and(|b| !is_loopback_bind(b));
+    // A previous run may have left the table behind.
+    #[cfg(target_os = "linux")]
+    if !restrict_egress_listener {
+        minga_node::netns::remove_egress_listener().await;
+    }
     // Start the egress proxy if --egress-bind is set.
     let _egress_proxy: Option<minga_egress::EgressProxy> = if let Some(ref bind) = args.egress_bind
     {
         tracing::info!(bind = %bind, upstream = %args.egress_upstream, "starting egress proxy");
-        #[cfg(target_os = "linux")]
-        if !is_loopback_bind(bind) {
-            let port = egress_port.unwrap_or(minga_node::netns::EGRESS_PROXY_PORT);
-            if let Err(e) = minga_node::netns::restrict_egress_listener(port).await {
-                eprintln!("error: cannot restrict the egress proxy port to task bridges: {e}");
-                return ExitCode::FAILURE;
-            }
-        }
         let upstream_auth = match load_upstream_auth(
             &args.secret_store,
             args.egress_credential.as_deref(),
@@ -2185,12 +2209,33 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
-        match proxy.start(bind).await {
+        // Bind first: if the port is taken, no firewall rule may close it
+        // to the service that owns it.
+        let listener = match tokio::net::TcpListener::bind(bind).await {
+            Ok(listener) => listener,
+            Err(e) => {
+                eprintln!("error: cannot start egress proxy: bind {bind}: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        #[cfg(target_os = "linux")]
+        if restrict_egress_listener {
+            let port = egress_port.unwrap_or(minga_node::netns::EGRESS_PROXY_PORT);
+            if let Err(e) = minga_node::netns::restrict_egress_listener(port).await {
+                eprintln!("error: cannot restrict the egress proxy port to task bridges: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+        match proxy.serve(listener) {
             Ok(addr) => {
                 println!("LLM egress proxy listening on http://{addr}");
                 Some(proxy)
             }
             Err(e) => {
+                #[cfg(target_os = "linux")]
+                if restrict_egress_listener {
+                    minga_node::netns::remove_egress_listener().await;
+                }
                 eprintln!("error: cannot start egress proxy: {e}");
                 return ExitCode::FAILURE;
             }
@@ -2274,6 +2319,10 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
     }
     if let Some(server) = api_server {
         server.shutdown();
+    }
+    #[cfg(target_os = "linux")]
+    if restrict_egress_listener {
+        minga_node::netns::remove_egress_listener().await;
     }
 
     ExitCode::SUCCESS
@@ -2940,6 +2989,17 @@ fn is_loopback_bind(addr: &str) -> bool {
             .is_ok_and(|ip| ip.is_loopback())
 }
 
+/// Whether a `host:port` bind address listens on every address (`0.0.0.0`
+/// or `[::]`), so task bridge gateways reach it.
+fn is_wildcard_bind(addr: &str) -> bool {
+    let host = match addr.strip_prefix('[') {
+        Some(rest) => rest.split(']').next().unwrap_or(""),
+        None => addr.rsplit_once(':').map_or(addr, |(h, _)| h),
+    };
+    host.parse::<std::net::IpAddr>()
+        .is_ok_and(|ip| ip.is_unspecified())
+}
+
 /// The port of a `host:port` bind address (`[::1]:7001` included).
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn port_of(addr: &str) -> Option<u16> {
@@ -2949,8 +3009,8 @@ fn port_of(addr: &str) -> Option<u16> {
 #[cfg(test)]
 mod tests {
     use super::{
-        is_loopback_bind, manager_requires_wg_endpoint, node_certificate_names, port_of,
-        project_dir, run_node, run_tls, worker_has_manager_only_flags, Cli, Command,
+        is_loopback_bind, is_wildcard_bind, manager_requires_wg_endpoint, node_certificate_names,
+        port_of, project_dir, run_node, run_tls, worker_has_manager_only_flags, Cli, Command,
         NodeCertificateRole, TlsCommand,
     };
     use clap::Parser;
@@ -3224,6 +3284,21 @@ mod tests {
         }
         for addr in ["0.0.0.0:7001", "10.0.0.1:7001", "[::]:2375", "node1:7001"] {
             assert!(!is_loopback_bind(addr), "{addr}");
+        }
+    }
+
+    #[test]
+    fn only_wildcard_binds_reach_task_bridge_gateways() {
+        for addr in ["0.0.0.0:8080", "[::]:8080"] {
+            assert!(is_wildcard_bind(addr), "{addr}");
+        }
+        for addr in [
+            "127.0.0.1:8080",
+            "[::1]:8080",
+            "10.0.0.1:8080",
+            "node1:8080",
+        ] {
+            assert!(!is_wildcard_bind(addr), "{addr}");
         }
     }
 

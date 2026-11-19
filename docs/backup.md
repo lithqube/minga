@@ -50,7 +50,7 @@ minga state import minga-state.json --api-url http://127.0.0.1:2375
 Import writes through Raft in dependency order: networks, secrets, configs, volumes, then services.
 
 - If any service in the file already exists, nothing is written and the API answers **409**. Pass `--overwrite` to replace those services with the file's version. Networks, volumes, secrets and configs are always upserted.
-- A file with a higher `format_version` than the running build is refused (use the newer binary). Versions 2 through 9 are migrated on import (v10 added service egress policies). A version outside that range answers 400 and writes nothing.
+- A file with a higher `format_version` than the running build is refused (use the newer binary). The current version 10 imports directly, and versions 2 through 9 are migrated on import (v10 added service egress policies). A lower version answers 400 and writes nothing. Each service's egress policy, rollback targets included, is checked with the same rules as Compose `x-minga-egress`.
 - Tasks are not imported. The scheduler places tasks for the restored specs. Not verified: how running tasks of a service replaced with `--overwrite` are rolled over; test that on a spare cluster first.
 
 `GET` and `POST /v1.41/state` sit behind the same bearer token as every other API route. They will be admin-only once API roles exist ([ADR 0005](adr/0005-api-identity-and-roles.md), proposed).
@@ -77,4 +77,4 @@ The manager's `--data-dir` holds Raft state (`raft_log.redb` and `state.redb`), 
 2. Copy its data directory with permissions kept (`sudo tar -cpf ...`). Include `secrets`, `volumes` and `nats` if they live under it.
 3. To restore, put the directory back on a host with the same node ID and bind address, then start the manager.
 
-A cold copy restores nodes, tasks and Raft membership exactly, but only for a `minga` build that reads the same data format (a newer format is refused, an older one has no migration). Do not copy the files of a running process: redb files copied mid-write may be unusable. Use `minga state export` for a backup without downtime, and the cold copy when you need an exact image or are moving a whole cluster.
+A cold copy restores nodes, tasks and Raft membership exactly, but only for a `minga` build that reads its data format: a newer format is refused, and formats v2 through v9 are migrated to v10 on open. Do not copy the files of a running process: redb files copied mid-write may be unusable. Use `minga state export` for a backup without downtime, and the cold copy when you need an exact image or are moving a whole cluster.

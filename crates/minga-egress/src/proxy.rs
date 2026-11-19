@@ -203,6 +203,12 @@ impl EgressProxy {
         let listener = tokio::net::TcpListener::bind(addr)
             .await
             .map_err(|e| EgressProxyError::Internal(format!("bind failed: {e}")))?;
+        self.serve(listener)
+    }
+
+    /// Serves on an already bound listener, so the caller can install a
+    /// firewall rule for the port between binding and serving.
+    pub fn serve(&mut self, listener: tokio::net::TcpListener) -> Result<String, EgressProxyError> {
         let local_addr = listener
             .local_addr()
             .map_err(|e| EgressProxyError::Internal(format!("local_addr failed: {e}")))?;
@@ -388,13 +394,14 @@ enum BodyError {
 }
 
 /// Tokens charged for a completion: provider counts when reported, else the
-/// request estimate plus the estimated output.
+/// request estimate for an unknown input plus the estimated output.
 fn charged_tokens(counts: &UsageCounts, estimated_input: u64) -> u64 {
-    if counts.estimated {
-        estimated_input.saturating_add(counts.output_tokens)
+    let input = if counts.estimated && counts.input_tokens == 0 {
+        estimated_input
     } else {
-        counts.input_tokens.saturating_add(counts.output_tokens)
-    }
+        counts.input_tokens
+    };
+    input.saturating_add(counts.output_tokens)
 }
 
 fn route_prices(route: Option<&ResolvedRoute>) -> Option<(Option<u64>, Option<u64>)> {
@@ -587,13 +594,19 @@ async fn proxy_handler(State(state): State<Arc<ProxyState>>, req: Request) -> Re
         Ok(reservation) => reservation,
         Err(e) => return error_response(&state, StatusCode::TOO_MANY_REQUESTS, &e.to_string()),
     };
-    let cache_path = format!("{path}{query}\0{requested_model}");
+    // Forwarded headers (API version, beta flags, accept) change the
+    // response, so each value is part of the key; escaping keeps it injective.
+    let mut cache_path = format!("{path}{query}\0{requested_model}");
+    for (name, value) in &forwarded {
+        cache_path.push_str(&format!("\0{name}={}", value.escape_ascii()));
+    }
     let cache_route = match policy {
         Some(policy) => format!("{route_name}\0{:016x}", policy.revision()),
         None => route_name.clone(),
     };
     let cache_key = ResponseCache::compute_key_for_workload_route(
         workload,
+        &customer_id,
         &cache_route,
         method.as_str(),
         &cache_path,
@@ -896,47 +909,54 @@ async fn proxy_handler(State(state): State<Arc<ProxyState>>, req: Request) -> Re
     let route = selected_route.map(|r| r.name.clone()).unwrap_or_default();
     let prices = route_prices(selected_route);
     let idle_timeout = state.config.stream_idle_timeout;
+    // Set when the client stopped reading: its body then ends in an error
+    // instead of a clean end of stream.
+    let stalled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let relay_stalled = Arc::clone(&stalled);
     tokio::spawn(async move {
         use futures_util::StreamExt;
         let mut parser = UsageParser::new(is_sse);
         let mut bytes_seen = 0_u64;
         let mut client = Some(sender);
+        let relay = |client: &Option<ClientSender>, item: ClientItem| {
+            relay_to_client(
+                client.clone(),
+                item,
+                idle_timeout,
+                Arc::clone(&relay_stalled),
+            )
+        };
         loop {
             let chunk = match tokio::time::timeout(idle_timeout, stream.next()).await {
                 Ok(Some(Ok(chunk))) => chunk,
                 Ok(None) => break,
                 Ok(Some(Err(error))) => {
-                    if let Some(client) = &client {
-                        let _ = client
-                            .send(Err(std::io::Error::other(error.to_string())))
-                            .await;
-                    }
+                    relay(&client, Err(std::io::Error::other(error.to_string()))).await;
                     break;
                 }
                 Err(_) => {
-                    if let Some(client) = &client {
-                        let _ = client
-                            .send(Err(std::io::Error::other("upstream stream idle timeout")))
-                            .await;
-                    }
+                    relay(
+                        &client,
+                        Err(std::io::Error::other("upstream stream idle timeout")),
+                    )
+                    .await;
                     break;
                 }
             };
             bytes_seen = bytes_seen.saturating_add(chunk.len() as u64);
             parser.push(&chunk);
-            // A client that hung up stops receiving, but the upstream is
-            // drained so its reported usage is still recorded.
-            if let Some(sender) = &client {
-                if sender.send(Ok(chunk)).await.is_err() {
-                    client = None;
-                }
+            // A client that hung up or stalled stops receiving, but the
+            // upstream is drained so its reported usage is still recorded.
+            if !relay(&client, Ok(chunk)).await {
+                client = None;
             }
         }
         // End the client body before waiting on usage publication.
         drop(client);
         let (mut counts, answered_model) = parser.finish_with_model(bytes_seen);
         let answered_model = answered_model.unwrap_or_else(|| requested_model.clone());
-        if counts.estimated {
+        // A partial provider count keeps its known input.
+        if counts.estimated && counts.input_tokens == 0 {
             counts.input_tokens = estimated_tokens;
         }
         let charged = charged_tokens(&counts, estimated_tokens);
@@ -968,11 +988,46 @@ async fn proxy_handler(State(state): State<Arc<ProxyState>>, req: Request) -> Re
     for (name, value) in &resp_headers {
         response = response.header(name, value);
     }
+    // A stalled client that resumes reads what was queued, then an error,
+    // so it never mistakes a cut-off body for a complete one.
+    use futures_util::StreamExt as _;
+    let cut_off = futures_util::stream::once(async move {
+        stalled
+            .load(std::sync::atomic::Ordering::SeqCst)
+            .then(|| Err(std::io::Error::other("client stopped reading the stream")))
+    })
+    .filter_map(std::future::ready);
     response
         .body(Body::from_stream(
-            tokio_stream::wrappers::ReceiverStream::new(receiver),
+            tokio_stream::wrappers::ReceiverStream::new(receiver).chain(cut_off),
         ))
         .unwrap_or_else(|_| Response::new(Body::empty()))
+}
+
+type ClientItem = Result<bytes::Bytes, std::io::Error>;
+type ClientSender = tokio::sync::mpsc::Sender<ClientItem>;
+
+/// Hands one item to the client body within `deadline`, so a client that
+/// stays connected but stops reading cannot hold the relay, and with it the
+/// reservation. Returns false when the client hung up or stalled; a stall
+/// also sets `stalled`, and the caller then drains the upstream, settles
+/// and publishes as for a client that hung up.
+async fn relay_to_client(
+    client: Option<ClientSender>,
+    item: ClientItem,
+    deadline: Duration,
+    stalled: Arc<std::sync::atomic::AtomicBool>,
+) -> bool {
+    let Some(client) = client else {
+        return false;
+    };
+    match tokio::time::timeout(deadline, client.send(item)).await {
+        Ok(result) => result.is_ok(),
+        Err(_) => {
+            stalled.store(true, std::sync::atomic::Ordering::SeqCst);
+            false
+        }
+    }
 }
 
 /// The base redactor plus every credential of the request's route chain.
@@ -1071,6 +1126,11 @@ async fn publish_event(
             Err(_) => tracing::warn!(attempt, "egress usage event publish timed out"),
         }
     }
+    minga_telemetry::METRICS
+        .agent_usage_events_dropped_total
+        .with_label_values(&[&event.tenant_id])
+        .inc();
+    tracing::error!(tenant = %event.tenant_id, "dropped an egress usage event after its publish retries");
 }
 
 struct AwsSigningConfig<'a> {
@@ -1186,8 +1246,9 @@ impl TopLevelFields {
     }
 
     fn key_byte(&mut self, byte: u8) {
-        // Longer keys are never `usage` or `model`.
-        if self.key.len() <= 8 {
+        // A five-character key takes at most 30 escaped bytes (`\u0075`
+        // each), so anything longer is never `usage` or `model`.
+        if self.key.len() <= 30 {
             self.key.push(byte);
         }
     }
@@ -1211,9 +1272,11 @@ impl TopLevelFields {
                 self.in_string = false;
                 if self.reading_key {
                     self.reading_key = false;
-                    self.pending = match self.key.as_slice() {
-                        b"usage" => Some(Field::Usage),
-                        b"model" => Some(Field::Model),
+                    // Match the decoded key, as the buffered path does.
+                    let quoted = [b"\"", self.key.as_slice(), b"\""].concat();
+                    self.pending = match serde_json::from_slice::<String>(&quoted).as_deref() {
+                        Ok("usage") => Some(Field::Usage),
+                        Ok("model") => Some(Field::Model),
                         _ => None,
                     };
                     self.key.clear();
@@ -1277,6 +1340,9 @@ struct UsageParser {
     fields: TopLevelFields,
     answered_model: Option<String>,
     usage: Option<UsageCounts>,
+    /// Whether the output count came from a final usage report rather than
+    /// Anthropic's initial `message_start` count.
+    output_final: bool,
 }
 
 impl UsageParser {
@@ -1290,6 +1356,7 @@ impl UsageParser {
             fields: TopLevelFields::default(),
             answered_model: None,
             usage: None,
+            output_final: false,
         }
     }
 
@@ -1299,13 +1366,13 @@ impl UsageParser {
             if let Some(raw) = self.fields.usage.take() {
                 let value = serde_json::from_slice::<serde_json::Value>(&raw).ok();
                 if let Some(usage) = usage_counts(value.as_ref()) {
-                    self.record_usage(usage);
+                    self.record_usage(usage, true);
                 }
             }
             if let Some(raw) = self.fields.model.take() {
                 if let Some(model) = serde_json::from_slice::<String>(&raw)
                     .ok()
-                    .filter(|model| !model.is_empty())
+                    .filter(|model| reported_model_fits(model))
                 {
                     self.answered_model = Some(model);
                 }
@@ -1333,7 +1400,8 @@ impl UsageParser {
         }
     }
 
-    fn record_usage(&mut self, next: UsageCounts) {
+    fn record_usage(&mut self, next: UsageCounts, output_final: bool) {
+        self.output_final |= output_final;
         let current = self.usage.get_or_insert(UsageCounts {
             input_tokens: 0,
             output_tokens: 0,
@@ -1357,8 +1425,8 @@ impl UsageParser {
                 if let Some(model) = find_answered_model(&self.event) {
                     self.answered_model = Some(model);
                 }
-                if let Some(usage) = find_usage(&self.event) {
-                    self.record_usage(usage);
+                if let Some((usage, output_final)) = find_event_usage(&self.event) {
+                    self.record_usage(usage, output_final);
                 }
             }
             self.event.clear();
@@ -1387,28 +1455,48 @@ impl UsageParser {
                 if let Some(model) = find_answered_model(&self.event) {
                     self.answered_model = Some(model);
                 }
-                if let Some(usage) = find_usage(&self.event) {
-                    self.record_usage(usage);
+                if let Some((usage, output_final)) = find_event_usage(&self.event) {
+                    self.record_usage(usage, output_final);
                 }
             }
         }
-        let usage = self.usage.unwrap_or(UsageCounts {
-            input_tokens: 0,
-            output_tokens: response_bytes / 4,
-            estimated: true,
-        });
+        let usage = match self.usage {
+            Some(usage) if self.output_final => usage,
+            // Cut before the final count: the input is known, the output is
+            // at least what the response bytes suggest.
+            Some(usage) => UsageCounts {
+                input_tokens: usage.input_tokens,
+                output_tokens: usage.output_tokens.max(response_bytes / 4),
+                estimated: true,
+            },
+            None => UsageCounts {
+                input_tokens: 0,
+                output_tokens: response_bytes / 4,
+                estimated: true,
+            },
+        };
         (usage, self.answered_model)
     }
 }
 
 fn find_usage(bytes: &[u8]) -> Option<UsageCounts> {
+    find_event_usage(bytes).map(|(usage, _)| usage)
+}
+
+/// Usage of one JSON document and whether its output count is final.
+/// Anthropic's `message_start` nests an initial count under `message`; a
+/// later top-level `usage` (`message_delta`) carries the final output.
+fn find_event_usage(bytes: &[u8]) -> Option<(UsageCounts, bool)> {
     let value: serde_json::Value = serde_json::from_slice(bytes).ok()?;
-    let usage = value.get("usage").or_else(|| {
-        value
-            .get("message")
-            .and_then(|message| message.get("usage"))
-    })?;
-    usage_counts(Some(usage))
+    if let Some(usage) = value.get("usage") {
+        // An input-only report leaves the output open; an explicit 0 is final.
+        let output_final = ["completion_tokens", "output_tokens"]
+            .iter()
+            .any(|key| usage.get(key).is_some_and(serde_json::Value::is_u64));
+        return usage_counts(Some(usage)).map(|usage| (usage, output_final));
+    }
+    let usage = value.get("message")?.get("usage")?;
+    usage_counts(Some(usage)).map(|usage| (usage, false))
 }
 
 fn find_answered_model(bytes: &[u8]) -> Option<String> {
@@ -1421,8 +1509,14 @@ fn find_answered_model(bytes: &[u8]) -> Option<String> {
                 .and_then(|message| message.get("model"))
         })
         .and_then(serde_json::Value::as_str)
-        .filter(|model| !model.is_empty())
+        .filter(|model| reported_model_fits(model))
         .map(str::to_owned)
+}
+
+/// A provider-reported model is kept for accounting only within the request
+/// identifier limit; otherwise the requested model stands in for it.
+fn reported_model_fits(model: &str) -> bool {
+    !model.is_empty() && model.len() <= MAX_IDENTIFIER_BYTES
 }
 
 fn usage_counts(usage: Option<&serde_json::Value>) -> Option<UsageCounts> {
@@ -1725,6 +1819,49 @@ mod tests {
         assert!(flattened.get("response_body").is_none());
     }
 
+    #[tokio::test]
+    async fn a_usage_event_dropped_after_its_retries_is_counted() {
+        use crate::routes::WorkloadIdentity;
+        let dropped = || {
+            minga_telemetry::METRICS
+                .agent_usage_events_dropped_total
+                .with_label_values(&["drop-test"])
+                .get()
+        };
+        let before = dropped();
+        let publish = |service_id: &str| {
+            publish_event(
+                Some(minga_bus::MemoryBus::new() as Arc<dyn EventBus>),
+                Arc::new(WorkloadIdentity {
+                    workload_id: "task-a".into(),
+                    tenant_id: "drop-test".into(),
+                    service_id: service_id.into(),
+                    policy: None,
+                }),
+                UsagePublication {
+                    customer_id: String::new(),
+                    route: "route-a".into(),
+                    requested_model: "model-a".into(),
+                    answered_model: "model-a".into(),
+                    counts: UsageCounts {
+                        input_tokens: 1,
+                        output_tokens: 1,
+                        estimated: false,
+                    },
+                    status: StatusCode::OK,
+                    latency_ms: 1,
+                    cache_hit: false,
+                    prices: None,
+                },
+            )
+        };
+        publish("service-a").await;
+        assert_eq!(dropped(), before, "a published event is not dropped");
+        // The memory bus refuses an event without a service on every attempt.
+        publish("").await;
+        assert_eq!(dropped(), before + 1.0);
+    }
+
     #[test]
     fn parses_openai_and_anthropic_json_usage() {
         let openai = br#"{"usage":{"prompt_tokens":12,"completion_tokens":7,"total_tokens":19}}"#;
@@ -1791,6 +1928,59 @@ mod tests {
             UsageCounts {
                 input_tokens: 12,
                 output_tokens: 3,
+                estimated: false,
+            }
+        );
+    }
+
+    #[test]
+    fn an_anthropic_stream_cut_before_the_final_usage_estimates_the_output() {
+        let events = concat!(
+            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":18,\"output_tokens\":0}}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"a generated answer that the provider charged for\"}}\n\n",
+        );
+        let mut parser = UsageParser::new(true);
+        parser.push(events.as_bytes());
+        let counts = parser.finish_with_model(events.len() as u64).0;
+        assert_eq!(
+            counts,
+            UsageCounts {
+                input_tokens: 18,
+                output_tokens: events.len() as u64 / 4,
+                estimated: true,
+            }
+        );
+        assert_eq!(
+            charged_tokens(&counts, 999),
+            18 + events.len() as u64 / 4,
+            "the known input is kept"
+        );
+    }
+
+    #[test]
+    fn a_top_level_input_only_usage_does_not_finalize_the_output() {
+        let events = concat!(
+            "data: {\"usage\":{\"input_tokens\":18}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"a generated answer that the provider charged for\"}}\n\n",
+        );
+        let mut parser = UsageParser::new(true);
+        parser.push(events.as_bytes());
+        assert_eq!(
+            parser.finish_with_model(events.len() as u64).0,
+            UsageCounts {
+                input_tokens: 18,
+                output_tokens: events.len() as u64 / 4,
+                estimated: true,
+            }
+        );
+        let explicit_zero = "data: {\"usage\":{\"input_tokens\":18,\"output_tokens\":0}}\n\n";
+        let mut parser = UsageParser::new(true);
+        parser.push(explicit_zero.as_bytes());
+        assert_eq!(
+            parser.finish_with_model(explicit_zero.len() as u64).0,
+            UsageCounts {
+                input_tokens: 18,
+                output_tokens: 0,
                 estimated: false,
             }
         );
@@ -1876,6 +2066,48 @@ mod tests {
     }
 
     #[test]
+    fn json_usage_parser_matches_escaped_top_level_keys() {
+        let body =
+            br#"{"\u006dodel":"m-2","us\u0061ge":{"prompt_tokens":3,"completion_tokens":4}}"#;
+        for chunk in [1, body.len()] {
+            let mut parser = UsageParser::new(false);
+            for part in body.chunks(chunk) {
+                parser.push(part);
+            }
+            let (counts, model) = parser.finish_with_model(body.len() as u64);
+            assert_eq!(
+                counts,
+                UsageCounts {
+                    input_tokens: 3,
+                    output_tokens: 4,
+                    estimated: false,
+                },
+                "chunk size {chunk}"
+            );
+            assert_eq!(model.as_deref(), Some("m-2"));
+        }
+        assert_eq!(
+            find_usage(body),
+            find_usage(br#"{"usage":{"prompt_tokens":3,"completion_tokens":4}}"#)
+        );
+    }
+
+    #[test]
+    fn oversized_reported_models_fall_back_to_the_requested_one() {
+        let long = "m".repeat(MAX_IDENTIFIER_BYTES + 1);
+        let body = format!(r#"{{"model":"{long}"}}"#);
+        assert_eq!(find_answered_model(body.as_bytes()), None);
+        let mut parser = UsageParser::new(false);
+        parser.push(body.as_bytes());
+        assert_eq!(parser.finish_with_model(body.len() as u64).1, None);
+        let fits = "m".repeat(MAX_IDENTIFIER_BYTES);
+        assert_eq!(
+            find_answered_model(format!(r#"{{"model":"{fits}"}}"#).as_bytes()),
+            Some(fits)
+        );
+    }
+
+    #[test]
     fn sse_usage_parser_caps_oversized_event_buffers() {
         let mut parser = UsageParser::new(true);
         parser.push(b"data:");
@@ -1893,22 +2125,29 @@ mod tests {
         use bytes::Bytes;
         use futures_util::StreamExt;
 
+        // The second chunk waits for the test, so a proxy that buffers the
+        // body before sending headers never answers within the deadline.
+        let release = Arc::new(tokio::sync::Notify::new());
+        let upstream_release = Arc::clone(&release);
         let app = Router::new().route(
             "/*path",
-            any(|| async {
-                let (sender, receiver) =
-                    tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(2);
-                tokio::spawn(async move {
-                    let _ = sender.send(Ok(Bytes::from_static(b"first\n"))).await;
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                    let _ = sender.send(Ok(Bytes::from_static(b"second\n"))).await;
-                });
-                Response::builder()
-                    .header("content-type", "text/event-stream")
-                    .body(AxumBody::from_stream(
-                        tokio_stream::wrappers::ReceiverStream::new(receiver),
-                    ))
-                    .unwrap()
+            any(move || {
+                let release = Arc::clone(&upstream_release);
+                async move {
+                    let (sender, receiver) =
+                        tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(2);
+                    tokio::spawn(async move {
+                        let _ = sender.send(Ok(Bytes::from_static(b"first\n"))).await;
+                        release.notified().await;
+                        let _ = sender.send(Ok(Bytes::from_static(b"second\n"))).await;
+                    });
+                    Response::builder()
+                        .header("content-type", "text/event-stream")
+                        .body(AxumBody::from_stream(
+                            tokio_stream::wrappers::ReceiverStream::new(receiver),
+                        ))
+                        .unwrap()
+                }
             }),
         );
         let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1931,23 +2170,82 @@ mod tests {
             tokens,
         );
         let address = proxy.start("127.0.0.1:0").await.unwrap();
-        let response = reqwest::Client::new()
-            .post(format!("http://{address}/v1/chat"))
-            .header(SANDBOX_TOKEN_HEADER, token.as_str())
-            .body("{}")
-            .send()
-            .await
-            .unwrap();
-        let mut body = response.bytes_stream();
-        let first = tokio::time::timeout(Duration::from_millis(500), body.next())
-            .await
-            .expect("first chunk should not wait for upstream completion")
-            .unwrap()
-            .unwrap();
+        let (mut body, first) = tokio::time::timeout(Duration::from_secs(5), async {
+            let response = reqwest::Client::new()
+                .post(format!("http://{address}/v1/chat"))
+                .header(SANDBOX_TOKEN_HEADER, token.as_str())
+                .body("{}")
+                .send()
+                .await
+                .unwrap();
+            let mut body = response.bytes_stream();
+            let first = body.next().await.unwrap().unwrap();
+            (body, first)
+        })
+        .await
+        .expect("headers and the first chunk should not wait for upstream completion");
         assert_eq!(first.as_ref(), b"first\n");
+        release.notify_one();
         while body.next().await.is_some() {}
         assert_eq!(proxy.cache_stats().unwrap().stores, 0, "not cached at EOF");
         proxy.shutdown();
+    }
+
+    #[tokio::test]
+    async fn a_client_that_stops_reading_releases_the_reservation() {
+        use bytes::Bytes;
+        let app = Router::new().route(
+            "/*path",
+            any(|| async {
+                let chunks = (0..64).map(|_| Ok::<_, std::io::Error>(Bytes::from(vec![b'x'; 64])));
+                Response::builder()
+                    .header("content-type", "text/event-stream")
+                    .body(Body::from_stream(futures_util::stream::iter(chunks)))
+                    .unwrap()
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.ok() });
+        let budgets = Arc::new(BudgetTracker::new());
+        budgets.register("stalled", Budget::new(1_000_000, Duration::from_secs(3600)));
+        let config = EgressProxyConfig {
+            upstream_url: format!("http://{address}"),
+            stream_idle_timeout: Duration::from_millis(200),
+            ..Default::default()
+        };
+        let tokens = Arc::new(SandboxTokens::new());
+        let token = tokens.issue_standalone("stalled");
+        let state = Arc::new(ProxyState {
+            route_client: route_client(&config),
+            config,
+            budgets: Arc::clone(&budgets),
+            cache: None,
+            redactor: SecretRedactor::with_defaults(),
+            client: reqwest::Client::new(),
+            tokens,
+            bus: std::sync::OnceLock::new(),
+        });
+        // No output cap: the request holds the whole balance until it settles.
+        let response = proxy_handler(State(state), post(token.as_str(), "{}")).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        // The body is never read, so the relay's queue fills and stalls.
+        let settled = tokio::time::timeout(Duration::from_secs(5), async {
+            while budgets.status("stalled").unwrap().used >= 1_000_000 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(
+            settled.is_ok(),
+            "a stalled client still holds the reservation"
+        );
+        assert!(
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .is_err(),
+            "a cut-off body ends in an error, not a clean end of stream"
+        );
     }
 
     #[test]
@@ -2454,6 +2752,97 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(&body[..], want.as_bytes());
+        }
+    }
+
+    #[tokio::test]
+    async fn forwarded_variant_headers_are_part_of_the_cache_key() {
+        use axum::http::HeaderMap;
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let upstream_hits = Arc::clone(&hits);
+        let app = Router::new().route(
+            "/*path",
+            any(move |headers: HeaderMap| {
+                let hits = Arc::clone(&upstream_hits);
+                async move {
+                    hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let version = headers
+                        .get("anthropic-version")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("")
+                        .to_owned();
+                    format!("version {version}")
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.ok() });
+        let state = test_state();
+        let token = routed_token(
+            &state,
+            "test-agent",
+            route_policy("primary", format!("http://{address}")),
+        );
+        for (version, want) in [
+            ("2023-06-01", "version 2023-06-01"),
+            ("2024-01-01", "version 2024-01-01"),
+            ("2023-06-01", "version 2023-06-01"),
+        ] {
+            let mut request = post(token.as_str(), "{}");
+            request
+                .headers_mut()
+                .insert("anthropic-version", version.parse().unwrap());
+            let response = proxy_handler(State(Arc::clone(&state)), request).await;
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert_eq!(&body[..], want.as_bytes());
+        }
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "a repeated variant is still a cache hit"
+        );
+    }
+
+    #[tokio::test]
+    async fn customers_do_not_share_cached_responses() {
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let upstream_hits = Arc::clone(&hits);
+        let app = Router::new().route(
+            "/*path",
+            any(move || {
+                let hits = Arc::clone(&upstream_hits);
+                async move {
+                    let n = hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                    format!("answer {n}")
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.ok() });
+        let state = test_state();
+        let token = routed_token(
+            &state,
+            "test-agent",
+            route_policy("primary", format!("http://{address}")),
+        );
+        for (customer, want) in [
+            ("alice", "answer 1"),
+            ("bob", "answer 2"),
+            ("alice", "answer 1"),
+        ] {
+            let mut request = post(token.as_str(), "{}");
+            request
+                .headers_mut()
+                .insert("x-minga-customer", customer.parse().unwrap());
+            let response = proxy_handler(State(Arc::clone(&state)), request).await;
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert_eq!(&body[..], want.as_bytes(), "customer {customer}");
         }
     }
 
