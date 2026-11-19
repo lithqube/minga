@@ -544,6 +544,7 @@ fn build_router_with_app_state(
         // Versioned endpoints: /{version}/...
         .route("/:version/version", get(handlers::get_version))
         .route("/:version/info", get(handlers::get_info))
+        .route("/:version/audit", get(handlers::list_audit))
         .route("/:version/agent/usage", get(handlers::agent_usage))
         // Nodes.
         .route(
@@ -1538,6 +1539,31 @@ mod tests {
             .role = Some(ApiRole::Admin);
         let (status, _) = send_request(router, operator).await;
         assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn tenant_admin_reaches_audit_and_usage_routes() {
+        let (router, store, _dir) = admin_router().await;
+        store
+            .upsert_tenant(minga_state::types::Tenant {
+                nats_revoked_user_public_keys: Vec::new(),
+                id: "tenant-a".into(),
+                name: "tenant-a".into(),
+                quotas: Default::default(),
+                created_at: 1,
+            })
+            .await
+            .unwrap();
+        for uri in ["/v1.41/audit", "/v1.41/agent/usage"] {
+            let mut request = Request::builder().uri(uri).body(Body::empty()).unwrap();
+            request.extensions_mut().insert(ClientIdentity {
+                name: "tenant-admin".into(),
+                role: Some(ApiRole::Admin),
+                tenant: Some("tenant-a".into()),
+            });
+            let (status, body) = send_request(router.clone(), request).await;
+            assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+        }
     }
 
     #[tokio::test]
