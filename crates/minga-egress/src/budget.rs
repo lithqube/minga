@@ -185,6 +185,9 @@ impl BudgetTracker {
             .get_mut(workload)
             .ok_or_else(|| BudgetTrackerError::NotFound(workload.to_string()))?;
         budget.maybe_reset_window();
+        // Every request reaches the provider, so even an empty one needs a
+        // token of headroom; a fully held budget admits nothing.
+        let floor = floor.max(1);
         if !budget.allows(floor) {
             return Err(BudgetTrackerError::Exceeded {
                 workload: workload.to_string(),
@@ -412,6 +415,9 @@ mod tests {
         tracker.register("limited", Budget::new(100, Duration::from_secs(60)));
         let held = tracker.reserve_rest("limited", 10).unwrap();
         assert!(tracker.reserve("limited", 1).is_err());
+        // An empty body bounds its input at zero; it must still be refused.
+        assert!(tracker.reserve_rest("limited", 0).is_err());
+        assert!(tracker.reserve("limited", 0).is_err());
         assert!(held.settle(30));
         assert_eq!(tracker.status("limited").unwrap().used, 30);
         // Unlimited budgets reserve only the floor, so uncapped requests overlap.

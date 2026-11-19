@@ -2308,6 +2308,8 @@ mod tests {
             format!(r#"{{"max_tokens":1,"p":"{}"}}"#, "x".repeat(37)),
             // Output is billed per choice: 3 x 20 plus the input must fit.
             r#"{"max_tokens":20,"n":3}"#.to_string(),
+            // An empty body bounds its input at zero but still needs headroom.
+            String::new(),
         ] {
             concurrent_requests_cannot_spend_the_same_budget_with(&body).await;
         }
