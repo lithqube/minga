@@ -1582,7 +1582,7 @@ mod tests {
             Budget::new(1_000_000, Duration::from_secs(3600)),
         );
         let tokens = Arc::new(SandboxTokens::new());
-        let token = tokens.issue("stream-task");
+        let token = tokens.issue_standalone("stream-task");
         let mut proxy = EgressProxy::new(
             EgressProxyConfig {
                 upstream_url: format!("http://{upstream_addr}"),
@@ -1729,7 +1729,7 @@ mod tests {
     async fn spoofed_workload_header_is_rejected() {
         let (_proxy, url, tokens) = start_proxy(UpstreamAuth::Bearer("k".into())).await;
         let client = reqwest::Client::new();
-        let token_b = tokens.issue("task-b");
+        let token_b = tokens.issue_standalone("task-b");
 
         // A name alone is not an identity.
         let resp = client
@@ -1786,7 +1786,7 @@ mod tests {
             ),
         ] {
             let (_proxy, url, tokens) = start_proxy(auth).await;
-            let token = tokens.issue("task-a");
+            let token = tokens.issue_standalone("task-a");
             let resp = reqwest::Client::new()
                 .post(&url)
                 .header(SANDBOX_TOKEN_HEADER, token.as_str())
@@ -1813,7 +1813,7 @@ mod tests {
         // No default rule matches this key; only the literal rule can catch it.
         let key = "plain-key-Zq9";
         let (_proxy, url, tokens) = start_proxy(UpstreamAuth::ApiKey(key.into())).await;
-        let token = tokens.issue("task-a");
+        let token = tokens.issue_standalone("task-a");
         let resp = reqwest::Client::new()
             .post(url.replace("/v1/chat", "/v1/reject"))
             .header(SANDBOX_TOKEN_HEADER, token.as_str())

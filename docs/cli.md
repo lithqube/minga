@@ -87,7 +87,7 @@ The API waits for catch-up before promotion. Remove it with
 | `--interval <SECS>` | `2` | Reconcile interval. |
 | `--sandbox-runtime <mock\|wasmtime>`, `--module-dir <DIR>` | none, `/var/lib/minga/modules` | `wasmtime` enables `x-minga-agent` tasks on this node. |
 | `--agent-dir-root <DIR>` (repeatable) | none | Canonicalized allowlist for agent directory grants; no configured root permits no directory grants. Grants are validated only: the sandbox mounts no directories and links no WASI yet. |
-| `--egress-bind`, `--egress-upstream`, `--egress-credential`, `--egress-credential-header` | none, `https://api.openai.com`, none, `authorization` | Starts the LLM egress proxy for agent tasks. The credential is a secret ID in `--secret-store`; agents never see the key. |
+| `--egress-bind`, `--egress-upstream`, `--egress-credential`, `--egress-credential-header` | none, `https://api.openai.com`, none, `authorization` | Opt-in. Starts the LLM egress proxy for agent and routed container tasks (for example `0.0.0.0:8080`); tasks reach it on their bridge gateway at the bind's port. On Linux a non-loopback bind installs the `minga_egress_listener` nft table, which closes that port to everything but `lo` and task bridges (not the WireGuard mesh). The node then carries the reserved `com.minga.egress.proxy=true` label, and services with egress routes are placed only on such nodes. The credential is a secret ID in `--secret-store`; agents never see the key. |
 
 The built-in NATS sidecar caps JetStream file storage at 8GB (not preallocated). The MINGA account's JetStream disk limit must not exceed that cap.
 

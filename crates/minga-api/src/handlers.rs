@@ -2372,6 +2372,12 @@ mod tests {
     #[tokio::test]
     async fn egress_route_secrets_of_another_tenant_are_not_found() {
         let (app, _dir) = app_with_node(1.0).await;
+        let mut node = app.store.get_node(1).await.unwrap().unwrap();
+        node.labels.insert(
+            minga_state::types::EGRESS_PROXY_NODE_LABEL.into(),
+            "true".into(),
+        );
+        app.store.upsert_node(node).await.unwrap();
         app.store
             .create_tenant(Tenant {
                 nats_revoked_user_public_keys: Vec::new(),

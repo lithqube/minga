@@ -90,8 +90,15 @@ pub trait AgentExecutor: Send + Sync {
     ///
     /// Returns the agent ID (same as task_id for simplicity).
     /// The agent runs asynchronously; use [`AgentExecutor::status`] to
-    /// check completion.
-    async fn start(&self, task_id: &TaskId, spec: &AgentSpec) -> Result<String, AgentError>;
+    /// check completion. `tenant_id` and `service_id` come from the
+    /// assignment and attribute the run's egress usage.
+    async fn start(
+        &self,
+        task_id: &TaskId,
+        tenant_id: &str,
+        service_id: &str,
+        spec: &AgentSpec,
+    ) -> Result<String, AgentError>;
 
     /// Stops and cleans up an agent. Safe to call even if the agent
     /// has already completed.
@@ -141,7 +148,13 @@ impl MockAgentExecutor {
 
 #[async_trait]
 impl AgentExecutor for MockAgentExecutor {
-    async fn start(&self, task_id: &TaskId, spec: &AgentSpec) -> Result<String, AgentError> {
+    async fn start(
+        &self,
+        task_id: &TaskId,
+        _tenant_id: &str,
+        _service_id: &str,
+        spec: &AgentSpec,
+    ) -> Result<String, AgentError> {
         if *self.fail_starts.lock().unwrap() {
             return Err(AgentError::Start("mock executor: starts disabled".into()));
         }
@@ -232,8 +245,24 @@ pub struct WasmtimeAgentExecutor {
     results: Mutex<HashMap<String, AgentRunResult>>,
     statuses: Mutex<HashMap<String, AgentStatus>>,
     egress_tokens: Option<Arc<minga_egress::SandboxTokens>>,
+    egress_budgets: Option<Arc<minga_egress::BudgetTracker>>,
     allowed_dir_roots: Vec<PathBuf>,
     egress_enabled: bool,
+}
+
+/// One run's egress token and budget; both end when the run does.
+struct EgressRun {
+    token: minga_egress::SandboxToken,
+    workload: String,
+    budgets: Option<Arc<minga_egress::BudgetTracker>>,
+}
+
+impl Drop for EgressRun {
+    fn drop(&mut self) {
+        if let Some(budgets) = &self.budgets {
+            budgets.unregister(&self.workload);
+        }
+    }
 }
 
 impl WasmtimeAgentExecutor {
@@ -250,6 +279,7 @@ impl WasmtimeAgentExecutor {
             results: Mutex::new(HashMap::new()),
             statuses: Mutex::new(HashMap::new()),
             egress_tokens: None,
+            egress_budgets: None,
             allowed_dir_roots: Vec::new(),
             egress_enabled: false,
         })
@@ -259,6 +289,12 @@ impl WasmtimeAgentExecutor {
     /// executor starts, so the co-located proxy knows which task is calling.
     pub fn with_egress_tokens(mut self, tokens: Arc<minga_egress::SandboxTokens>) -> Self {
         self.egress_tokens = Some(tokens);
+        self
+    }
+
+    /// Registers each `http` run's token budget in the proxy's tracker.
+    pub fn with_egress_budgets(mut self, budgets: Arc<minga_egress::BudgetTracker>) -> Self {
+        self.egress_budgets = Some(budgets);
         self
     }
 
@@ -285,6 +321,40 @@ impl WasmtimeAgentExecutor {
             self.allowed_dir_roots.push(canonical);
         }
         Ok(self)
+    }
+
+    /// Mints the token and budget of an `http` run, attributed to the
+    /// assignment's tenant and service.
+    fn egress_run(
+        &self,
+        id: &str,
+        tenant_id: &str,
+        service_id: &str,
+        spec: &AgentSpec,
+    ) -> Option<EgressRun> {
+        let tokens = self.egress_tokens.as_ref()?;
+        if !spec.capabilities.grants.contains(&AgentGrant::Http) {
+            return None;
+        }
+        if let Some(budgets) = &self.egress_budgets {
+            // Per-run budget; no `token_budget` means no token limit.
+            let limit = spec.token_budget.unwrap_or(u64::MAX);
+            budgets.register(
+                id,
+                minga_egress::Budget::new(limit, Duration::from_secs(24 * 3600)),
+            );
+        }
+        let token = tokens.issue_identity(minga_egress::WorkloadIdentity {
+            workload_id: id.to_owned(),
+            tenant_id: tenant_id.to_owned(),
+            service_id: service_id.to_owned(),
+            policy: None,
+        });
+        Some(EgressRun {
+            token,
+            workload: id.to_owned(),
+            budgets: self.egress_budgets.clone(),
+        })
     }
 
     /// Indicates whether this node has an outbound egress proxy configured.
@@ -356,7 +426,13 @@ fn validate_agent_capabilities(
 
 #[async_trait]
 impl AgentExecutor for WasmtimeAgentExecutor {
-    async fn start(&self, task_id: &TaskId, spec: &AgentSpec) -> Result<String, AgentError> {
+    async fn start(
+        &self,
+        task_id: &TaskId,
+        tenant_id: &str,
+        service_id: &str,
+        spec: &AgentSpec,
+    ) -> Result<String, AgentError> {
         let id = task_id.clone();
 
         // Read the WASM module from the filesystem.
@@ -384,14 +460,14 @@ impl AgentExecutor for WasmtimeAgentExecutor {
         }
         // Only an `http` grant gets a proxy token. Revoked when `start`
         // returns, i.e. when the run ends.
-        let http = spec.capabilities.grants.contains(&AgentGrant::Http);
-        let _egress_token = self.egress_tokens.as_ref().filter(|_| http).map(|tokens| {
-            let token = tokens.issue(&id);
-            sandbox_spec
-                .env
-                .insert("MINGA_EGRESS_TOKEN".to_string(), token.as_str().to_string());
-            token
-        });
+        let _egress_run = self
+            .egress_run(&id, tenant_id, service_id, spec)
+            .inspect(|run| {
+                sandbox_spec.env.insert(
+                    "MINGA_EGRESS_TOKEN".to_string(),
+                    run.token.as_str().to_string(),
+                );
+            });
 
         // Prepare input: use the prompt as input data.
         let input = spec
@@ -593,7 +669,10 @@ mod tests {
             module_ref: "start.wat".into(),
             ..*spec
         };
-        let id = exec.start(&"task-legacy".to_string(), &spec).await.unwrap();
+        let id = exec
+            .start(&"task-legacy".to_string(), "default", "svc", &spec)
+            .await
+            .unwrap();
         assert_eq!(exec.status(&id).await, Some(AgentStatus::Completed));
     }
 
@@ -624,7 +703,12 @@ mod tests {
     async fn mock_start_and_status() {
         let exec = MockAgentExecutor::new();
         let id = exec
-            .start(&"task-1".to_string(), &test_agent_spec("./agent.wasm"))
+            .start(
+                &"task-1".to_string(),
+                "default",
+                "svc",
+                &test_agent_spec("./agent.wasm"),
+            )
             .await
             .unwrap();
         assert_eq!(id, "task-1");
@@ -638,7 +722,12 @@ mod tests {
         *exec.auto_complete.lock().unwrap() = true;
 
         let id = exec
-            .start(&"task-1".to_string(), &test_agent_spec("./agent.wasm"))
+            .start(
+                &"task-1".to_string(),
+                "default",
+                "svc",
+                &test_agent_spec("./agent.wasm"),
+            )
             .await
             .unwrap();
         assert_eq!(exec.status(&id).await, Some(AgentStatus::Completed));
@@ -653,7 +742,12 @@ mod tests {
     async fn mock_stop() {
         let exec = MockAgentExecutor::new();
         let id = exec
-            .start(&"task-1".to_string(), &test_agent_spec("./agent.wasm"))
+            .start(
+                &"task-1".to_string(),
+                "default",
+                "svc",
+                &test_agent_spec("./agent.wasm"),
+            )
             .await
             .unwrap();
         assert_eq!(exec.agent_count(), 1);
@@ -674,7 +768,12 @@ mod tests {
         let exec = MockAgentExecutor::new();
         *exec.fail_starts.lock().unwrap() = true;
         let result = exec
-            .start(&"task-1".to_string(), &test_agent_spec("./agent.wasm"))
+            .start(
+                &"task-1".to_string(),
+                "default",
+                "svc",
+                &test_agent_spec("./agent.wasm"),
+            )
             .await;
         assert!(result.is_err());
     }
@@ -682,12 +781,22 @@ mod tests {
     #[tokio::test]
     async fn mock_list() {
         let exec = MockAgentExecutor::new();
-        exec.start(&"t1".to_string(), &test_agent_spec("a.wasm"))
-            .await
-            .unwrap();
-        exec.start(&"t2".to_string(), &test_agent_spec("b.wasm"))
-            .await
-            .unwrap();
+        exec.start(
+            &"t1".to_string(),
+            "default",
+            "svc",
+            &test_agent_spec("a.wasm"),
+        )
+        .await
+        .unwrap();
+        exec.start(
+            &"t2".to_string(),
+            "default",
+            "svc",
+            &test_agent_spec("b.wasm"),
+        )
+        .await
+        .unwrap();
         let agents = exec.list().await;
         assert_eq!(agents.len(), 2);
     }
@@ -696,7 +805,12 @@ mod tests {
     async fn mock_result_none_for_running() {
         let exec = MockAgentExecutor::new();
         let id = exec
-            .start(&"task-1".to_string(), &test_agent_spec("./agent.wasm"))
+            .start(
+                &"task-1".to_string(),
+                "default",
+                "svc",
+                &test_agent_spec("./agent.wasm"),
+            )
             .await
             .unwrap();
         assert!(
@@ -737,7 +851,10 @@ mod tests {
         let mut spec = test_agent_spec(module_path.to_str().unwrap());
         spec.prompt = Some("hello".to_string());
 
-        let id = exec.start(&"task-echo".to_string(), &spec).await.unwrap();
+        let id = exec
+            .start(&"task-echo".to_string(), "default", "svc", &spec)
+            .await
+            .unwrap();
 
         assert_eq!(exec.status(&id).await, Some(AgentStatus::Completed));
 
@@ -748,12 +865,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn http_run_token_carries_the_assignment_tenant_and_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let tokens = Arc::new(minga_egress::SandboxTokens::new());
+        let budgets = Arc::new(minga_egress::BudgetTracker::new());
+        let exec = WasmtimeAgentExecutor::new(dir.path())
+            .await
+            .unwrap()
+            .with_egress_tokens(Arc::clone(&tokens))
+            .with_egress_budgets(Arc::clone(&budgets));
+        let mut spec = test_agent_spec("./a.wasm");
+        spec.token_budget = Some(500);
+        assert!(exec.egress_run("t", "acme", "svc", &spec).is_none());
+        spec.capabilities.grants.insert(AgentGrant::Http);
+        let run = exec.egress_run("t", "acme", "acme.svc", &spec).unwrap();
+        let identity = tokens.identity(run.token.as_str()).unwrap();
+        assert_eq!(identity.tenant_id, "acme");
+        assert_eq!(identity.service_id, "acme.svc");
+        assert_eq!(budgets.status("t").unwrap().max_tokens, 500);
+        drop(run);
+        assert!(budgets.status("t").is_none());
+    }
+
+    #[tokio::test]
     async fn wasmtime_exec_missing_module() {
         let dir = tempfile::tempdir().unwrap();
         let exec = WasmtimeAgentExecutor::new(dir.path()).await.unwrap();
 
         let spec = test_agent_spec("./nonexistent.wasm");
-        let result = exec.start(&"task-missing".to_string(), &spec).await;
+        let result = exec
+            .start(&"task-missing".to_string(), "default", "svc", &spec)
+            .await;
         assert!(result.is_err());
     }
 
@@ -786,7 +928,12 @@ mod tests {
     async fn shared_executor_works() {
         let exec = shared_executor(MockAgentExecutor::new());
         let id = exec
-            .start(&"task-1".to_string(), &test_agent_spec("./a.wasm"))
+            .start(
+                &"task-1".to_string(),
+                "default",
+                "svc",
+                &test_agent_spec("./a.wasm"),
+            )
             .await
             .unwrap();
         assert_eq!(exec.status(&id).await, Some(AgentStatus::Running));

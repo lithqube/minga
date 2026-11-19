@@ -30,6 +30,13 @@ use crate::{constraints, netassign};
 pub(crate) fn is_eligible(n: &ClusterNode, service: &Service) -> bool {
     n.status == NodeStatus::Active
         && n.tenant_id == service.tenant_id
+        && (!service
+            .egress
+            .as_ref()
+            .is_some_and(|policy| policy.needs_proxy())
+            || n.labels
+                .get(minga_state::types::EGRESS_PROXY_NODE_LABEL)
+                .is_some_and(|value| value == "true"))
         && service
             .constraints
             .iter()
@@ -477,6 +484,12 @@ mod tests {
             }],
             models: vec!["model-*".to_string()],
         });
+        // A node without the egress proxy cannot run it.
+        assert!(place_service(&service, std::slice::from_ref(&worker), &[], &[], 0).is_empty());
+        worker.labels.insert(
+            minga_state::types::EGRESS_PROXY_NODE_LABEL.to_string(),
+            "true".to_string(),
+        );
         let tasks = place_service(&service, &[worker], &[], &[], 0);
         let identity = tasks[0].spec.egress.as_ref().unwrap();
         assert_eq!(identity.tenant_id, "tenant-a");

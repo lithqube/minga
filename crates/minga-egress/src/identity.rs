@@ -7,7 +7,7 @@
 //! agent executor run in the same `minga worker`.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use crate::routes::WorkloadIdentity;
 
@@ -25,10 +25,12 @@ impl SandboxTokens {
         Self::default()
     }
 
-    /// Mints a token for `workload`. It is revoked when the returned guard
-    /// drops, so a token can't outlive the sandbox run it was issued for.
-    /// Mints a token for a legacy workload identity.
-    pub fn issue(self: &Arc<Self>, workload: &str) -> SandboxToken {
+    /// Mints a token for `workload` under the default tenant, with the
+    /// workload as its service. Only the standalone `minga egress-proxy`
+    /// uses this: it has no tenant assignment. Node workloads use
+    /// [`SandboxTokens::issue_identity`]. The token is revoked when the
+    /// returned guard drops.
+    pub fn issue_standalone(self: &Arc<Self>, workload: &str) -> SandboxToken {
         self.issue_identity(WorkloadIdentity::legacy(workload))
     }
 
@@ -40,7 +42,7 @@ impl SandboxTokens {
             .collect();
         self.tokens
             .lock()
-            .unwrap()
+            .unwrap_or_else(PoisonError::into_inner)
             .insert(token.clone(), Arc::new(identity));
         SandboxToken {
             tokens: Arc::clone(self),
@@ -56,7 +58,11 @@ impl SandboxTokens {
 
     /// Trusted metadata bound to a live token.
     pub fn identity(&self, token: &str) -> Option<Arc<WorkloadIdentity>> {
-        self.tokens.lock().unwrap().get(token).cloned()
+        self.tokens
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(token)
+            .cloned()
     }
 }
 
@@ -75,7 +81,11 @@ impl SandboxToken {
 
 impl Drop for SandboxToken {
     fn drop(&mut self) {
-        self.tokens.tokens.lock().unwrap().remove(&self.token);
+        self.tokens
+            .tokens
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&self.token);
     }
 }
 
@@ -86,8 +96,8 @@ mod tests {
     #[test]
     fn token_maps_to_workload_until_dropped() {
         let tokens = Arc::new(SandboxTokens::new());
-        let a = tokens.issue("task-a");
-        let b = tokens.issue("task-b");
+        let a = tokens.issue_standalone("task-a");
+        let b = tokens.issue_standalone("task-b");
         assert_ne!(a.as_str(), b.as_str());
         assert_eq!(tokens.workload(a.as_str()).as_deref(), Some("task-a"));
         let raw = a.as_str().to_string();

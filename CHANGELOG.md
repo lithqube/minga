@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+- The worker egress proxy is opt-in: `--egress-bind` has no default, so a
+  worker without it no longer takes port 8080. Any bind is accepted; tasks use
+  its port on their bridge gateway, and on Linux an nft table closes it to
+  everything but loopback and task bridges. Workers with the proxy carry the
+  reserved `com.minga.egress.proxy=true` label, which placement requires for
+  services with egress routes.
+- Required-egress nft rules now match what the inet hooks see under
+  `br_netfilter` (the bridge plus the task's guarded source address), so they
+  block routed and same-bridge traffic; a real-kernel test covers it.
+- Routed containers and `http` agents register a budget in the proxy's
+  tracker before they start, so their first request is no longer refused with
+  429. Egress policies carry no token budget yet, so routed containers are not
+  token-limited; agents use `token_budget` per run.
+- WASM agent egress tokens carry the assignment's tenant and service instead
+  of the default tenant and the task ID.
+- After a worker restart, routed-egress containers are restarted with a fresh
+  token instead of adopted. A stopped task's token is revoked once its task
+  is deleted, even if container cleanup then fails.
+- A required egress policy with no routes is refused at start instead of
+  falling back to the node's legacy upstream.
 - The Docker API carries a service's egress policy in the `minga.egress`
   label (JSON, validated like Compose `x-minga-egress`), so `minga deploy`
   keeps `x-minga-egress`. An update without the label keeps the stored

@@ -291,6 +291,9 @@ impl SecretRef {
 
 /// Reserved state label for Compose's deny-by-default egress policy.
 pub const REQUIRED_EGRESS_LABEL: &str = "com.minga.egress.required";
+/// Reserved node label set when the worker runs its egress proxy
+/// (`--egress-bind`). Services with egress routes are placed only there.
+pub const EGRESS_PROXY_NODE_LABEL: &str = "com.minga.egress.proxy";
 /// Provider authentication reference for a named egress route.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "scheme", rename_all = "snake_case", deny_unknown_fields)]
@@ -358,6 +361,26 @@ impl EgressPolicy {
                     .map(String::as_str)
                     .collect(),
             })
+    }
+}
+
+impl TaskSpec {
+    /// Whether the task talks to the node egress proxy with a minted token:
+    /// it requires egress or names at least one route.
+    pub fn uses_egress_proxy(&self) -> bool {
+        self.labels
+            .get(REQUIRED_EGRESS_LABEL)
+            .is_some_and(|value| value == "true")
+            || self.egress.as_ref().is_some_and(|workload| {
+                workload.policy.required || !workload.policy.routes.is_empty()
+            })
+    }
+}
+
+impl EgressPolicy {
+    /// Whether placement needs a node running the egress proxy.
+    pub fn needs_proxy(&self) -> bool {
+        self.required || !self.routes.is_empty()
     }
 }
 
