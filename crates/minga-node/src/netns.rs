@@ -267,19 +267,31 @@ async fn move_filter_jump_first(hook: &str, chain: &str) -> Result<(), NetError>
             stderr,
         });
     }
-    let hooked = tokio::process::Command::new("iptables")
-        .args(["-w", "5", "-t", "filter", "-C", hook, "-j", chain])
-        .output()
-        .await
-        .is_ok_and(|o| o.status.success());
-    // Delete and re-insert in one transaction so the jump (source
-    // validation among them) is never missing from the hook.
-    let mut batch = String::from("*filter\n");
-    if hooked {
-        batch.push_str(&format!("-D {hook} -j {chain}\n"));
+    // With the nf_tables backend a concurrent mover can commit first and
+    // delete the rule this batch was built against (RULE_DELETE: No such
+    // file or directory), so re-read the hook and retry.
+    let mut attempt = 0;
+    loop {
+        let hooked = tokio::process::Command::new("iptables")
+            .args(["-w", "5", "-t", "filter", "-C", hook, "-j", chain])
+            .output()
+            .await
+            .is_ok_and(|o| o.status.success());
+        // Delete and re-insert in one transaction so the jump (source
+        // validation among them) is never missing from the hook.
+        let mut batch = String::from("*filter\n");
+        if hooked {
+            batch.push_str(&format!("-D {hook} -j {chain}\n"));
+        }
+        batch.push_str(&format!("-I {hook} 1 -j {chain}\nCOMMIT\n"));
+        match iptables_restore(&batch).await {
+            Err(_) if attempt < 4 => {
+                attempt += 1;
+                tokio::time::sleep(std::time::Duration::from_millis(20 * attempt)).await;
+            }
+            result => return result,
+        }
     }
-    batch.push_str(&format!("-I {hook} 1 -j {chain}\nCOMMIT\n"));
-    iptables_restore(&batch).await
 }
 
 /// Applies `iptables-restore --noflush` input as one atomic commit.
