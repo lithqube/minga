@@ -138,11 +138,13 @@ impl NatsCredentialIssuer {
         Ok((public_key, credentials))
     }
 }
+/// Order-insensitive, but duplicates count: `[X, X]` does not match `[X, Y]`.
 fn permission_lists_match(actual: &[String], expected: &[String]) -> bool {
-    actual.len() == expected.len()
-        && expected
-            .iter()
-            .all(|permission| actual.contains(permission))
+    let mut actual = actual.to_vec();
+    let mut expected = expected.to_vec();
+    actual.sort();
+    expected.sort();
+    actual == expected
 }
 
 fn worker_permission_template(tenant_id: &str) -> (Vec<String>, Vec<String>) {
@@ -180,14 +182,14 @@ fn worker_permission_template(tenant_id: &str) -> (Vec<String>, Vec<String>) {
 
 #[cfg(test)]
 pub(crate) fn test_issuer(tenant_id: &str) -> NatsCredentialIssuer {
-    test_issuer_with_sorted_permissions(tenant_id, false)
+    test_issuer_with_template(tenant_id, |_, _| {}).unwrap()
 }
 
 #[cfg(test)]
-fn test_issuer_with_sorted_permissions(
+fn test_issuer_with_template(
     tenant_id: &str,
-    sort_permissions: bool,
-) -> NatsCredentialIssuer {
+    edit_template: fn(&mut Vec<String>, &mut Vec<String>),
+) -> Result<NatsCredentialIssuer, String> {
     use nats_jwt_rs::{
         account::Account,
         operator::Operator,
@@ -199,10 +201,7 @@ fn test_issuer_with_sorted_permissions(
     let account_key = KeyPair::new_account();
     let tenant_signer = KeyPair::new_account();
     let (mut publish, mut subscribe) = worker_permission_template(tenant_id);
-    if sort_permissions {
-        publish.sort();
-        subscribe.sort();
-    }
+    edit_template(&mut publish, &mut subscribe);
     let template = UserPermissionLimits {
         permissions: Permissions {
             publish: Permission {
@@ -242,7 +241,6 @@ fn test_issuer_with_sorted_permissions(
         &account_key.seed().unwrap(),
         [(tenant_id.to_string(), tenant_signer.seed().unwrap())],
     )
-    .unwrap()
 }
 
 #[cfg(test)]
@@ -311,9 +309,132 @@ mod tests {
 
     #[test]
     fn issuer_accepts_sorted_signer_template_permissions() {
-        let issuer = test_issuer_with_sorted_permissions("tenant-a", true);
+        let issuer = test_issuer_with_template("tenant-a", |publish, subscribe| {
+            publish.sort();
+            subscribe.sort();
+        })
+        .unwrap();
 
         assert!(issuer.issue("tenant-a", 7).is_ok());
+    }
+
+    #[test]
+    fn issuer_rejects_a_template_that_repeats_one_permission_in_place_of_another() {
+        let result = test_issuer_with_template("tenant-a", |_, subscribe| {
+            subscribe[1] = subscribe[0].clone();
+        });
+
+        assert!(result.is_err_and(|error| error.contains("unexpected permission template")));
+    }
+
+    /// NATS subject matching: `*` is one token, a trailing `>` one or more.
+    fn subject_matches(pattern: &str, subject: &str) -> bool {
+        let (mut pattern, mut subject) = (pattern.split('.'), subject.split('.'));
+        loop {
+            match (pattern.next(), subject.next()) {
+                (Some(">"), Some(_)) => return true,
+                (Some(p), Some(s)) if p == "*" || p == s => {}
+                (None, None) => return true,
+                _ => return false,
+            }
+        }
+    }
+
+    /// What NATS grants the worker: the signer template expanded with the
+    /// claim's `node:` tag, as `{{tag(node)}}` does on the server.
+    fn effective_worker_permissions(
+        issuer: &NatsCredentialIssuer,
+        tenant_id: &str,
+        node_id: u64,
+    ) -> (Vec<String>, Vec<String>) {
+        let (_, credentials) = issuer.issue(tenant_id, node_id).unwrap();
+        let jwt = credentials
+            .split("-----BEGIN NATS USER JWT-----\n")
+            .nth(1)
+            .and_then(|rest| rest.split('\n').next())
+            .unwrap();
+        let claim = Claims::<User>::decode(jwt).unwrap();
+        let tags = claim.nats.generic_fields.tags.unwrap();
+        let [node] = tags
+            .iter()
+            .filter_map(|tag| tag.strip_prefix("node:"))
+            .collect::<Vec<_>>()[..]
+        else {
+            panic!("expected exactly one node tag, got {tags:?}");
+        };
+        let signer = issuer.tenant_signers[tenant_id].public_key();
+        let account = Claims::<Account>::decode(&issuer.account_claim_jwt).unwrap();
+        let template = account
+            .nats
+            .signing_keys
+            .unwrap()
+            .into_iter()
+            .find(|key| key.key == signer)
+            .and_then(|key| key.scope)
+            .and_then(|scope| scope.template)
+            .unwrap();
+        let expand = |list: Vec<String>| {
+            list.into_iter()
+                .map(|permission| permission.replace("{{tag(node)}}", node))
+                .collect::<Vec<_>>()
+        };
+        (
+            expand(template.permissions.publish.allow),
+            expand(template.permissions.subscribe.allow),
+        )
+    }
+
+    #[test]
+    fn effective_worker_permissions_cover_only_its_own_tenant_and_node() {
+        let issuer = test_issuer("tenant-a");
+        let (publish, subscribe) = effective_worker_permissions(&issuer, "tenant-a", 7);
+        let allows = |list: &[String], subject: &str| {
+            list.iter()
+                .any(|permission| subject_matches(permission, subject))
+        };
+
+        assert!(publish
+            .iter()
+            .chain(&subscribe)
+            .all(|permission| !permission.contains("{{")));
+        for own in [
+            "$KV.MINGA_ASSIGN.tenant-a.node.7.task.t1",
+            "$KV.MINGA_ASSIGN.tenant-a.node.7.wg",
+            "minga.tenant-a.ctl.node.7.drain",
+        ] {
+            assert!(allows(&subscribe, own), "{own} should be subscribable");
+        }
+        for own in [
+            "$KV.MINGA_STATUS_tenant-a.node.7.task.t1",
+            "minga.tenant-a.log.node.7.t1",
+        ] {
+            assert!(allows(&publish, own), "{own} should be publishable");
+        }
+        for foreign in [
+            "$KV.MINGA_ASSIGN.tenant-a.node.8.task.t1",
+            "$KV.MINGA_ASSIGN.tenant-b.node.7.task.t1",
+            "$KV.MINGA_ASSIGN.tenant-a.node.8.wg",
+            "$KV.MINGA_ASSIGN.tenant-b.node.7.wg",
+            "$KV.MINGA_STATUS_tenant-a.node.8.task.t1",
+            "$KV.MINGA_STATUS_tenant-b.node.7.task.t1",
+            "$KV.MINGA_LEASES.tenant-a.lease.node.8",
+            "$KV.MINGA_LEASES.tenant-b.lease.node.7",
+            "minga.tenant-a.ctl.node.8.drain",
+            "minga.tenant-b.ctl.node.7.drain",
+            "minga.tenant-a.log.node.8.t1",
+            "minga.tenant-b.log.node.7.t1",
+            "_INBOX.tenant-a.8.reply",
+            "_INBOX.tenant-b.7.reply",
+            "$JS.API.CONSUMER.CREATE.KV_MINGA_ASSIGN.c.$KV.MINGA_ASSIGN.tenant-a.node.8.task.>",
+            "$JS.API.CONSUMER.CREATE.KV_MINGA_ASSIGN.c.$KV.MINGA_ASSIGN.tenant-b.node.7.wg",
+            "$JS.API.DIRECT.GET.KV_MINGA_ASSIGN.$KV.MINGA_ASSIGN.tenant-a.node.8.task.t1",
+            "$JS.API.DIRECT.GET.KV_MINGA_STATUS_tenant-b.$KV.MINGA_STATUS_tenant-b.node.7.task.t1",
+        ] {
+            assert!(
+                !allows(&publish, foreign) && !allows(&subscribe, foreign),
+                "node 7 of tenant-a must not reach {foreign}"
+            );
+        }
     }
 
     #[test]

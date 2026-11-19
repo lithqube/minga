@@ -602,7 +602,9 @@ async fn read_task_statuses(
             }
             continue;
         }
-        if !key.starts_with("node.") || !key.contains(".task.") {
+        // Manager bookkeeping such as node registration shares the bucket;
+        // any other key is decoded so a malformed report is still logged.
+        if key.starts_with("internal.") {
             continue;
         }
 
