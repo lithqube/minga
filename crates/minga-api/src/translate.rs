@@ -93,6 +93,21 @@ pub fn service_spec_to_state(spec: &models::ServiceSpec) -> Result<Service, Stri
         })
         .transpose()?
         .map(Box::new);
+    // Caught here like `user` below: the node refuses it on every start.
+    // `http` and directory grants depend on node configuration, so only the
+    // node can check them.
+    if let Some(agent) = &agent {
+        if !agent.sandbox_env.is_empty()
+            && !agent
+                .capabilities
+                .grants
+                .contains(&minga_state::types::AgentGrant::Env)
+        {
+            return Err(format!(
+                "service '{name}': {AGENT_LABEL} sets sandbox_env without the env grant"
+            ));
+        }
+    }
 
     if container.Image.is_empty() && agent.is_none() {
         return Err(format!("service '{name}': ContainerSpec.Image is required"));
@@ -1122,6 +1137,24 @@ mod tests {
             }),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn agent_label_with_env_but_no_env_grant_is_refused() {
+        let mut spec = sample_docker_spec();
+        spec.Labels.insert(
+            AGENT_LABEL.to_string(),
+            r#"{"module_ref":"a.wasm","sandbox_env":{"K":"v"},"capabilities":{}}"#.to_string(),
+        );
+        let error = service_spec_to_state(&spec).unwrap_err();
+        assert!(error.contains("env grant"), "{error}");
+
+        spec.Labels.insert(
+            AGENT_LABEL.to_string(),
+            r#"{"module_ref":"a.wasm","sandbox_env":{"K":"v"},"capabilities":{"grants":["env"]}}"#
+                .to_string(),
+        );
+        assert!(service_spec_to_state(&spec).is_ok());
     }
 
     #[test]

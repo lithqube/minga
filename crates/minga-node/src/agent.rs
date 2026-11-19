@@ -603,6 +603,15 @@ mod tests {
             .contains("--agent-dir-root"));
     }
 
+    #[test]
+    fn a_pre_v9_agent_with_env_still_passes_start_validation() {
+        // Shape of a v8 record: no `capabilities` key.
+        let spec: AgentSpec =
+            serde_json::from_str(r#"{"module_ref":"a.wasm","sandbox_env":{"MODEL":"small"}}"#)
+                .unwrap();
+        validate_agent_capabilities(&spec, &[], false).unwrap();
+    }
+
     #[cfg(unix)]
     #[test]
     fn directory_grant_symlink_cannot_escape_configured_root() {
