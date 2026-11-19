@@ -1126,6 +1126,11 @@ async fn publish_event(
             Err(_) => tracing::warn!(attempt, "egress usage event publish timed out"),
         }
     }
+    minga_telemetry::METRICS
+        .agent_usage_events_dropped_total
+        .with_label_values(&[&event.tenant_id])
+        .inc();
+    tracing::error!(tenant = %event.tenant_id, "dropped an egress usage event after its publish retries");
 }
 
 struct AwsSigningConfig<'a> {
@@ -1799,6 +1804,49 @@ mod tests {
         let flattened = serde_json::to_value(&events[0]).unwrap();
         assert!(flattened.get("request_body").is_none());
         assert!(flattened.get("response_body").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_usage_event_dropped_after_its_retries_is_counted() {
+        use crate::routes::WorkloadIdentity;
+        let dropped = || {
+            minga_telemetry::METRICS
+                .agent_usage_events_dropped_total
+                .with_label_values(&["drop-test"])
+                .get()
+        };
+        let before = dropped();
+        let publish = |service_id: &str| {
+            publish_event(
+                Some(minga_bus::MemoryBus::new() as Arc<dyn EventBus>),
+                Arc::new(WorkloadIdentity {
+                    workload_id: "task-a".into(),
+                    tenant_id: "drop-test".into(),
+                    service_id: service_id.into(),
+                    policy: None,
+                }),
+                UsagePublication {
+                    customer_id: String::new(),
+                    route: "route-a".into(),
+                    requested_model: "model-a".into(),
+                    answered_model: "model-a".into(),
+                    counts: UsageCounts {
+                        input_tokens: 1,
+                        output_tokens: 1,
+                        estimated: false,
+                    },
+                    status: StatusCode::OK,
+                    latency_ms: 1,
+                    cache_hit: false,
+                    prices: None,
+                },
+            )
+        };
+        publish("service-a").await;
+        assert_eq!(dropped(), before, "a published event is not dropped");
+        // The memory bus refuses an event without a service on every attempt.
+        publish("").await;
+        assert_eq!(dropped(), before + 1.0);
     }
 
     #[test]

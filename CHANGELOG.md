@@ -33,9 +33,10 @@
   `anthropic-beta` values, the key is a SHA-256 digest that also covers the
   `x-minga-customer` value and the request body (a 64-bit FNV body hash let
   one end customer craft a prompt that collides with another's), the cache
-  is bounded by bytes, usage
-  publication is bounded and retried, and customer, model and route names
-  are capped at 256 bytes. `EgressProxy::with_event_bus` now returns a
+  is bounded by bytes, usage publication is bounded and retried (an event
+  dropped after its retries counts in
+  `minga_agent_usage_events_dropped_total`), and customer, model and route
+  names are capped at 256 bytes. `EgressProxy::with_event_bus` now returns a
   `Result` and works after `router()` was called.
 - The worker egress proxy is opt-in: `--egress-bind` has no default, so a
   worker without it no longer takes port 8080. Port 0 is refused; tasks use

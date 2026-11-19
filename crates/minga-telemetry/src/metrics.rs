@@ -42,6 +42,8 @@ pub struct Metrics {
     pub agent_usage_input_tokens_total: CounterVec,
     pub agent_usage_output_tokens_total: CounterVec,
     pub agent_usage_cost_micros_total: CounterVec,
+    /// Usage events the egress proxy gave up publishing after its retries.
+    pub agent_usage_events_dropped_total: CounterVec,
 
     // Containerd gRPC metrics
     pub containerd_grpc_latency_seconds: HistogramVec,
@@ -210,6 +212,17 @@ impl Metrics {
         registry
             .register(Box::new(agent_usage_cost_micros_total.clone()))
             .expect("register agent_usage_cost_micros_total");
+        let agent_usage_events_dropped_total = CounterVec::new(
+            prometheus::Opts::new(
+                "minga_agent_usage_events_dropped_total",
+                "Agent usage events dropped after failed publish retries, by tenant",
+            ),
+            &["tenant"],
+        )
+        .expect("minga_agent_usage_events_dropped_total");
+        registry
+            .register(Box::new(agent_usage_events_dropped_total.clone()))
+            .expect("register agent_usage_events_dropped_total");
 
         Self {
             registry,
@@ -229,6 +242,7 @@ impl Metrics {
             agent_usage_input_tokens_total,
             agent_usage_output_tokens_total,
             agent_usage_cost_micros_total,
+            agent_usage_events_dropped_total,
             containerd_grpc_latency_seconds,
         }
     }

@@ -6,7 +6,7 @@ The publisher interface is `EventBus::publish_usage(&UsageEvent)`. Implementatio
 
 `GET /v1.41/agent/usage` accepts `since_unix_ms`, optional `customer`, and optional `limit`. The handler derives the tenant from authenticated caller identity and never accepts a tenant query parameter. Tenant callers receive matching rows, with the response limit clamped to 1–1000. Cluster operators receive per-tenant aggregates only; customer, task, and request rows are not exposed by that response. `minga-ctl agent usage --customer C --since 30d` converts the relative duration into a Unix-millisecond lower bound and uses the same endpoint.
 
-Prometheus exports `minga_agent_usage_requests_total`, `minga_agent_usage_input_tokens_total`, `minga_agent_usage_output_tokens_total`, and `minga_agent_usage_cost_micros_total`. Each has a tenant-only label. Customer, service, task, route, and request identifiers are never metric labels.
+Prometheus exports `minga_agent_usage_requests_total`, `minga_agent_usage_input_tokens_total`, `minga_agent_usage_output_tokens_total`, and `minga_agent_usage_cost_micros_total`. Each has a tenant-only label. `minga_agent_usage_events_dropped_total` (tenant label) counts usage events the egress proxy dropped after its publish retries, so a gap in the usage stream is visible. Customer, service, task, route, and request identifiers are never metric labels.
 
 ## Service egress routes
 
