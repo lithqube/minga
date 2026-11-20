@@ -69,6 +69,9 @@ pub struct ServerTls {
 /// DNS SAN every route certificate must carry. NATS accepts an inbound route
 /// only from a certificate with this name, so a certificate that merely
 /// chains to the route CA (a worker's, via a shared ancestor) is refused.
+/// NATS matches this name in any DNS, email or URI SAN or the subject, so
+/// no CA under the route root may issue it to anything but a manager; Minga's
+/// own issuers add it only for `issue-node --role manager`.
 pub const ROUTE_NAME: &str = "minga-nats-route";
 
 /// Cluster (route) TLS for a NATS server.
@@ -718,6 +721,16 @@ mod tests {
         let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
         ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
         let ca = ca_params.self_signed(&ca_key).unwrap();
+        // An intermediate under the route root that is in no CA file: peers
+        // send it in their chain, as a client CA nested under the route root.
+        let mid_key = rcgen::KeyPair::generate().unwrap();
+        let mut mid_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        mid_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        mid_params.distinguished_name = rcgen::DistinguishedName::new();
+        mid_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "nested client CA");
+        let mid = mid_params.signed_by(&mid_key, &ca, &ca_key).unwrap();
         // Held until each sidecar starts so a parallel test cannot take them.
         let mut listeners: Vec<_> = (0..9)
             .map(|_| Some(std::net::TcpListener::bind("127.0.0.1:0").unwrap()))
@@ -728,8 +741,9 @@ mod tests {
             .map(|listener| listener.local_addr().unwrap().port())
             .collect();
 
-        // minga-1 accepts routes; minga-2's certificate chains to the same CA
-        // but lacks the route name; minga-3 carries it.
+        // minga-1 (issued by the root) accepts routes. minga-2 and minga-3 are
+        // both issued by the nested intermediate, so both complete the TLS
+        // handshake to the root; only minga-3 carries the route name.
         let mut sides = Vec::new();
         let mut dirs = Vec::new();
         for (i, has_route_name) in [(0usize, true), (1, false), (2, true)] {
@@ -742,7 +756,12 @@ mod tests {
             params
                 .subject_alt_names
                 .push(rcgen::SanType::IpAddress(IpAddr::V4(Ipv4Addr::LOCALHOST)));
-            let cert = params.signed_by(&key, &ca, &ca_key).unwrap();
+            let chain = if i == 0 {
+                params.signed_by(&key, &ca, &ca_key).unwrap().pem()
+            } else {
+                let leaf = params.signed_by(&key, &mid, &mid_key).unwrap();
+                format!("{}{}", leaf.pem(), mid.pem())
+            };
             let dir = tempfile::tempdir().unwrap();
             let file = |name: &str, body: String| {
                 let path = dir.path().join(name);
@@ -751,7 +770,7 @@ mod tests {
             };
             let cluster = ClusterTls {
                 name: "minga-test".to_string(),
-                cert_file: file("route-cert.pem", cert.pem()),
+                cert_file: file("route-cert.pem", chain),
                 key_file: file("route-key.pem", key.serialize_pem()),
                 ca_file: file("route-ca.pem", ca.pem()),
                 port: ports[6 + i],
