@@ -1400,13 +1400,17 @@ impl EventBus for NatsBus {
             .get_stream("MINGA_EVENTS")
             .await
             .map_err(|error| BusError::Subscribe(format!("get MINGA_EVENTS: {error}")))?;
-        // shortcut: scans the tenant's retained events (72h) per call, like
-        // tenant_log_history; seek by start sequence if that retention grows.
+        let filter = subjects::tenant_event_wildcard(tenant_id);
+        // Start at the tenant's `limit`-th newest event, so a call reads about
+        // `limit` messages instead of the tenant's whole retention.
+        let start = tenant_tail_start(&stream, &filter, limit as u64).await?;
         let mut consumer = stream
             .create_consumer(PullConsumerConfig {
-                filter_subjects: vec![subjects::tenant_event_wildcard(tenant_id)],
+                filter_subjects: vec![filter],
                 ack_policy: AckPolicy::None,
-                deliver_policy: DeliverPolicy::All,
+                deliver_policy: DeliverPolicy::ByStartSequence {
+                    start_sequence: start,
+                },
                 ..Default::default()
             })
             .await
@@ -2142,6 +2146,61 @@ impl EventBus for NatsBus {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// How many messages matching `filter` the stream holds from `start` on,
+/// read from a short-lived consumer's pending count (no messages are fetched).
+async fn pending_from(
+    stream: &async_nats::jetstream::stream::Stream,
+    filter: &str,
+    start: u64,
+) -> Result<u64> {
+    let mut consumer = stream
+        .create_consumer(PullConsumerConfig {
+            filter_subjects: vec![filter.to_owned()],
+            ack_policy: AckPolicy::None,
+            deliver_policy: DeliverPolicy::ByStartSequence {
+                start_sequence: start,
+            },
+            inactive_threshold: Duration::from_secs(5),
+            ..Default::default()
+        })
+        .await
+        .map_err(|error| BusError::Subscribe(format!("event tail probe: {error}")))?;
+    let pending = consumer
+        .info()
+        .await
+        .map_err(|error| BusError::Subscribe(format!("event tail probe info: {error}")))?
+        .num_pending;
+    // Best effort: the inactivity threshold removes it anyway.
+    let _ = stream.delete_consumer(&consumer.cached_info().name).await;
+    Ok(pending)
+}
+
+/// The stream sequence of the `limit`-th newest message matching `filter`,
+/// or the first sequence when fewer match. A binary search over sequences:
+/// about log2(stream length) pending-count probes, no payloads.
+async fn tenant_tail_start(
+    stream: &async_nats::jetstream::stream::Stream,
+    filter: &str,
+    limit: u64,
+) -> Result<u64> {
+    let state = &stream.cached_info().state;
+    let (first, last) = (state.first_sequence.max(1), state.last_sequence);
+    if last < first || pending_from(stream, filter, first).await? <= limit {
+        return Ok(first);
+    }
+    // Invariant: at least `limit` matching messages from `low` on.
+    let (mut low, mut high) = (first, last);
+    while low < high {
+        let mid = low + (high - low).div_ceil(2);
+        if pending_from(stream, filter, mid).await? >= limit {
+            low = mid;
+        } else {
+            high = mid - 1;
+        }
+    }
+    Ok(low)
+}
 
 fn now_millis() -> u64 {
     std::time::SystemTime::now()

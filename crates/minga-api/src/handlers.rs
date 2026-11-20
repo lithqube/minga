@@ -264,9 +264,29 @@ pub struct ChangeRequestQuery {
 }
 
 #[derive(Debug, Serialize)]
+/// What a reviewer sees of one side of a change: the fields whose values are
+/// safe to show. `env`, secret references and egress stay out (they can hold
+/// sensitive values); a change to them still appears by name in `changed_fields`.
 struct ChangeServiceSummary {
     image: String,
     replicas: u32,
+    mode: minga_state::types::ServiceMode,
+    ports: Vec<minga_state::types::PortMapping>,
+    networks: Vec<String>,
+    constraints: Vec<String>,
+}
+
+impl From<&StateService> for ChangeServiceSummary {
+    fn from(service: &StateService) -> Self {
+        Self {
+            image: service.image.clone(),
+            replicas: service.replicas,
+            mode: service.mode,
+            ports: service.ports.clone(),
+            networks: service.networks.clone(),
+            constraints: service.constraints.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -319,14 +339,8 @@ impl From<ChangeRequest> for ChangeRequestView {
             created_at_unix: request.created_at_unix,
             expires_at_unix: request.expires_at_unix,
             kind: request.kind,
-            before: ChangeServiceSummary {
-                image: request.before.image,
-                replicas: request.before.replicas,
-            },
-            after: ChangeServiceSummary {
-                image: request.after.image,
-                replicas: request.after.replicas,
-            },
+            before: ChangeServiceSummary::from(&request.before),
+            after: ChangeServiceSummary::from(&request.after),
             changed_fields,
             status: request.status,
             reviewer: request.reviewer,

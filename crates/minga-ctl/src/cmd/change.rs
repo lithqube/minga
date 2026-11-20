@@ -44,7 +44,8 @@ pub async fn run(
                 message: "change request list has an invalid shape".into(),
             })?;
             let mut output =
-                Rows::new(&["ID", "SERVICE", "ACTION", "STATUS", "EXPIRES"]).with_id_column(0);
+                Rows::new(&["ID", "SERVICE", "ACTION", "STATUS", "EXPIRES", "CHANGES"])
+                    .with_id_column(0);
             for request in rows {
                 let id = string_field(request, "id");
                 let service = string_field(request, "service_id");
@@ -55,6 +56,18 @@ pub async fn run(
                     .and_then(Value::as_u64)
                     .map(|value| value.to_string())
                     .unwrap_or_default();
+                // Field names only; `-o json` has the before/after values.
+                let changes = request
+                    .get("changed_fields")
+                    .and_then(Value::as_array)
+                    .map(|fields| {
+                        fields
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    })
+                    .unwrap_or_default();
                 output.push(
                     vec![
                         id.clone(),
@@ -62,6 +75,7 @@ pub async fn run(
                         action.clone(),
                         status.clone(),
                         expires,
+                        changes,
                     ],
                     request.clone(),
                 );

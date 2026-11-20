@@ -2346,8 +2346,11 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::CREATED);
-        assert_eq!(rollback["before"], rollback["after"]);
+        assert_eq!(rollback["before"]["image"], rollback["after"]["image"]);
+        assert_eq!(rollback["before"]["ports"], serde_json::json!([]));
+        assert_eq!(rollback["after"]["ports"][0]["published"], 18080);
         assert_eq!(rollback["changed_fields"], serde_json::json!(["ports"]));
+        assert!(rollback["after"].get("env").is_none());
 
         let (status, proposal) = send_request(
             router.clone(),

@@ -475,4 +475,29 @@ async fn nats_tenant_event_history_is_filtered_bounded_and_publish_stamped() {
     // The publish time, not the time of the read a second later.
     assert!(events[0].timestamp >= before.saturating_sub(1_000));
     assert!(events[0].timestamp < before + 1_000);
+
+    // A tail across many events, interleaved with another tenant's, keeps the
+    // newest `limit` in publish order.
+    for n in 0..20 {
+        for owner in [tenant.as_str(), "evh-other"] {
+            bus.publish_tenant_event(
+                owner,
+                &format!("minga.{owner}.task.t{n}.event"),
+                format!("{n}").as_bytes(),
+            )
+            .await
+            .expect("failed to publish tenant event");
+        }
+    }
+    let events = bus
+        .tenant_event_history(&tenant, 3)
+        .await
+        .expect("failed to read tenant event history");
+    let payloads: Vec<_> = events
+        .iter()
+        .map(|event| event.payload.as_slice())
+        .collect();
+    assert_eq!(payloads, [b"17".as_slice(), b"18", b"19"]);
+    let all = bus.tenant_event_history(&tenant, 100).await.unwrap();
+    assert_eq!(all.len(), 22, "fewer than `limit` events returns them all");
 }
