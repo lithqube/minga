@@ -1,0 +1,5 @@
+    Checking minga-egress v1.2.0 (/Users/admin/dev/minga/.claude/worktrees/issue-126-qa/crates/minga-egress)
+    Checking minga-scheduler v1.2.0 (/Users/admin/dev/minga/.claude/worktrees/issue-126-qa/crates/minga-scheduler)
+    Checking minga-node v1.2.0 (/Users/admin/dev/minga/.claude/worktrees/issue-126-qa/crates/minga-node)
+    Checking minga-cli v1.2.0 (/Users/admin/dev/minga/.claude/worktrees/issue-126-qa/crates/minga-cli)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 8.17s
