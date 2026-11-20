@@ -237,6 +237,10 @@ async fn remove_wireguard_rules() {
 /// Keeps source validation, emergency drops and mesh filtering ahead of
 /// broad bridge accepts, including when a bridge is created later.
 async fn keep_wireguard_forward_first() -> Result<(), NetError> {
+    // Concurrent setups each delete and re-insert the same jumps; one mover
+    // at a time, or a batch deletes a jump another mover already removed.
+    static HOOK_ORDER: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _order = HOOK_ORDER.lock().await;
     move_filter_jump_first("FORWARD", WG_FORWARD_CHAIN).await?;
     // Source validation runs before the mesh accept rules.
     move_filter_jump_first("FORWARD", TASK_SOURCE_CHAIN).await?;

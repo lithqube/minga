@@ -973,3 +973,44 @@ async fn required_egress_reaches_only_the_gateway_proxy() {
 
     result.expect("required-egress paths");
 }
+
+/// Concurrent bridge setups reorder the same host `FORWARD`/`INPUT` jumps.
+/// Each must succeed, not fail with `RULE_DELETE` because another setup
+/// moved the jump first (issue #115).
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_bridge_setups_keep_the_filter_jumps() {
+    if let Some(why) = unavailable() {
+        assert!(
+            std::env::var_os("MINGA_REQUIRE_NETNS").is_none(),
+            "required netns test cannot run: {why}"
+        );
+        eprintln!("SKIP: {why}");
+        return;
+    }
+
+    let state = tempfile::tempdir().unwrap();
+    let setup = NetworkSetup::new(state.path());
+    let networks: Vec<(String, Cidr)> = (0..16)
+        .map(|i| {
+            let subnet = Cidr::parse(&format!("10.234.{i}.0/24")).unwrap();
+            (format!("netns_test_race_{i}"), subnet)
+        })
+        .collect();
+    let mut errors = Vec::new();
+    for _ in 0..3 {
+        let results = futures::future::join_all(
+            networks
+                .iter()
+                .map(|(network, subnet)| setup.ensure_bridge(network, subnet)),
+        )
+        .await;
+        errors.extend(results.into_iter().filter_map(Result::err));
+    }
+    for (network, _) in &networks {
+        let _ = sh("ip", &["link", "del", &bridge_name(network)]);
+    }
+    assert!(
+        errors.is_empty(),
+        "concurrent ensure_bridge failed: {errors:?}"
+    );
+}
