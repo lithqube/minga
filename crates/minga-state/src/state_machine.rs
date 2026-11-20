@@ -523,8 +523,6 @@ pub struct RedbStateMachine {
     db: Arc<Mutex<Database>>,
     last_applied: Option<LogId<u64>>,
     last_membership: StoredMembership<u64, BasicNode>,
-    /// The overlay supernet network subnets must lie in, once the manager sets it.
-    overlay_supernet: Arc<std::sync::OnceLock<minga_net::Cidr>>,
 }
 
 #[allow(clippy::result_large_err)]
@@ -574,20 +572,9 @@ impl RedbStateMachine {
             db: Arc::new(Mutex::new(db)),
             last_applied: None,
             last_membership: StoredMembership::default(),
-            overlay_supernet: Arc::default(),
         };
         sm.load_meta()?;
         Ok(sm)
-    }
-
-    /// The overlay supernet `UpsertNetwork` confines subnets to, if set.
-    pub(crate) fn overlay_supernet(&self) -> Option<minga_net::Cidr> {
-        self.overlay_supernet.get().copied()
-    }
-
-    /// Sets the overlay supernet once; a later call keeps the first value.
-    pub(crate) fn set_overlay_supernet(&self, supernet: minga_net::Cidr) {
-        let _ = self.overlay_supernet.set(supernet);
     }
 
     /// Loads last_applied and last_membership from disk.
@@ -638,7 +625,6 @@ impl RedbStateMachine {
     fn apply_command(
         tx: &redb::WriteTransaction,
         cmd: &StateCommand,
-        supernet: Option<&minga_net::Cidr>,
     ) -> Result<StateResponse, StorageError<u64>> {
         match cmd {
             StateCommand::UpsertNode(node) => {
@@ -880,12 +866,13 @@ impl RedbStateMachine {
                 Ok(StateResponse::Ok)
             }
             StateCommand::UpsertNetwork(net) => {
+                // Only rules that hold on every replica: the overlay supernet is
+                // node-local config, so StateStore::upsert_network checks it
+                // before proposing.
                 if let Some(raw) = &net.subnet {
                     let checked = minga_net::Cidr::parse(raw)
                         .map_err(|error| error.to_string())
-                        .and_then(|subnet| {
-                            minga_net::overlay::check_network_subnet(&subnet, supernet)
-                        });
+                        .and_then(|subnet| minga_net::overlay::check_network_subnet(&subnet, None));
                     if let Err(error) = checked {
                         return Ok(StateResponse::Error(error));
                     }
@@ -1401,7 +1388,6 @@ impl RedbStateMachine {
                     match Self::apply_command(
                         tx,
                         &StateCommand::UpsertService(request.after.clone()),
-                        supernet,
                     )? {
                         StateResponse::Ok => {}
                         response => return Ok(response),
@@ -1720,9 +1706,7 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
 
             let response = match &entry.payload {
                 EntryPayload::Blank => StateResponse::Ok,
-                EntryPayload::Normal(cmd) => {
-                    Self::apply_command(&tx, cmd, self.overlay_supernet.get())?
-                }
+                EntryPayload::Normal(cmd) => Self::apply_command(&tx, cmd)?,
                 EntryPayload::Membership(_) => StateResponse::Ok,
             };
 
@@ -2050,8 +2034,7 @@ mod tests {
     fn apply(sm: &RedbStateMachine, command: StateCommand) -> StateResponse {
         let db = sm.db.lock().unwrap();
         let tx = db.begin_write().unwrap();
-        let response =
-            RedbStateMachine::apply_command(&tx, &command, sm.overlay_supernet.get()).unwrap();
+        let response = RedbStateMachine::apply_command(&tx, &command).unwrap();
         tx.commit().unwrap();
         response
     }
@@ -2156,5 +2139,41 @@ mod tests {
         let snapshot = snapshot_of(&mut follower);
         let snap: StateSnapshot = crate::codec::decode(snapshot.snapshot.get_ref()).unwrap();
         assert!(snap.change_requests.is_empty());
+    }
+
+    /// The apply reads no node-local config, so two managers started with
+    /// different `--overlay-supernet` flags agree on every UpsertNetwork entry.
+    #[test]
+    fn upsert_network_apply_uses_only_replica_independent_rules() {
+        let dir = tempfile::tempdir().unwrap();
+        let replicas = [
+            RedbStateMachine::open(dir.path().join("a.redb")).unwrap(),
+            RedbStateMachine::open(dir.path().join("b.redb")).unwrap(),
+        ];
+        let net = |subnet: &str| {
+            StateCommand::UpsertNetwork(Network {
+                id: "n".into(),
+                tenant_id: "default".into(),
+                name: "n".into(),
+                driver: "overlay".into(),
+                attachable: true,
+                subnet: Some(subnet.into()),
+                wg_port: None,
+            })
+        };
+        for sm in &replicas {
+            // Outside any one supernet: the subnet rule passes it (the missing
+            // tenant answers NotFound later).
+            assert!(!matches!(
+                apply(sm, net("192.168.1.0/24")),
+                StateResponse::Error(_)
+            ));
+            for refused in ["10.200.0.0/24", "10.100.9.7/32", "not-a-cidr"] {
+                assert!(
+                    matches!(apply(sm, net(refused)), StateResponse::Error(_)),
+                    "{refused}"
+                );
+            }
+        }
     }
 }

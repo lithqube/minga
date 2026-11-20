@@ -471,7 +471,7 @@ async fn reconcile_projects_wireguard_peer_sets_from_live_placement() {
     store.upsert_node(manager.clone()).await.unwrap();
     store.upsert_node(worker.clone()).await.unwrap();
     store.upsert_node(isolated).await.unwrap();
-    for (id, subnet) in [("shared", "10.1.0.0/24"), ("other", "10.2.0.0/24")] {
+    for (id, subnet) in [("shared", "10.100.1.0/24"), ("other", "10.100.2.0/24")] {
         store
             .upsert_network(Network {
                 id: id.into(),
@@ -503,18 +503,18 @@ async fn reconcile_projects_wireguard_peer_sets_from_live_placement() {
     manager_task
         .spec
         .ips
-        .insert("shared".into(), "10.1.0.10".into());
+        .insert("shared".into(), "10.100.1.10".into());
     store.upsert_task(manager_task).await.unwrap();
     let mut worker_task =
         minga_scheduler::place_service(&worker_service, &[worker], &[], &[], 0).remove(0);
     worker_task
         .spec
         .ips
-        .insert("shared".into(), "10.1.0.20".into());
+        .insert("shared".into(), "10.100.1.20".into());
     worker_task
         .spec
         .ips
-        .insert("other".into(), "10.2.0.20".into());
+        .insert("other".into(), "10.100.2.20".into());
     store.upsert_task(worker_task).await.unwrap();
     let bus = MemoryBus::new();
     for id in [1, 2, 3] {
@@ -559,7 +559,7 @@ async fn reconcile_projects_wireguard_peer_sets_from_live_placement() {
     );
     assert_eq!(
         manager_peer.allowed_ips,
-        ["10.1.0.20/32", "10.2.0.20/32", "10.200.0.2/32"]
+        ["10.100.1.20/32", "10.100.2.20/32", "10.200.0.2/32"]
     );
     assert!(manager_set.peers.iter().any(|peer| peer.node_id == 3));
 
@@ -578,7 +578,7 @@ async fn reconcile_projects_wireguard_peer_sets_from_live_placement() {
         .unwrap();
     assert_eq!(
         manager_peer.allowed_ips,
-        ["10.1.0.10/32", "10.200.0.1/32", "10.200.0.3/32"]
+        ["10.100.1.10/32", "10.200.0.1/32", "10.200.0.3/32"]
     );
     assert_eq!(manager_peer.keepalive, 25);
     // Nodes 1 and 2 run tasks on `shared`; node 3 does not, so it gets none.
@@ -609,7 +609,7 @@ async fn reconcile_projects_wireguard_peer_sets_from_live_placement() {
     );
     assert_eq!(
         relay_manager.allowed_ips,
-        ["10.2.0.20/32", "10.200.0.1/32", "10.200.0.2/32"]
+        ["10.100.2.20/32", "10.200.0.1/32", "10.200.0.2/32"]
     );
     let ingress = entries
         .iter()
@@ -627,11 +627,11 @@ async fn reconcile_projects_wireguard_peer_sets_from_live_placement() {
     assert!(network_assignment
         .tasks
         .iter()
-        .any(|task| task.service_name == "app.manager" && task.ip == "10.1.0.10"));
+        .any(|task| task.service_name == "app.manager" && task.ip == "10.100.1.10"));
     assert!(network_assignment
         .tasks
         .iter()
-        .any(|task| task.service_name == "app.worker" && task.ip == "10.1.0.20"));
+        .any(|task| task.service_name == "app.worker" && task.ip == "10.100.1.20"));
 
     drop(scheduler);
     Arc::try_unwrap(store)
@@ -837,7 +837,7 @@ async fn ingress_backend_and_backendless_workers_peer_both_ways() {
             name: "web".into(),
             driver: "overlay".into(),
             attachable: false,
-            subnet: Some("10.3.0.0/24".into()),
+            subnet: Some("10.100.3.0/24".into()),
             wg_port: None,
         })
         .await
@@ -852,7 +852,7 @@ async fn ingress_backend_and_backendless_workers_peer_both_ways() {
     }];
     store.upsert_service(service.clone()).await.unwrap();
     let mut task = minga_scheduler::place_service(&service, &[backend], &[], &[], 0).remove(0);
-    task.spec.ips.insert("web".into(), "10.3.0.20".into());
+    task.spec.ips.insert("web".into(), "10.100.3.20".into());
     store.upsert_task(task).await.unwrap();
     let bus = MemoryBus::new();
     for id in [1, 2, 3] {
@@ -890,7 +890,7 @@ async fn ingress_backend_and_backendless_workers_peer_both_ways() {
         .expect("frontend node must route to the backend");
     assert!(backend_peer
         .allowed_ips
-        .contains(&"10.3.0.20/32".to_string()));
+        .contains(&"10.100.3.20/32".to_string()));
 
     drop(scheduler);
     Arc::try_unwrap(store)
@@ -1257,16 +1257,16 @@ async fn nat_workers_relay_through_the_lowest_manager_and_fail_over_after_lease_
             name: "shared".into(),
             driver: "overlay".into(),
             attachable: false,
-            subnet: Some("10.1.0.0/24".into()),
+            subnet: Some("10.100.1.0/24".into()),
             wg_port: None,
         })
         .await
         .unwrap();
 
     for (service_id, worker, ip) in [
-        ("app.a", worker_a, "10.1.0.20"),
-        ("app.b", worker_b, "10.1.0.30"),
-        ("app.c", worker_c, "10.1.0.40"),
+        ("app.a", worker_a, "10.100.1.20"),
+        ("app.b", worker_b, "10.100.1.30"),
+        ("app.c", worker_c, "10.100.1.40"),
     ] {
         let mut service = make_service(service_id, 1);
         service.networks = vec!["shared".into()];
@@ -1303,7 +1303,7 @@ async fn nat_workers_relay_through_the_lowest_manager_and_fail_over_after_lease_
             .find(|peer| peer.node_id == 2)
             .unwrap()
             .allowed_ips,
-        ["10.1.0.20/32", "10.200.0.2/32"]
+        ["10.100.1.20/32", "10.200.0.2/32"]
     );
     assert_eq!(
         relay
@@ -1322,7 +1322,7 @@ async fn nat_workers_relay_through_the_lowest_manager_and_fail_over_after_lease_
     );
     assert_eq!(
         manager_peer.allowed_ips,
-        ["10.1.0.30/32", "10.200.0.1/32", "10.200.0.3/32"]
+        ["10.100.1.30/32", "10.200.0.1/32", "10.200.0.3/32"]
     );
     assert!(!worker.peers.iter().any(|peer| peer.node_id == 3));
     let direct_peer = worker.peers.iter().find(|peer| peer.node_id == 5).unwrap();
@@ -1331,7 +1331,7 @@ async fn nat_workers_relay_through_the_lowest_manager_and_fail_over_after_lease_
         minga_net::wireguard::WireGuardPeerPath::Direct
     );
     assert_eq!(direct_peer.endpoint.as_deref(), Some("192.0.2.5:51820"));
-    assert_eq!(direct_peer.allowed_ips, ["10.1.0.40/32", "10.200.0.5/32"]);
+    assert_eq!(direct_peer.allowed_ips, ["10.100.1.40/32", "10.200.0.5/32"]);
 
     tokio::time::sleep(Duration::from_millis(1_100)).await;
     for id in [2, 3, 4, 5] {
@@ -1352,7 +1352,7 @@ async fn nat_workers_relay_through_the_lowest_manager_and_fail_over_after_lease_
     );
     assert_eq!(
         manager_peer.allowed_ips,
-        ["10.1.0.30/32", "10.200.0.3/32", "10.200.0.4/32"]
+        ["10.100.1.30/32", "10.200.0.3/32", "10.200.0.4/32"]
     );
     assert!(!worker.peers.iter().any(|peer| peer.node_id == 1));
     assert!(!entries.iter().any(|(key, _)| key == "default.node.1.wg"));
@@ -1392,7 +1392,21 @@ async fn relay_manager_carries_only_unique_addresses_inside_each_network() {
             name: "shared".into(),
             driver: "overlay".into(),
             attachable: false,
-            subnet: Some("10.1.0.0/24".into()),
+            subnet: Some("10.100.1.0/24".into()),
+            wg_port: None,
+        })
+        .await
+        .unwrap();
+    // A network stored before the API confined subnets, outside the
+    // scheduler's supernet: its task addresses must not route either.
+    store
+        .upsert_network(Network {
+            id: "legacy".into(),
+            tenant_id: "default".to_string(),
+            name: "legacy".into(),
+            driver: "overlay".into(),
+            attachable: false,
+            subnet: Some("192.168.5.0/24".into()),
             wg_port: None,
         })
         .await
@@ -1400,17 +1414,29 @@ async fn relay_manager_carries_only_unique_addresses_inside_each_network() {
     // Worker A's tasks claim an address outside the network and one that
     // worker B also claims: neither may reach the relay manager's peer set.
     for (service_id, worker, ip) in [
-        ("app.a", worker_a.clone(), "10.1.0.20"),
+        ("app.a", worker_a.clone(), "10.100.1.20"),
         ("app.b", worker_a.clone(), "192.168.1.1"),
-        ("app.e", worker_a, "10.1.0.25"),
-        ("app.c", worker_b.clone(), "10.1.0.30"),
-        ("app.d", worker_b, "10.1.0.20"),
+        ("app.e", worker_a.clone(), "10.100.1.25"),
+        ("app.c", worker_b.clone(), "10.100.1.30"),
+        ("app.d", worker_b.clone(), "10.100.1.20"),
     ] {
         let mut service = make_service(service_id, 1);
         service.networks = vec!["shared".into()];
         store.upsert_service(service.clone()).await.unwrap();
         let mut task = minga_scheduler::place_service(&service, &[worker], &[], &[], 0).remove(0);
         task.spec.ips.insert("shared".into(), ip.into());
+        store.upsert_task(task).await.unwrap();
+    }
+    // Two NAT workers share it, so the relay would carry it without the check.
+    for (service_id, worker, ip) in [
+        ("app.legacy-a", worker_a, "192.168.5.10"),
+        ("app.legacy-b", worker_b, "192.168.5.11"),
+    ] {
+        let mut service = make_service(service_id, 1);
+        service.networks = vec!["legacy".into()];
+        store.upsert_service(service.clone()).await.unwrap();
+        let mut task = minga_scheduler::place_service(&service, &[worker], &[], &[], 0).remove(0);
+        task.spec.ips.insert("legacy".into(), ip.into());
         store.upsert_task(task).await.unwrap();
     }
 
@@ -1428,7 +1454,7 @@ async fn relay_manager_carries_only_unique_addresses_inside_each_network() {
         .expect("relay peer set published");
     let relay = minga_state::codec::decode_wire::<minga_net::wireguard::WireGuardPeerSet>(&value.1)
         .unwrap();
-    let subnet = minga_net::Cidr::parse("10.1.0.0/24").unwrap();
+    let subnet = minga_net::Cidr::parse("10.100.1.0/24").unwrap();
     let mesh = minga_net::overlay::allocate_mesh_subnet().unwrap();
     let mut seen = std::collections::HashSet::new();
     for allowed_ip in relay.peers.iter().flat_map(|peer| &peer.allowed_ips) {
@@ -1439,8 +1465,8 @@ async fn relay_manager_carries_only_unique_addresses_inside_each_network() {
         );
         assert!(seen.insert(allowed_ip), "{allowed_ip} under two peers");
     }
-    assert!(seen.contains(&"10.1.0.25/32".to_string()));
-    assert!(seen.contains(&"10.1.0.30/32".to_string()));
+    assert!(seen.contains(&"10.100.1.25/32".to_string()));
+    assert!(seen.contains(&"10.100.1.30/32".to_string()));
 
     drop(scheduler);
     Arc::try_unwrap(store)

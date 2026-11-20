@@ -487,7 +487,7 @@ impl Scheduler {
                     .map_err(|error| SchedulerError::Bus(error.to_string()))?;
             }
         }
-        let peer_sets = build_wireguard_peer_sets(nodes, &tasks, &networks)?;
+        let peer_sets = build_wireguard_peer_sets(nodes, &tasks, &networks, &self.supernet)?;
         for node in nodes {
             let key = format!("{}.node.{}.wg", node.tenant_id, node.id);
             let value = minga_state::codec::encode_wire(
@@ -659,6 +659,7 @@ fn build_wireguard_peer_sets(
     nodes: &[ClusterNode],
     tasks: &[Task],
     networks: &[Network],
+    supernet: &minga_net::Cidr,
 ) -> Result<HashMap<u64, WireGuardPeerSet>, SchedulerError> {
     let node_by_id: HashMap<_, _> = nodes.iter().map(|node| (node.id, node)).collect();
     let network_tenants: HashMap<_, _> = networks
@@ -669,6 +670,8 @@ fn build_wireguard_peer_sets(
         .iter()
         .filter_map(|network| {
             let subnet = minga_net::Cidr::parse(network.subnet.as_deref()?).ok()?;
+            // A subnet stored before the API checked it never routes.
+            minga_net::overlay::check_network_subnet(&subnet, Some(supernet)).ok()?;
             Some((network.id.as_str(), subnet))
         })
         .collect();
@@ -691,7 +694,7 @@ fn build_wireguard_peer_sets(
             if owned(task, network_id, ip) {
                 let (all, live) = claims.entry(ip.as_str()).or_default();
                 all.insert(task.node_id);
-                if !matches!(task.state, TaskState::Stopped | TaskState::Failed) {
+                if !task.state.is_terminal() {
                     live.insert(task.node_id);
                 }
             }
@@ -717,7 +720,7 @@ fn build_wireguard_peer_sets(
     let mut ingress_task_ips: HashMap<u64, HashMap<String, Vec<String>>> = HashMap::new();
     if nodes.len() > 1 {
         for task in tasks {
-            if matches!(task.state, TaskState::Stopped | TaskState::Failed)
+            if task.state.is_terminal()
                 || !task.spec.ports.iter().any(|port| {
                     port.published.is_some() && port.mode == minga_state::types::PortMode::Ingress
                 })

@@ -105,6 +105,8 @@ pub struct StateStore {
     tls_client: Option<std::sync::Arc<rustls::ClientConfig>>,
     /// Serializes membership changes initiated through this store.
     membership_change: tokio::sync::Mutex<()>,
+    /// This manager's `--overlay-supernet`, once set.
+    overlay_supernet: std::sync::OnceLock<minga_net::Cidr>,
 }
 
 /// Membership changes run only on the leader. A follower says which manager
@@ -307,6 +309,7 @@ impl StateStore {
             rpc_server,
             tls_client: client_tls,
             membership_change: tokio::sync::Mutex::new(()),
+            overlay_supernet: std::sync::OnceLock::new(),
         };
         if initialized {
             let default_tenant = Tenant {
@@ -844,18 +847,27 @@ impl StateStore {
         self.remove_owned(ObjectKind::Task, id, tenant_id).await
     }
 
-    /// Confines network subnets to `supernet` from now on. Managers call it
-    /// right after opening; entries applied before it skip only this check.
+    /// Confines network subnets this store proposes to `supernet` from now
+    /// on; a later call keeps the first value. Managers call it after opening.
     pub fn set_overlay_supernet(&self, supernet: minga_net::Cidr) {
-        self.reader.set_overlay_supernet(supernet);
+        let _ = self.overlay_supernet.set(supernet);
     }
 
     /// The overlay supernet set by `set_overlay_supernet`, if any.
     pub fn overlay_supernet(&self) -> Option<minga_net::Cidr> {
-        self.reader.overlay_supernet()
+        self.overlay_supernet.get().copied()
     }
 
     pub async fn upsert_network(&self, network: Network) -> Result<(), StateError> {
+        // Checked before proposing, not in the Raft apply: managers may run with
+        // different supernets, and apply must give every replica the same result.
+        // A malformed subnet is left to the apply, which refuses it everywhere.
+        if let (Some(supernet), Some(raw)) = (self.overlay_supernet.get(), &network.subnet) {
+            if let Ok(subnet) = minga_net::Cidr::parse(raw) {
+                minga_net::overlay::check_network_subnet(&subnet, Some(supernet))
+                    .map_err(StateError::Raft)?;
+            }
+        }
         match self.propose(StateCommand::UpsertNetwork(network)).await? {
             StateResponse::Ok | StateResponse::ChangeRequest(_) => Ok(()),
             StateResponse::Conflict(_) => Err(StateError::NameInUse),
