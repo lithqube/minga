@@ -16,6 +16,7 @@ Rust single-binary orchestrator replacing Docker Swarm for edge/on-prem/air-gapp
 - Only desired state and placement go through Raft. Heartbeats, task status and agent run steps go through JetStream.
 - Compose files must deploy unchanged; unknown keys fail loudly instead of being skipped.
 - Multi-tenancy is part of every change: tenants are untrusted, each owns its objects and nodes, every bus subject and key carries the tenant, and a reference across tenants returns 404. Every plan and PR that adds state, an endpoint, a bus subject or a node-local resource answers the tenancy checklist in `docs/adr/0008-multi-tenancy.md`.
+- Commits and PR titles use `type(scope): subject`, for example `feat(agent): Phase 16 agent-ready operations (#114)`. This overrides the emoji format in the super-board writing table below.
 
 ## Boundaries
 
