@@ -245,6 +245,33 @@ pub fn mesh_node_ip(node_id: u64) -> Result<Ipv4Addr, OverlayError> {
         .ok_or(OverlayError::NodeIdOutOfRange(node_id))
 }
 
+/// Longest prefix an explicit network subnet may have: a /28 still holds 14 tasks.
+pub const MAX_NETWORK_PREFIX_LEN: u8 = 28;
+
+/// Refuses a network subnet the overlay must not route: smaller than a /28,
+/// inside the node mesh, or (when known) outside the overlay supernet.
+pub fn check_network_subnet(subnet: &Cidr, supernet: Option<&Cidr>) -> Result<(), String> {
+    if subnet.prefix_len() > MAX_NETWORK_PREFIX_LEN {
+        return Err(format!(
+            "network subnet {subnet} is longer than /{MAX_NETWORK_PREFIX_LEN}"
+        ));
+    }
+    let mesh = allocate_mesh_subnet().map_err(|e| e.to_string())?;
+    if subnet.overlaps(&mesh) {
+        return Err(format!(
+            "network subnet {subnet} overlaps the node mesh {mesh}"
+        ));
+    }
+    if let Some(supernet) = supernet {
+        if !supernet.contains(subnet.network()) || !supernet.contains(subnet.broadcast()) {
+            return Err(format!(
+                "network subnet {subnet} is outside the overlay supernet {supernet}"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Checks a network's driver options (Compose `driver_opts`, Docker
 /// `Options`). Only `encrypted` is accepted, as a no-op; anything else
 /// fails loudly instead of being dropped.
@@ -410,6 +437,31 @@ mod tests {
         assert_eq!(services.to_cidr_string(), "10.100.0.0/16");
         // No overlap
         assert!(!mesh.contains(services.network()));
+    }
+
+    #[test]
+    fn network_subnet_must_stay_inside_the_supernet_and_off_the_mesh() {
+        let supernet = default_supernet().unwrap();
+        let check = |raw: &str| check_network_subnet(&Cidr::parse(raw).unwrap(), Some(&supernet));
+        assert!(check("10.100.5.0/24").is_ok());
+        assert!(check("10.100.5.16/28").is_ok());
+        assert!(check("10.100.0.0/16").is_ok());
+        for refused in [
+            "10.100.5.7/32",
+            "10.100.5.0/29",
+            "10.200.0.0/24",
+            "10.200.0.2/30",
+            "192.168.1.0/24",
+            "10.0.0.0/8",
+            "0.0.0.0/0",
+        ] {
+            assert!(check(refused).is_err(), "{refused} was accepted");
+        }
+        let wide = Cidr::parse("10.0.0.0/8").unwrap();
+        let mesh = Cidr::parse("10.200.1.0/24").unwrap();
+        assert!(check_network_subnet(&mesh, Some(&wide)).is_err());
+        assert!(check_network_subnet(&mesh, None).is_err());
+        assert!(check_network_subnet(&Cidr::parse("192.168.1.0/24").unwrap(), None).is_ok());
     }
 
     #[test]

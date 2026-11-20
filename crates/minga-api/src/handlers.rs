@@ -2197,10 +2197,15 @@ pub async fn create_network(
         .map_err(bad_request)?;
     let mut net = translate::network_create_to_state(&req);
     net.tenant_id = tenant_id.to_owned();
-    // An explicit subnet must not overlap another network's. Networks
-    // without one get theirs from the leader's next reconcile pass.
+    // An explicit subnet must stay inside the overlay and not overlap another
+    // network's. Networks without one get theirs from the leader's next
+    // reconcile pass.
     if let Some(raw) = &net.subnet {
         let subnet = minga_net::Cidr::parse(raw).map_err(|e| bad_request(e.to_string()))?;
+        let supernet = app.store.overlay_supernet().unwrap_or_else(|| {
+            minga_net::Cidr::parse(minga_net::DEFAULT_SUPERNET).expect("default supernet parses")
+        });
+        minga_net::overlay::check_network_subnet(&subnet, Some(&supernet)).map_err(bad_request)?;
         for other in app.store.list_networks().await? {
             let Some(theirs) = other.subnet.as_deref() else {
                 continue;
@@ -2935,6 +2940,36 @@ mod tests {
         )
         .await
         .expect("non-overlapping subnet");
+    }
+
+    #[tokio::test]
+    async fn network_subnet_outside_the_overlay_is_refused() {
+        let (app, _dir) = app_with_node(1.0).await;
+        let ipam = |s: &str| serde_json::json!({"IPAM": {"Config": [{"Subnet": s}]}});
+        for (name, subnet) in [
+            ("outside", "192.168.1.0/24"),
+            ("wide", "10.0.0.0/8"),
+            ("mesh", "10.200.0.0/24"),
+            ("host", "10.100.5.7/32"),
+            ("tiny", "10.100.5.0/29"),
+        ] {
+            let err = create_network(
+                State(app.clone()),
+                default_caller(),
+                net_req(name, ipam(subnet)),
+            )
+            .await
+            .unwrap_err();
+            assert!(matches!(err, ApiError::BadRequest(_)), "{subnet}: {err:?}");
+            assert!(app.store.get_network(name).await.unwrap().is_none());
+        }
+        let _ = create_network(
+            State(app.clone()),
+            default_caller(),
+            net_req("inside", ipam("10.100.5.0/28")),
+        )
+        .await
+        .expect("a /28 inside the supernet");
     }
 
     #[tokio::test]

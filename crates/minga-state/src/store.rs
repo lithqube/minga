@@ -844,6 +844,17 @@ impl StateStore {
         self.remove_owned(ObjectKind::Task, id, tenant_id).await
     }
 
+    /// Confines network subnets to `supernet` from now on. Managers call it
+    /// right after opening; entries applied before it skip only this check.
+    pub fn set_overlay_supernet(&self, supernet: minga_net::Cidr) {
+        self.reader.set_overlay_supernet(supernet);
+    }
+
+    /// The overlay supernet set by `set_overlay_supernet`, if any.
+    pub fn overlay_supernet(&self) -> Option<minga_net::Cidr> {
+        self.reader.overlay_supernet()
+    }
+
     pub async fn upsert_network(&self, network: Network) -> Result<(), StateError> {
         match self.propose(StateCommand::UpsertNetwork(network)).await? {
             StateResponse::Ok | StateResponse::ChangeRequest(_) => Ok(()),

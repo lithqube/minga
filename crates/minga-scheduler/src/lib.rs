@@ -661,11 +661,50 @@ fn build_wireguard_peer_sets(
     networks: &[Network],
 ) -> Result<HashMap<u64, WireGuardPeerSet>, SchedulerError> {
     let node_by_id: HashMap<_, _> = nodes.iter().map(|node| (node.id, node)).collect();
-    let network_ids: HashSet<&str> = networks.iter().map(|network| network.id.as_str()).collect();
     let network_tenants: HashMap<_, _> = networks
         .iter()
         .map(|network| (network.id.as_str(), network.tenant_id.as_str()))
         .collect();
+    let network_subnets: HashMap<_, _> = networks
+        .iter()
+        .filter_map(|network| {
+            let subnet = minga_net::Cidr::parse(network.subnet.as_deref()?).ok()?;
+            Some((network.id.as_str(), subnet))
+        })
+        .collect();
+    // A task address routes only inside its own network's subnet, from a node
+    // of that network's tenant.
+    let owned = |task: &Task, network_id: &str, ip: &str| {
+        node_by_id
+            .get(&task.node_id)
+            .is_some_and(|node| node.tenant_id == task.tenant_id)
+            && network_tenants.get(network_id) == Some(&task.tenant_id.as_str())
+            && ip.parse().is_ok_and(|ip| {
+                network_subnets
+                    .get(network_id)
+                    .is_some_and(|subnet| subnet.contains(ip))
+            })
+    };
+    let mut claims: HashMap<&str, (HashSet<u64>, HashSet<u64>)> = HashMap::new();
+    for task in tasks {
+        for (network_id, ip) in &task.spec.ips {
+            if owned(task, network_id, ip) {
+                let (all, live) = claims.entry(ip.as_str()).or_default();
+                all.insert(task.node_id);
+                if !matches!(task.state, TaskState::Stopped | TaskState::Failed) {
+                    live.insert(task.node_id);
+                }
+            }
+        }
+    }
+    // WireGuard hands a /32 listed under two peers to the last one, so an
+    // address two nodes claim goes to its one live claimant, or nowhere.
+    let routed = |task: &Task, network_id: &str, ip: &str| {
+        owned(task, network_id, ip)
+            && claims.get(ip).is_some_and(|(all, live)| {
+                all.len() == 1 || (live.len() == 1 && live.contains(&task.node_id))
+            })
+    };
     let mesh_node_ips: HashMap<_, _> = nodes
         .iter()
         .map(|node| {
@@ -685,16 +724,10 @@ fn build_wireguard_peer_sets(
             {
                 continue;
             }
-            let Some(node) = node_by_id.get(&task.node_id) else {
-                continue;
-            };
             let Some((network_id, ip)) = primary_task_ip(&task.spec.ips) else {
                 continue;
             };
-            if node.tenant_id != task.tenant_id
-                || network_tenants.get(network_id) != Some(&task.tenant_id.as_str())
-                || ip.parse::<std::net::Ipv4Addr>().is_err()
-            {
+            if !routed(task, network_id, ip) {
                 continue;
             }
             ingress_network_ids.insert(network_id);
@@ -708,17 +741,8 @@ fn build_wireguard_peer_sets(
     }
     let mut task_ips: HashMap<u64, HashMap<String, Vec<String>>> = HashMap::new();
     for task in tasks {
-        let Some(node) = node_by_id.get(&task.node_id) else {
-            continue;
-        };
-        if node.tenant_id != task.tenant_id {
-            continue;
-        }
         for (network_id, ip) in &task.spec.ips {
-            if network_ids.contains(network_id.as_str())
-                && network_tenants.get(network_id.as_str()) == Some(&task.tenant_id.as_str())
-                && ip.parse::<std::net::Ipv4Addr>().is_ok()
-            {
+            if routed(task, network_id, ip) {
                 task_ips
                     .entry(task.node_id)
                     .or_default()

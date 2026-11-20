@@ -523,6 +523,8 @@ pub struct RedbStateMachine {
     db: Arc<Mutex<Database>>,
     last_applied: Option<LogId<u64>>,
     last_membership: StoredMembership<u64, BasicNode>,
+    /// The overlay supernet network subnets must lie in, once the manager sets it.
+    overlay_supernet: Arc<std::sync::OnceLock<minga_net::Cidr>>,
 }
 
 #[allow(clippy::result_large_err)]
@@ -572,9 +574,20 @@ impl RedbStateMachine {
             db: Arc::new(Mutex::new(db)),
             last_applied: None,
             last_membership: StoredMembership::default(),
+            overlay_supernet: Arc::default(),
         };
         sm.load_meta()?;
         Ok(sm)
+    }
+
+    /// The overlay supernet `UpsertNetwork` confines subnets to, if set.
+    pub(crate) fn overlay_supernet(&self) -> Option<minga_net::Cidr> {
+        self.overlay_supernet.get().copied()
+    }
+
+    /// Sets the overlay supernet once; a later call keeps the first value.
+    pub(crate) fn set_overlay_supernet(&self, supernet: minga_net::Cidr) {
+        let _ = self.overlay_supernet.set(supernet);
     }
 
     /// Loads last_applied and last_membership from disk.
@@ -625,6 +638,7 @@ impl RedbStateMachine {
     fn apply_command(
         tx: &redb::WriteTransaction,
         cmd: &StateCommand,
+        supernet: Option<&minga_net::Cidr>,
     ) -> Result<StateResponse, StorageError<u64>> {
         match cmd {
             StateCommand::UpsertNode(node) => {
@@ -866,6 +880,16 @@ impl RedbStateMachine {
                 Ok(StateResponse::Ok)
             }
             StateCommand::UpsertNetwork(net) => {
+                if let Some(raw) = &net.subnet {
+                    let checked = minga_net::Cidr::parse(raw)
+                        .map_err(|error| error.to_string())
+                        .and_then(|subnet| {
+                            minga_net::overlay::check_network_subnet(&subnet, supernet)
+                        });
+                    if let Err(error) = checked {
+                        return Ok(StateResponse::Error(error));
+                    }
+                }
                 if owned_by_other_tenant(
                     tx,
                     NETWORKS_TABLE,
@@ -1377,6 +1401,7 @@ impl RedbStateMachine {
                     match Self::apply_command(
                         tx,
                         &StateCommand::UpsertService(request.after.clone()),
+                        supernet,
                     )? {
                         StateResponse::Ok => {}
                         response => return Ok(response),
@@ -1695,7 +1720,9 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
 
             let response = match &entry.payload {
                 EntryPayload::Blank => StateResponse::Ok,
-                EntryPayload::Normal(cmd) => Self::apply_command(&tx, cmd)?,
+                EntryPayload::Normal(cmd) => {
+                    Self::apply_command(&tx, cmd, self.overlay_supernet.get())?
+                }
                 EntryPayload::Membership(_) => StateResponse::Ok,
             };
 
@@ -2023,7 +2050,8 @@ mod tests {
     fn apply(sm: &RedbStateMachine, command: StateCommand) -> StateResponse {
         let db = sm.db.lock().unwrap();
         let tx = db.begin_write().unwrap();
-        let response = RedbStateMachine::apply_command(&tx, &command).unwrap();
+        let response =
+            RedbStateMachine::apply_command(&tx, &command, sm.overlay_supernet.get()).unwrap();
         tx.commit().unwrap();
         response
     }

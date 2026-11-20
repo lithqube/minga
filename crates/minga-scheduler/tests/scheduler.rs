@@ -1367,6 +1367,91 @@ async fn nat_workers_relay_through_the_lowest_manager_and_fail_over_after_lease_
 }
 
 #[tokio::test]
+async fn relay_manager_carries_only_unique_addresses_inside_each_network() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(
+        StateStore::open(1, "127.0.0.1:0", dir.path(), BTreeMap::new())
+            .await
+            .unwrap(),
+    );
+    let mut manager = make_node(1, 8.0, 1 << 34);
+    manager.role = NodeRole::Manager;
+    manager.wg_public_key = Some("manager-key".into());
+    manager.wg_endpoint = Some("192.0.2.1:51820".into());
+    let mut worker_a = make_node(2, 8.0, 1 << 34);
+    worker_a.wg_public_key = Some("worker-a-key".into());
+    let mut worker_b = make_node(3, 8.0, 1 << 34);
+    worker_b.wg_public_key = Some("worker-b-key".into());
+    for node in [manager, worker_a.clone(), worker_b.clone()] {
+        store.upsert_node(node).await.unwrap();
+    }
+    store
+        .upsert_network(Network {
+            id: "shared".into(),
+            tenant_id: "default".to_string(),
+            name: "shared".into(),
+            driver: "overlay".into(),
+            attachable: false,
+            subnet: Some("10.1.0.0/24".into()),
+            wg_port: None,
+        })
+        .await
+        .unwrap();
+    // Worker A's tasks claim an address outside the network and one that
+    // worker B also claims: neither may reach the relay manager's peer set.
+    for (service_id, worker, ip) in [
+        ("app.a", worker_a.clone(), "10.1.0.20"),
+        ("app.b", worker_a.clone(), "192.168.1.1"),
+        ("app.e", worker_a, "10.1.0.25"),
+        ("app.c", worker_b.clone(), "10.1.0.30"),
+        ("app.d", worker_b, "10.1.0.20"),
+    ] {
+        let mut service = make_service(service_id, 1);
+        service.networks = vec!["shared".into()];
+        store.upsert_service(service.clone()).await.unwrap();
+        let mut task = minga_scheduler::place_service(&service, &[worker], &[], &[], 0).remove(0);
+        task.spec.ips.insert("shared".into(), ip.into());
+        store.upsert_task(task).await.unwrap();
+    }
+
+    let bus = MemoryBus::new();
+    for id in [1, 2, 3] {
+        bus.refresh_lease(id, b"registration").await.unwrap();
+    }
+    let scheduler = Scheduler::with_bus(store.clone(), bus.clone());
+    scheduler.reconcile_once().await.unwrap();
+
+    let entries = bus.list_assignments("").await.unwrap();
+    let value = entries
+        .iter()
+        .find(|(key, _)| key == "default.node.1.wg")
+        .expect("relay peer set published");
+    let relay = minga_state::codec::decode_wire::<minga_net::wireguard::WireGuardPeerSet>(&value.1)
+        .unwrap();
+    let subnet = minga_net::Cidr::parse("10.1.0.0/24").unwrap();
+    let mesh = minga_net::overlay::allocate_mesh_subnet().unwrap();
+    let mut seen = std::collections::HashSet::new();
+    for allowed_ip in relay.peers.iter().flat_map(|peer| &peer.allowed_ips) {
+        let ip = allowed_ip.trim_end_matches("/32").parse().unwrap();
+        assert!(
+            subnet.contains(ip) || mesh.contains(ip),
+            "{allowed_ip} routed"
+        );
+        assert!(seen.insert(allowed_ip), "{allowed_ip} under two peers");
+    }
+    assert!(seen.contains(&"10.1.0.25/32".to_string()));
+    assert!(seen.contains(&"10.1.0.30/32".to_string()));
+
+    drop(scheduler);
+    Arc::try_unwrap(store)
+        .ok()
+        .expect("scheduler dropped")
+        .shutdown()
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
 async fn one_tenant_at_its_task_quota_does_not_block_other_tenants() {
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(
