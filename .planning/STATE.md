@@ -2,6 +2,8 @@
 
 **Current:** Phase 13 — WireGuard mesh and routing mesh. 13-03 node keys and interface are complete and merged (PR #84). ADR 0007 (13-01, PR #77) and unique subnets (13-02, PR #78) are merged. Phase 12 Managers-only Raft is complete (PR #76; live evidence below).
 
+**Next planned release phase:** Phase 14, [Agent-ready operations and painless management](phases/14-agent-ready-operations/14-PLAN.md), is planned before v1.3.0. It covers truthful version/Raft reporting, Compose fidelity, a read-only diagnostic/support bundle, upgrade preflight, stable agent tools, and server-enforced approval/audit before any agent writes. Implementation does not include VM testing; Phase 13-07 multi-VM proof is held for the v1.3.0 release-candidate gate. The roadmap marks Phase 12 complete and Phase 13-04…13-06 implemented; only Phase 13-07 release proof remains open.
+
 **Phase 12 live evidence (12-07, 2026-11-15):**
 
 - **T1:** One Linux manager/API with containerd and mTLS Raft deployed a real task. State export/import round-tripped; manager and sidecar restart on the same data directory recovered the service and running task.

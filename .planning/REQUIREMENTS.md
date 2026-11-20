@@ -31,3 +31,15 @@ The controls below are engineering targets, **not** an assertion of certificatio
 - [ ] **WG-ISOL** Network isolation and anti-spoofing hold across nodes. A task can't reach another network on another node, or send as another node's task.
 - [ ] **WG-INGRESS** `mode: ingress` (the default) answers on every node and load-balances to tasks anywhere. `mode: host` keeps per-node publishing and the client IP. Port conflicts fail cluster-wide with a 409.
 - [ ] **WG-PROOF** Separate VMs with one worker behind NAT demonstrate each item above, with iperf3 numbers for direct and relayed paths. Docs, CHANGELOG and the site roadmap are updated.
+
+# Phase 14 requirements (Agent-ready operations and painless management)
+
+- [ ] **OPS-VERSION** The API/CLI report the running binary version and available build revision separately from client and API versions; operators do not infer installed versions from behavior.
+- [ ] **OPS-RAFT** Diagnostics report persisted voter membership, leader, quorum/readiness and unavailable members, distinct from bootstrap `--peer` inputs. Configured peers are never represented as proof of running processes.
+- [ ] **OPS-COMPOSE** Compose keys are applied end to end or rejected before desired state changes. `deploy.labels` has an end-to-end regression proving the Swarm consumer sees the labels or receives an actionable validation error.
+- [ ] **OPS-DOCTOR** `minga-ctl doctor` is read-only and reports evidence-based, machine-readable findings for version, API, Raft, bus, nodes, tasks and auth/TLS. Shared support output redacts tokens, keys, secret values and sensitive environment data.
+- [ ] **OPS-UPGRADE** Upgrade preflight reports actual source/target compatibility, persisted format/migration, backup, ordering, downtime and rollback limits. Planning never wipes data, restarts roles or silently begins an upgrade.
+- [ ] **AGENT-CONTRACT** Agent tools use a documented typed interface and deterministic structured output/errors. Initial tools are allow-listed reads; agents do not receive shared admin credentials or arbitrary HTTP, shell or filesystem access.
+- [ ] **AGENT-AUTHZ** Agent mutations are impossible without server-enforced caller identity and role checks; client-side tool filtering is not treated as authorization. No multi-tenant isolation claim is made until ADR 0008 is implemented.
+- [ ] **AGENT-APPROVAL** Agents can only submit bounded, expiring change proposals. A distinct authorized operator approves or rejects the exact diff; every transition and result is attributable in the audit trail.
+- [ ] **RC-PROOF** No VM tests are run during implementation. At the v1.3.0 release-candidate gate, Phase 13 multi-VM T2/T3 proof and a staging upgrade from v1.2.0 are recorded against the exact candidate; release claims match that evidence.

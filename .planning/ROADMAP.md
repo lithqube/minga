@@ -51,15 +51,15 @@ Sequential implementation for one developer: B (NATS TLS/transport boundary) →
 **Requirements:** MOR-ADR, MOR-LEASE, MOR-STATUS, MOR-ASSIGN, MOR-AUTHZ, MOR-JOIN, MOR-FOLD, MOR-NATS, MOR-PART, MOR-PROOF
 **Plans:** `.planning/phases/12-managers-only-raft/12-PLAN.md`
 **Mode:** standard
-**Status:** Planned
+**Status:** Done (12-01…12-07 merged; live evidence in `.planning/STATE.md` and `CHANGELOG.md`)
 
-- [ ] 12-01 — ADR 0006: Workers leave Raft (no code)
-- [ ] 12-02 — Liveness and registration off Raft
-- [ ] 12-03 — Actual task state off Raft
-- [ ] 12-04 — Assignment KV, workers without a StateStore, one dispatch path, NATS subject permissions
-- [ ] 12-05 — Join and remove managers, cluster the managers' NATS sidecars (can run in parallel with 12-02…12-04)
-- [ ] 12-06 — Fold `minga api` into the manager
-- [ ] 12-07 — Live proof, docs, CHANGELOG, site roadmap
+- [x] 12-01 — ADR 0006: Workers leave Raft (no code)
+- [x] 12-02 — Liveness and registration off Raft
+- [x] 12-03 — Actual task state off Raft
+- [x] 12-04 — Assignment KV, workers without a StateStore, one dispatch path, NATS subject permissions
+- [x] 12-05 — Join and remove managers, cluster the managers' NATS sidecars (can run in parallel with 12-02…12-04)
+- [x] 12-06 — Fold `minga api` into the manager
+- [x] 12-07 — Live proof, docs, CHANGELOG, site roadmap
 
 ## Phase 13: WireGuard mesh and routing mesh
 **Goal:** Containers on different nodes reach each other over kernel WireGuard, with the same names and IPs, including edge workers behind NAT (relayed through managers). Published ports in Swarm's default `ingress` mode answer on every node.
@@ -72,7 +72,23 @@ Sequential implementation for one developer: B (NATS TLS/transport boundary) →
 - [x] 13-01 — ADR 0007: WireGuard mesh and routing mesh (no code)
 - [x] 13-02 — Unique subnets and strict network `driver_opts` (independent of Phase 12)
 - [x] 13-03 — Node keys and the `minga-wg0` interface
-- [ ] 13-04 — Peer sets, /32 routes, proxy ARP, cross-node isolation
-- [ ] 13-05 — NAT traversal by relay through managers
-- [ ] 13-06 — Routing mesh (`mode: ingress` as in Swarm, cluster-wide port reservation)
+- [x] 13-04 — Peer sets, /32 routes, proxy ARP, cross-node isolation (real-kernel CI evidence)
+- [x] 13-05 — NAT traversal by relay through managers (real-kernel CI evidence)
+- [x] 13-06 — Routing mesh (`mode: ingress` as in Swarm, cluster-wide port reservation)
 - [ ] 13-07 — Live proof on VMs, iperf3 numbers, docs, CHANGELOG, site roadmap
+
+## Phase 14: Agent-ready operations and painless management (pre-v1.3.0)
+**Goal:** Make operational facts trustworthy, common failure modes diagnosable, upgrades predictable, and Minga safely usable by automation and AI agents. Agent writes require server-side authorization and human approval.
+**Depends on:** Phase 13 implementation (13-01…13-06); 13-07 release-candidate proof remains a release gate.
+**Requirements:** OPS-VERSION, OPS-RAFT, OPS-COMPOSE, OPS-DOCTOR, OPS-UPGRADE, AGENT-CONTRACT, AGENT-AUTHZ, AGENT-APPROVAL, RC-PROOF
+**Plan:** `.planning/phases/14-agent-ready-operations/14-PLAN.md`
+**Mode:** standard
+**Status:** Planned for v1.3.0
+
+- [ ] 14-01 — Report exact version/build and persisted Raft membership, leader and quorum; separate these from bootstrap `--peer` inputs.
+- [ ] 14-02 — Make Compose fidelity explicit; implement `deploy.labels` or reject it before state changes.
+- [ ] 14-03 — Add read-only `minga-ctl doctor` and redacted support evidence.
+- [ ] 14-04 — Add upgrade compatibility/preflight plans; never wipe or restart as a planning side effect.
+- [ ] 14-05 — Define stable structured agent tools; begin with allow-listed read-only access.
+- [ ] 14-06 — Add server-enforced roles, audit and maker-checker change proposals before enabling agent writes.
+- [ ] 14-07 — At the v1.3.0 release-candidate gate, complete Phase 13 multi-VM proof and validate upgrade/staging/agent workflows. No VM testing before the candidate is ready.
