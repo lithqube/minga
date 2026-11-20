@@ -122,11 +122,11 @@ LLM egress handles few requests, each lasting seconds and dominated by the upstr
 | 0 | NATS supported server line (T0) | Complete: NATS 2.15.3, CI matrix and store-upgrade proof. |
 | 1 | A1–A5, B5, B8, ADR 0008 T1–T2 | Complete on current `main`; PR #103 finishes named routes, policy, streaming, usage and operator usage query. |
 | 1b | ADR 0008 T3–T5 | Implementation complete (PR #98 and Phase 15); T3 live tenant-isolation proof remains deferred until release readiness. |
-| 2 | B6, then B7 | Next code work: distributed customer window budgets, then request-rate limits. |
+| 1c | D11, D12 | Pulled forward into Phase 16 before v1.3.0; Phase 15 supplies tenant identity and audit. |
+| 2 | B6, then B7 | Planned after Phase 16: distributed customer window budgets, then request-rate limits. |
 | 3 | C9, C10 | Workload identity tokens and credential reload without restart. |
 | 4 | D13 | Jobs and deadlines. |
-| 5 | D11, D12 | MCP and maker-checker change requests. |
-| 6 | E14, E15, then [the WASM sandbox plan](sandbox-host-capabilities-plan.md) | Artifact distribution and local-model route; then WASI host capabilities. |
+| 5 | E14, E15, then [the WASM sandbox plan](sandbox-host-capabilities-plan.md) | Offline AI and WASM host capabilities. |
 
 The shared Wasmtime engine, bounded module cache, epoch timeout, enforced
 memory limit and capability-grant schema/validation are already merged (PRs
