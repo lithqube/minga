@@ -3045,6 +3045,9 @@ fn project_dir(compose_file: &str) -> Option<std::path::PathBuf> {
 /// or one holding a certificate issued by one in the other (a root and its
 /// intermediate). Issuers match by DN, so unrelated CAs with the same subject
 /// are refused too (fail closed). Missing files are left to the loaders.
+/// shortcut: only direct issuance is visible; a client CA two or more levels
+/// below the route CA (via an intermediate in neither file) is not detected.
+/// Upgrade by giving NATS routes their own peer authorization.
 fn cas_overlap(a: &Path, b: &Path) -> Result<bool, String> {
     if !a.exists() || !b.exists() {
         return Ok(false);
