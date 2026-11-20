@@ -840,6 +840,23 @@ fn assigned_peer(
     Ok(())
 }
 
+/// Whether `namespace` completed a handshake with the peer `public_key`.
+fn has_handshake(namespace: &str, public_key: &str) -> Result<bool, String> {
+    let handshakes = in_ns(
+        namespace,
+        "wg",
+        &["show", WG_INTERFACE_NAME, "latest-handshakes"],
+    )?;
+    Ok(handshakes.lines().any(|line| {
+        line.starts_with(public_key)
+            && line
+                .split_whitespace()
+                .nth(1)
+                .and_then(|timestamp| timestamp.parse::<u64>().ok())
+                .is_some_and(|timestamp| timestamp > 0)
+    }))
+}
+
 fn install_relay_rule(namespace: &str, subnet: &str) -> Result<(), String> {
     in_ns(namespace, "sysctl", &["-w", "net.ipv4.ip_forward=1"])?;
     in_ns(
@@ -1515,9 +1532,6 @@ async fn nat_workers_relay_through_manager_and_use_direct_path_to_reachable_work
     assigned_peer(&manager, &key_b.public_key, None, &["10.242.0.20/32"], 0)?;
     assigned_peer(&standby, &key_a.public_key, None, &["10.242.0.10/32"], 0)?;
     assigned_peer(&standby, &key_b.public_key, None, &["10.242.0.20/32"], 0)?;
-    // Responders know key A before its keepalive peers send the first
-    // handshake; a rejected one is retried only after WireGuard's 5 s timeout.
-    assigned_peer(&reachable, &key_a.public_key, None, &["10.242.0.10/32"], 0)?;
     assigned_peer(
         &worker_a,
         &key_manager.public_key,
@@ -1553,6 +1567,17 @@ async fn nat_workers_relay_through_manager_and_use_direct_path_to_reachable_work
         &["10.242.0.40/32"],
         25,
     )?;
+    assigned_peer(&reachable, &key_a.public_key, None, &["10.242.0.10/32"], 0)?;
+    // The keepalive peer handshakes as soon as it is set. A responder that
+    // rejects that first handshake retries only after WireGuard's 5 s
+    // REKEY_TIMEOUT, which made the direct ping below flaky (#115).
+    let handshake_deadline = Instant::now() + Duration::from_secs(2);
+    while !has_handshake(&reachable, &key_a.public_key)? {
+        if Instant::now() > handshake_deadline {
+            return Err("reachable worker rejected the NAT worker's first handshake".into());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 
     for (namespace, addresses) in [
         (&manager, &["10.242.0.10/32", "10.242.0.20/32"][..]),
@@ -1618,21 +1643,9 @@ async fn nat_workers_relay_through_manager_and_use_direct_path_to_reachable_work
         direct_endpoint.contains("198.18.0.5:51825"),
         "reachable worker endpoint was not selected directly: {direct_endpoint}"
     );
-    let direct_handshakes = in_ns(
-        &reachable,
-        "wg",
-        &["show", WG_INTERFACE_NAME, "latest-handshakes"],
-    )?;
     assert!(
-        direct_handshakes.lines().any(|line| {
-            line.starts_with(&key_a.public_key)
-                && line
-                    .split_whitespace()
-                    .nth(1)
-                    .and_then(|timestamp| timestamp.parse::<u64>().ok())
-                    .is_some_and(|timestamp| timestamp > 0)
-        }),
-        "reachable worker did not handshake directly with the NAT worker: {direct_handshakes}"
+        has_handshake(&reachable, &key_a.public_key)?,
+        "reachable worker did not handshake directly with the NAT worker"
     );
     ping(&task_reachable, "10.242.0.10", None).map_err(|error| {
         format!("reachable worker could not use the NAT worker's learned endpoint: {error}")
