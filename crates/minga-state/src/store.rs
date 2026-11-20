@@ -589,15 +589,24 @@ impl StateStore {
                     let forward = err.forward_to_leader();
                     match forward {
                         Some(fwd) if attempt < MAX_ATTEMPTS => {
-                            let addr = fwd.leader_node.as_ref().map(|n| n.addr.clone());
-                            match addr {
-                                Some(addr) => {
+                            let leader = fwd
+                                .leader_id
+                                .zip(fwd.leader_node.as_ref().map(|n| n.addr.clone()));
+                            match leader {
+                                Some((leader_id, addr)) => {
                                     tracing::debug!(
                                         attempt,
+                                        leader_id,
                                         leader_addr = %addr,
                                         "forwarding write to leader"
                                     );
-                                    match forward_write(&addr, &cmd, self.tls_client.clone()).await
+                                    match forward_write(
+                                        leader_id,
+                                        &addr,
+                                        &cmd,
+                                        self.tls_client.clone(),
+                                    )
+                                    .await
                                     {
                                         Ok(resp) => return Ok(resp),
                                         Err(e) => {

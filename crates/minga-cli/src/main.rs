@@ -6,7 +6,7 @@ mod sidecar;
 mod state;
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
@@ -634,12 +634,12 @@ async fn open_store(
         }
         (None, None, None) => {
             if !is_loopback_bind(bind) {
-                tracing::warn!(
-                    bind,
-                    "Raft is listening in plaintext on a non-loopback address: any peer that can \
-                     reach it can write cluster state, API token or not. Set --raft-tls-ca, \
-                     --raft-tls-cert and --raft-tls-key (`minga tls init-ca` / `issue-node`)"
-                );
+                return Err(format!(
+                    "Raft would listen in plaintext on {bind}, where any peer that can reach it \
+                     could write cluster state, API token or not. Set --raft-tls-ca, \
+                     --raft-tls-cert and --raft-tls-key (`minga tls init-ca` / `issue-node`) or \
+                     bind to loopback"
+                ));
             }
             if join {
                 minga_state::StateStore::open_join(node_id, bind, data_dir).await
@@ -923,7 +923,8 @@ fn node_certificate_names(node_id: u64, role: NodeCertificateRole) -> Vec<String
     };
     let mut names = vec![minga_state::network::MINGA_NODE_NAME.to_string(), identity];
     if matches!(role, NodeCertificateRole::Manager) {
-        names.push("localhost".to_string());
+        // A manager certificate from the route CA doubles as its route certificate.
+        names.extend(["localhost".to_string(), sidecar::ROUTE_NAME.to_string()]);
     }
     names
 }
@@ -1531,37 +1532,60 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
         eprintln!("error: --api-tls-cert, --api-tls-key, and --api-client-ca must be set together");
         return ExitCode::FAILURE;
     }
-    if let (Some(raft_ca), Some(client_ca)) =
-        (args.raft_tls_ca.as_deref(), args.api_client_ca.as_deref())
-    {
-        let raft_ca = PathBuf::from(raft_ca);
-        let client_ca = PathBuf::from(client_ca);
-        if raft_ca.exists() && client_ca.exists() {
-            let raft_pem = match std::fs::read(&raft_ca) {
-                Ok(pem) => pem,
-                Err(error) => {
-                    eprintln!("error: cannot read Raft CA {}: {error}", raft_ca.display());
-                    return ExitCode::FAILURE;
-                }
-            };
-            let client_pem = match std::fs::read(&client_ca) {
-                Ok(pem) => pem,
-                Err(error) => {
-                    eprintln!(
-                        "error: cannot read API client CA {}: {error}",
-                        client_ca.display()
-                    );
-                    return ExitCode::FAILURE;
-                }
-            };
-            let raft_certs = pem_certificates(&raft_pem);
-            let same_der = pem_certificates(&client_pem)
-                .iter()
-                .any(|cert| raft_certs.contains(cert));
-            if raft_pem == client_pem || same_der {
+    if is_manager {
+        // ADR 0005 §4: refuse an open control plane instead of warning about it.
+        if args
+            .api_token
+            .as_deref()
+            .is_some_and(|t| t.trim().is_empty())
+        {
+            eprintln!(
+                "error: --api-token / MINGA_API_TOKEN is set but empty; set a non-empty token or unset it"
+            );
+            return ExitCode::FAILURE;
+        }
+        let api_bind = args.api_bind.as_deref().unwrap_or("0.0.0.0:2375");
+        if args.api_token.is_none() && api_tls_count == 0 && !is_loopback_bind(api_bind) {
+            eprintln!(
+                "error: the Docker API would listen on {api_bind} with no token and no client TLS, \
+                 giving anyone who can reach it unauthenticated default-tenant access. Set \
+                 --api-token, configure --api-tls-cert/--api-tls-key/--api-client-ca, or bind \
+                 --api-bind to loopback"
+            );
+            return ExitCode::FAILURE;
+        }
+    }
+    // A CA that verifies lower-trust certificates must not also admit peers:
+    // operator/tenant API certs must not be Raft-valid, and worker certs (which
+    // chain to the NATS client CA) must not join NATS as a route, where the
+    // per-tenant JWT permissions do not apply.
+    for (peer_ca, peer_flag, other_ca, other_flag) in [
+        (
+            &args.raft_tls_ca,
+            "--raft-tls-ca",
+            &args.api_client_ca,
+            "--api-client-ca",
+        ),
+        (
+            &args.nats_cluster_ca,
+            "--nats-cluster-ca",
+            &args.nats_client_ca,
+            "--nats-client-ca",
+        ),
+    ] {
+        let (Some(peer_ca), Some(other_ca)) = (peer_ca.as_deref(), other_ca.as_deref()) else {
+            continue;
+        };
+        match cas_overlap(Path::new(peer_ca), Path::new(other_ca)) {
+            Ok(false) => {}
+            Ok(true) => {
                 eprintln!(
-                    "error: --api-client-ca must not be the Raft CA; use a separate API client CA"
+                    "error: {other_flag} must not share a CA with {peer_flag}; use a separate CA for {peer_flag}"
                 );
+                return ExitCode::FAILURE;
+            }
+            Err(error) => {
+                eprintln!("error: {error}");
                 return ExitCode::FAILURE;
             }
         }
@@ -1598,6 +1622,22 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
     if args.nats_cluster_port.is_some() && cluster.is_none() {
         eprintln!("error: --nats-cluster-port requires route TLS");
         return ExitCode::FAILURE;
+    }
+    if let Some(cluster) = &cluster {
+        match cert_has_dns_name(&cluster.cert_file, sidecar::ROUTE_NAME) {
+            Ok(true) => {}
+            Ok(false) => {
+                eprintln!(
+                    "error: --nats-cluster-cert lacks the SAN {}; peers refuse routes without it. Reissue it with `minga tls issue-node --role manager` from the route CA",
+                    sidecar::ROUTE_NAME
+                );
+                return ExitCode::FAILURE;
+            }
+            Err(error) => {
+                eprintln!("error: {error}");
+                return ExitCode::FAILURE;
+            }
+        }
     }
     let sidecar_configured = args.nats_server_cert.is_some()
         || args.nats_server_key.is_some()
@@ -2018,13 +2058,6 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
     };
     let api_server = if is_manager {
         let api_bind = args.api_bind.as_deref().unwrap_or("0.0.0.0:2375");
-        if args.api_token.is_none() && api_tls_count == 0 && !is_loopback_bind(api_bind) {
-            tracing::warn!(
-                api_bind,
-                "the Docker API has no token or client TLS and listens beyond loopback: anyone who can reach it \
-                 gets unauthenticated default-tenant access. Set --api-token or configure API client TLS"
-            );
-        }
         let api_tls = match (
             args.api_tls_cert.as_deref(),
             args.api_tls_key.as_deref(),
@@ -3025,6 +3058,68 @@ fn project_dir(compose_file: &str) -> Option<std::path::PathBuf> {
     dir.canonicalize().ok()
 }
 
+/// Whether two CA PEM files overlap: byte-identical, sharing a certificate,
+/// or one holding a certificate issued by one in the other (a root and its
+/// intermediate). Issuance is proven by the child's signature verifying with
+/// the parent's key, so unrelated roots with the same default subject (as
+/// `minga tls init-ca` makes) do not overlap. Missing files are left to the
+/// loaders. Only direct issuance is visible here; a deeper chain (an
+/// intermediate in neither file) is covered by route authorization on
+/// `sidecar::ROUTE_NAME`.
+fn cas_overlap(a: &Path, b: &Path) -> Result<bool, String> {
+    use x509_parser::certificate::X509Certificate;
+
+    fn parse_all(certs: &[Vec<u8>]) -> Vec<X509Certificate<'_>> {
+        certs
+            .iter()
+            .filter_map(|der| x509_parser::parse_x509_certificate(der).ok())
+            .map(|(_, cert)| cert)
+            .collect()
+    }
+    fn issued_by(children: &[X509Certificate<'_>], parents: &[X509Certificate<'_>]) -> bool {
+        children.iter().any(|child| {
+            parents
+                .iter()
+                .any(|parent| child.verify_signature(Some(parent.public_key())).is_ok())
+        })
+    }
+
+    if !a.exists() || !b.exists() {
+        return Ok(false);
+    }
+    let read = |path: &Path| {
+        std::fs::read(path).map_err(|error| format!("cannot read CA {}: {error}", path.display()))
+    };
+    let (a_pem, b_pem) = (read(a)?, read(b)?);
+    let (a_certs, b_certs) = (pem_certificates(&a_pem), pem_certificates(&b_pem));
+    let (a_names, b_names) = (parse_all(&a_certs), parse_all(&b_certs));
+    Ok(a_pem == b_pem
+        || b_certs.iter().any(|cert| a_certs.contains(cert))
+        || issued_by(&a_names, &b_names)
+        || issued_by(&b_names, &a_names))
+}
+
+/// Whether the first certificate in the PEM file at `path` carries `name` as
+/// a DNS SAN.
+fn cert_has_dns_name(path: &Path, name: &str) -> Result<bool, String> {
+    let pem = std::fs::read(path)
+        .map_err(|error| format!("cannot read certificate {}: {error}", path.display()))?;
+    let Some(der) = pem_certificates(&pem).into_iter().next() else {
+        return Err(format!("no certificate in {}", path.display()));
+    };
+    let (_, cert) = x509_parser::parse_x509_certificate(&der)
+        .map_err(|error| format!("cannot parse certificate {}: {error}", path.display()))?;
+    Ok(cert
+        .subject_alternative_name()
+        .ok()
+        .flatten()
+        .is_some_and(|san| {
+            san.value.general_names.iter().any(|general| {
+            matches!(general, x509_parser::extensions::GeneralName::DNSName(dns) if *dns == name)
+        })
+        }))
+}
+
 /// Whether a `host:port` bind address only listens on loopback. Unparsable
 /// addresses count as not loopback, so the caller warns rather than stays quiet.
 fn is_loopback_bind(addr: &str) -> bool {
@@ -3058,9 +3153,9 @@ fn port_of(addr: &str) -> Option<u16> {
 #[cfg(test)]
 mod tests {
     use super::{
-        is_loopback_bind, is_wildcard_bind, manager_requires_wg_endpoint, node_certificate_names,
-        port_of, project_dir, run_node, run_tls, worker_has_manager_only_flags, Cli, Command,
-        NodeCertificateRole, TlsCommand,
+        cas_overlap, cert_has_dns_name, is_loopback_bind, is_wildcard_bind,
+        manager_requires_wg_endpoint, node_certificate_names, port_of, project_dir, run_node,
+        run_tls, worker_has_manager_only_flags, Cli, Command, NodeCertificateRole, TlsCommand,
     };
     use clap::Parser;
     use std::os::unix::fs::PermissionsExt;
@@ -3235,6 +3330,8 @@ mod tests {
             "1",
             "--bind",
             "127.0.0.1:7001",
+            "--api-bind",
+            "127.0.0.1:2375",
             "--nats-cluster-port",
             "6223",
         ])
@@ -3243,6 +3340,87 @@ mod tests {
             panic!("expected manager command");
         };
         assert_eq!(run_node(args, true).await, std::process::ExitCode::FAILURE);
+    }
+
+    /// Runs a manager command line that must be refused at startup.
+    async fn manager_is_refused(argv: &[&str]) {
+        let cli = Cli::try_parse_from(argv).unwrap();
+        let Command::Manager(args) = cli.command else {
+            panic!("expected manager command");
+        };
+        let code = tokio::time::timeout(std::time::Duration::from_secs(10), run_node(args, true))
+            .await
+            .expect("startup must be refused, not run");
+        assert_eq!(code, std::process::ExitCode::FAILURE);
+    }
+
+    #[test]
+    fn only_manager_certificates_carry_the_route_name() {
+        let dir = tempdir().unwrap();
+        let cert = |role, file: &str| {
+            let key = rcgen::KeyPair::generate().unwrap();
+            let params = rcgen::CertificateParams::new(node_certificate_names(1, role)).unwrap();
+            let path = dir.path().join(file);
+            std::fs::write(&path, params.self_signed(&key).unwrap().pem()).unwrap();
+            path
+        };
+        let manager = cert(NodeCertificateRole::Manager, "manager.pem");
+        let worker = cert(NodeCertificateRole::Worker, "worker.pem");
+        let route = crate::sidecar::ROUTE_NAME;
+        assert!(cert_has_dns_name(&manager, route).unwrap());
+        assert!(!cert_has_dns_name(&worker, route).unwrap());
+        assert!(cert_has_dns_name(&dir.path().join("missing.pem"), route).is_err());
+    }
+
+    #[tokio::test]
+    async fn manager_refuses_tokenless_api_beyond_loopback() {
+        // The default API bind is 0.0.0.0:2375.
+        manager_is_refused(&[
+            "minga",
+            "manager",
+            "--node-id",
+            "1",
+            "--bind",
+            "127.0.0.1:7001",
+        ])
+        .await;
+    }
+
+    #[tokio::test]
+    async fn plaintext_raft_beyond_loopback_is_refused() {
+        let dir = tempdir().unwrap();
+        let data_dir = dir.path().to_str().unwrap();
+        let err = super::open_store(
+            1,
+            "10.0.0.1:7001",
+            data_dir,
+            Default::default(),
+            &None,
+            &None,
+            &None,
+            false,
+        )
+        .await
+        .err()
+        .expect("plaintext Raft on a routable address must be refused");
+        assert!(err.contains("--raft-tls-ca"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn manager_refuses_an_empty_api_token() {
+        manager_is_refused(&[
+            "minga",
+            "manager",
+            "--node-id",
+            "1",
+            "--bind",
+            "127.0.0.1:7001",
+            "--api-bind",
+            "127.0.0.1:2375",
+            "--api-token",
+            "",
+        ])
+        .await;
     }
     #[test]
     fn manager_api_flags_parse() {
@@ -3270,7 +3448,12 @@ mod tests {
     fn manager_certificate_names_cover_local_sidecar_tls_without_expanding_worker_identity() {
         assert_eq!(
             node_certificate_names(1, NodeCertificateRole::Manager),
-            ["minga-node", "minga-manager-1", "localhost"]
+            [
+                "minga-node",
+                "minga-manager-1",
+                "localhost",
+                crate::sidecar::ROUTE_NAME
+            ]
         );
         assert_eq!(
             node_certificate_names(2, NodeCertificateRole::Worker),
@@ -3319,6 +3502,67 @@ mod tests {
         assert!(!args.apply);
         assert_eq!(args.manager_ids, [1]);
         assert!(Cli::try_parse_from(["minga", "migrate-v1"]).is_err());
+    }
+
+    #[test]
+    fn cas_overlap_detects_a_shared_certificate() {
+        let ca_params = |name: &str| {
+            let mut params = rcgen::CertificateParams::new(vec![name.to_string()]).unwrap();
+            params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+            params.distinguished_name = rcgen::DistinguishedName::new();
+            params
+                .distinguished_name
+                .push(rcgen::DnType::CommonName, name);
+            params
+        };
+        let root_key = rcgen::KeyPair::generate().unwrap();
+        let root = ca_params("ca-one").self_signed(&root_key).unwrap();
+        let ca1 = root.pem();
+        let ca2 = ca_params("ca-two")
+            .self_signed(&rcgen::KeyPair::generate().unwrap())
+            .unwrap()
+            .pem();
+        let intermediate = ca_params("ca-one-intermediate")
+            .signed_by(&rcgen::KeyPair::generate().unwrap(), &root, &root_key)
+            .unwrap()
+            .pem();
+        let dir = tempdir().unwrap();
+        let write = |file: &str, body: &str| {
+            let path = dir.path().join(file);
+            std::fs::write(&path, body).unwrap();
+            path
+        };
+        let one = write("one.pem", &ca1);
+        let two = write("two.pem", &ca2);
+        let bundle = write("bundle.pem", &format!("{ca2}{ca1}"));
+        assert!(cas_overlap(&one, &one).unwrap());
+        assert!(
+            cas_overlap(&one, &bundle).unwrap(),
+            "a bundle containing the CA overlaps"
+        );
+        let child = write("intermediate.pem", &intermediate);
+        assert!(
+            cas_overlap(&one, &child).unwrap() && cas_overlap(&child, &one).unwrap(),
+            "a root and an intermediate it issued overlap, in either order"
+        );
+        assert!(!cas_overlap(&one, &two).unwrap());
+        assert!(!cas_overlap(&two, &child).unwrap());
+        // Two `init-ca` roots share rcgen's default subject but not a key.
+        let default_root = || {
+            let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+            params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+            params
+                .self_signed(&rcgen::KeyPair::generate().unwrap())
+                .unwrap()
+                .pem()
+        };
+        let route = write("route-root.pem", &default_root());
+        let client = write("client-root.pem", &default_root());
+        assert!(
+            !cas_overlap(&route, &client).unwrap(),
+            "independent roots with the same subject do not overlap"
+        );
+        assert!(!cas_overlap(&one, &dir.path().join("missing.pem")).unwrap());
     }
 
     #[test]

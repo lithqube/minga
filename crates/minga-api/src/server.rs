@@ -216,12 +216,14 @@ async fn resolve_caller(
     headers: &axum::http::HeaderMap,
     extensions: &axum::http::Extensions,
 ) -> Result<(Caller, Source), axum::response::Response> {
+    // An empty configured token must never match (`Basic Og==` presents "").
     let token_valid = state.auth_token.as_deref().is_some_and(|expected| {
-        headers
-            .get(axum::http::header::AUTHORIZATION)
-            .and_then(|value| value.to_str().ok())
-            .and_then(presented_token)
-            .is_some_and(|presented| constant_time_eq(&presented, expected))
+        !expected.is_empty()
+            && headers
+                .get(axum::http::header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok())
+                .and_then(presented_token)
+                .is_some_and(|presented| constant_time_eq(&presented, expected))
     });
     if token_valid {
         let tenant_id = sole_default_tenant(&state.store)
@@ -2998,6 +3000,28 @@ mod tests {
             status("127.0.0.1:2375", Some("http://evil.example:2375")).await,
             StatusCode::FORBIDDEN
         );
+    }
+
+    #[tokio::test]
+    async fn empty_configured_token_never_authenticates() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            StateStore::open(1, "127.0.0.1:0", dir.path(), BTreeMap::new())
+                .await
+                .unwrap(),
+        );
+        let router =
+            build_router_with_auth(store, Arc::new(ReadyState::new()), Some(String::new()));
+        // "Og==" is base64(":"), so Basic auth presents an empty password.
+        for header in ["Basic Og==", "Bearer "] {
+            let req = Request::builder()
+                .uri("/minga/tenants")
+                .header("Authorization", header)
+                .body(Body::empty())
+                .unwrap();
+            let (status, _) = send_request(router.clone(), req).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{header}");
+        }
     }
 
     #[tokio::test]

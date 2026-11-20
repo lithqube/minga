@@ -67,7 +67,7 @@ The API waits for catch-up before promotion. Remove it with
 | `--peer <ID=ADDR>` | none | Initial cluster membership only. Repeat for the other voters when bootstrapping; `--join` cannot be combined with `--peer`. |
 | `--join` | off | Never initializes a pristine store; waits for a manager to add this node. |
 | `--data-dir <DIR>` | `/var/lib/minga` | Manager Raft data (`raft_log.redb`, `state.redb`), plus node-local `secrets/`, `volumes/` and `modules/`. Workers never open Raft files. Tightened to 0700 at start. |
-| `--raft-tls-ca`, `--raft-tls-cert`, `--raft-tls-key` | none | All three together enable Raft mTLS. Required off loopback (otherwise a warning). The key must not be readable by group or others. |
+| `--raft-tls-ca`, `--raft-tls-cert`, `--raft-tls-key` | none | All three together enable Raft mTLS. Required off loopback: a manager refuses to start in plaintext on a non-loopback `--bind`. Peers must present a manager certificate (SAN `minga-manager-<id>`, from `minga tls issue-node --role manager`); worker certificates from the same CA are refused. The key must not be readable by group or others. |
 
 **Manager and worker flags**
 
@@ -81,7 +81,7 @@ The API waits for catch-up before promotion. Remove it with
 | `--nats-replicas <N>` | `1` | Copies of the event, status, lease, and assignment streams/buckets. Set 3 or 5 on a cluster with at least that many servers. Works with external NATS or route-TLS sidecars. |
 
 | `--nats-cluster-route <URL>` | none | Repeat for existing sidecar routes, e.g. `nats://manager-1:6222`. Requires route TLS. |
-| `--nats-cluster-cert`, `--nats-cluster-key`, `--nats-cluster-ca` | none | Route certificate, key, and peer CA for the built-in sidecar; required together and separate from client-facing TLS. `--nats-cluster-port` defaults to `6222`. |
+| `--nats-cluster-cert`, `--nats-cluster-key`, `--nats-cluster-ca` | none | Route certificate, key, and peer CA for the built-in sidecar; required together and separate from client-facing TLS. The route CA must be an independent root, never in the same chain as `--nats-client-ca` (worker certificates chain to the client CA, and a route bypasses per-tenant permissions); create it with its own `minga tls init-ca`. Issue the route certificate with `minga tls issue-node --role manager` from the route CA: routes accept only a peer certificate with the SAN `minga-nats-route`, and a manager refuses to start with a route certificate that lacks it. NATS matches that name in any SAN type (DNS, email, URI) or the subject, so if you use another PKI, no CA under the route root may issue it to anything but a manager. A manager also refuses a route CA that shares a certificate with the client CA or directly issued it (or the reverse). `--nats-cluster-port` defaults to `6222`. |
 | `--label <KEY=VALUE>` | none | Advertised to the cluster; matched by `node.labels.KEY` placement constraints. |
 | `--overlay-supernet <CIDR>`, `MINGA_OVERLAY_SUPERNET` | `10.100.0.0/16` | Manager subnet-allocation range; must contain `/24`s and avoid host routes. Use the same range on every cluster node. |
 | `--wg-listen <PORT>` | `51820` | UDP listen port for this node's WireGuard interface. |
@@ -162,8 +162,8 @@ certificate flags, or previous Raft data directory is needed.
 
 | Flag | Default | Notes |
 | --- | --- | --- |
-| `--api-bind <ADDR>` | `0.0.0.0:2375` | Manager Docker API listener. For remote access, prefer an SSH tunnel or TLS/mTLS. `--api-token` over plain HTTP sends the token and API traffic unencrypted; firewalling limits reachability but does not encrypt traffic. |
-| `--api-token`, `MINGA_API_TOKEN` | none | Bearer token on API requests, or Basic-auth password for Traefik's Swarm provider. Prefer the environment (`EnvironmentFile`) over the flag so the token is not in process listings. Membership and tenant-administration endpoints require a cluster-operator identity (`O=*` client certificate or configured API token). |
+| `--api-bind <ADDR>` | `0.0.0.0:2375` | Manager Docker API listener. A non-loopback bind needs `--api-token` or API client TLS; without either the manager refuses to start. For remote access, prefer an SSH tunnel or TLS/mTLS. `--api-token` over plain HTTP sends the token and API traffic unencrypted; firewalling limits reachability but does not encrypt traffic. |
+| `--api-token`, `MINGA_API_TOKEN` | none | Must not be empty. Bearer token on API requests, or Basic-auth password for Traefik's Swarm provider. Prefer the environment (`EnvironmentFile`) over the flag so the token is not in process listings. Membership and tenant-administration endpoints require a cluster-operator identity (`O=*` client certificate or configured API token). |
 | `--api-tls-cert <PEM>`, `--api-tls-key <PEM>`, `--api-client-ca <PEM>` | none | Enables HTTPS with mandatory client-certificate authentication (mTLS). All three flags are required together; a partial set fails startup. |
 
 ### Client commands

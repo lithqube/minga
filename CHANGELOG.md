@@ -2,6 +2,31 @@
 
 ## Unreleased
 
+- **Security, upgrade action needed.** These close audit leads on the shared node CA and on fail-open
+  defaults:
+  - **Raft accepts only manager certificates.** The Raft server accepts a peer only if its certificate has
+    a SAN `minga-manager-<id>`, and the client pins the exact `minga-manager-<id>` of the manager it dials,
+    including when it forwards a write. A tenant worker's node certificate comes from the same CA with the
+    shared `minga-node` SAN, and until now it was accepted for `ClientWrite`. Reissue any manager
+    certificate that lacks `minga-manager-<id>` with `minga tls issue-node --role manager` before
+    upgrading.
+  - **A manager refuses to start** in three cases that used to log a warning:
+    - The Docker API is on a non-loopback bind (the default is `0.0.0.0:2375`) with no `--api-token` and
+      no API client TLS. This is ADR 0005 §4.
+    - `--api-token` / `MINGA_API_TOKEN` is set but empty. The API also no longer accepts an empty
+      configured token, which `Authorization: Basic Og==` used to satisfy.
+    - Raft is plaintext on a non-loopback `--bind`.
+  - **The NATS route CA must be its own.** A manager refuses a `--nats-cluster-ca` that shares a
+    certificate with `--nats-client-ca` or directly issued it (or the reverse). Worker certificates
+    chain to the client CA, and a route peer bypasses per-tenant JWT permissions.
+  - **NATS routes need a route certificate.** Sidecar routes now accept an inbound peer only if its
+    certificate carries the SAN `minga-nats-route`, so a certificate that merely chains to the route
+    CA is refused. **Breaking:** reissue every `--nats-cluster-cert` with `minga tls issue-node
+    --role manager` from the route CA, which now adds that SAN; a manager refuses to start with a
+    route certificate that lacks it.
+  - **The templates are updated.** `scripts/minga.env.example` documents `MINGA_API_TOKEN`.
+    `talos/single-node.yaml` now runs the API from the manager with the token and drops the retired
+    `minga api` container and its phantom Raft peer.
 - `minga-ctl info` reports the client build separately from the server version,
   build revision and persisted Raft membership. `minga-ctl doctor` adds
   read-only readiness, bus, inventory and task findings; its optional support

@@ -63,7 +63,7 @@ talosctl gen config minga-cluster https://<node-ip>:6443 --output-dir ./talos-co
 talosctl validate --mode metal --config ./talos-config/controlplane.yaml
 talosctl apply-config --insecure --nodes <node-ip> --file ./talos-config/controlplane.yaml
 talosctl bootstrap --nodes <node-ip>
-talosctl get containerinstancestatus   # minga-manager, minga-api → running
+talosctl get containerinstancestatus   # minga-manager → running
 curl -s http://<node-ip>:9100/readyz   # OK
 ```
 
@@ -71,8 +71,7 @@ What runs where:
 
 | Container | Role | Why privileged / host network | State |
 |-----------|------|-------------------------------|-------|
-| `minga-manager` | `manager` (scheduler + supervisor + NATS sidecar) | Creates netns, bridges, veth pairs, iptables DNAT in the host netns | `minga-state` volume → `/var/mnt/minga-state` |
-| `minga-api` | `api` (Docker Engine API on `:2375`) | `restricted` profile is enough; host net so Raft peers on loopback work | `minga-api-state` volume → `/var/mnt/minga-api-state` |
+| `minga-manager` | `manager` (scheduler + supervisor + NATS sidecar + Docker Engine API on `:2375`, token from `MINGA_API_TOKEN`) | Creates netns, bridges, veth pairs, iptables DNAT in the host netns | `minga-state` volume → `/var/mnt/minga-state` |
 
 Two path rules follow from running Minga in a container while runc runs on
 the host. First, `--data-dir` must be the **same path** in the container and
@@ -157,6 +156,10 @@ args:
   - --bind=<node-ip>:7001
   - --peer=1=<ip1>:7001
   - --peer=2=<ip2>:7001            # … every node, ids unique
+  # Required off loopback: a manager refuses plaintext Raft on <node-ip>.
+  - --raft-tls-ca=/var/mnt/minga-state/tls/ca.pem
+  - --raft-tls-cert=/var/mnt/minga-state/tls/node.pem
+  - --raft-tls-key=/var/mnt/minga-state/tls/node-key.pem
   - --nats-url=tls://<nats-host>:4222
   # Must be identical in the container and on the host: runc resolves the
   # OCI bind sources minga writes (resolv.conf, secrets, volume binds).
@@ -169,6 +172,10 @@ environment:
   - MINGA_NATS_TLS_CERT=/etc/minga/nats-client.pem
   - MINGA_NATS_TLS_KEY=/etc/minga/nats-client-key.pem
   - MINGA_NATS_TLS_SERVER_NAME=<nats-host>
+  # Required: a manager refuses a tokenless API on 0.0.0.0:2375. Use a
+  # generated token per cluster (e.g. `openssl rand -hex 32`), or set
+  # --api-tls-* client certificates, or bind --api-bind to loopback.
+  - MINGA_API_TOKEN=<api-token>
 network:
   mode: host
 security:
@@ -196,8 +203,15 @@ dependsOn:
 
 Issue Raft (`--raft-tls-*`) and NATS certificates with `minga tls init-ca` and
 `minga tls issue-node`. Raft TLS is required here: without it, anyone who can
-reach a node's Raft port can rewrite cluster state, and Minga only logs a
-warning. Preload workload images on **every** node: convert the
+reach a node's Raft port could rewrite cluster state, so a manager refuses to
+start in plaintext on a non-loopback `--bind`. Raft accepts only manager
+certificates (SAN `minga-manager-<id>`), so worker certificates from the same CA
+cannot join it. Sidecar route TLS (`--nats-cluster-*`) needs its own CA: a
+manager refuses a `--nats-cluster-ca` that shares a certificate with, or
+directly issued, `--nats-client-ca` (or the reverse), because worker
+certificates chain to that CA. Routes also accept only a peer certificate with
+the SAN `minga-nats-route` (`minga tls issue-node --role manager` from the route
+CA adds it), so a certificate that merely chains to the route CA cannot join. Preload workload images on **every** node: convert the
 preload Job to a DaemonSet.
 
 ### Changing Minga's configuration later
@@ -301,8 +315,8 @@ manual equivalent.
 |------|---------|
 | Container status | `talosctl get containerinstancestatus` (resources in the `containers` namespace) |
 | Image pull status | `talosctl get containerimagestatus` |
-| Volumes | `talosctl get volumestatus` (`u-minga-state`, `u-minga-api-state`) |
-| Logs | `talosctl logs --namespace taloscontainers minga-manager` (or `minga-api`) |
+| Volumes | `talosctl get volumestatus` (`u-minga-state`) |
+| Logs | `talosctl logs --namespace taloscontainers minga-manager` |
 | Config change | edit + re-`apply-config` the full machine config (not `patch machineconfig`) |
 | Minga upgrade | bump the image tag/digest in the documents, re-`apply-config`; every node before relying on mixed versions |
 
