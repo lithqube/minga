@@ -65,3 +65,8 @@ prometheus = "0.13"
 wasmtime = { version = "50", default-features = false, features = ["cranelift", "runtime", "std", "parallel-compilation", "wat"] }
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 url = "2"
+
+[profile.dev]
+# Keep backtraces but drop variable-level debug info; "off" stops macOS keeping every .o for dsymutil (tens of GB).
+debug = "line-tables-only"
+split-debuginfo = "off"
