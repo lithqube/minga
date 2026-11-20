@@ -101,11 +101,11 @@ if ! talosctl get member --namespace cluster 2>/dev/null | grep -q .; then
     talosctl bootstrap --nodes "$NODE_IP" || true
 fi
 
-# 6. Wait for the two Minga containers.
+# 6. Wait for the Minga manager container (it serves the API too).
 echo "waiting for minga-manager (first pull can take a minute)..."
 for _ in $(seq 1 60); do
-    count=$(talosctl get containerstatus 2>/dev/null | grep -E "minga-(manager|api)" | grep -ci "running" || true)
-    if [ "$count" = "2" ]; then
+    count=$(talosctl get containerstatus 2>/dev/null | grep -E "minga-manager" | grep -ci "running" || true)
+    if [ "$count" = "1" ]; then
         break
     fi
     sleep 5

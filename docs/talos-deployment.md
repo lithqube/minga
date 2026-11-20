@@ -172,6 +172,10 @@ environment:
   - MINGA_NATS_TLS_CERT=/etc/minga/nats-client.pem
   - MINGA_NATS_TLS_KEY=/etc/minga/nats-client-key.pem
   - MINGA_NATS_TLS_SERVER_NAME=<nats-host>
+  # Required: a manager refuses a tokenless API on 0.0.0.0:2375. Use a
+  # generated token per cluster (e.g. `openssl rand -hex 32`), or set
+  # --api-tls-* client certificates, or bind --api-bind to loopback.
+  - MINGA_API_TOKEN=<api-token>
 network:
   mode: host
 security:
