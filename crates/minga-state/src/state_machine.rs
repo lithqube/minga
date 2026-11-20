@@ -125,6 +125,27 @@ fn tenant_has_records<T: DeserializeOwned>(
     Ok(false)
 }
 
+/// Whether every network in `ids` exists and belongs to `tenant_id`.
+#[allow(clippy::result_large_err)]
+fn networks_owned_by(
+    tx: &redb::WriteTransaction,
+    ids: &[NetworkId],
+    tenant_id: &str,
+) -> Result<bool, StorageError<u64>> {
+    let table = tx.open_table(NETWORKS_TABLE).map_err(sm_io_err)?;
+    for id in ids {
+        let Some(value) = table.get(id.as_str()).map_err(sm_io_err)? else {
+            return Ok(false);
+        };
+        let network: Network = crate::codec::decode(value.value())
+            .map_err(|e| sm_storage_err(ErrorSubject::Store, ErrorVerb::Read, e))?;
+        if network.tenant_id != tenant_id {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 /// Whether `id` already exists under a tenant other than `tenant_id`. Called
 /// inside the write transaction, before the table is opened for writing, so
 /// two API writes that both passed admission cannot take over each other's
@@ -336,7 +357,19 @@ const MAX_CHANGE_REQUESTS_PER_TENANT: usize = 256;
 /// Most open (pending, unexpired) change requests one tenant may hold.
 const MAX_OPEN_CHANGE_REQUESTS_PER_TENANT: usize = 32;
 
-/// The tenant's change requests as `(id, open at now_unix, created_at_unix)`.
+/// Change requests are keyed `{tenant}/{id}`, so one tenant's rows are one
+/// key range and a lookup can never land on another tenant's request.
+fn change_request_key(tenant_id: &str, id: &str) -> String {
+    format!("{tenant_id}/{id}")
+}
+
+/// The key range holding every change request of `tenant_id`: `/` sorts
+/// directly before `0`.
+fn change_request_range(tenant_id: &str) -> (String, String) {
+    (format!("{tenant_id}/"), format!("{tenant_id}0"))
+}
+
+/// The tenant's change requests as `(key, open at now_unix, created_at_unix)`.
 #[allow(clippy::result_large_err)]
 fn tenant_change_requests(
     tx: &redb::WriteTransaction,
@@ -344,8 +377,12 @@ fn tenant_change_requests(
     now_unix: u64,
 ) -> Result<Vec<(String, bool, u64)>, StorageError<u64>> {
     let table = tx.open_table(CHANGE_REQUESTS_TABLE).map_err(sm_io_err)?;
+    let (start, end) = change_request_range(tenant_id);
     let mut rows = Vec::new();
-    for row in table.iter().map_err(sm_io_err)? {
+    for row in table
+        .range::<&str>(start.as_str()..end.as_str())
+        .map_err(sm_io_err)?
+    {
         let (key, value) = row.map_err(sm_io_err)?;
         let request: ChangeRequest = crate::codec::decode(value.value())
             .map_err(|e| sm_storage_err(ErrorSubject::Store, ErrorVerb::Read, e))?;
@@ -1045,6 +1082,7 @@ impl RedbStateMachine {
             StateCommand::CreateChangeRequest(request) => {
                 if request.id.is_empty()
                     || request.id.len() > 128
+                    || request.id.contains('/')
                     || request.expires_at_unix <= request.created_at_unix
                     || request.before.id != request.service_id
                     || request.after.id != request.service_id
@@ -1097,23 +1135,20 @@ impl RedbStateMachine {
                 let bytes = crate::codec::encode(&request).map_err(|error| {
                     sm_storage_err(ErrorSubject::Store, ErrorVerb::Write, error)
                 })?;
+                let key = change_request_key(&request.tenant_id, &request.id);
                 let mut requests = tx.open_table(CHANGE_REQUESTS_TABLE).map_err(sm_io_err)?;
-                if requests
-                    .get(request.id.as_str())
-                    .map_err(sm_io_err)?
-                    .is_some()
-                {
+                if requests.get(key.as_str()).map_err(sm_io_err)?.is_some() {
                     return Ok(StateResponse::Conflict(
                         "change request ID already exists".into(),
                     ));
                 }
-                for (closed_id, _, _) in own.iter().take(excess) {
-                    requests.remove(closed_id.as_str()).map_err(sm_io_err)?;
+                for (closed_key, _, _) in own.iter().take(excess) {
+                    requests.remove(closed_key.as_str()).map_err(sm_io_err)?;
                 }
                 requests
-                    .insert(request.id.as_str(), bytes.as_slice())
+                    .insert(key.as_str(), bytes.as_slice())
                     .map_err(sm_io_err)?;
-                Ok(StateResponse::Ok)
+                Ok(StateResponse::ChangeRequest(request))
             }
             StateCommand::DecideChangeRequest {
                 id,
@@ -1122,10 +1157,11 @@ impl RedbStateMachine {
                 approve,
                 now_unix,
             } => {
+                let key = change_request_key(tenant_id, id);
                 let Some(mut request) = ({
                     let requests = tx.open_table(CHANGE_REQUESTS_TABLE).map_err(sm_io_err)?;
                     let request = requests
-                        .get(id.as_str())
+                        .get(key.as_str())
                         .map_err(sm_io_err)?
                         .map(|value| crate::codec::decode::<ChangeRequest>(value.value()))
                         .transpose()
@@ -1183,10 +1219,23 @@ impl RedbStateMachine {
                         let mut requests =
                             tx.open_table(CHANGE_REQUESTS_TABLE).map_err(sm_io_err)?;
                         requests
-                            .insert(request.id.as_str(), bytes.as_slice())
+                            .insert(key.as_str(), bytes.as_slice())
                             .map_err(sm_io_err)?;
+                        return Ok(StateResponse::ChangeRequest(Box::new(request)));
+                    }
+                    // A rollback can restore a network ID the tenant has since
+                    // removed and another tenant has taken: every network the
+                    // reviewed spec adds must still be the tenant's.
+                    let added: Vec<NetworkId> = request
+                        .after
+                        .networks
+                        .iter()
+                        .filter(|network| !request.before.networks.contains(network))
+                        .cloned()
+                        .collect();
+                    if !networks_owned_by(tx, &added, &request.tenant_id)? {
                         return Ok(StateResponse::Conflict(
-                            "service changed after this request was created".into(),
+                            "the change refers to a network the tenant does not own".into(),
                         ));
                     }
                     match Self::apply_command(
@@ -1211,13 +1260,11 @@ impl RedbStateMachine {
                 })?;
                 let mut requests = tx.open_table(CHANGE_REQUESTS_TABLE).map_err(sm_io_err)?;
                 requests
-                    .insert(request.id.as_str(), bytes.as_slice())
+                    .insert(key.as_str(), bytes.as_slice())
                     .map_err(sm_io_err)?;
-                if request.status == ChangeRequestStatus::Expired {
-                    Ok(StateResponse::Conflict("change request expired".into()))
-                } else {
-                    Ok(StateResponse::Ok)
-                }
+                // The caller reads the outcome (applied, rejected, expired or
+                // superseded) from the committed record's status.
+                Ok(StateResponse::ChangeRequest(Box::new(request)))
             }
         }
     }
@@ -1281,27 +1328,39 @@ impl RedbStateMachine {
         Ok(services)
     }
 
-    pub async fn get_change_request(&self, id: &str) -> Result<Option<ChangeRequest>, String> {
+    pub async fn get_change_request(
+        &self,
+        tenant_id: &str,
+        id: &str,
+    ) -> Result<Option<ChangeRequest>, String> {
         let db = self.db.lock().unwrap();
         let tx = db.begin_read().map_err(|e| e.to_string())?;
         let table = tx
             .open_table(CHANGE_REQUESTS_TABLE)
             .map_err(|e| e.to_string())?;
         table
-            .get(id)
+            .get(change_request_key(tenant_id, id).as_str())
             .map_err(|e| e.to_string())?
             .map(|value| crate::codec::decode(value.value()).map_err(|e| e.to_string()))
             .transpose()
     }
 
-    pub async fn list_change_requests(&self) -> Result<Vec<ChangeRequest>, String> {
+    /// One tenant's change requests, read from its key range only.
+    pub async fn list_change_requests(
+        &self,
+        tenant_id: &str,
+    ) -> Result<Vec<ChangeRequest>, String> {
         let db = self.db.lock().unwrap();
         let tx = db.begin_read().map_err(|e| e.to_string())?;
         let table = tx
             .open_table(CHANGE_REQUESTS_TABLE)
             .map_err(|e| e.to_string())?;
+        let (start, end) = change_request_range(tenant_id);
         let mut requests = Vec::new();
-        for row in table.iter().map_err(|e| e.to_string())? {
+        for row in table
+            .range::<&str>(start.as_str()..end.as_str())
+            .map_err(|e| e.to_string())?
+        {
             let (_, value) = row.map_err(|e| e.to_string())?;
             requests.push(crate::codec::decode(value.value()).map_err(|e| e.to_string())?);
         }

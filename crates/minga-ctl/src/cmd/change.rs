@@ -73,10 +73,8 @@ pub async fn run(
             let request = api.decide_tenant_change_request(&args.id, approve).await?;
             let status = string_field(&request, "status");
             let verb = if approve { "approved" } else { "rejected" };
-            if format == Format::Json {
-                let mut row = Rows::new(&["ID"]).with_id_column(0);
-                row.push(vec![args.id.clone()], request);
-                output::print(format, quiet, &row)?;
+            if format != Format::Table {
+                output::print_value(format, quiet, &request)?;
             } else {
                 output::say(
                     quiet,

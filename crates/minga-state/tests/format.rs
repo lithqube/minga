@@ -1245,7 +1245,11 @@ async fn a_v10_store_migrates_and_initializes_change_requests() {
         .await
         .unwrap();
     assert!(store.get_service("shop.web").await.unwrap().is_some());
-    assert!(store.list_change_requests().await.unwrap().is_empty());
+    assert!(store
+        .list_change_requests("default")
+        .await
+        .unwrap()
+        .is_empty());
     store.shutdown().await.unwrap();
 
     assert_eq!(read_marker(&state_file, SM_META), Some(FORMAT_VERSION));
@@ -1291,7 +1295,7 @@ async fn change_requests_require_distinct_approval_and_apply_atomically() {
         .await
         .unwrap();
     let approved = store
-        .get_change_request(&request.id)
+        .get_change_request("default", &request.id)
         .await
         .unwrap()
         .unwrap();
@@ -1322,7 +1326,8 @@ async fn change_requests_require_distinct_approval_and_apply_atomically() {
     expired.created_at_unix = 200;
     expired.expires_at_unix = 300;
     store.create_change_request(expired.clone()).await.unwrap();
-    assert!(store
+    // The decision that finds it expired records the expiry and says so.
+    let decided = store
         .decide_change_request(
             expired.id.clone(),
             expired.tenant_id.clone(),
@@ -1331,10 +1336,11 @@ async fn change_requests_require_distinct_approval_and_apply_atomically() {
             300,
         )
         .await
-        .is_err());
+        .unwrap();
+    assert_eq!(decided.status, ChangeRequestStatus::Expired);
     assert_eq!(
         store
-            .get_change_request(&expired.id)
+            .get_change_request("default", &expired.id)
             .await
             .unwrap()
             .unwrap()
@@ -1342,7 +1348,7 @@ async fn change_requests_require_distinct_approval_and_apply_atomically() {
         ChangeRequestStatus::Expired
     );
     let expired = store
-        .get_change_request(&expired.id)
+        .get_change_request("default", &expired.id)
         .await
         .unwrap()
         .unwrap();
@@ -1381,7 +1387,7 @@ async fn change_requests_require_distinct_approval_and_apply_atomically() {
         .await
         .unwrap();
     let rejected = store
-        .get_change_request(&rejected.id)
+        .get_change_request("default", &rejected.id)
         .await
         .unwrap()
         .unwrap();
@@ -1409,7 +1415,7 @@ async fn a_decided_or_superseded_request_cannot_apply_again() {
     assert!(decide(&request.id, "admin", true).await.is_err());
     assert!(decide(&request.id, "admin", false).await.is_err());
     let approved = store
-        .get_change_request(&request.id)
+        .get_change_request("default", &request.id)
         .await
         .unwrap()
         .unwrap();
@@ -1433,8 +1439,17 @@ async fn a_decided_or_superseded_request_cannot_apply_again() {
     let mut newer = current.clone();
     newer.replicas = 5;
     store.upsert_service(newer).await.unwrap();
-    assert!(decide(&stale.id, "deployer", true).await.is_err());
-    let stale = store.get_change_request("cr-stale").await.unwrap().unwrap();
+    assert_eq!(
+        decide(&stale.id, "deployer", true).await.unwrap().status,
+        ChangeRequestStatus::Superseded
+    );
+    // A later decision on the superseded request changes nothing.
+    assert!(decide(&stale.id, "admin", true).await.is_err());
+    let stale = store
+        .get_change_request("default", "cr-stale")
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(stale.status, ChangeRequestStatus::Superseded);
     assert_eq!(
         store
@@ -1444,6 +1459,82 @@ async fn a_decided_or_superseded_request_cannot_apply_again() {
             .unwrap()
             .replicas,
         5
+    );
+    store.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn change_requests_are_keyed_by_tenant_and_check_network_ownership() {
+    let (_dir, path) = written_dir().await;
+    let store = StateStore::open(1, "127.0.0.1:0", &path, BTreeMap::new())
+        .await
+        .unwrap();
+    store.create_tenant(tenant()).await.unwrap();
+    store
+        .upsert_network(Network {
+            id: "net-a".into(),
+            tenant_id: "tenant-a".into(),
+            name: "a".into(),
+            driver: "bridge".into(),
+            attachable: false,
+            subnet: None,
+            wg_port: None,
+        })
+        .await
+        .unwrap();
+
+    // The service's rollback revision names `net-a`, which another tenant owns now.
+    let mut current = service("shop.web");
+    let mut previous = current.clone();
+    previous.networks = vec!["net-a".into()];
+    current.previous = Some(Box::new(previous.clone()));
+    store.upsert_service(current.clone()).await.unwrap();
+    let mut request = change_request();
+    request.kind = ChangeKind::Rollback;
+    request.before = current.clone();
+    request.after = previous;
+    current.previous = None;
+    request.after.previous = Some(Box::new(current));
+    let created = store.create_change_request(request.clone()).await.unwrap();
+    assert_eq!(created.status, ChangeRequestStatus::Pending);
+    assert_eq!(created.audit.len(), 1);
+    // Another tenant's lookup of the same ID finds nothing.
+    assert!(store
+        .get_change_request("tenant-a", &request.id)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(store
+        .list_change_requests("tenant-a")
+        .await
+        .unwrap()
+        .is_empty());
+    // The reviewed spec refers to another tenant's network: approval
+    // refuses it and leaves both the request and the service unchanged.
+    assert!(store
+        .decide_change_request(
+            request.id.clone(),
+            "default".into(),
+            "deployer".into(),
+            true,
+            150,
+        )
+        .await
+        .is_err());
+    let unchanged = store
+        .get_change_request("default", &request.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(unchanged.status, ChangeRequestStatus::Pending);
+    assert_eq!(
+        store
+            .get_service(&request.service_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .replicas,
+        request.before.replicas
     );
     store.shutdown().await.unwrap();
 }
@@ -1475,7 +1566,7 @@ async fn removing_a_tenant_drops_its_change_requests() {
     store.remove_tenant("tenant-a").await.unwrap();
     assert!(store.get_tenant("tenant-a").await.unwrap().is_none());
     assert!(store
-        .get_change_request("cr-tenant-a")
+        .get_change_request("tenant-a", "cr-tenant-a")
         .await
         .unwrap()
         .is_none());
@@ -1501,7 +1592,7 @@ async fn a_tenant_keeps_a_bounded_number_of_change_requests() {
     for n in 0..260 {
         store.create_change_request(make(n, 5)).await.unwrap();
     }
-    let kept = store.list_change_requests().await.unwrap();
+    let kept = store.list_change_requests("default").await.unwrap();
     assert_eq!(kept.len(), 256);
     assert!(
         !kept.iter().any(|request| request.id == "cr-0000"),
@@ -1520,7 +1611,7 @@ async fn a_tenant_keeps_a_bounded_number_of_change_requests() {
         .create_change_request(make(1_032, 1_000_000))
         .await
         .is_err());
-    let kept = store.list_change_requests().await.unwrap();
+    let kept = store.list_change_requests("default").await.unwrap();
     assert_eq!(kept.len(), 256);
     assert_eq!(
         kept.iter()
@@ -2185,6 +2276,22 @@ async fn a_v9_labelled_snapshot_cannot_smuggle_an_egress_policy_past_the_quota()
         matches!(result, Err(minga_state::StateError::BadSnapshot(ref m)) if m.contains("egress")),
         "{result:?}"
     );
+}
+
+#[tokio::test]
+async fn a_v10_snapshot_keeps_its_egress_policy_without_an_allowance() {
+    let (_dir, path) = written_dir().await;
+    let store = StateStore::open(1, "127.0.0.1:0", &path, BTreeMap::new())
+        .await
+        .unwrap();
+    let mut old_json = serde_json::to_value(store.export().await.unwrap()).unwrap();
+    store.shutdown().await.unwrap();
+    old_json["format_version"] = serde_json::json!(minga_state::codec::V10_FORMAT_VERSION);
+    // v10 introduced egress policies, so a v10 snapshot may carry one.
+    assert!(!old_json["services"][0]["egress"].is_null());
+    let snapshot: StateSnapshot = serde_json::from_value(old_json).unwrap();
+    let (result, _) = import_with_byte_quota(snapshot, u64::MAX / 2).await;
+    assert!(result.is_ok(), "{result:?}");
 }
 
 #[tokio::test]

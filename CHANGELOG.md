@@ -18,7 +18,10 @@
   agent-only `request_change` proposal tool for deploy-image, scale, rollback
   and stop. `minga-ctl change list|approve|reject` uses tenant-scoped mTLS;
   listing requires a viewer role and decisions require a distinct deployer/admin
-  role. Approval atomically applies reviewed service state in Raft. Requests
+  role presented as a certificate; a token cannot decide. Approval runs the
+  same placement and secret admission as a service update, then atomically
+  applies the reviewed state in Raft. Each request lists every spec field it
+  changes (names only). Scale and stop refuse global services. Requests
   expire after 15 minutes. A tenant holds at most 32 open and 256 total
   requests; the oldest decided or expired ones are dropped first, and removing
   a tenant removes its requests. State/wire format is now v11.

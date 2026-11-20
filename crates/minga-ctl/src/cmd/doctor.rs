@@ -71,7 +71,8 @@ impl ConnectionSummary {
                 "http"
             },
             ssh_tunnel_configured: resolved.context.ssh.is_some(),
-            token_configured: resolved.token.is_some(),
+            // The client's token: a remote-file token is read when connecting.
+            token_configured: conn.api.token().is_some(),
             token_source,
             custom_tls_ca_configured: resolved.context.tls_cert.is_some(),
             separate_metrics_endpoint_configured: conn.metrics != conn.api.root(),

@@ -335,6 +335,16 @@ fn authorize(
             "only an agent certificate may propose changes",
         ));
     }
+    // Maker-checker needs a named reviewer: a shared token or a tokenless
+    // legacy client resolves to a generic name, not a tenant's reviewer.
+    if tenant_change_request_path(path)
+        && path != "/minga/change-requests"
+        && source != Source::Certificate
+    {
+        return Err(auth_forbidden(
+            "deciding a change request requires a tenant reviewer certificate",
+        ));
+    }
     if !caller.role.permits(request_minimum_role(method, path)) {
         return Err(auth_forbidden("caller role does not permit this operation"));
     }
@@ -2192,6 +2202,28 @@ mod tests {
         assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
+    #[test]
+    fn deciding_a_change_request_needs_a_reviewer_certificate() {
+        let caller = Caller {
+            name: "token".into(),
+            role: ApiRole::Admin,
+            tenant_id: Some("default".into()),
+            cluster_operator: true,
+        };
+        let post = axum::http::Method::POST;
+        for path in [
+            "/minga/change-requests/cr-1/approve",
+            "/minga/change-requests/cr-1/reject",
+        ] {
+            assert!(authorize(&caller, Source::Token, &post, path).is_err());
+            assert!(authorize(&caller, Source::Legacy, &post, path).is_err());
+            assert!(authorize(&caller, Source::Certificate, &post, path).is_ok());
+        }
+        // Listing still works with a token in a sole-tenant cluster.
+        let get = axum::http::Method::GET;
+        assert!(authorize(&caller, Source::Token, &get, "/minga/change-requests").is_ok());
+    }
+
     #[tokio::test]
     async fn change_requests_are_tenant_scoped_and_maker_checker_enforced() {
         let dir = tempfile::tempdir().unwrap();
@@ -2218,6 +2250,8 @@ mod tests {
             .upsert_service(service_record("svc-b", "tenant-b"))
             .await
             .unwrap();
+        // Approval runs placement admission, so the tenant needs a node.
+        store.upsert_node(node_record(1, "default")).await.unwrap();
 
         let bus = MemoryBus::new();
         let router = build_router_with_bus_and_auth(
@@ -2265,6 +2299,56 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::FORBIDDEN);
 
+        // A global service ignores `replicas`: scale and stop are refused.
+        let mut global = service_record("svc-global", "default");
+        global.mode = minga_state::types::ServiceMode::Global;
+        store.upsert_service(global).await.unwrap();
+        for body in [
+            serde_json::json!({"action": "scale", "service_id": "svc-global", "replicas": 2}),
+            serde_json::json!({"action": "stop", "service_id": "svc-global"}),
+        ] {
+            let (status, _) = send_request(
+                router.clone(),
+                request(
+                    "POST",
+                    "/minga/change-requests",
+                    ApiRole::Agent,
+                    "default",
+                    "agent",
+                    Some(body),
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+        }
+
+        // A rollback that only changes ports still shows the reviewer that it does.
+        let mut rolled = service_record("svc-rollback", "default");
+        let mut earlier = rolled.clone();
+        earlier.ports = vec![minga_state::types::PortMapping {
+            target: 80,
+            published: Some(18080),
+            protocol: "tcp".into(),
+            mode: minga_state::types::PortMode::Ingress,
+        }];
+        rolled.previous = Some(Box::new(earlier));
+        store.upsert_service(rolled).await.unwrap();
+        let (status, rollback) = send_request(
+            router.clone(),
+            request(
+                "POST",
+                "/minga/change-requests",
+                ApiRole::Agent,
+                "default",
+                "agent",
+                Some(serde_json::json!({"action": "rollback", "service_id": "svc-rollback"})),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(rollback["before"], rollback["after"]);
+        assert_eq!(rollback["changed_fields"], serde_json::json!(["ports"]));
+
         let (status, proposal) = send_request(
             router.clone(),
             request(
@@ -2297,7 +2381,7 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(default_list.as_array().unwrap().len(), 1);
+        assert_eq!(default_list.as_array().unwrap().len(), 2);
 
         let (status, _) = send_request(
             router.clone(),
@@ -2450,7 +2534,7 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::CONFLICT);
         let expired = store
-            .get_change_request("cr-expired-api-test")
+            .get_change_request("default", "cr-expired-api-test")
             .await
             .unwrap()
             .unwrap();

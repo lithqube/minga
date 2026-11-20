@@ -237,8 +237,8 @@ HTTPS context:
 minga-ctl context add tenant-a --endpoint https://manager.example:2376 \
   --tls-cert ./server-ca/ca.pem \
   --client-cert ./deployer.pem --client-key ./deployer-key.pem
-minga-ctl change list
-minga-ctl change approve cr-...
+minga-ctl --context tenant-a change list
+minga-ctl --context tenant-a change approve cr-...
 ```
 
 How a command picks its settings:
@@ -280,7 +280,7 @@ Through the API:
 | `upgrade preflight --to v1.3.0` | Read-only compatibility, Raft membership/quorum, selected-context auth/transport, backup, NATS, tenant impact, maintenance-order and rollback plan. Unknown release metadata fails closed; no upgrade is started. |
 | `metrics` | The Prometheus metrics the cluster reports. |
 | `agent usage [--customer ID] [--since 30d]` | Uses the context API token as a cluster operator and reports aggregate usage by tenant. The usage API does not expose tenant-scoped request rows; `--customer` is rejected for this caller. Read-only. |
-| `change list [--limit N]`, `change approve ID`, `change reject ID` | Tenant-scoped maker-checker over a direct HTTPS context with a tenant client certificate/key. Listing requires a tenant viewer certificate; approval/rejection additionally require deployer/admin role. Approval applies the reviewed desired state atomically. |
+| `change list [--limit N]`, `change approve ID`, `change reject ID` | Tenant-scoped maker-checker over a direct HTTPS context with a tenant client certificate/key. Listing requires a tenant viewer certificate; approval/rejection additionally require a deployer/admin certificate (a token is refused). Each request lists the spec fields it changes. Approval runs service-update admission, then applies the reviewed desired state atomically. |
 
 
 `doctor` reports observed status separately from unknowns; it never restarts or

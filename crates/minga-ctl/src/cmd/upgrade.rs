@@ -232,7 +232,8 @@ pub async fn run(
         state_format,
         bundled_nats_version: current_metadata.map(|release| release.bundled_nats),
         raft,
-        api_auth_configured: resolved.token.is_some(),
+        // A token or an mTLS client certificate both authenticate the context.
+        api_auth_configured: resolved.token.is_some() || resolved.context.client_cert.is_some(),
         api_transport_secure: resolved.context.ssh.is_some()
             || resolved.endpoint.starts_with("https://"),
         tenant_count,
@@ -253,13 +254,14 @@ pub async fn run(
         findings: Vec::new(),
         ordered_steps: vec![
             "Before the maintenance window, create and protect a `minga state export`; it contains service environment values and is sensitive.",
-            "Back up node data directories, volume data, secret values, TLS files and NATS data separately when their recovery matters; state export omits these.",
             "For external NATS, verify JetStream API level 4 or newer. The target bundle is NATS 2.15.3; current external NATS is not exposed by the management API.",
-            "Stop all Minga managers and workers, install the same candidate on every node, start the manager cohort together, then start workers; do not mix wire-format versions.",
+            "Stop all Minga managers and workers.",
+            "With every role stopped, take a cold backup of node data directories, volume data, secret values, TLS files and NATS data, and verify it restores; state export omits these and an online copy is not a restorable backup.",
+            "Install the same candidate on every node, start the manager cohort together, then start workers; do not mix wire-format versions.",
             "After the candidate is ready, verify doctor readiness, Raft quorum, tenant ownership, task health and restored workload behavior.",
         ],
         disruption: "Plan a coordinated Minga control-plane outage. The API and scheduler are unavailable during replacement; workload continuity depends on replica placement and is not guaranteed.",
-        rollback_boundary: "Do not downgrade the v10 Minga data or wire format in place. Rollback requires restoring the complete pre-upgrade backup with the previous binary across the cluster; NATS downgrade is not a supported rollback path.",
+        rollback_boundary: "Once the candidate opens the data it is migrated to state format v11, which the previous binary cannot read; do not downgrade in place. Rollback requires restoring the complete pre-upgrade backup with the previous binary across the cluster; NATS downgrade is not a supported rollback path.",
         read_only: true,
     };
     let mut state_finding =
@@ -306,7 +308,7 @@ pub async fn run(
             status: Status::Ok,
             summary: "selected API context has authentication and protected transport configured".into(),
             evidence: format!(
-                "API token configured {}; transport protected by {}",
+                "API token or client certificate configured {}; transport protected by {}",
                 report.current.api_auth_configured,
                 if resolved.context.ssh.is_some() {
                     "SSH tunnel"
@@ -323,7 +325,7 @@ pub async fn run(
             status: Status::Unknown,
             summary: "selected API context does not prove authenticated protected transport".into(),
             evidence: format!(
-                "API token configured {}; protected transport configured {}",
+                "API token or client certificate configured {}; protected transport configured {}",
                 report.current.api_auth_configured, report.current.api_transport_secure
             ),
             next_action: "Use an authenticated HTTPS or SSH context, then verify Raft and NATS TLS independently on every node.",
@@ -389,7 +391,7 @@ pub async fn run(
             "cluster inventory is incomplete".into()
         },
         evidence: format!(
-            "node count {}; tenant count {}; service names and IDs omitted",
+            "nodes visible to this identity {}; tenant count {}; service names and IDs omitted",
             report
                 .current
                 .node_count

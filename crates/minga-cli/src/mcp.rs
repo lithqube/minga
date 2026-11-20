@@ -689,7 +689,8 @@ fn tool_definitions(role: ApiRole) -> Vec<Value> {
         let mut proposal = tool(
             "request_change",
             "Propose a service change for same-tenant deployer/admin review; never applies it.",
-            json!({"oneOf":[
+            // MCP requires an object at the root; `oneOf` narrows it per action.
+            json!({"type":"object","oneOf":[
                 {"type":"object","properties":{"action":{"const":"deploy"},"service_id":{"type":"string"},"image":{"type":"string","maxLength":512}},"required":["action","service_id","image"],"additionalProperties":false},
                 {"type":"object","properties":{"action":{"const":"scale"},"service_id":{"type":"string"},"replicas":{"type":"integer","minimum":1,"maximum":1000}},"required":["action","service_id","replicas"],"additionalProperties":false},
                 {"type":"object","properties":{"action":{"enum":["rollback","stop"]},"service_id":{"type":"string"}},"required":["action","service_id"],"additionalProperties":false}
@@ -822,6 +823,10 @@ mod tests {
         assert_eq!(proposal["annotations"]["readOnlyHint"], false);
         assert_eq!(proposal["annotations"]["openWorldHint"], false);
         assert_eq!(tools.len(), 10);
+        // MCP 2024-11-05: every inputSchema is an object schema.
+        assert!(tools
+            .iter()
+            .all(|tool| tool["inputSchema"]["type"] == "object"));
         assert!(tool_definitions(ApiRole::Deployer)
             .iter()
             .all(|tool| tool["name"] != "request_change"));

@@ -280,14 +280,37 @@ pub struct ChangeRequestView {
     kind: ChangeKind,
     before: ChangeServiceSummary,
     after: ChangeServiceSummary,
+    /// Every spec field approval would change, by name only: a rollback can
+    /// change ports or networks while image and replicas stay the same.
+    /// Values are omitted because `env` can hold secrets.
+    changed_fields: Vec<String>,
     status: ChangeRequestStatus,
     reviewer: Option<String>,
     decided_at_unix: Option<u64>,
     audit: Vec<ChangeRequestAudit>,
 }
 
+/// Top-level service fields that differ, ignoring the rollback history.
+fn changed_service_fields(before: &StateService, after: &StateService) -> Vec<String> {
+    let as_object = |service: &StateService| match serde_json::to_value(service) {
+        Ok(serde_json::Value::Object(fields)) => fields,
+        _ => serde_json::Map::new(),
+    };
+    let (before, after) = (as_object(before), as_object(after));
+    let mut names: Vec<String> = before
+        .keys()
+        .chain(after.keys())
+        .filter(|name| name.as_str() != "previous" && before.get(*name) != after.get(*name))
+        .cloned()
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
 impl From<ChangeRequest> for ChangeRequestView {
     fn from(request: ChangeRequest) -> Self {
+        let changed_fields = changed_service_fields(&request.before, &request.after);
         Self {
             id: request.id,
             tenant_id: request.tenant_id,
@@ -304,6 +327,7 @@ impl From<ChangeRequest> for ChangeRequestView {
                 image: request.after.image,
                 replicas: request.after.replicas,
             },
+            changed_fields,
             status: request.status,
             reviewer: request.reviewer,
             decided_at_unix: request.decided_at_unix,
@@ -349,6 +373,15 @@ pub async fn create_change_request(
         .await?
         .filter(|service| service.tenant_id == tenant_id)
         .ok_or_else(|| not_found("service", &service_id))?;
+    // A global service runs one task per eligible node and ignores
+    // `replicas`, so a replica change would be approved but never take effect.
+    if matches!(kind, ChangeKind::Scale | ChangeKind::Stop)
+        && before.mode == minga_state::types::ServiceMode::Global
+    {
+        return Err(bad_request(
+            "scale and stop apply only to replicated services",
+        ));
+    }
     let mut after = before.clone();
     match proposal {
         ChangeProposal::Deploy { image, .. } => {
@@ -376,6 +409,9 @@ pub async fn create_change_request(
             let Some(mut previous) = before.previous.as_deref().cloned() else {
                 return Err(conflict("service has no rollback revision"));
             };
+            if previous.check_agent_egress().is_err() {
+                return Err(conflict("the rollback revision is no longer a valid spec"));
+            }
             let mut current = before.clone();
             current.previous = None;
             previous.previous = Some(Box::new(current));
@@ -399,20 +435,15 @@ pub async fn create_change_request(
         decided_at_unix: None,
         audit: Vec::new(),
     };
-    app.store.create_change_request(request.clone()).await?;
-    append_tenant_audit(
+    let persisted = app.store.create_change_request(request).await?;
+    record_change_audit(
         &app,
         tenant_id,
         &caller.name,
         "change_request.created",
-        &format!("/minga/change-requests/{}", request.id),
+        &persisted.id,
     )
-    .await?;
-    let persisted = app
-        .store
-        .get_change_request(&request.id)
-        .await?
-        .ok_or_else(|| not_found("change request", &request.id))?;
+    .await;
     Ok((
         StatusCode::CREATED,
         Json(ChangeRequestView::from(persisted)),
@@ -426,13 +457,8 @@ pub async fn list_change_requests(
 ) -> ApiResult<Json<Vec<ChangeRequestView>>> {
     let tenant_id = tenant_scope(&caller)?;
     let limit = query.limit.unwrap_or(100).clamp(1, 100);
-    let mut requests = app
-        .store
-        .list_change_requests()
-        .await?
-        .into_iter()
-        .filter(|request| request.tenant_id == tenant_id)
-        .collect::<Vec<_>>();
+    // Reads only this tenant's key range, which holds at most 256 requests.
+    let mut requests = app.store.list_change_requests(tenant_id).await?;
     requests.sort_unstable_by(|left, right| {
         right
             .created_at_unix
@@ -445,6 +471,16 @@ pub async fn list_change_requests(
     ))
 }
 
+/// Appends a change-request audit line after the Raft write committed. A
+/// failure is logged, not returned: the write has happened, and a retry
+/// would create a second request or hit a terminal one.
+async fn record_change_audit(app: &AppState, tenant_id: &str, actor: &str, action: &str, id: &str) {
+    let path = format!("/minga/change-requests/{id}");
+    if let Err(error) = append_tenant_audit(app, tenant_id, actor, action, &path).await {
+        tracing::warn!(%error, tenant_id, action, id, "change request committed but its audit line was not appended");
+    }
+}
+
 async fn decide_change_request(
     app: &AppState,
     caller: &Caller,
@@ -452,13 +488,19 @@ async fn decide_change_request(
     approve: bool,
 ) -> ApiResult<Json<ChangeRequestView>> {
     let tenant_id = tenant_scope(caller)?;
-    let Some(request) = app.store.get_change_request(id).await? else {
+    let Some(request) = app.store.get_change_request(tenant_id, id).await? else {
         return Err(not_found("change request", id));
     };
-    if request.tenant_id != tenant_id {
-        return Err(not_found("change request", id));
+    // Approval writes the reviewed spec directly, so it passes the same
+    // admission as a service update. Raft still re-checks the base spec.
+    if approve
+        && request.status == ChangeRequestStatus::Pending
+        && unix_now() < request.expires_at_unix
+    {
+        check_service_secrets(app, tenant_id, &request.after).await?;
+        ensure_placeable(app, &request.after, Some(&request.service_id)).await?;
     }
-    if let Err(error) = app
+    let decided = app
         .store
         .decide_change_request(
             id.to_owned(),
@@ -467,46 +509,26 @@ async fn decide_change_request(
             approve,
             unix_now(),
         )
-        .await
-    {
-        if let Some(updated) = app.store.get_change_request(id).await? {
-            let action = match updated.status {
-                ChangeRequestStatus::Expired => Some("change_request.expired"),
-                ChangeRequestStatus::Superseded => Some("change_request.superseded"),
-                _ => None,
-            };
-            if let Some(action) = action {
-                append_tenant_audit(
-                    app,
-                    tenant_id,
-                    &caller.name,
-                    action,
-                    &format!("/minga/change-requests/{id}"),
-                )
-                .await?;
-            }
+        .await?;
+    // Raft returns only transitions this decision made, so each audit line
+    // is attributed to the reviewer who caused it.
+    let (action, refused) = match decided.status {
+        ChangeRequestStatus::Approved => ("change_request.approved_and_applied", None),
+        ChangeRequestStatus::Rejected => ("change_request.rejected", None),
+        ChangeRequestStatus::Expired => ("change_request.expired", Some("change request expired")),
+        ChangeRequestStatus::Superseded => (
+            "change_request.superseded",
+            Some("service changed after this request was created"),
+        ),
+        ChangeRequestStatus::Pending => {
+            return Err(internal("change request decision left it pending"));
         }
-        return Err(error.into());
-    }
-    let action = if approve {
-        "change_request.approved_and_applied"
-    } else {
-        "change_request.rejected"
     };
-    append_tenant_audit(
-        app,
-        tenant_id,
-        &caller.name,
-        action,
-        &format!("/minga/change-requests/{id}"),
-    )
-    .await?;
-    let updated = app
-        .store
-        .get_change_request(id)
-        .await?
-        .ok_or_else(|| not_found("change request", id))?;
-    Ok(Json(ChangeRequestView::from(updated)))
+    record_change_audit(app, tenant_id, &caller.name, action, id).await;
+    if let Some(message) = refused {
+        return Err(conflict(message));
+    }
+    Ok(Json(ChangeRequestView::from(decided)))
 }
 
 pub async fn approve_change_request(

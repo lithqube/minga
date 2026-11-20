@@ -102,4 +102,7 @@ pub enum StateResponse {
     NotFound,
     Conflict(String),
     Error(String),
+    /// The change request as this write committed it, so a follower can
+    /// answer from the write itself instead of its possibly-lagging replica.
+    ChangeRequest(Box<ChangeRequest>),
 }
