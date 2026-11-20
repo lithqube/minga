@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- **Security, upgrade action needed.** Network subnets are confined to the overlay (#124):
+  - Creating a network refuses a subnet outside `--overlay-supernet`, inside the node mesh
+    `10.200.0.0/16`, or longer than `/28`, with a 400. Snapshot import refuses the same, before it writes
+    anything.
+  - WireGuard peer sets carry a task address only inside its own network's subnet, from a node and
+    network of the task's tenant, and under one peer. `validate_peer_set` refuses a duplicate AllowedIP.
+  - A network stored earlier with a subnet outside the supernet stops routing between nodes, and the
+    manager logs it once. Before upgrading, widen `--overlay-supernet` on every node to cover any Compose
+    `ipam` subnet you use, or recreate those networks inside it.
+
 - **Security, upgrade action needed.** These close audit leads on the shared node CA and on fail-open
   defaults:
   - **Raft accepts only manager certificates.** The Raft server accepts a peer only if its certificate has

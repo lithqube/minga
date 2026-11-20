@@ -544,6 +544,30 @@ impl Scheduler {
                 );
             }
         }
+        // A stored subnet that breaks the overlay rules never routes between
+        // nodes (build_wireguard_peer_sets drops it). Keyed (id, "") so it
+        // shares the report-once set with collision pairs.
+        for net in networks.iter() {
+            let Some(raw) = net.subnet.as_deref() else {
+                continue;
+            };
+            let refused = minga_net::Cidr::parse(raw)
+                .map_err(|error| error.to_string())
+                .and_then(|subnet| {
+                    minga_net::overlay::check_network_subnet(&subnet, Some(&self.supernet))
+                });
+            if let Err(why) = refused {
+                if reported.insert((net.id.clone(), String::new())) {
+                    tracing::error!(
+                        "network {}: {why}, so its tasks do not reach each other across nodes. \
+                         Fix: recreate it with a subnet inside {} (or no `ipam` subnet), or \
+                         widen --overlay-supernet on every node",
+                        net.id,
+                        self.supernet
+                    );
+                }
+            }
+        }
         Ok(())
     }
 

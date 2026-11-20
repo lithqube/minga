@@ -853,7 +853,8 @@ async fn a_snapshot_with_one_refused_network_writes_none() {
     };
     let mut snapshot = store.export().await.unwrap();
     snapshot.networks = vec![net("a", "10.100.1.0/24"), net("b", "192.168.1.0/24")];
-    assert!(store.import(snapshot, true).await.is_err());
+    let error = store.import(snapshot, true).await.unwrap_err();
+    assert!(matches!(error, StateError::BadSnapshot(_)), "{error:?}");
     assert!(store.get_network("a").await.unwrap().is_none());
     store.shutdown().await.unwrap();
 }

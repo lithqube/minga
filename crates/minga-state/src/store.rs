@@ -123,13 +123,12 @@ fn membership_error(e: RaftError<NodeId, ClientWriteError<NodeId, BasicNode>>) -
 fn check_network_subnet_rules(
     network: &Network,
     supernet: Option<&minga_net::Cidr>,
-) -> Result<(), StateError> {
+) -> Result<(), String> {
     let Some(raw) = &network.subnet else {
         return Ok(());
     };
-    let subnet =
-        minga_net::Cidr::parse(raw).map_err(|error| StateError::Raft(error.to_string()))?;
-    minga_net::overlay::check_network_subnet(&subnet, supernet).map_err(StateError::Raft)
+    let subnet = minga_net::Cidr::parse(raw).map_err(|error| error.to_string())?;
+    minga_net::overlay::check_network_subnet(&subnet, supernet)
 }
 
 fn command_error(message: String) -> StateError {
@@ -883,7 +882,8 @@ impl StateStore {
     }
 
     pub async fn upsert_network(&self, network: Network) -> Result<(), StateError> {
-        check_network_subnet_rules(&network, self.overlay_supernet.get())?;
+        check_network_subnet_rules(&network, self.overlay_supernet.get())
+            .map_err(StateError::Raft)?;
         match self.propose(StateCommand::UpsertNetwork(network)).await? {
             StateResponse::Ok | StateResponse::ChangeRequest(_) => Ok(()),
             StateResponse::Conflict(_) => Err(StateError::NameInUse),
@@ -1136,7 +1136,9 @@ impl StateStore {
         // Every network rule runs before the first write, so a refused network
         // leaves nothing half-imported.
         for network in &snapshot.networks {
-            check_network_subnet_rules(network, self.overlay_supernet.get())?;
+            check_network_subnet_rules(network, self.overlay_supernet.get()).map_err(|error| {
+                StateError::BadSnapshot(format!("network {}: {error}", network.id))
+            })?;
         }
         let mut tenants = snapshot.tenants;
         if !tenants.iter().any(|tenant| tenant.id == DEFAULT_TENANT_ID) {
