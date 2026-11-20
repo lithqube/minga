@@ -307,10 +307,111 @@ pub struct ChangeRequestView {
     /// change ports or networks while image and replicas stay the same.
     /// Values are omitted because `env` can hold secrets.
     changed_fields: Vec<String>,
+    /// The exact diff, one entry per changed field, with environment values
+    /// replaced by `<hidden>`.
+    changes: Vec<FieldChange>,
+    /// Environment keys whose hidden values differ, as `env.KEY` paths.
+    hidden_changes: Vec<String>,
     status: ChangeRequestStatus,
     reviewer: Option<String>,
     decided_at_unix: Option<u64>,
     audit: Vec<ChangeRequestAudit>,
+}
+
+#[derive(Debug, Serialize)]
+struct FieldChange {
+    field: String,
+    before: serde_json::Value,
+    after: serde_json::Value,
+}
+
+/// Maps whose values can be secrets: shown by key only.
+const HIDDEN_MAPS: [&str; 2] = ["env", "sandbox_env"];
+
+/// `value` with every hidden map's values replaced by `<hidden>`, recording
+/// in `changed` the paths of hidden values that differ from `other`.
+fn redact(
+    value: &serde_json::Value,
+    other: &serde_json::Value,
+    path: &str,
+    changed: &mut Vec<String>,
+) -> serde_json::Value {
+    use serde_json::Value;
+    match value {
+        Value::Object(fields) => Value::Object(
+            fields
+                .iter()
+                .map(|(key, field)| {
+                    let path = if path.is_empty() {
+                        key.clone()
+                    } else {
+                        format!("{path}.{key}")
+                    };
+                    let other_field = other.get(key).unwrap_or(&Value::Null);
+                    let shown = match field.as_object() {
+                        Some(map) if HIDDEN_MAPS.contains(&key.as_str()) => Value::Object(
+                            map.iter()
+                                .map(|(name, secret)| {
+                                    if other_field.get(name) != Some(secret) {
+                                        changed.push(format!("{path}.{name}"));
+                                    }
+                                    (name.clone(), Value::String("<hidden>".into()))
+                                })
+                                .collect(),
+                        ),
+                        _ => redact(field, other_field, &path, changed),
+                    };
+                    (key.clone(), shown)
+                })
+                .collect(),
+        ),
+        Value::Array(items) => Value::Array(
+            items
+                .iter()
+                .enumerate()
+                .map(|(index, item)| {
+                    let other_item = other.get(index).unwrap_or(&Value::Null);
+                    redact(item, other_item, &format!("{path}[{index}]"), changed)
+                })
+                .collect(),
+        ),
+        _ => value.clone(),
+    }
+}
+
+/// The redacted diff of every changed field, and the hidden paths that changed.
+fn service_changes(
+    before: &StateService,
+    after: &StateService,
+    fields: &[String],
+) -> (Vec<FieldChange>, Vec<String>) {
+    let (before, after) = (
+        serde_json::to_value(before).unwrap_or_default(),
+        serde_json::to_value(after).unwrap_or_default(),
+    );
+    let null = serde_json::Value::Null;
+    let mut hidden = Vec::new();
+    let changes = fields
+        .iter()
+        .map(|field| {
+            let (old, new) = (
+                before.get(field).unwrap_or(&null),
+                after.get(field).unwrap_or(&null),
+            );
+            // Both directions, so added, removed and changed keys all show.
+            let wrap = |value: &serde_json::Value| serde_json::json!({ field.as_str(): value });
+            let old_shown = redact(&wrap(old), &wrap(new), "", &mut hidden);
+            let new_shown = redact(&wrap(new), &wrap(old), "", &mut hidden);
+            FieldChange {
+                field: field.clone(),
+                before: old_shown[field.as_str()].clone(),
+                after: new_shown[field.as_str()].clone(),
+            }
+        })
+        .collect();
+    hidden.sort();
+    hidden.dedup();
+    (changes, hidden)
 }
 
 /// Top-level service fields that differ, ignoring the rollback history.
@@ -334,6 +435,8 @@ fn changed_service_fields(before: &StateService, after: &StateService) -> Vec<St
 impl From<ChangeRequest> for ChangeRequestView {
     fn from(request: ChangeRequest) -> Self {
         let changed_fields = changed_service_fields(&request.before, &request.after);
+        let (changes, hidden_changes) =
+            service_changes(&request.before, &request.after, &changed_fields);
         Self {
             id: request.id,
             tenant_id: request.tenant_id,
@@ -345,6 +448,8 @@ impl From<ChangeRequest> for ChangeRequestView {
             before: ChangeServiceSummary::from(&request.before),
             after: ChangeServiceSummary::from(&request.after),
             changed_fields,
+            changes,
+            hidden_changes,
             status: request.status,
             reviewer: request.reviewer,
             decided_at_unix: request.decided_at_unix,

@@ -2203,6 +2203,54 @@ mod tests {
     }
 
     #[test]
+    fn the_change_diff_hides_environment_values_but_names_their_keys() {
+        let mut before = service_record("svc-env", "default");
+        before.env = [("KEEP", "same"), ("TOKEN", "old-value"), ("GONE", "x")]
+            .into_iter()
+            .map(|(key, value)| (key.to_owned(), value.to_owned()))
+            .collect();
+        let mut after = before.clone();
+        after.env.insert("TOKEN".into(), "new-value".into());
+        after.env.remove("GONE");
+        after.env.insert("ADDED".into(), "y".into());
+        after.replicas += 1;
+        let view = serde_json::to_value(crate::handlers::ChangeRequestView::from(
+            minga_state::types::ChangeRequest {
+                id: "cr-env".into(),
+                tenant_id: "default".into(),
+                service_id: "svc-env".into(),
+                requester: "agent".into(),
+                created_at_unix: 1,
+                expires_at_unix: 2,
+                kind: minga_state::types::ChangeKind::Rollback,
+                before,
+                after,
+                status: minga_state::types::ChangeRequestStatus::Pending,
+                reviewer: None,
+                decided_at_unix: None,
+                audit: Vec::new(),
+            },
+        ))
+        .unwrap();
+        let text = view.to_string();
+        for secret in ["old-value", "new-value", "\"x\"", "\"y\""] {
+            assert!(!text.contains(secret), "{secret} leaked: {text}");
+        }
+        assert_eq!(
+            view["hidden_changes"],
+            serde_json::json!(["env.ADDED", "env.GONE", "env.TOKEN"])
+        );
+        let fields: Vec<_> = view["changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|change| change["field"].as_str().unwrap())
+            .collect();
+        assert_eq!(fields, ["env", "replicas"]);
+        assert_eq!(view["changes"][1]["after"], 2);
+    }
+
+    #[test]
     fn deciding_a_change_request_needs_a_reviewer_certificate() {
         let caller = Caller {
             name: "token".into(),
@@ -2351,6 +2399,9 @@ mod tests {
         assert_eq!(rollback["after"]["ports"][0]["published"], 18080);
         assert_eq!(rollback["changed_fields"], serde_json::json!(["ports"]));
         assert!(rollback["after"].get("env").is_none());
+        assert_eq!(rollback["changes"][0]["field"], "ports");
+        assert_eq!(rollback["changes"][0]["before"], serde_json::json!([]));
+        assert_eq!(rollback["changes"][0]["after"][0]["published"], 18080);
 
         let (status, proposal) = send_request(
             router.clone(),

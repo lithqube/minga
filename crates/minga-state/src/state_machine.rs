@@ -167,6 +167,29 @@ fn all_owned_by<T: DeserializeOwned>(
     Ok(true)
 }
 
+/// Whether any record in `ids` exists in `definition` under a tenant other
+/// than `tenant_id`. A missing record is not another tenant's.
+#[allow(clippy::result_large_err)]
+fn owned_by_another<T: DeserializeOwned>(
+    tx: &redb::WriteTransaction,
+    definition: TableDefinition<&str, &[u8]>,
+    ids: &[String],
+    tenant_id: &str,
+    tenant_of: impl Fn(&T) -> &str,
+) -> Result<bool, StorageError<u64>> {
+    let table = tx.open_table(definition).map_err(sm_io_err)?;
+    for id in ids {
+        if let Some(value) = table.get(id.as_str()).map_err(sm_io_err)? {
+            let record: T = crate::codec::decode(value.value())
+                .map_err(|e| sm_storage_err(ErrorSubject::Store, ErrorVerb::Read, e))?;
+            if tenant_of(&record) != tenant_id {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
 /// Every secret a spec names, directly or through an egress route.
 fn secret_references(service: &Service) -> Vec<String> {
     service
@@ -709,6 +732,11 @@ impl RedbStateMachine {
                 {
                     return Ok(StateResponse::Conflict(NAME_IN_USE.into()));
                 }
+                // References already stored pass, so older state never wedges.
+                let (stored_networks, stored_secrets) = stored
+                    .as_ref()
+                    .map(|stored| (stored.networks.clone(), secret_references(stored)))
+                    .unwrap_or_default();
                 // A write that keeps the stored ports (a rollout or rollback
                 // step) passes, so state from before this rule never wedges.
                 let ports_unchanged = stored.is_some_and(|stored| stored.ports == svc.ports);
@@ -718,6 +746,42 @@ impl RedbStateMachine {
                     }
                 }
                 drop(t);
+                // No network or secret this write adds may be another tenant's,
+                // checked in the write: the API's earlier check can race a
+                // removal and another tenant's re-creation of the same ID. A
+                // missing one stays allowed, as before.
+                let added_networks: Vec<NetworkId> = svc
+                    .networks
+                    .iter()
+                    .filter(|network| !stored_networks.contains(network))
+                    .cloned()
+                    .collect();
+                if owned_by_another(
+                    tx,
+                    NETWORKS_TABLE,
+                    &added_networks,
+                    &svc.tenant_id,
+                    |n: &Network| &n.tenant_id,
+                )? {
+                    return Ok(StateResponse::Conflict(
+                        "the service refers to another tenant's network".into(),
+                    ));
+                }
+                let added_secrets: Vec<String> = secret_references(svc)
+                    .into_iter()
+                    .filter(|secret| !stored_secrets.contains(secret))
+                    .collect();
+                if owned_by_another(
+                    tx,
+                    SECRETS_TABLE,
+                    &added_secrets,
+                    &svc.tenant_id,
+                    |secret: &Secret| &secret.tenant_id,
+                )? {
+                    return Ok(StateResponse::Conflict(
+                        "the service refers to another tenant's secret".into(),
+                    ));
+                }
                 let Some(quotas) = tenant_quota(tx, &svc.tenant_id)? else {
                     return Ok(StateResponse::NotFound);
                 };
@@ -1267,9 +1331,9 @@ impl RedbStateMachine {
                             .map_err(sm_io_err)?;
                         return Ok(StateResponse::ChangeRequest(Box::new(request)));
                     }
-                    // A rollback can restore a network ID the tenant has since
-                    // removed and another tenant has taken: every network the
-                    // reviewed spec adds must still be the tenant's.
+                    // A rollback can restore a network or secret the tenant has
+                    // since removed: whatever the reviewed spec adds must still
+                    // exist and be the tenant's. The request stays pending if not.
                     let added: Vec<NetworkId> = request
                         .after
                         .networks
@@ -1283,13 +1347,17 @@ impl RedbStateMachine {
                         &added,
                         &request.tenant_id,
                         |n: &Network| &n.tenant_id,
+                    )? || owned_by_another(
+                        tx,
+                        NETWORKS_TABLE,
+                        &request.after.networks,
+                        &request.tenant_id,
+                        |n: &Network| &n.tenant_id,
                     )? {
                         return Ok(StateResponse::Conflict(
                             "the change refers to a network the tenant does not own".into(),
                         ));
                     }
-                    // The API checked secrets before proposing; one removed since
-                    // then must not reach the applied spec. The request stays pending.
                     let current_secrets = secret_references(&request.before);
                     let added_secrets: Vec<String> = secret_references(&request.after)
                         .into_iter()
@@ -2031,6 +2099,14 @@ mod tests {
                 1
             );
         });
+        // The retention scan behind the 32/256 limits sees the restored row.
+        {
+            let db = follower.db.lock().unwrap();
+            let tx = db.begin_write().unwrap();
+            let rows = tenant_change_requests(&tx, &tenant.id, request.created_at_unix).unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].0, change_request_key(&tenant.id, &request.id));
+        }
 
         // Removing the tenant there drops the request, so a recreated tenant
         // and a later snapshot carry none of it.

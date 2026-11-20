@@ -847,6 +847,40 @@ mod tests {
     /// and `required` (when present) have the schema's types.
     #[test]
     fn every_tool_list_matches_the_mcp_tool_shape() {
+        // An object schema per MCP 2024-11-05: `properties` maps names to
+        // schema objects and `required` lists names it declares.
+        fn check_object_schema(schema: &Value, name: &str) {
+            assert!(schema.is_object(), "{name}: {schema}");
+            if let Some(properties) = schema.get("properties") {
+                let properties = properties.as_object().expect("properties is an object");
+                for (key, property) in properties {
+                    assert!(property.is_object(), "{name}.{key}");
+                    let declares = property.get("type").is_some_and(Value::is_string)
+                        || property.get("const").is_some()
+                        || property.get("enum").is_some_and(Value::is_array);
+                    assert!(declares, "{name}.{key} has no type, const or enum");
+                }
+                if let Some(required) = schema.get("required") {
+                    let required = required.as_array().expect("required is an array");
+                    for key in required {
+                        let key = key.as_str().expect("required names are strings");
+                        assert!(
+                            properties.contains_key(key),
+                            "{name}: {key} is not declared"
+                        );
+                    }
+                }
+            }
+            for alternative in schema
+                .get("oneOf")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                assert_eq!(alternative["type"], "object", "{name}: oneOf alternative");
+                check_object_schema(alternative, name);
+            }
+        }
         for role in [
             ApiRole::Viewer,
             ApiRole::Agent,
@@ -859,17 +893,7 @@ mod tests {
                 assert!(tool["description"].is_string(), "{name}");
                 let schema = &tool["inputSchema"];
                 assert_eq!(schema["type"], "object", "{name}");
-                if let Some(properties) = schema.get("properties") {
-                    assert!(properties.is_object(), "{name}");
-                }
-                if let Some(required) = schema.get("required") {
-                    assert!(
-                        required
-                            .as_array()
-                            .is_some_and(|keys| keys.iter().all(Value::is_string)),
-                        "{name}"
-                    );
-                }
+                check_object_schema(schema, name);
             }
         }
     }

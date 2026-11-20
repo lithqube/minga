@@ -20,14 +20,16 @@
   listing requires a viewer role and decisions require a distinct deployer/admin
   role presented as a certificate; a token cannot decide. Approval runs the
   same placement and secret admission as a service update, then atomically
-  applies the reviewed state in Raft. Each request lists every spec field it
-  changes (names only). Scale and stop refuse global services. Requests
+  applies the reviewed state in Raft. Each request carries the exact diff of
+  every spec field it changes, with environment values shown as `<hidden>`
+  and their changed keys listed. Scale and stop refuse global services. Requests
   expire after 15 minutes. A tenant holds at most 32 open and 256 total
   requests; the oldest decided or expired ones are dropped first, and removing
   a tenant removes its requests. State/wire format is now v11.
 - Removing a network that a service, or a rollback revision it keeps, still
   uses now returns 409, as Docker refuses a network in use. Remove the service
-  first.
+  first. A service write that adds a network or secret another tenant owns is
+  refused in the Raft write itself.
 - `minga validate` and `minga deploy` reject Compose `deploy.labels` before API
   writes instead of silently dropping those labels.
 - `minga-ctl` gains `manager`, `node`, `network`, `config`, `task`, `info` and

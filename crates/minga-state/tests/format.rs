@@ -1653,6 +1653,65 @@ async fn approval_rechecks_secrets_the_rollback_restores() {
 }
 
 #[tokio::test]
+async fn another_tenants_network_is_refused_in_writes_and_approvals() {
+    let (_dir, path) = written_dir().await;
+    let store = StateStore::open(1, "127.0.0.1:0", &path, BTreeMap::new())
+        .await
+        .unwrap();
+    store.create_tenant(tenant()).await.unwrap();
+    // A service names `net-x` while it does not exist yet (allowed, as before).
+    let mut svc = service("race.web");
+    svc.ports.clear();
+    svc.secrets.clear();
+    svc.egress = None;
+    svc.networks = vec!["net-x".into()];
+    store.upsert_service(svc.clone()).await.unwrap();
+    // Another tenant then takes the ID.
+    store
+        .upsert_network(Network {
+            id: "net-x".into(),
+            tenant_id: "tenant-a".into(),
+            name: "x".into(),
+            driver: "bridge".into(),
+            attachable: false,
+            subnet: None,
+            wg_port: None,
+        })
+        .await
+        .unwrap();
+    // A new service write naming it is refused in the Raft write itself.
+    let mut other = svc.clone();
+    other.id = "race.api".into();
+    assert!(store.upsert_service(other).await.is_err());
+    // An approval that keeps the now cross-tenant reference unchanged is
+    // refused too, and the request stays pending.
+    let mut request = change_request();
+    request.id = "cr-race".into();
+    request.service_id = svc.id.clone();
+    request.before = svc.clone();
+    request.after = svc.clone();
+    request.after.replicas += 1;
+    store.create_change_request(request.clone()).await.unwrap();
+    assert!(store
+        .decide_change_request(
+            request.id.clone(),
+            "default".into(),
+            "deployer".into(),
+            true,
+            150
+        )
+        .await
+        .is_err());
+    let pending = store
+        .get_change_request("default", &request.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(pending.status, ChangeRequestStatus::Pending);
+    store.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn removing_a_tenant_drops_its_change_requests() {
     let (_dir, path) = written_dir().await;
     let store = StateStore::open(1, "127.0.0.1:0", &path, BTreeMap::new())
