@@ -1,0 +1,17 @@
+$ cargo test -p minga-telemetry --lib serve
+test serve::tests::an_idle_http2_connection_is_closed ... ok
+test serve::tests::a_partial_http2_preface_is_closed ... ok
+test serve::tests::a_request_is_served ... ok
+test serve::tests::a_silent_connection_is_closed ... ok
+test serve::tests::a_head_that_never_ends_is_closed ... ok
+test serve::tests::an_idle_keep_alive_connection_is_closed ... ok
+test serve::tests::connections_over_the_cap_wait ... ok
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.61s
+
+$ cargo test -p minga-api --lib mtls_accepts
+test server::tests::mtls_accepts_ca_signed_clients_and_maps_them_to_roles ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 128 filtered out; finished in 0.39s
+
+$ cargo fmt --all --check && cargo clippy --all-targets -- -D warnings
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 15.40s
+exit=0

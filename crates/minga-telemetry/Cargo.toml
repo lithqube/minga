@@ -16,6 +16,8 @@ serde = { version = "1.0", features = ["derive"] }
 thiserror = "1.0"
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 http = "1.0"
+hyper.workspace = true
 hyper-util.workspace = true
 
 [dev-dependencies]
+tokio = { version = "1", features = ["io-util"] }

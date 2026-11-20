@@ -11,9 +11,9 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
-use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
-use hyper_util::server::conn::auto;
+use hyper_util::rt::{TokioIo, TokioTimer};
 use hyper_util::service::TowerToHyperService;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 
 /// Per-listener limits for [`serve_bounded`].
@@ -66,33 +66,37 @@ pub async fn serve_bounded<F>(
                 }
             },
         };
-        let service = TowerToHyperService::new(router.clone());
+        let router = router.clone();
         tokio::spawn(async move {
             let _permit = permit;
-            // The auto builder reads the first bytes to pick HTTP/1 or HTTP/2
-            // with no deadline of its own, before hyper's header timer starts:
-            // a peer that sends nothing must not hold the slot.
-            if tokio::time::timeout(limits.header_read_timeout, stream.readable())
-                .await
-                .is_err()
-            {
-                return;
-            }
-            let mut builder = auto::Builder::new(TokioExecutor::new());
-            builder
-                .http1()
-                .timer(TokioTimer::new())
-                .header_read_timeout(limits.header_read_timeout)
-                .max_buf_size(limits.max_buf_size);
-            builder.http2().timer(TokioTimer::new());
-            if let Err(e) = builder
-                .serve_connection_with_upgrades(TokioIo::new(stream), service)
-                .await
-            {
+            if let Err(e) = serve_connection(stream, router, limits).await {
                 tracing::debug!(error = %e, "connection closed");
             }
         });
     }
+}
+
+/// Serves one connection as HTTP/1.1 with upgrades, under `limits`.
+///
+/// HTTP/2 is not served: its preface and an idle HTTP/2 connection run
+/// outside hyper's header-read timeout, so a peer that sends the preface and
+/// then nothing would hold its connection slot forever. Every Minga client
+/// (Docker, Prometheus, the egress `CONNECT`) speaks HTTP/1.1.
+pub async fn serve_connection<I>(
+    io: I,
+    router: axum::Router,
+    limits: Limits,
+) -> Result<(), hyper::Error>
+where
+    I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    hyper::server::conn::http1::Builder::new()
+        .timer(TokioTimer::new())
+        .header_read_timeout(limits.header_read_timeout)
+        .max_buf_size(limits.max_buf_size)
+        .serve_connection(TokioIo::new(io), TowerToHyperService::new(router))
+        .with_upgrades()
+        .await
 }
 
 #[cfg(test)]
@@ -174,6 +178,24 @@ mod tests {
         let addr = server(short()).await;
         let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
         s.write_all(b"GET / HTTP/1.1\r\nX-Pad: aaaa").await.unwrap();
+        assert!(closed_within(&mut s, Duration::from_secs(3)).await);
+    }
+
+    #[tokio::test]
+    async fn a_partial_http2_preface_is_closed() {
+        let addr = server(short()).await;
+        let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+        s.write_all(b"PRI * HTTP/2.0\r\n").await.unwrap();
+        assert!(closed_within(&mut s, Duration::from_secs(3)).await);
+    }
+
+    #[tokio::test]
+    async fn an_idle_http2_connection_is_closed() {
+        let addr = server(short()).await;
+        let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+        s.write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
+            .await
+            .unwrap();
         assert!(closed_within(&mut s, Duration::from_secs(3)).await);
     }
 
