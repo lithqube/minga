@@ -21,6 +21,7 @@ Rust single-binary orchestrator replacing Docker Swarm for edge/on-prem/air-gapp
 ## Boundaries
 
 - Keep the disk free. In a worktree, build with `CARGO_TARGET_DIR=<main checkout>/target`: a worktree's own `target/` grows to 20–50 GB. After every PR merge or completed Phase, immediately inventory and clean up that work: remove its merged local branch and owned worktree, task-created temp files, and confirmed task-created dangling Docker containers, networks, images, or volumes; clean task-owned Cargo `target/` artifacts when no active worktree depends on them. Verify merge/completion and ownership first. Never prune global Docker resources, shared Cargo caches/targets, locked or other-session worktrees, or worktrees/files with unrelated uncommitted changes. Preserve unsafe leftovers and report what remains and why; do not silently skip cleanup.
+- Parallel board lanes share one target: every lane builds with `CARGO_TARGET_DIR=<main checkout>/target`, so cargo's build lock queues same-workspace compiles and artifacts dedupe. Lanes set `CARGO_INCREMENTAL=0` so the incremental cache does not grow under parallelism. Run read-only lanes (pre-flight, review, QA analysis) in parallel rather than several builders. Test only the crates a lane touches (`cargo test -p <crate>`); run `cargo test --workspace` only at the merge gate.
 
 ## Rust skills
 
