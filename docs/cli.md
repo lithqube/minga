@@ -270,7 +270,7 @@ Through the API:
 | `manager ls`, `manager add ID --raft-addr ADDR`, `manager rm ID [--yes]` | Inspect and change Raft voter membership. Add and remove need the manager API admin token; removal confirms unless `--yes`. |
 | `node ls`, `node inspect ID` | Node identity, role, availability, scheduling state and address. |
 | `node update ID [--availability active\|drain] [--label KEY=VALUE]... [--label-rm KEY]... [--clear-labels]` | Update node scheduling and labels. |
-| `network ls`, `network inspect ID`, `network create NAME [--subnet CIDR] [--attachable]`, `network rm ID [--yes]` | Cluster network metadata and allocation. Compose remains the full-featured path for network options. |
+| `network ls`, `network inspect ID`, `network create NAME [--subnet CIDR] [--attachable]`, `network rm ID [--yes]` | Cluster network metadata and allocation. Removal is refused while a service or its rollback revision uses the network. Compose remains the full-featured path for network options. |
 | `config ls`, `config inspect ID`, `config create NAME --file FILE`, `config rm ID [--yes]` | Config metadata and creation from file bytes; the API never returns contents. |
 | `task ls`, `task inspect ID` | Desired and actual task state, placement and errors. |
 | `version` | API version metadata. |

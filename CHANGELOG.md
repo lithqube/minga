@@ -25,6 +25,9 @@
   expire after 15 minutes. A tenant holds at most 32 open and 256 total
   requests; the oldest decided or expired ones are dropped first, and removing
   a tenant removes its requests. State/wire format is now v11.
+- Removing a network that a service, or a rollback revision it keeps, still
+  uses now returns 409, as Docker refuses a network in use. Remove the service
+  first.
 - `minga validate` and `minga deploy` reject Compose `deploy.labels` before API
   writes instead of silently dropping those labels.
 - `minga-ctl` gains `manager`, `node`, `network`, `config`, `task`, `info` and

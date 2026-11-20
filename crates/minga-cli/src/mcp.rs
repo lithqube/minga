@@ -813,6 +813,38 @@ mod tests {
             .iter()
             .all(|name| !["deploy", "scale", "stop", "rollback"].contains(name)));
     }
+    /// The `Tool` shape of MCP 2024-11-05, for every role's list: a non-empty
+    /// name, a description, and an object `inputSchema` whose `properties`
+    /// and `required` (when present) have the schema's types.
+    #[test]
+    fn every_tool_list_matches_the_mcp_tool_shape() {
+        for role in [
+            ApiRole::Viewer,
+            ApiRole::Agent,
+            ApiRole::Deployer,
+            ApiRole::Admin,
+        ] {
+            for tool in tool_definitions(role) {
+                let name = tool["name"].as_str().unwrap_or_default();
+                assert!(!name.is_empty(), "{tool}");
+                assert!(tool["description"].is_string(), "{name}");
+                let schema = &tool["inputSchema"];
+                assert_eq!(schema["type"], "object", "{name}");
+                if let Some(properties) = schema.get("properties") {
+                    assert!(properties.is_object(), "{name}");
+                }
+                if let Some(required) = schema.get("required") {
+                    assert!(
+                        required
+                            .as_array()
+                            .is_some_and(|keys| keys.iter().all(Value::is_string)),
+                        "{name}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn agent_gets_only_a_proposal_write_tool() {
         let tools = tool_definitions(ApiRole::Agent);

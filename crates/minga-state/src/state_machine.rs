@@ -125,6 +125,25 @@ fn tenant_has_records<T: DeserializeOwned>(
     Ok(false)
 }
 
+/// Whether any service, or a rollback revision it keeps, names network `id`.
+#[allow(clippy::result_large_err)]
+fn network_in_use(tx: &redb::WriteTransaction, id: &str) -> Result<bool, StorageError<u64>> {
+    let table = tx.open_table(SERVICES_TABLE).map_err(sm_io_err)?;
+    for row in table.iter().map_err(sm_io_err)? {
+        let (_, value) = row.map_err(sm_io_err)?;
+        let service: Service = crate::codec::decode(value.value())
+            .map_err(|e| sm_storage_err(ErrorSubject::Store, ErrorVerb::Read, e))?;
+        let mut revision = Some(&service);
+        while let Some(spec) = revision {
+            if spec.networks.iter().any(|network| network == id) {
+                return Ok(true);
+            }
+            revision = spec.previous.as_deref();
+        }
+    }
+    Ok(false)
+}
+
 /// Whether every network in `ids` exists and belongs to `tenant_id`.
 #[allow(clippy::result_large_err)]
 fn networks_owned_by(
@@ -1033,6 +1052,13 @@ impl RedbStateMachine {
                     ObjectKind::Secret => SECRETS_TABLE,
                     ObjectKind::Config => CONFIGS_TABLE,
                 };
+                // Like Docker, a network in use stays: otherwise a service (or
+                // its rollback revision) keeps an ID another tenant can take.
+                if *kind == ObjectKind::Network && network_in_use(tx, id)? {
+                    return Ok(StateResponse::Conflict(format!(
+                        "network {id} is in use by a service"
+                    )));
+                }
                 let mut t = tx.open_table(definition).map_err(sm_io_err)?;
                 let owner = t
                     .get(id.as_str())
@@ -1690,7 +1716,8 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
             for request in &snap.change_requests {
                 let bytes = crate::codec::encode(request)
                     .map_err(|e| sm_storage_err(ErrorSubject::Store, ErrorVerb::Write, e))?;
-                t.insert(request.id.as_str(), bytes.as_slice())
+                let key = change_request_key(&request.tenant_id, &request.id);
+                t.insert(key.as_str(), bytes.as_slice())
                     .map_err(sm_io_err)?;
             }
         }
@@ -1876,5 +1903,112 @@ fn sm_storage_err<E: std::error::Error + Send + Sync + 'static>(
 ) -> StorageError<u64> {
     StorageError::IO {
         source: StorageIOError::new(subject, verb, AnyError::new(&e)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn apply(sm: &RedbStateMachine, command: StateCommand) -> StateResponse {
+        let db = sm.db.lock().unwrap();
+        let tx = db.begin_write().unwrap();
+        let response = RedbStateMachine::apply_command(&tx, &command).unwrap();
+        tx.commit().unwrap();
+        response
+    }
+
+    fn snapshot_of(sm: &mut RedbStateMachine) -> Snapshot<TypeConfig> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            sm.get_snapshot_builder()
+                .await
+                .build_snapshot()
+                .await
+                .unwrap()
+        })
+    }
+
+    #[test]
+    fn a_snapshot_keeps_change_requests_tenant_keyed() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut leader = RedbStateMachine::open(dir.path().join("leader.redb")).unwrap();
+        let tenant: Tenant =
+            serde_json::from_str(include_str!("../tests/fixtures/v11/tenant.json")).unwrap();
+        let mut request: ChangeRequest =
+            serde_json::from_str(include_str!("../tests/fixtures/v11/change_request.json"))
+                .unwrap();
+        request.tenant_id = tenant.id.clone();
+        request.before.tenant_id = tenant.id.clone();
+        request.after.tenant_id = tenant.id.clone();
+        assert_eq!(
+            apply(&leader, StateCommand::CreateTenant(tenant.clone())),
+            StateResponse::Ok
+        );
+        assert_eq!(
+            apply(&leader, StateCommand::UpsertService(request.before.clone())),
+            StateResponse::Ok
+        );
+        assert!(matches!(
+            apply(
+                &leader,
+                StateCommand::CreateChangeRequest(Box::new(request.clone()))
+            ),
+            StateResponse::ChangeRequest(_)
+        ));
+        apply(
+            &leader,
+            StateCommand::RemoveService(request.service_id.clone()),
+        );
+
+        // A follower that installs the leader's snapshot finds the request
+        // under its tenant, exactly as the leader does.
+        let snapshot = snapshot_of(&mut leader);
+        let mut follower = RedbStateMachine::open(dir.path().join("follower.redb")).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            follower
+                .install_snapshot(&snapshot.meta, snapshot.snapshot)
+                .await
+                .unwrap();
+            assert!(follower
+                .get_change_request(&tenant.id, &request.id)
+                .await
+                .unwrap()
+                .is_some());
+            assert_eq!(
+                follower
+                    .list_change_requests(&tenant.id)
+                    .await
+                    .unwrap()
+                    .len(),
+                1
+            );
+        });
+
+        // Removing the tenant there drops the request, so a recreated tenant
+        // and a later snapshot carry none of it.
+        assert_eq!(
+            apply(&follower, StateCommand::RemoveTenant(tenant.id.clone())),
+            StateResponse::Ok
+        );
+        assert_eq!(
+            apply(&follower, StateCommand::CreateTenant(tenant.clone())),
+            StateResponse::Ok
+        );
+        runtime.block_on(async {
+            assert!(follower
+                .list_change_requests(&tenant.id)
+                .await
+                .unwrap()
+                .is_empty());
+        });
+        let snapshot = snapshot_of(&mut follower);
+        let snap: StateSnapshot = crate::codec::decode(snapshot.snapshot.get_ref()).unwrap();
+        assert!(snap.change_requests.is_empty());
     }
 }

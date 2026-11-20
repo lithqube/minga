@@ -1540,6 +1540,56 @@ async fn change_requests_are_keyed_by_tenant_and_check_network_ownership() {
 }
 
 #[tokio::test]
+async fn a_network_a_service_or_its_rollback_uses_cannot_be_removed() {
+    let (_dir, path) = written_dir().await;
+    let store = StateStore::open(1, "127.0.0.1:0", &path, BTreeMap::new())
+        .await
+        .unwrap();
+    let network = |id: &str| Network {
+        id: id.into(),
+        tenant_id: "default".into(),
+        name: id.into(),
+        driver: "bridge".into(),
+        attachable: false,
+        subnet: None,
+        wg_port: None,
+    };
+    store.upsert_network(network("net-live")).await.unwrap();
+    store.upsert_network(network("net-old")).await.unwrap();
+    let mut svc = service("net.web");
+    svc.ports.clear();
+    let mut earlier = svc.clone();
+    earlier.networks = vec!["net-old".into()];
+    svc.networks = vec!["net-live".into()];
+    svc.previous = Some(Box::new(earlier));
+    store.upsert_service(svc.clone()).await.unwrap();
+
+    for id in ["net-live", "net-old"] {
+        assert!(
+            matches!(
+                store.remove_network(id.into(), "default").await,
+                Err(minga_state::StateError::Conflict(_))
+            ),
+            "{id} is still referenced"
+        );
+    }
+    store
+        .remove_service(svc.id.clone(), "default")
+        .await
+        .unwrap();
+    store
+        .remove_network("net-live".into(), "default")
+        .await
+        .unwrap();
+    store
+        .remove_network("net-old".into(), "default")
+        .await
+        .unwrap();
+    assert!(store.get_network("net-old").await.unwrap().is_none());
+    store.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn removing_a_tenant_drops_its_change_requests() {
     let (_dir, path) = written_dir().await;
     let store = StateStore::open(1, "127.0.0.1:0", &path, BTreeMap::new())

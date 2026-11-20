@@ -816,13 +816,17 @@ impl StateStore {
         id: String,
         tenant_id: &str,
     ) -> Result<(), StateError> {
-        self.propose(StateCommand::RemoveOwned {
-            kind,
-            id,
-            tenant_id: tenant_id.to_owned(),
-        })
-        .await?;
-        Ok(())
+        match self
+            .propose(StateCommand::RemoveOwned {
+                kind,
+                id,
+                tenant_id: tenant_id.to_owned(),
+            })
+            .await?
+        {
+            StateResponse::Conflict(message) => Err(StateError::Conflict(message)),
+            _ => Ok(()),
+        }
     }
 
     pub async fn upsert_task(&self, task: Task) -> Result<(), StateError> {
