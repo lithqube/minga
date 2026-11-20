@@ -449,6 +449,8 @@ mod tests {
         for refused in [
             "10.100.5.7/32",
             "10.100.5.0/29",
+            // Starts inside the supernet, ends past its broadcast address.
+            "10.100.0.0/15",
             "10.200.0.0/24",
             "10.200.0.2/30",
             "192.168.1.0/24",

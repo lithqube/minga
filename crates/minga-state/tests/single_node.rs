@@ -839,6 +839,26 @@ async fn quotas_ignore_stopped_tasks_and_never_block_rewrites() {
 }
 
 #[tokio::test]
+async fn a_snapshot_with_one_refused_network_writes_none() {
+    let (store, _dir) = test_store("import-refused-network").await;
+    store.set_overlay_supernet(minga_net::Cidr::parse("10.100.0.0/16").unwrap());
+    let net = |id: &str, subnet: &str| Network {
+        id: id.to_string(),
+        tenant_id: "default".to_string(),
+        name: id.to_string(),
+        driver: "overlay".to_string(),
+        attachable: true,
+        subnet: Some(subnet.to_string()),
+        wg_port: None,
+    };
+    let mut snapshot = store.export().await.unwrap();
+    snapshot.networks = vec![net("a", "10.100.1.0/24"), net("b", "192.168.1.0/24")];
+    assert!(store.import(snapshot, true).await.is_err());
+    assert!(store.get_network("a").await.unwrap().is_none());
+    store.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn importing_a_snapshot_keeps_existing_tenant_quotas() {
     let (store, _dir) = test_store("import-quotas").await;
     let quotas = TenantQuotas {

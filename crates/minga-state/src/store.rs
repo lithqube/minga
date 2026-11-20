@@ -117,6 +117,21 @@ fn membership_error(e: RaftError<NodeId, ClientWriteError<NodeId, BasicNode>>) -
         None => StateError::Raft(e.to_string()),
     }
 }
+/// The subnet rules for a network write, checked before proposing. The Raft
+/// apply repeats all but the supernet rule: managers may run with different
+/// supernets, and the apply must give every replica the same result.
+fn check_network_subnet_rules(
+    network: &Network,
+    supernet: Option<&minga_net::Cidr>,
+) -> Result<(), StateError> {
+    let Some(raw) = &network.subnet else {
+        return Ok(());
+    };
+    let subnet =
+        minga_net::Cidr::parse(raw).map_err(|error| StateError::Raft(error.to_string()))?;
+    minga_net::overlay::check_network_subnet(&subnet, supernet).map_err(StateError::Raft)
+}
+
 fn command_error(message: String) -> StateError {
     if let Some(quota) = message.strip_prefix("tenant quota exceeded: ") {
         StateError::QuotaExceeded(quota.to_owned())
@@ -868,15 +883,7 @@ impl StateStore {
     }
 
     pub async fn upsert_network(&self, network: Network) -> Result<(), StateError> {
-        // Checked before proposing, not in the Raft apply: managers may run with
-        // different supernets, and apply must give every replica the same result.
-        // A malformed subnet is left to the apply, which refuses it everywhere.
-        if let (Some(supernet), Some(raw)) = (self.overlay_supernet.get(), &network.subnet) {
-            if let Ok(subnet) = minga_net::Cidr::parse(raw) {
-                minga_net::overlay::check_network_subnet(&subnet, Some(supernet))
-                    .map_err(StateError::Raft)?;
-            }
-        }
+        check_network_subnet_rules(&network, self.overlay_supernet.get())?;
         match self.propose(StateCommand::UpsertNetwork(network)).await? {
             StateResponse::Ok | StateResponse::ChangeRequest(_) => Ok(()),
             StateResponse::Conflict(_) => Err(StateError::NameInUse),
@@ -1125,6 +1132,11 @@ impl StateStore {
             if !clashes.is_empty() {
                 return Err(StateError::Conflict(clashes.join(", ")));
             }
+        }
+        // Every network rule runs before the first write, so a refused network
+        // leaves nothing half-imported.
+        for network in &snapshot.networks {
+            check_network_subnet_rules(network, self.overlay_supernet.get())?;
         }
         let mut tenants = snapshot.tenants;
         if !tenants.iter().any(|tenant| tenant.id == DEFAULT_TENANT_ID) {

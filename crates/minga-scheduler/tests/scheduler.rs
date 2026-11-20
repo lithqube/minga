@@ -193,7 +193,7 @@ async fn multi_tenant_placement_and_wireguard_routes_stay_tenant_scoped() {
             name: "private".into(),
             driver: "overlay".into(),
             attachable: false,
-            subnet: Some("10.70.0.0/24".into()),
+            subnet: Some("10.100.70.0/24".into()),
             wg_port: None,
         })
         .await
@@ -1427,6 +1427,46 @@ async fn relay_manager_carries_only_unique_addresses_inside_each_network() {
         task.spec.ips.insert("shared".into(), ip.into());
         store.upsert_task(task).await.unwrap();
     }
+    // Tasks that claim tenant B's network from default nodes. Default tasks
+    // pass the NAT-worker filter, so only the ownership check keeps their
+    // addresses off the relay; the tenant-B ones are refused twice over.
+    store
+        .upsert_tenant(minga_state::types::Tenant {
+            nats_revoked_user_public_keys: Vec::new(),
+            id: "tenant-b".into(),
+            name: "Tenant B".into(),
+            quotas: Default::default(),
+            created_at: 1,
+        })
+        .await
+        .unwrap();
+    store
+        .upsert_network(Network {
+            id: "b-net".into(),
+            tenant_id: "tenant-b".into(),
+            name: "b-net".into(),
+            driver: "overlay".into(),
+            attachable: false,
+            subnet: Some("10.100.7.0/24".into()),
+            wg_port: None,
+        })
+        .await
+        .unwrap();
+    for (service_id, node_id, tenant_id, ip) in [
+        ("app.forged-a", 2, "default", "10.100.7.10"),
+        ("app.forged-b", 3, "default", "10.100.7.11"),
+        ("app.forged-c", 2, "tenant-b", "10.100.7.12"),
+        ("app.forged-d", 3, "tenant-b", "10.100.7.13"),
+    ] {
+        let service = make_service(service_id, 1);
+        store.upsert_service(service.clone()).await.unwrap();
+        let node = make_node(node_id, 8.0, 1 << 34);
+        let mut task = minga_scheduler::place_service(&service, &[node], &[], &[], 0).remove(0);
+        task.tenant_id = tenant_id.into();
+        task.spec.ips.insert("b-net".into(), ip.into());
+        store.upsert_task(task).await.unwrap();
+    }
+
     // Two NAT workers share it, so the relay would carry it without the check.
     for (service_id, worker, ip) in [
         ("app.legacy-a", worker_a, "192.168.5.10"),
