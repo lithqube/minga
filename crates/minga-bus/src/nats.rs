@@ -1389,6 +1389,76 @@ impl EventBus for NatsBus {
             }
         })))
     }
+    async fn tenant_event_history(&self, tenant_id: &str, limit: usize) -> Result<Vec<BusEvent>> {
+        validate_tenant_id(tenant_id)?;
+        self.require_manager("read retained tenant events")?;
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let stream = self
+            .js
+            .get_stream("MINGA_EVENTS")
+            .await
+            .map_err(|error| BusError::Subscribe(format!("get MINGA_EVENTS: {error}")))?;
+        let mut consumer = stream
+            .create_consumer(bounded(PullConsumerConfig {
+                filter_subjects: vec![subjects::tenant_event_wildcard(tenant_id)],
+                deliver_policy: DeliverPolicy::All,
+                ..Default::default()
+            }))
+            .await
+            .map_err(|error| {
+                BusError::Subscribe(format!("tenant event history consumer: {error}"))
+            })?;
+        let mut remaining = consumer
+            .info()
+            .await
+            .map_err(|error| BusError::Subscribe(format!("tenant event history info: {error}")))?
+            .num_pending as usize;
+        let mut events = VecDeque::new();
+        while remaining > 0 {
+            let mut batch = consumer
+                .fetch()
+                .max_messages(remaining.min(200))
+                .expires(Duration::from_secs(5))
+                .messages()
+                .await
+                .map_err(|error| {
+                    BusError::Subscribe(format!("tenant event history fetch: {error}"))
+                })?;
+            let mut received = 0usize;
+            while let Some(message) = batch.next().await {
+                let message = message.map_err(|error| {
+                    BusError::Subscribe(format!("tenant event history message: {error}"))
+                })?;
+                received += 1;
+                if !message
+                    .subject
+                    .starts_with(&format!("minga.{tenant_id}.task."))
+                {
+                    return Err(BusError::Subscribe(
+                        "tenant event subject does not match its filter".into(),
+                    ));
+                }
+                message.ack().await.map_err(|error| {
+                    BusError::Subscribe(format!("tenant event history ack: {error}"))
+                })?;
+                events.push_back(BusEvent {
+                    subject: message.subject.to_string(),
+                    payload: message.payload.to_vec(),
+                    timestamp: now_millis(),
+                });
+                while events.len() > limit {
+                    events.pop_front();
+                }
+            }
+            if received == 0 {
+                break;
+            }
+            remaining = remaining.saturating_sub(received);
+        }
+        Ok(events.into_iter().collect())
+    }
     async fn configure_tenant_quota(
         &self,
         tenant_id: &str,

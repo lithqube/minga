@@ -240,7 +240,7 @@ async fn resolve_caller(
     }
     if let Some(identity) = extensions.get::<ClientIdentity>() {
         let role = identity.role.ok_or_else(|| {
-            auth_forbidden("client certificate has an unsupported role; reissue it with OU viewer, deployer, or admin")
+            auth_forbidden("client certificate has an unsupported role; reissue it with OU viewer, agent, deployer, or admin")
         })?;
         let (tenant_id, cluster_operator) = match identity.tenant.as_deref() {
             Some("*") => (None, true),
@@ -320,8 +320,20 @@ fn authorize(
     let legacy_read = source == Source::Legacy
         && matches!(*method, axum::http::Method::GET | axum::http::Method::HEAD)
         && !path.starts_with("/minga/");
-    if cluster_operator_path(path) && !caller.cluster_operator && !legacy_read {
+    let tenant_node_read = matches!(*method, axum::http::Method::GET | axum::http::Method::HEAD)
+        && !path.starts_with("/minga/")
+        && path.split('/').nth(2) == Some("nodes");
+    if cluster_operator_path(path) && !caller.cluster_operator && !legacy_read && !tenant_node_read
+    {
         return Err(auth_forbidden("cluster operator identity required"));
+    }
+    if *method == axum::http::Method::POST
+        && path == "/minga/change-requests"
+        && caller.role != ApiRole::Agent
+    {
+        return Err(auth_forbidden(
+            "only an agent certificate may propose changes",
+        ));
     }
     if !caller.role.permits(request_minimum_role(method, path)) {
         return Err(auth_forbidden("caller role does not permit this operation"));
@@ -349,25 +361,49 @@ fn agent_usage_path(path: &str) -> bool {
     )
 }
 
+fn tenant_change_request_path(path: &str) -> bool {
+    if path == "/minga/change-requests" {
+        return true;
+    }
+    let mut segments = path.trim_matches('/').split('/');
+    matches!(
+        (
+            segments.next(),
+            segments.next(),
+            segments.next(),
+            segments.next(),
+            segments.next()
+        ),
+        (
+            Some("minga"),
+            Some("change-requests"),
+            Some(id),
+            Some("approve" | "reject"),
+            None
+        ) if !id.is_empty()
+    )
+}
+
 fn tenant_scoped_path(path: &str) -> bool {
-    !path.starts_with("/minga/")
-        && path.split('/').any(|segment| {
-            matches!(
-                segment,
-                "services"
-                    | "tasks"
-                    | "networks"
-                    | "secrets"
-                    | "configs"
-                    | "audit"
-                    | "state"
-                    | "agent"
-            )
-        })
+    tenant_change_request_path(path)
+        || (!path.starts_with("/minga/")
+            && path.split('/').any(|segment| {
+                matches!(
+                    segment,
+                    "services"
+                        | "tasks"
+                        | "networks"
+                        | "secrets"
+                        | "configs"
+                        | "audit"
+                        | "state"
+                        | "agent"
+                )
+            }))
 }
 
 fn cluster_operator_path(path: &str) -> bool {
-    path.starts_with("/minga/")
+    (path.starts_with("/minga/") && !tenant_change_request_path(path))
         || path.split('/').nth(2) == Some("nodes")
         || path.split('/').nth(2) == Some("info")
         || matches!(path, "/healthz" | "/readyz" | "/metrics")
@@ -375,7 +411,15 @@ fn cluster_operator_path(path: &str) -> bool {
 
 fn request_minimum_role(method: &axum::http::Method, path: &str) -> ApiRole {
     use axum::http::Method;
-    if path.split('/').nth(2) == Some("audit") || path == "/minga/audit" {
+    if tenant_change_request_path(path) {
+        if path == "/minga/change-requests" && matches!(*method, Method::GET | Method::HEAD) {
+            ApiRole::Viewer
+        } else if path == "/minga/change-requests" {
+            ApiRole::Agent
+        } else {
+            ApiRole::Deployer
+        }
+    } else if path.split('/').nth(2) == Some("audit") || path == "/minga/audit" {
         ApiRole::Admin
     } else if method == Method::GET || method == Method::HEAD {
         ApiRole::Viewer
@@ -541,11 +585,29 @@ fn build_router_with_app_state(
                 .delete(handlers::delete_tenant)
                 .layer(axum::middleware::from_fn(require_operator_admin)),
         )
+        .route(
+            "/minga/change-requests",
+            get(handlers::list_change_requests).post(handlers::create_change_request),
+        )
+        .route(
+            "/minga/change-requests/:id/approve",
+            post(handlers::approve_change_request),
+        )
+        .route(
+            "/minga/change-requests/:id/reject",
+            post(handlers::reject_change_request),
+        )
         // Versioned endpoints: /{version}/...
         .route("/:version/version", get(handlers::get_version))
+        .route(
+            "/:version/minga/cluster",
+            get(handlers::get_cluster_diagnostics)
+                .layer(axum::middleware::from_fn(require_operator_admin)),
+        )
         .route("/:version/info", get(handlers::get_info))
         .route("/:version/audit", get(handlers::list_audit))
         .route("/:version/agent/usage", get(handlers::agent_usage))
+        .route("/:version/agent/events", get(handlers::agent_events))
         // Nodes.
         .route(
             "/:version/nodes",
@@ -567,6 +629,7 @@ fn build_router_with_app_state(
         )
         // Tasks.
         .route("/:version/tasks", get(handlers::list_tasks))
+        .route("/:version/tasks/:id/logs", get(handlers::task_logs))
         .route("/:version/tasks/:id", get(handlers::get_task))
         // Networks.
         .route("/:version/networks", get(handlers::list_networks))
@@ -871,7 +934,7 @@ impl ApiServer {
             tokio::spawn(async move {
                 let mut revocations_published = false;
                 loop {
-                    ready.set_raft_ready(store.current_leader().await.is_some());
+                    ready.set_raft_ready(store.raft_ready());
                     let leader = store.is_leader().await;
                     METRICS.raft_leader.set(if leader { 1.0 } else { 0.0 });
                     revocations_published =
@@ -1110,6 +1173,28 @@ mod tests {
             update: Default::default(),
             rollback: None,
             previous: None,
+        }
+    }
+
+    fn node_record(id: u64, tenant_id: &str) -> minga_state::types::ClusterNode {
+        minga_state::types::ClusterNode {
+            id,
+            address: format!("127.0.0.1:{}", 50000 + id),
+            labels: Default::default(),
+            status: minga_state::types::NodeStatus::Active,
+            capacity: minga_state::types::ResourceSpec {
+                cpus: 8.0,
+                memory_bytes: 1024,
+                gpus: 0,
+            },
+            wg_public_key: None,
+            wg_endpoint: None,
+            overlay_ip: None,
+            tenant_id: tenant_id.to_owned(),
+            last_seen_unix: None,
+            role: Default::default(),
+            reserved_ports: Vec::new(),
+            nats_user_public_key: None,
         }
     }
 
@@ -1495,6 +1580,9 @@ mod tests {
                 .await
                 .unwrap();
         }
+        for (id, tenant_id) in [(1, "tenant-a"), (2, "tenant-b")] {
+            store.upsert_node(node_record(id, tenant_id)).await.unwrap();
+        }
 
         let request = |uri: &str, tenant: Option<&str>| {
             let mut request = Request::builder().uri(uri).body(Body::empty()).unwrap();
@@ -1510,6 +1598,14 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(services.as_array().unwrap().len(), 1);
         assert_eq!(services[0]["ID"], "tenant-a-service");
+        let (status, nodes) =
+            send_request(router.clone(), request("/v1.41/nodes", Some("tenant-a"))).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(nodes.as_array().unwrap().len(), 1);
+        assert_eq!(nodes[0]["ID"], "1");
+        let (status, _) =
+            send_request(router.clone(), request("/v1.41/nodes/2", Some("tenant-a"))).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
 
         let (status, _) = send_request(
             router.clone(),
@@ -1554,7 +1650,7 @@ mod tests {
             })
             .await
             .unwrap();
-        for uri in ["/v1.41/audit", "/v1.41/agent/usage"] {
+        for uri in ["/v1.41/audit", "/v1.41/agent/usage", "/v1.41/agent/events"] {
             let mut request = Request::builder().uri(uri).body(Body::empty()).unwrap();
             request.extensions_mut().insert(ClientIdentity {
                 name: "tenant-admin".into(),
@@ -2000,6 +2096,380 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn task_logs_are_bounded_and_scoped_to_the_callers_tenant() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            StateStore::open(1, "127.0.0.1:0", dir.path(), BTreeMap::new())
+                .await
+                .unwrap(),
+        );
+        store
+            .upsert_tenant(minga_state::types::Tenant {
+                nats_revoked_user_public_keys: Vec::new(),
+                id: "tenant-b".into(),
+                name: "tenant-b".into(),
+                quotas: Default::default(),
+                created_at: 1,
+            })
+            .await
+            .unwrap();
+        for (service_id, task_id, tenant_id) in [
+            ("service-a", "task-a", "default"),
+            ("service-b", "task-b", "tenant-b"),
+        ] {
+            store
+                .upsert_service(service_record(service_id, tenant_id))
+                .await
+                .unwrap();
+            store
+                .upsert_task(Task {
+                    id: task_id.into(),
+                    tenant_id: tenant_id.into(),
+                    service_id: service_id.into(),
+                    node_id: 1,
+                    state: TaskState::Assigned,
+                    spec: TaskSpec {
+                        image: "nginx:latest".into(),
+                        ..Default::default()
+                    },
+                    restarts: 0,
+                    running_since_unix: None,
+                    last_error: None,
+                    last_exit_code: None,
+                })
+                .await
+                .unwrap();
+        }
+        let bus = MemoryBus::new();
+        bus.publish_tenant_node_log(
+            "default",
+            1,
+            "task-a",
+            &minga_bus::LogEntry::stdout("task-a", b"tenant-a-log".to_vec()),
+        )
+        .await
+        .unwrap();
+        bus.publish_tenant_node_log(
+            "tenant-b",
+            1,
+            "task-b",
+            &minga_bus::LogEntry::stdout("task-b", b"tenant-b-secret".to_vec()),
+        )
+        .await
+        .unwrap();
+        let router = build_router_with_bus_and_auth(store, bus, Arc::new(ReadyState::new()), None);
+        let request = |uri: &str| {
+            let mut request = Request::builder().uri(uri).body(Body::empty()).unwrap();
+            request.extensions_mut().insert(ClientIdentity {
+                name: "tenant-viewer".into(),
+                role: Some(ApiRole::Viewer),
+                tenant: Some("default".into()),
+            });
+            request
+        };
+
+        let (status, logs) =
+            send_request(router.clone(), request("/v1.41/tasks/task-a/logs?tail=0")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(logs.as_array().unwrap().len(), 1);
+        assert_eq!(logs[0]["data"], serde_json::json!(b"tenant-a-log".to_vec()));
+        assert_ne!(
+            logs[0]["data"],
+            serde_json::json!(b"tenant-b-secret".to_vec())
+        );
+
+        let (status, _) = send_request(router, request("/v1.41/tasks/task-b/logs")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn change_requests_are_tenant_scoped_and_maker_checker_enforced() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            StateStore::open(1, "127.0.0.1:0", dir.path(), BTreeMap::new())
+                .await
+                .unwrap(),
+        );
+        store
+            .upsert_tenant(minga_state::types::Tenant {
+                nats_revoked_user_public_keys: Vec::new(),
+                id: "tenant-b".into(),
+                name: "tenant-b".into(),
+                quotas: Default::default(),
+                created_at: 1,
+            })
+            .await
+            .unwrap();
+        store
+            .upsert_service(service_record("svc-a", "default"))
+            .await
+            .unwrap();
+        store
+            .upsert_service(service_record("svc-b", "tenant-b"))
+            .await
+            .unwrap();
+
+        let bus = MemoryBus::new();
+        let router = build_router_with_bus_and_auth(
+            store.clone(),
+            bus.clone(),
+            Arc::new(ReadyState::new()),
+            None,
+        );
+        let request = |method: &str,
+                       uri: &str,
+                       role: ApiRole,
+                       tenant: &str,
+                       actor: &str,
+                       body: Option<serde_json::Value>| {
+            let mut builder = Request::builder().method(method).uri(uri);
+            if body.is_some() {
+                builder = builder.header("content-type", "application/json");
+            }
+            let mut request = builder
+                .body(body.map_or_else(Body::empty, |value| Body::from(value.to_string())))
+                .unwrap();
+            request.extensions_mut().insert(ClientIdentity {
+                name: actor.into(),
+                role: Some(role),
+                tenant: Some(tenant.into()),
+            });
+            request
+        };
+
+        let (status, _) = send_request(
+            router.clone(),
+            request(
+                "POST",
+                "/minga/change-requests",
+                ApiRole::Deployer,
+                "default",
+                "deployer",
+                Some(serde_json::json!({
+                    "action": "scale",
+                    "service_id": "svc-a",
+                    "replicas": 2
+                })),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        let (status, proposal) = send_request(
+            router.clone(),
+            request(
+                "POST",
+                "/minga/change-requests",
+                ApiRole::Agent,
+                "default",
+                "agent",
+                Some(serde_json::json!({
+                    "action": "scale",
+                    "service_id": "svc-a",
+                    "replicas": 2
+                })),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let id = proposal["id"].as_str().unwrap().to_owned();
+
+        let (status, default_list) = send_request(
+            router.clone(),
+            request(
+                "GET",
+                "/minga/change-requests",
+                ApiRole::Viewer,
+                "default",
+                "viewer-a",
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(default_list.as_array().unwrap().len(), 1);
+
+        let (status, _) = send_request(
+            router.clone(),
+            request(
+                "POST",
+                "/minga/change-requests",
+                ApiRole::Agent,
+                "tenant-b",
+                "agent-b",
+                Some(serde_json::json!({
+                    "action": "scale",
+                    "service_id": "svc-a",
+                    "replicas": 2
+                })),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        let (status, tenant_b_list) = send_request(
+            router.clone(),
+            request(
+                "GET",
+                "/minga/change-requests",
+                ApiRole::Viewer,
+                "tenant-b",
+                "viewer-b",
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(tenant_b_list.as_array().unwrap().is_empty());
+
+        let (status, _) = send_request(
+            router.clone(),
+            request(
+                "POST",
+                &format!("/minga/change-requests/{id}/approve"),
+                ApiRole::Deployer,
+                "tenant-b",
+                "deployer-b",
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        let (status, _) = send_request(
+            router.clone(),
+            request(
+                "POST",
+                &format!("/minga/change-requests/{id}/approve"),
+                ApiRole::Deployer,
+                "default",
+                "agent",
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            store.get_service("svc-a").await.unwrap().unwrap().replicas,
+            1
+        );
+
+        let (status, decision) = send_request(
+            router.clone(),
+            request(
+                "POST",
+                &format!("/minga/change-requests/{id}/approve"),
+                ApiRole::Deployer,
+                "default",
+                "deployer",
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(decision["status"], "approved");
+        assert_eq!(
+            store.get_service("svc-a").await.unwrap().unwrap().replicas,
+            2
+        );
+        let (status, rejected_request) = send_request(
+            router.clone(),
+            request(
+                "POST",
+                "/minga/change-requests",
+                ApiRole::Agent,
+                "default",
+                "agent-2",
+                Some(serde_json::json!({
+                    "action": "scale",
+                    "service_id": "svc-a",
+                    "replicas": 3
+                })),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let rejected_id = rejected_request["id"].as_str().unwrap();
+        let (status, rejected) = send_request(
+            router.clone(),
+            request(
+                "POST",
+                &format!("/minga/change-requests/{rejected_id}/reject"),
+                ApiRole::Deployer,
+                "default",
+                "deployer-2",
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(rejected["status"], "rejected");
+
+        let expired_before = store.get_service("svc-a").await.unwrap().unwrap();
+        let mut expired_after = expired_before.clone();
+        expired_after.replicas += 1;
+        store
+            .create_change_request(minga_state::types::ChangeRequest {
+                id: "cr-expired-api-test".into(),
+                tenant_id: "default".into(),
+                service_id: "svc-a".into(),
+                requester: "expired-agent".into(),
+                created_at_unix: 1,
+                expires_at_unix: 2,
+                kind: minga_state::types::ChangeKind::Scale,
+                before: expired_before,
+                after: expired_after,
+                status: minga_state::types::ChangeRequestStatus::Pending,
+                reviewer: None,
+                decided_at_unix: None,
+                audit: Vec::new(),
+            })
+            .await
+            .unwrap();
+        let (status, _) = send_request(
+            router,
+            request(
+                "POST",
+                "/minga/change-requests/cr-expired-api-test/approve",
+                ApiRole::Deployer,
+                "default",
+                "deployer-3",
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        let expired = store
+            .get_change_request("cr-expired-api-test")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            expired.status,
+            minga_state::types::ChangeRequestStatus::Expired
+        );
+        assert_eq!(
+            store.get_service("svc-a").await.unwrap().unwrap().replicas,
+            2
+        );
+
+        let audit = bus.list_audit("default", 20).await.unwrap();
+        assert!(audit
+            .iter()
+            .any(|record| record.action == "change_request.rejected"));
+        assert!(audit
+            .iter()
+            .any(|record| record.action == "change_request.expired"));
+
+        assert!(audit
+            .iter()
+            .any(|record| record.action == "change_request.created"));
+        assert!(audit
+            .iter()
+            .any(|record| record.action == "change_request.approved_and_applied"));
+    }
+
+    #[tokio::test]
     async fn task_view_uses_bus_actual_state_and_keeps_traefik_attachments() {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(
@@ -2440,6 +2910,13 @@ mod tests {
         );
 
         let req = Request::builder()
+            .uri("/v1.41/minga/cluster")
+            .body(Body::empty())
+            .unwrap();
+        let (status, _) = send_request(router.clone(), req).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        let req = Request::builder()
             .uri("/minga/managers")
             .body(Body::from(r#"{"id":2,"raft_addr":"127.0.0.1:1"}"#))
             .unwrap();
@@ -2456,6 +2933,32 @@ mod tests {
         let (status, body) = send_request(router.clone(), req).await;
         assert_eq!(status, StatusCode::CREATED, "{body}");
         assert_eq!(body["id"], 2);
+
+        let req = Request::builder()
+            .uri("/v1.41/minga/cluster")
+            .header("Authorization", "Bearer manager-secret")
+            .body(Body::empty())
+            .unwrap();
+        let (status, diagnostics) = send_request(router.clone(), req).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(diagnostics["server_version"], crate::models::MINGA_VERSION);
+        assert_eq!(diagnostics["api_version"], crate::models::API_VERSION);
+        assert_eq!(
+            diagnostics["state_format_version"],
+            minga_state::codec::FORMAT_VERSION
+        );
+        assert!(diagnostics["build_revision"]
+            .as_str()
+            .is_some_and(|revision| !revision.is_empty()));
+        assert_eq!(diagnostics["raft"]["node_id"], 1);
+        assert!(diagnostics["raft"]["ready"].as_bool().unwrap());
+        assert_eq!(diagnostics["raft"]["leader_id"], 1);
+        assert_eq!(diagnostics["raft"]["members"].as_array().unwrap().len(), 2);
+        assert_eq!(diagnostics["raft"]["members"][1]["id"], 2);
+        assert_eq!(diagnostics["raft"]["members"][1]["address"], addr2.as_str());
+        assert!(diagnostics["raft"]["members"][1]["voter"]
+            .as_bool()
+            .unwrap());
 
         let req = Request::builder()
             .method("DELETE")
@@ -2494,6 +2997,80 @@ mod tests {
             .await
             .unwrap();
         Arc::try_unwrap(store2)
+            .ok()
+            .unwrap()
+            .shutdown()
+            .await
+            .unwrap();
+    }
+    #[tokio::test]
+    async fn diagnostics_report_persisted_voters_and_unreachable_member() {
+        let dir1 = tempfile::tempdir().unwrap();
+        let dir2 = tempfile::tempdir().unwrap();
+        let store1 = Arc::new(
+            StateStore::open(1, "127.0.0.1:0", dir1.path(), BTreeMap::new())
+                .await
+                .unwrap(),
+        );
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr2 = listener.local_addr().unwrap().to_string();
+        drop(listener);
+        let store2 = Arc::new(StateStore::open_join(2, &addr2, dir2.path()).await.unwrap());
+        let router = build_router_with_bus_and_auth(
+            store1.clone(),
+            MemoryBus::new(),
+            Arc::new(ReadyState::new()),
+            Some("manager-secret".into()),
+        );
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/minga/managers")
+            .header("Authorization", "Bearer manager-secret")
+            .header("Content-Type", "application/json")
+            .body(Body::from(format!(r#"{{"id":2,"raft_addr":"{addr2}"}}"#)))
+            .unwrap();
+        let (status, _) = send_request(router.clone(), req).await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(store1.manager_voters().await, vec![1, 2]);
+
+        Arc::try_unwrap(store2)
+            .ok()
+            .unwrap()
+            .shutdown()
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let status = store1.raft_diagnostics().await;
+                let missing_voter = status.members.iter().any(|member| {
+                    member.id == 2 && member.voter && member.transport_reachable == Some(false)
+                });
+                if missing_voter && status.quorum_ack_recent == Some(false) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("diagnostics should expose a missing voter and stale quorum acknowledgment");
+
+        let req = Request::builder()
+            .uri("/v1.41/minga/cluster")
+            .header("Authorization", "Bearer manager-secret")
+            .body(Body::empty())
+            .unwrap();
+        let (status, diagnostics) = send_request(router, req).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(!diagnostics["raft"]["ready"].as_bool().unwrap());
+        assert_eq!(diagnostics["raft"]["quorum_ack_recent"], false);
+        assert_eq!(diagnostics["raft"]["members"].as_array().unwrap().len(), 2);
+        assert_eq!(diagnostics["raft"]["members"][1]["id"], 2);
+        assert!(!diagnostics["raft"]["members"][1]["transport_reachable"]
+            .as_bool()
+            .unwrap());
+
+        Arc::try_unwrap(store1)
             .ok()
             .unwrap()
             .shutdown()

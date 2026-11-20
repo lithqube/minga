@@ -222,11 +222,24 @@ minga-ctl context delete old
 | `--remote-token-file <PATH>` | File on the SSH target with the token: the bare token, or an env file with a `MINGA_API_TOKEN=` line (such as the API's `EnvironmentFile`). |
 | `--token-command <CMD>` | Local command that prints the token, run without a shell. |
 | `--tls-cert <PEM>` | CA certificate to trust for an `https://` endpoint. |
+| `--client-cert <PEM>` | Tenant-scoped API client certificate for maker-checker commands; direct HTTPS only. |
+| `--client-key <PEM>` | Matching private key, mode `0600`; used with `--client-cert`. |
 | `--node <TARGET>` | SSH target for node-local commands (secrets, images, registry logins). Repeat for each node. |
 | `--nats-url <URL>` | NATS URL for logs, as seen from where `minga logs` runs. |
 | `--metrics-endpoint <URL>` | Metrics URL, as seen from the SSH target. |
 | `--registry-auth-file <PATH>` | Docker credential file on the node that Minga reads when pulling. |
 | `--use` | Make it the current context. |
+
+For tenant approvals, use a tenant deployer/admin certificate and a direct
+HTTPS context:
+
+```bash
+minga-ctl context add tenant-a --endpoint https://manager.example:2376 \
+  --tls-cert ./server-ca/ca.pem \
+  --client-cert ./deployer.pem --client-key ./deployer-key.pem
+minga-ctl change list
+minga-ctl change approve cr-...
+```
 
 How a command picks its settings:
 
@@ -255,8 +268,32 @@ Through the API:
 | `service rollback SERVICE [--yes]` | Restores the spec saved before `minga-ctl` last changed or removed the service. One revision, saved on this machine: a deploy from CI cannot be rolled back from a laptop. |
 | `secret list` | Secret metadata; values never leave the nodes. |
 | `health [--stack STACK] [--timeout SECS]` | The API, and with `--stack` the stack's services and their health URLs. |
+| `info` | Client build, server version/build, Docker API version, persisted state format and Raft membership/quorum observations. |
+| `doctor [--bundle PATH] [--timeout SECS]` | Read-only API/readiness, Raft, bus, inventory, task and local auth/TLS diagnostics. Default probe timeout is 5 seconds. |
+| `upgrade preflight --to v1.3.0` | Read-only compatibility, Raft membership/quorum, selected-context auth/transport, backup, NATS, tenant impact, maintenance-order and rollback plan. Unknown release metadata fails closed; no upgrade is started. |
 | `metrics` | The Prometheus metrics the cluster reports. |
-| `agent usage [--customer ID] [--since 30d]` | Authenticates with the context API token as a cluster operator and reports usage totals by tenant. `minga-ctl` cannot present tenant client certificates, so it does not return per-tenant request rows; `--customer` is rejected for this caller. Read-only. |
+| `agent usage [--customer ID] [--since 30d]` | Uses the context API token as a cluster operator and reports aggregate usage by tenant. The usage API does not expose tenant-scoped request rows; `--customer` is rejected for this caller. Read-only. |
+| `change list [--limit N]`, `change approve ID`, `change reject ID` | Tenant-scoped maker-checker over a direct HTTPS context with a tenant client certificate/key. Listing requires a tenant viewer certificate; approval/rejection additionally require deployer/admin role. Approval applies the reviewed desired state atomically. |
+
+
+`doctor` reports observed status separately from unknowns; it never restarts or
+changes a cluster. A support bundle is JSON, created locally with mode `0600`,
+and refuses to overwrite an existing file. It includes version/build facts,
+readiness, Raft membership counts, inventory counts and sanitized findings.
+It omits tokens, command arguments, config paths and contents, NATS URLs,
+certificate contents, service/task errors and resource identifiers. HTTP
+response bodies are not copied into findings.
+
+The upgrade preflight uses the server's reported state format or known release
+metadata. Its current v1.3.0 target metadata is planned, not release approval.
+The v1.2.0 format-v2 to v1.3.0 format-v11 path is supported by checked-in
+migrations, but all Minga roles must move together because peer and worker
+wire frames are versioned. External NATS must meet JetStream API level 4; its
+version is not inferred from readiness.
+It also reports the observed Raft membership and the selected CLI context's
+token/transport configuration without exposing peer addresses or credential
+details. This is not proof of each manager's Raft TLS configuration; verify
+Raft and NATS TLS independently on every node.
 
 On the nodes, over SSH (`--ssh TARGET`, repeatable; by default the context's
 `--node` targets, else its `--ssh`, else this machine):

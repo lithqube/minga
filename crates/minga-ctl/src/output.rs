@@ -1,8 +1,8 @@
 //! Output rendering: table, JSON and YAML.
 //!
-//! Results go to stdout; progress, prompts and errors go to stderr. JSON and
-//! YAML output is an array of the same rows the table shows, with snake_case
-//! keys.
+//! Results go to stdout; progress, prompts and errors go to stderr. Row-based
+//! commands render JSON arrays or YAML sequences; structured reports render
+//! objects.
 
 use std::io::Write;
 
@@ -16,9 +16,9 @@ pub enum Format {
     /// Padded columns.
     #[default]
     Table,
-    /// A JSON array.
+    /// Structured JSON (an array for row-based commands).
     Json,
-    /// A YAML sequence.
+    /// Structured YAML (a sequence for row-based commands).
     Yaml,
 }
 

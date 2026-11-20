@@ -1,5 +1,6 @@
 mod bus;
 mod deploy;
+mod mcp;
 mod private;
 mod sidecar;
 mod state;
@@ -87,6 +88,11 @@ enum Command {
     Agent {
         #[command(subcommand)]
         cmd: AgentCommand,
+    },
+    /// Run a tenant-scoped Model Context Protocol server over stdio.
+    Mcp {
+        #[command(subcommand)]
+        cmd: McpCommand,
     },
     /// Show logs for a task.
     Logs {
@@ -177,6 +183,28 @@ enum AgentCommand {
         #[arg(long, env = "MINGA_NATS_URL")]
         nats_url: Option<String>,
     },
+}
+
+#[derive(Subcommand)]
+enum McpCommand {
+    /// Start the read-only MCP server using a tenant API client certificate.
+    Serve(McpServeArgs),
+}
+
+#[derive(Args)]
+struct McpServeArgs {
+    /// HTTPS URL of the Minga manager API.
+    #[arg(long, env = "MINGA_API_URL")]
+    api_url: String,
+    /// CA certificate that issued the manager API server certificate.
+    #[arg(long, env = "MINGA_API_CA")]
+    ca_cert: PathBuf,
+    /// Tenant-scoped API client certificate (PEM).
+    #[arg(long, env = "MINGA_CLIENT_CERT")]
+    client_cert: PathBuf,
+    /// Private key for the API client certificate (PEM, mode 0600).
+    #[arg(long, env = "MINGA_CLIENT_KEY")]
+    client_key: PathBuf,
 }
 
 #[derive(Subcommand)]
@@ -645,6 +673,18 @@ fn parse_labels(raw: &[String]) -> Result<std::collections::HashMap<String, Stri
     Ok(labels)
 }
 
+async fn run_mcp(cmd: McpCommand) -> ExitCode {
+    match cmd {
+        McpCommand::Serve(args) => {
+            if let Err(error) = mcp::serve(args).await {
+                eprintln!("error: {error}");
+                ExitCode::FAILURE
+            } else {
+                ExitCode::SUCCESS
+            }
+        }
+    }
+}
 #[tokio::main]
 async fn main() -> ExitCode {
     let cli = Cli::parse();
@@ -666,6 +706,14 @@ async fn main() -> ExitCode {
             let Some(loaded) = load(&args) else {
                 return ExitCode::FAILURE;
             };
+            let stack = loaded.project.name.as_deref().unwrap_or("validation");
+            let project_dir = project_dir(&args.compose_file);
+            if let Err(error) =
+                minga_scheduler::translate_project(&loaded.project, stack, project_dir.as_deref())
+            {
+                eprintln!("error: {error}");
+                return ExitCode::FAILURE;
+            }
             print_plan(&loaded);
         }
         Command::Deploy {
@@ -730,6 +778,7 @@ async fn main() -> ExitCode {
         Command::Egress(args) => return run_egress(args).await,
         Command::MigrateV1(args) => return run_migrate_v1(args).await,
         Command::Agent { cmd } => return run_agent(cmd).await,
+        Command::Mcp { cmd } => return run_mcp(cmd).await,
         Command::Logs {
             task_id,
             follow,

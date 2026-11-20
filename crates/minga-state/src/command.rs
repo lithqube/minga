@@ -3,8 +3,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::types::{
-    ClusterNode, Config, ConfigId, Network, NetworkId, NodeId, Secret, SecretId, Service,
-    ServiceId, Task, TaskId, Tenant, TenantId, TenantQuotas, Volume, VolumeId,
+    ChangeRequest, ClusterNode, Config, ConfigId, Network, NetworkId, NodeId, Secret, SecretId,
+    Service, ServiceId, Task, TaskId, Tenant, TenantId, TenantQuotas, Volume, VolumeId,
 };
 
 /// A mutation proposed to the Raft log. This is the `D` (app data) type.
@@ -51,6 +51,14 @@ pub enum StateCommand {
         quotas: TenantQuotas,
     },
     RemoveTenant(TenantId),
+    CreateChangeRequest(ChangeRequest),
+    DecideChangeRequest {
+        id: String,
+        tenant_id: TenantId,
+        actor: String,
+        approve: bool,
+        now_unix: u64,
+    },
     RecordNatsUserRevocation {
         user_public_key: String,
     },

@@ -28,6 +28,8 @@ const CHANNEL_CAPACITY: usize = 1024;
 
 /// How many log entries the in-memory bus retains per task.
 const LOG_HISTORY_CAPACITY: usize = 1000;
+/// Maximum retained tenant events for deterministic in-memory diagnostics.
+const TENANT_EVENT_HISTORY_CAPACITY: usize = 4096;
 
 // ---------------------------------------------------------------------------
 // MemoryBus
@@ -37,6 +39,7 @@ const LOG_HISTORY_CAPACITY: usize = 1000;
 pub struct MemoryBus {
     /// Broadcast channel for events.
     events_tx: broadcast::Sender<BusEvent>,
+    tenant_events: Mutex<VecDeque<(String, BusEvent)>>,
     /// Assignment KV store: key → latest manager-authored value.
     assignments: Mutex<HashMap<String, Vec<u8>>>,
     /// Broadcast channel for assignment KV notifications.
@@ -93,6 +96,7 @@ impl MemoryBus {
         let (tenant_logs_tx, _) = broadcast::channel(CHANNEL_CAPACITY);
         Arc::new(Self {
             events_tx,
+            tenant_events: Mutex::new(VecDeque::new()),
             assignments: Mutex::new(HashMap::new()),
             assignment_tx,
             kv: Mutex::new(HashMap::new()),
@@ -169,6 +173,19 @@ impl EventBus for MemoryBus {
         self.subscribe_events(&[&subjects::tenant_event_wildcard(tenant_id)])
             .await
     }
+    async fn tenant_event_history(&self, tenant_id: &str, limit: usize) -> Result<Vec<BusEvent>> {
+        validate_tenant_id(tenant_id)?;
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let events = self.tenant_events.lock().unwrap();
+        let matching = events
+            .iter()
+            .filter(|(tenant, _)| tenant == tenant_id)
+            .map(|(_, event)| event.clone())
+            .collect::<Vec<_>>();
+        Ok(matching[matching.len().saturating_sub(limit)..].to_vec())
+    }
     async fn configure_tenant_quota(
         &self,
         tenant_id: &str,
@@ -188,7 +205,22 @@ impl EventBus for MemoryBus {
                 "event subject is outside tenant namespace".into(),
             ));
         }
-        self.publish_event(subject, payload).await
+        let event = BusEvent {
+            subject: subject.to_owned(),
+            payload: payload.to_vec(),
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64,
+        };
+        let mut events = self.tenant_events.lock().unwrap();
+        events.push_back((tenant_id.to_owned(), event.clone()));
+        while events.len() > TENANT_EVENT_HISTORY_CAPACITY {
+            events.pop_front();
+        }
+        drop(events);
+        let _ = self.events_tx.send(event);
+        Ok(())
     }
     async fn put_assignment(&self, key: &str, value: &[u8]) -> Result<()> {
         self.assignments
@@ -856,6 +888,30 @@ mod tests {
     use super::*;
     use crate::subjects;
     use futures::StreamExt;
+
+    #[tokio::test]
+    async fn tenant_event_history_is_filtered_and_bounded() {
+        let bus = MemoryBus::new();
+        bus.publish_tenant_event("tenant-a", "minga.tenant-a.task.one.event", b"first")
+            .await
+            .unwrap();
+        bus.publish_tenant_event("tenant-b", "minga.tenant-b.task.two.event", b"private")
+            .await
+            .unwrap();
+        bus.publish_tenant_event("tenant-a", "minga.tenant-a.task.three.event", b"last")
+            .await
+            .unwrap();
+
+        let events = bus.tenant_event_history("tenant-a", 1).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].subject, "minga.tenant-a.task.three.event");
+        assert_eq!(events[0].payload, b"last");
+        assert!(bus
+            .tenant_event_history("tenant-a", 0)
+            .await
+            .unwrap()
+            .is_empty());
+    }
 
     // -- Subject matching ----------------------------------------------------
 

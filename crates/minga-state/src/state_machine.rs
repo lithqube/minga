@@ -19,9 +19,9 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::codec::{
-    check_format, FORMAT_KEY, FORMAT_VERSION, V2_FORMAT_VERSION, V3_FORMAT_VERSION,
-    V4_FORMAT_VERSION, V5_FORMAT_VERSION, V6_FORMAT_VERSION, V7_FORMAT_VERSION, V8_FORMAT_VERSION,
-    V9_FORMAT_VERSION,
+    check_format, FORMAT_KEY, FORMAT_VERSION, V10_FORMAT_VERSION, V2_FORMAT_VERSION,
+    V3_FORMAT_VERSION, V4_FORMAT_VERSION, V5_FORMAT_VERSION, V6_FORMAT_VERSION, V7_FORMAT_VERSION,
+    V8_FORMAT_VERSION, V9_FORMAT_VERSION,
 };
 use crate::command::{ObjectKind, StateCommand, StateResponse};
 use crate::types::*;
@@ -37,11 +37,12 @@ const NETWORKS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("netwo
 const VOLUMES_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("volumes");
 const SECRETS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("secrets");
 const CONFIGS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("configs");
+const CHANGE_REQUESTS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("change_requests");
 const TENANTS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("tenants");
 const SM_META_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("sm_meta");
 
 /// All entity tables, used for clearing on snapshot install.
-const ENTITY_TABLES: [TableDefinition<&str, &[u8]>; 8] = [
+const ENTITY_TABLES: [TableDefinition<&str, &[u8]>; 9] = [
     NODES_TABLE,
     SERVICES_TABLE,
     TASKS_TABLE,
@@ -50,16 +51,17 @@ const ENTITY_TABLES: [TableDefinition<&str, &[u8]>; 8] = [
     SECRETS_TABLE,
     CONFIGS_TABLE,
     TENANTS_TABLE,
+    CHANGE_REQUESTS_TABLE,
 ];
 
-/// Re-encodes entity records and advances the marker during the v10 migration.
+/// Re-encodes entity records and advances the marker during format migration.
 ///
 /// The caller advances the marker in the same redb transaction, so a failure
 /// leaves both the old values and the old marker intact.
 #[allow(clippy::result_large_err)]
 fn migrate_state(tx: &redb::WriteTransaction) -> Result<(), StorageIOError<u64>> {
     // Serde defaults fields introduced in later formats; re-encoding applies
-    // the egress policy and agent capability shapes and earlier additions.
+    // prior migrations. The v11 table starts empty on upgraded state.
     rewrite_state_table::<ClusterNode>(tx, NODES_TABLE)?;
     rewrite_state_table::<Tenant>(tx, TENANTS_TABLE)?;
     rewrite_state_table::<Service>(tx, SERVICES_TABLE)?;
@@ -67,6 +69,8 @@ fn migrate_state(tx: &redb::WriteTransaction) -> Result<(), StorageIOError<u64>>
     rewrite_state_table::<Network>(tx, NETWORKS_TABLE)?;
     rewrite_state_table::<Volume>(tx, VOLUMES_TABLE)?;
     rewrite_state_table::<Secret>(tx, SECRETS_TABLE)?;
+    // The v11 table starts empty on upgraded state.
+    let _ = tx.open_table(CHANGE_REQUESTS_TABLE).map_err(sm_io_err)?;
     rewrite_state_table::<Config>(tx, CONFIGS_TABLE)?;
     let mut meta = tx.open_table(SM_META_TABLE).map_err(sm_io_err)?;
     meta.insert(FORMAT_KEY, [FORMAT_VERSION].as_slice())
@@ -322,8 +326,50 @@ fn tenant_has_resources(
             })?
             || tenant_has_records::<Config>(tx, CONFIGS_TABLE, tenant_id, |r, id| {
                 r.tenant_id == id
-            })?,
+            })?
+            || tenant_has_records::<ChangeRequest>(
+                tx,
+                CHANGE_REQUESTS_TABLE,
+                tenant_id,
+                |r, id| r.tenant_id == id,
+            )?,
     )
+}
+
+fn valid_change_request_after(request: &ChangeRequest) -> bool {
+    match request.kind {
+        ChangeKind::Deploy => {
+            let mut expected = request.before.clone();
+            let mut previous = request.before.clone();
+            previous.previous = None;
+            expected.previous = Some(Box::new(previous));
+            expected.image = request.after.image.clone();
+            request.before.agent.is_none()
+                && !request.after.image.trim().is_empty()
+                && request.after.image.len() <= 512
+                && !request.after.image.chars().any(char::is_control)
+                && expected == request.after
+        }
+        ChangeKind::Scale => {
+            let mut expected = request.before.clone();
+            expected.replicas = request.after.replicas;
+            (1..=1000).contains(&request.after.replicas) && expected == request.after
+        }
+        ChangeKind::Rollback => {
+            let Some(mut expected) = request.before.previous.as_deref().cloned() else {
+                return false;
+            };
+            let mut previous = request.before.clone();
+            previous.previous = None;
+            expected.previous = Some(Box::new(previous));
+            expected == request.after
+        }
+        ChangeKind::Stop => {
+            let mut expected = request.before.clone();
+            expected.replicas = 0;
+            expected == request.after
+        }
+    }
 }
 
 // --- snapshot -----------------------------------------------------------------
@@ -340,6 +386,8 @@ struct StateSnapshot {
     configs: Vec<Config>,
     #[serde(default)]
     tenants: Vec<Tenant>,
+    #[serde(default)]
+    change_requests: Vec<ChangeRequest>,
     last_applied: Option<LogId<u64>>,
     last_membership: StoredMembership<u64, BasicNode>,
 }
@@ -389,6 +437,7 @@ impl RedbStateMachine {
             || stored.as_deref() == Some(&[V7_FORMAT_VERSION])
             || stored.as_deref() == Some(&[V8_FORMAT_VERSION])
             || stored.as_deref() == Some(&[V9_FORMAT_VERSION])
+            || stored.as_deref() == Some(&[V10_FORMAT_VERSION])
         {
             migrate_state(&tx)?;
         } else {
@@ -963,6 +1012,169 @@ impl RedbStateMachine {
                 t.remove(id.as_str()).map_err(sm_io_err)?;
                 Ok(StateResponse::Ok)
             }
+            StateCommand::CreateChangeRequest(request) => {
+                if request.id.is_empty()
+                    || request.id.len() > 128
+                    || request.expires_at_unix <= request.created_at_unix
+                    || request.before.id != request.service_id
+                    || request.after.id != request.service_id
+                    || request.before.tenant_id != request.tenant_id
+                    || request.after.tenant_id != request.tenant_id
+                    || !valid_change_request_after(request)
+                {
+                    return Ok(StateResponse::Error("invalid change request".into()));
+                }
+                if tenant_quota(tx, &request.tenant_id)?.is_none() {
+                    return Ok(StateResponse::NotFound);
+                }
+                let current = {
+                    let services = tx.open_table(SERVICES_TABLE).map_err(sm_io_err)?;
+                    let current = services
+                        .get(request.service_id.as_str())
+                        .map_err(sm_io_err)?
+                        .map(|value| crate::codec::decode::<Service>(value.value()))
+                        .transpose()
+                        .map_err(|error| {
+                            sm_storage_err(ErrorSubject::Store, ErrorVerb::Read, error)
+                        })?;
+                    current
+                };
+                if current.as_ref() != Some(&request.before) {
+                    return Ok(StateResponse::Conflict(
+                        "service changed while the request was being created".into(),
+                    ));
+                }
+                let mut request = request.clone();
+                request.status = ChangeRequestStatus::Pending;
+                request.reviewer = None;
+                request.decided_at_unix = None;
+                request.audit = vec![ChangeRequestAudit {
+                    action: "created".into(),
+                    actor: request.requester.clone(),
+                    occurred_at_unix: request.created_at_unix,
+                }];
+                let bytes = crate::codec::encode(&request).map_err(|error| {
+                    sm_storage_err(ErrorSubject::Store, ErrorVerb::Write, error)
+                })?;
+                let mut requests = tx.open_table(CHANGE_REQUESTS_TABLE).map_err(sm_io_err)?;
+                if requests
+                    .get(request.id.as_str())
+                    .map_err(sm_io_err)?
+                    .is_some()
+                {
+                    return Ok(StateResponse::Conflict(
+                        "change request ID already exists".into(),
+                    ));
+                }
+                requests
+                    .insert(request.id.as_str(), bytes.as_slice())
+                    .map_err(sm_io_err)?;
+                Ok(StateResponse::Ok)
+            }
+            StateCommand::DecideChangeRequest {
+                id,
+                tenant_id,
+                actor,
+                approve,
+                now_unix,
+            } => {
+                let Some(mut request) = ({
+                    let requests = tx.open_table(CHANGE_REQUESTS_TABLE).map_err(sm_io_err)?;
+                    let request = requests
+                        .get(id.as_str())
+                        .map_err(sm_io_err)?
+                        .map(|value| crate::codec::decode::<ChangeRequest>(value.value()))
+                        .transpose()
+                        .map_err(|error| {
+                            sm_storage_err(ErrorSubject::Store, ErrorVerb::Read, error)
+                        })?;
+                    request
+                }) else {
+                    return Ok(StateResponse::NotFound);
+                };
+                if request.tenant_id != *tenant_id {
+                    return Ok(StateResponse::NotFound);
+                }
+                if request.status != ChangeRequestStatus::Pending {
+                    return Ok(StateResponse::Conflict(
+                        "change request is no longer pending".into(),
+                    ));
+                }
+                if request.requester == *actor {
+                    return Ok(StateResponse::Conflict(
+                        "the requester cannot decide their own change request".into(),
+                    ));
+                }
+                let action = if *now_unix >= request.expires_at_unix {
+                    request.status = ChangeRequestStatus::Expired;
+                    "expired"
+                } else if !approve {
+                    request.status = ChangeRequestStatus::Rejected;
+                    "rejected"
+                } else {
+                    let current = {
+                        let services = tx.open_table(SERVICES_TABLE).map_err(sm_io_err)?;
+                        let current = services
+                            .get(request.service_id.as_str())
+                            .map_err(sm_io_err)?
+                            .map(|value| crate::codec::decode::<Service>(value.value()))
+                            .transpose()
+                            .map_err(|error| {
+                                sm_storage_err(ErrorSubject::Store, ErrorVerb::Read, error)
+                            })?;
+                        current
+                    };
+                    if current.as_ref() != Some(&request.before) {
+                        request.status = ChangeRequestStatus::Superseded;
+                        request.reviewer = Some(actor.clone());
+                        request.decided_at_unix = Some(*now_unix);
+                        request.audit.push(ChangeRequestAudit {
+                            action: "superseded".into(),
+                            actor: actor.clone(),
+                            occurred_at_unix: *now_unix,
+                        });
+                        let bytes = crate::codec::encode(&request).map_err(|error| {
+                            sm_storage_err(ErrorSubject::Store, ErrorVerb::Write, error)
+                        })?;
+                        let mut requests =
+                            tx.open_table(CHANGE_REQUESTS_TABLE).map_err(sm_io_err)?;
+                        requests
+                            .insert(request.id.as_str(), bytes.as_slice())
+                            .map_err(sm_io_err)?;
+                        return Ok(StateResponse::Conflict(
+                            "service changed after this request was created".into(),
+                        ));
+                    }
+                    match Self::apply_command(
+                        tx,
+                        &StateCommand::UpsertService(request.after.clone()),
+                    )? {
+                        StateResponse::Ok => {}
+                        response => return Ok(response),
+                    }
+                    request.status = ChangeRequestStatus::Approved;
+                    "approved_and_applied"
+                };
+                request.reviewer = Some(actor.clone());
+                request.decided_at_unix = Some(*now_unix);
+                request.audit.push(ChangeRequestAudit {
+                    action: action.into(),
+                    actor: actor.clone(),
+                    occurred_at_unix: *now_unix,
+                });
+                let bytes = crate::codec::encode(&request).map_err(|error| {
+                    sm_storage_err(ErrorSubject::Store, ErrorVerb::Write, error)
+                })?;
+                let mut requests = tx.open_table(CHANGE_REQUESTS_TABLE).map_err(sm_io_err)?;
+                requests
+                    .insert(request.id.as_str(), bytes.as_slice())
+                    .map_err(sm_io_err)?;
+                if request.status == ChangeRequestStatus::Expired {
+                    Ok(StateResponse::Conflict("change request expired".into()))
+                } else {
+                    Ok(StateResponse::Ok)
+                }
+            }
         }
     }
 
@@ -1023,6 +1235,33 @@ impl RedbStateMachine {
             services.push(svc);
         }
         Ok(services)
+    }
+
+    pub async fn get_change_request(&self, id: &str) -> Result<Option<ChangeRequest>, String> {
+        let db = self.db.lock().unwrap();
+        let tx = db.begin_read().map_err(|e| e.to_string())?;
+        let table = tx
+            .open_table(CHANGE_REQUESTS_TABLE)
+            .map_err(|e| e.to_string())?;
+        table
+            .get(id)
+            .map_err(|e| e.to_string())?
+            .map(|value| crate::codec::decode(value.value()).map_err(|e| e.to_string()))
+            .transpose()
+    }
+
+    pub async fn list_change_requests(&self) -> Result<Vec<ChangeRequest>, String> {
+        let db = self.db.lock().unwrap();
+        let tx = db.begin_read().map_err(|e| e.to_string())?;
+        let table = tx
+            .open_table(CHANGE_REQUESTS_TABLE)
+            .map_err(|e| e.to_string())?;
+        let mut requests = Vec::new();
+        for row in table.iter().map_err(|e| e.to_string())? {
+            let (_, value) = row.map_err(|e| e.to_string())?;
+            requests.push(crate::codec::decode(value.value()).map_err(|e| e.to_string())?);
+        }
+        Ok(requests)
     }
 
     pub async fn get_task(&self, id: &str) -> Result<Option<Task>, String> {
@@ -1343,6 +1582,15 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
                     .map_err(sm_io_err)?;
             }
         }
+        {
+            let mut t = tx.open_table(CHANGE_REQUESTS_TABLE).map_err(sm_io_err)?;
+            for request in &snap.change_requests {
+                let bytes = crate::codec::encode(request)
+                    .map_err(|e| sm_storage_err(ErrorSubject::Store, ErrorVerb::Write, e))?;
+                t.insert(request.id.as_str(), bytes.as_slice())
+                    .map_err(sm_io_err)?;
+            }
+        }
 
         // Save snapshot metadata.
         Self::save_meta(&tx, snap.last_applied, &snap.last_membership)?;
@@ -1385,6 +1633,7 @@ impl RaftSnapshotBuilder<TypeConfig> for RedbSnapshotBuilder {
             secrets: Vec::new(),
             configs: Vec::new(),
             tenants: Vec::new(),
+            change_requests: Vec::new(),
             last_applied: None,
             last_membership: StoredMembership::default(),
         };
@@ -1460,6 +1709,15 @@ impl RaftSnapshotBuilder<TypeConfig> for RedbSnapshotBuilder {
                 let tenant: Tenant = crate::codec::decode(value.value())
                     .map_err(|e| sm_storage_err(ErrorSubject::Store, ErrorVerb::Read, e))?;
                 snap.tenants.push(tenant);
+            }
+        }
+        {
+            let t = tx.open_table(CHANGE_REQUESTS_TABLE).map_err(sm_io_err)?;
+            for row in t.iter().map_err(sm_io_err)? {
+                let (_, value) = row.map_err(sm_io_err)?;
+                let request: ChangeRequest = crate::codec::decode(value.value())
+                    .map_err(|e| sm_storage_err(ErrorSubject::Store, ErrorVerb::Read, e))?;
+                snap.change_requests.push(request);
             }
         }
         // Read metadata.

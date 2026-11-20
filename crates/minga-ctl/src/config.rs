@@ -42,6 +42,12 @@ pub struct Context {
     pub token_command: Option<Vec<String>>,
     /// PEM CA certificate to trust for an `https://` endpoint.
     pub tls_cert: Option<PathBuf>,
+    /// Client certificate for tenant-scoped mTLS operations.
+    #[serde(default)]
+    pub client_cert: Option<PathBuf>,
+    /// Private key matching `client_cert`; keep mode 0600.
+    #[serde(default)]
+    pub client_key: Option<PathBuf>,
     /// Metrics URL. With `ssh`, as seen from the SSH target.
     pub metrics_endpoint: Option<String>,
     /// NATS URL for logs, as seen from where `minga logs` runs.

@@ -71,6 +71,13 @@ pub async fn connect(resolved: &Resolved, debug: bool) -> Result<Connection, Ctl
     }
 
     // Direct transport: http:// to loopback, or https:// (plan item 4).
+    if (resolved.context.client_cert.is_some() || resolved.context.client_key.is_some())
+        && !resolved.endpoint.starts_with("https://")
+    {
+        return Err(CtlError::Config(
+            "mTLS client identity requires a direct HTTPS endpoint".into(),
+        ));
+    }
     config::check_endpoint_policy(None, &resolved.endpoint)?;
     let metrics = match &resolved.context.metrics_endpoint {
         Some(url) => {
@@ -79,10 +86,12 @@ pub async fn connect(resolved: &Resolved, debug: bool) -> Result<Connection, Ctl
         }
         None => resolved.endpoint.trim_end_matches('/').to_string(),
     };
-    let api = ApiClient::new(
+    let api = ApiClient::new_with_identity(
         &resolved.endpoint,
         resolved.token.clone(),
         resolved.context.tls_cert.as_deref(),
+        resolved.context.client_cert.as_deref(),
+        resolved.context.client_key.as_deref(),
         &resolved.name,
         debug,
     )?;
@@ -99,6 +108,11 @@ async fn connect_ssh(
     target: &str,
     debug: bool,
 ) -> Result<Connection, CtlError> {
+    if resolved.context.client_cert.is_some() || resolved.context.client_key.is_some() {
+        return Err(CtlError::Config(
+            "mTLS client identity is only supported on a direct HTTPS endpoint".into(),
+        ));
+    }
     validate_target(target)?;
     let api_dest = forward_dest(&resolved.endpoint)?;
     let metrics_dest = resolved

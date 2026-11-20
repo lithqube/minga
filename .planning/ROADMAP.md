@@ -119,12 +119,12 @@ Sequential implementation for one developer: B (NATS TLS/transport boundary) →
 **Requirements:** OPS-VERSION, OPS-RAFT, OPS-COMPOSE, OPS-DOCTOR, OPS-UPGRADE, AGENT-CONTRACT, AGENT-APPROVAL, RC-PROOF
 **Plan:** `.planning/phases/16-agent-ready-operations/16-PLAN.md`
 **Mode:** standard
-**Status:** Planned for v1.3.0
+**Status:** Implementation complete through 16-06 in the Phase 16 worktree, not merged to `main`; 16-07 remains gated on a v1.3.0 release candidate.
 
-- [ ] 16-01 — Report exact binary/build and persisted Raft membership, leader and quorum; distinguish them from `--peer` bootstrap inputs.
-- [ ] 16-02 — Verify Compose fidelity, including `deploy.labels`; implement supported behavior or reject it before state changes.
-- [ ] 16-03 — Add read-only `minga-ctl doctor` and redacted support evidence.
-- [ ] 16-04 — Add a compatibility/upgrade preflight with backup, migration and rollback guidance; no destructive side effects.
-- [ ] 16-05 — Implement tenant-scoped typed MCP read tools (Agent Plane D11).
-- [ ] 16-06 — Implement same-tenant maker-checker change requests with audit (Agent Plane D12).
-- [ ] 16-07 — At the v1.3.0 release-candidate gate, prove Phase 15 tenant isolation and staging upgrade on the exact candidate. No VM tests before then.
+- [x] 16-01 — Report exact binary/build and persisted Raft membership, leader and quorum; distinguish them from `--peer` bootstrap inputs.
+- [x] 16-02 — Verify Compose fidelity, including `deploy.labels`; implement supported behavior or reject it before state changes.
+- [x] 16-03 — Add read-only `minga-ctl doctor` and redacted support evidence.
+- [x] 16-04 — Add a compatibility/upgrade preflight with backup, migration and rollback guidance; no destructive side effects.
+- [x] 16-05 — Implement tenant-scoped typed MCP read tools (Agent Plane D11).
+- [x] 16-06 — Implement same-tenant maker-checker change requests with distinct approver, expiry and audit (Agent Plane D12).
+- [ ] 16-07 — Run the prepared candidate-gated tenant-isolation and staging-upgrade verification; execution is blocked until the v1.3.0 release candidate is ready (no VM tests before then).

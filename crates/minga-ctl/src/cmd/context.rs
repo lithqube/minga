@@ -51,6 +51,12 @@ pub struct AddArgs {
     /// PEM CA certificate to trust for an `https://` endpoint.
     #[arg(long)]
     pub tls_cert: Option<PathBuf>,
+    /// Tenant-scoped API client certificate (PEM).
+    #[arg(long)]
+    pub client_cert: Option<PathBuf>,
+    /// Private key matching `--client-cert` (PEM, mode 0600).
+    #[arg(long)]
+    pub client_key: Option<PathBuf>,
     /// Metrics URL. With `--ssh`, as seen from the SSH target.
     #[arg(long)]
     pub metrics_endpoint: Option<String>,
@@ -87,12 +93,25 @@ fn add(args: &AddArgs, quiet: bool) -> Result<(), CtlError> {
         remote_token_file,
         token_command,
         tls_cert,
+        client_cert,
+        client_key,
         metrics_endpoint,
         nats_url,
         nodes,
         registry_auth_file,
         use_current,
     } = args;
+
+    if client_cert.is_some() != client_key.is_some() {
+        return Err(CtlError::Usage(
+            "--client-cert and --client-key must be set together".to_string(),
+        ));
+    }
+    if client_cert.is_some() && (!endpoint.starts_with("https://") || ssh.is_some()) {
+        return Err(CtlError::Usage(
+            "mTLS client identity requires a direct https:// endpoint".to_string(),
+        ));
+    }
 
     if name.is_empty() {
         return Err(CtlError::Usage("a context needs a name".to_string()));
@@ -138,6 +157,8 @@ fn add(args: &AddArgs, quiet: bool) -> Result<(), CtlError> {
         remote_token_file: remote_token_file.clone(),
         token_command: command,
         tls_cert: tls_cert.clone(),
+        client_cert: client_cert.clone(),
+        client_key: client_key.clone(),
         metrics_endpoint: metrics_endpoint.clone(),
         nats_url: nats_url.clone(),
         nodes: nodes.clone(),
@@ -278,5 +299,35 @@ mod tests {
             token_label(&Context::default()),
             TokenSource::None
         ));
+    }
+    fn mtls_args(endpoint: &str, ssh: Option<&str>) -> AddArgs {
+        AddArgs {
+            name: "tenant".into(),
+            ssh: ssh.map(str::to_owned),
+            endpoint: endpoint.into(),
+            remote_token_file: None,
+            token_command: None,
+            tls_cert: Some(PathBuf::from("ca.pem")),
+            client_cert: Some(PathBuf::from("client.pem")),
+            client_key: Some(PathBuf::from("client.key")),
+            metrics_endpoint: None,
+            nats_url: None,
+            nodes: Vec::new(),
+            registry_auth_file: None,
+            use_current: false,
+        }
+    }
+
+    #[test]
+    fn mtls_contexts_require_direct_https() {
+        let err = add(&mtls_args("http://manager.example:2375", None), false).unwrap_err();
+        assert!(matches!(err, CtlError::Usage(_)), "{err:?}");
+
+        let err = add(
+            &mtls_args("https://manager.example:2376", Some("user@manager")),
+            false,
+        )
+        .unwrap_err();
+        assert!(matches!(err, CtlError::Usage(_)), "{err:?}");
     }
 }

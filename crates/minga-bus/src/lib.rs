@@ -404,6 +404,9 @@ pub trait EventBus: Send + Sync {
         payload: &[u8],
     ) -> Result<()>;
     async fn subscribe_tenant_events(&self, tenant_id: &str) -> Result<EventStream>;
+    /// Read at most `limit` retained events from one tenant's event subjects,
+    /// oldest first. A zero limit returns no events.
+    async fn tenant_event_history(&self, tenant_id: &str, limit: usize) -> Result<Vec<BusEvent>>;
     async fn configure_tenant_quota(
         &self,
         tenant_id: &str,

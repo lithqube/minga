@@ -17,25 +17,27 @@
 //! # Format marker
 //!
 //! Each redb file stores [`FORMAT_VERSION`] under [`FORMAT_KEY`] in its
-//! metadata table. A store with data and no marker was written by minga 1.0.2
-//! Formats v2 through v9 migrate to v10 on open; portable snapshots are
-//! migrated on import.
+//! metadata table. Formats v2 through v10 migrate to v11 on open; portable
+//! snapshots are migrated on import.
 //!
 //! # Wire frame
 //!
 //! A Raft message is `[u32 BE length][u8 FORMAT_VERSION][JSON]`, the length
 //! covering the version byte and the JSON. Since peers reject a different
-//! frame version, v10 requires a coordinated upgrade of every cluster node;
-//! mixed v9/v10 nodes cannot exchange Raft messages. Worker assignments use
-//! the same frame, so a v9 worker refuses a v10 task instead of dropping its
-//! egress policy.
+//! frame version, v11 requires a coordinated upgrade of every cluster node;
+//! mixed v10/v11 nodes cannot exchange Raft messages. Worker assignments use
+//! the same frame, so a v10 worker refuses a v11 task instead of dropping its
+//! state.
 
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
 /// Version of the persisted and wire format. Bump it for every persisted
 /// field-shape change and add the corresponding migration.
-pub const FORMAT_VERSION: u8 = 10;
+pub const FORMAT_VERSION: u8 = 11;
+
+/// The persisted version immediately before Raft-backed change requests.
+pub const V10_FORMAT_VERSION: u8 = 10;
 
 /// The persisted version immediately before service and task egress policy
 /// were added.

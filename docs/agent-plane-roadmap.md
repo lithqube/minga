@@ -65,11 +65,58 @@ Implemented on current `main` (PR #103 and preceding agent-plane changes):
     - Write tools only *propose* (item 12).
 
     This gives an ops agent a scoped interface instead of SSH.
+
+Phase 16 implementation: `minga mcp serve` is a stdio MCP server with a fixed
+tenant-scoped read allow-list for status, tenants, nodes, services, tasks,
+bounded task logs, event metadata, usage and derived diagnostics. It requires
+an HTTPS manager endpoint, a trusted API CA and a tenant client certificate
+with a protected private key; `O=*` and bearer tokens are not accepted. The
+server never exposes arbitrary HTTP, service environment values, task error
+text or event payloads. Event results contain only subject, observation time
+and payload. Its `request_change` write proposal is advertised only to agent
+certificates and implements item 12; no other write tool is exposed.
+
+Example setup (the client CA must match the manager's API client CA; the CA
+passed to `--ca-cert` must issue the manager's HTTPS server certificate):
+
+```sh
+minga tls issue-client --ca-dir ./client-ca --out-dir ./mcp-client \
+  --cn tenant-ops --role viewer --tenant tenant-a
+minga mcp serve --api-url https://manager.example:2376 \
+  --ca-cert ./server-ca/ca.pem \
+  --client-cert ./mcp-client/tenant-ops.pem \
+  --client-key ./mcp-client/tenant-ops-key.pem
+```
 12. **Change requests (maker-checker).** Adds a new certificate role, `agent`, below `deployer`:
     - An `agent` can create a change request (deploy, scale, rollback, stop) but cannot apply it.
     - A `deployer` or `admin` **of the same tenant** approves it with `minga-ctl change approve ID`.
     - The approver must not be the requester, and requests expire.
     - Requests are desired state (Raft). Every create, approve, reject and expire writes the existing audit line.
+
+Phase 16 implementation: certificate role `agent` is below `deployer`; only
+agent identities can propose, and only a distinct same-tenant deployer/admin
+can decide. Requests expire after 15 minutes and persist with their lifecycle
+audit in Raft. Approval compares the reviewed base service and applies the
+desired-state update atomically; stale proposals become `superseded`. The
+existing tenant audit stream records create, approve-and-apply, reject, expire
+and supersede outcomes. `minga-ctl context add` accepts
+`--client-cert`/`--client-key`; `minga-ctl change list|approve|reject` uses
+mTLS and never sends a configured bearer token. The supported proposals are
+image deployment for an existing container service, scale to 1–1000 replicas,
+rollback to the stored previous revision, and stop by setting replicas to
+zero. New-service creation is not an agent proposal.
+
+Provision a tenant agent certificate with:
+
+```sh
+minga tls issue-client --ca-dir ./client-ca --out-dir ./mcp-client \
+  --cn tenant-agent --role agent --tenant tenant-a
+```
+
+Configure `minga mcp serve` with the HTTPS manager URL, server CA, agent
+certificate and mode-0600 private key. A deployer/admin uses a separate tenant
+certificate and a direct HTTPS `minga-ctl` context to review the image/replica
+change and approve or reject it.
 13. **Jobs and schedules.**
     - `x-minga-job: { schedule: "0 3 * * *", deadline: 600s, concurrency: forbid }` runs a container or agent to completion.
     - When the deadline passes, the task is killed, which fixes agent threads that cannot be cancelled in process.

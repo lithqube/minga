@@ -17,8 +17,9 @@ use minga_bus::{
     subjects, AuditRecord, EventBus, TaskActualState, TaskStatusReport, UsageEvent, UsageTotals,
 };
 use minga_state::types::{
-    unix_now, ClusterNode, NodeStatus as MingaNodeStatus, ResourceSpec, Service as StateService,
-    Task, Tenant, TenantQuotas,
+    unix_now, ChangeKind, ChangeRequest, ChangeRequestAudit, ChangeRequestStatus, ClusterNode,
+    NodeStatus as MingaNodeStatus, ResourceSpec, Service as StateService, Task, Tenant,
+    TenantQuotas,
 };
 use minga_state::{join_token::JoinTokenKey, StateStore};
 use serde::{Deserialize, Serialize};
@@ -247,6 +248,283 @@ async fn append_tenant_audit(
     .map_err(|error| ApiError::Unavailable(format!("tenant audit append failed: {error}")))
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ChangeProposal {
+    Deploy { service_id: String, image: String },
+    Scale { service_id: String, replicas: u32 },
+    Rollback { service_id: String },
+    Stop { service_id: String },
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChangeRequestQuery {
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+struct ChangeServiceSummary {
+    image: String,
+    replicas: u32,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ChangeRequestView {
+    id: String,
+    tenant_id: String,
+    service_id: String,
+    requester: String,
+    created_at_unix: u64,
+    expires_at_unix: u64,
+    kind: ChangeKind,
+    before: ChangeServiceSummary,
+    after: ChangeServiceSummary,
+    status: ChangeRequestStatus,
+    reviewer: Option<String>,
+    decided_at_unix: Option<u64>,
+    audit: Vec<ChangeRequestAudit>,
+}
+
+impl From<ChangeRequest> for ChangeRequestView {
+    fn from(request: ChangeRequest) -> Self {
+        Self {
+            id: request.id,
+            tenant_id: request.tenant_id,
+            service_id: request.service_id,
+            requester: request.requester,
+            created_at_unix: request.created_at_unix,
+            expires_at_unix: request.expires_at_unix,
+            kind: request.kind,
+            before: ChangeServiceSummary {
+                image: request.before.image,
+                replicas: request.before.replicas,
+            },
+            after: ChangeServiceSummary {
+                image: request.after.image,
+                replicas: request.after.replicas,
+            },
+            status: request.status,
+            reviewer: request.reviewer,
+            decided_at_unix: request.decided_at_unix,
+            audit: request.audit,
+        }
+    }
+}
+
+const CHANGE_REQUEST_TTL_SECS: u64 = 15 * 60;
+
+fn new_change_request_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos());
+    format!(
+        "cr-{:x}-{:x}-{:x}",
+        nanos,
+        std::process::id(),
+        NEXT_ID.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+pub async fn create_change_request(
+    State(app): State<Arc<AppState>>,
+    Extension(caller): Extension<Caller>,
+    Json(proposal): Json<ChangeProposal>,
+) -> ApiResult<(StatusCode, Json<ChangeRequestView>)> {
+    let tenant_id = tenant_scope(&caller)?;
+    let (service_id, kind) = match &proposal {
+        ChangeProposal::Deploy { service_id, .. } => (service_id.clone(), ChangeKind::Deploy),
+        ChangeProposal::Scale { service_id, .. } => (service_id.clone(), ChangeKind::Scale),
+        ChangeProposal::Rollback { service_id } => (service_id.clone(), ChangeKind::Rollback),
+        ChangeProposal::Stop { service_id } => (service_id.clone(), ChangeKind::Stop),
+    };
+    if service_id.is_empty() || service_id.len() > 400 {
+        return Err(bad_request("service_id must be between 1 and 400 bytes"));
+    }
+    let before = app
+        .store
+        .get_service(&service_id)
+        .await?
+        .filter(|service| service.tenant_id == tenant_id)
+        .ok_or_else(|| not_found("service", &service_id))?;
+    let mut after = before.clone();
+    match proposal {
+        ChangeProposal::Deploy { image, .. } => {
+            if before.agent.is_some()
+                || image.trim().is_empty()
+                || image.len() > 512
+                || image.chars().any(char::is_control)
+            {
+                return Err(bad_request(
+                    "deploy requires a container image of 1–512 printable bytes",
+                ));
+            }
+            let mut prior = before.clone();
+            prior.previous = None;
+            after.previous = Some(Box::new(prior));
+            after.image = image;
+        }
+        ChangeProposal::Scale { replicas, .. } => {
+            if !(1..=1000).contains(&replicas) {
+                return Err(bad_request("replicas must be between 1 and 1000"));
+            }
+            after.replicas = replicas;
+        }
+        ChangeProposal::Rollback { .. } => {
+            let Some(mut previous) = before.previous.as_deref().cloned() else {
+                return Err(conflict("service has no rollback revision"));
+            };
+            let mut current = before.clone();
+            current.previous = None;
+            previous.previous = Some(Box::new(current));
+            after = previous;
+        }
+        ChangeProposal::Stop { .. } => after.replicas = 0,
+    }
+    let created_at_unix = unix_now();
+    let request = ChangeRequest {
+        id: new_change_request_id(),
+        tenant_id: tenant_id.to_owned(),
+        service_id: service_id.clone(),
+        requester: caller.name.clone(),
+        created_at_unix,
+        expires_at_unix: created_at_unix.saturating_add(CHANGE_REQUEST_TTL_SECS),
+        kind,
+        before,
+        after,
+        status: ChangeRequestStatus::Pending,
+        reviewer: None,
+        decided_at_unix: None,
+        audit: Vec::new(),
+    };
+    app.store.create_change_request(request.clone()).await?;
+    append_tenant_audit(
+        &app,
+        tenant_id,
+        &caller.name,
+        "change_request.created",
+        &format!("/minga/change-requests/{}", request.id),
+    )
+    .await?;
+    let persisted = app
+        .store
+        .get_change_request(&request.id)
+        .await?
+        .ok_or_else(|| not_found("change request", &request.id))?;
+    Ok((
+        StatusCode::CREATED,
+        Json(ChangeRequestView::from(persisted)),
+    ))
+}
+
+pub async fn list_change_requests(
+    State(app): State<Arc<AppState>>,
+    Extension(caller): Extension<Caller>,
+    Query(query): Query<ChangeRequestQuery>,
+) -> ApiResult<Json<Vec<ChangeRequestView>>> {
+    let tenant_id = tenant_scope(&caller)?;
+    let limit = query.limit.unwrap_or(100).clamp(1, 100);
+    let mut requests = app
+        .store
+        .list_change_requests()
+        .await?
+        .into_iter()
+        .filter(|request| request.tenant_id == tenant_id)
+        .collect::<Vec<_>>();
+    requests.sort_unstable_by(|left, right| {
+        right
+            .created_at_unix
+            .cmp(&left.created_at_unix)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    requests.truncate(limit);
+    Ok(Json(
+        requests.into_iter().map(ChangeRequestView::from).collect(),
+    ))
+}
+
+async fn decide_change_request(
+    app: &AppState,
+    caller: &Caller,
+    id: &str,
+    approve: bool,
+) -> ApiResult<Json<ChangeRequestView>> {
+    let tenant_id = tenant_scope(caller)?;
+    let Some(request) = app.store.get_change_request(id).await? else {
+        return Err(not_found("change request", id));
+    };
+    if request.tenant_id != tenant_id {
+        return Err(not_found("change request", id));
+    }
+    if let Err(error) = app
+        .store
+        .decide_change_request(
+            id.to_owned(),
+            tenant_id.to_owned(),
+            caller.name.clone(),
+            approve,
+            unix_now(),
+        )
+        .await
+    {
+        if let Some(updated) = app.store.get_change_request(id).await? {
+            let action = match updated.status {
+                ChangeRequestStatus::Expired => Some("change_request.expired"),
+                ChangeRequestStatus::Superseded => Some("change_request.superseded"),
+                _ => None,
+            };
+            if let Some(action) = action {
+                append_tenant_audit(
+                    app,
+                    tenant_id,
+                    &caller.name,
+                    action,
+                    &format!("/minga/change-requests/{id}"),
+                )
+                .await?;
+            }
+        }
+        return Err(error.into());
+    }
+    let action = if approve {
+        "change_request.approved_and_applied"
+    } else {
+        "change_request.rejected"
+    };
+    append_tenant_audit(
+        app,
+        tenant_id,
+        &caller.name,
+        action,
+        &format!("/minga/change-requests/{id}"),
+    )
+    .await?;
+    let updated = app
+        .store
+        .get_change_request(id)
+        .await?
+        .ok_or_else(|| not_found("change request", id))?;
+    Ok(Json(ChangeRequestView::from(updated)))
+}
+
+pub async fn approve_change_request(
+    State(app): State<Arc<AppState>>,
+    Extension(caller): Extension<Caller>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<ChangeRequestView>> {
+    decide_change_request(&app, &caller, &id, true).await
+}
+
+pub async fn reject_change_request(
+    State(app): State<Arc<AppState>>,
+    Extension(caller): Extension<Caller>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<ChangeRequestView>> {
+    decide_change_request(&app, &caller, &id, false).await
+}
+
 /// Updates a tenant's display name and quotas.
 pub async fn update_tenant(
     State(app): State<Arc<AppState>>,
@@ -390,6 +668,50 @@ pub(crate) async fn agent_usage(
         .map_err(|error| ApiError::Unavailable(format!("agent usage query failed: {error}")))?;
     events.truncate(limit);
     Ok(Json(AgentUsageResponse::Tenant { events }))
+}
+#[derive(Debug, Deserialize)]
+pub(crate) struct AgentEventsQuery {
+    limit: Option<usize>,
+}
+
+#[derive(Serialize)]
+pub(crate) struct TenantEventSummary {
+    subject: String,
+    observed_at_unix_ms: u64,
+    payload_size_bytes: usize,
+}
+
+/// `GET /v{version}/agent/events` — bounded tenant event metadata.
+pub(crate) async fn agent_events(
+    State(app): State<Arc<AppState>>,
+    Extension(caller): Extension<Caller>,
+    Query(query): Query<AgentEventsQuery>,
+) -> ApiResult<Json<Vec<TenantEventSummary>>> {
+    let tenant_id = tenant_scope(&caller)?;
+    let bus = app
+        .bus
+        .as_ref()
+        .ok_or_else(|| ApiError::Unavailable("tenant event service is not configured".into()))?;
+    let limit = query.limit.unwrap_or(100).clamp(1, 200);
+    let events = bus
+        .tenant_event_history(tenant_id, limit)
+        .await
+        .map_err(|_| ApiError::Unavailable("tenant event query failed".into()))?;
+    Ok(Json(
+        events
+            .into_iter()
+            .filter(|event| {
+                event
+                    .subject
+                    .starts_with(&format!("minga.{tenant_id}.task."))
+            })
+            .map(|event| TenantEventSummary {
+                subject: event.subject,
+                observed_at_unix_ms: event.timestamp,
+                payload_size_bytes: event.payload.len(),
+            })
+            .collect(),
+    ))
 }
 
 /// `GET /minga/audit` — list the cluster audit trail for operators.
@@ -767,6 +1089,19 @@ pub async fn get_version() -> Json<models::VersionInfo> {
     Json(translate::version_info())
 }
 
+/// Returns the running Minga build and the persisted/local Raft observations.
+pub async fn get_cluster_diagnostics(
+    State(app): State<Arc<AppState>>,
+) -> Json<models::ClusterDiagnostics> {
+    Json(models::ClusterDiagnostics {
+        server_version: models::MINGA_VERSION.to_owned(),
+        build_revision: models::MINGA_GIT_COMMIT.map(str::to_owned),
+        api_version: models::API_VERSION.to_owned(),
+        state_format_version: minga_state::codec::FORMAT_VERSION,
+        raft: app.store.raft_diagnostics().await,
+    })
+}
+
 /// `GET /v{version}/info` — system info.
 pub async fn get_info(
     State(app): State<Arc<AppState>>,
@@ -835,6 +1170,7 @@ pub async fn get_info(
 /// `GET /v{version}/nodes` — list all nodes.
 pub async fn list_nodes(
     State(app): State<Arc<AppState>>,
+    Extension(caller): Extension<Caller>,
     Query(query): Query<models::NodeListQuery>,
 ) -> ApiResult<Json<Vec<models::Node>>> {
     let filters = models::parse_filters(query.filters.as_deref());
@@ -846,18 +1182,27 @@ pub async fn list_nodes(
     let nodes = app.store.list_nodes().await?;
     let result: Vec<models::Node> = nodes
         .iter()
-        .filter(|n| models::labels_match(&n.labels, &label_filters))
-        .map(|n| {
-            translate::node_to_docker(n, Some(n.id) == leader_id || (n.id == my_id && is_leader))
+        .filter(|node| {
+            caller
+                .tenant_id()
+                .is_none_or(|tenant_id| node.tenant_id == tenant_id)
+        })
+        .filter(|node| models::labels_match(&node.labels, &label_filters))
+        .map(|node| {
+            translate::node_to_docker(
+                node,
+                Some(node.id) == leader_id || (node.id == my_id && is_leader),
+            )
         })
         .collect();
 
     Ok(Json(result))
 }
 
-/// `GET /v{version}/nodes/{id}` — inspect a node.
+/// `GET /v{version}/nodes/{id}` — inspect a node in the caller's tenant.
 pub async fn get_node(
     State(app): State<Arc<AppState>>,
+    Extension(caller): Extension<Caller>,
     Path((_version, id)): Path<(String, String)>,
 ) -> ApiResult<Json<models::Node>> {
     let nodes = app.store.list_nodes().await?;
@@ -865,7 +1210,12 @@ pub async fn get_node(
 
     let node = nodes
         .iter()
-        .find(|n| n.id.to_string() == id || n.address == id)
+        .find(|node| {
+            (node.id.to_string() == id || node.address == id)
+                && caller
+                    .tenant_id()
+                    .is_none_or(|tenant_id| node.tenant_id == tenant_id)
+        })
         .ok_or_else(|| not_found("node", &id))?;
 
     let is_leader = Some(node.id) == leader_id;
@@ -1544,6 +1894,45 @@ pub async fn list_tasks(
         .collect();
 
     Ok(Json(result))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TaskLogsQuery {
+    tail: Option<usize>,
+}
+
+/// `GET /v{version}/tasks/{id}/logs` — read retained logs in the caller's tenant.
+pub async fn task_logs(
+    State(app): State<Arc<AppState>>,
+    Extension(caller): Extension<Caller>,
+    Path((_version, task_id)): Path<(String, String)>,
+    Query(query): Query<TaskLogsQuery>,
+) -> ApiResult<Json<Vec<minga_bus::LogEntry>>> {
+    let tenant_id = tenant_scope(&caller)?;
+    let task = app
+        .store
+        .get_task(&task_id)
+        .await?
+        .filter(|task| task.tenant_id == tenant_id)
+        .ok_or_else(|| not_found("task", &task_id))?;
+    if !app
+        .store
+        .get_service(&task.service_id)
+        .await?
+        .is_some_and(|service| service.tenant_id == tenant_id)
+    {
+        return Err(not_found("task", &task_id));
+    }
+    let bus = app
+        .bus
+        .as_ref()
+        .ok_or_else(|| ApiError::Unavailable("task log service is not configured".into()))?;
+    let tail = query.tail.unwrap_or(100).clamp(1, 200);
+    let entries = bus
+        .tenant_log_history(tenant_id, &task_id, tail)
+        .await
+        .map_err(|_| ApiError::Unavailable("task log query failed".into()))?;
+    Ok(Json(entries))
 }
 
 /// `GET /v{version}/tasks/{id}` — inspect a task.

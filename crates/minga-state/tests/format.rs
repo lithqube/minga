@@ -14,15 +14,17 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
 
 use minga_state::codec::{
-    self, FORMAT_KEY, FORMAT_VERSION, V2_FORMAT_VERSION, V3_FORMAT_VERSION, V4_FORMAT_VERSION,
-    V5_FORMAT_VERSION, V6_FORMAT_VERSION, V7_FORMAT_VERSION, V8_FORMAT_VERSION, V9_FORMAT_VERSION,
+    self, FORMAT_KEY, FORMAT_VERSION, V10_FORMAT_VERSION, V2_FORMAT_VERSION, V3_FORMAT_VERSION,
+    V4_FORMAT_VERSION, V5_FORMAT_VERSION, V6_FORMAT_VERSION, V7_FORMAT_VERSION, V8_FORMAT_VERSION,
+    V9_FORMAT_VERSION,
 };
 use minga_state::types::{
-    AgentCapabilities, AgentDirGrant, AgentGrant, AgentSpec, ClusterNode, Config, EgressAuth,
-    EgressPolicy, EgressRoute, EgressWorkload, FailureAction, Healthcheck, MountKind, Network,
-    NodeRole, NodeStatus, PortMapping, PortMode, ReservedPort, ResourceSpec, RestartCondition,
-    RestartPolicy, Secret, SecretRef, Service, ServiceMode, ServiceMount, Task, TaskSpec,
-    TaskState, Tenant, TenantQuotas, UpdateOrder, UpdatePolicy, Volume, WorkloadKind,
+    AgentCapabilities, AgentDirGrant, AgentGrant, AgentSpec, ChangeKind, ChangeRequest,
+    ChangeRequestAudit, ChangeRequestStatus, ClusterNode, Config, EgressAuth, EgressPolicy,
+    EgressRoute, EgressWorkload, FailureAction, Healthcheck, MountKind, Network, NodeRole,
+    NodeStatus, PortMapping, PortMode, ReservedPort, ResourceSpec, RestartCondition, RestartPolicy,
+    Secret, SecretRef, Service, ServiceMode, ServiceMount, Task, TaskSpec, TaskState, Tenant,
+    TenantQuotas, UpdateOrder, UpdatePolicy, Volume, WorkloadKind,
 };
 use minga_state::{ObjectKind, StateCommand, StateSnapshot, StateStore, TypeConfig};
 use openraft::{BasicNode, CommittedLeaderId, Entry, EntryPayload, LogId, Membership, Vote};
@@ -84,7 +86,7 @@ fn a_fixture_accepts_added_fields_and_rejects_changed_ones() {
 
 /// Compares `value` with its fixture, and decodes the fixture back.
 fn check<T: Serialize + DeserializeOwned>(name: &str, value: &T) {
-    for version in V2_FORMAT_VERSION..=V9_FORMAT_VERSION {
+    for version in V2_FORMAT_VERSION..=V10_FORMAT_VERSION {
         let old_path = fixture_path_for_version(version, name);
         if old_path.exists() {
             let old = std::fs::read_to_string(&old_path).unwrap_or_else(|e| {
@@ -422,6 +424,51 @@ fn service_fixture() {
     earlier.agent = None;
     svc.previous = Some(Box::new(earlier));
     check("service", &svc);
+}
+
+fn change_request() -> ChangeRequest {
+    let before = service("shop.web");
+    let mut after = before.clone();
+    after.replicas += 1;
+    ChangeRequest {
+        id: "cr-1-2-3".into(),
+        tenant_id: "default".into(),
+        service_id: "shop.web".into(),
+        requester: "agent".into(),
+        created_at_unix: 100,
+        expires_at_unix: 1000,
+        kind: ChangeKind::Scale,
+        before,
+        after,
+        status: ChangeRequestStatus::Pending,
+        reviewer: None,
+        decided_at_unix: None,
+        audit: vec![ChangeRequestAudit {
+            action: "created".into(),
+            actor: "agent".into(),
+            occurred_at_unix: 100,
+        }],
+    }
+}
+
+#[test]
+fn change_request_fixtures() {
+    let request = change_request();
+    check("change_request", &request);
+    check(
+        "command_create_change_request",
+        &StateCommand::CreateChangeRequest(request.clone()),
+    );
+    check(
+        "command_decide_change_request",
+        &StateCommand::DecideChangeRequest {
+            id: request.id,
+            tenant_id: request.tenant_id,
+            actor: "deployer".into(),
+            approve: true,
+            now_unix: 101,
+        },
+    );
 }
 
 #[test]
@@ -1186,6 +1233,164 @@ async fn a_new_store_gets_the_marker_and_reopens() {
     store.shutdown().await.unwrap();
 }
 
+#[tokio::test]
+async fn a_v10_store_migrates_and_initializes_change_requests() {
+    let (_dir, path) = written_dir().await;
+    let state_file = path.join("state.redb");
+    let log_file = path.join("raft_log.redb");
+    set_marker(state_file.clone(), SM_META, Some(V10_FORMAT_VERSION));
+    set_marker(log_file.clone(), RAFT_META, Some(V10_FORMAT_VERSION));
+
+    let store = StateStore::open(1, "127.0.0.1:0", &path, BTreeMap::new())
+        .await
+        .unwrap();
+    assert!(store.get_service("shop.web").await.unwrap().is_some());
+    assert!(store.list_change_requests().await.unwrap().is_empty());
+    store.shutdown().await.unwrap();
+
+    assert_eq!(read_marker(&state_file, SM_META), Some(FORMAT_VERSION));
+    assert_eq!(read_marker(&log_file, RAFT_META), Some(FORMAT_VERSION));
+}
+
+#[tokio::test]
+async fn change_requests_require_distinct_approval_and_apply_atomically() {
+    let (_dir, path) = written_dir().await;
+    let store = StateStore::open(1, "127.0.0.1:0", &path, BTreeMap::new())
+        .await
+        .unwrap();
+
+    let request = change_request();
+    store.create_change_request(request.clone()).await.unwrap();
+    assert!(store
+        .decide_change_request(
+            request.id.clone(),
+            request.tenant_id.clone(),
+            request.requester.clone(),
+            true,
+            101,
+        )
+        .await
+        .is_err());
+    assert_eq!(
+        store
+            .get_service(&request.service_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .replicas,
+        request.before.replicas
+    );
+    store
+        .decide_change_request(
+            request.id.clone(),
+            request.tenant_id.clone(),
+            "deployer".into(),
+            true,
+            102,
+        )
+        .await
+        .unwrap();
+    let approved = store
+        .get_change_request(&request.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(approved.status, ChangeRequestStatus::Approved);
+    assert_eq!(approved.reviewer.as_deref(), Some("deployer"));
+    assert_eq!(approved.audit.len(), 2);
+    assert_eq!(approved.audit[0].action, "created");
+    assert_eq!(approved.audit[1].action, "approved_and_applied");
+    assert_eq!(
+        store
+            .get_service(&request.service_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .replicas,
+        request.after.replicas
+    );
+
+    let mut expired = change_request();
+    expired.id = "cr-expired".into();
+    expired.before = store
+        .get_service(&expired.service_id)
+        .await
+        .unwrap()
+        .unwrap();
+    expired.after = expired.before.clone();
+    expired.after.replicas += 1;
+    expired.created_at_unix = 200;
+    expired.expires_at_unix = 300;
+    store.create_change_request(expired.clone()).await.unwrap();
+    assert!(store
+        .decide_change_request(
+            expired.id.clone(),
+            expired.tenant_id.clone(),
+            "deployer".into(),
+            true,
+            300,
+        )
+        .await
+        .is_err());
+    assert_eq!(
+        store
+            .get_change_request(&expired.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        ChangeRequestStatus::Expired
+    );
+    let expired = store
+        .get_change_request(&expired.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(expired.audit[1].action, "expired");
+
+    let mut rejected = change_request();
+    rejected.id = "cr-rejected".into();
+    rejected.before = store
+        .get_service(&rejected.service_id)
+        .await
+        .unwrap()
+        .unwrap();
+    rejected.after = rejected.before.clone();
+    rejected.after.replicas += 1;
+    rejected.created_at_unix = 301;
+    rejected.expires_at_unix = 500;
+    store.create_change_request(rejected.clone()).await.unwrap();
+    assert!(store
+        .decide_change_request(
+            rejected.id.clone(),
+            "another-tenant".into(),
+            "deployer".into(),
+            false,
+            400,
+        )
+        .await
+        .is_err());
+    store
+        .decide_change_request(
+            rejected.id.clone(),
+            rejected.tenant_id.clone(),
+            "deployer".into(),
+            false,
+            401,
+        )
+        .await
+        .unwrap();
+    let rejected = store
+        .get_change_request(&rejected.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(rejected.status, ChangeRequestStatus::Rejected);
+    assert_eq!(rejected.reviewer.as_deref(), Some("deployer"));
+    assert_eq!(rejected.audit[0].action, "created");
+    assert_eq!(rejected.audit[1].action, "rejected");
+    store.shutdown().await.unwrap();
+}
 #[tokio::test]
 async fn a_v2_state_file_is_rewritten_and_its_marker_advanced() {
     let (_dir, path) = written_dir().await;

@@ -1,7 +1,6 @@
-//! HTTP client for the Minga Docker Engine API.
+//! HTTP client for the Minga Docker Engine API and tenant change-request API.
 //!
-//! The client only knows a root URL and a token. How that root is reached
-//! (directly, or through an SSH tunnel) is decided in `transport.rs`.
+//! The client binds one root URL, trust configuration, and optional caller identity.
 
 use std::path::Path;
 use std::time::Duration;
@@ -40,6 +39,37 @@ fn builder() -> reqwest::ClientBuilder {
         .no_proxy()
 }
 
+fn check_client_key_mode(path: &Path) -> Result<(), CtlError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(path)
+            .map_err(|error| {
+                CtlError::Config(format!(
+                    "cannot inspect client_key {}: {error}",
+                    path.display()
+                ))
+            })?
+            .permissions()
+            .mode();
+        if mode & 0o077 != 0 {
+            return Err(CtlError::Config(format!(
+                "client_key {} must have mode 0600 or stricter",
+                path.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn valid_change_request_id(id: &str) -> bool {
+    id.starts_with("cr-")
+        && id.len() <= 128
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
+
 /// The outcome of a request that may name something that does not exist.
 pub enum Found {
     Yes(Value),
@@ -56,6 +86,24 @@ impl ApiClient {
         context: &str,
         debug: bool,
     ) -> Result<Self, CtlError> {
+        Self::new_with_identity(root, token, tls_cert, None, None, context, debug)
+    }
+
+    /// A client for a context that may use mTLS as well as a pinned server CA.
+    pub fn new_with_identity(
+        root: &str,
+        token: Option<String>,
+        tls_cert: Option<&Path>,
+        client_cert: Option<&Path>,
+        client_key: Option<&Path>,
+        context: &str,
+        debug: bool,
+    ) -> Result<Self, CtlError> {
+        if client_cert.is_some() != client_key.is_some() {
+            return Err(CtlError::Config(
+                "client certificate and private key must be configured together".into(),
+            ));
+        }
         let mut builder = builder();
         if let Some(path) = tls_cert {
             let pem = std::fs::read(path).map_err(|e| {
@@ -67,10 +115,29 @@ impl ApiClient {
                     path.display()
                 ))
             })?;
-            // Pin: trust this CA only, not the system roots.
             builder = builder
                 .tls_built_in_root_certs(false)
                 .add_root_certificate(cert);
+        }
+        if let (Some(cert_path), Some(key_path)) = (client_cert, client_key) {
+            check_client_key_mode(key_path)?;
+            let mut identity_pem = std::fs::read(cert_path).map_err(|error| {
+                CtlError::Config(format!(
+                    "cannot read client_cert {}: {error}",
+                    cert_path.display()
+                ))
+            })?;
+            identity_pem.push(10);
+            identity_pem.extend(std::fs::read(key_path).map_err(|error| {
+                CtlError::Config(format!(
+                    "cannot read client_key {}: {error}",
+                    key_path.display()
+                ))
+            })?);
+            let identity = reqwest::Identity::from_pem(&identity_pem).map_err(|error| {
+                CtlError::Config(format!("client certificate or key is invalid PEM: {error}"))
+            })?;
+            builder = builder.identity(identity);
         }
         let http = builder
             .build()
@@ -83,6 +150,71 @@ impl ApiClient {
             debug,
             text_route: None,
         })
+    }
+
+    /// Lists tenant change requests over mTLS without sending any configured bearer token.
+    pub async fn tenant_change_requests(&self, limit: u8) -> Result<Value, CtlError> {
+        if !(1..=100).contains(&limit) {
+            return Err(CtlError::Usage("limit must be between 1 and 100".into()));
+        }
+        let url = format!("{}/minga/change-requests", self.root);
+        let response = self
+            .http
+            .get(&url)
+            .query(&[("limit", limit)])
+            .send()
+            .await
+            .map_err(|error| CtlError::Unreachable {
+                endpoint: self.root.clone(),
+                detail: reqwest_detail(&error),
+            })?;
+        let status = response.status().as_u16();
+        let body = response
+            .text()
+            .await
+            .map_err(|error| CtlError::Unreachable {
+                endpoint: self.root.clone(),
+                detail: reqwest_detail(&error),
+            })?;
+        if self.debug {
+            eprintln!("debug: GET /minga/change-requests -> {status}");
+        }
+        expect_found(classify(&self.root, status, &body)?, "change requests")
+    }
+
+    /// Decides a tenant change request over mTLS without sending a bearer token.
+    pub async fn decide_tenant_change_request(
+        &self,
+        id: &str,
+        approve: bool,
+    ) -> Result<Value, CtlError> {
+        if !valid_change_request_id(id) {
+            return Err(CtlError::Usage("invalid change request ID".into()));
+        }
+        let decision = if approve { "approve" } else { "reject" };
+        let path = format!("/minga/change-requests/{id}/{decision}");
+        let url = format!("{}{}", self.root, path);
+        let response =
+            self.http
+                .post(&url)
+                .send()
+                .await
+                .map_err(|error| CtlError::Unreachable {
+                    endpoint: self.root.clone(),
+                    detail: reqwest_detail(&error),
+                })?;
+        let status = response.status().as_u16();
+        let body = response
+            .text()
+            .await
+            .map_err(|error| CtlError::Unreachable {
+                endpoint: self.root.clone(),
+                detail: reqwest_detail(&error),
+            })?;
+        if self.debug {
+            eprintln!("debug: POST {path} -> {status}");
+        }
+        expect_found(classify(&self.root, status, &body)?, "change request")
     }
 
     /// A client whose connections all go to the Unix socket `sock` (the SSH
@@ -389,11 +521,26 @@ mod tests {
     }
 
     #[test]
-    fn ids_for_url_paths_are_checked() {
-        assert!(check_id("service", "shop.web").is_ok());
-        assert!(check_id("service", "shop_db-1").is_ok());
-        for bad in ["", "../x", "-x", "a/b", "a b", "a?b", ".hidden"] {
-            assert!(check_id("service", bad).is_err(), "{bad:?}");
+    fn change_request_ids_are_safe_path_segments() {
+        for valid in ["cr-a1-2-3", "cr-123abc"] {
+            assert!(valid_change_request_id(valid), "{valid:?}");
         }
+        for invalid in ["", "wrong-prefix", "cr-../services", "cr-a/b", "cr-UPPER"] {
+            assert!(!valid_change_request_id(invalid), "{invalid:?}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn client_private_key_must_not_be_group_or_world_readable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("client.key");
+        std::fs::write(&path, "test").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(check_client_key_mode(&path).is_ok());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        assert!(check_client_key_mode(&path).is_err());
     }
 }

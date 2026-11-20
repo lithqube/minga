@@ -73,6 +73,53 @@ impl Tenant {
     }
 }
 
+/// A scoped proposal for a supported service desired-state change.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ChangeKind {
+    Deploy,
+    Scale,
+    Rollback,
+    Stop,
+}
+
+/// Lifecycle state of a maker-checker request.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ChangeRequestStatus {
+    Pending,
+    Approved,
+    Rejected,
+    Expired,
+    Superseded,
+}
+
+/// One durable lifecycle/audit fact attached to a change request.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChangeRequestAudit {
+    pub action: String,
+    pub actor: String,
+    pub occurred_at_unix: u64,
+}
+
+/// A tenant-owned service change held in Raft until a separate reviewer decides.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ChangeRequest {
+    pub id: String,
+    pub tenant_id: TenantId,
+    pub service_id: ServiceId,
+    pub requester: String,
+    pub created_at_unix: u64,
+    pub expires_at_unix: u64,
+    pub kind: ChangeKind,
+    pub before: Service,
+    pub after: Service,
+    pub status: ChangeRequestStatus,
+    pub reviewer: Option<String>,
+    pub decided_at_unix: Option<u64>,
+    pub audit: Vec<ChangeRequestAudit>,
+}
+
 /// Optional per-tenant resource and shared-plane limits. `None` means no limit.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TenantQuotas {

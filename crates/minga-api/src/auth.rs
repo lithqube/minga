@@ -5,19 +5,21 @@ use x509_parser::prelude::parse_x509_certificate;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ApiRole {
     Viewer,
+    Agent,
     Deployer,
     Admin,
 }
 
 impl ApiRole {
     /// Every role name a certificate's OU may carry.
-    pub const NAMES: [&'static str; 3] = ["viewer", "deployer", "admin"];
+    pub const NAMES: [&'static str; 4] = ["viewer", "agent", "deployer", "admin"];
 
     /// The role named by a certificate OU, if it is one of [`Self::NAMES`].
     #[must_use]
     pub fn parse(value: &str) -> Option<Self> {
         match value {
             "viewer" => Some(Self::Viewer),
+            "agent" => Some(Self::Agent),
             "deployer" => Some(Self::Deployer),
             "admin" => Some(Self::Admin),
             _ => None,
@@ -29,13 +31,14 @@ impl ApiRole {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Viewer => "viewer",
+            Self::Agent => "agent",
             Self::Deployer => "deployer",
             Self::Admin => "admin",
         }
     }
 
     /// Whether this role may do what `minimum` requires. Roles are ordered:
-    /// deployer includes viewer, admin includes both.
+    /// agent includes viewer; deployer includes both; admin includes all.
     #[must_use]
     pub fn permits(self, minimum: Self) -> bool {
         self >= minimum

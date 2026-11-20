@@ -17,14 +17,30 @@ use crate::log_store::RedbLogStore;
 use crate::network::{forward_write, serve_raft_rpc, RaftTlsConfig, TcpNetworkFactory};
 use crate::state_machine::RedbStateMachine;
 use crate::types::{
-    AgentCapabilities, ClusterNode, Config as StateConfig, ConfigId, Network, NetworkId, NodeId,
-    Secret, SecretId, Service, ServiceId, Task, TaskId, Tenant, TenantQuotas, Volume, VolumeId,
-    DEFAULT_TENANT_ID,
+    AgentCapabilities, ChangeRequest, ClusterNode, Config as StateConfig, ConfigId, Network,
+    NetworkId, NodeId, Secret, SecretId, Service, ServiceId, Task, TaskId, Tenant, TenantQuotas,
+    Volume, VolumeId, DEFAULT_TENANT_ID,
 };
 use crate::TypeConfig;
 
 /// How long to wait for leader election or write acknowledgment.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Four 500 ms heartbeats without a quorum acknowledgment is stale.
+const QUORUM_ACK_FRESH_MS: u64 = 2_000;
+
+fn quorum_ack_recent(
+    node_id: NodeId,
+    leader_id: Option<NodeId>,
+    ack_age_ms: Option<u64>,
+) -> Option<bool> {
+    match leader_id {
+        None => Some(false),
+        Some(leader) if leader == node_id => {
+            Some(ack_age_ms.is_some_and(|age| age <= QUORUM_ACK_FRESH_MS))
+        }
+        Some(_) => None,
+    }
+}
 
 /// Desired state in a portable form, for backup and restore.
 ///
@@ -45,6 +61,37 @@ pub struct StateSnapshot {
     pub volumes: Vec<Volume>,
     pub secrets: Vec<Secret>,
     pub configs: Vec<StateConfig>,
+}
+
+/// A read-only snapshot of this node's observed Raft state.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RaftDiagnostics {
+    pub node_id: NodeId,
+    pub state: String,
+    pub leader_id: Option<NodeId>,
+    /// Matches the local readiness check: a leader is known to this node.
+    pub ready: bool,
+    /// Available only when this node is leader; `None` is not evidence that a
+    /// follower has no cluster quorum.
+    pub quorum_ack_age_ms: Option<u64>,
+    /// For the local leader, whether quorum was acknowledged within two seconds.
+    /// `None` means this node is a follower and cannot report the leader's age.
+    pub quorum_ack_recent: Option<bool>,
+    pub members: Vec<RaftMemberDiagnostics>,
+}
+
+/// A member from the membership configuration persisted in the Raft log.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RaftMemberDiagnostics {
+    pub id: NodeId,
+    pub address: String,
+    pub voter: bool,
+    /// Present on the leader only. `false` means no successful log progress
+    /// has been reported for this member, not that its process is stopped.
+    pub replication_acknowledged: Option<bool>,
+    /// TCP reachability of the address stored in Raft membership; this is not
+    /// proof that the remote Raft process is healthy.
+    pub transport_reachable: Option<bool>,
 }
 
 /// The cluster state store. Owns the Raft instance and provides
@@ -289,6 +336,76 @@ impl StateStore {
             .membership_config
             .voter_ids()
             .collect()
+    }
+
+    /// Whether this node currently meets the Raft portion of `/readyz`.
+    pub fn raft_ready(&self) -> bool {
+        let metrics = self.raft.metrics();
+        let metrics = metrics.borrow();
+        let quorum_recent = quorum_ack_recent(
+            self.node_id,
+            metrics.current_leader,
+            metrics.millis_since_quorum_ack,
+        );
+        metrics.current_leader.is_some() && quorum_recent != Some(false)
+    }
+
+    /// Returns persisted membership and observed Raft and transport facts.
+    pub async fn raft_diagnostics(&self) -> RaftDiagnostics {
+        let metrics = self.raft.metrics().borrow().clone();
+        let voters = metrics
+            .membership_config
+            .voter_ids()
+            .collect::<BTreeSet<_>>();
+        let mut members = metrics
+            .membership_config
+            .nodes()
+            .map(|(id, node)| RaftMemberDiagnostics {
+                id: *id,
+                address: node.addr.clone(),
+                voter: voters.contains(id),
+                replication_acknowledged: metrics
+                    .replication
+                    .as_ref()
+                    .map(|progress| progress.get(id).is_some_and(|log_id| log_id.is_some())),
+                transport_reachable: (*id == self.node_id).then_some(true),
+            })
+            .collect::<Vec<_>>();
+
+        let mut probes = tokio::task::JoinSet::new();
+        for member in members.iter().filter(|member| member.id != self.node_id) {
+            let id = member.id;
+            let address = member.address.clone();
+            probes.spawn(async move {
+                let reachable = timeout(
+                    Duration::from_millis(300),
+                    tokio::net::TcpStream::connect(address),
+                )
+                .await
+                .is_ok_and(|result| result.is_ok());
+                (id, reachable)
+            });
+        }
+        while let Some(Ok((id, reachable))) = probes.join_next().await {
+            if let Some(member) = members.iter_mut().find(|member| member.id == id) {
+                member.transport_reachable = Some(reachable);
+            }
+        }
+        let quorum_ack_recent = quorum_ack_recent(
+            self.node_id,
+            metrics.current_leader,
+            metrics.millis_since_quorum_ack,
+        );
+
+        RaftDiagnostics {
+            node_id: self.node_id,
+            state: format!("{:?}", metrics.state),
+            leader_id: metrics.current_leader,
+            ready: metrics.current_leader.is_some() && quorum_ack_recent != Some(false),
+            quorum_ack_age_ms: metrics.millis_since_quorum_ack,
+            quorum_ack_recent,
+            members,
+        }
     }
 
     /// Adds a manager as a learner, waits for it to catch up, then promotes it.
@@ -623,6 +740,45 @@ impl StateStore {
         }
     }
 
+    pub async fn create_change_request(&self, request: ChangeRequest) -> Result<(), StateError> {
+        match self
+            .propose(StateCommand::CreateChangeRequest(request))
+            .await?
+        {
+            StateResponse::Ok => Ok(()),
+            StateResponse::NotFound => Err(StateError::NotFound("tenant or service".into())),
+            StateResponse::Conflict(message) | StateResponse::Error(message) => {
+                Err(StateError::Conflict(message))
+            }
+        }
+    }
+
+    pub async fn decide_change_request(
+        &self,
+        id: String,
+        tenant_id: String,
+        actor: String,
+        approve: bool,
+        now_unix: u64,
+    ) -> Result<(), StateError> {
+        match self
+            .propose(StateCommand::DecideChangeRequest {
+                id,
+                tenant_id,
+                actor,
+                approve,
+                now_unix,
+            })
+            .await?
+        {
+            StateResponse::Ok => Ok(()),
+            StateResponse::NotFound => Err(StateError::NotFound("change request".into())),
+            StateResponse::Conflict(message) | StateResponse::Error(message) => {
+                Err(StateError::Conflict(message))
+            }
+        }
+    }
+
     pub async fn upsert_service(&self, service: Service) -> Result<(), StateError> {
         self.write_service(StateCommand::UpsertService(service))
             .await
@@ -759,6 +915,23 @@ impl StateStore {
             .map_err(StateError::storage)
     }
 
+    pub async fn get_change_request(
+        &self,
+        id: impl AsRef<str>,
+    ) -> Result<Option<ChangeRequest>, StateError> {
+        self.reader
+            .get_change_request(id.as_ref())
+            .await
+            .map_err(StateError::storage)
+    }
+
+    pub async fn list_change_requests(&self) -> Result<Vec<ChangeRequest>, StateError> {
+        self.reader
+            .list_change_requests()
+            .await
+            .map_err(StateError::storage)
+    }
+
     pub async fn get_task(&self, id: impl AsRef<str>) -> Result<Option<Task>, StateError> {
         self.reader
             .get_task(id.as_ref())
@@ -869,6 +1042,7 @@ impl StateStore {
         match snapshot.format_version {
             crate::codec::FORMAT_VERSION
             | crate::codec::V9_FORMAT_VERSION
+            | crate::codec::V10_FORMAT_VERSION
             | crate::codec::V8_FORMAT_VERSION
             | crate::codec::V7_FORMAT_VERSION
             | crate::codec::V6_FORMAT_VERSION

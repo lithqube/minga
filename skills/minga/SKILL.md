@@ -7,14 +7,14 @@ description: Operate a Minga cluster (the single-binary Rust orchestrator that r
 
 Minga runs Compose files on a single Rust binary: managers hold Raft desired state and placement, NATS/JetStream carries runtime status and events, and containerd runs containers. Workers are JetStream clients, not Raft voters. On multi-tenant clusters, each worker serves one tenant. For changing Minga's code, follow the repository's `CLAUDE.md`.
 
-Version claims are release-specific. Check `minga --version` / `minga-ctl --version` and the target machine before acting. The latest tagged release is v1.2.0; current `main` includes unreleased multi-node WireGuard, tenant isolation, agent egress and usage changes. Do not describe current-main behavior as shipped in v1.2.0. For current status and verification gates, read `README.md`, `docs/architecture.md` and `.planning/STATE.md`.
+Version claims are release-specific. Check `minga --version` / `minga-ctl --version` and the target machine before acting. The latest tagged release is v1.2.0; current `main` includes unreleased multi-node WireGuard, tenant isolation, agent egress and usage, plus Phase 16 diagnostics, MCP reads and maker-checker operations as they merge. Do not describe current-main behavior as shipped in v1.2.0. For current status and verification gates, read `README.md`, `docs/architecture.md` and `.planning/STATE.md`.
 
 ## Two CLIs
 
 | Tool | What it is | Use it for |
 | --- | --- | --- |
-| `minga` | Node daemon and client commands; manager and worker roles. There is no separate `api` role. | Running nodes, `validate`, `deploy`, `logs`, `image pull`, `state export` / `import`, TLS and tenant-enrollment utilities, sandbox, agent and egress commands. |
-| `minga-ctl` | Companion CLI on the operator's machine. Talks to the manager API over SSH or HTTPS. | Contexts, stacks, services, health, metrics, images/secrets/registry and `agent usage`. |
+| `minga` | Node daemon and client commands; manager and worker roles. There is no separate `api` role. | Running nodes, `validate`, `deploy`, `logs`, `image pull`, `state export` / `import`, TLS and tenant-enrollment utilities, sandbox, agent and egress commands, and tenant-scoped MCP server. |
+| `minga-ctl` | Companion CLI on the operator's machine. Talks to the manager API over SSH or HTTPS. | Contexts, stacks, services, health, metrics, images/secrets/registry, `agent usage`, and tenant change-request listing/approval over mTLS. |
 
 `minga-ctl` is not in the release archive: install it from the matching source tag with `cargo install --locked --path crates/minga-ctl`. It runs the `minga` binary **on the operator's machine** for `stack deploy` (through the tunnel), so `minga` must be on PATH there or `MINGA_BIN` set; the node only needs the API.
 
@@ -56,6 +56,20 @@ minga-ctl image pull <ref>
 minga-ctl health --stack <stack>
 ```
 
+For tenant-scoped agent operations, an agent certificate can propose only a
+fixed service change; it cannot apply it. A separate same-tenant deployer/admin
+certificate approves or rejects:
+
+```bash
+minga-ctl context add tenant-a --endpoint https://manager.example:2376 \
+  --tls-cert ./server-ca/ca.pem \
+  --client-cert ./deployer.pem --client-key ./deployer-key.pem --use
+minga-ctl change list
+minga-ctl change approve cr-...
+```
+
+The private key must be mode 0600. Proposals expire after 15 minutes, and
+approval applies only if the service still matches the reviewed snapshot.
 `--remote-token-file` takes a bare token file or an env file with a `MINGA_API_TOKEN=` line (as in a systemd `EnvironmentFile`).
 
 Global flags: `--context <name>`, `-o table|json|yaml` (`--json`), `-q`, `--debug` (traces with credentials redacted). Use `--json` when you need to parse output: the table cuts the `ERROR` column to 50 characters, JSON has the full text and the exit code.
@@ -72,8 +86,7 @@ Things that surprise people:
 
 ## Backup, restore and upgrades
 
-- **Back up desired state** before anything that touches the data directory: `minga state export -o backup.json` (on the node, with `--api-url` and `MINGA_API_TOKEN` like `deploy`). The file holds services, networks, volumes and secret and config references, including environment values, so it is written 0600: treat it as a secret. It does not hold secret values (`--secret-store`), named volume data or TLS material; `docs/backup.md` says how to copy those.
-- **Restore** into a fresh cluster with `minga state import backup.json`. It refuses when a service already exists unless `--overwrite`; ask before using that flag. Nodes and tasks are not in the file: nodes re-register and the scheduler places the tasks again.
+- **Back up desired state** before anything that touches the data directory: `minga state export -o backup.json` (on the node, with `--api-url` and `MINGA_API_TOKEN` like `deploy`). The file holds services, networks, volumes and secret and config references, including environment values, so it is written 0600: treat it as a secret. It does not hold secret values (`--secret-store`), named volume data, TLS material, or agent change-request history; `docs/backup.md` says what to copy. Preserve the full Raft data directory for proposal and decision history.
 - **Upgrading from 1.0.2 to 1.1.0** needs one last wipe. A 1.1.0 node on a 1.0.2 data directory stops with `written by minga 1.0.2 or older ... remove raft_log.redb and state.redb`. Remove only those two files in each role's `--data-dir`, on every node, and upgrade every node together. **Never delete the whole data directory**: with default paths it also holds secret values (`secrets/`), named volume data (`volumes/`) and agent modules (`modules/`). Ask before removing anything.
 - **Upgrading to 1.2.0** keeps state, but it tightens behaviour that used to work. Read `docs/release-1.2.0.md` first and check each node for:
   - a Raft key (`--raft-tls-key`) readable by group or others: the node refuses to start until it is `chmod 600`. Data directories are tightened to 0700 and the redb files to 0600 at start.
@@ -88,7 +101,7 @@ Things that surprise people:
 - Tokens and secret values never go in arguments or config files, since both end up in process listings and shell history. `secret put` and `registry login` read stdin. The `minga-ctl` config has no token field on purpose; use `--remote-token-file`, `--token-command` or `MINGA_CTL_TOKEN`.
 - `service update --env-add` values are visible in process listings. Use Minga secrets for credentials.
 - Ask the user before `stack rm`, `stack deploy --prune`, `service rm`, `service rollback`, `image rm`, `registry logout`, `state import --overwrite`, removing Raft files, or anything that restarts a role. Do not pass `--yes` unless they said to.
-- The manager API supports bearer-token authentication and optional TLS/mTLS client identities with caller, role and tenant. Do not assume every operator token is tenant-scoped: cluster-operator credentials have administrative access. `minga-ctl` currently supports bearer-token contexts and trusts an HTTPS server CA; it does not present a client certificate/key.
+- The manager API supports bearer-token authentication and optional TLS/mTLS client identities with caller, role and tenant. Do not assume every operator token is tenant-scoped: cluster-operator credentials have administrative access. `minga-ctl` supports bearer-token contexts and, for direct HTTPS only, tenant client-certificate/key contexts for `change list|approve|reject`; the client key must be mode 0600. It does not use SSH for tenant change requests.
 - Raft without `--raft-tls-*` on a non-loopback bind lets anything that reaches the port rewrite cluster state, and Minga only logs a warning. Flag a multi-node cluster without Raft TLS.
 
 ## Troubleshooting

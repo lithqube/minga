@@ -25,7 +25,7 @@ Named after the [minga](https://en.wikipedia.org/wiki/Minga) of Chiloé, where a
 >
 > These are current-main features, not part of the v1.2.0 release.
 >
-> Other current limits: no seccomp profile; Raft TLS without mTLS still warns rather than refusing off-loopback; API TLS/mTLS is available on current main, while `minga-ctl` does not yet support client-certificate credentials in its context.
+> Other current limits: no seccomp profile; Raft TLS without mTLS still warns rather than refusing off-loopback; `minga-ctl` client-certificate contexts currently support tenant-scoped change-request workflows over direct HTTPS.
 >
 > Details: [changelog](CHANGELOG.md), [release notes](docs/release-1.2.0.md), [architecture](docs/architecture.md), [supported topologies](docs/topologies.md), [CLI reference](docs/cli.md), [planning state](.planning/STATE.md).
 >
@@ -157,8 +157,8 @@ flowchart TB
 
 | Crate | Purpose |
 | --- | --- |
-| `minga-cli` | `minga` binary: manager/worker lifecycle, Compose validate/deploy, state export/import, logs, TLS/tenant enrollment utilities, networking, sandbox, agent, image and egress commands. |
-| `minga-ctl` | Operator workstation CLI: contexts, stack/service operations, health, metrics, images/secrets/registry, and operator agent-usage totals by tenant. |
+| `minga-cli` | `minga` binary: manager/worker lifecycle, Compose validate/deploy, state export/import, logs, TLS/tenant enrollment utilities, networking, sandbox, agent, image/egress commands, and tenant-scoped MCP server. |
+| `minga-ctl` | Operator workstation CLI: contexts, stack/service operations, health, metrics, images/secrets/registry, operator agent-usage totals by tenant, and tenant maker-checker approvals. |
 | `minga-compose` | Compose parser/validator, `x-minga-agent` and `x-minga-egress` extensions, interpolation, profiles, dependency and port checks. |
 | `minga-state` | Raft desired state, tenant-owned entities, persisted formats/migrations, manager membership and state forwarding. |
 | `minga-scheduler` | Compose translation, tenant-aware placement, IPAM, task/ingress/WireGuard projections and reconciliation. |

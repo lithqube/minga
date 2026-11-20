@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+- `minga-ctl info` reports the client build separately from the server version,
+  build revision and persisted Raft membership. `minga-ctl doctor` adds
+  read-only readiness, bus, inventory and task findings; its optional support
+  bundle is a new local mode-0600 JSON file and omits credentials, sensitive
+  paths, resource identifiers and raw task errors.
+- The cluster diagnostics endpoint reports the persisted state format. `minga-ctl
+  upgrade preflight --to v1.3.0` compares known release metadata with the
+  running server and emits a read-only Raft membership/quorum, API-context
+  security, backup, NATS, tenant, coordinated upgrade and rollback plan.
+  Unknown formats or releases fail closed; it does not stop, restart, migrate
+  or wipe cluster state.
+- `minga mcp serve` exposes fixed tenant-scoped reads over HTTPS/mTLS and an
+  agent-only `request_change` proposal tool for deploy-image, scale, rollback
+  and stop. `minga-ctl change list|approve|reject` uses tenant-scoped mTLS;
+  listing requires a viewer role and decisions require a distinct deployer/admin
+  role. Approval atomically applies reviewed service state in Raft. Requests
+  expire after 15 minutes. State/wire format is now v11.
+- `minga validate` and `minga deploy` reject Compose `deploy.labels` before API
+  writes instead of silently dropping those labels.
+
 - Tenant egress routes no longer follow redirects or system proxies and
   refuse loopback, link-local, private, shared (`100.64.0.0/10`),
   `0.0.0.0/8`, unspecified and multicast destinations, including through
