@@ -3060,11 +3060,30 @@ fn project_dir(compose_file: &str) -> Option<std::path::PathBuf> {
 
 /// Whether two CA PEM files overlap: byte-identical, sharing a certificate,
 /// or one holding a certificate issued by one in the other (a root and its
-/// intermediate). Issuers match by DN, so unrelated CAs with the same subject
-/// are refused too (fail closed). Missing files are left to the loaders.
-/// Only direct issuance is visible here; a deeper chain (an intermediate in
-/// neither file) is covered by route authorization on `sidecar::ROUTE_NAME`.
+/// intermediate). Issuance is proven by the child's signature verifying with
+/// the parent's key, so unrelated roots with the same default subject (as
+/// `minga tls init-ca` makes) do not overlap. Missing files are left to the
+/// loaders. Only direct issuance is visible here; a deeper chain (an
+/// intermediate in neither file) is covered by route authorization on
+/// `sidecar::ROUTE_NAME`.
 fn cas_overlap(a: &Path, b: &Path) -> Result<bool, String> {
+    use x509_parser::certificate::X509Certificate;
+
+    fn parse_all(certs: &[Vec<u8>]) -> Vec<X509Certificate<'_>> {
+        certs
+            .iter()
+            .filter_map(|der| x509_parser::parse_x509_certificate(der).ok())
+            .map(|(_, cert)| cert)
+            .collect()
+    }
+    fn issued_by(children: &[X509Certificate<'_>], parents: &[X509Certificate<'_>]) -> bool {
+        children.iter().any(|child| {
+            parents
+                .iter()
+                .any(|parent| child.verify_signature(Some(parent.public_key())).is_ok())
+        })
+    }
+
     if !a.exists() || !b.exists() {
         return Ok(false);
     }
@@ -3073,25 +3092,7 @@ fn cas_overlap(a: &Path, b: &Path) -> Result<bool, String> {
     };
     let (a_pem, b_pem) = (read(a)?, read(b)?);
     let (a_certs, b_certs) = (pem_certificates(&a_pem), pem_certificates(&b_pem));
-    // (subject, issuer) raw DNs of every parsable certificate in a bundle.
-    let names = |certs: &[Vec<u8>]| -> Vec<(Vec<u8>, Vec<u8>)> {
-        certs
-            .iter()
-            .filter_map(|der| x509_parser::parse_x509_certificate(der).ok())
-            .map(|(_, cert)| {
-                (
-                    cert.subject().as_raw().to_vec(),
-                    cert.issuer().as_raw().to_vec(),
-                )
-            })
-            .collect()
-    };
-    let issued_by = |children: &[(Vec<u8>, Vec<u8>)], parents: &[(Vec<u8>, Vec<u8>)]| {
-        children
-            .iter()
-            .any(|(_, issuer)| parents.iter().any(|(subject, _)| subject == issuer))
-    };
-    let (a_names, b_names) = (names(&a_certs), names(&b_certs));
+    let (a_names, b_names) = (parse_all(&a_certs), parse_all(&b_certs));
     Ok(a_pem == b_pem
         || b_certs.iter().any(|cert| a_certs.contains(cert))
         || issued_by(&a_names, &b_names)
@@ -3546,6 +3547,21 @@ mod tests {
         );
         assert!(!cas_overlap(&one, &two).unwrap());
         assert!(!cas_overlap(&two, &child).unwrap());
+        // Two `init-ca` roots share rcgen's default subject but not a key.
+        let default_root = || {
+            let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+            params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+            params
+                .self_signed(&rcgen::KeyPair::generate().unwrap())
+                .unwrap()
+                .pem()
+        };
+        let route = write("route-root.pem", &default_root());
+        let client = write("client-root.pem", &default_root());
+        assert!(
+            !cas_overlap(&route, &client).unwrap(),
+            "independent roots with the same subject do not overlap"
+        );
         assert!(!cas_overlap(&one, &dir.path().join("missing.pem")).unwrap());
     }
 

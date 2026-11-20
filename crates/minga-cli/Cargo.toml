@@ -27,7 +27,7 @@ libc.workspace = true
 rand.workspace = true
 rcgen.workspace = true
 rustls-pemfile.workspace = true
-x509-parser.workspace = true
+x509-parser = { workspace = true, features = ["verify"] }
 time.workspace = true
 thiserror.workspace = true
 tokio.workspace = true

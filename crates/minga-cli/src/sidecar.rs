@@ -800,22 +800,30 @@ mod tests {
 
         let routez = format!("http://127.0.0.1:{}/routez", ports[3]);
         let http = reqwest::Client::new();
+        // Route peer names on minga-1, or why /routez could not be read.
         let remote_names = || async {
-            let body: serde_json::Value = match http.get(&routez).send().await {
-                Ok(resp) => resp.json().await.unwrap_or_default(),
-                Err(_) => serde_json::Value::Null,
-            };
-            body["routes"]
+            let body: serde_json::Value = http
+                .get(&routez)
+                .send()
+                .await
+                .map_err(|error| error.to_string())?
+                .json()
+                .await
+                .map_err(|error| error.to_string())?;
+            let routes = body["routes"]
                 .as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(|route| route["remote_name"].as_str().map(str::to_string))
-                .collect::<std::collections::BTreeSet<_>>()
+                .ok_or_else(|| format!("no routes array in {body}"))?;
+            Ok::<_, String>(
+                routes
+                    .iter()
+                    .filter_map(|route| route["remote_name"].as_str().map(str::to_string))
+                    .collect::<std::collections::BTreeSet<_>>(),
+            )
         };
         let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
         loop {
             let names = remote_names().await;
-            if names.contains("minga-3") {
+            if names.as_ref().is_ok_and(|names| names.contains("minga-3")) {
                 break;
             }
             assert!(
@@ -826,7 +834,13 @@ mod tests {
         }
         // minga-2 has been retrying all along; give it a few more attempts.
         tokio::time::sleep(Duration::from_secs(3)).await;
-        let names = remote_names().await;
+        // A valid final observation with minga-3 still routed, so an absent
+        // minga-2 means it was refused, not that monitoring failed.
+        let names = remote_names().await.expect("read /routez on minga-1");
+        assert!(
+            names.contains("minga-3"),
+            "the authorized route dropped: {names:?}"
+        );
         assert!(
             !names.contains("minga-2"),
             "a route without the route name was accepted: {names:?}"
