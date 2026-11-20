@@ -5,6 +5,9 @@
 - `minga-ctl` gains `manager`, `node`, `network`, `config`, `task`, `info` and
   `version` commands over the existing API, including Raft manager
   add/remove and node drain and labels.
+- The API now reports a draining node as `Spec.Availability: "drain"` instead
+  of always `"active"`, and `minga-ctl node update` stops if the node changed
+  between its read and its write.
 - Tenant egress routes no longer follow redirects or system proxies and
   refuse loopback, link-local, private, shared (`100.64.0.0/10`),
   `0.0.0.0/8`, unspecified and multicast destinations, including through

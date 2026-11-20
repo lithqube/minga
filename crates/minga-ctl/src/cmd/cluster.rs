@@ -314,6 +314,20 @@ async fn run_node(
                     ));
                 }
             };
+            // The API has no revision to check (it ignores `?version`), so
+            // re-read just before writing and refuse if another operator changed
+            // the node since the first read. This narrows the window; it does not
+            // close it.
+            let fresh = client.get(&format!("nodes/{id}"), None).await?;
+            if ["/Spec/Availability", "/Spec/Labels", "/Status/State"]
+                .iter()
+                .any(|field| fresh.pointer(field) != current.pointer(field))
+            {
+                return Err(CtlError::Api {
+                    status: 409,
+                    message: format!("node `{id}` changed while updating; run the command again"),
+                });
+            }
             let updated = client
                 .post(
                     &format!("nodes/{id}/update"),

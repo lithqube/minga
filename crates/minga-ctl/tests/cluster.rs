@@ -31,6 +31,27 @@ async fn cluster_resources_round_trip() {
     let nodes: Value = serde_json::from_str(&out).unwrap();
     assert_eq!(nodes.as_array().unwrap().len(), 1);
 
+    let (code, _, err) = run(
+        &cluster,
+        home,
+        &[
+            "node",
+            "update",
+            "1",
+            "--availability",
+            "drain",
+            "--label",
+            "zone=a",
+        ],
+    )
+    .await;
+    assert_eq!(code, 0, "{err}");
+    let (code, out, err) = run(&cluster, home, &["-o", "json", "node", "inspect", "1"]).await;
+    assert_eq!(code, 0, "{err}");
+    let node: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(node["Spec"]["Availability"], "drain");
+    assert_eq!(node["Spec"]["Labels"]["zone"], "a");
+
     let (code, _, err) = run(&cluster, home, &["manager", "ls"]).await;
     assert_eq!(code, 0, "{err}");
 

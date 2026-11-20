@@ -290,6 +290,15 @@ the `minga-ctl` context token must be a cluster-operator credential. The
 `--tls-cert` context setting trusts an HTTPS server CA; it is not a client
 certificate/key option.
 
+On a cluster with more than one tenant, the context token has no tenant
+identity, so `minga-ctl` commands that touch tenant resources (`stack`,
+`service`, `secret`, `network`, `config` and `task`) fail with 403 until
+`minga-ctl` can present a tenant client certificate. `node`, `manager`, `info`
+and `version` are operator-only and work with an operator token. `node update`
+re-reads the node before writing and stops if another operator changed it, but
+the API has no revision check, so two writes in the same instant can still
+race.
+
 ## Environment variables
 
 | Variable | Read by | Meaning |
