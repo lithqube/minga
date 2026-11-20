@@ -742,7 +742,7 @@ impl StateStore {
 
     pub async fn create_change_request(&self, request: ChangeRequest) -> Result<(), StateError> {
         match self
-            .propose(StateCommand::CreateChangeRequest(request))
+            .propose(StateCommand::CreateChangeRequest(Box::new(request)))
             .await?
         {
             StateResponse::Ok => Ok(()),

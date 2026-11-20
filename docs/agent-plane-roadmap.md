@@ -73,7 +73,7 @@ an HTTPS manager endpoint, a trusted API CA and a tenant client certificate
 with a protected private key; `O=*` and bearer tokens are not accepted. The
 server never exposes arbitrary HTTP, service environment values, task error
 text or event payloads. Event results contain only subject, observation time
-and payload. Its `request_change` write proposal is advertised only to agent
+and payload size. Its `request_change` write proposal is advertised only to agent
 certificates and implements item 12; no other write tool is exposed.
 
 Example setup (the client CA must match the manager's API client CA; the CA

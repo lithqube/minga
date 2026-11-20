@@ -202,31 +202,36 @@ pub async fn run(
         ))
     })?;
     let timeout = Duration::from_secs(args.timeout);
-    let version_value = request(timeout, conn.api.get("version", None))
+    // Keep the client's own error: a 401/403 must reach the user as an auth failure.
+    let version_value = tokio::time::timeout(timeout, conn.api.get("version", None))
         .await
-        .ok_or_else(|| {
-            CtlError::Usage(
-                "cannot read the running server version (request failed or timed out)".to_owned(),
-            )
-        })?;
+        .map_err(|_| {
+            CtlError::Usage("timed out reading the running server version".to_owned())
+        })??;
     let version: VersionInfo = serde_json::from_value(version_value)?;
     let current_metadata = known_current(&version.version);
     let cluster = request(timeout, conn.api.get("minga/cluster", None))
         .await
-        .and_then(|value| serde_json::from_value::<ClusterDiagnostics>(value).ok());
-    let state_format = cluster
+        .and_then(|value| {
+            serde_json::from_value::<ClusterDiagnostics>(value)
+                .map_err(|error| format!("unexpected cluster diagnostics: {error}"))
+        });
+    let reported_format = cluster
         .as_ref()
-        .and_then(|diagnostics| diagnostics.state_format_version)
-        .or_else(|| current_metadata.map(|release| release.state_format));
-    let node_count = collection_count(request(timeout, conn.api.get("nodes", None)).await);
+        .ok()
+        .and_then(|diagnostics| diagnostics.state_format_version);
+    let state_format =
+        reported_format.or_else(|| current_metadata.map(|release| release.state_format));
+    let node_count = collection_count(request(timeout, conn.api.get("nodes", None)).await.ok());
     let tenants_url = format!("{}/minga/tenants", conn.api.root());
     let tenant_count = request(timeout, conn.api.text(&tenants_url))
         .await
+        .ok()
         .and_then(|(status, body)| (status == 200).then_some(body))
         .and_then(|body| serde_json::from_str::<Value>(&body).ok())
         .and_then(|value| collection_count(Some(value)));
 
-    let raft = cluster.as_ref().map(|diagnostics| {
+    let raft = cluster.as_ref().ok().map(|diagnostics| {
         let members = &diagnostics.raft.members;
         RaftSummary {
             node_id: diagnostics.raft.node_id,
@@ -246,6 +251,7 @@ pub async fn run(
         version: version.version,
         build_revision: cluster
             .as_ref()
+            .ok()
             .and_then(|diagnostics| diagnostics.build_revision.clone())
             .or(version.build_revision),
         state_format,
@@ -281,10 +287,14 @@ pub async fn run(
         rollback_boundary: "Do not downgrade the v10 Minga data or wire format in place. Rollback requires restoring the complete pre-upgrade backup with the previous binary across the cluster; NATS downgrade is not a supported rollback path.",
         read_only: true,
     };
-    report.findings.push(state_format_finding(
-        report.current.state_format,
-        report.target.state_format,
-    ));
+    let mut state_finding =
+        state_format_finding(report.current.state_format, report.target.state_format);
+    if reported_format.is_none() && report.current.state_format.is_some() {
+        state_finding.evidence.push_str(
+            "; inferred from release metadata for the reported server version, not reported by the server",
+        );
+    }
+    report.findings.push(state_finding);
     report.findings.push(Finding {
         id: "current-binary",
         severity: Severity::Info,
@@ -305,9 +315,13 @@ pub async fn run(
         ),
         next_action: "Compare the observed server build with the intended starting release.",
     });
-    report
-        .findings
-        .push(raft_finding(report.current.raft.as_ref()));
+    report.findings.push(raft_finding(
+        report
+            .current
+            .raft
+            .as_ref()
+            .ok_or_else(|| cluster.as_ref().err().map_or("", String::as_str)),
+    ));
     report.findings.push(if report.current.api_auth_configured
         && report.current.api_transport_secure
     {
@@ -354,10 +368,19 @@ pub async fn run(
         ),
         next_action: "Before upgrading, verify the external server's JetStream API level or use the supported bundled NATS line.",
     });
+    let tenants_known = report.current.tenant_count.is_some();
     report.findings.push(Finding {
         id: "tenant-impact",
-        severity: Severity::Info,
-        status: Status::Ok,
+        severity: if tenants_known {
+            Severity::Info
+        } else {
+            Severity::Warning
+        },
+        status: if tenants_known {
+            Status::Ok
+        } else {
+            Status::Unknown
+        },
         summary: "legacy resources migrate into the default tenant",
         evidence: format!(
             "state migration defaults legacy resource ownership to `default` and ensures the default tenant; current tenant count {}",
@@ -375,17 +398,21 @@ pub async fn run(
     });
     report.findings.push(Finding {
         id: "cluster-inventory",
-        severity: if report.current.node_count.is_some() {
+        severity: if report.current.node_count.is_some() && tenants_known {
             Severity::Info
         } else {
             Severity::Warning
         },
-        status: if report.current.node_count.is_some() {
+        status: if report.current.node_count.is_some() && tenants_known {
             Status::Ok
         } else {
             Status::Unknown
         },
-        summary: "read-only cluster inventory collected",
+        summary: if report.current.node_count.is_some() && tenants_known {
+            "read-only cluster inventory collected"
+        } else {
+            "cluster inventory is incomplete"
+        },
         evidence: format!(
             "node count {}; tenant count {}; service names and IDs omitted",
             report
@@ -401,24 +428,30 @@ pub async fn run(
     });
 
     print_report(&report, format, quiet)?;
-    let failed = report
-        .findings
-        .iter()
-        .filter(|finding| finding.severity == Severity::Error && finding.status == Status::Failed)
-        .count();
+    let failed = blocking_findings(&report.findings);
     if failed > 0 {
         return Err(CtlError::HealthFailed { failed });
     }
     Ok(())
 }
 
+/// Every `Error` finding blocks, including one whose check could not run:
+/// a preflight that cannot confirm a precondition must not exit 0.
+fn blocking_findings(findings: &[Finding]) -> usize {
+    findings
+        .iter()
+        .filter(|finding| finding.severity == Severity::Error)
+        .count()
+}
+
 async fn request<T>(
     timeout: Duration,
     future: impl std::future::Future<Output = Result<T, CtlError>>,
-) -> Option<T> {
+) -> Result<T, String> {
     match tokio::time::timeout(timeout, future).await {
-        Ok(Ok(value)) => Some(value),
-        Ok(Err(_)) | Err(_) => None,
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(error)) => Err(error.to_string()),
+        Err(_) => Err(format!("timed out after {}s", timeout.as_secs())),
     }
 }
 
@@ -434,9 +467,10 @@ fn known_current(version: &str) -> Option<&'static ReleaseMetadata> {
         .find(|release| release.version == version)
 }
 
-fn raft_finding(raft: Option<&RaftSummary>) -> Finding {
+/// `Err` carries why the diagnostics could not be read.
+fn raft_finding(raft: Result<&RaftSummary, &str>) -> Finding {
     match raft {
-        Some(raft) if !raft.ready || raft.quorum_ack_recent == Some(false) => Finding {
+        Ok(raft) if !raft.ready || raft.quorum_ack_recent == Some(false) => Finding {
             id: "raft-membership",
             severity: Severity::Error,
             status: Status::Failed,
@@ -444,7 +478,7 @@ fn raft_finding(raft: Option<&RaftSummary>) -> Finding {
             evidence: raft_evidence(raft),
             next_action: "Restore leader readiness and recent quorum acknowledgement before planning a coordinated upgrade.",
         },
-        Some(raft)
+        Ok(raft)
             if raft.unreachable_voter_count > 0 || raft.quorum_ack_recent.is_none() =>
         {
             Finding {
@@ -456,7 +490,7 @@ fn raft_finding(raft: Option<&RaftSummary>) -> Finding {
                 next_action: "Confirm all manager processes and quorum on the leader before the maintenance window.",
             }
         }
-        Some(raft) => Finding {
+        Ok(raft) => Finding {
             id: "raft-membership",
             severity: Severity::Info,
             status: Status::Ok,
@@ -464,12 +498,12 @@ fn raft_finding(raft: Option<&RaftSummary>) -> Finding {
             evidence: raft_evidence(raft),
             next_action: "Keep the membership stable during the coordinated manager upgrade.",
         },
-        None => Finding {
+        Err(reason) => Finding {
             id: "raft-membership",
-            severity: Severity::Warning,
+            severity: Severity::Error,
             status: Status::Unknown,
             summary: "Raft membership could not be read",
-            evidence: "The server did not return cluster diagnostics.".to_owned(),
+            evidence: format!("The server did not return cluster diagnostics: {reason}"),
             next_action: "Use an authenticated operator context and confirm the membership with `minga-ctl info` before the upgrade.",
         },
     }
@@ -699,7 +733,7 @@ mod tests {
             voter_count: 3,
             unreachable_voter_count: 0,
         };
-        let finding = raft_finding(Some(&healthy));
+        let finding = raft_finding(Ok(&healthy));
         assert_eq!(finding.status, Status::Ok);
         assert_eq!(finding.severity, Severity::Info);
         assert!(finding.evidence.contains("members 3; voters 3"));
@@ -710,7 +744,7 @@ mod tests {
             unreachable_voter_count: 1,
             ..healthy.clone()
         };
-        let finding = raft_finding(Some(&degraded));
+        let finding = raft_finding(Ok(&degraded));
         assert_eq!(finding.status, Status::Failed);
         assert_eq!(finding.severity, Severity::Error);
 
@@ -718,7 +752,28 @@ mod tests {
             quorum_ack_recent: None,
             ..healthy
         };
-        assert_eq!(raft_finding(Some(&follower)).status, Status::Unknown);
-        assert_eq!(raft_finding(None).status, Status::Unknown);
+        assert_eq!(raft_finding(Ok(&follower)).status, Status::Unknown);
+        let unread = raft_finding(Err("API 403: forbidden"));
+        assert_eq!(unread.status, Status::Unknown);
+        assert_eq!(unread.severity, Severity::Error);
+        assert!(unread.evidence.contains("API 403"));
+    }
+
+    #[test]
+    fn a_check_that_could_not_run_blocks_the_upgrade() {
+        let unknown_format = state_format_finding(None, 11);
+        let unread_raft = raft_finding(Err("timed out after 10s"));
+        let warning = Finding {
+            id: "release-gate",
+            severity: Severity::Warning,
+            status: Status::Unknown,
+            summary: "",
+            evidence: String::new(),
+            next_action: "",
+        };
+        assert_eq!(blocking_findings(&[unknown_format]), 1);
+        assert_eq!(blocking_findings(&[unread_raft]), 1);
+        assert_eq!(blocking_findings(&[warning]), 0);
+        assert_eq!(blocking_findings(&[state_format_finding(Some(10), 11)]), 0);
     }
 }

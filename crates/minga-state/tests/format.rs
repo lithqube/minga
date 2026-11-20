@@ -457,7 +457,7 @@ fn change_request_fixtures() {
     check("change_request", &request);
     check(
         "command_create_change_request",
-        &StateCommand::CreateChangeRequest(request.clone()),
+        &StateCommand::CreateChangeRequest(Box::new(request.clone())),
     );
     check(
         "command_decide_change_request",
@@ -1389,6 +1389,89 @@ async fn change_requests_require_distinct_approval_and_apply_atomically() {
     assert_eq!(rejected.reviewer.as_deref(), Some("deployer"));
     assert_eq!(rejected.audit[0].action, "created");
     assert_eq!(rejected.audit[1].action, "rejected");
+    store.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn removing_a_tenant_drops_its_change_requests() {
+    let (_dir, path) = written_dir().await;
+    let store = StateStore::open(1, "127.0.0.1:0", &path, BTreeMap::new())
+        .await
+        .unwrap();
+    store.create_tenant(tenant()).await.unwrap();
+    let mut svc = service("a.web");
+    svc.tenant_id = "tenant-a".into();
+    svc.ports.clear();
+    store.upsert_service(svc.clone()).await.unwrap();
+    let mut request = change_request();
+    request.id = "cr-tenant-a".into();
+    request.tenant_id = "tenant-a".into();
+    request.service_id = svc.id.clone();
+    request.before = svc.clone();
+    request.after = svc.clone();
+    request.after.replicas += 1;
+    store.create_change_request(request).await.unwrap();
+
+    store
+        .remove_service(svc.id.clone(), "tenant-a")
+        .await
+        .unwrap();
+    store.remove_tenant("tenant-a").await.unwrap();
+    assert!(store.get_tenant("tenant-a").await.unwrap().is_none());
+    assert!(store
+        .get_change_request("cr-tenant-a")
+        .await
+        .unwrap()
+        .is_none());
+    store.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_tenant_keeps_a_bounded_number_of_change_requests() {
+    let (_dir, path) = written_dir().await;
+    let store = StateStore::open(1, "127.0.0.1:0", &path, BTreeMap::new())
+        .await
+        .unwrap();
+    let base = change_request();
+    let make = |n: u64, lifetime: u64| {
+        let mut request = base.clone();
+        request.id = format!("cr-{n:04}");
+        request.created_at_unix = 1_000 + n * 10;
+        request.expires_at_unix = request.created_at_unix + lifetime;
+        request
+    };
+
+    // Each request has expired by the time the next one is created.
+    for n in 0..260 {
+        store.create_change_request(make(n, 5)).await.unwrap();
+    }
+    let kept = store.list_change_requests().await.unwrap();
+    assert_eq!(kept.len(), 256);
+    assert!(
+        !kept.iter().any(|request| request.id == "cr-0000"),
+        "the oldest closed requests are dropped first"
+    );
+    assert!(kept.iter().any(|request| request.id == "cr-0259"));
+
+    // Open requests are never dropped; past the cap a new one is refused.
+    for n in 1_000..1_032 {
+        store
+            .create_change_request(make(n, 1_000_000))
+            .await
+            .unwrap();
+    }
+    assert!(store
+        .create_change_request(make(1_032, 1_000_000))
+        .await
+        .is_err());
+    let kept = store.list_change_requests().await.unwrap();
+    assert_eq!(kept.len(), 256);
+    assert_eq!(
+        kept.iter()
+            .filter(|request| request.expires_at_unix > 1_000_000)
+            .count(),
+        32
+    );
     store.shutdown().await.unwrap();
 }
 #[tokio::test]

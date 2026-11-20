@@ -326,14 +326,36 @@ fn tenant_has_resources(
             })?
             || tenant_has_records::<Config>(tx, CONFIGS_TABLE, tenant_id, |r, id| {
                 r.tenant_id == id
-            })?
-            || tenant_has_records::<ChangeRequest>(
-                tx,
-                CHANGE_REQUESTS_TABLE,
-                tenant_id,
-                |r, id| r.tenant_id == id,
-            )?,
+            })?,
     )
+}
+
+/// Most change requests one tenant may keep, decided or not. Past it the
+/// oldest closed ones are dropped, so an agent cannot grow Raft state forever.
+const MAX_CHANGE_REQUESTS_PER_TENANT: usize = 256;
+/// Most open (pending, unexpired) change requests one tenant may hold.
+const MAX_OPEN_CHANGE_REQUESTS_PER_TENANT: usize = 32;
+
+/// The tenant's change requests as `(id, open at now_unix, created_at_unix)`.
+#[allow(clippy::result_large_err)]
+fn tenant_change_requests(
+    tx: &redb::WriteTransaction,
+    tenant_id: &str,
+    now_unix: u64,
+) -> Result<Vec<(String, bool, u64)>, StorageError<u64>> {
+    let table = tx.open_table(CHANGE_REQUESTS_TABLE).map_err(sm_io_err)?;
+    let mut rows = Vec::new();
+    for row in table.iter().map_err(sm_io_err)? {
+        let (key, value) = row.map_err(sm_io_err)?;
+        let request: ChangeRequest = crate::codec::decode(value.value())
+            .map_err(|e| sm_storage_err(ErrorSubject::Store, ErrorVerb::Read, e))?;
+        if request.tenant_id == tenant_id {
+            let open = request.status == ChangeRequestStatus::Pending
+                && now_unix < request.expires_at_unix;
+            rows.push((key.value().to_owned(), open, request.created_at_unix));
+        }
+    }
+    Ok(rows)
 }
 
 fn valid_change_request_after(request: &ChangeRequest) -> bool {
@@ -1008,6 +1030,14 @@ impl RedbStateMachine {
                         "tenant {id} still owns resources"
                     )));
                 }
+                // Change requests are history, not resources: with the tenant's
+                // services gone none can apply, so they go with the tenant.
+                let requests = tenant_change_requests(tx, id, 0)?;
+                let mut table = tx.open_table(CHANGE_REQUESTS_TABLE).map_err(sm_io_err)?;
+                for (request_id, _, _) in &requests {
+                    table.remove(request_id.as_str()).map_err(sm_io_err)?;
+                }
+                drop(table);
                 let mut t = tx.open_table(TENANTS_TABLE).map_err(sm_io_err)?;
                 t.remove(id.as_str()).map_err(sm_io_err)?;
                 Ok(StateResponse::Ok)
@@ -1044,6 +1074,17 @@ impl RedbStateMachine {
                         "service changed while the request was being created".into(),
                     ));
                 }
+                let mut own =
+                    tenant_change_requests(tx, &request.tenant_id, request.created_at_unix)?;
+                let open = own.iter().filter(|(_, open, _)| *open).count();
+                if open >= MAX_OPEN_CHANGE_REQUESTS_PER_TENANT {
+                    return Ok(StateResponse::Conflict(format!(
+                        "tenant has {open} open change requests; decide or let some expire first"
+                    )));
+                }
+                own.retain(|(_, open, _)| !*open);
+                own.sort_by(|left, right| left.2.cmp(&right.2).then_with(|| left.0.cmp(&right.0)));
+                let excess = (own.len() + open + 1).saturating_sub(MAX_CHANGE_REQUESTS_PER_TENANT);
                 let mut request = request.clone();
                 request.status = ChangeRequestStatus::Pending;
                 request.reviewer = None;
@@ -1065,6 +1106,9 @@ impl RedbStateMachine {
                     return Ok(StateResponse::Conflict(
                         "change request ID already exists".into(),
                     ));
+                }
+                for (closed_id, _, _) in own.iter().take(excess) {
+                    requests.remove(closed_id.as_str()).map_err(sm_io_err)?;
                 }
                 requests
                     .insert(request.id.as_str(), bytes.as_slice())

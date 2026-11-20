@@ -11,14 +11,17 @@
   upgrade preflight --to v1.3.0` compares known release metadata with the
   running server and emits a read-only Raft membership/quorum, API-context
   security, backup, NATS, tenant, coordinated upgrade and rollback plan.
-  Unknown formats or releases fail closed; it does not stop, restart, migrate
-  or wipe cluster state.
+  Unknown formats or releases fail closed, and so does any blocking check that
+  could not run (for example unreadable Raft diagnostics): it exits non-zero.
+  It does not stop, restart, migrate or wipe cluster state.
 - `minga mcp serve` exposes fixed tenant-scoped reads over HTTPS/mTLS and an
   agent-only `request_change` proposal tool for deploy-image, scale, rollback
   and stop. `minga-ctl change list|approve|reject` uses tenant-scoped mTLS;
   listing requires a viewer role and decisions require a distinct deployer/admin
   role. Approval atomically applies reviewed service state in Raft. Requests
-  expire after 15 minutes. State/wire format is now v11.
+  expire after 15 minutes. A tenant holds at most 32 open and 256 total
+  requests; the oldest decided or expired ones are dropped first, and removing
+  a tenant removes its requests. State/wire format is now v11.
 - `minga validate` and `minga deploy` reject Compose `deploy.labels` before API
   writes instead of silently dropping those labels.
 

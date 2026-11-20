@@ -1393,8 +1393,18 @@ mod tests {
             tls_status(&addr, &ca.0, Some(&viewer), "/minga/tenants").await,
             Some(403)
         );
+        // `agent` is a role: it reads like a viewer but is still no operator.
+        let agent = client("agent");
+        assert_eq!(
+            tls_status(&addr, &ca.0, Some(&agent), "/v1.41/version").await,
+            Some(200)
+        );
+        assert_eq!(
+            tls_status(&addr, &ca.0, Some(&agent), "/minga/tenants").await,
+            Some(403)
+        );
         // An OU that is not a role is refused, not guessed at.
-        let unknown = client("agent");
+        let unknown = client("intern");
         assert_eq!(
             tls_status(&addr, &ca.0, Some(&unknown), "/v1.41/version").await,
             Some(403)

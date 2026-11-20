@@ -51,7 +51,8 @@ pub enum StateCommand {
         quotas: TenantQuotas,
     },
     RemoveTenant(TenantId),
-    CreateChangeRequest(ChangeRequest),
+    /// Boxed: a request holds two full services. The encoding is unchanged.
+    CreateChangeRequest(Box<ChangeRequest>),
     DecideChangeRequest {
         id: String,
         tenant_id: TenantId,

@@ -13,7 +13,7 @@ use crate::McpServeArgs;
 
 const API_VERSION: &str = "v1.41";
 const MAX_MESSAGE_BYTES: usize = 1024 * 1024;
-const MAX_LOG_TAIL: u64 = 100;
+const MAX_LOG_TAIL: u64 = 200;
 const MAX_LOG_BYTES: usize = 128 * 1024;
 const USAGE_LIMIT: u64 = 100;
 
