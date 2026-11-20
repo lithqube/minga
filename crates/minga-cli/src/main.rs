@@ -923,7 +923,8 @@ fn node_certificate_names(node_id: u64, role: NodeCertificateRole) -> Vec<String
     };
     let mut names = vec![minga_state::network::MINGA_NODE_NAME.to_string(), identity];
     if matches!(role, NodeCertificateRole::Manager) {
-        names.push("localhost".to_string());
+        // A manager certificate from the route CA doubles as its route certificate.
+        names.extend(["localhost".to_string(), sidecar::ROUTE_NAME.to_string()]);
     }
     names
 }
@@ -1621,6 +1622,22 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
     if args.nats_cluster_port.is_some() && cluster.is_none() {
         eprintln!("error: --nats-cluster-port requires route TLS");
         return ExitCode::FAILURE;
+    }
+    if let Some(cluster) = &cluster {
+        match cert_has_dns_name(&cluster.cert_file, sidecar::ROUTE_NAME) {
+            Ok(true) => {}
+            Ok(false) => {
+                eprintln!(
+                    "error: --nats-cluster-cert lacks the SAN {}; peers refuse routes without it. Reissue it with `minga tls issue-node --role manager` from the route CA",
+                    sidecar::ROUTE_NAME
+                );
+                return ExitCode::FAILURE;
+            }
+            Err(error) => {
+                eprintln!("error: {error}");
+                return ExitCode::FAILURE;
+            }
+        }
     }
     let sidecar_configured = args.nats_server_cert.is_some()
         || args.nats_server_key.is_some()
@@ -3045,9 +3062,8 @@ fn project_dir(compose_file: &str) -> Option<std::path::PathBuf> {
 /// or one holding a certificate issued by one in the other (a root and its
 /// intermediate). Issuers match by DN, so unrelated CAs with the same subject
 /// are refused too (fail closed). Missing files are left to the loaders.
-/// shortcut: only direct issuance is visible; a client CA two or more levels
-/// below the route CA (via an intermediate in neither file) is not detected.
-/// Upgrade by giving NATS routes their own peer authorization.
+/// Only direct issuance is visible here; a deeper chain (an intermediate in
+/// neither file) is covered by route authorization on `sidecar::ROUTE_NAME`.
 fn cas_overlap(a: &Path, b: &Path) -> Result<bool, String> {
     if !a.exists() || !b.exists() {
         return Ok(false);
@@ -3080,6 +3096,27 @@ fn cas_overlap(a: &Path, b: &Path) -> Result<bool, String> {
         || b_certs.iter().any(|cert| a_certs.contains(cert))
         || issued_by(&a_names, &b_names)
         || issued_by(&b_names, &a_names))
+}
+
+/// Whether the first certificate in the PEM file at `path` carries `name` as
+/// a DNS SAN.
+fn cert_has_dns_name(path: &Path, name: &str) -> Result<bool, String> {
+    let pem = std::fs::read(path)
+        .map_err(|error| format!("cannot read certificate {}: {error}", path.display()))?;
+    let Some(der) = pem_certificates(&pem).into_iter().next() else {
+        return Err(format!("no certificate in {}", path.display()));
+    };
+    let (_, cert) = x509_parser::parse_x509_certificate(&der)
+        .map_err(|error| format!("cannot parse certificate {}: {error}", path.display()))?;
+    Ok(cert
+        .subject_alternative_name()
+        .ok()
+        .flatten()
+        .is_some_and(|san| {
+            san.value.general_names.iter().any(|general| {
+            matches!(general, x509_parser::extensions::GeneralName::DNSName(dns) if *dns == name)
+        })
+        }))
 }
 
 /// Whether a `host:port` bind address only listens on loopback. Unparsable
@@ -3115,9 +3152,9 @@ fn port_of(addr: &str) -> Option<u16> {
 #[cfg(test)]
 mod tests {
     use super::{
-        cas_overlap, is_loopback_bind, is_wildcard_bind, manager_requires_wg_endpoint,
-        node_certificate_names, port_of, project_dir, run_node, run_tls,
-        worker_has_manager_only_flags, Cli, Command, NodeCertificateRole, TlsCommand,
+        cas_overlap, cert_has_dns_name, is_loopback_bind, is_wildcard_bind,
+        manager_requires_wg_endpoint, node_certificate_names, port_of, project_dir, run_node,
+        run_tls, worker_has_manager_only_flags, Cli, Command, NodeCertificateRole, TlsCommand,
     };
     use clap::Parser;
     use std::os::unix::fs::PermissionsExt;
@@ -3316,6 +3353,24 @@ mod tests {
         assert_eq!(code, std::process::ExitCode::FAILURE);
     }
 
+    #[test]
+    fn only_manager_certificates_carry_the_route_name() {
+        let dir = tempdir().unwrap();
+        let cert = |role, file: &str| {
+            let key = rcgen::KeyPair::generate().unwrap();
+            let params = rcgen::CertificateParams::new(node_certificate_names(1, role)).unwrap();
+            let path = dir.path().join(file);
+            std::fs::write(&path, params.self_signed(&key).unwrap().pem()).unwrap();
+            path
+        };
+        let manager = cert(NodeCertificateRole::Manager, "manager.pem");
+        let worker = cert(NodeCertificateRole::Worker, "worker.pem");
+        let route = crate::sidecar::ROUTE_NAME;
+        assert!(cert_has_dns_name(&manager, route).unwrap());
+        assert!(!cert_has_dns_name(&worker, route).unwrap());
+        assert!(cert_has_dns_name(&dir.path().join("missing.pem"), route).is_err());
+    }
+
     #[tokio::test]
     async fn manager_refuses_tokenless_api_beyond_loopback() {
         // The default API bind is 0.0.0.0:2375.
@@ -3392,7 +3447,12 @@ mod tests {
     fn manager_certificate_names_cover_local_sidecar_tls_without_expanding_worker_identity() {
         assert_eq!(
             node_certificate_names(1, NodeCertificateRole::Manager),
-            ["minga-node", "minga-manager-1", "localhost"]
+            [
+                "minga-node",
+                "minga-manager-1",
+                "localhost",
+                crate::sidecar::ROUTE_NAME
+            ]
         );
         assert_eq!(
             node_certificate_names(2, NodeCertificateRole::Worker),

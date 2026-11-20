@@ -209,8 +209,9 @@ certificates (SAN `minga-manager-<id>`), so worker certificates from the same CA
 cannot join it. Sidecar route TLS (`--nats-cluster-*`) needs its own CA: a
 manager refuses a `--nats-cluster-ca` that shares a certificate with, or
 directly issued, `--nats-client-ca` (or the reverse), because worker
-certificates chain to that CA. The check cannot see intermediates absent from
-both files, so keep the two CAs as unrelated roots. Preload workload images on **every** node: convert the
+certificates chain to that CA. Routes also accept only a peer certificate with
+the SAN `minga-nats-route` (`minga tls issue-node --role manager` from the route
+CA adds it), so a certificate that merely chains to the route CA cannot join. Preload workload images on **every** node: convert the
 preload Job to a DaemonSet.
 
 ### Changing Minga's configuration later

@@ -17,8 +17,13 @@
       configured token, which `Authorization: Basic Og==` used to satisfy.
     - Raft is plaintext on a non-loopback `--bind`.
   - **The NATS route CA must be its own.** A manager refuses a `--nats-cluster-ca` that shares a
-    certificate with `--nats-client-ca`. Worker certificates chain to the client CA, and a route peer
-    bypasses per-tenant JWT permissions.
+    certificate with `--nats-client-ca` or directly issued it (or the reverse). Worker certificates
+    chain to the client CA, and a route peer bypasses per-tenant JWT permissions.
+  - **NATS routes need a route certificate.** Sidecar routes now accept an inbound peer only if its
+    certificate carries the SAN `minga-nats-route`, so a certificate that merely chains to the route
+    CA is refused. **Breaking:** reissue every `--nats-cluster-cert` with `minga tls issue-node
+    --role manager` from the route CA, which now adds that SAN; a manager refuses to start with a
+    route certificate that lacks it.
   - **The templates are updated.** `scripts/minga.env.example` documents `MINGA_API_TOKEN`.
     `talos/single-node.yaml` now runs the API from the manager with the token and drops the retired
     `minga api` container and its phantom Raft peer.
