@@ -222,4 +222,13 @@ jobs:
           sudo modprobe wireguard
           sudo modprobe br_netfilter
       - name: Network-namespace suite (fails closed when it cannot run)
-        run: sudo -E env "PATH=$PATH" MINGA_REQUIRE_NETNS=1 cargo test -p minga-node --test netns --test wireguard_netns -- --nocapture
+        # TEMP (#115): loop the suite to catch the flake; reverted before review.
+        run: |
+          fail=0
+          for i in $(seq 15); do
+            echo "::group::netns loop $i"
+            sudo -E env "PATH=$PATH" MINGA_REQUIRE_NETNS=1 cargo test -p minga-node --test netns --test wireguard_netns -- --nocapture || { fail=$((fail+1)); echo "LOOP $i FAILED"; }
+            echo "::endgroup::"
+          done
+          echo "failed iterations: $fail/15"
+          test "$fail" -eq 0
