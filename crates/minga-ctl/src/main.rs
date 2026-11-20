@@ -66,6 +66,23 @@ enum Command {
     /// Log nodes in to private container registries.
     #[command(subcommand)]
     Registry(cmd::registry::RegistryCommand),
+    /// Manage Raft managers.
+    #[command(subcommand)]
+    Manager(cmd::cluster::ManagerCommand),
+    /// Inspect and update cluster nodes.
+    #[command(subcommand)]
+    Node(cmd::cluster::NodeCommand),
+    /// Manage cluster networks.
+    #[command(subcommand)]
+    Network(cmd::cluster::NetworkCommand),
+    /// Manage cluster configs.
+    #[command(subcommand)]
+    Config(cmd::cluster::ConfigCommand),
+    /// Inspect cluster tasks.
+    #[command(subcommand)]
+    Task(cmd::cluster::TaskCommand),
+    /// Show API version information.
+    Version,
     /// Query agent request usage.
     #[command(subcommand)]
     Agent(AgentCommand),
@@ -174,6 +191,16 @@ fn run(cli: &Cli) -> Result<(), CtlError> {
             let conn = connect(cli).await?;
             cmd::change::run(command, &conn.api, format, quiet).await
         }),
+        Command::Manager(cmd) => {
+            run_cluster(cli, cmd::cluster::ClusterCommand::Manager(cmd.clone()))
+        }
+        Command::Node(cmd) => run_cluster(cli, cmd::cluster::ClusterCommand::Node(cmd.clone())),
+        Command::Network(cmd) => {
+            run_cluster(cli, cmd::cluster::ClusterCommand::Network(cmd.clone()))
+        }
+        Command::Config(cmd) => run_cluster(cli, cmd::cluster::ClusterCommand::Config(cmd.clone())),
+        Command::Task(cmd) => run_cluster(cli, cmd::cluster::ClusterCommand::Task(cmd.clone())),
+        Command::Version => run_system_info(cli, true),
         Command::Registry(cmd) => api::block_on(cmd::registry::run(
             cmd,
             &resolve_target(cli)?,
@@ -182,6 +209,26 @@ fn run(cli: &Cli) -> Result<(), CtlError> {
             cli.debug,
         )),
     }
+}
+
+fn run_cluster(cli: &Cli, command: cmd::cluster::ClusterCommand) -> Result<(), CtlError> {
+    api::block_on(async {
+        let resolved = resolve(cli)?;
+        let result = async {
+            let conn = transport::connect(&resolved, cli.debug).await?;
+            cmd::cluster::run(&command, &conn.api, cli.format(), cli.quiet).await
+        }
+        .await;
+        audit(&resolved, command.audit(), &result);
+        result
+    })
+}
+
+fn run_system_info(cli: &Cli, version: bool) -> Result<(), CtlError> {
+    api::block_on(async {
+        let conn = connect(cli).await?;
+        cmd::cluster::system_info(&conn.api, version, cli.format(), cli.quiet).await
+    })
 }
 
 /// Connects to the selected context. The connection (and, once step 3 lands,

@@ -297,6 +297,32 @@ impl ApiClient {
         expect_found(classify(&self.root, status, &body)?, path)
     }
 
+    /// `GET /<path>` for Minga's unversioned management endpoints.
+    pub async fn get_unversioned(&self, path: &str) -> Result<Value, CtlError> {
+        let (status, body) = self.send_unversioned(Method::GET, path, None).await?;
+        expect_found_at(
+            classify(&self.root, status, &body)?,
+            &format!("/{}", path.trim_start_matches('/')),
+        )
+    }
+
+    /// `POST /<path>` for Minga's unversioned management endpoints.
+    pub async fn post_unversioned(&self, path: &str, body: &Value) -> Result<Value, CtlError> {
+        let (status, text) = self
+            .send_unversioned(Method::POST, path, Some(body))
+            .await?;
+        expect_found_at(
+            classify(&self.root, status, &text)?,
+            &format!("/{}", path.trim_start_matches('/')),
+        )
+    }
+
+    /// `DELETE /<path>` for Minga's unversioned management endpoints.
+    pub async fn delete_unversioned(&self, path: &str) -> Result<Found, CtlError> {
+        let (status, body) = self.send_unversioned(Method::DELETE, path, None).await?;
+        classify(&self.root, status, &body)
+    }
+
     /// `POST /v1.41/<path>` with a JSON body. An empty response body is `null`.
     pub async fn post(&self, path: &str, body: &Value) -> Result<Value, CtlError> {
         let (status, text) = self.send(Method::POST, path, None, Some(body)).await?;
@@ -346,7 +372,37 @@ impl ApiClient {
         body: Option<&Value>,
     ) -> Result<(u16, String), CtlError> {
         let url = format!("{}/{API_VERSION}/{path}", self.root);
-        let mut request = self.http.request(method.clone(), &url);
+        self.send_url(
+            method,
+            &url,
+            &format!("/{API_VERSION}/{path}"),
+            filters,
+            body,
+        )
+        .await
+    }
+
+    async fn send_unversioned(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<&Value>,
+    ) -> Result<(u16, String), CtlError> {
+        let path = path.trim_start_matches('/');
+        let url = format!("{}/{path}", self.root);
+        self.send_url(method, &url, &format!("/{path}"), None, body)
+            .await
+    }
+
+    async fn send_url(
+        &self,
+        method: Method,
+        url: &str,
+        shown: &str,
+        filters: Option<&Value>,
+        body: Option<&Value>,
+    ) -> Result<(u16, String), CtlError> {
+        let mut request = self.http.request(method.clone(), url);
         if let Some(filters) = filters {
             request = request.query(&[("filters", filters.to_string())]);
         }
@@ -363,7 +419,7 @@ impl ApiClient {
         let status = response.status().as_u16();
         if self.debug {
             // Method, path and status only; the Authorization header is never printed.
-            eprintln!("debug: {method} /{API_VERSION}/{path} -> {status}");
+            eprintln!("debug: {method} {shown} -> {status}");
         }
         let text = response.text().await.map_err(|e| CtlError::Unreachable {
             endpoint: self.root.clone(),
@@ -399,11 +455,15 @@ fn classify(root: &str, status: u16, body: &str) -> Result<Found, CtlError> {
 /// Turns [`Found::No`] into an exit-2 error for callers that expect the path
 /// to exist.
 fn expect_found(found: Found, path: &str) -> Result<Value, CtlError> {
+    expect_found_at(found, &format!("/{API_VERSION}/{path}"))
+}
+
+fn expect_found_at(found: Found, path: &str) -> Result<Value, CtlError> {
     match found {
         Found::Yes(value) => Ok(value),
         Found::No => Err(CtlError::Api {
             status: 404,
-            message: format!("/{API_VERSION}/{path} not found"),
+            message: format!("{path} not found"),
         }),
     }
 }

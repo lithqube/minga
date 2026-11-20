@@ -1,8 +1,8 @@
-//! Output rendering: table, JSON and YAML.
+//! Output rendering: tables, JSON and YAML.
 //!
-//! Results go to stdout; progress, prompts and errors go to stderr. Row-based
-//! commands render JSON arrays or YAML sequences; structured reports render
-//! objects.
+//! Results go to stdout; progress, prompts and errors go to stderr. List
+//! commands render row arrays; detail commands and structured reports render
+//! one object.
 
 use std::io::Write;
 
@@ -92,6 +92,61 @@ pub fn print(format: Format, quiet: bool, rows: &Rows) -> Result<(), CtlError> {
     written
         .and_then(|()| out.flush())
         .map_err(|e| CtlError::Output(format!("write to stdout: {e}")))
+}
+
+/// Prints one API object without wrapping JSON or YAML in a row array.
+pub fn print_value(format: Format, quiet: bool, value: &serde_json::Value) -> Result<(), CtlError> {
+    if format == Format::Table {
+        if quiet {
+            let stdout = std::io::stdout();
+            let mut out = stdout.lock();
+            if let Some(id) = value.get("ID").and_then(serde_json::Value::as_str) {
+                writeln!(out, "{id}")
+                    .and_then(|()| out.flush())
+                    .map_err(|e| CtlError::Output(format!("write to stdout: {e}")))?;
+            }
+            return Ok(());
+        }
+
+        let mut rows = Rows::new(&["FIELD", "VALUE"]);
+        if let Some(object) = value.as_object() {
+            for (key, value) in object {
+                let text = match value {
+                    serde_json::Value::String(value) => value.clone(),
+                    serde_json::Value::Null => String::new(),
+                    value => serde_json::to_string(value)?,
+                };
+                rows.push(
+                    vec![key.clone(), text],
+                    serde_json::json!({"field": key, "value": value}),
+                );
+            }
+        } else {
+            rows.push(
+                vec!["VALUE".into(), serde_json::to_string(value)?],
+                value.clone(),
+            );
+        }
+        return print(Format::Table, false, &rows);
+    }
+
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    match format {
+        Format::Json => {
+            serde_json::to_writer_pretty(&mut out, value)?;
+            writeln!(out)
+                .and_then(|()| out.flush())
+                .map_err(|e| CtlError::Output(format!("write to stdout: {e}")))
+        }
+        Format::Yaml => {
+            let yaml = serde_yaml::to_string(value).map_err(|e| CtlError::Output(e.to_string()))?;
+            write!(out, "{yaml}")
+                .and_then(|()| out.flush())
+                .map_err(|e| CtlError::Output(format!("write to stdout: {e}")))
+        }
+        Format::Table => unreachable!("table format returned above"),
+    }
 }
 
 /// Prints a one-line confirmation to stdout unless `quiet` is set.

@@ -1,6 +1,7 @@
 //! Command groups.
 
 pub mod change;
+pub mod cluster;
 pub mod context;
 pub mod doctor;
 pub mod health;
