@@ -14,7 +14,9 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
 
-use minga_state::codec::{self, FORMAT_KEY, FORMAT_VERSION, V2_FORMAT_VERSION};
+use minga_state::codec::{
+    self, FORMAT_KEY, FORMAT_VERSION, V2_FORMAT_VERSION, V8_FORMAT_VERSION,
+};
 use minga_state::types::{
     AgentSpec, ClusterNode, FailureAction, Healthcheck, MountKind, NodeRole, NodeStatus,
     PortMapping, PortMode, ReservedPort, ResourceSpec, RestartCondition, RestartPolicy, SecretRef,
@@ -81,12 +83,15 @@ fn a_fixture_accepts_added_fields_and_rejects_changed_ones() {
 
 /// Compares `value` with its fixture, and decodes the fixture back.
 fn check<T: Serialize + DeserializeOwned>(name: &str, value: &T) {
-    let old_path = fixture_path_for_version(V2_FORMAT_VERSION, name);
-    if old_path.exists() {
-        let old = std::fs::read_to_string(&old_path)
-            .unwrap_or_else(|e| panic!("cannot read frozen fixture {}: {e}", old_path.display()));
-        let _: T = codec::decode(old.as_bytes())
-            .unwrap_or_else(|e| panic!("v2 fixture {name} no longer decodes: {e}"));
+    for version in V2_FORMAT_VERSION..=V8_FORMAT_VERSION {
+        let old_path = fixture_path_for_version(version, name);
+        if old_path.exists() {
+            let old = std::fs::read_to_string(&old_path)
+                .unwrap_or_else(|e| panic!("cannot read frozen fixture {}: {e}", old_path.display()));
+            let _: T = codec::decode(old.as_bytes()).unwrap_or_else(|e| {
+                panic!("v{version} fixture {name} no longer decodes: {e}")
+            });
+        }
     }
     let actual = serde_json::to_value(value).unwrap();
     let path = fixture_path(name);
@@ -162,6 +167,7 @@ fn node() -> ClusterNode {
             gpus: 0,
         },
         wg_public_key: Some("pk".into()),
+        nats_user_public_key: None,
         wg_endpoint: Some("10.0.0.3:51820".into()),
         overlay_ip: Some("10.100.0.3".into()),
         last_seen_unix: Some(1_794_000_000),
@@ -468,6 +474,23 @@ fn strip_v3_fields(value: &mut serde_json::Value) {
     }
 }
 
+fn strip_v8_fields(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(object) => {
+            object.remove("capabilities");
+            for nested in object.values_mut() {
+                strip_v8_fields(nested);
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for nested in values {
+                strip_v8_fields(nested);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn downgrade_string_table(tx: &redb::WriteTransaction, definition: TableDefinition<&str, &[u8]>) {
     let records = {
         let table = tx.open_table(definition).unwrap();
@@ -538,6 +561,66 @@ fn prepare_v2_log(file: &std::path::Path) {
     tx.commit().unwrap();
 }
 
+fn prepare_v8_state(file: &std::path::Path) {
+    let db = Database::create(file).unwrap();
+    let tx = db.begin_write().unwrap();
+    let records = {
+        let table = tx.open_table(SM_SERVICES).unwrap();
+        table
+            .iter()
+            .unwrap()
+            .map(|row| {
+                let (key, value) = row.unwrap();
+                (
+                    key.value().to_owned(),
+                    serde_json::from_slice::<serde_json::Value>(value.value()).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut table = tx.open_table(SM_SERVICES).unwrap();
+    for (key, mut value) in records {
+        strip_v8_fields(&mut value);
+        let bytes = serde_json::to_vec(&value).unwrap();
+        table.insert(key.as_str(), bytes.as_slice()).unwrap();
+    }
+    tx.open_table(SM_META)
+        .unwrap()
+        .insert(FORMAT_KEY, [V8_FORMAT_VERSION].as_slice())
+        .unwrap();
+    tx.commit().unwrap();
+}
+
+fn prepare_v8_log(file: &std::path::Path) {
+    let db = Database::create(file).unwrap();
+    let tx = db.begin_write().unwrap();
+    let records = {
+        let table = tx.open_table(RAFT_LOGS).unwrap();
+        table
+            .iter()
+            .unwrap()
+            .map(|row| {
+                let (index, value) = row.unwrap();
+                (
+                    index.value(),
+                    serde_json::from_slice::<serde_json::Value>(value.value()).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut table = tx.open_table(RAFT_LOGS).unwrap();
+    for (index, mut value) in records {
+        strip_v8_fields(&mut value);
+        let bytes = serde_json::to_vec(&value).unwrap();
+        table.insert(index, bytes.as_slice()).unwrap();
+    }
+    tx.open_table(RAFT_META)
+        .unwrap()
+        .insert(FORMAT_KEY, [V8_FORMAT_VERSION].as_slice())
+        .unwrap();
+    tx.commit().unwrap();
+}
+
 fn read_marker(file: &std::path::Path, table: TableDefinition<&str, &[u8]>) -> Option<u8> {
     let db = Database::create(file).unwrap();
     let tx = db.begin_read().unwrap();
@@ -580,6 +663,16 @@ fn has_ingress_port_mode(value: &serde_json::Value) -> bool {
                 || object.values().any(has_ingress_port_mode)
         }
         serde_json::Value::Array(values) => values.iter().any(has_ingress_port_mode),
+        _ => false,
+    }
+}
+
+fn has_capabilities(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Object(object) => {
+            object.contains_key("capabilities") || object.values().any(has_capabilities)
+        }
+        serde_json::Value::Array(values) => values.iter().any(has_capabilities),
         _ => false,
     }
 }
@@ -651,7 +744,57 @@ async fn a_v2_log_file_rewrites_entries_and_preserves_indices() {
 }
 
 #[tokio::test]
-async fn importing_a_v2_portable_snapshot_defaults_ports_and_exports_v3() {
+async fn v8_state_and_logs_migrate_agent_capabilities() {
+    let (_dir, path) = written_dir().await;
+    let state_file = path.join("state.redb");
+    let log_file = path.join("raft_log.redb");
+    prepare_v8_state(&state_file);
+    prepare_v8_log(&log_file);
+
+    let store = StateStore::open(1, "127.0.0.1:0", &path, BTreeMap::new())
+        .await
+        .unwrap();
+    let service = store.get_service("shop.web").await.unwrap().unwrap();
+    let capabilities = &service.agent.as_ref().unwrap().capabilities;
+    assert!(capabilities.grants.is_empty());
+    assert!(capabilities.dirs.is_empty());
+    store.shutdown().await.unwrap();
+
+    assert_eq!(read_marker(&state_file, SM_META), Some(FORMAT_VERSION));
+    assert_eq!(read_marker(&log_file, RAFT_META), Some(FORMAT_VERSION));
+    assert!(read_log_values(&log_file)
+        .iter()
+        .any(|(_, value)| has_capabilities(value)));
+    let service: Service =
+        serde_json::from_value(read_state_value(&state_file, SM_SERVICES, "shop.web")).unwrap();
+    let capabilities = &service.agent.as_ref().unwrap().capabilities;
+    assert!(capabilities.grants.is_empty());
+    assert!(capabilities.dirs.is_empty());
+}
+
+#[tokio::test]
+async fn importing_a_v8_portable_snapshot_defaults_agent_capabilities() {
+    let (_dir, path) = written_dir().await;
+    let store = StateStore::open(1, "127.0.0.1:0", &path, BTreeMap::new())
+        .await
+        .unwrap();
+
+    let mut old_json = serde_json::to_value(store.export().await.unwrap()).unwrap();
+    old_json["format_version"] = serde_json::json!(V8_FORMAT_VERSION);
+    strip_v8_fields(&mut old_json);
+    let snapshot: StateSnapshot = serde_json::from_value(old_json).unwrap();
+    store.import(snapshot, true).await.unwrap();
+
+    let imported = store.get_service("shop.web").await.unwrap().unwrap();
+    let capabilities = &imported.agent.as_ref().unwrap().capabilities;
+    assert!(capabilities.grants.is_empty());
+    assert!(capabilities.dirs.is_empty());
+    assert_eq!(store.export().await.unwrap().format_version, FORMAT_VERSION);
+    store.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn importing_a_v2_portable_snapshot_defaults_ports_and_exports_v9() {
     let (_dir, path) = written_dir().await;
     let store = StateStore::open(1, "127.0.0.1:0", &path, BTreeMap::new())
         .await

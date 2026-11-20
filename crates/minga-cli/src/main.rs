@@ -1415,6 +1415,8 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
         None
     };
 
+    // Shared by container workloads, the agent executor and the egress proxy.
+    let egress_tokens = Arc::new(minga_egress::SandboxTokens::new());
     // Construct the container runtime based on --runtime flag.
     let runtime: Arc<dyn minga_node::Runtime> = match args.runtime.as_str() {
         "mock" => {
@@ -1441,7 +1443,8 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
                     );
                     let rt = rt
                         .with_volume_dir(format!("{}/volumes", args.data_dir))
-                        .with_logs_dir(format!("{}/logs", args.data_dir));
+                        .with_logs_dir(format!("{}/logs", args.data_dir))
+                        .with_egress_tokens(egress_tokens.clone());
                     Arc::new(rt.with_secret_store(store))
                 }
                 Err(e) => {
@@ -1459,8 +1462,6 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
         }
     };
 
-    // Shared by the agent executor (mints) and the egress proxy (checks).
-    let egress_tokens = Arc::new(minga_egress::SandboxTokens::new());
 
     // Construct the agent executor if --sandbox-runtime is set.
     let agent_executor: Option<Arc<dyn minga_node::AgentExecutor>> = match &args.sandbox_runtime {

@@ -16,8 +16,8 @@
 //!
 //! | Bucket | Keys | Purpose |
 //! |---|---|---|
-//! | `MINGA_ASSIGN` | `node.{id}.task.{id}`, `node.{id}.net.{id}` | Manager-authored desired task assignments and, per node, the networks its tasks use with their DNS records |
-//! | `MINGA_LEASES` | `lease.node.{id}` | Liveness (server-expiring registration lease) |
+//! | `MINGA_ASSIGN` | `{tenant}.node.{id}.task.{id}`, `{tenant}.node.{id}.net.{id}` | Manager-authored desired task assignments and tenant-scoped network metadata |
+//! | `MINGA_LEASES` | `{tenant}.node.{id}` | Tenant-qualified liveness leases (globally unique node IDs) |
 //! | `MINGA_STATUS` | `node.{id}.task.{id}` | Actual task status reports |
 //!
 //! # High availability
@@ -40,14 +40,38 @@ use async_nats::jetstream::stream::{Config as StreamConfig, RetentionPolicy};
 use async_nats::jetstream::AckKind;
 use async_nats::jetstream::{self, Context as JetStream};
 use async_nats::Client;
+use async_nats::HeaderMap;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::StreamExt;
 
 use crate::{
     subjects, BusError, BusEvent, BusRequest, EventBus, EventStream, KvEvent, KvOp, KvStream,
-    LogEntry, LogEventStream, RequestStream, Result,
+    LogEntry, LogEventStream, RequestStream, Result, UsageEvent, UsageTotals,
 };
+
+/// Default retained usage window and storage cap for each tenant stream.
+const USAGE_MAX_AGE: Duration = Duration::from_secs(30 * 24 * 3600);
+const USAGE_MAX_BYTES: i64 = 256 * 1024 * 1024;
+
+async fn ensure_usage_stream(js: &JetStream, tenant_id: &str) -> Result<jetstream::stream::Stream> {
+    if !crate::valid_subject_token(tenant_id) {
+        return Err(BusError::Other("invalid usage tenant".into()));
+    }
+    let name = format!("MINGA_USAGE_{tenant_id}");
+    let config = StreamConfig {
+        name: name.clone(),
+        subjects: vec![format!("minga.{tenant_id}.usage.>")],
+        retention: RetentionPolicy::Limits,
+        max_age: USAGE_MAX_AGE,
+        max_bytes: USAGE_MAX_BYTES,
+        duplicate_window: Duration::from_secs(120),
+        ..Default::default()
+    };
+    js.get_or_create_stream(config)
+        .await
+        .map_err(|error| BusError::Other(format!("{name}: {error}")))
+}
 
 /// Default lease TTL: 30 seconds.
 const DEFAULT_LEASE_TTL: Duration = Duration::from_secs(30);
@@ -89,7 +113,7 @@ pub struct NatsBus {
     status_kv: jetstream::kv::Store,
     assignments_kv: jetstream::kv::Store,
     leases_kv: jetstream::kv::Store,
-    worker_node_id: Option<u64>,
+    worker_identity: Option<(String, u64)>,
 }
 
 /// Turns a KV stream message into a put or delete event.
@@ -165,7 +189,7 @@ impl NatsBus {
     /// server has joined JetStream, so this retries for up to 10 seconds,
     /// like stream setup does.
     pub async fn ensure_replicas(&self, replicas: usize) -> Result<()> {
-        if self.worker_node_id.is_some() {
+        if self.worker_identity.is_some() {
             return Err(BusError::Other(
                 "workers cannot change JetStream replica counts".to_string(),
             ));
@@ -211,19 +235,25 @@ impl NatsBus {
     }
 
     fn require_manager(&self, operation: &str) -> Result<()> {
-        if self.worker_node_id.is_some() {
+        if self.worker_identity.is_some() {
             return Err(BusError::Kv(format!("worker identity cannot {operation}")));
         }
         Ok(())
     }
 
     fn check_worker_key(&self, key: &str) -> Result<()> {
-        if let Some(node_id) = self.worker_node_id {
-            let task_prefix = subjects::kv_assignment_node_prefix(node_id);
-            let ingress_prefix = subjects::kv_assignment_ingress_prefix(node_id);
-            if !key.starts_with(&task_prefix) && !key.starts_with(&ingress_prefix) {
+        if let Some((tenant_id, node_id)) = &self.worker_identity {
+            let task_prefix = subjects::kv_assignment_node_prefix(tenant_id, *node_id);
+            let ingress_prefix = subjects::kv_assignment_ingress_prefix(tenant_id, *node_id);
+            let network_prefix = subjects::kv_assignment_node_network_prefix(tenant_id, *node_id);
+            let wireguard_key = format!("{tenant_id}.node.{node_id}.wg");
+            if !key.starts_with(&task_prefix)
+                && !key.starts_with(&ingress_prefix)
+                && !key.starts_with(&network_prefix)
+                && key != wireguard_key
+            {
                 return Err(BusError::Kv(format!(
-                    "worker {node_id} cannot access assignment/status key {key}"
+                    "worker {tenant_id}/{node_id} cannot access assignment/status key {key}"
                 )));
             }
         }
@@ -231,13 +261,13 @@ impl NatsBus {
     }
 
     fn check_worker_prefix(&self, prefix: &str) -> Result<()> {
-        if let Some(node_id) = self.worker_node_id {
-            let task_prefix = subjects::kv_assignment_node_prefix(node_id);
-            let ingress_prefix = subjects::kv_assignment_ingress_prefix(node_id);
-            let network_prefix = subjects::kv_assignment_node_network_prefix(node_id);
-            if prefix != task_prefix && prefix != ingress_prefix && prefix != network_prefix {
+        if let Some((tenant_id, node_id)) = &self.worker_identity {
+            if prefix != subjects::kv_assignment_node_prefix(tenant_id, *node_id)
+                && prefix != subjects::kv_assignment_ingress_prefix(tenant_id, *node_id)
+                && prefix != subjects::kv_assignment_node_network_prefix(tenant_id, *node_id)
+            {
                 return Err(BusError::Kv(format!(
-                    "worker {node_id} may list only its own task, ingress and network assignments"
+                    "worker {tenant_id}/{node_id} may list only its own assignments"
                 )));
             }
         }
@@ -245,18 +275,15 @@ impl NatsBus {
     }
 
     fn check_worker_watch(&self, prefix: &str) -> Result<()> {
-        if let Some(node_id) = self.worker_node_id {
-            let task_prefix = subjects::kv_assignment_node_prefix(node_id);
-            let ingress_prefix = subjects::kv_assignment_ingress_prefix(node_id);
-            let wireguard_key = format!("node.{node_id}.wg");
-            let network_prefix = subjects::kv_assignment_node_network_prefix(node_id);
-            if prefix != task_prefix
-                && prefix != ingress_prefix
+        if let Some((tenant_id, node_id)) = &self.worker_identity {
+            let wireguard_key = format!("{tenant_id}.node.{node_id}.wg");
+            if prefix != subjects::kv_assignment_node_prefix(tenant_id, *node_id)
+                && prefix != subjects::kv_assignment_ingress_prefix(tenant_id, *node_id)
                 && prefix != wireguard_key
-                && prefix != network_prefix
+                && prefix != subjects::kv_assignment_node_network_prefix(tenant_id, *node_id)
             {
                 return Err(BusError::Kv(format!(
-                    "worker {node_id} may watch only its own assignments and networks"
+                    "worker {tenant_id}/{node_id} may watch only its own assignments"
                 )));
             }
         }
@@ -289,22 +316,23 @@ impl NatsBus {
     ///
     /// Plaintext worker connections are intended only for local development;
     /// production workers should use [`Self::connect_worker_secure`].
-    pub async fn connect_worker(url: &str, node_id: u64) -> Result<Arc<Self>> {
-        Self::connect_worker_with_token_inner(url, node_id, None).await
+    pub async fn connect_worker(url: &str, tenant_id: &str, node_id: u64) -> Result<Arc<Self>> {
+        Self::connect_worker_with_token_inner(url, tenant_id, node_id, None).await
     }
 
-    /// Connect a development worker with token authentication, without
-    /// creating streams or buckets.
+    /// Connect a development worker with token authentication.
     pub async fn connect_worker_with_token(
         url: &str,
         token: &str,
+        tenant_id: &str,
         node_id: u64,
     ) -> Result<Arc<Self>> {
-        Self::connect_worker_with_token_inner(url, node_id, Some(token)).await
+        Self::connect_worker_with_token_inner(url, tenant_id, node_id, Some(token)).await
     }
 
     async fn connect_worker_with_token_inner(
         url: &str,
+        tenant_id: &str,
         node_id: u64,
         token: Option<&str>,
     ) -> Result<Arc<Self>> {
@@ -317,7 +345,7 @@ impl NatsBus {
             .connect(seed_list(url))
             .await
             .map_err(|error| BusError::Connection(error.to_string()))?;
-        Self::from_worker_client(client, node_id).await
+        Self::from_worker_client(client, tenant_id, node_id).await
     }
 
     /// This workspace links rustls with both ring and aws-lc-rs enabled
@@ -343,16 +371,14 @@ impl NatsBus {
             .await
             .map_err(|e| BusError::Connection(e.to_string()))?;
         let js = jetstream::new(client.clone());
-
         let (status_kv, assignments_kv, leases_kv) = Self::setup_when_ready(&js, lease_ttl).await?;
-
         Ok(Arc::new(Self {
             client,
             js,
             status_kv,
             assignments_kv,
             leases_kv,
-            worker_node_id: None,
+            worker_identity: None,
         }))
     }
 
@@ -400,7 +426,7 @@ impl NatsBus {
             status_kv,
             assignments_kv,
             leases_kv,
-            worker_node_id: None,
+            worker_identity: None,
         }))
     }
 
@@ -438,7 +464,7 @@ impl NatsBus {
             status_kv,
             assignments_kv,
             leases_kv,
-            worker_node_id: None,
+            worker_identity: None,
         }))
     }
 
@@ -446,6 +472,7 @@ impl NatsBus {
     pub async fn connect_worker_secure(
         url: &str,
         config: &crate::tls::NatsTlsConfig,
+        tenant_id: &str,
         node_id: u64,
     ) -> Result<Arc<Self>> {
         config
@@ -462,10 +489,14 @@ impl NatsBus {
             async_nats::connect_with_options(seed_list(url), options.ignore_discovered_servers())
                 .await
                 .map_err(|error| BusError::Connection(format!("TLS connection failed: {error}")))?;
-        Self::from_worker_client(client, node_id).await
+        Self::from_worker_client(client, tenant_id, node_id).await
     }
 
-    async fn from_worker_client(client: Client, node_id: u64) -> Result<Arc<Self>> {
+    async fn from_worker_client(
+        client: Client,
+        tenant_id: &str,
+        node_id: u64,
+    ) -> Result<Arc<Self>> {
         let js = jetstream::new(client.clone());
         let status_kv = js
             .get_key_value("MINGA_STATUS")
@@ -485,7 +516,7 @@ impl NatsBus {
             status_kv,
             assignments_kv,
             leases_kv,
-            worker_node_id: Some(node_id),
+            worker_identity: Some((tenant_id.to_string(), node_id)),
         }))
     }
 
@@ -537,9 +568,9 @@ impl NatsBus {
         let events = StreamConfig {
             name: "MINGA_EVENTS".to_string(),
             subjects: vec![
-                "minga.node.>".to_string(),
-                "minga.task.>".to_string(),
-                "minga.egress.>".to_string(),
+                "minga.*.node.>".to_string(),
+                "minga.*.task.>".to_string(),
+                "minga.*.egress.>".to_string(),
             ],
             retention: RetentionPolicy::Limits,
             max_age: Duration::from_secs(72 * 3600),
@@ -628,6 +659,138 @@ impl EventBus for NatsBus {
             .await
             .map_err(|e| BusError::Publish(format!("ack: {e}")))?;
         Ok(())
+    }
+
+    async fn publish_usage(&self, event: &UsageEvent) -> Result<()> {
+        if let Some((tenant_id, _)) = &self.worker_identity {
+            if tenant_id != &event.tenant_id {
+                return Err(BusError::Publish(
+                    "worker cannot publish usage for another tenant".into(),
+                ));
+            }
+        } else {
+            self.require_manager("publish usage")?;
+        }
+        if event.request_id.is_empty()
+            || event.request_id.bytes().any(|byte| matches!(byte, b'\r' | b'\n'))
+        {
+            return Err(BusError::Publish("invalid usage request ID".into()));
+        }
+        let subject = crate::usage_subject(&event.tenant_id, &event.service_id)?;
+        let stream = ensure_usage_stream(&self.js, &event.tenant_id).await?;
+        let payload = serde_json::to_vec(event)
+            .map_err(|error| BusError::Serialization(error.to_string()))?;
+        let mut headers = HeaderMap::new();
+        headers.insert("Nats-Msg-Id", event.request_id.as_str());
+        let ack = stream
+            .send_with_headers(subject, headers, Bytes::from(payload))
+            .await
+            .map_err(|error| BusError::Publish(error.to_string()))?
+            .await
+            .map_err(|error| BusError::Publish(format!("usage ack: {error}")))?;
+        if !ack.duplicate {
+            minga_telemetry::METRICS.record_agent_usage(
+                &event.tenant_id,
+                event.input_tokens,
+                event.output_tokens,
+                event.cost_micros.unwrap_or_default(),
+            );
+        }
+        Ok(())
+    }
+
+    async fn usage_events(
+        &self,
+        tenant_id: &str,
+        since_unix_ms: u64,
+        customer: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<UsageEvent>> {
+        self.require_manager("query usage")?;
+        if !crate::valid_subject_token(tenant_id) {
+            return Err(BusError::Other("invalid usage tenant".into()));
+        }
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let stream = ensure_usage_stream(&self.js, tenant_id).await?;
+        let consumer = stream
+            .create_consumer(PullConsumerConfig {
+                filter_subject: format!("minga.{tenant_id}.usage.>"),
+                deliver_policy: DeliverPolicy::All,
+                ..Default::default()
+            })
+            .await
+            .map_err(|error| BusError::Subscribe(format!("usage consumer: {error}")))?;
+        let pending = consumer.cached_info().num_pending;
+        let mut messages = consumer
+            .messages()
+            .await
+            .map_err(|error| BusError::Subscribe(format!("usage messages: {error}")))?;
+        let mut events = Vec::with_capacity(limit.min(pending as usize));
+        if pending == 0 {
+            return Ok(events);
+        }
+        while let Some(message) = messages.next().await {
+            let message = message
+                .map_err(|error| BusError::Subscribe(format!("usage message: {error}")))?;
+            let remaining = message
+                .info()
+                .map_err(|error| BusError::Subscribe(format!("usage info: {error}")))?
+                .pending;
+            let event: UsageEvent = serde_json::from_slice(&message.payload)
+                .map_err(|error| BusError::Serialization(error.to_string()))?;
+            let matches = event.tenant_id == tenant_id
+                && event.occurred_at_unix_ms >= since_unix_ms
+                && customer.is_none_or(|customer| event.customer_id == customer);
+            if matches {
+                events.push(event);
+            }
+            message
+                .ack()
+                .await
+                .map_err(|error| BusError::Subscribe(format!("usage ack: {error}")))?;
+            if events.len() >= limit || remaining == 0 {
+                break;
+            }
+        }
+        Ok(events)
+    }
+
+    async fn usage_totals(&self, since_unix_ms: u64) -> Result<Vec<(String, UsageTotals)>> {
+        self.require_manager("aggregate usage")?;
+        use futures::TryStreamExt;
+
+        let mut streams = self
+            .js
+            .streams()
+            .await
+            .map_err(|error| BusError::Subscribe(format!("list streams: {error}")))?;
+        let mut totals = Vec::new();
+        while let Some(info) = streams
+            .try_next()
+            .await
+            .map_err(|error| BusError::Subscribe(format!("list streams: {error}")))?
+        {
+            let Some(tenant_id) = info.config.name.strip_prefix("MINGA_USAGE_") else {
+                continue;
+            };
+            if !crate::valid_subject_token(tenant_id) {
+                continue;
+            }
+            let events = self
+                .usage_events(tenant_id, since_unix_ms, None, usize::MAX)
+                .await?;
+            let mut total = UsageTotals::default();
+            for event in events {
+                total.request_count += 1;
+                total.input_tokens += event.input_tokens;
+                total.output_tokens += event.output_tokens;
+                total.cost_micros += event.cost_micros.unwrap_or_default();
+            }
+            totals.push((tenant_id.to_string(), total));
+        }
+        Ok(totals)
     }
 
     async fn subscribe_events(&self, patterns: &[&str]) -> Result<EventStream> {
@@ -843,38 +1006,41 @@ impl EventBus for NatsBus {
         Ok(Box::pin(kv_stream))
     }
 
-    async fn refresh_lease(&self, node_id: u64, registration: &[u8]) -> Result<()> {
-        if self
-            .worker_node_id
-            .is_some_and(|worker_id| worker_id != node_id)
-        {
+    async fn refresh_lease(
+        &self,
+        tenant_id: &str,
+        node_id: u64,
+        registration: &[u8],
+    ) -> Result<()> {
+        if self.worker_identity.as_ref().is_some_and(|identity| {
+            identity.0 != tenant_id || identity.1 != node_id
+        }) {
             return Err(BusError::Lease(format!(
-                "worker cannot refresh node {node_id}'s lease"
+                "worker cannot refresh lease for {tenant_id}/{node_id}"
             )));
         }
-        let key = subjects::kv_lease(node_id);
+        let key = subjects::kv_lease(tenant_id, node_id);
         self.leases_kv
             .put(key, Bytes::copy_from_slice(registration))
             .await
-            .map_err(|e| BusError::Lease(format!("refresh {node_id}: {e}")))?;
+            .map_err(|error| BusError::Lease(format!("refresh {tenant_id}/{node_id}: {error}")))?;
         Ok(())
     }
 
-    async fn is_alive(&self, node_id: u64) -> Result<bool> {
-        if self
-            .worker_node_id
-            .is_some_and(|worker_id| worker_id != node_id)
-        {
+    async fn is_alive(&self, tenant_id: &str, node_id: u64) -> Result<bool> {
+        if self.worker_identity.as_ref().is_some_and(|identity| {
+            identity.0 != tenant_id || identity.1 != node_id
+        }) {
             return Err(BusError::Lease(format!(
-                "worker cannot query node {node_id}'s lease"
+                "worker cannot query lease for {tenant_id}/{node_id}"
             )));
         }
-        let key = subjects::kv_lease(node_id);
+        let key = subjects::kv_lease(tenant_id, node_id);
         Ok(self
             .leases_kv
             .get(key)
             .await
-            .map_err(|e| BusError::Lease(format!("get {node_id}: {e}")))?
+            .map_err(|error| BusError::Lease(format!("get {tenant_id}/{node_id}: {error}")))?
             .is_some())
     }
 
@@ -889,8 +1055,8 @@ impl EventBus for NatsBus {
         while let Some(key) = keys.next().await {
             let key = key.map_err(|e| BusError::Lease(format!("list key: {e}")))?;
             if let Some(node_id) = key
-                .strip_prefix("lease.node.")
-                .and_then(|id| id.parse().ok())
+                .rsplit_once(".node.")
+                .and_then(|(_, id)| id.parse().ok())
             {
                 nodes.insert(node_id);
             }
@@ -969,14 +1135,19 @@ impl EventBus for NatsBus {
     }
 
     async fn publish_log(&self, task_id: &str, entry: &LogEntry) -> Result<()> {
-        let node_id = self.worker_node_id.unwrap_or(0);
+        let node_id = self
+            .worker_identity
+            .as_ref()
+            .map(|identity| identity.1)
+            .unwrap_or(0);
         self.publish_node_log(node_id, task_id, entry).await
     }
 
     async fn publish_node_log(&self, node_id: u64, task_id: &str, entry: &LogEntry) -> Result<()> {
         if self
-            .worker_node_id
-            .is_some_and(|worker_id| worker_id != node_id)
+            .worker_identity
+            .as_ref()
+            .is_some_and(|identity| identity.1 != node_id)
         {
             return Err(BusError::Publish(format!(
                 "worker cannot publish logs for node {node_id}"
@@ -991,7 +1162,12 @@ impl EventBus for NatsBus {
             .bus_publish_latency_seconds
             .with_label_values(&["logs"])
             .start_timer();
-        let subject = subjects::node_task_log(node_id, task_id);
+        let tenant_id = self
+            .worker_identity
+            .as_ref()
+            .map(|identity| identity.0.as_str())
+            .unwrap_or("default");
+        let subject = subjects::node_task_log(tenant_id, node_id, task_id);
         let payload = entry.to_bytes()?;
         // Double await: the first yields a PublishAckFuture (message sent),
         // the second the server's acknowledgment (message stored). Without
@@ -1016,7 +1192,7 @@ impl EventBus for NatsBus {
         let filter = if task_id == "*" {
             subjects::log_events_wildcard()
         } else {
-            subjects::task_log(task_id)
+            subjects::task_log("default", task_id)
         };
 
         // Pull consumers need no delivery subject, unlike push consumers.
@@ -1081,7 +1257,7 @@ impl EventBus for NatsBus {
         let filter = if task_id == "*" {
             subjects::log_events_wildcard()
         } else {
-            subjects::task_log(task_id)
+            subjects::task_log("default", task_id)
         };
 
         // Read the retained backlog with a short-lived pull consumer that
@@ -1250,4 +1426,5 @@ mod tests {
             Rejection::Nak(NAK_DELAY)
         );
     }
+
 }

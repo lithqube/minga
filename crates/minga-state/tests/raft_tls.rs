@@ -85,6 +85,7 @@ fn sample_node(id: u64, addr: &str) -> ClusterNode {
         status: NodeStatus::Active,
         capacity: ResourceSpec::default(),
         wg_public_key: None,
+        nats_user_public_key: None,
         wg_endpoint: None,
         overlay_ip: None,
         last_seen_unix: None,

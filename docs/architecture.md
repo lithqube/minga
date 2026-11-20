@@ -99,6 +99,5 @@ settled decisions and [supported topologies](topologies.md) for T1–T4.
 2. Sandbox host capabilities: WASI with explicit grants, outbound HTTP only
    through the local egress proxy, host-injected workload identity and
    enforced memory limits.
-
 Image pulls already use containerd’s Transfer service, read inline auth,
 `credsStore` and `credHelpers`, and keep credentials off command lines.

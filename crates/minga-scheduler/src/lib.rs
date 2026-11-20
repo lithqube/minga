@@ -106,6 +106,7 @@ pub fn task_with_actual_status(mut task: Task, report: Option<&TaskStatusReport>
 pub struct Scheduler {
     state: Arc<StateStore>,
     bus: Option<Arc<dyn EventBus>>,
+    tenant_id: String,
     supernet: minga_net::Cidr,
     /// Subnet collisions already logged, so each is reported once.
     reported: std::sync::Mutex<std::collections::HashSet<(String, String)>>,
@@ -123,11 +124,17 @@ impl Scheduler {
         Self {
             state,
             bus: None,
+            tenant_id: "default".to_string(),
             supernet: minga_net::Cidr::parse(minga_net::DEFAULT_SUPERNET)
                 .expect("default supernet parses"),
             reported: Default::default(),
             lease_grace_until: Default::default(),
         }
+    }
+
+    pub fn with_tenant_id(mut self, tenant_id: impl Into<String>) -> Self {
+        self.tenant_id = tenant_id.into();
+        self
     }
 
     /// Allocates network subnets from `supernet` instead of 10.100.0.0/16.
@@ -202,7 +209,7 @@ impl Scheduler {
         let services = self.state.list_services().await?;
         let mut tasks = self.state.list_tasks().await?;
         if let Some(bus) = &self.bus {
-            let statuses = match read_task_statuses(bus.as_ref()).await {
+            let statuses = match read_task_statuses(bus.as_ref(), &self.tenant_id).await {
                 Ok(statuses) => statuses,
                 Err(error) => {
                     tracing::warn!(error = %error, "cannot read task status; skipping reconciliation");
@@ -282,7 +289,7 @@ impl Scheduler {
         let services = self.state.list_services().await?;
         // Stored task state lags the nodes' reports; without the overlay a
         // replica reported Failed would stay an ingress backend.
-        let statuses = match read_task_statuses(bus.as_ref()).await {
+        let statuses = match read_task_statuses(bus.as_ref(), &self.tenant_id).await {
             Ok(statuses) => statuses,
             Err(error) => {
                 tracing::warn!(error = %error, "cannot read task status; skipping projection");
@@ -327,7 +334,7 @@ impl Scheduler {
                 spec: task.spec.clone(),
                 networks: task_networks,
             };
-            let key = subjects::kv_assignment_task(task.node_id, &task.id);
+            let key = subjects::kv_assignment_task(&self.tenant_id, task.node_id, &task.id);
             let value = minga_state::codec::encode_wire(&assignment)
                 .map_err(|error| SchedulerError::Serialization(error.to_string()))?;
             bus.put_assignment(&key, &value)
@@ -396,7 +403,12 @@ impl Scheduler {
                             .to_string(),
                     ),
                 };
-                let key = subjects::kv_assignment_ingress(node.id, *published, protocol);
+                let key = subjects::kv_assignment_ingress(
+                    &self.tenant_id,
+                    node.id,
+                    *published,
+                    protocol,
+                );
                 let value = minga_state::codec::encode_wire(&assignment)
                     .map_err(|error| SchedulerError::Serialization(error.to_string()))?;
                 bus.put_assignment(&key, &value)
@@ -419,7 +431,7 @@ impl Scheduler {
             })
             .map_err(|error| SchedulerError::Serialization(error.to_string()))?;
             for node_id in task_nodes {
-                let key = subjects::kv_assignment_network(node_id, &network.id);
+                let key = subjects::kv_assignment_network(&self.tenant_id, node_id, &network.id);
                 desired.insert(key.clone());
                 bus.put_assignment(&key, &value)
                     .await
@@ -428,7 +440,7 @@ impl Scheduler {
         }
         let peer_sets = build_wireguard_peer_sets(nodes, &tasks, &networks)?;
         for node in nodes {
-            let key = format!("node.{}.wg", node.id);
+            let key = format!("{}.node.{}.wg", self.tenant_id, node.id);
             let value = minga_state::codec::encode_wire(
                 peer_sets
                     .get(&node.id)
@@ -442,7 +454,7 @@ impl Scheduler {
         }
 
         for (key, _) in bus
-            .list_assignments("")
+            .list_assignments(&format!("{}.", self.tenant_id))
             .await
             .map_err(|error| SchedulerError::Bus(error.to_string()))?
         {
@@ -526,14 +538,17 @@ fn validate_manager_endpoints(nodes: &[ClusterNode]) -> Result<(), SchedulerErro
 /// whose key does not match its own node and task is ignored.
 async fn read_task_statuses(
     bus: &dyn EventBus,
+    tenant_id: &str,
 ) -> minga_bus::Result<HashMap<String, TaskStatusReport>> {
     let mut statuses = HashMap::new();
     for (key, bytes) in bus.list_status().await? {
-        if !key.starts_with("node.") || !key.contains(".task.") {
+        if !key.starts_with(&format!("{tenant_id}.node.")) || !key.contains(".task.") {
             continue;
         }
         match TaskStatusReport::from_bytes(&bytes) {
-            Ok(report) if key == subjects::kv_node_task_status(report.node_id, &report.task_id) => {
+            Ok(report)
+                if key == subjects::kv_node_task_status(tenant_id, report.node_id, &report.task_id) =>
+            {
                 statuses.insert(report.task_id.clone(), report);
             }
             Ok(_) => {}

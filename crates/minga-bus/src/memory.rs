@@ -17,7 +17,7 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 
 use crate::{
     subjects, BusError, BusEvent, BusRequest, EventBus, EventStream, KvEvent, KvOp, KvStream,
-    LogEntry, LogEventStream, RequestStream, Result,
+    LogEntry, LogEventStream, RequestStream, Result, UsageEvent, UsageTotals,
 };
 
 /// Default lease TTL: 30 seconds.
@@ -45,9 +45,8 @@ pub struct MemoryBus {
     kv: Mutex<HashMap<String, Vec<u8>>>,
     /// Broadcast channel for KV change notifications.
     kv_tx: broadcast::Sender<KvEvent>,
-    /// Liveness leases: node_id → last refresh and registration payload.
-    leases: Mutex<HashMap<u64, Lease>>,
-    /// Broadcast channel for lease changes.
+    /// Liveness leases: (tenant_id, node_id) → refresh and registration payload.
+    leases: Mutex<HashMap<(String, u64), Lease>>,
     lease_tx: broadcast::Sender<KvEvent>,
     /// Lease TTL.
     lease_ttl: Duration,
@@ -61,6 +60,9 @@ pub struct MemoryBus {
     logs_tx: broadcast::Sender<LogEntry>,
     /// Retained log entries per task, oldest first.
     log_history: Mutex<HashMap<String, VecDeque<LogEntry>>>,
+    /// Retained usage events, deduplicated by tenant and request ID.
+    usage: Mutex<Vec<UsageEvent>>,
+    usage_ids: Mutex<HashSet<(String, String)>>,
 }
 struct Lease {
     refreshed_at: Instant,
@@ -94,6 +96,8 @@ impl MemoryBus {
             reply_counter: AtomicU64::new(0),
             logs_tx,
             log_history: Mutex::new(HashMap::new()),
+            usage: Mutex::new(Vec::new()),
+            usage_ids: Mutex::new(HashSet::new()),
         })
     }
 }
@@ -267,16 +271,21 @@ impl EventBus for MemoryBus {
         Ok(Box::pin(ReceiverStream { rx: mpsc_rx }))
     }
 
-    async fn refresh_lease(&self, node_id: u64, registration: &[u8]) -> Result<()> {
+    async fn refresh_lease(
+        &self,
+        tenant_id: &str,
+        node_id: u64,
+        registration: &[u8],
+    ) -> Result<()> {
         self.leases.lock().unwrap().insert(
-            node_id,
+            (tenant_id.to_string(), node_id),
             Lease {
                 refreshed_at: Instant::now(),
                 registration: registration.to_vec(),
             },
         );
         let event = KvEvent {
-            key: subjects::kv_lease(node_id),
+            key: subjects::kv_lease(tenant_id, node_id),
             value: Some(registration.to_vec()),
             op: KvOp::Put,
         };
@@ -284,10 +293,10 @@ impl EventBus for MemoryBus {
         Ok(())
     }
 
-    async fn is_alive(&self, node_id: u64) -> Result<bool> {
+    async fn is_alive(&self, tenant_id: &str, node_id: u64) -> Result<bool> {
         let leases = self.leases.lock().unwrap();
         Ok(leases
-            .get(&node_id)
+            .get(&(tenant_id.to_string(), node_id))
             .is_some_and(|lease| lease.refreshed_at.elapsed() < self.lease_ttl))
     }
 
@@ -296,7 +305,7 @@ impl EventBus for MemoryBus {
         Ok(leases
             .iter()
             .filter(|(_, lease)| lease.refreshed_at.elapsed() < self.lease_ttl)
-            .map(|(node_id, _)| *node_id)
+            .map(|((_, node_id), _)| *node_id)
             .collect())
     }
 
@@ -307,8 +316,8 @@ impl EventBus for MemoryBus {
             leases
                 .iter()
                 .filter(|(_, lease)| lease.refreshed_at.elapsed() < self.lease_ttl)
-                .map(|(node_id, lease)| KvEvent {
-                    key: subjects::kv_lease(*node_id),
+                .map(|((tenant_id, node_id), lease)| KvEvent {
+                    key: subjects::kv_lease(tenant_id, *node_id),
                     value: Some(lease.registration.clone()),
                     op: KvOp::Put,
                 })
@@ -402,6 +411,62 @@ impl EventBus for MemoryBus {
                 "no pending reply for `{reply_subject}`"
             ))),
         }
+    }
+
+    async fn publish_usage(&self, event: &UsageEvent) -> Result<()> {
+        if !crate::valid_subject_token(&event.tenant_id) || event.request_id.is_empty() {
+            return Err(BusError::Other("invalid usage tenant or request ID".into()));
+        }
+        let key = (event.tenant_id.clone(), event.request_id.clone());
+        if !self.usage_ids.lock().unwrap().insert(key) {
+            return Ok(());
+        }
+        minga_telemetry::METRICS.record_agent_usage(
+            &event.tenant_id,
+            event.input_tokens,
+            event.output_tokens,
+            event.cost_micros.unwrap_or_default(),
+        );
+        self.usage.lock().unwrap().push(event.clone());
+        Ok(())
+    }
+
+    async fn usage_events(
+        &self,
+        tenant_id: &str,
+        since_unix_ms: u64,
+        customer: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<UsageEvent>> {
+        if !crate::valid_subject_token(tenant_id) {
+            return Err(BusError::Other("invalid usage tenant".into()));
+        }
+        Ok(self
+            .usage
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| {
+                event.tenant_id == tenant_id
+                    && event.occurred_at_unix_ms >= since_unix_ms
+                    && customer.is_none_or(|customer| event.customer_id == customer)
+            })
+            .take(limit)
+            .cloned()
+            .collect())
+    }
+
+    async fn usage_totals(&self, since_unix_ms: u64) -> Result<Vec<(String, UsageTotals)>> {
+        let events = self.usage.lock().unwrap();
+        let mut totals = std::collections::BTreeMap::<String, UsageTotals>::new();
+        for event in events.iter().filter(|event| event.occurred_at_unix_ms >= since_unix_ms) {
+            let total = totals.entry(event.tenant_id.clone()).or_default();
+            total.request_count += 1;
+            total.input_tokens += event.input_tokens;
+            total.output_tokens += event.output_tokens;
+            total.cost_micros += event.cost_micros.unwrap_or_default();
+        }
+        Ok(totals.into_iter().collect())
     }
 
     async fn publish_log(&self, task_id: &str, entry: &LogEntry) -> Result<()> {
@@ -635,29 +700,40 @@ mod tests {
     #[tokio::test]
     async fn assignments_are_prefix_scoped_and_deletable() {
         let bus = MemoryBus::new();
-        let prefix = "node.7.task.";
+        let prefix = "tenant-a.node.7.task.";
         let mut watch = bus.watch_assignments(prefix).await.unwrap();
 
-        bus.put_assignment("node.8.task.other", b"other")
+        bus.put_assignment("tenant-a.node.8.task.other", b"other")
             .await
             .unwrap();
-        bus.put_assignment("node.7.task.one", b"assignment")
+        bus.put_assignment("tenant-a.node.7.task.one", b"assignment")
+            .await
+            .unwrap();
+        bus.put_assignment("tenant-b.node.7.task.one", b"foreign")
             .await
             .unwrap();
 
         assert_eq!(
             bus.list_assignments(prefix).await.unwrap(),
-            vec![("node.7.task.one".to_string(), b"assignment".to_vec())]
+            vec![(
+                "tenant-a.node.7.task.one".to_string(),
+                b"assignment".to_vec()
+            )]
         );
         let event = tokio::time::timeout(Duration::from_secs(1), watch.next())
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(event.key, "node.7.task.one");
+        assert_eq!(event.key, "tenant-a.node.7.task.one");
         assert_eq!(event.value, Some(b"assignment".to_vec()));
 
-        bus.delete_assignment("node.7.task.one").await.unwrap();
-        assert_eq!(bus.get_assignment("node.7.task.one").await.unwrap(), None);
+        bus.delete_assignment("tenant-a.node.7.task.one")
+            .await
+            .unwrap();
+        assert_eq!(
+            bus.get_assignment("tenant-a.node.7.task.one").await.unwrap(),
+            None
+        );
         let removed = tokio::time::timeout(Duration::from_secs(1), watch.next())
             .await
             .unwrap()
@@ -743,36 +819,66 @@ mod tests {
         let bus = MemoryBus::with_lease_ttl(Duration::from_millis(100));
 
         // No lease yet.
-        assert!(!bus.is_alive(1).await.unwrap());
+        assert!(!bus.is_alive("tenant-a", 1).await.unwrap());
 
         // Refresh → alive.
-        bus.refresh_lease(1, b"registration").await.unwrap();
-        assert!(bus.is_alive(1).await.unwrap());
+        bus.refresh_lease("tenant-a", 1, b"registration")
+            .await
+            .unwrap();
+        assert!(bus.is_alive("tenant-a", 1).await.unwrap());
 
         // Wait for expiry.
         tokio::time::sleep(Duration::from_millis(150)).await;
-        assert!(!bus.is_alive(1).await.unwrap());
+        assert!(!bus.is_alive("tenant-a", 1).await.unwrap());
     }
 
     #[tokio::test]
     async fn test_lease_refresh_extends() {
         let bus = MemoryBus::with_lease_ttl(Duration::from_millis(200));
 
-        bus.refresh_lease(1, b"registration").await.unwrap();
+        bus.refresh_lease("tenant-a", 1, b"registration")
+            .await
+            .unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
-        bus.refresh_lease(1, b"registration").await.unwrap();
+        bus.refresh_lease("tenant-a", 1, b"registration")
+            .await
+            .unwrap();
         tokio::time::sleep(Duration::from_millis(150)).await;
-        // 250ms since first refresh, but only 150ms since second.
-        assert!(bus.is_alive(1).await.unwrap());
+        assert!(bus.is_alive("tenant-a", 1).await.unwrap());
     }
 
     #[tokio::test]
     async fn test_lease_per_node() {
         let bus = MemoryBus::with_lease_ttl(Duration::from_millis(100));
 
-        bus.refresh_lease(1, b"registration").await.unwrap();
-        assert!(bus.is_alive(1).await.unwrap());
-        assert!(!bus.is_alive(2).await.unwrap());
+        bus.refresh_lease("tenant-a", 1, b"registration")
+            .await
+            .unwrap();
+        assert!(bus.is_alive("tenant-a", 1).await.unwrap());
+        assert!(!bus.is_alive("tenant-a", 2).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn leases_are_isolated_by_tenant() {
+        let bus = MemoryBus::new();
+        bus.refresh_lease("tenant-a", 9, b"a").await.unwrap();
+        bus.refresh_lease("tenant-b", 9, b"b").await.unwrap();
+        assert!(bus.is_alive("tenant-a", 9).await.unwrap());
+        assert!(bus.is_alive("tenant-b", 9).await.unwrap());
+        assert_eq!(bus.list_alive_nodes().await.unwrap(), HashSet::from([9]));
+        let mut leases = bus.watch_leases().await.unwrap();
+        let first = tokio::time::timeout(Duration::from_secs(1), leases.next())
+            .await
+            .unwrap()
+            .unwrap();
+        let second = tokio::time::timeout(Duration::from_secs(1), leases.next())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            HashSet::from([first.key, second.key]),
+            HashSet::from(["tenant-a.node.9".to_string(), "tenant-b.node.9".to_string()])
+        );
     }
 
     // -- Request / Reply -----------------------------------------------------
@@ -781,7 +887,7 @@ mod tests {
     async fn test_request_reply() {
         let bus = MemoryBus::new();
         let mut requests = bus
-            .subscribe_requests(&subjects::ctl_ping(1))
+            .subscribe_requests(&subjects::ctl_ping("default", 1))
             .await
             .unwrap();
 
@@ -794,7 +900,11 @@ mod tests {
         });
 
         let reply = bus
-            .request(&subjects::ctl_ping(1), b"ping", Duration::from_secs(1))
+            .request(
+                &subjects::ctl_ping("default", 1),
+                b"ping",
+                Duration::from_secs(1),
+            )
             .await
             .unwrap();
         assert_eq!(reply, b"pong");
@@ -965,5 +1075,58 @@ mod tests {
         assert_eq!(entries.len(), 2);
         assert!(entries.iter().any(|(k, v)| k == "task.a" && v == b"one"));
         assert!(entries.iter().any(|(k, v)| k == "task.b" && v == b"two"));
+    }
+
+    fn usage_event(request_id: &str, tenant_id: &str, occurred_at_unix_ms: u64) -> UsageEvent {
+        UsageEvent {
+            request_id: request_id.into(),
+            tenant_id: tenant_id.into(),
+            service_id: "svc".into(),
+            task_id: "task".into(),
+            customer_id: "customer".into(),
+            route: "/v1/chat".into(),
+            requested_model: "requested".into(),
+            answered_model: "answered".into(),
+            input_tokens: 11,
+            output_tokens: 7,
+            cache_hit: false,
+            latency_ms: 42,
+            status: 200,
+            occurred_at_unix_ms,
+            cost_micros: Some(9),
+        }
+    }
+
+    #[tokio::test]
+    async fn usage_query_is_tenant_and_time_scoped_and_deduplicated() {
+        let bus = MemoryBus::new();
+        let event = usage_event("req-1", "tenant-a", 100);
+        bus.publish_usage(&event).await.unwrap();
+        bus.publish_usage(&event).await.unwrap();
+        bus.publish_usage(&usage_event("req-2", "tenant-a", 50))
+            .await
+            .unwrap();
+        let mut other_customer = usage_event("req-3", "tenant-a", 100);
+        other_customer.customer_id = "other".into();
+        bus.publish_usage(&other_customer).await.unwrap();
+
+        let rows = bus
+            .usage_events("tenant-a", 100, Some("customer"), 1)
+            .await
+            .unwrap();
+        let totals = bus.usage_totals(100).await.unwrap();
+        assert_eq!(totals.len(), 2);
+        assert_eq!(totals[0].0, "tenant-a");
+        assert_eq!(totals[0].1.request_count, 1);
+    }
+
+    #[test]
+    fn usage_event_contract_serializes_integer_cost_without_prompt_fields() {
+        let event = usage_event("req-1", "tenant-a", 123);
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["cost_micros"], 9);
+        assert_eq!(json["input_tokens"], 11);
+        assert!(json.get("prompt").is_none());
+        assert!(serde_json::from_value::<UsageEvent>(json).is_ok());
     }
 }

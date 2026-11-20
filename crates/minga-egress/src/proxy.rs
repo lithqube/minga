@@ -260,11 +260,7 @@ async fn proxy_handler(State(state): State<Arc<ProxyState>>, req: Request) -> Re
         .and_then(|v| v.to_str().ok())
         .and_then(|t| state.tokens.workload(t))
     else {
-        return error_response(
-            &state,
-            StatusCode::UNAUTHORIZED,
-            "missing or unknown sandbox token",
-        );
+        return error_response(&state, StatusCode::UNAUTHORIZED, "missing or unknown sandbox token");
     };
     if let Some(claimed) = req.headers().get("x-minga-workload") {
         if claimed.as_bytes() != workload.as_bytes() {
@@ -280,7 +276,7 @@ async fn proxy_handler(State(state): State<Arc<ProxyState>>, req: Request) -> Re
         .filter_map(|&n| req.headers().get(n).map(|v| (n, v.as_bytes().to_vec())))
         .collect();
 
-    // Read body.
+    // Keep the existing request cap: only request bodies are buffered.
     let body_bytes = match axum::body::to_bytes(req.into_body(), 10 * 1024 * 1024).await {
         Ok(b) => b,
         Err(e) => {
@@ -291,17 +287,17 @@ async fn proxy_handler(State(state): State<Arc<ProxyState>>, req: Request) -> Re
             );
         }
     };
-
-    // Estimate tokens from request body (rough: 1 token ≈ 4 chars).
     let estimated_tokens = (body_bytes.len() as u64) / 4;
-
-    // Check budget.
+    let request_stream = serde_json::from_slice::<serde_json::Value>(&body_bytes)
+        .ok()
+        .and_then(|value| value.get("stream").and_then(serde_json::Value::as_bool))
+        .unwrap_or(false);
     if let Err(e) = state.budgets.check(&workload, estimated_tokens) {
         return error_response(&state, StatusCode::TOO_MANY_REQUESTS, &e.to_string());
     }
 
-    // Check cache.
-    let cache_key = ResponseCache::compute_key(method.as_str(), &path, &body_bytes);
+    let cache_key =
+        ResponseCache::compute_key_for_workload(&workload, method.as_str(), &path, &body_bytes);
     if let Some(ref cache) = state.cache {
         if let Some((status, headers, body)) = cache.get(&cache_key) {
             tracing::debug!(workload, path, "cache hit");
@@ -315,7 +311,6 @@ async fn proxy_handler(State(state): State<Arc<ProxyState>>, req: Request) -> Re
         }
     }
 
-    // Forward to upstream.
     let upstream_url = format!("{}{}{}", state.config.upstream_url, path, query);
     let mut upstream_req = state.client.request(
         reqwest::Method::from_bytes(method.as_str().as_bytes()).unwrap_or(reqwest::Method::GET),
@@ -329,10 +324,9 @@ async fn proxy_handler(State(state): State<Arc<ProxyState>>, req: Request) -> Re
         Some(UpstreamAuth::ApiKey(key)) => upstream_req.header("x-api-key", key.as_str()),
         None => upstream_req,
     };
-
     let upstream_resp = match upstream_req
         .header("content-type", "application/json")
-        .body(body_bytes.clone())
+        .body(body_bytes)
         .send()
         .await
     {
@@ -346,69 +340,291 @@ async fn proxy_handler(State(state): State<Arc<ProxyState>>, req: Request) -> Re
         }
     };
 
-    let status = upstream_resp.status().as_u16();
+    let status = upstream_resp.status();
     let resp_headers: Vec<(String, String)> = upstream_resp
         .headers()
         .iter()
         .filter(|(name, _)| {
-            let n = name.as_str();
-            n != "content-length" && n != "transfer-encoding" && n != "connection"
+            !matches!(name.as_str(), "content-length" | "transfer-encoding" | "connection")
         })
         .map(|(name, value)| (name.to_string(), value.to_str().unwrap_or("").to_string()))
         .collect();
-
-    let resp_body = match upstream_resp.bytes().await {
-        // Providers echo rejected keys back in error bodies.
-        Ok(b) if status >= 400 && state.config.redact_errors => state
-            .redactor
-            .redact(&String::from_utf8_lossy(&b))
-            .into_bytes(),
-        Ok(b) => b.to_vec(),
-        Err(e) => {
-            return error_response(
-                &state,
-                StatusCode::BAD_GATEWAY,
-                &format!("failed to read upstream response: {e}"),
-            );
+    let is_sse = upstream_resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.to_ascii_lowercase().contains("text/event-stream"));
+    if !is_sse && !request_stream {
+        let body = match upstream_resp.bytes().await {
+            Ok(body) => body,
+            Err(error) => {
+                return error_response(
+                    &state,
+                    StatusCode::BAD_GATEWAY,
+                    &format!("failed to read upstream response: {error}"),
+                );
+            }
+        };
+        let body = if status.is_client_error() || status.is_server_error() {
+            if state.config.redact_errors {
+                state
+                    .redactor
+                    .redact(&String::from_utf8_lossy(&body))
+                    .into_bytes()
+            } else {
+                body.to_vec()
+            }
+        } else {
+            body.to_vec()
+        };
+        let counts = find_usage_fragment(&body).unwrap_or(UsageCounts {
+            input_tokens: 0,
+            output_tokens: (body.len() as u64) / 4,
+            estimated: true,
+        });
+        if let Err(error) = state.budgets.record(
+            &workload,
+            estimated_tokens + counts.input_tokens + counts.output_tokens,
+        ) {
+            tracing::warn!(workload, error = %error, "budget exceeded after upstream call");
         }
-    };
-
-    // Record token usage from response.
-    let response_tokens = estimate_response_tokens(&resp_body);
-    let total_tokens = estimated_tokens + response_tokens;
-    if let Err(e) = state.budgets.record(&workload, total_tokens) {
-        tracing::warn!(workload, error = %e, "budget exceeded after upstream call");
-        // Still return the response — the budget check is advisory for the
-        // current request. The NEXT request will be rejected.
+        if let Some(cache) = &state.cache {
+            cache.put(&cache_key, status.as_u16(), resp_headers.clone(), body.clone());
+        }
+        let mut response = Response::builder().status(status);
+        for (name, value) in &resp_headers {
+            response = response.header(name, value);
+        }
+        return response
+            .body(Body::from(body))
+            .unwrap_or_else(|_| Response::new(Body::empty()));
     }
+    let stream = upstream_resp.bytes_stream();
+    let (sender, receiver) = tokio::sync::mpsc::channel(8);
+    let budgets = Arc::clone(&state.budgets);
+    let redactor = state.redactor.clone();
+    let redact =
+        state.config.redact_errors && (status.is_client_error() || status.is_server_error());
+    tokio::spawn(async move {
+        use futures_util::StreamExt;
+        let mut stream = stream;
+        let mut parser = UsageParser::new(is_sse);
+        let mut response_bytes = 0_u64;
+        let mut redaction_tail = Vec::new();
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(chunk) => {
+                    response_bytes = response_bytes.saturating_add(chunk.len() as u64);
+                    parser.push(&chunk);
+                    if redact {
+                        redaction_tail.extend_from_slice(&chunk);
+                        if redaction_tail.len() > 8192 {
+                            let split = redaction_tail.len() - 8192;
+                            let safe = String::from_utf8_lossy(&redaction_tail[..split]);
+                            let redacted = redactor.redact(&safe);
+                            if sender.send(Ok(bytes::Bytes::from(redacted))).await.is_err() {
+                                return;
+                            }
+                            redaction_tail.drain(..split);
+                        }
+                    } else if sender.send(Ok(chunk)).await.is_err() {
+                        return;
+                    }
+                }
+                Err(error) => {
+                    let _ = sender
+                        .send(Err(std::io::Error::other(error.to_string())))
+                        .await;
+                    return;
+                }
+            }
+        }
+        if redact && !redaction_tail.is_empty() {
+            let safe = String::from_utf8_lossy(&redaction_tail);
+            let redacted = redactor.redact(&safe);
+            if sender.send(Ok(bytes::Bytes::from(redacted))).await.is_err() {
+                return;
+            }
+        }
+        let counts = parser.finish(response_bytes);
+        if let Err(error) = budgets.record(&workload, estimated_tokens + counts.input_tokens + counts.output_tokens) {
+            tracing::warn!(workload, error = %error, "budget exceeded after upstream call");
+        }
+    });
 
-    // Cache successful responses.
-    if let Some(ref cache) = state.cache {
-        cache.put(&cache_key, status, resp_headers.clone(), resp_body.clone());
-    }
-
-    // Build response.
     let mut resp = Response::builder().status(status);
     for (name, value) in &resp_headers {
         resp = resp.header(name, value);
     }
-    resp.body(Body::from(resp_body))
+    // A streamed response is deliberately never inserted in the response cache.
+    resp.body(Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(receiver)))
         .unwrap_or_else(|_| Response::new(Body::empty()))
 }
 
-/// Estimates token count from a response body by looking for
-/// `usage.total_tokens` in the JSON, falling back to char/4 estimate.
-fn estimate_response_tokens(body: &[u8]) -> u64 {
-    if let Ok(json) = serde_json::from_slice::<serde_json::Value>(body) {
-        if let Some(total) = json
-            .get("usage")
-            .and_then(|u| u.get("total_tokens"))
-            .and_then(|t| t.as_u64())
-        {
-            return total;
+/// Provider-reported request and response token counts for one completion.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct UsageCounts {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub estimated: bool,
+}
+
+struct UsageParser {
+    is_sse: bool,
+    line: Vec<u8>,
+    event: Vec<u8>,
+    json_scan: Vec<u8>,
+    usage: Option<UsageCounts>,
+}
+
+impl UsageParser {
+    fn new(is_sse: bool) -> Self {
+        Self {
+            is_sse,
+            line: Vec::new(),
+            event: Vec::new(),
+            json_scan: Vec::new(),
+            usage: None,
         }
     }
-    (body.len() as u64) / 4
+
+    fn push(&mut self, chunk: &[u8]) {
+        if self.is_sse {
+            for &byte in chunk {
+                if byte == b'\n' {
+                    self.process_sse_line();
+                } else {
+                    self.line.push(byte);
+                }
+            }
+        } else {
+            self.json_scan.extend_from_slice(chunk);
+            if let Some(usage) = find_usage_fragment(&self.json_scan) {
+                self.record_usage(usage);
+                self.json_scan.clear();
+            } else if let Some(marker) = self
+                .json_scan
+                .windows(b"\"usage\"".len())
+                .position(|window| window == b"\"usage\"")
+            {
+                if marker > 0 {
+                    self.json_scan.drain(..marker);
+                }
+            } else if self.json_scan.len() > 16 {
+                let keep_from = self.json_scan.len() - 16;
+                self.json_scan.drain(..keep_from);
+            }
+        }
+
+    }
+
+    fn record_usage(&mut self, next: UsageCounts) {
+        let current = self.usage.get_or_insert(UsageCounts {
+            input_tokens: 0,
+            output_tokens: 0,
+            estimated: false,
+        });
+        if next.input_tokens > 0 {
+            current.input_tokens = next.input_tokens;
+        }
+        if next.output_tokens > 0 {
+            current.output_tokens = next.output_tokens;
+        }
+        current.estimated = false;
+    }
+
+    fn process_sse_line(&mut self) {
+        if self.line.last() == Some(&b'\r') {
+            self.line.pop();
+        }
+        if self.line.is_empty() {
+            if let Some(usage) = find_usage(&self.event) {
+                self.record_usage(usage);
+            }
+            self.event.clear();
+        } else if let Some(data) = self.line.strip_prefix(b"data:") {
+            self.event.extend_from_slice(data.strip_prefix(b" ").unwrap_or(data));
+            self.event.push(b'\n');
+        }
+        self.line.clear();
+    }
+
+    fn finish(mut self, response_bytes: u64) -> UsageCounts {
+        if self.is_sse && !self.line.is_empty() {
+            self.process_sse_line();
+        }
+        self.usage.unwrap_or(UsageCounts {
+            input_tokens: 0,
+            output_tokens: response_bytes / 4,
+            estimated: true,
+        })
+    }
+}
+
+fn find_usage(bytes: &[u8]) -> Option<UsageCounts> {
+    let value: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    let usage = value
+        .get("usage")
+        .or_else(|| value.get("message").and_then(|message| message.get("usage")))?;
+    usage_counts(Some(usage))
+}
+
+fn find_usage_fragment(bytes: &[u8]) -> Option<UsageCounts> {
+    let marker = bytes.windows(b"\"usage\"".len()).position(|w| w == b"\"usage\"")?;
+    let open = bytes[marker + b"\"usage\"".len()..]
+        .iter()
+        .position(|byte| *byte == b'{')?
+        + marker
+        + b"\"usage\"".len();
+    let mut depth = 0_u32;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (offset, &byte) in bytes[open..].iter().enumerate() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match byte {
+            b'"' => in_string = true,
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    let usage: serde_json::Value =
+                        serde_json::from_slice(&bytes[open..=open + offset]).ok()?;
+                    return usage_counts(Some(&usage));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn usage_counts(usage: Option<&serde_json::Value>) -> Option<UsageCounts> {
+    let usage = usage?;
+    let input = usage
+        .get("prompt_tokens")
+        .or_else(|| usage.get("input_tokens"))
+        .and_then(serde_json::Value::as_u64);
+    let output = usage
+        .get("completion_tokens")
+        .or_else(|| usage.get("output_tokens"))
+        .and_then(serde_json::Value::as_u64);
+    if input.is_none() && output.is_none() {
+        return None;
+    }
+    Some(UsageCounts {
+        input_tokens: input.unwrap_or(0),
+        output_tokens: output.unwrap_or(0),
+        estimated: false,
+    })
 }
 
 /// Builds an error response, optionally redacting secrets.
@@ -467,23 +683,153 @@ mod tests {
     }
 
     #[test]
-    fn estimate_tokens_from_usage() {
-        let body =
-            br#"{"usage": {"total_tokens": 150, "prompt_tokens": 100, "completion_tokens": 50}}"#;
-        assert_eq!(estimate_response_tokens(body), 150);
+    fn parses_openai_and_anthropic_json_usage() {
+        let openai = br#"{"usage":{"prompt_tokens":12,"completion_tokens":7,"total_tokens":19}}"#;
+        assert_eq!(
+            find_usage_fragment(openai),
+            Some(UsageCounts {
+                input_tokens: 12,
+                output_tokens: 7,
+                estimated: false,
+            })
+        );
+        let anthropic = br#"{"usage":{"input_tokens":21,"output_tokens":9}}"#;
+        assert_eq!(
+            find_usage(anthropic),
+            Some(UsageCounts {
+                input_tokens: 21,
+                output_tokens: 9,
+                estimated: false,
+            })
+        );
     }
 
     #[test]
-    fn estimate_tokens_fallback() {
-        let body = br#"{"choices": [{"message": {"content": "hello world"}}]}"#;
-        // No usage field → char/4 estimate
-        let expected = (body.len() as u64) / 4;
-        assert_eq!(estimate_response_tokens(body), expected);
+    fn parses_sse_usage_across_arbitrary_chunks() {
+        let event = b"data: {\"type\":\"message_delta\",\"usage\":{\"input_tokens\":31,\"output_tokens\":4}}\r\n\r\n";
+        let mut parser = UsageParser::new(true);
+        for part in event.chunks(3) {
+            parser.push(part);
+        }
+        assert_eq!(
+            parser.finish(event.len() as u64),
+            UsageCounts {
+                input_tokens: 31,
+                output_tokens: 4,
+                estimated: false,
+            }
+        );
     }
 
     #[test]
-    fn estimate_tokens_empty() {
-        assert_eq!(estimate_response_tokens(b""), 0);
+    fn parses_openai_sse_usage_across_arbitrary_chunks() {
+        let openai = b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":3}}\n\n";
+        let mut parser = UsageParser::new(true);
+        for part in openai.chunks(2) {
+            parser.push(part);
+        }
+        assert_eq!(
+            parser.finish(openai.len() as u64),
+            UsageCounts {
+                input_tokens: 12,
+                output_tokens: 3,
+                estimated: false,
+            }
+        );
+    }
+
+    #[test]
+    fn combines_anthropic_sse_usage_from_message_start_and_delta() {
+        let events = concat!(
+            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":18,\"output_tokens\":0}}}\n\n",
+            "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":6}}\n\n",
+        );
+        let mut parser = UsageParser::new(true);
+        for part in events.as_bytes().chunks(7) {
+            parser.push(part);
+        }
+        assert_eq!(
+            parser.finish(events.len() as u64),
+            UsageCounts {
+                input_tokens: 18,
+                output_tokens: 6,
+                estimated: false,
+            }
+        );
+    }
+
+    #[test]
+    fn missing_usage_falls_back_to_response_bytes_over_four() {
+        let body = b"response without provider usage";
+        let mut parser = UsageParser::new(false);
+        for part in body.chunks(5) {
+            parser.push(part);
+        }
+        assert_eq!(
+            parser.finish(body.len() as u64),
+            UsageCounts {
+                input_tokens: 0,
+                output_tokens: (body.len() / 4) as u64,
+                estimated: true,
+            }
+        );
+    }
+    #[tokio::test]
+    async fn streamed_upstream_chunks_are_forwarded_before_completion_and_not_cached() {
+        use axum::body::Body as AxumBody;
+        use bytes::Bytes;
+        use futures_util::StreamExt;
+
+        let app = Router::new().route(
+            "/*path",
+            any(|| async {
+                let (sender, receiver) =
+                    tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(2);
+                tokio::spawn(async move {
+                    let _ = sender.send(Ok(Bytes::from_static(b"first\n"))).await;
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    let _ = sender.send(Ok(Bytes::from_static(b"second\n"))).await;
+                });
+                Response::builder()
+                    .header("content-type", "text/event-stream")
+                    .body(AxumBody::from_stream(tokio_stream::wrappers::ReceiverStream::new(receiver)))
+                    .unwrap()
+            }),
+        );
+        let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(upstream_listener, app).await.ok() });
+
+        let budgets = Arc::new(BudgetTracker::new());
+        budgets.register("stream-task", Budget::new(1_000_000, Duration::from_secs(3600)));
+        let tokens = Arc::new(SandboxTokens::new());
+        let token = tokens.issue("stream-task");
+        let proxy = EgressProxy::new(
+            EgressProxyConfig {
+                upstream_url: format!("http://{upstream_addr}"),
+                ..Default::default()
+            },
+            budgets,
+            tokens,
+        );
+        let mut proxy = proxy;
+        let address = proxy.start("127.0.0.1:0").await.unwrap();
+        let response = reqwest::Client::new()
+            .post(format!("http://{address}/v1/chat"))
+            .header(SANDBOX_TOKEN_HEADER, token.as_str())
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        let mut body = response.bytes_stream();
+        let first = tokio::time::timeout(Duration::from_millis(500), body.next())
+            .await
+            .expect("first chunk should not wait for upstream completion")
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.as_ref(), b"first\n");
+        assert_eq!(proxy.cache_stats().unwrap().stores, 0);
+        proxy.shutdown();
     }
 
     #[test]

@@ -14,11 +14,16 @@ Flags change between releases. Before running a command you have not run in this
 | Tool | What it is | Use it for |
 | --- | --- | --- |
 | `minga` | The orchestrator itself. Roles (`manager`, `worker`, `api`) plus client commands. | Running nodes, `validate`, `deploy`, `logs`, `image pull`, `state export` / `import`, `tls`, node-local `secret`. |
-| `minga-ctl` | Companion CLI on the operator's machine. Talks to `minga api`, usually through an SSH tunnel. | Contexts, stacks, services, scale / update / rollback, inspect, health, metrics, secrets and registry logins across nodes. |
+| `minga-ctl` | Companion CLI on the operator's machine; connects to `minga api`, usually over SSH. | Contexts, stacks, services, secrets, images, registry logins, health and metrics; current-main builds also expose manager, node, network, config and task operations plus `info` / `version`. |
 
 `minga-ctl` is not in the release archive: `cargo install --locked --path crates/minga-ctl` from a checkout of the release tag. It runs the `minga` binary **on the operator's machine** for `stack deploy` (through the tunnel), so `minga` must be on PATH there or `MINGA_BIN` set; the node only needs the API. Release archives are Linux only, so on macOS build it with `cargo install --locked --path crates/minga-cli`.
 
 Which deploy command: `minga-ctl stack deploy` from a workstation (it saves specs for `service rollback` and has `--prune`); `minga deploy` on the node itself, in CI or in scripts (neither). `docs/cli.md` has every command, flag and environment variable; `docs/topologies.md` has the supported layouts and what each needs.
+
+The additional cluster-resource commands are in the current source tree and
+are not part of the released v1.2.0 CLI. Check `minga-ctl --help` on the actual
+binary before using them; do not assume a command exists on a released node or
+workstation build.
 
 ## Deploying a Compose file
 
@@ -70,6 +75,29 @@ Things that surprise people:
 - Plain HTTP to a host other than loopback is refused, with no override. Use `--ssh`, or an `https://` endpoint with `--tls-cert`.
 - Exit codes: 1 user or config error, 2 API / transport / auth / failed health check, 3 the named thing does not exist.
 
+Current-main cluster commands:
+
+```bash
+minga-ctl info
+minga-ctl version
+minga-ctl manager ls
+minga-ctl manager add ID --raft-addr HOST:PORT
+minga-ctl node ls
+minga-ctl node inspect ID
+minga-ctl node update ID --availability drain
+minga-ctl network ls
+minga-ctl network create NAME [--subnet CIDR] [--attachable]
+minga-ctl config ls
+minga-ctl config create NAME --file FILE
+minga-ctl task ls
+minga-ctl task inspect ID
+```
+
+`manager add` requires an already-running joiner. `node update` changes
+scheduling or labels; a non-ready node needs explicit availability. Network
+and config removal use `rm` and prompt unless `--yes`. Detail output is an
+object in JSON/YAML; list output is an array.
+
 ## Backup, restore and upgrades
 
 - **Back up desired state** before anything that touches the data directory: `minga state export -o backup.json` (on the node, with `--api-url` and `MINGA_API_TOKEN` like `deploy`). The file holds services, networks, volumes and secret and config references, including environment values, so it is written 0600: treat it as a secret. It does not hold secret values (`--secret-store`), named volume data or TLS material; `docs/backup.md` says how to copy those.
@@ -87,7 +115,7 @@ Things that surprise people:
 
 - Tokens and secret values never go in arguments or config files, since both end up in process listings and shell history. `secret put` and `registry login` read stdin. The `minga-ctl` config has no token field on purpose; use `--remote-token-file`, `--token-command` or `MINGA_CTL_TOKEN`.
 - `service update --env-add` values are visible in process listings. Use Minga secrets for credentials.
-- Ask the user before `stack rm`, `stack deploy --prune`, `service rm`, `service rollback`, `image rm`, `registry logout`, `state import --overwrite`, removing Raft files, or anything that restarts a role. Do not pass `--yes` unless they said to.
+- Ask the user before `stack rm`, `stack deploy --prune`, `service rm`, `service rollback`, `manager rm`, `node update` with `--availability drain`, `network rm`, `config rm`, `image rm`, `registry logout`, `state import --overwrite`, removing Raft files, or anything that restarts a role. Do not pass `--yes` unless they said to.
 - Without `MINGA_API_TOKEN` on `minga api` the API is unauthenticated, and anything that reaches it can deploy privileged containers. Flag that if you see it. From 1.2.0 a tokenless API refuses requests with an `Origin` header or a DNS-name `Host`, which stops a browser page, but not a direct client. There are no roles yet: everyone with the token is an admin.
 - Raft without `--raft-tls-*` on a non-loopback bind lets anything that reaches the port rewrite cluster state, and Minga only logs a warning. Flag a multi-node cluster without Raft TLS.
 
@@ -114,6 +142,7 @@ On the node itself, `minga-ctl` still needs a context: `minga-ctl context add lo
 | Task fails: `published port N/tcp is in use on this node (...)` | The port is reserved by the node itself or a host process listens on it (the text in brackets says which). Publish a different port; do not stop the node service holding it. |
 | Node exits: `private key ... has mode 644; it must not be readable by group or others (chmod 600)` | Raft key with loose permissions (1.2.0+). `chmod 600` it, after confirming the file is the node's own key. |
 | API answers 403: `request carries an Origin header` or `Host is a DNS name` | Tokenless API (1.2.0+). Set `MINGA_API_TOKEN` on `minga api` and give clients the token; Traefik sends it as its Basic-auth password. |
+| Traefik v3 Swarm provider shows no routes on **v1.0.1** (Traefik serves 404, no routers discovered) | Three compounding issues unique to v1.0.1: **(1) Auth** — v1.0.1 only accepts `Authorization: Bearer`; Traefik can only do Basic auth (added in v1.0.2). Workaround: nginx proxy on the host (`listen 10.100.236.1:2376; proxy_pass http://127.0.0.1:2375; proxy_set_header Authorization "Bearer ${TOKEN}"; proxy_buffering off; proxy_read_timeout 86400s;`) and point `--providers.swarm.endpoint` at the proxy port. **(2) Labels** — `deploy.labels:` is silently ignored; use top-level `labels:` — Minga maps them to `Spec.Labels` where the Swarm provider reads. **(3) Docker provider unusable** — `/containers/json` returns `endpoint not implemented by Minga`; use the Swarm provider (`--providers.swarm.*`) only. All three are fixed in v1.0.2. |
 | A task cannot reach a service on the node's `127.0.0.1`, or another stack's containers | Blocked on purpose from 1.2.0. Publish the service's port and use the node address. |
 | A workload fails writing `/proc/sys/...`, or reading `/proc/kcore` | `/proc/sys` is read-only and Docker's sensitive paths are masked inside containers (1.2.0+). |
 | A stopped Minga task container is gone after a node restart | Expected from 1.2.0: at start the supervisor removes every container with a `minga/task_id` label that Raft does not assign to that node, running or exited, with its network and staged secrets, and adopts the ones Raft still assigns. The journal logs each removal. To keep a workload, deploy it through Minga. |
@@ -123,6 +152,12 @@ On the node itself, `minga-ctl` still needs a context: `minga-ctl context add lo
 ## Limits to state up front
 
 Say these before promising a design that depends on them, and confirm against the current README, since they are release-specific (written for v1.2.0):
+
+The limits below describe the v1.2.0 release. Current main has since added
+runtime manager membership changes and cross-node WireGuard networking; those
+features are unreleased. Check the current `CHANGELOG.md` and `docs/topologies.md`
+for implementation evidence and known limits rather than applying release
+limitations to a main checkout.
 
 - Single host is the verified path. Multi-node schedules across nodes but has no cross-node container networking.
 - A node cannot join a running cluster. Every node is listed with `--peer` and started together, and all run the same version.

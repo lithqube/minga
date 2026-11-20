@@ -9,157 +9,163 @@ const PREFIX: &str = "minga";
 // -- Node subjects ----------------------------------------------------------
 
 /// `minga.node.{id}.status` — node status reports (JetStream).
-pub fn node_status(node_id: u64) -> String {
-    format!("{PREFIX}.node.{node_id}.status")
+/// `minga.{tenant}.node.{id}.status` — node status reports (JetStream).
+pub fn node_status(tenant_id: &str, node_id: u64) -> String {
+    format!("{PREFIX}.{tenant_id}.node.{node_id}.status")
 }
 
-/// `minga.node.{id}.event` — node lifecycle events (JetStream).
-pub fn node_event(node_id: u64) -> String {
-    format!("{PREFIX}.node.{node_id}.event")
+/// `minga.{tenant}.node.{id}.event` — node lifecycle events (JetStream).
+pub fn node_event(tenant_id: &str, node_id: u64) -> String {
+    format!("{PREFIX}.{tenant_id}.node.{node_id}.event")
 }
 
-/// `minga.node.{id}.heartbeat` — ephemeral liveness ping (core NATS).
-pub fn node_heartbeat(node_id: u64) -> String {
-    format!("{PREFIX}.node.{node_id}.heartbeat")
+/// `minga.{tenant}.node.{id}.heartbeat` — ephemeral liveness ping (core NATS).
+pub fn node_heartbeat(tenant_id: &str, node_id: u64) -> String {
+    format!("{PREFIX}.{tenant_id}.node.{node_id}.heartbeat")
 }
 
 // -- Task subjects ----------------------------------------------------------
 
-/// `minga.task.{id}.status` — task status reports (JetStream).
-pub fn task_status(task_id: &str) -> String {
-    format!("{PREFIX}.task.{task_id}.status")
+/// `minga.{tenant}.task.{id}.status` — task status reports (JetStream).
+pub fn task_status(tenant_id: &str, task_id: &str) -> String {
+    format!("{PREFIX}.{tenant_id}.task.{task_id}.status")
 }
 
-/// `minga.task.{id}.event` — task lifecycle events (JetStream).
-pub fn task_event(task_id: &str) -> String {
-    format!("{PREFIX}.task.{task_id}.event")
+/// `minga.{tenant}.task.{id}.event` — task lifecycle events (JetStream).
+pub fn task_event(tenant_id: &str, task_id: &str) -> String {
+    format!("{PREFIX}.{tenant_id}.task.{task_id}.event")
 }
 
-/// `minga.log.node.{node_id}.{task_id}` — worker-owned log chunks.
-pub fn node_task_log(node_id: u64, task_id: &str) -> String {
-    format!("{PREFIX}.log.node.{node_id}.{task_id}")
+/// `minga.{tenant}.log.node.{node_id}.{task_id}` — worker-owned log chunks.
+pub fn node_task_log(tenant_id: &str, node_id: u64, task_id: &str) -> String {
+    format!("{PREFIX}.{tenant_id}.log.node.{node_id}.{task_id}")
 }
 
-/// Log subject filter for a task across nodes.
-pub fn task_log(task_id: &str) -> String {
-    format!("{PREFIX}.log.node.*.{task_id}")
+/// Log subject filter for a task across nodes in one tenant.
+pub fn task_log(tenant_id: &str, task_id: &str) -> String {
+    format!("{PREFIX}.{tenant_id}.log.node.*.{task_id}")
 }
 
-/// `minga.ctl.node.{id}.ping` — synchronous health probe (core NATS, req/reply).
-pub fn ctl_ping(node_id: u64) -> String {
-    format!("{PREFIX}.ctl.node.{node_id}.ping")
+/// `minga.{tenant}.ctl.node.{id}.ping` — synchronous health probe.
+pub fn ctl_ping(tenant_id: &str, node_id: u64) -> String {
+    format!("{PREFIX}.{tenant_id}.ctl.node.{node_id}.ping")
 }
 
-/// `minga.ctl.node.{id}.drain` — synchronous drain (core NATS, req/reply).
-pub fn ctl_drain(node_id: u64) -> String {
-    format!("{PREFIX}.ctl.node.{node_id}.drain")
+/// `minga.{tenant}.ctl.node.{id}.drain` — synchronous drain.
+pub fn ctl_drain(tenant_id: &str, node_id: u64) -> String {
+    format!("{PREFIX}.{tenant_id}.ctl.node.{node_id}.drain")
 }
 
 // -- Wildcard patterns ------------------------------------------------------
 
-/// All task events: `minga.task.>`
-pub fn task_events_wildcard() -> String {
-    format!("{PREFIX}.task.>")
+/// All task events in one tenant.
+pub fn task_events_wildcard(tenant_id: &str) -> String {
+    format!("{PREFIX}.{tenant_id}.task.>")
 }
 
-/// All node events: `minga.node.>`
-pub fn node_events_wildcard() -> String {
-    format!("{PREFIX}.node.>")
+/// All node events in one tenant.
+pub fn node_events_wildcard(tenant_id: &str) -> String {
+    format!("{PREFIX}.{tenant_id}.node.>")
 }
 
-/// All log subjects: `minga.log.>`
+/// All log subjects across tenants.
 pub fn log_events_wildcard() -> String {
-    format!("{PREFIX}.log.>")
+    format!("{PREFIX}.*.log.>")
 }
 
-/// All events (nodes + tasks): patterns for the MINGA_EVENTS stream.
-pub fn all_events_wildcards() -> Vec<String> {
+/// All events for one tenant.
+pub fn all_events_wildcards(tenant_id: &str) -> Vec<String> {
     vec![
-        node_events_wildcard(),
-        task_events_wildcard(),
-        format!("{PREFIX}.egress.>"),
+        node_events_wildcard(tenant_id),
+        task_events_wildcard(tenant_id),
+        format!("{PREFIX}.{tenant_id}.egress.>"),
     ]
 }
 
 // -- KV keys ----------------------------------------------------------------
 
-/// KV key for a task's latest status, scoped to its owning node.
-pub fn kv_node_task_status(node_id: u64, task_id: &str) -> String {
-    format!("node.{node_id}.task.{task_id}")
+/// KV key for a task's latest status, scoped to its tenant and owning node.
+pub fn kv_node_task_status(tenant_id: &str, node_id: u64, task_id: &str) -> String {
+    format!("{tenant_id}.node.{node_id}.task.{task_id}")
 }
 
-/// KV key for a node's latest status.
-pub fn kv_node_status(node_id: u64) -> String {
-    format!("node.{node_id}")
+/// KV key for a node's latest status, scoped to its tenant.
+pub fn kv_node_status(tenant_id: &str, node_id: u64) -> String {
+    format!("{tenant_id}.node.{node_id}")
 }
 
-/// KV key prefix for a node's task assignments.
-pub fn kv_assignment_node_prefix(node_id: u64) -> String {
-    format!("node.{node_id}.task.")
+/// KV key prefix for a node's task assignments within a tenant.
+pub fn kv_assignment_node_prefix(tenant_id: &str, node_id: u64) -> String {
+    format!("{tenant_id}.node.{node_id}.task.")
 }
-/// KV key prefix for one node's ingress backend assignments.
-pub fn kv_assignment_ingress_prefix(node_id: u64) -> String {
-    format!("node.{node_id}.ingress.")
+
+/// KV key prefix for one node's ingress backend assignments within a tenant.
+pub fn kv_assignment_ingress_prefix(tenant_id: &str, node_id: u64) -> String {
+    format!("{tenant_id}.node.{node_id}.ingress.")
 }
 
 /// KV key for one node's ingress port assignment.
-pub fn kv_assignment_ingress(node_id: u64, published: u16, protocol: &str) -> String {
-    format!(
-        "{}{published}.{protocol}",
-        kv_assignment_ingress_prefix(node_id)
-    )
+pub fn kv_assignment_ingress(
+    tenant_id: &str,
+    node_id: u64,
+    published: u16,
+    protocol: &str,
+) -> String {
+    format!("{}{published}.{protocol}", kv_assignment_ingress_prefix(tenant_id, node_id))
 }
 
 /// KV key for a task assignment.
-pub fn kv_assignment_task(node_id: u64, task_id: &str) -> String {
-    format!("{}{task_id}", kv_assignment_node_prefix(node_id))
+pub fn kv_assignment_task(tenant_id: &str, node_id: u64, task_id: &str) -> String {
+    format!("{}{task_id}", kv_assignment_node_prefix(tenant_id, node_id))
 }
 
 /// KV key prefix for the networks a node's tasks are attached to.
-pub fn kv_assignment_node_network_prefix(node_id: u64) -> String {
-    format!("node.{node_id}.net.")
+pub fn kv_assignment_node_network_prefix(tenant_id: &str, node_id: u64) -> String {
+    format!("{tenant_id}.node.{node_id}.net.")
 }
 
 /// KV key for a network's metadata and DNS records, as projected to one node.
-/// Only nodes running a task on the network get the key, so a worker never
-/// learns other networks' names or task addresses.
-pub fn kv_assignment_network(node_id: u64, network_id: &str) -> String {
-    format!("{}{network_id}", kv_assignment_node_network_prefix(node_id))
+pub fn kv_assignment_network(tenant_id: &str, node_id: u64, network_id: &str) -> String {
+    format!("{}{network_id}", kv_assignment_node_network_prefix(tenant_id, node_id))
 }
 
-/// KV key for a node's liveness lease.
-pub fn kv_lease(node_id: u64) -> String {
-    format!("lease.node.{node_id}")
+pub fn kv_lease(tenant_id: &str, node_id: u64) -> String {
+    format!("{tenant_id}.lease.node.{node_id}")
 }
 
-/// NATS permissions for the `minga-worker-{id}` identity: `(publish, subscribe)`.
-///
-/// Worker N may read only its own task, ingress, WireGuard and network assignments,
-/// and write only its own status and lease. Consumer creation and direct gets
-/// are scoped to the key carried in the subject, so the server can bind them
-/// to `node.{id}`; a consumer whose filter rides in the payload is refused.
-pub fn worker_acl(node_id: u64) -> (Vec<String>, Vec<String>) {
-    let own_tasks = format!("$KV.MINGA_ASSIGN.{}>", kv_assignment_node_prefix(node_id));
-    let own_ingress_prefix = kv_assignment_ingress_prefix(node_id);
+
+
+/// Parse a tenant-qualified lease key, returning `(tenant_id, node_id)`.
+pub fn parse_kv_lease(key: &str) -> Option<(&str, u64)> {
+    let (tenant_id, node_id) = key.split_once(".lease.node.")?;
+    if tenant_id.is_empty() || tenant_id.contains('.') {
+        return None;
+    }
+    Some((tenant_id, node_id.parse().ok()?))
+}
+/// NATS permissions for a tenant/node worker identity: `(publish, subscribe)`.
+pub fn worker_acl(tenant_id: &str, node_id: u64) -> (Vec<String>, Vec<String>) {
+    let own_tasks = format!(
+        "$KV.MINGA_ASSIGN.{}>",
+        kv_assignment_node_prefix(tenant_id, node_id)
+    );
+    let own_ingress_prefix = kv_assignment_ingress_prefix(tenant_id, node_id);
     let own_ingress = format!("$KV.MINGA_ASSIGN.{own_ingress_prefix}>");
-    let own_wireguard = format!("$KV.MINGA_ASSIGN.node.{node_id}.wg");
+    let own_wireguard = format!("$KV.MINGA_ASSIGN.{tenant_id}.node.{node_id}.wg");
     let networks = format!(
         "$KV.MINGA_ASSIGN.{}>",
-        kv_assignment_node_network_prefix(node_id)
+        kv_assignment_node_network_prefix(tenant_id, node_id)
     );
-    let own_status = format!("$KV.MINGA_STATUS.node.{node_id}.task.>");
-    let own_lease = format!("$KV.MINGA_LEASES.{}", kv_lease(node_id));
+    let own_status = format!("$KV.MINGA_STATUS.{tenant_id}.node.{node_id}.task.>");
+    let own_lease = format!("$KV.MINGA_LEASES.{}", kv_lease(tenant_id, node_id));
     let publish = vec![
         own_lease.clone(),
         own_status.clone(),
-        format!("{PREFIX}.log.node.{node_id}.>"),
+        format!("{PREFIX}.{tenant_id}.log.node.{node_id}.>"),
         "$JS.API.STREAM.INFO.KV_MINGA_ASSIGN".into(),
         "$JS.API.STREAM.INFO.KV_MINGA_STATUS".into(),
         "$JS.API.STREAM.INFO.KV_MINGA_LEASES".into(),
-        // Flow-control replies; without them an ordered consumer stalls.
         "$JS.FC.KV_MINGA_ASSIGN.>".into(),
-        // Consumer creation is allowed only when the filter is scoped to
-        // this node, as encoded in the API subject.
         format!("$JS.API.CONSUMER.CREATE.KV_MINGA_ASSIGN.*.{own_tasks}"),
         format!("$JS.API.CONSUMER.CREATE.KV_MINGA_ASSIGN.*.{own_ingress}"),
         format!("$JS.API.CONSUMER.CREATE.KV_MINGA_ASSIGN.*.{networks}"),
@@ -183,6 +189,7 @@ pub fn worker_acl(node_id: u64) -> (Vec<String>, Vec<String>) {
     (publish, subscribe)
 }
 
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -193,87 +200,92 @@ mod tests {
 
     #[test]
     fn subject_formats() {
-        assert_eq!(node_status(1), "minga.node.1.status");
-        assert_eq!(node_event(2), "minga.node.2.event");
-        assert_eq!(node_heartbeat(3), "minga.node.3.heartbeat");
+        assert_eq!(node_status("tenant-a", 1), "minga.tenant-a.node.1.status");
+        assert_eq!(node_event("tenant-a", 2), "minga.tenant-a.node.2.event");
         assert_eq!(
-            task_status("plant-7.inference.1"),
-            "minga.task.plant-7.inference.1.status"
+            node_heartbeat("tenant-a", 3),
+            "minga.tenant-a.node.3.heartbeat"
         );
         assert_eq!(
-            task_event("plant-7.worker.0"),
-            "minga.task.plant-7.worker.0.event"
+            task_status("tenant-a", "plant-7.inference.1"),
+            "minga.tenant-a.task.plant-7.inference.1.status"
         );
-        assert_eq!(task_log("abc"), "minga.log.node.*.abc");
-        assert_eq!(node_task_log(7, "abc"), "minga.log.node.7.abc");
-        assert_eq!(ctl_ping(1), "minga.ctl.node.1.ping");
-        assert_eq!(ctl_drain(1), "minga.ctl.node.1.drain");
+        assert_eq!(
+            task_event("tenant-a", "plant-7.worker.0"),
+            "minga.tenant-a.task.plant-7.worker.0.event"
+        );
+        assert_eq!(task_log("tenant-a", "abc"), "minga.tenant-a.log.node.*.abc");
+        assert_eq!(
+            node_task_log("tenant-a", 7, "abc"),
+            "minga.tenant-a.log.node.7.abc"
+        );
+        assert_eq!(ctl_ping("tenant-a", 1), "minga.tenant-a.ctl.node.1.ping");
+        assert_eq!(ctl_drain("tenant-a", 1), "minga.tenant-a.ctl.node.1.drain");
     }
 
     #[test]
     fn wildcard_formats() {
-        assert_eq!(task_events_wildcard(), "minga.task.>");
-        assert_eq!(node_events_wildcard(), "minga.node.>");
-        assert_eq!(log_events_wildcard(), "minga.log.>");
+        assert_eq!(task_events_wildcard("tenant-a"), "minga.tenant-a.task.>");
+        assert_eq!(node_events_wildcard("tenant-a"), "minga.tenant-a.node.>");
+        assert_eq!(log_events_wildcard("tenant-a"), "minga.tenant-a.log.>");
     }
 
     #[test]
-    fn kv_key_formats() {
+    fn tenant_qualified_kv_keys_do_not_collide() {
+        assert_eq!(kv_lease("tenant-a", 2), "tenant-a.lease.node.2");
+        assert_eq!(kv_lease("tenant-b", 2), "tenant-b.lease.node.2");
         assert_eq!(
-            kv_node_task_status(4, "plant-7.db.0"),
-            "node.4.task.plant-7.db.0"
-        );
-        assert_eq!(kv_node_status(1), "node.1");
-        assert_eq!(kv_lease(2), "lease.node.2");
-        assert_eq!(kv_assignment_node_prefix(4), "node.4.task.");
-        assert_eq!(
-            kv_assignment_task(4, "plant-7.db.0"),
-            "node.4.task.plant-7.db.0"
+            kv_assignment_node_prefix("tenant-a", 4),
+            "tenant-a.node.4.task."
         );
         assert_eq!(
-            kv_assignment_network(4, "shop_default"),
-            "node.4.net.shop_default"
+            kv_assignment_task("tenant-a", 4, "plant-7.db.0"),
+            "tenant-a.node.4.task.plant-7.db.0"
         );
         assert_eq!(
-            kv_assignment_ingress(7, 8080, "tcp"),
-            "node.7.ingress.8080.tcp"
+            kv_assignment_network("tenant-a", 4, "shop_default"),
+            "tenant-a.node.4.net.shop_default"
+        );
+        assert_eq!(
+            kv_assignment_ingress("tenant-a", 7, 8080, "tcp"),
+            "tenant-a.node.7.ingress.8080.tcp"
         );
     }
+
     #[test]
-    fn worker_network_acl_is_node_scoped() {
-        let (publish, subscribe) = worker_acl(7);
-        assert!(subscribe.contains(&"$KV.MINGA_ASSIGN.node.7.net.>".to_string()));
+    fn worker_acl_is_tenant_and_node_scoped() {
+        let (publish, subscribe) = worker_acl("tenant-a", 7);
+        assert!(subscribe.contains(
+            &"$KV.MINGA_ASSIGN.tenant-a.node.7.net.>".to_string()
+        ));
+        assert!(subscribe.contains(
+            &"$KV.MINGA_ASSIGN.tenant-a.node.7.task.>".to_string()
+        ));
+        assert!(publish.contains(
+            &"$KV.MINGA_LEASES.tenant-a.lease.node.7".to_string()
+        ));
+        assert!(!publish.iter().any(|subject| subject.contains("audit")));
         for subject in publish.iter().chain(&subscribe) {
             assert!(
-                !subject.contains("MINGA_ASSIGN.net.") && !subject.contains("node.8"),
-                "worker 7 must not reach shared or other nodes' networks: {subject}"
+                !subject.contains("tenant-b") && !subject.contains("node.8"),
+                "worker must not reach another tenant or node: {subject}"
             );
         }
     }
+
     #[test]
-    fn worker_wireguard_acl_is_exactly_node_scoped() {
-        let (publish, subscribe) = worker_acl(7);
+    fn worker_wireguard_acl_is_exactly_tenant_node_scoped() {
+        let (publish, subscribe) = worker_acl("tenant-a", 7);
         assert!(publish.contains(
-            &"$JS.API.CONSUMER.CREATE.KV_MINGA_ASSIGN.*.$KV.MINGA_ASSIGN.node.7.wg".to_string()
-        ));
-        assert!(subscribe.contains(&"$KV.MINGA_ASSIGN.node.7.wg".to_string()));
-        assert!(publish.contains(
-            &"$JS.API.CONSUMER.CREATE.KV_MINGA_ASSIGN.*.$KV.MINGA_ASSIGN.node.7.ingress.>"
+            &"$JS.API.CONSUMER.CREATE.KV_MINGA_ASSIGN.*.$KV.MINGA_ASSIGN.tenant-a.node.7.wg"
                 .to_string()
         ));
-        assert!(subscribe.contains(&"$KV.MINGA_ASSIGN.node.7.ingress.>".to_string()));
-        assert!(publish.contains(
-            &"$JS.API.DIRECT.GET.KV_MINGA_ASSIGN.$KV.MINGA_ASSIGN.node.7.ingress.>".to_string()
+        assert!(subscribe.contains(
+            &"$KV.MINGA_ASSIGN.tenant-a.node.7.wg".to_string()
         ));
-        assert!(!publish
-            .iter()
-            .any(|subject| subject.contains("node.8.ingress")));
-        assert!(!subscribe
-            .iter()
-            .any(|subject| subject.contains("node.8.ingress")));
-        assert!(!publish.iter().any(|subject| subject.contains("node.8.wg")));
-        assert!(!subscribe
-            .iter()
-            .any(|subject| subject.contains("node.8.wg")));
+        assert!(publish.contains(
+            &"$JS.API.DIRECT.GET.KV_MINGA_ASSIGN.$KV.MINGA_ASSIGN.tenant-a.node.7.ingress.>"
+                .to_string()
+        ));
     }
 }

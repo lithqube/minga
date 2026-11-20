@@ -13,9 +13,9 @@ reference](cli.md).
 | [Container image](#container-image) | Supported | Image verified on arm64 |
 | [Multi-node](#multi-node) | **Supported; T2 and T3 live-verified** | Raft mTLS, NATS client/route mTLS, worker partition/rejoin, manager failover and runtime membership changes on Ubuntu VMs. T4 scale remains untested. |
 
-Not supported: containers on different nodes reaching each other, nodes running
-different versions, and TLS on the API listener. See
-[what is not supported](#not-supported).
+Not supported: nodes running different versions and TLS on the API listener.
+See [what is not supported](#not-supported) for alternatives and limits.
+
 
 ## Single host
 
@@ -142,6 +142,19 @@ running a task while its replacement starts elsewhere. Both copies can run
 until the old worker reconnects and observes the smaller assignment set. This
 is intentional; there is no per-service “never reschedule on lease loss”
 option. See [ADR 0006](adr/0006-workers-leave-raft.md#11-bus-partitions-preserve-running-tasks).
+
+**WireGuard mesh and routing mesh**
+
+- Every manager in a multi-manager cluster needs a reachable UDP endpoint,
+  normally `--wg-endpoint <address>:51820`. Workers may omit an endpoint and
+  remain behind NAT; they keep outbound WireGuard sessions to managers.
+- Worker pairs connect directly when at least one endpoint is reachable.
+  Otherwise, the lowest-ID healthy manager relays their overlay traffic.
+  Relays decrypt and re-encrypt packets, so managers can inspect relayed
+  container payloads; treat managers as trusted.
+- Ingress-published ports answer on every node and route to task backends
+  across the mesh. `mode: host` remains node-local and preserves the client
+  address. The mesh does not implement UDP hole punching.
 
 **Managers**
 

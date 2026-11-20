@@ -16,7 +16,7 @@ use openraft::{
 use redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition};
 use std::sync::Mutex;
 
-use crate::codec::{check_format, FORMAT_KEY, FORMAT_VERSION, V2_FORMAT_VERSION};
+use crate::codec::{check_format, FORMAT_KEY, FORMAT_VERSION, V2_FORMAT_VERSION, V8_FORMAT_VERSION};
 use crate::TypeConfig;
 
 /// Log entries: log index → serialized entry.
@@ -27,7 +27,7 @@ const META_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("raft_meta
 
 /// Re-encodes each Raft entry and advances the marker atomically.
 #[allow(clippy::result_large_err)]
-fn migrate_v2_logs(tx: &redb::WriteTransaction) -> Result<(), StorageIOError<u64>> {
+fn migrate_logs(tx: &redb::WriteTransaction) -> Result<(), StorageIOError<u64>> {
     let entries = {
         let logs = tx.open_table(LOGS_TABLE).map_err(io_err)?;
         let mut entries = Vec::new();
@@ -78,13 +78,14 @@ impl RedbLogStore {
             (stored, empty)
         };
 
-        if stored.as_deref() == Some(&[V2_FORMAT_VERSION]) {
-            migrate_v2_logs(&tx)?;
-        } else {
-            let mut meta = tx.open_table(META_TABLE).map_err(io_err)?;
-            if check_format(stored.as_deref(), empty).map_err(io_err)? {
-                meta.insert(FORMAT_KEY, [FORMAT_VERSION].as_slice())
-                    .map_err(io_err)?;
+        match stored.as_deref() {
+            Some([V2_FORMAT_VERSION | V8_FORMAT_VERSION]) => migrate_logs(&tx)?,
+            _ => {
+                let mut meta = tx.open_table(META_TABLE).map_err(io_err)?;
+                if check_format(stored.as_deref(), empty).map_err(io_err)? {
+                    meta.insert(FORMAT_KEY, [FORMAT_VERSION].as_slice())
+                        .map_err(io_err)?;
+                }
             }
         }
         tx.commit().map_err(io_err)?;

@@ -1,4 +1,4 @@
-//! `minga-ctl` — companion CLI for Minga: contexts, stacks, services, health.
+//! `minga-ctl` — companion operator CLI for Minga clusters.
 
 use std::process::ExitCode;
 
@@ -9,8 +9,8 @@ use minga_ctl::output::Format;
 use minga_ctl::transport::{self, Connection};
 use minga_ctl::{cmd, config, state};
 
-/// Companion CLI for Minga: contexts, stack and service operations, health,
-/// metrics and release management.
+/// Companion CLI for Minga cluster operations: contexts, deployments,
+/// services, cluster resources, health and observability.
 #[derive(Debug, Parser)]
 #[command(name = "minga-ctl", version, about)]
 struct Cli {
@@ -57,6 +57,25 @@ enum Command {
     /// Log nodes in to private container registries.
     #[command(subcommand)]
     Registry(cmd::registry::RegistryCommand),
+    /// Manage Raft managers.
+    #[command(subcommand)]
+    Manager(cmd::cluster::ManagerCommand),
+    /// Inspect and update cluster nodes.
+    #[command(subcommand)]
+    Node(cmd::cluster::NodeCommand),
+    /// Manage cluster networks.
+    #[command(subcommand)]
+    Network(cmd::cluster::NetworkCommand),
+    /// Manage cluster configs.
+    #[command(subcommand)]
+    Config(cmd::cluster::ConfigCommand),
+    /// Inspect cluster tasks.
+    #[command(subcommand)]
+    Task(cmd::cluster::TaskCommand),
+    /// Show cluster information.
+    Info,
+    /// Show API version information.
+    Version,
 }
 
 /// The output format after `--json` is folded in.
@@ -141,7 +160,38 @@ fn run(cli: &Cli) -> Result<(), CtlError> {
             quiet,
             cli.debug,
         )),
+        Command::Manager(cmd) => {
+            run_cluster(cli, cmd::cluster::ClusterCommand::Manager(cmd.clone()))
+        }
+        Command::Node(cmd) => run_cluster(cli, cmd::cluster::ClusterCommand::Node(cmd.clone())),
+        Command::Network(cmd) => {
+            run_cluster(cli, cmd::cluster::ClusterCommand::Network(cmd.clone()))
+        }
+        Command::Config(cmd) => run_cluster(cli, cmd::cluster::ClusterCommand::Config(cmd.clone())),
+        Command::Task(cmd) => run_cluster(cli, cmd::cluster::ClusterCommand::Task(cmd.clone())),
+        Command::Info => run_system_info(cli, false),
+        Command::Version => run_system_info(cli, true),
     }
+}
+
+fn run_cluster(cli: &Cli, command: cmd::cluster::ClusterCommand) -> Result<(), CtlError> {
+    api::block_on(async {
+        let resolved = resolve(cli)?;
+        let result = async {
+            let conn = transport::connect(&resolved, cli.debug).await?;
+            cmd::cluster::run(&command, &conn.api, cli.format(), cli.quiet).await
+        }
+        .await;
+        audit(&resolved, command.audit(), &result);
+        result
+    })
+}
+
+fn run_system_info(cli: &Cli, version: bool) -> Result<(), CtlError> {
+    api::block_on(async {
+        let conn = connect(cli).await?;
+        cmd::cluster::system_info(&conn.api, version, cli.format(), cli.quiet).await
+    })
 }
 
 /// Connects to the selected context. The connection (and, once step 3 lands,
@@ -192,6 +242,42 @@ mod tests {
     #[test]
     fn the_cli_definition_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn cluster_commands_parse() {
+        for args in [
+            &[
+                "minga-ctl",
+                "manager",
+                "add",
+                "2",
+                "--raft-addr",
+                "node:7001",
+            ][..],
+            &["minga-ctl", "node", "update", "2", "--clear-labels"][..],
+            &[
+                "minga-ctl",
+                "network",
+                "create",
+                "overlay",
+                "--subnet",
+                "10.0.0.0/24",
+            ][..],
+            &[
+                "minga-ctl",
+                "config",
+                "create",
+                "app",
+                "--file",
+                "config.toml",
+            ][..],
+            &["minga-ctl", "task", "inspect", "task-1"][..],
+            &["minga-ctl", "info"][..],
+            &["minga-ctl", "version"][..],
+        ] {
+            Cli::try_parse_from(args.iter().copied()).expect("cluster command should parse");
+        }
     }
 
     #[test]

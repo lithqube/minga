@@ -25,7 +25,6 @@ pub type VolumeId = String;
 
 /// Secret identifier.
 pub type SecretId = String;
-
 /// Config identifier.
 pub type ConfigId = String;
 
@@ -377,7 +376,6 @@ pub fn published_port_conflict<'a>(
 pub struct Task {
     pub id: TaskId,
     pub service_id: ServiceId,
-    pub node_id: NodeId,
     pub state: TaskState,
     pub spec: TaskSpec,
     /// When the task last became `Running`.
@@ -529,7 +527,6 @@ pub struct AgentSpec {
 pub struct Network {
     pub id: NetworkId,
     pub name: String,
-    pub driver: String,
     pub attachable: bool,
     /// Subnet CIDR for the overlay (e.g. "10.100.0.0/24").
     #[serde(default)]
@@ -594,7 +591,6 @@ pub struct NetworkDnsTask {
 pub struct Volume {
     pub id: VolumeId,
     pub name: String,
-    pub driver: String,
 }
 
 /// A cluster-level secret (value is not stored here; this is metadata).

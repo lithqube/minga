@@ -79,6 +79,30 @@ pub struct StagedSecret {
     /// The immutable staged path to bind-mount read-only.
     pub staged_path: PathBuf,
 }
+/// An ephemeral token file removed automatically unless a container starts.
+#[derive(Debug)]
+pub struct StagedEgressToken {
+    path: PathBuf,
+    keep: bool,
+}
+
+impl StagedEgressToken {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn keep(&mut self) {
+        self.keep = true;
+    }
+}
+
+impl Drop for StagedEgressToken {
+    fn drop(&mut self) {
+        if !self.keep {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
 
 /// A resolver over a node-local secret store directory.
 #[derive(Debug, Clone)]
@@ -160,6 +184,29 @@ impl SecretStore {
                 tracing::warn!(task = %task_id, error = %e, "secret staging cleanup failed");
             }
         }
+    }
+    /// Stages a per-task token under the owner-only secret staging directory.
+    #[cfg(unix)]
+    pub fn stage_egress_token(
+        &self,
+        task_id: &str,
+        token: &str,
+    ) -> std::io::Result<StagedEgressToken> {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+        let dir = self.root.join("staged").join(task_id);
+        std::fs::create_dir_all(&dir)?;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+        let path = dir.join("egress-token");
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o400)
+            .open(&path)?;
+        std::io::Write::write_all(&mut file, token.as_bytes())?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400))?;
+        Ok(StagedEgressToken { path, keep: false })
     }
 }
 
@@ -634,5 +681,18 @@ mod staging_tests {
         store.cleanup_task("task.b");
         assert!(!staged_b[0].staged_path.exists());
         assert!(staged_a[0].staged_path.exists());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn egress_token_is_read_only_and_task_cleanup_removes_it() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = SecretStore::new(dir.path());
+        let path = store.stage_egress_token("task.a", "sensitive-value").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "sensitive-value");
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o400);
+        store.cleanup_task("task.a");
+        assert!(!path.exists());
     }
 }

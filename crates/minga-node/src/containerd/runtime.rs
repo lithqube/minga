@@ -331,7 +331,6 @@ pub struct ContainerdRuntime {
     /// Per-container log rings (bounded, drop-oldest) and their readers.
     log_rings: Arc<Mutex<HashMap<String, Arc<LogRing>>>>,
     /// Reader task handles, aborted on stop.
-    log_readers: Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>>,
     /// Network setup; assignment records carry the subnet metadata.
     #[cfg(target_os = "linux")]
     networking: Option<Arc<crate::netns::NetworkSetup>>,
@@ -376,6 +375,7 @@ impl ContainerdRuntime {
         self.secret_store = Some(store);
         self
     }
+
 
     /// Resolve and stage the task's secret references into mounts.
     ///
@@ -441,9 +441,18 @@ impl ContainerdRuntime {
     async fn prepare_network(
         &self,
         task_id: &str,
-        spec: &TaskSpec,
+        spec: &mut TaskSpec,
         networks: &[minga_state::types::Network],
     ) -> Result<Option<oci::NetworkSpec>, RuntimeError> {
+        let required_egress = spec
+            .labels
+            .get(minga_state::types::REQUIRED_EGRESS_LABEL)
+            .is_some_and(|value| value == "true");
+        if spec.ips.is_empty() && required_egress {
+            return Err(RuntimeError::Start(
+                "required egress task has no network assignment".into(),
+            ));
+        }
         if spec.ips.is_empty() {
             return Ok(None);
         }
@@ -481,6 +490,21 @@ impl ContainerdRuntime {
             .setup_task(task_id, &attachments, &spec.ports, &search)
             .await
             .map_err(|e| RuntimeError::Start(format!("network setup: {e}")))?;
+        if required_egress {
+            if let Err(error) = setup
+                .require_task_egress(task_id, crate::netns::EGRESS_PROXY_PORT)
+                .await
+            {
+                let _ = setup.teardown_task(task_id).await;
+                return Err(RuntimeError::Start(format!("egress policy setup: {error}")));
+            }
+            let gateway = crate::netns::gateway_of(&attachments[0].subnet)
+                .expect("network attachment has a gateway");
+            spec.env.insert(
+                "MINGA_EGRESS_URL".into(),
+                format!("http://{gateway}:{}", crate::netns::EGRESS_PROXY_PORT),
+            );
+        }
         let hosts_path = if spec.extra_hosts.is_empty() {
             None
         } else {
@@ -832,13 +856,37 @@ impl Runtime for ContainerdRuntime {
             self.networking_blocked.store(false, Ordering::Release);
         }
         let container_id = task_id.clone();
-        let secret_mounts = self.resolve_secrets(&container_id, spec)?;
-        let spec = &self.resolve_mounts(spec).await?;
-        check_extra_hosts_have_network(spec)?;
+        let required_egress = spec
+            .labels
+            .get(minga_state::types::REQUIRED_EGRESS_LABEL)
+            .is_some_and(|value| value == "true");
+        let mut egress_token = None;
+        let mut egress_token_file = None;
+        let mut secret_mounts = self.resolve_secrets(&container_id, spec)?;
+        if required_egress {
+            let tokens = self.egress_tokens.as_ref().ok_or_else(|| {
+                RuntimeError::Start("required egress has no token issuer configured".into())
+            })?;
+            let store = self.secret_store.as_ref().ok_or_else(|| {
+                RuntimeError::Start("required egress has no node secret store configured".into())
+            })?;
+            let token = tokens.issue(&container_id);
+            let staged = store
+                .stage_egress_token(&container_id, token.as_str())
+                .map_err(|_| RuntimeError::Start("failed to stage egress token".into()))?;
+            secret_mounts.push(oci::SecretMount {
+                source: staged.path().to_path_buf(),
+                target: "/run/minga/egress-token".to_string(),
+            });
+            egress_token_file = Some(staged);
+            egress_token = Some(token);
+        }
+        let mut spec = self.resolve_mounts(spec).await?;
+        check_extra_hosts_have_network(&spec)?;
         let image_ref = image::normalize_ref(&spec.image);
         let image = self.ensure_image(&image_ref).await?;
         #[cfg(target_os = "linux")]
-        let network = self.prepare_network(&container_id, spec, networks).await?;
+        let network = self.prepare_network(&container_id, &mut spec, networks).await?;
         #[cfg(not(target_os = "linux"))]
         let network: Option<oci::NetworkSpec> = {
             if !spec.ips.is_empty() {
@@ -1015,6 +1063,12 @@ impl Runtime for ContainerdRuntime {
 
         drop(client);
         self.containers.lock().await.insert(container_id.clone());
+        if let Some(token) = egress_token {
+            self.active_egress_tokens
+                .lock()
+                .await
+                .insert(container_id.clone(), token);
+        }
 
         tracing::info!(
             task_id = %task_id,
@@ -1118,6 +1172,7 @@ impl Runtime for ContainerdRuntime {
         if let Some(store) = &self.secret_store {
             store.cleanup_task(container_id);
         }
+        self.active_egress_tokens.lock().await.remove(container_id);
 
         tracing::info!(container = %container_id, "containerd: stopped container");
         Ok(())

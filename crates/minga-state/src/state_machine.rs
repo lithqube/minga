@@ -18,7 +18,9 @@ use openraft::{
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-use crate::codec::{check_format, FORMAT_KEY, FORMAT_VERSION, V2_FORMAT_VERSION};
+use crate::codec::{
+    check_format, FORMAT_KEY, FORMAT_VERSION, V2_FORMAT_VERSION, V8_FORMAT_VERSION,
+};
 use crate::command::{StateCommand, StateResponse};
 use crate::types::*;
 use crate::TypeConfig;
@@ -56,6 +58,18 @@ fn migrate_v2_state(tx: &redb::WriteTransaction) -> Result<(), StorageIOError<u6
     rewrite_state_table::<Service>(tx, SERVICES_TABLE)?;
     rewrite_state_table::<Task>(tx, TASKS_TABLE)?;
 
+    advance_state_marker(tx)
+}
+
+/// Re-encodes services so AgentSpec's new capabilities field is persisted.
+#[allow(clippy::result_large_err)]
+fn migrate_v8_state(tx: &redb::WriteTransaction) -> Result<(), StorageIOError<u64>> {
+    rewrite_state_table::<Service>(tx, SERVICES_TABLE)?;
+    advance_state_marker(tx)
+}
+
+#[allow(clippy::result_large_err)]
+fn advance_state_marker(tx: &redb::WriteTransaction) -> Result<(), StorageIOError<u64>> {
     let mut meta = tx.open_table(SM_META_TABLE).map_err(sm_io_err)?;
     meta.insert(FORMAT_KEY, [FORMAT_VERSION].as_slice())
         .map_err(sm_io_err)?;
@@ -143,15 +157,19 @@ impl RedbStateMachine {
             stored
         };
 
-        if stored.as_deref() == Some(&[V2_FORMAT_VERSION]) {
-            // Raft metadata is untouched; only changed entity records and the
-            // marker are rewritten in this transaction.
-            migrate_v2_state(&tx)?;
-        } else {
-            let mut meta = tx.open_table(SM_META_TABLE).map_err(sm_io_err)?;
-            if check_format(stored.as_deref(), empty).map_err(sm_io_err)? {
-                meta.insert(FORMAT_KEY, [FORMAT_VERSION].as_slice())
-                    .map_err(sm_io_err)?;
+        match stored.as_deref() {
+            Some([V2_FORMAT_VERSION]) => {
+                // Raft metadata is untouched; only changed entity records and
+                // the marker are rewritten in this transaction.
+                migrate_v2_state(&tx)?;
+            }
+            Some([V8_FORMAT_VERSION]) => migrate_v8_state(&tx)?,
+            _ => {
+                let mut meta = tx.open_table(SM_META_TABLE).map_err(sm_io_err)?;
+                if check_format(stored.as_deref(), empty).map_err(sm_io_err)? {
+                    meta.insert(FORMAT_KEY, [FORMAT_VERSION].as_slice())
+                        .map_err(sm_io_err)?;
+                }
             }
         }
         tx.commit().map_err(sm_io_err)?;

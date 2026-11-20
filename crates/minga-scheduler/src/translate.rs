@@ -78,7 +78,6 @@ fn translate_service(
     let agent_ext = svc
         .agent_extension()
         .map_err(|e| TranslateError::Service(name.to_string(), e))?;
-
     let image = match &agent_ext {
         Some(_) => String::new(), // agent services have no container image
         None => svc.image.clone().filter(|i| !i.is_empty()).ok_or_else(|| {

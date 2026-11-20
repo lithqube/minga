@@ -16,15 +16,15 @@
 //! # Subject namespace
 //!
 //! ```text
-//! minga.node.{id}.status      JetStream   node status events
-//! minga.node.{id}.event       JetStream   node lifecycle events
-//! minga.task.{id}.status      JetStream   task lifecycle events
-//! minga.task.{id}.event       JetStream   task lifecycle events
-//! minga.log.node.{id}.{task}  JetStream   container log chunks
-//! KV_MINGA_ASSIGN             KV          manager-authored task/WireGuard assignments and network metadata
-//! KV_MINGA_LEASES             KV          node liveness leases
-//! minga.ctl.node.{id}.ping    core NATS   synchronous health probe [req/reply]
-//! minga.ctl.node.{id}.drain   core NATS   synchronous drain [req/reply]
+//! minga.{tenant}.node.{id}.status      JetStream   node status events
+//! minga.{tenant}.node.{id}.event       JetStream   node lifecycle events
+//! minga.{tenant}.task.{id}.status      JetStream   task lifecycle events
+//! minga.{tenant}.task.{id}.event       JetStream   task lifecycle events
+//! minga.{tenant}.log.node.{id}.{task}  JetStream   container log chunks
+//! KV_MINGA_ASSIGN             KV          manager-authored tenant-qualified assignments
+//! KV_MINGA_LEASES              KV          tenant-qualified node liveness leases
+//! minga.{tenant}.ctl.node.{id}.ping    core NATS   synchronous health probe [req/reply]
+//! minga.{tenant}.ctl.node.{id}.drain   core NATS   synchronous drain [req/reply]
 //! ```
 //!
 //!
@@ -119,6 +119,42 @@ pub struct BusRequest {
     pub payload: Vec<u8>,
 }
 
+/// A body-free accounting record for one completed agent-model request.
+///
+/// `occurred_at_unix_ms` supports bounded-window queries. Token counts and
+/// cost are integers so serialization and aggregation never use floats.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UsageEvent {
+    pub request_id: String,
+    pub tenant_id: String,
+    pub service_id: String,
+    pub task_id: String,
+    pub customer_id: String,
+    pub route: String,
+    pub requested_model: String,
+    pub answered_model: String,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_hit: bool,
+    pub latency_ms: u64,
+    pub status: u16,
+    pub occurred_at_unix_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_micros: Option<u64>,
+}
+
+/// Bounded per-tenant aggregate returned to cluster operators.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UsageTotals {
+    pub request_count: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cost_micros: u64,
+}
+
+/// Stream of usage events.
+pub type UsageEventStream = Pin<Box<dyn Stream<Item = UsageEvent> + Send>>;
+
 /// Stream of events.
 pub type EventStream = Pin<Box<dyn Stream<Item = BusEvent> + Send>>;
 
@@ -127,6 +163,22 @@ pub type KvStream = Pin<Box<dyn Stream<Item = KvEvent> + Send>>;
 
 /// Stream of incoming requests.
 pub type RequestStream = Pin<Box<dyn Stream<Item = BusRequest> + Send>>;
+
+pub(crate) fn valid_subject_token(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
+pub(crate) fn usage_subject(tenant_id: &str, service_id: &str) -> Result<String> {
+    if !valid_subject_token(tenant_id) || !valid_subject_token(service_id) {
+        return Err(BusError::Other(
+            "usage tenant and service must be valid subject tokens".to_string(),
+        ));
+    }
+    Ok(format!("minga.{tenant_id}.usage.{service_id}"))
+}
 
 pub(crate) fn assignment_prefix_matches(prefix: &str, key: &str) -> bool {
     if prefix.is_empty() || prefix.ends_with('.') {
@@ -348,20 +400,22 @@ pub trait EventBus: Send + Sync {
     /// Watch for changes to any status key.
     async fn watch_status(&self) -> Result<KvStream>;
 
-    // -- Liveness (server-expiring leases) -----------------------------------
+    /// Refresh a node lease under its tenant-qualified key.
+    async fn refresh_lease(
+        &self,
+        tenant_id: &str,
+        node_id: u64,
+        registration: &[u8],
+    ) -> Result<()>;
 
-    /// Refresh a node lease, carrying the node's registration payload.
-    async fn refresh_lease(&self, node_id: u64, registration: &[u8]) -> Result<()>;
+    /// Check whether a tenant's node lease key exists.
+    async fn is_alive(&self, tenant_id: &str, node_id: u64) -> Result<bool>;
 
-    /// Check whether a node's lease key exists.
-    async fn is_alive(&self, node_id: u64) -> Result<bool>;
-
-    /// Return the node IDs whose lease keys currently exist.
+    /// Return the globally unique node IDs whose lease keys currently exist.
     async fn list_alive_nodes(&self) -> Result<HashSet<u64>>;
 
-    /// Watch lease changes, including the current lease entries.
+    /// Watch tenant-qualified lease changes, including current lease entries.
     async fn watch_leases(&self) -> Result<KvStream>;
-
     // -- Request / Reply (synchronous control) -------------------------------
 
     /// Send a request and wait for a reply, with a timeout.
@@ -372,6 +426,25 @@ pub trait EventBus: Send + Sync {
 
     /// Send a reply to a request.
     async fn reply(&self, reply_subject: &str, payload: &[u8]) -> Result<()>;
+
+    // -- Usage (append-only, tenant-isolated) --------------------------------
+
+    /// Persist one request's usage record. Repeated `request_id` values within
+    /// the JetStream duplicate window are idempotent.
+    async fn publish_usage(&self, event: &UsageEvent) -> Result<()>;
+
+    /// Read the retained usage events for exactly one tenant and time window.
+    async fn usage_events(
+        &self,
+        tenant_id: &str,
+        since_unix_ms: u64,
+        customer: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<UsageEvent>>;
+
+    /// Aggregate retained usage by tenant. No customer-level data is returned.
+    async fn usage_totals(&self, since_unix_ms: u64) -> Result<Vec<(String, UsageTotals)>>;
+
 
     // -- Logs (append-only, per-task) ----------------------------------------
 

@@ -238,7 +238,7 @@ flowchart TB
     m1["one minga manager<br/>Raft voter + API + NATS sidecar"] --> ct1[containerd]
   end
 
-  subgraph multi["2 · Multi-node cluster (control plane only)"]
+  subgraph multi["2 · Multi-node cluster"]
     direction LR
     natsx[("manager sidecars with route TLS<br/>or external NATS")]
     mA["manager 1"] <-->|Raft mTLS| mB["manager 2"]
@@ -322,11 +322,10 @@ Requirements: Rust 1.80+ with `rustfmt` and `clippy`, and `nats-server` for the 
 
 Next, in order (rationale in [docs/architecture.md](docs/architecture.md)):
 
-1. Managers-only Raft: workers become pure JetStream clients, liveness moves to `MINGA_LEASES`, and nodes can join a running cluster.
+1. Managers-only Raft: complete (Phase 12; see planning evidence).
 2. A multi-node WireGuard mesh on top of the per-node data plane.
 3. ~~Registry credentials for image pull (an in-process pull that honors `--containerd-socket`).~~ Done in `v1.1.0`.
 4. Host capabilities for agent sandboxes: WASI, egress-only networking, host-injected workload identity, memory limits.
-
 ## Documentation
 
 - [Architecture notes](docs/architecture.md): how the pieces fit today, known structural limits, and the plan

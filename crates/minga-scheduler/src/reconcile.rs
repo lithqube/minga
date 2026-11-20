@@ -248,6 +248,7 @@ mod tests {
                 gpus: 0,
             },
             wg_public_key: None,
+            nats_user_public_key: None,
             wg_endpoint: None,
             overlay_ip: None,
             last_seen_unix: None,

@@ -42,6 +42,8 @@
   lowest-ID healthy manager. Multi-node managers require a reachable
   `--wg-endpoint`; relays decrypt and re-encrypt traffic and can inspect
   container payloads.
+- `minga-ctl` now covers manager membership, node scheduling and labels,
+  cluster networks and configs, task inspection, and API info/version.
 
 
 ## [1.2.0] — 2026-11-13

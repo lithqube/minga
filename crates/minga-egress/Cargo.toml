@@ -7,6 +7,9 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+futures-util.workspace = true
+bytes.workspace = true
+tokio-stream.workspace = true
 axum.workspace = true
 minga-telemetry = { path = "../minga-telemetry" }
 lru.workspace = true

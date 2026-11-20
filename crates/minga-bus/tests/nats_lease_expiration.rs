@@ -35,24 +35,24 @@ async fn jetstream_expiry_makes_a_node_ineligible() {
         .expect("connect to NATS");
 
     // This opaque payload has no timestamp. The server owns lease expiry.
-    bus.refresh_lease(91, b"registration payload")
+    bus.refresh_lease("default", 91, b"registration payload")
         .await
         .unwrap();
-    assert!(bus.is_alive(91).await.unwrap());
+    assert!(bus.is_alive("default", 91).await.unwrap());
 
     let mut leases = bus.watch_leases().await.unwrap();
     let snapshot = tokio::time::timeout(Duration::from_secs(1), leases.next())
         .await
         .expect("lease watch did not replay the current entry")
         .expect("lease watch ended");
-    assert_eq!(snapshot.key, "lease.node.91");
+    assert_eq!(snapshot.key, "default.lease.node.91");
     assert_eq!(
         snapshot.value.as_deref(),
         Some(b"registration payload".as_slice())
     );
 
     let expiry_deadline = tokio::time::Instant::now() + Duration::from_secs(6);
-    while bus.is_alive(91).await.unwrap() {
+    while bus.is_alive("default", 91).await.unwrap() {
         assert!(
             tokio::time::Instant::now() < expiry_deadline,
             "JetStream did not expire the lease"

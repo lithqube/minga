@@ -683,6 +683,10 @@ pub fn node_to_docker(node: &ClusterNode, is_leader: bool) -> models::Node {
         MingaNodeStatus::Draining => "down",
         MingaNodeStatus::Left => "down",
     };
+    let availability = match node.status {
+        MingaNodeStatus::Draining => "drain",
+        _ => "active",
+    };
 
     let mut labels = node.labels.clone();
     labels.insert("minga.node.id".to_string(), node.id.to_string());
@@ -706,7 +710,7 @@ pub fn node_to_docker(node: &ClusterNode, is_leader: bool) -> models::Node {
             Name: Some(format!("node-{}", node.id)),
             Labels: labels,
             Role: role.to_string(),
-            Availability: "active".to_string(),
+            Availability: availability.to_string(),
         },
         Description: models::NodeDescription {
             Hostname: Some(format!("node-{}", node.id)),
@@ -1483,6 +1487,7 @@ mod tests {
                 gpus: 1,
             },
             wg_public_key: None,
+            nats_user_public_key: None,
             wg_endpoint: None,
             overlay_ip: None,
             last_seen_unix: None,
@@ -1506,6 +1511,7 @@ mod tests {
             status: MingaNodeStatus::Active,
             capacity: ResourceSpec::default(),
             wg_public_key: None,
+            nats_user_public_key: None,
             wg_endpoint: None,
             overlay_ip: None,
             last_seen_unix: None,
@@ -1526,6 +1532,7 @@ mod tests {
             status: MingaNodeStatus::Draining,
             capacity: ResourceSpec::default(),
             wg_public_key: None,
+            nats_user_public_key: None,
             wg_endpoint: None,
             overlay_ip: None,
             last_seen_unix: None,
@@ -1534,6 +1541,7 @@ mod tests {
         };
         let docker = node_to_docker(&node, false);
         assert_eq!(docker.Status.State, "down");
+        assert_eq!(docker.Spec.Availability, "drain");
     }
 
     #[test]

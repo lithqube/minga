@@ -19,6 +19,7 @@ bincode = { version = "2", features = ["serde"] }
 bytes = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 futures = "0.3"
+futures-util = "0.3"
 hyper-util = { version = "0.1", features = ["tokio", "server-auto", "service"] }
 indexmap = { version = "2", features = ["serde"] }
 ipnet = "2"
@@ -31,7 +32,7 @@ rand = "0.8"
 redb = "2"
 regex = "1"
 rpassword = "7"
-reqwest = { version = "0.12", default-features = false, features = ["json"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream"] }
 rustls = { version = "0.23", features = ["ring"] }
 rustls-pemfile = "2"
 tokio-rustls = "0.26"
@@ -54,3 +55,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 prometheus = "0.13"
 wasmtime = "24"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
+
+[profile.dev]
+# Keep backtraces but drop variable-level debug info; "off" avoids macOS keeping every .o for dsymutil (~25 GB).
+debug = "line-tables-only"
+split-debuginfo = "off"

@@ -11,8 +11,9 @@ use std::sync::Arc;
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
-    Json,
+    Extension, Json,
 };
+use crate::auth::Caller;
 use minga_bus::{subjects, EventBus, TaskActualState, TaskStatusReport};
 use minga_state::types::{
     unix_now, ClusterNode, NodeStatus as MingaNodeStatus, ResourceSpec, Service as StateService,
@@ -417,6 +418,7 @@ pub async fn create_node(
             gpus: req.gpus.unwrap_or(0),
         },
         wg_public_key: None,
+        nats_user_public_key: None,
         wg_endpoint: None,
         overlay_ip: None,
         // Operator-registered nodes carry no lease: they stay eligible

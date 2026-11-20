@@ -424,7 +424,7 @@ fn start_worker_acl_server(pki: &Pki) -> TlsServer {
     write_file(&cert_path, &pki.server_cert_pem, false);
     write_file(&key_path, &pki.server_key_pem, true);
     // The production worker ACL, so this test cannot drift from the sidecar.
-    let (worker_publish, worker_subscribe) = minga_bus::subjects::worker_acl(7);
+    let (worker_publish, worker_subscribe) = minga_bus::subjects::worker_acl("default", 7);
     let config = format!(
         r#"listen: 127.0.0.1:-1
 server_name: minga-worker-acl-test
@@ -524,108 +524,114 @@ async fn worker_certificate_cannot_write_assignments_or_other_nodes_status_and_l
         .await
         .expect("manager certificate can create the KV buckets");
     manager
-        .put_assignment("node.7.task.allowed", b"assignment")
+        .put_assignment("default.node.7.task.allowed", b"assignment")
         .await
         .unwrap();
     manager
-        .put_assignment("node.8.task.foreign", b"foreign")
+        .put_assignment("default.node.8.task.foreign", b"foreign")
         .await
         .unwrap();
     manager
-        .put_assignment("node.7.wg", b"peer-set")
+        .put_assignment("default.node.7.wg", b"peer-set")
         .await
         .unwrap();
     manager
-        .put_assignment("node.7.wg.extra", b"not-the-peer-set")
+        .put_assignment("default.node.7.wg.extra", b"not-the-peer-set")
         .await
         .unwrap();
     manager
-        .put_assignment("node.8.wg", b"foreign-peer-set")
+        .put_assignment("default.node.8.wg", b"foreign-peer-set")
         .await
         .unwrap();
     manager
-        .put_assignment("node.7.net.test", b"network")
+        .put_assignment("default.node.7.net.test", b"network")
         .await
         .unwrap();
     manager
-        .put_assignment("node.8.net.foreign", b"foreign-network")
+        .put_assignment("default.node.8.net.foreign", b"foreign-network")
         .await
         .unwrap();
     manager
-        .put_status("node.7.task.allowed", b"starting")
+        .put_status("default.node.7.task.allowed", b"starting")
         .await
         .unwrap();
 
     let worker_config = worker_client_config(dir.path(), &pki);
-    let worker_bus = NatsBus::connect_worker_secure(&url, &worker_config, 7)
+    let worker_bus = NatsBus::connect_worker_secure(&url, &worker_config, "default", 7)
         .await
         .expect("worker can open existing KV buckets");
     let mut assignments = worker_bus
-        .watch_assignments("node.7.task.")
+        .watch_assignments("default.node.7.task.")
         .await
         .expect("worker can watch its own assignment prefix");
     let event = tokio::time::timeout(Duration::from_secs(2), assignments.next())
         .await
         .expect("worker receives the existing scoped assignment before timeout")
         .expect("watch remains open");
-    assert_eq!(event.key, "node.7.task.allowed");
+    assert_eq!(event.key, "default.node.7.task.allowed");
     assert_eq!(event.value.as_deref(), Some(&b"assignment"[..]));
     assert_eq!(
         worker_bus
-            .get_assignment("node.7.task.allowed")
+            .get_assignment("default.node.7.task.allowed")
             .await
             .unwrap()
             .as_deref(),
         Some(&b"assignment"[..])
     );
-    let assignments = worker_bus.list_assignments("node.7.task.").await.unwrap();
+    let assignments = worker_bus
+        .list_assignments("default.node.7.task.")
+        .await
+        .unwrap();
     assert_eq!(
         assignments
             .iter()
             .map(|(key, _)| key.as_str())
             .collect::<Vec<_>>(),
-        ["node.7.task.allowed"]
+        ["default.node.7.task.allowed"]
     );
     let mut wireguard = worker_bus
-        .watch_assignments("node.7.wg")
+        .watch_assignments("default.node.7.wg")
         .await
         .expect("worker can watch its own WireGuard peer set");
     let event = tokio::time::timeout(Duration::from_secs(2), wireguard.next())
         .await
         .expect("worker receives its existing WireGuard peer set before timeout")
         .expect("WireGuard watch remains open");
-    assert_eq!(event.key, "node.7.wg");
+    assert_eq!(event.key, "default.node.7.wg");
     assert_eq!(event.value.as_deref(), Some(&b"peer-set"[..]));
-    assert!(worker_bus.get_assignment("node.7.wg").await.is_err());
-    assert!(worker_bus.list_assignments("node.7.wg").await.is_err());
+    assert!(worker_bus.get_assignment("default.node.7.wg").await.is_err());
+    assert!(worker_bus.list_assignments("default.node.7.wg").await.is_err());
     assert!(worker_bus
-        .watch_assignments("node.7.wg.extra")
+        .watch_assignments("default.node.7.wg.extra")
         .await
         .is_err());
-    assert!(worker_bus.watch_assignments("node.8.wg").await.is_err());
-    let networks = worker_bus.list_assignments("node.7.net.").await.unwrap();
+    assert!(worker_bus.watch_assignments("default.node.8.wg").await.is_err());
+    let networks = worker_bus
+        .list_assignments("default.node.7.net.")
+        .await
+        .unwrap();
     assert_eq!(
         networks
             .iter()
             .map(|(key, _)| key.as_str())
             .collect::<Vec<_>>(),
-        ["node.7.net.test"]
+        ["default.node.7.net.test"]
     );
-    assert!(worker_bus.list_assignments("net.").await.is_err());
-    assert!(worker_bus.list_assignments("node.8.net.").await.is_err());
+    assert!(worker_bus.list_assignments("default.net.").await.is_err());
+    assert!(worker_bus.list_assignments("default.node.8.net.").await.is_err());
 
     // Enough data to cross several flow-control windows: the worker must be
     // allowed to answer the server's flow-control requests.
     let big = vec![7u8; 512 * 1024];
     for i in 0..64 {
         manager
-            .put_assignment(&format!("node.7.task.big-{i:02}"), &big)
+            .put_assignment(&format!("default.node.7.task.big-{i:02}"), &big)
             .await
             .unwrap();
     }
     let listed = tokio::time::timeout(
         Duration::from_secs(20),
-        worker_bus.list_assignments("node.7.task."),
+        worker_bus.list_assignments("default.node.7.task."),
     )
     .await
     .expect("listing stalled: flow-control replies denied?")
@@ -706,7 +712,7 @@ async fn worker_certificate_cannot_write_assignments_or_other_nodes_status_and_l
         .expect("worker certificate maps to the restricted NATS identity");
     let own_status = tokio::time::timeout(
         Duration::from_secs(2),
-        publish_jetstream_message(&worker, "$KV.MINGA_STATUS.node.7.task.allowed", b"running"),
+        publish_jetstream_message(&worker, "$KV.MINGA_STATUS.default.node.7.task.allowed", b"running"),
     )
     .await;
     assert!(
@@ -715,7 +721,7 @@ async fn worker_certificate_cannot_write_assignments_or_other_nodes_status_and_l
     );
     assert_eq!(
         manager
-            .get_status("node.7.task.allowed")
+            .get_status("default.node.7.task.allowed")
             .await
             .unwrap()
             .as_deref(),
@@ -723,7 +729,7 @@ async fn worker_certificate_cannot_write_assignments_or_other_nodes_status_and_l
     );
     assert_eq!(
         worker_bus
-            .get_status("node.7.task.allowed")
+            .get_status("default.node.7.task.allowed")
             .await
             .unwrap()
             .as_deref(),
@@ -731,21 +737,21 @@ async fn worker_certificate_cannot_write_assignments_or_other_nodes_status_and_l
     );
     let own_lease = tokio::time::timeout(
         Duration::from_secs(2),
-        publish_jetstream_message(&worker, "$KV.MINGA_LEASES.lease.node.7", b"alive"),
+        publish_jetstream_message(&worker, "$KV.MINGA_LEASES.default.lease.node.7", b"alive"),
     )
     .await;
     assert!(
         matches!(own_lease, Ok(Ok(()))),
         "worker's own lease write should be authorized: {own_lease:?}"
     );
-    assert!(manager.is_alive(7).await.unwrap());
-    assert!(worker_bus.is_alive(7).await.unwrap());
+    assert!(manager.is_alive("default", 7).await.unwrap());
+    assert!(worker_bus.is_alive("default", 7).await.unwrap());
 
     for subject in [
-        "$KV.MINGA_ASSIGN.node.7.task.forbidden",
-        "$KV.MINGA_ASSIGN.node.7.wg",
-        "$KV.MINGA_LEASES.lease.node.8",
-        "$KV.MINGA_STATUS.node.8.task.forbidden",
+        "$KV.MINGA_ASSIGN.default.node.7.task.forbidden",
+        "$KV.MINGA_ASSIGN.default.node.7.wg",
+        "$KV.MINGA_LEASES.default.lease.node.8",
+        "$KV.MINGA_STATUS.default.node.8.task.forbidden",
     ] {
         let worker =
             async_nats::connect_with_options(&url, worker_config.connect_options().unwrap())

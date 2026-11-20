@@ -30,6 +30,7 @@ fn node(id: u64, cpus: f64, mem: u64, gpus: u32, labels: &[(&str, &str)]) -> Clu
             gpus,
         },
         wg_public_key: None,
+        nats_user_public_key: None,
         wg_endpoint: None,
         overlay_ip: None,
         last_seen_unix: None,

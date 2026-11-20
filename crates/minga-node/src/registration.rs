@@ -14,9 +14,15 @@ use minga_state::StateStore;
 use serde::{Deserialize, Serialize};
 use tokio_stream::StreamExt;
 
+fn default_tenant_id() -> String {
+    "default".to_string()
+}
+
 /// Who this node is, as announced to the cluster.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeIdentity {
+    #[serde(default = "default_tenant_id")]
+    pub tenant_id: String,
     pub node_id: NodeId,
     /// Address other nodes can reach this node's Raft RPC on.
     pub address: String,
@@ -46,6 +52,7 @@ impl NodeIdentity {
             status: NodeStatus::Active,
             capacity: self.capacity.clone(),
             wg_public_key: self.wg_public_key.clone(),
+            nats_user_public_key: None,
             wg_endpoint: self.wg_endpoint.clone(),
             overlay_ip: None,
             last_seen_unix: None,
@@ -101,9 +108,11 @@ impl NodeMembership {
     ) -> Result<Self, BusError> {
         let registration = minga_state::codec::encode_wire(&identity)
             .map_err(|error| BusError::Serialization(error.to_string()))?;
-        bus.refresh_lease(identity.node_id, &registration).await?;
+        bus.refresh_lease(&identity.tenant_id, identity.node_id, &registration)
+            .await?;
 
         tracing::info!(
+            tenant_id = %identity.tenant_id,
             node_id = identity.node_id,
             address = %identity.address,
             cpus = identity.capacity.cpus,
@@ -112,14 +121,18 @@ impl NodeMembership {
             "node lease published"
         );
 
+        let tenant_id = identity.tenant_id.clone();
         let node_id = identity.node_id;
         let renew_task = tokio::spawn(async move {
             let mut tick = tokio::time::interval(interval);
             tick.tick().await;
             loop {
                 tick.tick().await;
-                if let Err(error) = bus.refresh_lease(node_id, &registration).await {
-                    tracing::warn!(node_id, error = %error, "lease refresh failed");
+                if let Err(error) = bus
+                    .refresh_lease(&tenant_id, node_id, &registration)
+                    .await
+                {
+                    tracing::warn!(tenant_id, node_id, error = %error, "lease refresh failed");
                 }
             }
         });
@@ -142,7 +155,11 @@ impl NodeMembership {
 /// lose pending registrations. Existing Raft records are never overwritten;
 /// manager-owned status keys keep removed IDs from being re-registered after
 /// a manager restart.
-pub async fn run_node_registration(store: Arc<StateStore>, bus: Arc<dyn EventBus>) {
+pub async fn run_node_registration(
+    store: Arc<StateStore>,
+    bus: Arc<dyn EventBus>,
+    verified_tenant_id: &str,
+) {
     let mut registered = loop {
         match load_registered_nodes(&store, bus.as_ref()).await {
             Ok(nodes) => break nodes,
@@ -172,7 +189,14 @@ pub async fn run_node_registration(store: Arc<StateStore>, bus: Arc<dyn EventBus
                         tracing::warn!("node lease watch ended; reconnecting");
                         break;
                     };
-                    queue_node_registration(&store, event, &mut registered, &mut pending).await;
+                    queue_node_registration(
+                        &store,
+                        event,
+                        verified_tenant_id,
+                        &mut registered,
+                        &mut pending,
+                    )
+                    .await;
                     if store.is_leader().await {
                         register_pending_nodes(&store, bus.as_ref(), &mut registered, &mut pending).await;
                     }
@@ -187,11 +211,11 @@ pub async fn run_node_registration(store: Arc<StateStore>, bus: Arc<dyn EventBus
     }
 }
 
-const REGISTRATION_STATUS_PREFIX: &str = "internal.node-registration.";
+const REGISTRATION_STATUS_SUFFIX: &str = ".internal.node-registration.";
 const REGISTERED_STATUS: &[u8] = b"registered";
 
-fn registration_status_key(node_id: NodeId) -> String {
-    format!("{REGISTRATION_STATUS_PREFIX}{node_id}")
+fn registration_status_key(tenant_id: &str, node_id: NodeId) -> String {
+    format!("{tenant_id}{REGISTRATION_STATUS_SUFFIX}{node_id}")
 }
 
 async fn load_registered_nodes(
@@ -209,8 +233,8 @@ async fn load_registered_nodes(
 
     for (key, _) in statuses {
         if let Some(node_id) = key
-            .strip_prefix(REGISTRATION_STATUS_PREFIX)
-            .and_then(|id| id.parse().ok())
+            .rsplit_once(REGISTRATION_STATUS_SUFFIX)
+            .and_then(|(_, id)| id.parse().ok())
         {
             registered.insert(node_id);
             persisted.insert(node_id);
@@ -218,9 +242,12 @@ async fn load_registered_nodes(
     }
 
     for node_id in existing.difference(&persisted) {
-        bus.put_status(&registration_status_key(*node_id), REGISTERED_STATUS)
-            .await
-            .map_err(|error| error.to_string())?;
+        bus.put_status(
+            &registration_status_key("default", *node_id),
+            REGISTERED_STATUS,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
     }
 
     Ok(registered)
@@ -240,16 +267,22 @@ fn registration_changed(node: &ClusterNode, identity: &NodeIdentity) -> bool {
 async fn queue_node_registration(
     store: &StateStore,
     event: KvEvent,
+    verified_tenant_id: &str,
     registered: &mut HashSet<NodeId>,
     pending: &mut HashMap<NodeId, NodeIdentity>,
 ) {
-    let Some(node_id) = event
-        .key
-        .strip_prefix("lease.node.")
-        .and_then(|id| id.parse().ok())
-    else {
+    let Some((tenant_id, node_id)) = minga_bus::subjects::parse_kv_lease(&event.key) else {
         return;
     };
+    if tenant_id != verified_tenant_id {
+        tracing::warn!(
+            key_tenant_id = tenant_id,
+            verified_tenant_id,
+            node_id,
+            "ignoring lease outside the join-token tenant"
+        );
+        return;
+    }
 
     if event.op == KvOp::Delete {
         pending.remove(&node_id);
@@ -258,13 +291,14 @@ async fn queue_node_registration(
     let Some(payload) = event.value else {
         return;
     };
-    let identity: NodeIdentity = match minga_state::codec::decode_wire(&payload) {
+    let mut identity: NodeIdentity = match minga_state::codec::decode_wire(&payload) {
         Ok(identity) => identity,
         Err(error) => {
             tracing::debug!(node_id, error = %error, "ignoring lease without a registration payload");
             return;
         }
     };
+    identity.tenant_id = verified_tenant_id.to_string();
     if identity.node_id != node_id {
         tracing::warn!(
             lease_node_id = node_id,
@@ -328,7 +362,8 @@ async fn register_pending_nodes(
         if !store.is_leader().await {
             return;
         }
-        match bus.is_alive(node_id).await {
+        let tenant_id = &pending[&node_id].tenant_id;
+        match bus.is_alive(tenant_id, node_id).await {
             Ok(true) => {}
             Ok(false) => {
                 pending.remove(&node_id);
@@ -355,7 +390,10 @@ async fn register_pending_nodes(
                     }
                 }
                 if let Err(error) = bus
-                    .put_status(&registration_status_key(node_id), REGISTERED_STATUS)
+                    .put_status(
+                        &registration_status_key(tenant_id, node_id),
+                        REGISTERED_STATUS,
+                    )
                     .await
                 {
                     tracing::warn!(node_id, error = %error, "cannot persist node registration");
@@ -377,7 +415,10 @@ async fn register_pending_nodes(
         match store.upsert_node(identity.cluster_node()).await {
             Ok(()) => {
                 if let Err(error) = bus
-                    .put_status(&registration_status_key(node_id), REGISTERED_STATUS)
+                    .put_status(
+                        &registration_status_key(&identity.tenant_id, node_id),
+                        REGISTERED_STATUS,
+                    )
                     .await
                 {
                     tracing::warn!(node_id, error = %error, "cannot persist node registration");
@@ -399,8 +440,18 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
 
+    async fn queue_node_registration(
+        store: &StateStore,
+        event: KvEvent,
+        registered: &mut HashSet<NodeId>,
+        pending: &mut HashMap<NodeId, NodeIdentity>,
+    ) {
+        super::queue_node_registration(store, event, "default", registered, pending).await;
+    }
+
     fn identity(node_id: NodeId) -> NodeIdentity {
         NodeIdentity {
+            tenant_id: "default".to_string(),
             node_id,
             address: format!("127.0.0.1:{}", 50051 + node_id),
             labels: HashMap::from([("zone".to_string(), "a".to_string())]),
@@ -475,7 +526,7 @@ mod tests {
         assert_eq!(stored.wg_endpoint, None);
         assert_eq!(stored.labels.get("zone").unwrap(), "a");
         assert_eq!(stored.last_seen_unix, None);
-        assert!(bus.is_alive(1).await.unwrap());
+        assert!(bus.is_alive("default", 1).await.unwrap());
         assert_eq!(
             bus.get_status("internal.node-registration.1")
                 .await
@@ -532,10 +583,10 @@ mod tests {
         .unwrap();
 
         tokio::time::sleep(Duration::from_millis(120)).await;
-        assert!(bus.is_alive(1).await.unwrap());
+        assert!(bus.is_alive("default", 1).await.unwrap());
         membership.leave().await;
         tokio::time::sleep(Duration::from_millis(100)).await;
-        assert!(!bus.is_alive(1).await.unwrap());
+        assert!(!bus.is_alive("default", 1).await.unwrap());
     }
 
     #[tokio::test]
@@ -548,7 +599,7 @@ mod tests {
             NodeMembership::start_with_interval(bus.clone(), identity(1), Duration::from_secs(10))
                 .await
                 .unwrap();
-        let registrar = tokio::spawn(run_node_registration(store.clone(), bus));
+        let registrar = tokio::spawn(run_node_registration(store.clone(), bus, "default"));
 
         tokio::time::timeout(Duration::from_secs(3), async {
             while store.get_node(1).await.unwrap().is_none() {
@@ -594,7 +645,7 @@ mod tests {
         store.upsert_node(node).await.unwrap();
 
         let payload = minga_state::codec::encode_wire(&identity(1)).unwrap();
-        bus.refresh_lease(1, &payload).await.unwrap();
+        bus.refresh_lease("default", 1, &payload).await.unwrap();
         queue_node_registration(
             &store,
             next_lease(&mut stream).await,
@@ -646,7 +697,7 @@ mod tests {
         renewed.wg_public_key = Some("AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=".into());
         renewed.wg_endpoint = None;
         let payload = minga_state::codec::encode_wire(&renewed).unwrap();
-        bus.refresh_lease(1, &payload).await.unwrap();
+        bus.refresh_lease("default", 1, &payload).await.unwrap();
         queue_node_registration(
             &store,
             next_lease(&mut stream).await,
@@ -670,7 +721,7 @@ mod tests {
             protocol: "tcp".into(),
         }];
         let payload = minga_state::codec::encode_wire(&renewed).unwrap();
-        bus.refresh_lease(1, &payload).await.unwrap();
+        bus.refresh_lease("default", 1, &payload).await.unwrap();
         queue_node_registration(
             &store,
             next_lease(&mut stream).await,
@@ -711,7 +762,7 @@ mod tests {
         registered = load_registered_nodes(&store, bus.as_ref()).await.unwrap();
 
         let payload = minga_state::codec::encode_wire(&identity(1)).unwrap();
-        bus.refresh_lease(1, &payload).await.unwrap();
+        bus.refresh_lease("default", 1, &payload).await.unwrap();
         queue_node_registration(
             &store,
             next_lease(&mut stream).await,

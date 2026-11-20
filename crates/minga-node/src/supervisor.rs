@@ -31,18 +31,25 @@ use crate::runtime::{ContainerStatus, Runtime, RuntimeError};
 #[derive(Clone)]
 pub struct Assignments {
     bus: Arc<dyn EventBus>,
+    tenant_id: String,
     prefix: String,
     node_id: Option<NodeId>,
 }
 
 impl Assignments {
-    /// Manager sources list all assignment keys; worker sources are node-scoped.
-    pub fn new(bus: Arc<dyn EventBus>, node_id: Option<NodeId>) -> Self {
+    /// Manager sources list all assignment keys; worker sources are tenant/node-scoped.
+    pub fn new(
+        bus: Arc<dyn EventBus>,
+        tenant_id: impl Into<String>,
+        node_id: Option<NodeId>,
+    ) -> Self {
+        let tenant_id = tenant_id.into();
         let prefix = node_id
-            .map(|id| format!("node.{id}.task."))
+            .map(|id| subjects::kv_assignment_node_prefix(&tenant_id, id))
             .unwrap_or_default();
         Self {
             bus,
+            tenant_id,
             prefix,
             node_id,
         }
@@ -57,12 +64,17 @@ impl Assignments {
         entries
             .into_iter()
             // Skip `node.N.wg` peer sets: only task keys decode as assignments.
-            .filter(|(key, _)| key.starts_with("node.") && key.contains(".task."))
+            .filter(|(key, _)| key.starts_with(&self.tenant_id) && key.contains(".task."))
             .map(|(key, bytes)| {
                 let assignment: TaskAssignment = minga_state::codec::decode_wire(&bytes)
                     .map_err(|e| format!("invalid assignment {key}: {e}"))?;
                 if self.node_id.is_some_and(|node| assignment.node_id != node)
-                    || key != format!("node.{}.task.{}", assignment.node_id, assignment.task_id)
+                    || key
+                        != subjects::kv_assignment_task(
+                            &self.tenant_id,
+                            assignment.node_id,
+                            &assignment.task_id,
+                        )
                 {
                     return Err(format!("assignment key/value mismatch: {key}"));
                 }
@@ -82,7 +94,7 @@ impl Assignments {
     pub async fn networks(&self, node_id: NodeId) -> Result<Vec<NetworkAssignment>, String> {
         let entries = self
             .bus
-            .list_assignments(&subjects::kv_assignment_node_network_prefix(node_id))
+            .list_assignments(&subjects::kv_assignment_node_network_prefix(&self.tenant_id, node_id))
             .await
             .map_err(|e| e.to_string())?;
         entries
@@ -90,7 +102,13 @@ impl Assignments {
             .map(|(key, bytes)| {
                 let assignment: NetworkAssignment = minga_state::codec::decode_wire(&bytes)
                     .map_err(|e| format!("invalid network assignment {key}: {e}"))?;
-                if key != subjects::kv_assignment_network(node_id, &assignment.network.id) {
+                if key
+                    != subjects::kv_assignment_network(
+                        &self.tenant_id,
+                        node_id,
+                        &assignment.network.id,
+                    )
+                {
                     return Err(format!("network assignment key/value mismatch: {key}"));
                 }
                 Ok(assignment)
@@ -101,7 +119,7 @@ impl Assignments {
         let Some(node_id) = self.node_id else {
             return Ok(Vec::new());
         };
-        let prefix = minga_bus::subjects::kv_assignment_ingress_prefix(node_id);
+        let prefix = minga_bus::subjects::kv_assignment_ingress_prefix(&self.tenant_id, node_id);
         self.bus
             .list_assignments(&prefix)
             .await
@@ -113,6 +131,7 @@ impl Assignments {
                         .map_err(|error| format!("invalid ingress assignment {key}: {error}"))?;
                 if key
                     != minga_bus::subjects::kv_assignment_ingress(
+                        &self.tenant_id,
                         node_id,
                         assignment.published,
                         &assignment.protocol,
@@ -264,8 +283,13 @@ impl Supervisor {
         Self::build(assignments, runtime, None, None, node_id)
     }
 
-    pub fn with_bus(runtime: Arc<dyn Runtime>, bus: Arc<dyn EventBus>, node_id: NodeId) -> Self {
-        let assignments = Assignments::new(bus.clone(), Some(node_id));
+    pub fn with_bus(
+        runtime: Arc<dyn Runtime>,
+        bus: Arc<dyn EventBus>,
+        tenant_id: impl Into<String>,
+        node_id: NodeId,
+    ) -> Self {
+        let assignments = Assignments::new(bus.clone(), tenant_id, Some(node_id));
         Self::build(assignments, runtime, Some(bus), None, node_id)
     }
 
@@ -273,9 +297,10 @@ impl Supervisor {
         runtime: Arc<dyn Runtime>,
         bus: Arc<dyn EventBus>,
         agent_executor: Arc<dyn AgentExecutor>,
+        tenant_id: impl Into<String>,
         node_id: NodeId,
     ) -> Self {
-        let assignments = Assignments::new(bus.clone(), Some(node_id));
+        let assignments = Assignments::new(bus.clone(), tenant_id, Some(node_id));
         Self::build(
             assignments,
             runtime,
@@ -885,7 +910,7 @@ impl Supervisor {
         bus: &Arc<dyn EventBus>,
         task_id: &TaskId,
     ) -> Option<TaskStatusReport> {
-        let key = subjects::kv_node_task_status(self.node_id, task_id);
+        let key = subjects::kv_node_task_status(&self.assignments.tenant_id, self.node_id, task_id);
         match bus.get_status(&key).await {
             Ok(Some(bytes)) => match TaskStatusReport::from_bytes(&bytes) {
                 Ok(report) if report.node_id == self.node_id => Some(report),
@@ -909,7 +934,7 @@ impl Supervisor {
         task_id: &TaskId,
         update: TaskStatusUpdate,
     ) {
-        let key = subjects::kv_node_task_status(self.node_id, task_id);
+        let key = subjects::kv_node_task_status(&self.assignments.tenant_id, self.node_id, task_id);
         let current = match bus.get_status(&key).await {
             Ok(Some(bytes)) => match TaskStatusReport::from_bytes(&bytes) {
                 Ok(report) if report.node_id == self.node_id => Some(report),
@@ -1432,8 +1457,7 @@ mod assignment_tests {
     async fn write_assignment(bus: &MemoryBus, assignment: &TaskAssignment) {
         let bytes = minga_state::codec::encode_wire(assignment).unwrap();
         bus.put_assignment(
-            &format!("node.{}.task.{}", assignment.node_id, assignment.task_id),
-            &bytes,
+            &subjects::kv_assignment_task("default", assignment.node_id, &assignment.task_id),
         )
         .await
         .unwrap();
@@ -1442,12 +1466,12 @@ mod assignment_tests {
     async fn setup(node_id: NodeId) -> (Supervisor, Arc<MockRuntime>, Arc<MemoryBus>) {
         let runtime = Arc::new(MockRuntime::new());
         let bus = MemoryBus::new();
-        let supervisor = Supervisor::with_bus(runtime.clone(), bus.clone(), node_id);
+        let supervisor = Supervisor::with_bus(runtime.clone(), bus.clone(), "default", node_id);
         (supervisor, runtime, bus)
     }
     async fn actual_status(bus: &MemoryBus, node_id: NodeId, task_id: &str) -> TaskStatusReport {
         let bytes = bus
-            .get_status(&subjects::kv_node_task_status(node_id, task_id))
+            .get_status(&subjects::kv_node_task_status("default", node_id, task_id))
             .await
             .unwrap()
             .unwrap();
@@ -1476,6 +1500,7 @@ mod assignment_tests {
             runtime.clone(),
             bus.clone(),
             executor.clone(),
+            "default",
             node_id,
         );
         (supervisor, runtime, executor, bus)
@@ -1544,12 +1569,19 @@ mod assignment_tests {
             self.inner.watch_status().await
         }
 
-        async fn refresh_lease(&self, node_id: u64, registration: &[u8]) -> minga_bus::Result<()> {
-            self.inner.refresh_lease(node_id, registration).await
+        async fn refresh_lease(
+            &self,
+            tenant_id: &str,
+            node_id: u64,
+            registration: &[u8],
+        ) -> minga_bus::Result<()> {
+            self.inner
+                .refresh_lease(tenant_id, node_id, registration)
+                .await
         }
 
-        async fn is_alive(&self, node_id: u64) -> minga_bus::Result<bool> {
-            self.inner.is_alive(node_id).await
+        async fn is_alive(&self, tenant_id: &str, node_id: u64) -> minga_bus::Result<bool> {
+            self.inner.is_alive(tenant_id, node_id).await
         }
 
         async fn list_alive_nodes(&self) -> minga_bus::Result<HashSet<u64>> {
@@ -1619,7 +1651,7 @@ mod assignment_tests {
         assert_eq!(supervisor.reconcile_once().await.unwrap(), 2);
         assert_eq!(runtime.container_count(), 2);
         assert_eq!(supervisor.reconcile_once().await.unwrap(), 0);
-        bus.delete_assignment("node.7.task.first").await.unwrap();
+        bus.delete_assignment("default.node.7.task.first").await.unwrap();
         assert_eq!(supervisor.reconcile_once().await.unwrap(), 1);
         assert_eq!(runtime.container_count(), 1);
         assert_eq!(supervisor.running_tasks().await, vec!["second".to_string()]);
@@ -1643,11 +1675,11 @@ mod assignment_tests {
         let bus = MemoryBus::new();
         let assignment = assignment("task-1");
         let bytes = minga_state::codec::encode_wire(&assignment).unwrap();
-        bus.put_assignment("node.7.task.task-1", &bytes)
+        bus.put_assignment("default.node.7.task.task-1", &bytes)
             .await
             .unwrap();
         let supervisor =
-            Supervisor::with_bus(Arc::new(MockRuntime::new()), bus, assignment.node_id);
+            Supervisor::with_bus(Arc::new(MockRuntime::new()), bus, "default", assignment.node_id);
 
         assert_eq!(supervisor.reconcile_once().await.unwrap(), 1);
         assert_eq!(supervisor.running_tasks().await, vec!["task-1".to_string()]);
@@ -1676,7 +1708,7 @@ mod assignment_tests {
         assert_eq!(supervisor.running_tasks().await, vec!["kept".to_string()]);
         assert_eq!(supervisor.reconcile_once().await.unwrap(), 0);
 
-        bus.delete_assignment("node.7.task.kept").await.unwrap();
+        bus.delete_assignment("default.node.7.task.kept").await.unwrap();
         assert_eq!(supervisor.reconcile_once().await.unwrap(), 1);
         assert_eq!(runtime.container_count(), 0);
     }
@@ -1685,10 +1717,10 @@ mod assignment_tests {
         let bus = MemoryBus::new();
         let mut bytes = minga_state::codec::encode_wire(&assignment("task-1")).unwrap();
         bytes[0] = bytes[0].wrapping_add(1);
-        bus.put_assignment("node.7.task.task-1", &bytes)
+        bus.put_assignment("default.node.7.task.task-1", &bytes)
             .await
             .unwrap();
-        let source = Assignments::new(bus, Some(7));
+        let source = Assignments::new(bus, "default", Some(7));
 
         assert!(source.list().await.is_err());
     }
@@ -1702,13 +1734,13 @@ mod assignment_tests {
         write_assignment(&inner, &assignment("keep")).await;
         write_assignment(&inner, &assignment("move")).await;
         let runtime = Arc::new(MockRuntime::new());
-        let supervisor = Supervisor::with_bus(runtime.clone(), bus.clone(), 7);
+        let supervisor = Supervisor::with_bus(runtime.clone(), bus.clone(), "default", 7);
         assert_eq!(supervisor.reconcile_once().await.unwrap(), 2);
         assert_eq!(runtime.container_count(), 2);
 
         bus.assignments_offline
             .store(true, std::sync::atomic::Ordering::SeqCst);
-        inner.delete_assignment("node.7.task.move").await.unwrap();
+        inner.delete_assignment("default.node.7.task.move").await.unwrap();
         assert_eq!(supervisor.reconcile_once().await.unwrap(), 0);
         assert_eq!(runtime.container_count(), 2);
 
@@ -1728,15 +1760,15 @@ mod assignment_tests {
             max_attempts: None,
         };
         let bytes = minga_state::codec::encode_wire(&desired).unwrap();
-        bus.put_assignment("node.7.task.task-1", &bytes)
+        bus.put_assignment("default.node.7.task.task-1", &bytes)
             .await
             .unwrap();
         let runtime = Arc::new(MockRuntime::new());
-        let supervisor = Supervisor::with_bus(runtime.clone(), bus.clone(), 7);
+        let supervisor = Supervisor::with_bus(runtime.clone(), bus.clone(), "default", 7);
         supervisor.reconcile_once().await.unwrap();
 
         let status = bus
-            .get_status(&subjects::kv_node_task_status(7, "task-1"))
+            .get_status(&subjects::kv_node_task_status("default", 7, "task-1"))
             .await
             .unwrap()
             .unwrap();
@@ -1769,7 +1801,7 @@ mod assignment_tests {
         });
         write_assignment(&bus, &desired).await;
         let runtime = Arc::new(MockRuntime::new());
-        let supervisor = Supervisor::with_bus(runtime.clone(), bus.clone(), desired.node_id);
+        let supervisor = Supervisor::with_bus(runtime.clone(), bus.clone(), "default", desired.node_id);
         for _ in 0..100 {
             supervisor.reconcile_once().await.unwrap();
             if actual_status(&bus, 7, "task-1").await.state == TaskActualState::Running {
@@ -1800,7 +1832,7 @@ mod assignment_tests {
         assert_eq!(runtime.container_count(), 0);
         assert_eq!(executor.agent_count(), 1);
 
-        bus.delete_assignment("node.7.task.agent-1").await.unwrap();
+        bus.delete_assignment("default.node.7.task.agent-1").await.unwrap();
         assert_eq!(supervisor.reconcile_once().await.unwrap(), 1);
         assert_eq!(executor.agent_count(), 0);
     }

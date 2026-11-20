@@ -28,6 +28,7 @@ fn make_node(id: u64, cpus: f64, mem: u64) -> ClusterNode {
             gpus: 0,
         },
         wg_public_key: None,
+        nats_user_public_key: None,
         wg_endpoint: None,
         overlay_ip: None,
         last_seen_unix: None,
@@ -89,7 +90,7 @@ async fn bus_lease_controls_node_eligibility() {
     );
     assert!(store.list_tasks().await.unwrap().is_empty());
 
-    bus.refresh_lease(1, b"registration").await.unwrap();
+    bus.refresh_lease("default", 1, b"registration").await.unwrap();
     let actions = scheduler.reconcile_once().await.unwrap();
     assert_eq!(actions.len(), 1);
     assert_eq!(store.list_tasks().await.unwrap()[0].node_id, 1);
@@ -131,8 +132,8 @@ async fn manager_without_endpoint_blocks_multi_node_placement() {
         .await
         .unwrap();
     let bus = MemoryBus::new();
-    bus.refresh_lease(1, b"registration").await.unwrap();
-    bus.refresh_lease(2, b"registration").await.unwrap();
+    bus.refresh_lease("default", 1, b"registration").await.unwrap();
+    bus.refresh_lease("default", 2, b"registration").await.unwrap();
     let scheduler = Scheduler::with_bus(store.clone(), bus);
 
     assert!(scheduler.reconcile_once().await.is_err());
@@ -179,7 +180,7 @@ async fn network_is_projected_only_to_nodes_running_its_tasks() {
     store.upsert_service(web).await.unwrap();
     let bus = MemoryBus::new();
     for id in [1, 2] {
-        bus.refresh_lease(id, b"registration").await.unwrap();
+        bus.refresh_lease("default", id, b"registration").await.unwrap();
     }
     let scheduler = Scheduler::with_bus(store.clone(), bus.clone());
     scheduler.reconcile_once().await.unwrap();
@@ -228,7 +229,7 @@ async fn empty_lease_set_does_not_remove_tasks() {
         .await
         .unwrap();
     let bus = MemoryBus::with_lease_ttl(Duration::from_millis(50));
-    bus.refresh_lease(1, b"registration").await.unwrap();
+    bus.refresh_lease("default", 1, b"registration").await.unwrap();
     let scheduler = Scheduler::with_bus(store.clone(), bus.clone());
     scheduler.reconcile_once().await.unwrap();
     assert_eq!(store.list_tasks().await.unwrap().len(), 2);
@@ -237,7 +238,7 @@ async fn empty_lease_set_does_not_remove_tasks() {
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert!(scheduler.reconcile_once().await.unwrap().is_empty());
     // A live lease for a node Raft does not know about does not count.
-    bus.refresh_lease(99, b"unregistered").await.unwrap();
+    bus.refresh_lease("default", 99, b"unregistered").await.unwrap();
     assert!(scheduler.reconcile_once().await.unwrap().is_empty());
     assert_eq!(
         store.list_tasks().await.unwrap().len(),
@@ -274,7 +275,7 @@ async fn partial_lease_set_after_an_empty_one_does_not_remove_tasks() {
     store.upsert_service(service).await.unwrap();
     let bus = MemoryBus::with_lease_ttl(Duration::from_millis(50));
     for id in [1, 2] {
-        bus.refresh_lease(id, b"registration").await.unwrap();
+        bus.refresh_lease("default", id, b"registration").await.unwrap();
     }
     let scheduler = Scheduler::with_bus(store.clone(), bus.clone());
     scheduler.reconcile_once().await.unwrap();
@@ -283,7 +284,7 @@ async fn partial_lease_set_after_an_empty_one_does_not_remove_tasks() {
     // Every lease expires, then only node 1 has renewed so far.
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert!(scheduler.reconcile_once().await.unwrap().is_empty());
-    bus.refresh_lease(1, b"registration").await.unwrap();
+    bus.refresh_lease("default", 1, b"registration").await.unwrap();
     assert!(scheduler.reconcile_once().await.unwrap().is_empty());
     assert_eq!(
         store.list_tasks().await.unwrap().len(),
@@ -292,11 +293,11 @@ async fn partial_lease_set_after_an_empty_one_does_not_remove_tasks() {
     );
 
     // Node 2 renews: recovery is complete and the grace window ends.
-    bus.refresh_lease(2, b"registration").await.unwrap();
+    bus.refresh_lease("default", 2, b"registration").await.unwrap();
     scheduler.reconcile_once().await.unwrap();
     // A later lost lease is a real node failure, acted on right away.
     tokio::time::sleep(Duration::from_millis(100)).await;
-    bus.refresh_lease(1, b"registration").await.unwrap();
+    bus.refresh_lease("default", 1, b"registration").await.unwrap();
     assert!(
         !scheduler.reconcile_once().await.unwrap().is_empty(),
         "a finished grace window must not delay removing node 2's task"
@@ -376,7 +377,7 @@ async fn reconcile_projects_wireguard_peer_sets_from_live_placement() {
     store.upsert_task(worker_task).await.unwrap();
     let bus = MemoryBus::new();
     for id in [1, 2, 3] {
-        bus.refresh_lease(id, b"registration").await.unwrap();
+        bus.refresh_lease("default", id, b"registration").await.unwrap();
     }
     bus.put_assignment("node.99.wg", b"stale").await.unwrap();
     let scheduler = Scheduler::with_bus(store.clone(), bus.clone());
@@ -440,10 +441,10 @@ async fn reconcile_projects_wireguard_peer_sets_from_live_placement() {
     // Nodes 1 and 2 run tasks on `shared`; node 3 does not, so it gets none.
     assert!(entries
         .iter()
-        .any(|(key, _)| key == &subjects::kv_assignment_network(1, "shared")));
+        .any(|(key, _)| key == &subjects::kv_assignment_network("default", 1, "shared")));
     assert!(!entries
         .iter()
-        .any(|(key, _)| key == &subjects::kv_assignment_network(3, "shared")));
+        .any(|(key, _)| key == &subjects::kv_assignment_network("default", 3, "shared")));
 
     let ingress_only_set = decode(3);
     assert!(ingress_only_set
@@ -469,14 +470,14 @@ async fn reconcile_projects_wireguard_peer_sets_from_live_placement() {
     );
     let ingress = entries
         .iter()
-        .find(|(key, _)| key == &subjects::kv_assignment_ingress(3, 18080, "tcp"))
+        .find(|(key, _)| key == &subjects::kv_assignment_ingress("default", 3, 18080, "tcp"))
         .expect("ingress-only node receives a backend assignment");
     let ingress: minga_state::types::IngressAssignment =
         minga_state::codec::decode_wire(&ingress.1).unwrap();
     assert_eq!(ingress.backends[0].node_id, 2);
     let network_entry = entries
         .iter()
-        .find(|(key, _)| key == &subjects::kv_assignment_network(2, "shared"))
+        .find(|(key, _)| key == &subjects::kv_assignment_network("default", 2, "shared"))
         .expect("network assignment published to the worker running a task on it");
     let network_assignment: minga_state::types::NetworkAssignment =
         minga_state::codec::decode_wire(&network_entry.1).unwrap();
@@ -519,7 +520,7 @@ async fn rollout_uses_failed_status_from_bus_kv() {
     store.upsert_task(task.clone()).await.unwrap();
 
     let bus = MemoryBus::new();
-    bus.refresh_lease(1, b"registration").await.unwrap();
+    bus.refresh_lease("default", 1, b"registration").await.unwrap();
     let status = TaskStatusReport {
         task_id: task.id.clone(),
         node_id: 1,
@@ -532,7 +533,7 @@ async fn rollout_uses_failed_status_from_bus_kv() {
         running_since_unix: None,
     };
     bus.put_status(
-        &subjects::kv_node_task_status(task.node_id, &task.id),
+        &subjects::kv_node_task_status("default", task.node_id, &task.id),
         &status.to_bytes().unwrap(),
     )
     .await
@@ -652,7 +653,7 @@ async fn ingress_backend_and_backendless_workers_peer_both_ways() {
     store.upsert_task(task).await.unwrap();
     let bus = MemoryBus::new();
     for id in [1, 2, 3] {
-        bus.refresh_lease(id, b"registration").await.unwrap();
+        bus.refresh_lease("default", id, b"registration").await.unwrap();
     }
     let scheduler = Scheduler::with_bus(store.clone(), bus.clone());
     scheduler.reconcile_once().await.unwrap();
@@ -730,11 +731,11 @@ async fn ingress_backend_projection_tracks_task_movement() {
     store.upsert_service(service).await.unwrap();
 
     let bus = MemoryBus::with_lease_ttl(Duration::from_millis(100));
-    bus.refresh_lease(1, b"registration").await.unwrap();
-    bus.refresh_lease(2, b"registration").await.unwrap();
+    bus.refresh_lease("default", 1, b"registration").await.unwrap();
+    bus.refresh_lease("default", 2, b"registration").await.unwrap();
     let scheduler = Scheduler::with_bus(store.clone(), bus.clone());
     scheduler.reconcile_once().await.unwrap();
-    let key = subjects::kv_assignment_ingress(1, 18080, "tcp");
+    let key = subjects::kv_assignment_ingress("default", 1, 18080, "tcp");
     let initial: minga_state::types::IngressAssignment =
         minga_state::codec::decode_wire(&bus.get_assignment(&key).await.unwrap().unwrap()).unwrap();
     assert_eq!(initial.backends.len(), 1);
@@ -742,9 +743,9 @@ async fn ingress_backend_projection_tracks_task_movement() {
     assert_eq!(initial.source_overlay_ip.as_deref(), Some("10.200.0.1"));
 
     tokio::time::sleep(Duration::from_millis(150)).await;
-    bus.refresh_lease(2, b"registration").await.unwrap();
+    bus.refresh_lease("default", 2, b"registration").await.unwrap();
     scheduler.reconcile_once().await.unwrap();
-    let key = subjects::kv_assignment_ingress(2, 18080, "tcp");
+    let key = subjects::kv_assignment_ingress("default", 2, 18080, "tcp");
     let moved: minga_state::types::IngressAssignment =
         minga_state::codec::decode_wire(&bus.get_assignment(&key).await.unwrap().unwrap()).unwrap();
     assert_eq!(moved.backends.len(), 1);
@@ -1067,7 +1068,7 @@ async fn nat_workers_relay_through_the_lowest_manager_and_fail_over_after_lease_
 
     let bus = MemoryBus::with_lease_ttl(Duration::from_secs(1));
     for id in [1, 2, 3, 4, 5] {
-        bus.refresh_lease(id, b"registration").await.unwrap();
+        bus.refresh_lease("default", id, b"registration").await.unwrap();
     }
     let scheduler = Scheduler::with_bus(store.clone(), bus.clone());
     scheduler.reconcile_once().await.unwrap();
@@ -1124,7 +1125,7 @@ async fn nat_workers_relay_through_the_lowest_manager_and_fail_over_after_lease_
 
     tokio::time::sleep(Duration::from_millis(1_100)).await;
     for id in [2, 3, 4, 5] {
-        bus.refresh_lease(id, b"registration").await.unwrap();
+        bus.refresh_lease("default", id, b"registration").await.unwrap();
     }
     scheduler.reconcile_once().await.unwrap();
 

@@ -121,6 +121,23 @@ export const milestones: Milestone[] = [
     source: 'CHANGELOG.md',
   },
   {
+    version: 'Unreleased',
+    status: 'shipped',
+    title: 'Tenants and API identity',
+    features: [
+      'Tenants are desired state, with quotas and a replicated `default` tenant for existing clusters',
+      'Cluster operators create and delete tenants through the API',
+      'Client certificates carry the caller, the role and the tenant',
+      'The API can require mTLS with its own client CA',
+    ],
+    security: [
+      'Workload routes and their responses are filtered by tenant',
+      'A foreign service, network, secret or config returns 404, not 403',
+      'Tenant, node and cluster routes need a cluster operator identity',
+    ],
+    source: 'CHANGELOG.md',
+  },
+  {
     version: 'Then',
     status: 'next',
     title: 'WireGuard mesh',
@@ -145,7 +162,7 @@ export const milestones: Milestone[] = [
     title: 'Not scheduled yet',
     features: [],
     security: [
-      'API roles, TLS on the API listener and a server-side audit log (ADR 0005)',
+      'A server-side audit trail with the tenant (ADR 0005, ADR 0008)',
       'Raft TLS required off loopback, not just warned about',
       'A seccomp profile for containers',
     ],

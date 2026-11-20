@@ -148,19 +148,32 @@ impl ResponseCache {
         stats.size = cache.len();
     }
 
+    /// Computes a cache key scoped to an authenticated workload.
+    ///
+    /// The workload identity is mixed into the key so identical prompts from
+    /// different workloads cannot share responses.
+    pub fn compute_key_for_workload(
+        workload: &str,
+        method: &str,
+        path: &str,
+        body: &[u8],
+    ) -> String {
+        let mut hash = fnv1a(body);
+        for b in workload
+            .bytes()
+            .chain(method.bytes())
+            .chain(path.bytes())
+        {
+            hash = (hash ^ (b as u64)).wrapping_mul(0x100000001b3);
+        }
+        format!("{workload}:{method}:{path}:{hash:016x}")
+    }
+
     /// Computes a cache key from a request method, path, and body.
     ///
     /// Uses a simple hash (FNV-1a) of the body to generate a compact key.
     pub fn compute_key(method: &str, path: &str, body: &[u8]) -> String {
-        let mut hash = fnv1a(body);
-        // Mix in method and path for uniqueness.
-        for b in method.as_bytes() {
-            hash = (hash ^ (*b as u64)).wrapping_mul(0x100000001b3);
-        }
-        for b in path.as_bytes() {
-            hash = (hash ^ (*b as u64)).wrapping_mul(0x100000001b3);
-        }
-        format!("{method}:{path}:{hash:016x}")
+        Self::compute_key_for_workload("", method, path, body)
     }
 
     /// Returns current cache statistics.
@@ -294,6 +307,16 @@ mod tests {
         assert_eq!(stats.stores, 1);
         assert_eq!(stats.size, 1);
         assert!((stats.hit_rate() - 0.666).abs() < 0.01);
+    }
+
+    #[test]
+    fn workload_cache_keys_are_isolated() {
+        let cache = ResponseCache::new(test_config());
+        let first = ResponseCache::compute_key_for_workload("task-a", "POST", "/v1/chat", b"same");
+        let second = ResponseCache::compute_key_for_workload("task-b", "POST", "/v1/chat", b"same");
+        assert_ne!(first, second);
+        cache.put(&first, 200, vec![], b"task-a response".to_vec());
+        assert!(cache.get(&second).is_none());
     }
 
     #[test]

@@ -1,14 +1,14 @@
 # CLI reference
 
-Minga has two command-line tools. This page documents the current manager-only
-Raft CLI shape and describes what each command does, where it runs and which
-flags matter. For the exact flags in your build, run `minga <command> --help`
-and `minga-ctl <command> --help`.
+Minga provides `minga` for node roles and local automation, and `minga-ctl` for
+operator workflows from a workstation. This reference describes the commands
+implemented in the current codebase. For exact flags in your build, run
+`minga <command> --help` and `minga-ctl <command> --help`.
 
 | Tool | Runs on | What it does | Ships in |
 | --- | --- | --- | --- |
-| `minga` | Every node for the `manager` and `worker` roles; any machine for client commands | Runs the cluster, serves the manager's Docker API, and deploys, validates, backs up state, reads logs, pulls images and issues certificates | The release archive and the `ghcr.io/lithqube/minga` image |
-| `minga-ctl` | The operator's workstation | Named contexts, stacks, services, secrets, images, registry logins and health checks, over SSH or HTTPS | Not in the archive: `cargo install --locked --path crates/minga-ctl` from a checkout of the release tag |
+| `minga` | Every node for the `manager` and `worker` roles; any machine for client commands | Runs the cluster and serves the manager's Docker API; deploys, validates, backs up state, reads logs, pulls images, manages TLS and runs agent/sandbox tooling | The release archive and the `ghcr.io/lithqube/minga` image |
+| `minga-ctl` | The operator's workstation | Contexts, stacks, services, secrets, images, managers, nodes, networks, configs, tasks, health, metrics and registry logins over SSH or HTTPS | Not in the archive: `cargo install --locked --path crates/minga-ctl` from a checkout of the release tag |
 
 Supported layouts (single host, multi-node, Talos, air-gapped) are in
 [topologies.md](topologies.md).
@@ -48,10 +48,16 @@ JetStream clients and do not open a `StateStore`. A new manager uses `--join`
 to open without bootstrapping and wait for an administrator to add it through
 the authenticated API.
 
-With the manager API token configured, add a running joiner with
-`POST /minga/managers` and `{ "id": ID, "raft_addr": "HOST:PORT" }`.
-The API waits for catch-up before promotion. Remove it with
-`DELETE /minga/managers/ID`; the last manager cannot be removed.
+With the manager API token configured, manage Raft membership with `minga-ctl`:
+
+```bash
+minga-ctl manager ls
+minga-ctl manager add ID --raft-addr HOST:PORT
+minga-ctl manager rm ID [--yes]
+```
+
+The add operation waits for catch-up before promotion. Removal respects quorum;
+the last manager cannot be removed.
 
 **Raft flags (managers only)**
 
@@ -137,14 +143,14 @@ certificate flags, or previous Raft data directory is needed.
 `deploy` and `state` take `--api-url` (or `MINGA_API_URL`, default
 `http://127.0.0.1:2375`) and read the token from `MINGA_API_TOKEN`.
 
-### Planning utilities
+### Network and WireGuard utilities
 
 `minga net create` and `net inspect`, and `minga wg keygen`, `wg pubkey` and
-`wg config`, compute and print subnets, WireGuard keys and a sample interface
-config. **These commands change nothing**: they do not create a cluster
-network, configure an interface or write to Raft. Compose networks are created
-by `minga deploy`; cross-node networking becomes active when the peer-set plan
-lands.
+`wg config`, are local planning and key/configuration helpers. They do not
+create cluster networks or write state. Compose networks are created by
+`minga deploy` or `minga-ctl stack deploy`; the node reconciler configures the
+WireGuard mesh and cross-node routes from cluster membership and task
+assignments.
 
 ## `minga-ctl`
 
@@ -205,6 +211,13 @@ Through the API:
 | `secret list` | Secret metadata; values never leave the nodes. |
 | `health [--stack STACK] [--timeout SECS]` | The API, and with `--stack` the stack's services and their health URLs. |
 | `metrics` | The Prometheus metrics the cluster reports. |
+| `manager ls`, `manager add ID --raft-addr ADDR`, `manager rm ID [--yes]` | Inspect and change Raft voter membership. Add/remove requires the manager API admin token; removal confirms unless `--yes`. |
+| `node ls`, `node inspect ID` | Node identity, role, availability, scheduling state and address. |
+| `node update ID [--availability active\|drain] [--label KEY=VALUE]... [--label-rm KEY]... [--clear-labels]` | Update node scheduling and labels. A non-ready node requires an explicit availability when labels are changed. |
+| `network ls`, `network inspect ID`, `network create NAME [--subnet CIDR] [--attachable]`, `network rm ID [--yes]` | Cluster network metadata and allocation. Compose remains the full-featured path for network options. |
+| `config ls`, `config inspect ID`, `config create NAME --file FILE`, `config rm ID [--yes]` | Config metadata and creation from file bytes; contents are not returned by the API. |
+| `task ls`, `task inspect ID` | Desired and actual task state, placement, and errors. |
+| `info`, `version` | API cluster information and version metadata. |
 
 On the nodes, over SSH (`--ssh TARGET`, repeatable; by default the context's
 `--node` targets, else its `--ssh`, else this machine):
@@ -218,8 +231,8 @@ On the nodes, over SSH (`--ssh TARGET`, repeatable; by default the context's
 
 Global flags: `--context NAME`, `-o table|json|yaml` (`--json`), `-q` (IDs
 only; changes print nothing), `--debug` (request and ssh traces on stderr, with
-credentials redacted). The table cuts the `ERROR` column; `--json` has the full
-text.
+credentials redacted). List commands emit JSON/YAML arrays; inspect and
+information commands emit objects. The table truncates the `ERROR` column.
 
 Exit codes: `0` success, `1` usage or configuration error, `2` API, transport,
 SSH or authentication failure or a failed health check, `3` the named service,
