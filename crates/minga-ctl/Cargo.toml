@@ -1,6 +1,6 @@
 [package]
 name = "minga-ctl"
-description = "Companion CLI for Minga: contexts, stacks, services, health"
+description = "Operator CLI for Minga clusters: resources, health, and observability"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

@@ -809,7 +809,11 @@ pub fn node_to_docker(node: &ClusterNode, is_leader: bool) -> models::Node {
             Name: Some(format!("node-{}", node.id)),
             Labels: labels,
             Role: role.to_string(),
-            Availability: "active".to_string(),
+            Availability: match node.status {
+                MingaNodeStatus::Draining => "drain",
+                _ => "active",
+            }
+            .to_string(),
         },
         Description: models::NodeDescription {
             Hostname: Some(format!("node-{}", node.id)),

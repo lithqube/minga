@@ -8,7 +8,7 @@ feature documented under current `main` exists in v1.2.0.
 | Tool | Runs on | What it does | Ships in |
 | --- | --- | --- | --- |
 | `minga` | Every node for the `manager` and `worker` roles; any machine for client commands | Runs the cluster, serves the manager's Docker API, and deploys, validates, backs up state, reads logs, pulls images and issues certificates | The release archive and the `ghcr.io/lithqube/minga` image |
-| `minga-ctl` | The operator's workstation | Named contexts, stacks, services, secrets, images, registry logins and health checks, over SSH or HTTPS | Not in the archive: `cargo install --locked --path crates/minga-ctl` from a checkout of the release tag |
+| `minga-ctl` | The operator's workstation | Named contexts, stacks, services, secrets, images, managers, nodes, networks, configs, tasks, registry logins and health checks, over SSH or HTTPS | Not in the archive: `cargo install --locked --path crates/minga-ctl` from a checkout of the release tag |
 
 Supported layouts (single host, multi-node, Talos, air-gapped) are in
 [topologies.md](topologies.md).
@@ -254,6 +254,13 @@ Through the API:
 | `service rm SERVICE [--yes]` | Saves the spec first, so `service rollback` can bring it back. |
 | `service rollback SERVICE [--yes]` | Restores the spec saved before `minga-ctl` last changed or removed the service. One revision, saved on this machine: a deploy from CI cannot be rolled back from a laptop. |
 | `secret list` | Secret metadata; values never leave the nodes. |
+| `manager ls`, `manager add ID --raft-addr ADDR`, `manager rm ID [--yes]` | Inspect and change Raft voter membership. Add and remove need the manager API admin token; removal confirms unless `--yes`. |
+| `node ls`, `node inspect ID` | Node identity, role, availability, scheduling state and address. |
+| `node update ID [--availability active\|drain] [--label KEY=VALUE]... [--label-rm KEY]... [--clear-labels]` | Update node scheduling and labels. |
+| `network ls`, `network inspect ID`, `network create NAME [--subnet CIDR] [--attachable]`, `network rm ID [--yes]` | Cluster network metadata and allocation. Compose remains the full-featured path for network options. |
+| `config ls`, `config inspect ID`, `config create NAME --file FILE`, `config rm ID [--yes]` | Config metadata and creation from file bytes; the API never returns contents. |
+| `task ls`, `task inspect ID` | Desired and actual task state, placement and errors. |
+| `info`, `version` | API cluster information and version metadata. |
 | `health [--stack STACK] [--timeout SECS]` | The API, and with `--stack` the stack's services and their health URLs. |
 | `metrics` | The Prometheus metrics the cluster reports. |
 | `agent usage [--customer ID] [--since 30d]` | Authenticates with the context API token as a cluster operator and reports usage totals by tenant. `minga-ctl` cannot present tenant client certificates, so it does not return per-tenant request rows; `--customer` is rejected for this caller. Read-only. |
@@ -282,6 +289,15 @@ cluster-operator API for tenant CRUD and node-bound join-token issuance;
 the `minga-ctl` context token must be a cluster-operator credential. The
 `--tls-cert` context setting trusts an HTTPS server CA; it is not a client
 certificate/key option.
+
+On a cluster with more than one tenant, the context token has no tenant
+identity, so `minga-ctl` commands that touch tenant resources (`stack`,
+`service`, `secret`, `network`, `config` and `task`) fail with 403 until
+`minga-ctl` can present a tenant client certificate. `node`, `manager`, `info`
+and `version` are operator-only and work with an operator token. `node update`
+re-reads the node before writing and stops if another operator changed it, but
+the API has no revision check, so two writes in the same instant can still
+race.
 
 ## Environment variables
 
