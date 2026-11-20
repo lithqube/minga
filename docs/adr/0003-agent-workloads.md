@@ -140,7 +140,7 @@ New subcommand: `minga agent ls` — list running/completed agents.
 
 The egress proxy runs **on the worker node** (co-located with the agent executor), not as a separate service. This means:
 
-- Routed containers use the worker-local egress proxy. Current WASM guests have no HTTP host import and cannot reach it; the planned host function will route approved guest HTTP through this proxy.
+- Agent WASM modules reach the LLM API only through the local proxy (`127.0.0.1:PORT`).
 - Token budgets are enforced per-workload at the proxy, keyed by the workload the request's sandbox token was minted for (see Implementation status).
 - Secrets (API keys) never cross the bus or Raft, and agents never hold them: the proxy reads the provider key from the node secret store and injects it in transit.
 - In air-gapped deployments, the proxy can point at a local model server instead of a cloud API.
@@ -181,7 +181,7 @@ WASM modules are referenced by `module_ref` (a filesystem path on the node). Dis
 
 - **Working:** `x-minga-agent` parsing, tenant-aware translation and placement, supervisor dispatch, shared Wasmtime engine, bounded module cache, fuel, epoch interruption and enforced memory limits. Capability grants and directory roots are parsed, persisted and validated against worker configuration.
 - **Not yet active:** no WASI linker or guest HTTP host function is installed. Grants do not expose env, clocks, random, stdout/stderr, directories or egress to a guest; agent modules remain pure compute. `MINGA_EGRESS_URL` and `MINGA_EGRESS_TOKEN` cannot be read by a guest yet.
-- **Egress:** named tenant-owned routes, route/model policy, secret-backed credentials, streaming, per-workload cache isolation and usage events/metrics are implemented for proxy clients. Per-workload budgets are node-local; distributed customer-window budgets and request-rate limits remain planned. Provider credentials are read at startup, so rotating one requires a restart.
+- **Egress:** named tenant-owned routes, route/model policy, secret-backed credentials, streaming, per-workload cache isolation and usage events/metrics are implemented for proxy clients. Today those clients are routed containers; WASM guests cannot reach the proxy until the HTTP host function lands. Token budgets apply only to agent runs with `token_budget`: they are node-local and checked when a request is admitted, not enforced against provider spend. Egress policies carry no token budget yet, so routed containers are not token-limited. Distributed customer-window budgets and request-rate limits remain planned. Provider credentials are read at startup, so rotating one requires a restart.
 - **Firecracker:** `FirecrackerRuntime` remains a stub.
 
 See the [sandbox host-capabilities plan](../sandbox-host-capabilities-plan.md)

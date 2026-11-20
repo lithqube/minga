@@ -94,7 +94,7 @@ The API waits for catch-up before promotion. Remove it with
 | `--agent-dir-root <DIR>` (repeatable) | none | Canonicalized allowlist for agent directory grants. A grant must resolve under `<DIR>/<tenant-id>/` for the node's `--tenant-id`, so one tenant cannot name another's directories; a symlinked tenant directory is refused. No configured root permits no directory grants. Grants are validated only: the sandbox mounts no directories and links no WASI yet. |
 | `--egress-bind`, `--egress-upstream`, `--egress-credential`, `--egress-credential-header` | none, `https://api.openai.com`, none, `authorization` | Opt-in. Starts the LLM egress proxy for agent and routed container tasks (for example `0.0.0.0:8080`); tasks reach it on their bridge gateway at the bind's port. The port must be fixed and nonzero. On Linux a non-loopback bind installs the `minga_egress_listener` nft table after the socket is bound and before it serves, which closes that port to everything but `lo` and task bridges (not the WireGuard mesh); the table is removed on shutdown, when serving fails after this run installed it, and at start-up without such a bind. A start whose bind fails leaves any existing table alone, since another process may own the port: a table left by a crashed run then stays until a later start succeeds or runs without such a bind, or until `nft delete table inet minga_egress_listener`. Only a wildcard bind (`0.0.0.0` or `[::]`) reaches task bridge gateways, so only then does the node carry the reserved `com.minga.egress.proxy=true` label, and services with egress routes are placed only on such nodes. A loopback bind serves host-local agents through their `egress_url` only. The credential is a secret ID in `--secret-store`; agents never see the key. |
 | `--egress-allow-cidr <CIDR>` (repeatable) | none | Tenant egress routes refuse loopback, link-local (`169.254.0.0/16`, `fe80::/10`), shared (`100.64.0.0/10`), `0.0.0.0/8`, unspecified, multicast, broadcast and private or unique-local destinations, checked on literal addresses and on every DNS answer at connect time, including IPv4 reached through NAT64 (`64:ff9b::/96`). Each flag allows one such range, for example an on-prem model gateway at `10.20.0.0/24`. The operator's `--egress-upstream` is not filtered. |
-| `--tenant-id <ID>`, `MINGA_TENANT_ID` (worker env only) | `default` | Tenant bound to the node's NATS credentials and leases. A non-default worker must be pre-registered and use its tenant-bound join token; managers accept the flag but do not host tenant workloads in multi-tenant clusters. |
+| `--tenant-id <ID>`, `MINGA_TENANT_ID` | `default` | Tenant bound to the node's NATS credentials and leases. A non-default worker must be pre-registered and use its tenant-bound join token; managers accept the flag and the env var but do not host tenant workloads in multi-tenant clusters. |
 
 The built-in NATS sidecar caps JetStream file storage at 8GB (not preallocated). The MINGA account's JetStream disk limit must not exceed that cap. JetStream shares the data volume with Raft and containerd, so on nodes with less than about 8GB free, the volume fills before the cap applies.
 
@@ -138,10 +138,14 @@ securely to every manager and set `MINGA_JOIN_TOKEN_KEY_FILE` to that
 owner-only 32-byte key.
 
 An operator pre-registers the node with `POST /v1.41/nodes`, then calls
-`POST /minga/nodes/ID/join-token` with cluster-operator authentication. Store
-the returned token in an owner-only file and set `MINGA_NODE_JOIN_TOKEN_FILE`
-on the worker. Tokens expire after 15 minutes; the manager records the tenant
-binding after the first valid lease.
+`POST /minga/nodes/ID/join-token` with cluster-operator authentication. The
+manager API must run with TLS (the endpoint answers 403 otherwise) and needs
+`MINGA_JOIN_TOKEN_KEY_FILE` and the tenant NATS signer (503 otherwise). The
+response carries `token` and `credentials`, a NATS `.creds` payload for this
+node. Store each in an owner-only file and set `MINGA_NODE_JOIN_TOKEN_FILE`
+and `MINGA_NATS_CREDENTIALS_FILE` on the worker. Issuing again revokes the
+node's previous NATS credentials. Tokens expire after 15 minutes; the manager
+records the tenant binding after the first valid lease.
 
 The worker's NATS identity must be restricted to its own lease key
 (`lease.node.ID`) by certificate mapping or JWT permissions. The join token
