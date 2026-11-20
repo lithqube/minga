@@ -1221,7 +1221,10 @@ fn validate_ingress_ports(
     if minga_state::types::published_port_conflict(service, services).is_some() {
         return Err("published port conflicts with another cluster service".to_owned());
     }
-    // An ingress port opens on every node, so no node's listener may own it.
+    // An ingress port opens on every node of the service's tenant — the
+    // scheduler's ingress fan-out is per-tenant — so only a same-tenant
+    // node's reservation may block it. A port another tenant reserved on
+    // its own node never sees this service's traffic.
     for port in &service.ports {
         let Some(published) = port.published else {
             continue;
@@ -1229,7 +1232,10 @@ fn validate_ingress_ports(
         if port.mode != minga_state::types::PortMode::Ingress {
             continue;
         }
-        for node in nodes {
+        for node in nodes
+            .iter()
+            .filter(|node| node.tenant_id == service.tenant_id)
+        {
             if node.reserved_ports.iter().any(|reserved| {
                 reserved.port == published && reserved.protocol.eq_ignore_ascii_case(&port.protocol)
             }) {
@@ -3274,6 +3280,141 @@ mod tests {
         assert!(
             matches!(&err, ApiError::Conflict(m) if m == "service cannot be placed with current cluster capacity or constraints"),
             "expected a generic placement conflict, got {err:?}"
+        );
+    }
+
+    fn ingress_service(tenant_id: &str, published: u16) -> StateService {
+        StateService {
+            is_job: false,
+            id: format!("svc-{tenant_id}"),
+            tenant_id: tenant_id.to_string(),
+            name: format!("svc-{tenant_id}"),
+            image: "nginx:latest".to_string(),
+            replicas: 1,
+            mode: minga_state::types::ServiceMode::Replicated,
+            constraints: Vec::new(),
+            env: HashMap::new(),
+            ports: vec![minga_state::types::PortMapping {
+                target: 443,
+                published: Some(published),
+                protocol: "tcp".to_string(),
+                mode: minga_state::types::PortMode::Ingress,
+            }],
+            networks: Vec::new(),
+            resources: ResourceSpec::default(),
+            agent: None,
+            egress: None,
+            restart_policy: Default::default(),
+            secrets: Vec::new(),
+            command: Vec::new(),
+            entrypoint: Vec::new(),
+            labels: HashMap::new(),
+            healthcheck: None,
+            mounts: Vec::new(),
+            user: None,
+            update: Default::default(),
+            rollback: None,
+            previous: None,
+            extra_hosts: Vec::new(),
+        }
+    }
+
+    fn worker_node(id: u64, tenant_id: &str, reserved: &[u16]) -> ClusterNode {
+        ClusterNode {
+            id,
+            address: format!("127.0.0.1:{}", 50051 + id),
+            labels: HashMap::new(),
+            status: NodeStatus::Active,
+            capacity: ResourceSpec {
+                cpus: 4.0,
+                memory_bytes: 8 << 30,
+                gpus: 0,
+            },
+            wg_public_key: None,
+            wg_endpoint: None,
+            overlay_ip: None,
+            tenant_id: tenant_id.to_string(),
+            last_seen_unix: None,
+            role: Default::default(),
+            reserved_ports: reserved
+                .iter()
+                .map(|port| minga_state::types::ReservedPort {
+                    port: *port,
+                    protocol: "tcp".to_string(),
+                })
+                .collect(),
+            nats_user_public_key: None,
+        }
+    }
+
+    #[test]
+    fn cross_tenant_reserved_port_does_not_block_ingress() {
+        let service = ingress_service("acme", 443);
+        let nodes = vec![worker_node(1, "default", &[443])];
+        assert!(
+            validate_ingress_ports(&service, &[], &nodes).is_ok(),
+            "a port tenant `default` reserved on its own node must not block tenant `acme` ingress"
+        );
+    }
+
+    #[test]
+    fn same_tenant_reserved_port_still_blocks_ingress() {
+        let service = ingress_service("acme", 443);
+        let nodes = vec![worker_node(1, "acme", &[443])];
+        assert_eq!(
+            validate_ingress_ports(&service, &[], &nodes),
+            Err("ingress port is reserved on a cluster node".to_owned())
+        );
+    }
+
+    #[tokio::test]
+    async fn service_admission_scopes_reserved_ports_to_the_service_tenant() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            StateStore::open(1, "127.0.0.1:0", dir.path(), BTreeMap::new())
+                .await
+                .unwrap(),
+        );
+        store
+            .create_tenant(Tenant {
+                nats_revoked_user_public_keys: Vec::new(),
+                id: "acme".into(),
+                name: "acme".into(),
+                quotas: TenantQuotas::default(),
+                created_at: 1,
+            })
+            .await
+            .unwrap();
+        // Tenant `default` reserves 443 on its node; tenant `acme` does not.
+        store
+            .upsert_node(worker_node(1, "default", &[443]))
+            .await
+            .unwrap();
+        store
+            .upsert_node(worker_node(2, "acme", &[]))
+            .await
+            .unwrap();
+        let app = Arc::new(AppState::with_bus(store, MemoryBus::new()));
+
+        // The admission every write path runs (create, update and
+        // change-request approval) must not see the other tenant's
+        // reservation.
+        let service = ingress_service("acme", 443);
+        ensure_placeable(&app, &service, None).await.expect(
+            "tenant `acme` ingress on 443 must pass while only tenant `default` reserves it",
+        );
+
+        // Once `acme`'s own node reserves the port, admission refuses.
+        app.store
+            .upsert_node(worker_node(2, "acme", &[443]))
+            .await
+            .unwrap();
+        let err = ensure_placeable(&app, &service, None)
+            .await
+            .expect_err("tenant `acme`'s own reservation must block its ingress on 443");
+        assert!(
+            matches!(&err, ApiError::Conflict(m) if m == "ingress port is reserved on a cluster node"),
+            "expected the reserved-port conflict, got {err:?}"
         );
     }
 }

@@ -48,7 +48,7 @@ The role is in the certificate, not in a server-side table, so there is nothing 
 ### 3. Operator certificates come from their own CA, and Raft checks the peer name
 - Operators are issued from a **separate CA**, made with the existing `minga tls init-ca` in a different directory. `--api-client-ca` points at that CA and nothing else. A node certificate (from the Raft CA) is not accepted by the API, and an operator certificate is not accepted by Raft.
 - `minga api` also opens the Raft store (it has the `--raft-tls-*` flags, `main.rs:311-319`). It refuses to start if `--api-client-ca` and `--raft-tls-ca` hold the same certificate.
-- **Raft also verifies the peer name.** After the handshake, the server side of the Raft transport checks that the peer certificate has SAN `minga-node` and drops the connection if not. This is defence in depth, not a replacement for the CA split: today a certificate the Raft CA signs for any purpose is accepted, and nothing but operator discipline keeps those certificates to nodes. The check is the server-side half of what the client already does with `MINGA_NODE_NAME`.
+- **Raft also verifies the peer name.** The server side of the Raft transport accepts only a peer certificate with a SAN `minga-manager-<id>`, and the client pins the exact `minga-manager-<target>` of the manager it dials. Worker certificates come from the same CA and carry the shared `minga-node` SAN, so checking `minga-node` alone would let a tenant-owned worker join Raft (ADR 0006 keeps workers out of it). This is defence in depth on top of the CA split.
 
 ### 4. Token-only mode stays, as admin, and the open-bind default goes away
 - `--api-token` keeps working exactly as today (Bearer or Basic password), so Traefik and existing deployments are unaffected. A request authenticated by the token has no name and counts as **admin**. It is a shared secret; it is the compatibility path, not the target.
@@ -128,7 +128,7 @@ As in `docs/minga-ctl-plan.md` section 2.4: SOC 2 attests an organisation's cont
   - Revocation is coarse until a deny list exists (see Decision 7).
   - The token remains a shared admin secret for as long as it is configured. Environments that want only certificates should leave `--api-token` unset on a TLS listener.
   - minga-ctl needs `client_cert` and `client_key` context keys (F4); SSH tunnelling keeps working but is no longer the only secure path.
-  - Raft peers with certificates that lack SAN `minga-node` stop connecting. `minga tls issue-node` always sets it, so only hand-made certificates are affected.
+  - Raft peers with certificates that lack SAN `minga-manager-<id>` stop connecting. `minga tls issue-node --role manager` sets it; manager certificates issued by older releases, or by hand, must be reissued.
 - **Open questions for review:**
   - Should `/healthz` stay behind authentication, or be exempt for load balancers that cannot present a certificate? The proposal keeps it behind, to match ADR 0004 and today's behaviour.
   - The API server certificate: issue it from the operator CA, or from an organisation CA via `--api-tls-cert`? The flags accept either; no `issue-server` command is proposed here.

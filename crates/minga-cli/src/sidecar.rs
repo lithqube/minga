@@ -66,6 +66,14 @@ pub struct ServerTls {
     pub verify_and_map: bool,
 }
 
+/// DNS SAN every route certificate must carry. NATS accepts an inbound route
+/// only from a certificate with this name, so a certificate that merely
+/// chains to the route CA (a worker's, via a shared ancestor) is refused.
+/// NATS matches this name in any DNS, email or URI SAN or the subject, so
+/// no CA under the route root may issue it to anything but a manager; Minga's
+/// own issuers add it only for `issue-node --role manager`.
+pub const ROUTE_NAME: &str = "minga-nats-route";
+
 /// Cluster (route) TLS for a NATS server.
 ///
 /// Separate from the client-facing TLS: routes are a different trust
@@ -416,6 +424,11 @@ fn generate_config(opts: &SidecarOptions, jetstream_dir: &Path) -> String {
             }
             out.push_str("    ]\n");
         }
+        // With verify_and_map, the route user is matched against the peer
+        // certificate's names: only certificates carrying ROUTE_NAME pass.
+        out.push_str(&format!(
+            "    authorization {{\n        user: \"{ROUTE_NAME}\"\n    }}\n"
+        ));
         out.push_str("    tls {\n");
         out.push_str(&format!(
             "        cert_file: \"{}\"\n",
@@ -430,6 +443,7 @@ fn generate_config(opts: &SidecarOptions, jetstream_dir: &Path) -> String {
             cluster.ca_file.display()
         ));
         out.push_str("        verify: true\n");
+        out.push_str("        verify_and_map: true\n");
         out.push_str("    }\n");
         out.push_str("}\n\n");
     }
@@ -693,6 +707,171 @@ mod tests {
         assert!(config.contains("cert_file: \"/etc/minga/tls/route-cert.pem\""));
         assert!(config.contains("key_file: \"/etc/minga/tls/route-key.pem\""));
         assert!(config.contains("ca_file: \"/etc/minga/tls/route-ca.pem\""));
+        // Routes are authorized by the route certificate name, not the CA alone.
+        let route_block = &config[config.find("cluster {").unwrap()..];
+        assert!(route_block.contains(&format!("user: \"{ROUTE_NAME}\"")));
+        assert!(route_block.contains("verify_and_map: true"));
+    }
+
+    #[tokio::test]
+    async fn route_peer_without_the_route_name_is_refused() {
+        use std::net::{IpAddr, Ipv4Addr};
+
+        let ca_key = rcgen::KeyPair::generate().unwrap();
+        let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let ca = ca_params.self_signed(&ca_key).unwrap();
+        // A client CA two levels below the route root (root -> mid -> client).
+        // Neither intermediate is in any CA file; peers send both in their chain.
+        let sub_ca = |name: &str, issuer: &rcgen::Certificate, issuer_key: &rcgen::KeyPair| {
+            let key = rcgen::KeyPair::generate().unwrap();
+            let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+            params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+            params.distinguished_name = rcgen::DistinguishedName::new();
+            params
+                .distinguished_name
+                .push(rcgen::DnType::CommonName, name);
+            (params.signed_by(&key, issuer, issuer_key).unwrap(), key)
+        };
+        let (mid, mid_key) = sub_ca("route intermediate", &ca, &ca_key);
+        let (client_ca, client_key) = sub_ca("nested client CA", &mid, &mid_key);
+        // Held until each sidecar starts so a parallel test cannot take them.
+        let mut listeners: Vec<_> = (0..12)
+            .map(|_| Some(std::net::TcpListener::bind("127.0.0.1:0").unwrap()))
+            .collect();
+        let ports: Vec<u16> = listeners
+            .iter()
+            .flatten()
+            .map(|listener| listener.local_addr().unwrap().port())
+            .collect();
+
+        // minga-1 (issued by the root) accepts routes. minga-2..4 are issued
+        // by the nested client CA, so all complete the TLS handshake to the
+        // root; they differ only in where (or whether) they carry the name.
+        enum RouteName {
+            Dns,
+            Email,
+            Absent,
+        }
+        let peers = [
+            RouteName::Dns,    // minga-1
+            RouteName::Absent, // minga-2: must be refused
+            RouteName::Dns,    // minga-3: must be accepted
+            // minga-4: NATS also maps an email SAN, so this is accepted. It
+            // pins the documented constraint that no CA under the route root
+            // may issue the route name, in any SAN, to anything but a manager.
+            RouteName::Email,
+        ];
+        let mut sides = Vec::new();
+        let mut dirs = Vec::new();
+        for (i, route_name) in peers.into_iter().enumerate() {
+            let key = rcgen::KeyPair::generate().unwrap();
+            let mut names = vec!["localhost".to_string()];
+            if matches!(route_name, RouteName::Dns) {
+                names.push(ROUTE_NAME.to_string());
+            }
+            let mut params = rcgen::CertificateParams::new(names).unwrap();
+            params
+                .subject_alt_names
+                .push(rcgen::SanType::IpAddress(IpAddr::V4(Ipv4Addr::LOCALHOST)));
+            if matches!(route_name, RouteName::Email) {
+                params
+                    .subject_alt_names
+                    .push(rcgen::SanType::Rfc822Name(ROUTE_NAME.try_into().unwrap()));
+            }
+            let chain = if i == 0 {
+                params.signed_by(&key, &ca, &ca_key).unwrap().pem()
+            } else {
+                let leaf = params.signed_by(&key, &client_ca, &client_key).unwrap();
+                format!("{}{}{}", leaf.pem(), client_ca.pem(), mid.pem())
+            };
+            let dir = tempfile::tempdir().unwrap();
+            let file = |name: &str, body: String| {
+                let path = dir.path().join(name);
+                std::fs::write(&path, body).unwrap();
+                path
+            };
+            let cluster = ClusterTls {
+                name: "minga-test".to_string(),
+                cert_file: file("route-cert.pem", chain),
+                key_file: file("route-key.pem", key.serialize_pem()),
+                ca_file: file("route-ca.pem", ca.pem()),
+                port: ports[8 + i],
+                // minga-1 dials only minga-3, so minga-2 can only arrive as an
+                // inbound route, which is what route authorization guards.
+                routes: vec![format!(
+                    "nats://127.0.0.1:{}",
+                    ports[if i == 0 { 10 } else { 8 }]
+                )],
+            };
+            for port in [i, 4 + i, 8 + i] {
+                listeners[port] = None;
+            }
+            let side = NatsSidecar::start(&SidecarOptions {
+                data_dir: dir.path().to_path_buf(),
+                node_id: i as u64 + 1,
+                client_port: ports[i],
+                monitor_port: ports[4 + i],
+                cluster: Some(cluster),
+                ..SidecarOptions::default()
+            })
+            .await
+            .expect("start route-TLS sidecar");
+            sides.push(side);
+            dirs.push(dir);
+        }
+
+        let routez = format!("http://127.0.0.1:{}/routez", ports[4]);
+        let http = reqwest::Client::new();
+        // Route peer names on minga-1, or why /routez could not be read.
+        let remote_names = || async {
+            let body: serde_json::Value = http
+                .get(&routez)
+                .send()
+                .await
+                .map_err(|error| error.to_string())?
+                .json()
+                .await
+                .map_err(|error| error.to_string())?;
+            let routes = body["routes"]
+                .as_array()
+                .ok_or_else(|| format!("no routes array in {body}"))?;
+            Ok::<_, String>(
+                routes
+                    .iter()
+                    .filter_map(|route| route["remote_name"].as_str().map(str::to_string))
+                    .collect::<std::collections::BTreeSet<_>>(),
+            )
+        };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let names = remote_names().await;
+            if names
+                .as_ref()
+                .is_ok_and(|names| names.contains("minga-3") && names.contains("minga-4"))
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "routes carrying the route name never formed: {names:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        // minga-2 has been retrying all along; give it a few more attempts.
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        // A valid final observation with minga-3 still routed, so an absent
+        // minga-2 means it was refused, not that monitoring failed.
+        let names = remote_names().await.expect("read /routez on minga-1");
+        assert!(
+            names.contains("minga-3") && names.contains("minga-4"),
+            "an authorized route dropped: {names:?}"
+        );
+        assert!(
+            !names.contains("minga-2"),
+            "a route without the route name was accepted: {names:?}"
+        );
+        drop(sides);
     }
 
     #[test]
@@ -856,7 +1035,8 @@ mod tests {
 
         for i in 0..3 {
             let key = rcgen::KeyPair::generate().unwrap();
-            let mut params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+            let names = vec!["localhost".to_string(), ROUTE_NAME.to_string()];
+            let mut params = rcgen::CertificateParams::new(names).unwrap();
             params
                 .subject_alt_names
                 .push(rcgen::SanType::IpAddress(IpAddr::V4(Ipv4Addr::LOCALHOST)));

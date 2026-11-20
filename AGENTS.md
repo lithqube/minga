@@ -21,12 +21,30 @@ Rust single-binary orchestrator replacing Docker Swarm for edge/on-prem/air-gapp
 ## Boundaries
 
 - Keep the disk free. In a worktree, build with `CARGO_TARGET_DIR=<main checkout>/target`: a worktree's own `target/` grows to 20–50 GB. After every PR merge or completed Phase, immediately inventory and clean up that work: remove its merged local branch and owned worktree, task-created temp files, and confirmed task-created dangling Docker containers, networks, images, or volumes; clean task-owned Cargo `target/` artifacts when no active worktree depends on them. Verify merge/completion and ownership first. Never prune global Docker resources, shared Cargo caches/targets, locked or other-session worktrees, or worktrees/files with unrelated uncommitted changes. Preserve unsafe leftovers and report what remains and why; do not silently skip cleanup.
+- Parallel board lanes share one target: every lane builds with `CARGO_TARGET_DIR=<main checkout>/target`, so cargo's build lock queues same-workspace compiles and artifacts dedupe. Lanes set `CARGO_INCREMENTAL=0` so the incremental cache does not grow under parallelism. Run read-only lanes (pre-flight, review, QA analysis) in parallel rather than several builders. Test only the crates a lane touches (`cargo test -p <crate>`); run `cargo test --workspace` only at the merge gate.
 
 ## Rust skills
 
 - Build/QA/Review lanes: load `rust-best-practices` before writing Rust; `m06-error-handling` for `Result`/error types; `m07-concurrency` for async, tasks and channels; `m10-performance` on hot-path changes.
 - Any `unsafe`, FFI or raw-syscall change (netns, WireGuard, containerd): run `unsafe-checker` and justify each `unsafe` block with a `// SAFETY:` comment.
 - Use `rust-refactor-helper` for renames and signature changes across crates.
+
+## Agent ownership
+
+Two agents share the board. The OMP harness drains it with `/super-board run`. Claude Code plans, audits security and takes the fixes that need a design call. An issue's owner label says which agent may work it.
+
+| Label | Who works it | The other agent |
+|---|---|---|
+| `owner:omp` | OMP, from Ready, through the board lanes | NEVER builds, QAs, reviews or pushes to it. May comment a finding or file a new issue. |
+| `owner:claude-code` | Claude Code, on its own branch and PR | NEVER claims, moves, builds or comments on it. A wave skips it, even in Ready. |
+
+- Read the owner label before you touch an issue, its board card or its PR. No owner label: don't start it; ask the user.
+- Only the user changes an owner label. If an issue needs the other agent, comment why on it and leave the label.
+- Whoever files an issue sets its owner label:
+  - `owner:omp` for a narrow fix in one area with clear acceptance criteria.
+  - `owner:claude-code` for a design call, Raft or bus semantics, a state migration, a policy decision or a change across several crates.
+- One orchestrator per board. Claude Code runs `/super-board run` only when the user asks, and only while no OMP wave is active. Check `.claude/super-board/inflight/workflow-wave.lock` and live lanes first.
+- NEVER clear `.claude/super-board/github-halt.json` set by the other agent without the user. It pauses both agents.
 
 <!-- super-board:begin v3.1.2 (managed; edits inside are overwritten on upgrade) -->
 ## Super Board

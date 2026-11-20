@@ -15,11 +15,6 @@ use axum::{
     routing::{delete, get, post},
     Router,
 };
-use hyper_util::{
-    rt::{TokioExecutor, TokioIo, TokioTimer},
-    server::conn::auto,
-    service::TowerToHyperService,
-};
 use minga_bus::{AuditRecord, EventBus};
 use minga_state::{
     join_token::JoinTokenKey,
@@ -216,12 +211,14 @@ async fn resolve_caller(
     headers: &axum::http::HeaderMap,
     extensions: &axum::http::Extensions,
 ) -> Result<(Caller, Source), axum::response::Response> {
+    // An empty configured token must never match (`Basic Og==` presents "").
     let token_valid = state.auth_token.as_deref().is_some_and(|expected| {
-        headers
-            .get(axum::http::header::AUTHORIZATION)
-            .and_then(|value| value.to_str().ok())
-            .and_then(presented_token)
-            .is_some_and(|presented| constant_time_eq(&presented, expected))
+        !expected.is_empty()
+            && headers
+                .get(axum::http::header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok())
+                .and_then(presented_token)
+                .is_some_and(|presented| constant_time_eq(&presented, expected))
     });
     if token_valid {
         let tenant_id = sole_default_tenant(&state.store)
@@ -779,21 +776,14 @@ async fn serve_tls_bounded(
             else {
                 return;
             };
-            let service = match ClientIdentity::from_certificate(cert) {
-                Some(identity) => TowerToHyperService::new(router.layer(Extension(identity))),
-                None => TowerToHyperService::new(router.layer(Extension(InvalidClientIdentity))),
+            let router = match ClientIdentity::from_certificate(cert) {
+                Some(identity) => router.layer(Extension(identity)),
+                None => router.layer(Extension(InvalidClientIdentity)),
             };
-            // No ALPN is offered and the Docker client speaks HTTP/1.1, so
-            // HTTP/2 (and its stream and keepalive limits) is not served here.
-            let mut builder = auto::Builder::new(TokioExecutor::new()).http1_only();
-            builder
-                .http1()
-                .timer(TokioTimer::new())
-                .header_read_timeout(limits.header_read_timeout)
-                .max_buf_size(limits.max_buf_size);
-            if let Err(error) = builder
-                .serve_connection_with_upgrades(TokioIo::new(stream), service)
-                .await
+            // HTTP/1.1 only, like the plaintext listeners: no ALPN is offered
+            // and an HTTP/2 preface is rejected within the header timeout.
+            if let Err(error) =
+                minga_telemetry::serve::serve_connection(stream, router, limits).await
             {
                 tracing::debug!(%error, "TLS API connection closed");
             }
@@ -1313,6 +1303,25 @@ mod tests {
         path: &str,
     ) -> Option<u16> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut tls = tls_connect(addr, ca, client).await?;
+        let request =
+            format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+        tls.write_all(request.as_bytes()).await.ok()?;
+        let mut reply = Vec::new();
+        // A server that drops the connection mid-read leaves what it sent.
+        let _ = tls.read_to_end(&mut reply).await;
+        String::from_utf8_lossy(&reply)
+            .split_whitespace()
+            .nth(1)?
+            .parse()
+            .ok()
+    }
+
+    async fn tls_connect(
+        addr: &str,
+        ca: &rcgen::Certificate,
+        client: Option<&(rcgen::Certificate, rcgen::KeyPair)>,
+    ) -> Option<tokio_rustls::client::TlsStream<tokio::net::TcpStream>> {
         let mut roots = rustls::RootCertStore::empty();
         roots.add(ca.der().clone()).unwrap();
         let builder = rustls::ClientConfig::builder_with_provider(Arc::new(
@@ -1332,20 +1341,9 @@ mod tests {
         };
         let tcp = tokio::net::TcpStream::connect(addr).await.ok()?;
         let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
-        let mut tls = tokio_rustls::TlsConnector::from(Arc::new(config))
+        tokio_rustls::TlsConnector::from(Arc::new(config))
             .connect(name, tcp)
             .await
-            .ok()?;
-        let request =
-            format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
-        tls.write_all(request.as_bytes()).await.ok()?;
-        let mut reply = Vec::new();
-        // A server that drops the connection mid-read leaves what it sent.
-        let _ = tls.read_to_end(&mut reply).await;
-        String::from_utf8_lossy(&reply)
-            .split_whitespace()
-            .nth(1)?
-            .parse()
             .ok()
     }
 
@@ -1436,6 +1434,19 @@ mod tests {
             None
         );
         assert_eq!(tls_status(&addr, &ca.0, None, "/v1.41/version").await, None);
+        // HTTP/1.1 only: an HTTP/2 preface that then goes quiet is closed, so
+        // it does not hold a connection slot.
+        let mut h2 = tls_connect(&addr, &ca.0, Some(&viewer)).await.unwrap();
+        tokio::io::AsyncWriteExt::write_all(&mut h2, b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
+            .await
+            .unwrap();
+        let mut rest = Vec::new();
+        let closed = tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio::io::AsyncReadExt::read_to_end(&mut h2, &mut rest),
+        )
+        .await;
+        assert!(closed.is_ok(), "an idle HTTP/2 connection stayed open");
         api.shutdown();
     }
 
@@ -2998,6 +3009,28 @@ mod tests {
             status("127.0.0.1:2375", Some("http://evil.example:2375")).await,
             StatusCode::FORBIDDEN
         );
+    }
+
+    #[tokio::test]
+    async fn empty_configured_token_never_authenticates() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            StateStore::open(1, "127.0.0.1:0", dir.path(), BTreeMap::new())
+                .await
+                .unwrap(),
+        );
+        let router =
+            build_router_with_auth(store, Arc::new(ReadyState::new()), Some(String::new()));
+        // "Og==" is base64(":"), so Basic auth presents an empty password.
+        for header in ["Basic Og==", "Bearer "] {
+            let req = Request::builder()
+                .uri("/minga/tenants")
+                .header("Authorization", header)
+                .body(Body::empty())
+                .unwrap();
+            let (status, _) = send_request(router.clone(), req).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{header}");
+        }
     }
 
     #[tokio::test]

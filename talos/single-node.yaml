@@ -1,4 +1,4 @@
-# Minga single-node on Talos: manager + API on one host, as Talos
+# Minga single-node on Talos: one manager serving the API, as Talos
 # ContainerConfig documents (no system extension, no custom boot asset;
 # Talos pulls the image with CRI). Requires Talos v1.14+.
 #
@@ -16,11 +16,6 @@ name: minga-state
 volumeType: directory
 ---
 apiVersion: v1alpha1
-kind: UserVolumeConfig
-name: minga-api-state
-volumeType: directory
----
-apiVersion: v1alpha1
 kind: ContainerConfig
 name: minga-manager
 image: __MINGA_IMAGE__
@@ -28,7 +23,6 @@ args:
   - manager
   - --node-id=1
   - --bind=127.0.0.1:7001
-  - --peer=2=127.0.0.1:7002
   # The data dir must be the SAME path in the container and on the host:
   # the OCI specs minga writes (resolv.conf, secrets, volume binds) are
   # resolved by runc on the host. A UserVolume mounts at /var/mnt/<name>
@@ -39,6 +33,11 @@ args:
   - --runtime=containerd
   - --containerd-socket=/run/containerd/containerd.sock
   - --metrics-bind=0.0.0.0:9100
+  # The manager serves the Docker API. A non-loopback API bind needs a token
+  # or client TLS: without one the manager refuses to start.
+  - --api-bind=0.0.0.0:2375
+environment:
+  - MINGA_API_TOKEN=__MINGA_API_TOKEN__
 # The supervisor creates netns, bridges, veth pairs and iptables rules in
 # the host network namespace: privileged + host network are required.
 network:
@@ -61,33 +60,5 @@ mounts:
         - rbind
         - rshared
 dependsOn:
-  networks:
-    - addresses
----
-apiVersion: v1alpha1
-kind: ContainerConfig
-name: minga-api
-image: __MINGA_IMAGE__
-args:
-  - api
-  - --node-id=2
-  - --bind=127.0.0.1:7002
-  - --peer=1=127.0.0.1:7001
-  - --data-dir=/var/mnt/minga-api-state
-  - --api-bind=0.0.0.0:2375
-environment:
-  - MINGA_API_TOKEN=__MINGA_API_TOKEN__
-# The API role only writes to its mounted state volume: restricted works.
-network:
-  mode: host
-security:
-  profile: restricted
-mounts:
-  - userVolume:
-      name: minga-api-state
-      destination: /var/mnt/minga-api-state
-dependsOn:
-  containers:
-    - minga-manager
   networks:
     - addresses

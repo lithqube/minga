@@ -1,0 +1,167 @@
+   Compiling minga-api v1.2.0 (/Users/admin/dev/minga/.claude/worktrees/issue-126-qa/crates/minga-api)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 6.97s
+     Running unittests src/lib.rs (/Users/admin/dev/minga/target/debug/deps/minga_api-96826c47d441a10d)
+
+running 133 tests
+test error::tests::no_content_status ... ok
+test error::tests::from_state_error ... ok
+test error::tests::not_found_helper ... ok
+test error::tests::quota_errors_map_to_rate_limit_or_storage_status ... ok
+test error::tests::ok_message_json ... ok
+test error::tests::bad_request_status ... ok
+test error::tests::conflict_status ... ok
+test handlers::tests::cross_tenant_reserved_port_does_not_block_ingress ... ok
+test auth::tests::client_identity_reads_role_and_tenant_from_subject ... ok
+test error::tests::error_response_format ... ok
+test handlers::tests::agent_usage_is_tenant_scoped_and_operator_output_is_aggregate_only ... ok
+test handlers::tests::same_tenant_reserved_port_still_blocks_ingress ... ok
+test handlers::tests::operator_registered_node_accepts_tenant_assignment_and_defaults_to_default ... ok
+test handlers::tests::deleting_node_revokes_its_bus_user_before_removing_it ... ok
+test handlers::tests::overlapping_ipam_subnet_does_not_disclose_other_networks ... ok
+test models::node_join_token_tests::debug_output_redacts_the_token_and_seed ... ok
+test models::tests::config_spec_deserialize ... ok
+test models::tests::error_response_serialize ... ok
+test models::tests::labels_match_existence ... ok
+test models::tests::labels_match_key_value ... ok
+test models::tests::labels_match_multiple ... ok
+test models::tests::network_create_deserialize ... ok
+test models::tests::network_resource_serialize ... ok
+test models::tests::node_serialize ... ok
+test models::tests::parse_filters_canonical_go_client_form ... ok
+test models::tests::parse_filters_invalid_json ... ok
+test models::tests::parse_filters_none ... ok
+test models::tests::parse_filters_valid ... ok
+test models::tests::secret_spec_deserialize ... ok
+test models::tests::service_mode_global ... ok
+test models::tests::service_serialize_roundtrip ... ok
+test models::tests::service_spec_deserialize ... ok
+test models::tests::task_serialize ... ok
+test models::tests::version_info_serialize ... ok
+test nats_credentials::tests::effective_worker_permissions_cover_only_its_own_tenant_and_node ... ok
+test nats_credentials::tests::issued_credentials_are_node_and_tenant_scoped ... ok
+test nats_credentials::tests::issuer_accepts_sorted_signer_template_permissions ... ok
+test nats_credentials::tests::issuer_rejects_a_template_that_repeats_one_permission_in_place_of_another ... ok
+test nats_credentials::tests::issuer_rejects_missing_tenant_signer ... ok
+test nats_credentials::tests::revocation_claim_contains_the_complete_replicated_key_set ... ok
+test nats_credentials::tests::wireguard_watch_permissions_are_limited_to_the_tenant_node_key ... ok
+test handlers::tests::cluster_audit_merges_tenant_trails_by_time ... ok
+test handlers::tests::deleting_node_fails_closed_when_revocation_bus_is_missing ... ok
+test handlers::tests::new_leader_republishes_stored_revocations_once_per_term ... ok
+test handlers::tests::reissuing_node_credentials_revokes_the_previous_nkey ... ok
+test handlers::tests::node_join_token_is_signed_for_the_preregistered_tenant ... ok
+test handlers::tests::egress_route_secrets_of_another_tenant_are_not_found ... ok
+test handlers::tests::unknown_network_driver_option_is_refused ... ok
+test handlers::tests::service_admission_scopes_reserved_ports_to_the_service_tenant ... ok
+test server::tests::bearer_auth_rejects_and_accepts ... ok
+test server::tests::api_server_start_and_shutdown ... ok
+test server::tests::create_and_list_config ... ok
+test handlers::tests::update_excludes_the_services_own_tasks_from_capacity ... ok
+test server::tests::a_service_name_cannot_be_taken_over_by_another_tenant ... ok
+test server::tests::create_and_list_network ... ok
+test server::tests::deciding_a_change_request_needs_a_reviewer_certificate ... ok
+test server::tests::client_certificates_scope_docker_routes_to_their_tenant ... ok
+test server::tests::create_and_list_secret ... ok
+test server::tests::create_node_registers_and_inspects ... ok
+test server::tests::create_node_rejects_duplicates_and_empty_address ... ok
+test server::tests::create_and_list_service ... ok
+test server::tests::create_secret_with_inline_data_is_rejected ... ok
+test server::tests::create_service_fails_loudly_without_nodes ... ok
+test server::tests::create_service_conflict ... ok
+test server::tests::delete_service ... ok
+test server::tests::empty_configured_token_never_authenticates ... ok
+test server::tests::fallback_not_found ... ok
+test server::tests::get_info ... ok
+test server::tests::get_service_not_found ... ok
+test server::tests::list_tasks_empty ... ok
+test server::tests::get_version ... ok
+test server::tests::list_nodes ... ok
+test server::tests::operator_certificates_need_the_role_the_operation_requires ... ok
+test server::tests::mtls_accepts_ca_signed_clients_and_maps_them_to_roles ... ok
+test server::tests::missing_status_does_not_replay_raft_actual_fields ... ok
+test server::tests::ping ... ok
+test server::tests::tenant_audit_is_admin_only_and_tenant_scoped ... ok
+test server::tests::service_filter_by_stack_label ... ok
+test server::tests::the_change_diff_hides_environment_values_but_names_their_keys ... ok
+test server::tests::state_routes_need_the_token_and_check_version_first ... ok
+test server::tests::state_import_round_trips_v9_agents_and_runs_agent_admission ... ok
+test server::tests::change_requests_are_tenant_scoped_and_maker_checker_enforced ... ok
+test server::tests::manager_membership_routes_require_admin_auth_and_change_membership ... ok
+test translate::tests::a_failed_task_reports_its_reason_and_exit_code ... ok
+test translate::tests::a_healthy_task_has_a_message_and_no_error_on_the_wire ... ok
+test translate::tests::a_relative_bind_source_is_refused_and_an_absolute_one_kept ... ok
+test translate::tests::a_task_that_failed_to_start_has_an_error_but_no_exit_code ... ok
+test translate::tests::agent_label_directory_grants_are_bounded ... ok
+test translate::tests::agent_label_must_be_a_json_object ... ok
+test translate::tests::agent_label_with_an_invalid_directory_path_is_refused ... ok
+test translate::tests::agent_label_with_env_but_no_env_grant_is_refused ... ok
+test translate::tests::agent_label_with_unknown_keys_is_refused ... ok
+test translate::tests::config_spec_to_state_translation ... ok
+test translate::tests::config_to_docker_translation ... ok
+test translate::tests::docker_port_publish_mode_defaults_and_round_trips ... ok
+test translate::tests::egress_policy_survives_the_docker_api_round_trip_and_is_validated ... ok
+test translate::tests::host_entries_take_aliases_and_reject_a_bare_ip ... ok
+test translate::tests::network_create_to_state_defaults_translation ... ok
+test translate::tests::network_create_to_state_translation ... ok
+test translate::tests::network_to_docker_with_subnet ... ok
+test translate::tests::network_to_docker_without_subnet ... ok
+test translate::tests::node_to_docker_draining ... ok
+test translate::tests::node_to_docker_leader ... ok
+test translate::tests::node_to_docker_worker ... ok
+test translate::tests::replicated_job_mode_is_preserved_for_tenant_quota_accounting ... ok
+test translate::tests::secret_spec_to_state_translation ... ok
+test translate::tests::secret_to_docker_translation ... ok
+test translate::tests::service_roundtrip ... ok
+test translate::tests::service_secret_references_reject_unsafe_targets_and_options ... ok
+test translate::tests::service_spec_to_state_basic ... ok
+test translate::tests::service_spec_to_state_default_mode ... ok
+test translate::tests::service_spec_to_state_global_mode ... ok
+test translate::tests::service_spec_to_state_missing_container ... ok
+test translate::tests::service_spec_to_state_missing_image ... ok
+test translate::tests::service_spec_to_state_missing_name ... ok
+test translate::tests::service_spec_to_state_no_ports ... ok
+test translate::tests::service_spec_to_state_restart_policy_defaults_and_rounding ... ok
+test translate::tests::service_to_docker_env_excludes_minga_stack ... ok
+test translate::tests::system_info_basic ... ok
+test translate::tests::task_to_docker_failed ... ok
+test translate::tests::task_to_docker_pending ... ok
+test translate::tests::task_to_docker_running ... ok
+test translate::tests::user_and_update_policy_survive_the_docker_api_round_trip ... ok
+test translate::tests::version_info_basic ... ok
+test server::tests::task_logs_are_bounded_and_scoped_to_the_callers_tenant ... ok
+test server::tests::tenant_admin_reaches_audit_and_usage_routes ... ok
+test server::tests::task_view_uses_bus_actual_state_and_keeps_traefik_attachments ... ok
+test server::tests::tokenless_api_refuses_browser_shaped_requests ... ok
+test server::tests::tenant_crud_requires_admin_and_protects_owned_resources ... ok
+test server::tests::tokenless_sole_tenant_caller_reads_inventory_but_cannot_administer ... ok
+test server::tests::update_node_drains_and_relabels ... ok
+test server::tests::update_node_rejects_what_minga_cannot_do ... ok
+test server::tests::diagnostics_report_persisted_voters_and_unreachable_member ... ok
+
+test result: ok. 133 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.58s
+
+     Running tests/integration.rs (/Users/admin/dev/minga/target/debug/deps/integration-b151f72bc6685b88)
+
+running 13 tests
+test ping_endpoint ... ok
+test info_endpoint_shows_swarm ... ok
+test ingress_port_conflicts_return_http_409 ... ok
+test node_join_credentials_require_mutual_tls ... ok
+test error_responses_are_docker_compatible ... ok
+test full_stack_deploy_workflow ... ok
+test version_endpoint ... ok
+test tasks_endpoint_returns_empty_initially ... ok
+test service_update_changes_replicas ... ok
+test docker_cli_service_ls_via_testcontainer ... ok
+test docker_cli_node_ls_via_testcontainer ... ok
+test docker_cli_info_via_testcontainer ... ok
+test docker_cli_version_via_testcontainer ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.04s
+
+   Doc-tests minga_api
+
+running 1 test
+test crates/minga-api/src/lib.rs - (line 47) - compile ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+

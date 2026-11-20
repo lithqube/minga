@@ -2258,7 +2258,6 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "chrono",
- "hyper-util",
  "indexmap 2.14.2",
  "minga-bus",
  "minga-net",
@@ -2338,6 +2337,7 @@ dependencies = [
  "tower 0.5.3",
  "tracing",
  "tracing-subscriber",
+ "x509-parser",
 ]
 
 [[package]]
@@ -2507,6 +2507,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tracing",
+ "x509-parser",
 ]
 
 [[package]]
@@ -2515,6 +2516,7 @@ version = "1.2.0"
 dependencies = [
  "axum",
  "http",
+ "hyper",
  "hyper-util",
  "prometheus",
  "serde",
