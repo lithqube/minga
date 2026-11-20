@@ -132,6 +132,8 @@ bff:
     - "traefik.http.services.bff.loadbalancer.server.port=3000"
 ```
 
+**Label semantics:** On released v1.2.0, top-level service `labels:` are copied into Docker `Spec.Labels`, which is the Swarm-provider path used above. `deploy.labels` is parsed but not copied, so a deployment can appear successful while Traefik discovers no route. Phase 16 development code rejects non-empty `deploy.labels` in both `minga validate` and `minga deploy`, before API writes; this rejection is not present in the v1.2.0 binary.
+
 ### Private GHCR images
 
 Minga v1.0.2+ reads the Docker credential file on every pull: a task's automatic pull and `minga image pull`. v1.0.2 reads inline `auth` entries only; v1.1.0 also reads credential helpers (`credHelpers`, then `credsStore`), which must then be on the manager's `PATH`, and needs containerd 1.7+ for credentialed pulls. The manager runs as root, so point it at a root-owned file explicitly instead of relying on `HOME`:

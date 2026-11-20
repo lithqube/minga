@@ -17,8 +17,9 @@ use minga_bus::{
     subjects, AuditRecord, EventBus, TaskActualState, TaskStatusReport, UsageEvent, UsageTotals,
 };
 use minga_state::types::{
-    unix_now, ClusterNode, NodeStatus as MingaNodeStatus, ResourceSpec, Service as StateService,
-    Task, Tenant, TenantQuotas,
+    unix_now, ChangeKind, ChangeRequest, ChangeRequestAudit, ChangeRequestStatus, ClusterNode,
+    NodeStatus as MingaNodeStatus, ResourceSpec, Service as StateService, Task, Tenant,
+    TenantQuotas,
 };
 use minga_state::{join_token::JoinTokenKey, StateStore};
 use serde::{Deserialize, Serialize};
@@ -247,6 +248,448 @@ async fn append_tenant_audit(
     .map_err(|error| ApiError::Unavailable(format!("tenant audit append failed: {error}")))
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ChangeProposal {
+    Deploy { service_id: String, image: String },
+    Scale { service_id: String, replicas: u32 },
+    Rollback { service_id: String },
+    Stop { service_id: String },
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChangeRequestQuery {
+    limit: Option<usize>,
+    /// Only requests in this state, filtered before `limit`, so a pending
+    /// request stays findable behind newer decided ones.
+    status: Option<ChangeRequestStatus>,
+}
+
+#[derive(Debug, Serialize)]
+/// What a reviewer sees of one side of a change: the fields whose values are
+/// safe to show. `env`, secret references and egress stay out (they can hold
+/// sensitive values); a change to them still appears by name in `changed_fields`.
+struct ChangeServiceSummary {
+    image: String,
+    replicas: u32,
+    mode: minga_state::types::ServiceMode,
+    ports: Vec<minga_state::types::PortMapping>,
+    networks: Vec<String>,
+    constraints: Vec<String>,
+}
+
+impl From<&StateService> for ChangeServiceSummary {
+    fn from(service: &StateService) -> Self {
+        Self {
+            image: service.image.clone(),
+            replicas: service.replicas,
+            mode: service.mode,
+            ports: service.ports.clone(),
+            networks: service.networks.clone(),
+            constraints: service.constraints.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct ChangeRequestView {
+    id: String,
+    tenant_id: String,
+    service_id: String,
+    requester: String,
+    created_at_unix: u64,
+    expires_at_unix: u64,
+    kind: ChangeKind,
+    before: ChangeServiceSummary,
+    after: ChangeServiceSummary,
+    /// Every spec field approval would change, by name only: a rollback can
+    /// change ports or networks while image and replicas stay the same.
+    /// Values are omitted because `env` can hold secrets.
+    changed_fields: Vec<String>,
+    /// The exact diff, one entry per changed field, with environment values
+    /// replaced by `<hidden>`.
+    changes: Vec<FieldChange>,
+    /// Environment keys whose hidden values differ, as `env.KEY` paths.
+    hidden_changes: Vec<String>,
+    status: ChangeRequestStatus,
+    reviewer: Option<String>,
+    decided_at_unix: Option<u64>,
+    audit: Vec<ChangeRequestAudit>,
+}
+
+#[derive(Debug, Serialize)]
+struct FieldChange {
+    field: String,
+    before: serde_json::Value,
+    after: serde_json::Value,
+}
+
+/// Maps whose values can be secrets: shown by key only.
+const HIDDEN_MAPS: [&str; 2] = ["env", "sandbox_env"];
+
+/// `value` with every hidden map's values replaced by `<hidden>`, recording
+/// in `changed` the paths of hidden values that differ from `other`.
+fn redact(
+    value: &serde_json::Value,
+    other: &serde_json::Value,
+    path: &str,
+    changed: &mut Vec<String>,
+) -> serde_json::Value {
+    use serde_json::Value;
+    match value {
+        Value::Object(fields) => Value::Object(
+            fields
+                .iter()
+                .map(|(key, field)| {
+                    let path = if path.is_empty() {
+                        key.clone()
+                    } else {
+                        format!("{path}.{key}")
+                    };
+                    let other_field = other.get(key).unwrap_or(&Value::Null);
+                    let shown = match field.as_object() {
+                        Some(map) if HIDDEN_MAPS.contains(&key.as_str()) => Value::Object(
+                            map.iter()
+                                .map(|(name, secret)| {
+                                    if other_field.get(name) != Some(secret) {
+                                        changed.push(format!("{path}.{name}"));
+                                    }
+                                    (name.clone(), Value::String("<hidden>".into()))
+                                })
+                                .collect(),
+                        ),
+                        _ => redact(field, other_field, &path, changed),
+                    };
+                    (key.clone(), shown)
+                })
+                .collect(),
+        ),
+        Value::Array(items) => Value::Array(
+            items
+                .iter()
+                .enumerate()
+                .map(|(index, item)| {
+                    let other_item = other.get(index).unwrap_or(&Value::Null);
+                    redact(item, other_item, &format!("{path}[{index}]"), changed)
+                })
+                .collect(),
+        ),
+        _ => value.clone(),
+    }
+}
+
+/// The redacted diff of every changed field, and the hidden paths that changed.
+fn service_changes(
+    before: &StateService,
+    after: &StateService,
+    fields: &[String],
+) -> (Vec<FieldChange>, Vec<String>) {
+    let (before, after) = (
+        serde_json::to_value(before).unwrap_or_default(),
+        serde_json::to_value(after).unwrap_or_default(),
+    );
+    let null = serde_json::Value::Null;
+    let mut hidden = Vec::new();
+    let changes = fields
+        .iter()
+        .map(|field| {
+            let (old, new) = (
+                before.get(field).unwrap_or(&null),
+                after.get(field).unwrap_or(&null),
+            );
+            // Both directions, so added, removed and changed keys all show.
+            let wrap = |value: &serde_json::Value| serde_json::json!({ field.as_str(): value });
+            let old_shown = redact(&wrap(old), &wrap(new), "", &mut hidden);
+            let new_shown = redact(&wrap(new), &wrap(old), "", &mut hidden);
+            FieldChange {
+                field: field.clone(),
+                before: old_shown[field.as_str()].clone(),
+                after: new_shown[field.as_str()].clone(),
+            }
+        })
+        .collect();
+    hidden.sort();
+    hidden.dedup();
+    (changes, hidden)
+}
+
+/// Top-level service fields that differ, ignoring the rollback history.
+fn changed_service_fields(before: &StateService, after: &StateService) -> Vec<String> {
+    let as_object = |service: &StateService| match serde_json::to_value(service) {
+        Ok(serde_json::Value::Object(fields)) => fields,
+        _ => serde_json::Map::new(),
+    };
+    let (before, after) = (as_object(before), as_object(after));
+    let mut names: Vec<String> = before
+        .keys()
+        .chain(after.keys())
+        .filter(|name| name.as_str() != "previous" && before.get(*name) != after.get(*name))
+        .cloned()
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
+impl From<ChangeRequest> for ChangeRequestView {
+    fn from(request: ChangeRequest) -> Self {
+        let changed_fields = changed_service_fields(&request.before, &request.after);
+        let (changes, hidden_changes) =
+            service_changes(&request.before, &request.after, &changed_fields);
+        Self {
+            id: request.id,
+            tenant_id: request.tenant_id,
+            service_id: request.service_id,
+            requester: request.requester,
+            created_at_unix: request.created_at_unix,
+            expires_at_unix: request.expires_at_unix,
+            kind: request.kind,
+            before: ChangeServiceSummary::from(&request.before),
+            after: ChangeServiceSummary::from(&request.after),
+            changed_fields,
+            changes,
+            hidden_changes,
+            status: request.status,
+            reviewer: request.reviewer,
+            decided_at_unix: request.decided_at_unix,
+            audit: request.audit,
+        }
+    }
+}
+
+const CHANGE_REQUEST_TTL_SECS: u64 = 15 * 60;
+
+fn new_change_request_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos());
+    format!(
+        "cr-{:x}-{:x}-{:x}",
+        nanos,
+        std::process::id(),
+        NEXT_ID.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+pub async fn create_change_request(
+    State(app): State<Arc<AppState>>,
+    Extension(caller): Extension<Caller>,
+    Json(proposal): Json<ChangeProposal>,
+) -> ApiResult<(StatusCode, Json<ChangeRequestView>)> {
+    let tenant_id = tenant_scope(&caller)?;
+    let (service_id, kind) = match &proposal {
+        ChangeProposal::Deploy { service_id, .. } => (service_id.clone(), ChangeKind::Deploy),
+        ChangeProposal::Scale { service_id, .. } => (service_id.clone(), ChangeKind::Scale),
+        ChangeProposal::Rollback { service_id } => (service_id.clone(), ChangeKind::Rollback),
+        ChangeProposal::Stop { service_id } => (service_id.clone(), ChangeKind::Stop),
+    };
+    if service_id.is_empty() || service_id.len() > 400 {
+        return Err(bad_request("service_id must be between 1 and 400 bytes"));
+    }
+    let before = app
+        .store
+        .get_service(&service_id)
+        .await?
+        .filter(|service| service.tenant_id == tenant_id)
+        .ok_or_else(|| not_found("service", &service_id))?;
+    // A global service runs one task per eligible node and ignores
+    // `replicas`, so a replica change would be approved but never take effect.
+    if matches!(kind, ChangeKind::Scale | ChangeKind::Stop)
+        && before.mode == minga_state::types::ServiceMode::Global
+    {
+        return Err(bad_request(
+            "scale and stop apply only to replicated services",
+        ));
+    }
+    let mut after = before.clone();
+    match proposal {
+        ChangeProposal::Deploy { image, .. } => {
+            if before.agent.is_some()
+                || image.trim().is_empty()
+                || image.len() > 512
+                || image.chars().any(char::is_control)
+            {
+                return Err(bad_request(
+                    "deploy requires a container image of 1–512 printable bytes",
+                ));
+            }
+            let mut prior = before.clone();
+            prior.previous = None;
+            after.previous = Some(Box::new(prior));
+            after.image = image;
+        }
+        ChangeProposal::Scale { replicas, .. } => {
+            if !(1..=1000).contains(&replicas) {
+                return Err(bad_request("replicas must be between 1 and 1000"));
+            }
+            after.replicas = replicas;
+        }
+        ChangeProposal::Rollback { .. } => {
+            let Some(mut previous) = before.previous.as_deref().cloned() else {
+                return Err(conflict("service has no rollback revision"));
+            };
+            if previous.check_agent_egress().is_err() {
+                return Err(conflict("the rollback revision is no longer a valid spec"));
+            }
+            let mut current = before.clone();
+            current.previous = None;
+            previous.previous = Some(Box::new(current));
+            after = previous;
+        }
+        ChangeProposal::Stop { .. } => after.replicas = 0,
+    }
+    let created_at_unix = unix_now();
+    let request = ChangeRequest {
+        id: new_change_request_id(),
+        tenant_id: tenant_id.to_owned(),
+        service_id: service_id.clone(),
+        requester: caller.name.clone(),
+        created_at_unix,
+        expires_at_unix: created_at_unix.saturating_add(CHANGE_REQUEST_TTL_SECS),
+        kind,
+        before,
+        after,
+        status: ChangeRequestStatus::Pending,
+        reviewer: None,
+        decided_at_unix: None,
+        audit: Vec::new(),
+    };
+    let persisted = app.store.create_change_request(request).await?;
+    record_change_audit(
+        &app,
+        tenant_id,
+        &caller.name,
+        "change_request.created",
+        &persisted.id,
+    )
+    .await;
+    Ok((
+        StatusCode::CREATED,
+        Json(ChangeRequestView::from(persisted)),
+    ))
+}
+
+pub async fn list_change_requests(
+    State(app): State<Arc<AppState>>,
+    Extension(caller): Extension<Caller>,
+    Query(query): Query<ChangeRequestQuery>,
+) -> ApiResult<Json<Vec<ChangeRequestView>>> {
+    let tenant_id = tenant_scope(&caller)?;
+    let limit = query.limit.unwrap_or(100).clamp(1, 100);
+    // Reads only this tenant's key range, which holds at most 256 requests.
+    let mut requests = app.store.list_change_requests(tenant_id).await?;
+    if let Some(status) = query.status {
+        requests.retain(|request| request.status == status);
+    }
+    requests.sort_unstable_by(|left, right| {
+        right
+            .created_at_unix
+            .cmp(&left.created_at_unix)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    requests.truncate(limit);
+    Ok(Json(
+        requests.into_iter().map(ChangeRequestView::from).collect(),
+    ))
+}
+
+/// Appends a change-request audit line after the Raft write committed. A
+/// failure is logged, not returned: the write has happened, and a retry
+/// would create a second request or hit a terminal one.
+async fn record_change_audit(app: &AppState, tenant_id: &str, actor: &str, action: &str, id: &str) {
+    let path = format!("/minga/change-requests/{id}");
+    if let Err(error) = append_tenant_audit(app, tenant_id, actor, action, &path).await {
+        tracing::warn!(%error, tenant_id, action, id, "change request committed but its audit line was not appended");
+    }
+}
+
+/// The change request from the local replica. A follower can answer a create
+/// (which commits on the leader) before applying it, so a miss waits briefly.
+/// shortcut: up to 2s of replication lag; past that the 404 is honest for this
+/// node, upgrade to a leader read-index if decisions must route through any node.
+async fn committed_change_request(
+    app: &AppState,
+    tenant_id: &str,
+    id: &str,
+) -> ApiResult<Option<ChangeRequest>> {
+    for _ in 0..40 {
+        if let Some(request) = app.store.get_change_request(tenant_id, id).await? {
+            return Ok(Some(request));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    Ok(app.store.get_change_request(tenant_id, id).await?)
+}
+
+async fn decide_change_request(
+    app: &AppState,
+    caller: &Caller,
+    id: &str,
+    approve: bool,
+) -> ApiResult<Json<ChangeRequestView>> {
+    let tenant_id = tenant_scope(caller)?;
+    let Some(request) = committed_change_request(app, tenant_id, id).await? else {
+        return Err(not_found("change request", id));
+    };
+    // Approval writes the reviewed spec directly, so it passes the same
+    // admission as a service update. Raft still re-checks the base spec.
+    if approve
+        && request.status == ChangeRequestStatus::Pending
+        && unix_now() < request.expires_at_unix
+    {
+        check_service_secrets(app, tenant_id, &request.after).await?;
+        ensure_placeable(app, &request.after, Some(&request.service_id)).await?;
+    }
+    let decided = app
+        .store
+        .decide_change_request(
+            id.to_owned(),
+            tenant_id.to_owned(),
+            caller.name.clone(),
+            approve,
+            unix_now(),
+        )
+        .await?;
+    // Raft returns only transitions this decision made, so each audit line
+    // is attributed to the reviewer who caused it.
+    let (action, refused) = match decided.status {
+        ChangeRequestStatus::Approved => ("change_request.approved_and_applied", None),
+        ChangeRequestStatus::Rejected => ("change_request.rejected", None),
+        ChangeRequestStatus::Expired => ("change_request.expired", Some("change request expired")),
+        ChangeRequestStatus::Superseded => (
+            "change_request.superseded",
+            Some("service changed after this request was created"),
+        ),
+        ChangeRequestStatus::Pending => {
+            return Err(internal("change request decision left it pending"));
+        }
+    };
+    record_change_audit(app, tenant_id, &caller.name, action, id).await;
+    if let Some(message) = refused {
+        return Err(conflict(message));
+    }
+    Ok(Json(ChangeRequestView::from(decided)))
+}
+
+pub async fn approve_change_request(
+    State(app): State<Arc<AppState>>,
+    Extension(caller): Extension<Caller>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<ChangeRequestView>> {
+    decide_change_request(&app, &caller, &id, true).await
+}
+
+pub async fn reject_change_request(
+    State(app): State<Arc<AppState>>,
+    Extension(caller): Extension<Caller>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<ChangeRequestView>> {
+    decide_change_request(&app, &caller, &id, false).await
+}
+
 /// Updates a tenant's display name and quotas.
 pub async fn update_tenant(
     State(app): State<Arc<AppState>>,
@@ -390,6 +833,50 @@ pub(crate) async fn agent_usage(
         .map_err(|error| ApiError::Unavailable(format!("agent usage query failed: {error}")))?;
     events.truncate(limit);
     Ok(Json(AgentUsageResponse::Tenant { events }))
+}
+#[derive(Debug, Deserialize)]
+pub(crate) struct AgentEventsQuery {
+    limit: Option<usize>,
+}
+
+#[derive(Serialize)]
+pub(crate) struct TenantEventSummary {
+    subject: String,
+    observed_at_unix_ms: u64,
+    payload_size_bytes: usize,
+}
+
+/// `GET /v{version}/agent/events` — bounded tenant event metadata.
+pub(crate) async fn agent_events(
+    State(app): State<Arc<AppState>>,
+    Extension(caller): Extension<Caller>,
+    Query(query): Query<AgentEventsQuery>,
+) -> ApiResult<Json<Vec<TenantEventSummary>>> {
+    let tenant_id = tenant_scope(&caller)?;
+    let bus = app
+        .bus
+        .as_ref()
+        .ok_or_else(|| ApiError::Unavailable("tenant event service is not configured".into()))?;
+    let limit = query.limit.unwrap_or(100).clamp(1, 200);
+    let events = bus
+        .tenant_event_history(tenant_id, limit)
+        .await
+        .map_err(|_| ApiError::Unavailable("tenant event query failed".into()))?;
+    Ok(Json(
+        events
+            .into_iter()
+            .filter(|event| {
+                event
+                    .subject
+                    .starts_with(&format!("minga.{tenant_id}.task."))
+            })
+            .map(|event| TenantEventSummary {
+                subject: event.subject,
+                observed_at_unix_ms: event.timestamp,
+                payload_size_bytes: event.payload.len(),
+            })
+            .collect(),
+    ))
 }
 
 /// `GET /minga/audit` — list the cluster audit trail for operators.
@@ -767,6 +1254,19 @@ pub async fn get_version() -> Json<models::VersionInfo> {
     Json(translate::version_info())
 }
 
+/// Returns the running Minga build and the persisted/local Raft observations.
+pub async fn get_cluster_diagnostics(
+    State(app): State<Arc<AppState>>,
+) -> Json<models::ClusterDiagnostics> {
+    Json(models::ClusterDiagnostics {
+        server_version: models::MINGA_VERSION.to_owned(),
+        build_revision: models::MINGA_GIT_COMMIT.map(str::to_owned),
+        api_version: models::API_VERSION.to_owned(),
+        state_format_version: minga_state::codec::FORMAT_VERSION,
+        raft: app.store.raft_diagnostics().await,
+    })
+}
+
 /// `GET /v{version}/info` — system info.
 pub async fn get_info(
     State(app): State<Arc<AppState>>,
@@ -835,6 +1335,7 @@ pub async fn get_info(
 /// `GET /v{version}/nodes` — list all nodes.
 pub async fn list_nodes(
     State(app): State<Arc<AppState>>,
+    Extension(caller): Extension<Caller>,
     Query(query): Query<models::NodeListQuery>,
 ) -> ApiResult<Json<Vec<models::Node>>> {
     let filters = models::parse_filters(query.filters.as_deref());
@@ -846,18 +1347,27 @@ pub async fn list_nodes(
     let nodes = app.store.list_nodes().await?;
     let result: Vec<models::Node> = nodes
         .iter()
-        .filter(|n| models::labels_match(&n.labels, &label_filters))
-        .map(|n| {
-            translate::node_to_docker(n, Some(n.id) == leader_id || (n.id == my_id && is_leader))
+        .filter(|node| {
+            caller
+                .tenant_id()
+                .is_none_or(|tenant_id| node.tenant_id == tenant_id)
+        })
+        .filter(|node| models::labels_match(&node.labels, &label_filters))
+        .map(|node| {
+            translate::node_to_docker(
+                node,
+                Some(node.id) == leader_id || (node.id == my_id && is_leader),
+            )
         })
         .collect();
 
     Ok(Json(result))
 }
 
-/// `GET /v{version}/nodes/{id}` — inspect a node.
+/// `GET /v{version}/nodes/{id}` — inspect a node in the caller's tenant.
 pub async fn get_node(
     State(app): State<Arc<AppState>>,
+    Extension(caller): Extension<Caller>,
     Path((_version, id)): Path<(String, String)>,
 ) -> ApiResult<Json<models::Node>> {
     let nodes = app.store.list_nodes().await?;
@@ -865,7 +1375,12 @@ pub async fn get_node(
 
     let node = nodes
         .iter()
-        .find(|n| n.id.to_string() == id || n.address == id)
+        .find(|node| {
+            (node.id.to_string() == id || node.address == id)
+                && caller
+                    .tenant_id()
+                    .is_none_or(|tenant_id| node.tenant_id == tenant_id)
+        })
         .ok_or_else(|| not_found("node", &id))?;
 
     let is_leader = Some(node.id) == leader_id;
@@ -1544,6 +2059,45 @@ pub async fn list_tasks(
         .collect();
 
     Ok(Json(result))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TaskLogsQuery {
+    tail: Option<usize>,
+}
+
+/// `GET /v{version}/tasks/{id}/logs` — read retained logs in the caller's tenant.
+pub async fn task_logs(
+    State(app): State<Arc<AppState>>,
+    Extension(caller): Extension<Caller>,
+    Path((_version, task_id)): Path<(String, String)>,
+    Query(query): Query<TaskLogsQuery>,
+) -> ApiResult<Json<Vec<minga_bus::LogEntry>>> {
+    let tenant_id = tenant_scope(&caller)?;
+    let task = app
+        .store
+        .get_task(&task_id)
+        .await?
+        .filter(|task| task.tenant_id == tenant_id)
+        .ok_or_else(|| not_found("task", &task_id))?;
+    if !app
+        .store
+        .get_service(&task.service_id)
+        .await?
+        .is_some_and(|service| service.tenant_id == tenant_id)
+    {
+        return Err(not_found("task", &task_id));
+    }
+    let bus = app
+        .bus
+        .as_ref()
+        .ok_or_else(|| ApiError::Unavailable("task log service is not configured".into()))?;
+    let tail = query.tail.unwrap_or(100).clamp(1, 200);
+    let entries = bus
+        .tenant_log_history(tenant_id, &task_id, tail)
+        .await
+        .map_err(|_| ApiError::Unavailable("task log query failed".into()))?;
+    Ok(Json(entries))
 }
 
 /// `GET /v{version}/tasks/{id}` — inspect a task.

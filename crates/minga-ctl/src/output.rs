@@ -1,7 +1,8 @@
 //! Output rendering: tables, JSON and YAML.
 //!
 //! Results go to stdout; progress, prompts and errors go to stderr. List
-//! commands render row arrays; detail commands render one object.
+//! commands render row arrays; detail commands and structured reports render
+//! one object.
 
 use std::io::Write;
 
@@ -15,9 +16,9 @@ pub enum Format {
     /// Padded columns.
     #[default]
     Table,
-    /// JSON output.
+    /// Structured JSON (an array for row-based commands).
     Json,
-    /// YAML output.
+    /// Structured YAML (a sequence for row-based commands).
     Yaml,
 }
 

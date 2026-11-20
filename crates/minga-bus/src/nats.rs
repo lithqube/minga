@@ -1389,6 +1389,91 @@ impl EventBus for NatsBus {
             }
         })))
     }
+    async fn tenant_event_history(&self, tenant_id: &str, limit: usize) -> Result<Vec<BusEvent>> {
+        validate_tenant_id(tenant_id)?;
+        self.require_manager("read retained tenant events")?;
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let stream = self
+            .js
+            .get_stream("MINGA_EVENTS")
+            .await
+            .map_err(|error| BusError::Subscribe(format!("get MINGA_EVENTS: {error}")))?;
+        let filter = subjects::tenant_event_wildcard(tenant_id);
+        // Start at the tenant's `limit`-th newest event, so a call reads about
+        // `limit` messages instead of the tenant's whole retention.
+        let start = tenant_tail_start(&stream, &filter, limit as u64).await?;
+        let mut consumer = stream
+            .create_consumer(PullConsumerConfig {
+                filter_subjects: vec![filter],
+                ack_policy: AckPolicy::None,
+                deliver_policy: DeliverPolicy::ByStartSequence {
+                    start_sequence: start,
+                },
+                ..Default::default()
+            })
+            .await
+            .map_err(|error| {
+                BusError::Subscribe(format!("tenant event history consumer: {error}"))
+            })?;
+        // `start` holds the newest `limit` events of the stream as it was when
+        // read, so the first `limit` from it are exactly those; events that
+        // arrive meanwhile come after them and are not read.
+        let mut remaining = (consumer
+            .info()
+            .await
+            .map_err(|error| BusError::Subscribe(format!("tenant event history info: {error}")))?
+            .num_pending as usize)
+            .min(limit);
+        let mut events = VecDeque::new();
+        while remaining > 0 {
+            let mut batch = consumer
+                .fetch()
+                .max_messages(remaining.min(200))
+                .expires(Duration::from_secs(5))
+                .messages()
+                .await
+                .map_err(|error| {
+                    BusError::Subscribe(format!("tenant event history fetch: {error}"))
+                })?;
+            let mut received = 0usize;
+            while let Some(message) = batch.next().await {
+                let message = message.map_err(|error| {
+                    BusError::Subscribe(format!("tenant event history message: {error}"))
+                })?;
+                received += 1;
+                if !message
+                    .subject
+                    .starts_with(&format!("minga.{tenant_id}.task."))
+                {
+                    return Err(BusError::Subscribe(
+                        "tenant event subject does not match its filter".into(),
+                    ));
+                }
+                // The publish time, not the read time.
+                let timestamp = message
+                    .info()
+                    .map(|info| (info.published.unix_timestamp_nanos() / 1_000_000) as u64)
+                    .map_err(|error| {
+                        BusError::Subscribe(format!("tenant event history metadata: {error}"))
+                    })?;
+                events.push_back(BusEvent {
+                    subject: message.subject.to_string(),
+                    payload: message.payload.to_vec(),
+                    timestamp,
+                });
+                while events.len() > limit {
+                    events.pop_front();
+                }
+            }
+            if received == 0 {
+                break;
+            }
+            remaining = remaining.saturating_sub(received);
+        }
+        Ok(events.into_iter().collect())
+    }
     async fn configure_tenant_quota(
         &self,
         tenant_id: &str,
@@ -2065,6 +2150,61 @@ impl EventBus for NatsBus {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// How many messages matching `filter` the stream holds from `start` on,
+/// read from a short-lived consumer's pending count (no messages are fetched).
+async fn pending_from(
+    stream: &async_nats::jetstream::stream::Stream,
+    filter: &str,
+    start: u64,
+) -> Result<u64> {
+    let mut consumer = stream
+        .create_consumer(PullConsumerConfig {
+            filter_subjects: vec![filter.to_owned()],
+            ack_policy: AckPolicy::None,
+            deliver_policy: DeliverPolicy::ByStartSequence {
+                start_sequence: start,
+            },
+            inactive_threshold: Duration::from_secs(5),
+            ..Default::default()
+        })
+        .await
+        .map_err(|error| BusError::Subscribe(format!("event tail probe: {error}")))?;
+    let pending = consumer
+        .info()
+        .await
+        .map_err(|error| BusError::Subscribe(format!("event tail probe info: {error}")))?
+        .num_pending;
+    // Best effort: the inactivity threshold removes it anyway.
+    let _ = stream.delete_consumer(&consumer.cached_info().name).await;
+    Ok(pending)
+}
+
+/// The stream sequence of the `limit`-th newest message matching `filter`,
+/// or the first sequence when fewer match. A binary search over sequences:
+/// about log2(stream length) pending-count probes, no payloads.
+async fn tenant_tail_start(
+    stream: &async_nats::jetstream::stream::Stream,
+    filter: &str,
+    limit: u64,
+) -> Result<u64> {
+    let state = &stream.cached_info().state;
+    let (first, last) = (state.first_sequence.max(1), state.last_sequence);
+    if last < first || pending_from(stream, filter, first).await? <= limit {
+        return Ok(first);
+    }
+    // Invariant: at least `limit` matching messages from `low` on.
+    let (mut low, mut high) = (first, last);
+    while low < high {
+        let mid = low + (high - low).div_ceil(2);
+        if pending_from(stream, filter, mid).await? >= limit {
+            low = mid;
+        } else {
+            high = mid - 1;
+        }
+    }
+    Ok(low)
+}
 
 fn now_millis() -> u64 {
     std::time::SystemTime::now()

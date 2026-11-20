@@ -1,0 +1,6 @@
+{
+  "driver": "local",
+  "id": "shop_data",
+  "name": "data",
+  "tenant_id": "default"
+}

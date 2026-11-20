@@ -1156,7 +1156,7 @@ pub fn version_info() -> models::VersionInfo {
         Version: models::MINGA_VERSION.to_string(),
         ApiVersion: models::API_VERSION.to_string(),
         MinAPIVersion: models::MIN_API_VERSION.to_string(),
-        GitCommit: None,
+        GitCommit: models::MINGA_GIT_COMMIT.map(str::to_owned),
         GoVersion: None,
         Os: std::env::consts::OS.to_string(),
         Arch: std::env::consts::ARCH.to_string(),

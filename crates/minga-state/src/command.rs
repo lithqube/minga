@@ -3,8 +3,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::types::{
-    ClusterNode, Config, ConfigId, Network, NetworkId, NodeId, Secret, SecretId, Service,
-    ServiceId, Task, TaskId, Tenant, TenantId, TenantQuotas, Volume, VolumeId,
+    ChangeRequest, ClusterNode, Config, ConfigId, Network, NetworkId, NodeId, Secret, SecretId,
+    Service, ServiceId, Task, TaskId, Tenant, TenantId, TenantQuotas, Volume, VolumeId,
 };
 
 /// A mutation proposed to the Raft log. This is the `D` (app data) type.
@@ -51,6 +51,15 @@ pub enum StateCommand {
         quotas: TenantQuotas,
     },
     RemoveTenant(TenantId),
+    /// Boxed: a request holds two full services. The encoding is unchanged.
+    CreateChangeRequest(Box<ChangeRequest>),
+    DecideChangeRequest {
+        id: String,
+        tenant_id: TenantId,
+        actor: String,
+        approve: bool,
+        now_unix: u64,
+    },
     RecordNatsUserRevocation {
         user_public_key: String,
     },
@@ -93,4 +102,7 @@ pub enum StateResponse {
     NotFound,
     Conflict(String),
     Error(String),
+    /// The change request as this write committed it, so a follower can
+    /// answer from the write itself instead of its possibly-lagging replica.
+    ChangeRequest(Box<ChangeRequest>),
 }

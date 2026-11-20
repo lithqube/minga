@@ -17,14 +17,30 @@ use crate::log_store::RedbLogStore;
 use crate::network::{forward_write, serve_raft_rpc, RaftTlsConfig, TcpNetworkFactory};
 use crate::state_machine::RedbStateMachine;
 use crate::types::{
-    AgentCapabilities, ClusterNode, Config as StateConfig, ConfigId, Network, NetworkId, NodeId,
-    Secret, SecretId, Service, ServiceId, Task, TaskId, Tenant, TenantQuotas, Volume, VolumeId,
-    DEFAULT_TENANT_ID,
+    AgentCapabilities, ChangeRequest, ClusterNode, Config as StateConfig, ConfigId, Network,
+    NetworkId, NodeId, Secret, SecretId, Service, ServiceId, Task, TaskId, Tenant, TenantQuotas,
+    Volume, VolumeId, DEFAULT_TENANT_ID,
 };
 use crate::TypeConfig;
 
 /// How long to wait for leader election or write acknowledgment.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Four 500 ms heartbeats without a quorum acknowledgment is stale.
+const QUORUM_ACK_FRESH_MS: u64 = 2_000;
+
+fn quorum_ack_recent(
+    node_id: NodeId,
+    leader_id: Option<NodeId>,
+    ack_age_ms: Option<u64>,
+) -> Option<bool> {
+    match leader_id {
+        None => Some(false),
+        Some(leader) if leader == node_id => {
+            Some(ack_age_ms.is_some_and(|age| age <= QUORUM_ACK_FRESH_MS))
+        }
+        Some(_) => None,
+    }
+}
 
 /// Desired state in a portable form, for backup and restore.
 ///
@@ -45,6 +61,37 @@ pub struct StateSnapshot {
     pub volumes: Vec<Volume>,
     pub secrets: Vec<Secret>,
     pub configs: Vec<StateConfig>,
+}
+
+/// A read-only snapshot of this node's observed Raft state.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RaftDiagnostics {
+    pub node_id: NodeId,
+    pub state: String,
+    pub leader_id: Option<NodeId>,
+    /// Matches the local readiness check: a leader is known to this node.
+    pub ready: bool,
+    /// Available only when this node is leader; `None` is not evidence that a
+    /// follower has no cluster quorum.
+    pub quorum_ack_age_ms: Option<u64>,
+    /// For the local leader, whether quorum was acknowledged within two seconds.
+    /// `None` means this node is a follower and cannot report the leader's age.
+    pub quorum_ack_recent: Option<bool>,
+    pub members: Vec<RaftMemberDiagnostics>,
+}
+
+/// A member from the membership configuration persisted in the Raft log.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RaftMemberDiagnostics {
+    pub id: NodeId,
+    pub address: String,
+    pub voter: bool,
+    /// Present on the leader only. `false` means no successful log progress
+    /// has been reported for this member, not that its process is stopped.
+    pub replication_acknowledged: Option<bool>,
+    /// TCP reachability of the address stored in Raft membership; this is not
+    /// proof that the remote Raft process is healthy.
+    pub transport_reachable: Option<bool>,
 }
 
 /// The cluster state store. Owns the Raft instance and provides
@@ -291,6 +338,76 @@ impl StateStore {
             .collect()
     }
 
+    /// Whether this node currently meets the Raft portion of `/readyz`.
+    pub fn raft_ready(&self) -> bool {
+        let metrics = self.raft.metrics();
+        let metrics = metrics.borrow();
+        let quorum_recent = quorum_ack_recent(
+            self.node_id,
+            metrics.current_leader,
+            metrics.millis_since_quorum_ack,
+        );
+        metrics.current_leader.is_some() && quorum_recent != Some(false)
+    }
+
+    /// Returns persisted membership and observed Raft and transport facts.
+    pub async fn raft_diagnostics(&self) -> RaftDiagnostics {
+        let metrics = self.raft.metrics().borrow().clone();
+        let voters = metrics
+            .membership_config
+            .voter_ids()
+            .collect::<BTreeSet<_>>();
+        let mut members = metrics
+            .membership_config
+            .nodes()
+            .map(|(id, node)| RaftMemberDiagnostics {
+                id: *id,
+                address: node.addr.clone(),
+                voter: voters.contains(id),
+                replication_acknowledged: metrics
+                    .replication
+                    .as_ref()
+                    .map(|progress| progress.get(id).is_some_and(|log_id| log_id.is_some())),
+                transport_reachable: (*id == self.node_id).then_some(true),
+            })
+            .collect::<Vec<_>>();
+
+        let mut probes = tokio::task::JoinSet::new();
+        for member in members.iter().filter(|member| member.id != self.node_id) {
+            let id = member.id;
+            let address = member.address.clone();
+            probes.spawn(async move {
+                let reachable = timeout(
+                    Duration::from_millis(300),
+                    tokio::net::TcpStream::connect(address),
+                )
+                .await
+                .is_ok_and(|result| result.is_ok());
+                (id, reachable)
+            });
+        }
+        while let Some(Ok((id, reachable))) = probes.join_next().await {
+            if let Some(member) = members.iter_mut().find(|member| member.id == id) {
+                member.transport_reachable = Some(reachable);
+            }
+        }
+        let quorum_ack_recent = quorum_ack_recent(
+            self.node_id,
+            metrics.current_leader,
+            metrics.millis_since_quorum_ack,
+        );
+
+        RaftDiagnostics {
+            node_id: self.node_id,
+            state: format!("{:?}", metrics.state),
+            leader_id: metrics.current_leader,
+            ready: metrics.current_leader.is_some() && quorum_ack_recent != Some(false),
+            quorum_ack_age_ms: metrics.millis_since_quorum_ack,
+            quorum_ack_recent,
+            members,
+        }
+    }
+
     /// Adds a manager as a learner, waits for it to catch up, then promotes it.
     pub async fn add_manager(&self, id: NodeId, raft_addr: String) -> Result<(), StateError> {
         let _guard = self.membership_change.lock().await;
@@ -512,7 +629,7 @@ impl StateStore {
             .validate()
             .map_err(|error| StateError::InvalidTenant(error.into()))?;
         match self.propose(StateCommand::CreateTenant(tenant)).await? {
-            StateResponse::Ok => Ok(()),
+            StateResponse::Ok | StateResponse::ChangeRequest(_) => Ok(()),
             StateResponse::Conflict(message) => Err(StateError::Conflict(message)),
             StateResponse::NotFound => Err(StateError::NotFound("tenant".into())),
             StateResponse::Error(message) => Err(StateError::Raft(message)),
@@ -545,7 +662,7 @@ impl StateStore {
             })
             .await?
         {
-            StateResponse::Ok => Ok(()),
+            StateResponse::Ok | StateResponse::ChangeRequest(_) => Ok(()),
             StateResponse::NotFound => Err(StateError::NotFound(id)),
             StateResponse::Conflict(message) => Err(StateError::Conflict(message)),
             StateResponse::Error(message) => Err(StateError::Raft(message)),
@@ -560,7 +677,7 @@ impl StateStore {
             .propose(StateCommand::RecordNatsUserRevocation { user_public_key })
             .await?
         {
-            StateResponse::Ok => Ok(()),
+            StateResponse::Ok | StateResponse::ChangeRequest(_) => Ok(()),
             StateResponse::NotFound => Err(StateError::NotFound("default tenant".into())),
             StateResponse::Conflict(message) | StateResponse::Error(message) => {
                 Err(StateError::Raft(message))
@@ -585,7 +702,7 @@ impl StateStore {
             .propose(StateCommand::RemoveTenant(id.to_owned()))
             .await?
         {
-            StateResponse::Ok => Ok(()),
+            StateResponse::Ok | StateResponse::ChangeRequest(_) => Ok(()),
             StateResponse::NotFound => Err(StateError::NotFound(id.to_owned())),
             StateResponse::Conflict(message) => Err(StateError::Conflict(message)),
             StateResponse::Error(message) => Err(StateError::Raft(message)),
@@ -595,7 +712,7 @@ impl StateStore {
     pub async fn upsert_node(&self, node: ClusterNode) -> Result<(), StateError> {
         let tenant_id = node.tenant_id.clone();
         match self.propose(StateCommand::UpsertNode(node)).await? {
-            StateResponse::Ok => Ok(()),
+            StateResponse::Ok | StateResponse::ChangeRequest(_) => Ok(()),
             StateResponse::NotFound => Err(StateError::NotFound(format!("tenant {tenant_id}"))),
             StateResponse::Conflict(_) => Err(StateError::NameInUse),
             StateResponse::Error(message) => Err(command_error(message)),
@@ -616,10 +733,57 @@ impl StateStore {
             .propose(StateCommand::SetNodeNatsUserPublicKey { id, public_key })
             .await?
         {
-            StateResponse::Ok => Ok(()),
+            StateResponse::Ok | StateResponse::ChangeRequest(_) => Ok(()),
             StateResponse::NotFound => Err(StateError::NotFound(format!("node {id}"))),
             StateResponse::Error(message) => Err(command_error(message)),
             StateResponse::Conflict(_) => Err(StateError::NameInUse),
+        }
+    }
+
+    /// Returns the request as committed, which a lagging follower may not hold yet.
+    pub async fn create_change_request(
+        &self,
+        request: ChangeRequest,
+    ) -> Result<ChangeRequest, StateError> {
+        match self
+            .propose(StateCommand::CreateChangeRequest(Box::new(request)))
+            .await?
+        {
+            StateResponse::ChangeRequest(request) => Ok(*request),
+            StateResponse::Ok => Err(StateError::storage("create returned no change request")),
+            StateResponse::NotFound => Err(StateError::NotFound("tenant or service".into())),
+            StateResponse::Conflict(message) | StateResponse::Error(message) => {
+                Err(StateError::Conflict(message))
+            }
+        }
+    }
+
+    pub async fn decide_change_request(
+        &self,
+        id: String,
+        tenant_id: String,
+        actor: String,
+        approve: bool,
+        now_unix: u64,
+    ) -> Result<ChangeRequest, StateError> {
+        match self
+            .propose(StateCommand::DecideChangeRequest {
+                id,
+                tenant_id,
+                actor,
+                approve,
+                now_unix,
+            })
+            .await?
+        {
+            // Every transition this decision made, including expired and
+            // superseded; its status says which.
+            StateResponse::ChangeRequest(request) => Ok(*request),
+            StateResponse::Ok => Err(StateError::storage("decision returned no change request")),
+            StateResponse::NotFound => Err(StateError::NotFound("change request".into())),
+            StateResponse::Conflict(message) | StateResponse::Error(message) => {
+                Err(StateError::Conflict(message))
+            }
         }
     }
 
@@ -630,7 +794,7 @@ impl StateStore {
 
     async fn write_service(&self, command: StateCommand) -> Result<(), StateError> {
         match self.propose(command).await? {
-            StateResponse::Ok => Ok(()),
+            StateResponse::Ok | StateResponse::ChangeRequest(_) => Ok(()),
             StateResponse::Conflict(_) => Err(StateError::NameInUse),
             StateResponse::Error(message) if message.starts_with("tenant quota exceeded: ") => {
                 Err(command_error(message))
@@ -652,18 +816,22 @@ impl StateStore {
         id: String,
         tenant_id: &str,
     ) -> Result<(), StateError> {
-        self.propose(StateCommand::RemoveOwned {
-            kind,
-            id,
-            tenant_id: tenant_id.to_owned(),
-        })
-        .await?;
-        Ok(())
+        match self
+            .propose(StateCommand::RemoveOwned {
+                kind,
+                id,
+                tenant_id: tenant_id.to_owned(),
+            })
+            .await?
+        {
+            StateResponse::Conflict(message) => Err(StateError::Conflict(message)),
+            _ => Ok(()),
+        }
     }
 
     pub async fn upsert_task(&self, task: Task) -> Result<(), StateError> {
         match self.propose(StateCommand::UpsertTask(task)).await? {
-            StateResponse::Ok => Ok(()),
+            StateResponse::Ok | StateResponse::ChangeRequest(_) => Ok(()),
             StateResponse::Conflict(_) => Err(StateError::NameInUse),
             StateResponse::Error(message) => Err(command_error(message)),
             StateResponse::NotFound => Err(StateError::NotFound("tenant".into())),
@@ -678,7 +846,7 @@ impl StateStore {
 
     pub async fn upsert_network(&self, network: Network) -> Result<(), StateError> {
         match self.propose(StateCommand::UpsertNetwork(network)).await? {
-            StateResponse::Ok => Ok(()),
+            StateResponse::Ok | StateResponse::ChangeRequest(_) => Ok(()),
             StateResponse::Conflict(_) => Err(StateError::NameInUse),
             StateResponse::Error(message) => Err(command_error(message)),
             StateResponse::NotFound => Err(StateError::NotFound("tenant".into())),
@@ -693,7 +861,7 @@ impl StateStore {
 
     pub async fn upsert_volume(&self, volume: Volume) -> Result<(), StateError> {
         match self.propose(StateCommand::UpsertVolume(volume)).await? {
-            StateResponse::Ok => Ok(()),
+            StateResponse::Ok | StateResponse::ChangeRequest(_) => Ok(()),
             StateResponse::Conflict(_) => Err(StateError::NameInUse),
             StateResponse::Error(message) => Err(command_error(message)),
             StateResponse::NotFound => Err(StateError::NotFound("tenant".into())),
@@ -707,7 +875,7 @@ impl StateStore {
 
     pub async fn upsert_secret(&self, secret: Secret) -> Result<(), StateError> {
         match self.propose(StateCommand::UpsertSecret(secret)).await? {
-            StateResponse::Ok => Ok(()),
+            StateResponse::Ok | StateResponse::ChangeRequest(_) => Ok(()),
             StateResponse::Conflict(_) => Err(StateError::NameInUse),
             StateResponse::Error(message) => Err(command_error(message)),
             StateResponse::NotFound => Err(StateError::NotFound("tenant".into())),
@@ -722,7 +890,7 @@ impl StateStore {
 
     pub async fn upsert_config(&self, config: StateConfig) -> Result<(), StateError> {
         match self.propose(StateCommand::UpsertConfig(config)).await? {
-            StateResponse::Ok => Ok(()),
+            StateResponse::Ok | StateResponse::ChangeRequest(_) => Ok(()),
             StateResponse::Conflict(_) => Err(StateError::NameInUse),
             StateResponse::Error(message) => Err(command_error(message)),
             StateResponse::NotFound => Err(StateError::NotFound("tenant".into())),
@@ -755,6 +923,28 @@ impl StateStore {
     pub async fn list_services(&self) -> Result<Vec<Service>, StateError> {
         self.reader
             .list_services()
+            .await
+            .map_err(StateError::storage)
+    }
+
+    pub async fn get_change_request(
+        &self,
+        tenant_id: &str,
+        id: &str,
+    ) -> Result<Option<ChangeRequest>, StateError> {
+        self.reader
+            .get_change_request(tenant_id, id)
+            .await
+            .map_err(StateError::storage)
+    }
+
+    /// One tenant's change requests, unordered.
+    pub async fn list_change_requests(
+        &self,
+        tenant_id: &str,
+    ) -> Result<Vec<ChangeRequest>, StateError> {
+        self.reader
+            .list_change_requests(tenant_id)
             .await
             .map_err(StateError::storage)
     }
@@ -869,6 +1059,7 @@ impl StateStore {
         match snapshot.format_version {
             crate::codec::FORMAT_VERSION
             | crate::codec::V9_FORMAT_VERSION
+            | crate::codec::V10_FORMAT_VERSION
             | crate::codec::V8_FORMAT_VERSION
             | crate::codec::V7_FORMAT_VERSION
             | crate::codec::V6_FORMAT_VERSION
@@ -964,7 +1155,7 @@ impl StateStore {
 /// version is caller-chosen, so this keeps [`legacy_growth`] to migration
 /// growth.
 fn check_legacy_shape(service: &Service, from_version: u8) -> Result<(), StateError> {
-    if from_version < crate::codec::FORMAT_VERSION && service.egress.is_some() {
+    if from_version < crate::codec::V10_FORMAT_VERSION && service.egress.is_some() {
         return Err(StateError::BadSnapshot(format!(
             "service `{}`: a pre-v10 snapshot cannot declare an egress policy",
             service.id
@@ -993,7 +1184,10 @@ fn legacy_growth(service: &Service, from_version: u8) -> Result<u64, StateError>
         let Some(object) = value.as_object_mut() else {
             return;
         };
-        object.remove("egress");
+        // v10 already stored `egress`, so only older formats grew by it.
+        if from_version < crate::codec::V10_FORMAT_VERSION {
+            object.remove("egress");
+        }
         if from_version < crate::codec::V9_FORMAT_VERSION {
             if let Some(agent) = object.get_mut("agent").and_then(|a| a.as_object_mut()) {
                 agent.remove("capabilities");

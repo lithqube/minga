@@ -55,11 +55,11 @@ W10-STAGE and W10-COMP stay open: the 10-01 host gate is blocked by user choice 
 
 # Phase 16 requirements (Agent-ready operations and painless management)
 
-- [ ] **OPS-VERSION** The running Minga binary version/build, client version and API version are separately reported; release identity is never inferred from behavior.
-- [ ] **OPS-RAFT** Diagnostics show persisted voter membership, leader, quorum/readiness and unavailable members, separately from bootstrap `--peer` input.
-- [ ] **OPS-COMPOSE** Parsed Compose semantics are applied end to end or rejected before desired-state changes. `deploy.labels` has a regression proving visibility to the Swarm consumer or an actionable validation failure.
-- [ ] **OPS-DOCTOR** `minga-ctl doctor` is read-only, evidence-based and machine-readable; shared support output redacts credentials, private keys, secret values and sensitive environment data.
-- [ ] **OPS-UPGRADE** Preflight reports source/target compatibility, state and NATS migrations, tenant impact, backups, ordering, disruption and rollback limits. Planning never wipes, restarts or upgrades the cluster.
-- [ ] **AGENT-CONTRACT** MCP tools are typed, deterministic and tenant-scoped; initial operations are allow-listed reads. Agents receive neither shared admin credentials nor arbitrary HTTP, shell or filesystem access.
-- [ ] **AGENT-APPROVAL** Agent changes are bounded, expiring proposals; a distinct deployer/admin in the same tenant approves the exact diff. Create, approve, reject, expire and apply are auditable.
+- [x] **OPS-VERSION** The running Minga binary version/build, client version and API version are separately reported; release identity is never inferred from behavior.
+- [x] **OPS-RAFT** Diagnostics show persisted voter membership, leader, quorum/readiness and unavailable members, separately from bootstrap `--peer` input.
+- [x] **OPS-COMPOSE** Parsed Compose semantics are applied end to end or rejected before desired-state changes. `deploy.labels` has a regression proving visibility to the Swarm consumer or an actionable validation failure.
+- [x] **OPS-DOCTOR** `minga-ctl doctor` is read-only, evidence-based and machine-readable; shared support output redacts credentials, private keys, secret values and sensitive environment data.
+- [x] **OPS-UPGRADE** Preflight reports source/target compatibility, state and NATS migrations, tenant impact, backups, ordering, disruption and rollback limits. Planning never wipes, restarts or upgrades the cluster.
+- [x] **AGENT-CONTRACT** MCP tools are typed, deterministic and tenant-scoped; initial operations are allow-listed reads. Agents receive neither shared admin credentials nor arbitrary HTTP, shell or filesystem access.
+- [x] **AGENT-APPROVAL** Agent changes are bounded, expiring proposals; a distinct deployer/admin in the same tenant approves the exact diff. Create, approve, reject, expire and apply are auditable.
 - [ ] **RC-PROOF** VM validation is deferred until the v1.3.0 release candidate is ready; then the Phase 15 tenant-isolation proof and staging upgrade are recorded against that exact build.

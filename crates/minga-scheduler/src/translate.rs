@@ -98,6 +98,12 @@ fn translate_service(
     };
 
     let deploy = svc.deploy.clone().unwrap_or_default();
+    if !deploy.labels.0.is_empty() {
+        return Err(TranslateError::Service(
+            name.to_owned(),
+            "`deploy.labels` is not supported yet; deployment stopped before any API writes".into(),
+        ));
+    }
 
     let (replicas, mode) = match deploy.mode {
         DeployMode::Replicated => (deploy.replicas.unwrap_or(1), ServiceMode::Replicated),
@@ -907,6 +913,25 @@ mod tests {
         );
         let result = translate_service("agent", &svc, "test", &empty_project(), None);
         assert!(result.is_ok(), "agent service without image should succeed");
+    }
+
+    #[test]
+    fn translate_rejects_deploy_labels_before_api_writes() {
+        let svc = make_compose_service(
+            r#"
+            image: nginx
+            deploy:
+              labels:
+                - "traefik.enable=true"
+            "#,
+        );
+        let error = translate_service("web", &svc, "test", &empty_project(), None)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            error,
+            "service `web`: `deploy.labels` is not supported yet; deployment stopped before any API writes"
+        );
     }
 
     #[test]

@@ -50,6 +50,15 @@ enum Command {
     /// Pull, list and remove images on nodes.
     #[command(subcommand)]
     Image(cmd::image::ImageCommand),
+    /// Show the client build and the server's persisted Raft observations.
+    Info,
+    /// Inspect and decide tenant-scoped agent change requests.
+    #[command(subcommand)]
+    Change(cmd::change::ChangeCommand),
+    /// Inspect API, Raft, bus, inventory and task health without changing cluster state.
+    Doctor(cmd::doctor::DoctorArgs),
+    /// Plan a release upgrade without changing cluster state.
+    Upgrade(cmd::upgrade::UpgradeArgs),
     /// Check the API, and optionally a stack's services.
     Health(cmd::health::HealthArgs),
     /// Show the Prometheus metrics the cluster reports.
@@ -72,8 +81,6 @@ enum Command {
     /// Inspect cluster tasks.
     #[command(subcommand)]
     Task(cmd::cluster::TaskCommand),
-    /// Show cluster information.
-    Info,
     /// Show API version information.
     Version,
     /// Query agent request usage.
@@ -154,6 +161,20 @@ fn run(cli: &Cli) -> Result<(), CtlError> {
             audit(&resolved, cmd.audit(), &result);
             result
         }),
+        Command::Upgrade(args) => api::block_on(async {
+            let resolved = resolve(cli)?;
+            let conn = transport::connect(&resolved, cli.debug).await?;
+            cmd::upgrade::run(args, &conn, &resolved, format, quiet).await
+        }),
+        Command::Doctor(args) => api::block_on(async {
+            let resolved = resolve(cli)?;
+            let conn = transport::connect(&resolved, cli.debug).await?;
+            cmd::doctor::run(args, &conn, &resolved, format, quiet).await
+        }),
+        Command::Info => api::block_on(async {
+            let conn = connect(cli).await?;
+            cmd::info::run(&conn.api, format, quiet).await
+        }),
         Command::Health(args) => api::block_on(async {
             let conn = connect(cli).await?;
             cmd::health::run(args, &conn, format, quiet).await
@@ -166,6 +187,12 @@ fn run(cli: &Cli) -> Result<(), CtlError> {
             let conn = connect(cli).await?;
             cmd::usage::run(args, &conn, format, quiet).await
         }),
+        Command::Change(command) => api::block_on(async {
+            // Change requests authenticate with the context's client
+            // certificate only, so a failing token supplier must not block them.
+            let conn = transport::connect(&resolve_target(cli)?, cli.debug).await?;
+            cmd::change::run(command, &conn.api, format, quiet).await
+        }),
         Command::Manager(cmd) => {
             run_cluster(cli, cmd::cluster::ClusterCommand::Manager(cmd.clone()))
         }
@@ -175,7 +202,6 @@ fn run(cli: &Cli) -> Result<(), CtlError> {
         }
         Command::Config(cmd) => run_cluster(cli, cmd::cluster::ClusterCommand::Config(cmd.clone())),
         Command::Task(cmd) => run_cluster(cli, cmd::cluster::ClusterCommand::Task(cmd.clone())),
-        Command::Info => run_system_info(cli, false),
         Command::Version => run_system_info(cli, true),
         Command::Registry(cmd) => api::block_on(cmd::registry::run(
             cmd,

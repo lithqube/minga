@@ -1651,6 +1651,13 @@ mod assignment_tests {
         ) -> minga_bus::Result<minga_bus::EventStream> {
             self.inner.subscribe_tenant_events(tenant_id).await
         }
+        async fn tenant_event_history(
+            &self,
+            tenant_id: &str,
+            limit: usize,
+        ) -> minga_bus::Result<Vec<minga_bus::BusEvent>> {
+            self.inner.tenant_event_history(tenant_id, limit).await
+        }
         async fn configure_tenant_quota(
             &self,
             tenant_id: &str,

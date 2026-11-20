@@ -26,9 +26,9 @@ its per-workload budget tracking is node-local, not a distributed customer
 window budget. `MINGA_EGRESS_URL` / `MINGA_EGRESS_TOKEN` are not usable by a
 guest until a WASI environment is added.
 
-Step 2 introduced the capability field in the persisted format v9. Current
-main uses format v10 after subsequent tenancy changes; do not use the
-historical v9 format as the current version.
+Step 2 introduced the capability field in persisted format v9. Current main
+uses format v11 after subsequent tenant and maker-checker changes; do not use
+historical v9 or v10 fixtures as the current version.
 
 ## 2. Compose grammar
 

@@ -27,6 +27,8 @@ pub const API_VERSION: &str = "1.41";
 pub const MIN_API_VERSION: &str = "1.24";
 /// Minga version reported in `/version` and `/info`.
 pub const MINGA_VERSION: &str = env!("CARGO_PKG_VERSION");
+/// Build revision set by `build.rs` when the source checkout exposes one.
+pub const MINGA_GIT_COMMIT: Option<&str> = option_env!("MINGA_GIT_SHA");
 
 /// Docker-compatible error response body.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -64,6 +66,16 @@ pub struct VersionInfo {
     pub KernelVersion: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub BuildTime: Option<String>,
+}
+
+/// Minga-specific build and persisted Raft facts for operator diagnostics.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClusterDiagnostics {
+    pub server_version: String,
+    pub build_revision: Option<String>,
+    pub api_version: String,
+    pub state_format_version: u8,
+    pub raft: minga_state::RaftDiagnostics,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

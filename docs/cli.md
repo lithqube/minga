@@ -222,11 +222,24 @@ minga-ctl context delete old
 | `--remote-token-file <PATH>` | File on the SSH target with the token: the bare token, or an env file with a `MINGA_API_TOKEN=` line (such as the API's `EnvironmentFile`). |
 | `--token-command <CMD>` | Local command that prints the token, run without a shell. |
 | `--tls-cert <PEM>` | CA certificate to trust for an `https://` endpoint. |
+| `--client-cert <PEM>` | Tenant-scoped API client certificate for maker-checker commands; direct HTTPS only. |
+| `--client-key <PEM>` | Matching private key, mode `0600`; used with `--client-cert`. |
 | `--node <TARGET>` | SSH target for node-local commands (secrets, images, registry logins). Repeat for each node. |
 | `--nats-url <URL>` | NATS URL for logs, as seen from where `minga logs` runs. |
 | `--metrics-endpoint <URL>` | Metrics URL, as seen from the SSH target. |
 | `--registry-auth-file <PATH>` | Docker credential file on the node that Minga reads when pulling. |
 | `--use` | Make it the current context. |
+
+For tenant approvals, use a tenant deployer/admin certificate and a direct
+HTTPS context:
+
+```bash
+minga-ctl context add tenant-a --endpoint https://manager.example:2376 \
+  --tls-cert ./server-ca/ca.pem \
+  --client-cert ./deployer.pem --client-key ./deployer-key.pem
+minga-ctl --context tenant-a change list
+minga-ctl --context tenant-a change approve cr-...
+```
 
 How a command picks its settings:
 
@@ -257,13 +270,38 @@ Through the API:
 | `manager ls`, `manager add ID --raft-addr ADDR`, `manager rm ID [--yes]` | Inspect and change Raft voter membership. Add and remove need the manager API admin token; removal confirms unless `--yes`. |
 | `node ls`, `node inspect ID` | Node identity, role, availability, scheduling state and address. |
 | `node update ID [--availability active\|drain] [--label KEY=VALUE]... [--label-rm KEY]... [--clear-labels]` | Update node scheduling and labels. |
-| `network ls`, `network inspect ID`, `network create NAME [--subnet CIDR] [--attachable]`, `network rm ID [--yes]` | Cluster network metadata and allocation. Compose remains the full-featured path for network options. |
+| `network ls`, `network inspect ID`, `network create NAME [--subnet CIDR] [--attachable]`, `network rm ID [--yes]` | Cluster network metadata and allocation. Removal is refused while a service or its rollback revision uses the network. Compose remains the full-featured path for network options. |
 | `config ls`, `config inspect ID`, `config create NAME --file FILE`, `config rm ID [--yes]` | Config metadata and creation from file bytes; the API never returns contents. |
 | `task ls`, `task inspect ID` | Desired and actual task state, placement and errors. |
-| `info`, `version` | API cluster information and version metadata. |
+| `version` | API version metadata. |
 | `health [--stack STACK] [--timeout SECS]` | The API, and with `--stack` the stack's services and their health URLs. |
+| `info` | Client build, server version/build, Docker API version, persisted state format and Raft membership/quorum observations. |
+| `doctor [--bundle PATH] [--timeout SECS]` | Read-only API/readiness, Raft, bus, inventory, task and local auth/TLS diagnostics. Default probe timeout is 5 seconds. |
+| `upgrade preflight --to v1.3.0` | Read-only compatibility, Raft membership/quorum, selected-context auth/transport, backup, NATS, tenant impact, maintenance-order and rollback plan. Unknown release metadata fails closed; no upgrade is started. |
 | `metrics` | The Prometheus metrics the cluster reports. |
-| `agent usage [--customer ID] [--since 30d]` | Authenticates with the context API token as a cluster operator and reports usage totals by tenant. `minga-ctl` cannot present tenant client certificates, so it does not return per-tenant request rows; `--customer` is rejected for this caller. Read-only. |
+| `agent usage [--customer ID] [--since 30d]` | Uses the context API token as a cluster operator and reports aggregate usage by tenant. The usage API does not expose tenant-scoped request rows; `--customer` is rejected for this caller. Read-only. |
+| `change list [--limit N] [--pending]`, `change approve ID`, `change reject ID` | Tenant-scoped maker-checker over a direct HTTPS context with a tenant client certificate/key. Listing requires a tenant viewer certificate; approval/rejection additionally require a deployer/admin certificate (a token is refused). Each request lists the spec fields it changes. Approval runs service-update admission, then applies the reviewed desired state atomically. |
+
+
+`doctor` reports observed status separately from unknowns; it never restarts or
+changes a cluster. A support bundle is JSON, created locally with mode `0600`,
+and refuses to overwrite an existing file. It includes version/build facts,
+readiness, Raft membership counts, inventory counts and sanitized findings.
+It omits tokens, command arguments, config paths and contents, NATS URLs,
+certificate contents, service/task errors and resource identifiers. HTTP
+response bodies are not copied into findings.
+
+The upgrade preflight uses the server's reported state format or known release
+metadata, and says when the format was inferred. Any error-severity finding,
+including a check that could not run, makes it exit non-zero. Its current v1.3.0 target metadata is planned, not release approval.
+The v1.2.0 format-v10 to v1.3.0 format-v11 path is supported by checked-in
+migrations, but all Minga roles must move together because peer and worker
+wire frames are versioned. External NATS must meet JetStream API level 4; its
+version is not inferred from readiness.
+It also reports the observed Raft membership and the selected CLI context's
+token/transport configuration without exposing peer addresses or credential
+details. This is not proof of each manager's Raft TLS configuration; verify
+Raft and NATS TLS independently on every node.
 
 On the nodes, over SSH (`--ssh TARGET`, repeatable; by default the context's
 `--node` targets, else its `--ssh`, else this machine):
@@ -284,17 +322,17 @@ Exit codes: `0` success, `1` usage or configuration error, `2` API, transport,
 SSH or authentication failure or a failed health check, `3` the named service,
 stack or context does not exist.
 
-Tenant operations are not yet exposed as `minga-ctl` subcommands. Use the
-cluster-operator API for tenant CRUD and node-bound join-token issuance;
-the `minga-ctl` context token must be a cluster-operator credential. The
-`--tls-cert` context setting trusts an HTTPS server CA; it is not a client
-certificate/key option.
+Tenant CRUD and node-bound join-token issuance are not `minga-ctl`
+subcommands yet; use the cluster-operator API for them. The `--tls-cert`
+context setting trusts an HTTPS server CA. A tenant identity is the separate
+`--client-cert`/`--client-key` pair on a direct HTTPS context, which `change`
+uses (it never resolves the context token).
 
-On a cluster with more than one tenant, the context token has no tenant
-identity, so `minga-ctl` commands that touch tenant resources (`stack`,
-`service`, `secret`, `network`, `config` and `task`) fail with 403 until
-`minga-ctl` can present a tenant client certificate. `node`, `manager`, `info`
-and `version` are operator-only and work with an operator token. `node update`
+On a cluster with more than one tenant, a context token has no tenant
+identity, so the token-based commands that touch tenant resources (`stack`,
+`service`, `secret`, `network`, `config` and `task`) fail with 403. `node`,
+`manager`, `info` and `version` are operator-only and work with an operator
+token. `node update`
 re-reads the node before writing and stops if another operator changed it, but
 the API has no revision check, so two writes in the same instant can still
 race.

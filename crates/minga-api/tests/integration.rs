@@ -464,13 +464,14 @@ async fn full_stack_deploy_workflow() {
     assert_eq!(services.len(), 1);
     assert_eq!(services[0]["ID"], "myapp_web");
 
-    // --- Step 14: docker network rm ---
+    // --- Step 14: docker network rm while myapp_web uses it ---
+    // Like Docker, a network in use is refused.
     let resp = http
         .delete(format!("{base}/v1.41/networks/myapp_default"))
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 204);
+    assert_eq!(resp.status(), 409);
 
     // --- Step 15: docker secret rm ---
     let resp = http
@@ -491,6 +492,14 @@ async fn full_stack_deploy_workflow() {
     // --- Step 17: docker service rm (last one) ---
     let resp = http
         .delete(format!("{base}/v1.41/services/myapp_web"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 204);
+
+    // --- Step 18: docker network rm, now unused ---
+    let resp = http
+        .delete(format!("{base}/v1.41/networks/myapp_default"))
         .send()
         .await
         .unwrap();

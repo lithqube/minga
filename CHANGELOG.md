@@ -2,12 +2,43 @@
 
 ## Unreleased
 
+- `minga-ctl info` reports the client build separately from the server version,
+  build revision and persisted Raft membership. `minga-ctl doctor` adds
+  read-only readiness, bus, inventory and task findings; its optional support
+  bundle is a new local mode-0600 JSON file and omits credentials, sensitive
+  paths, resource identifiers and raw task errors.
+- The cluster diagnostics endpoint reports the persisted state format. `minga-ctl
+  upgrade preflight --to v1.3.0` compares known release metadata with the
+  running server and emits a read-only Raft membership/quorum, API-context
+  security, backup, NATS, tenant, coordinated upgrade and rollback plan.
+  Unknown formats or releases fail closed, and so does any blocking check that
+  could not run (for example unreadable Raft diagnostics): it exits non-zero.
+  It does not stop, restart, migrate or wipe cluster state.
+- `minga mcp serve` exposes fixed tenant-scoped reads over HTTPS/mTLS and an
+  agent-only `request_change` proposal tool for deploy-image, scale, rollback
+  and stop. `minga-ctl change list|approve|reject` uses tenant-scoped mTLS;
+  listing requires a viewer role and decisions require a distinct deployer/admin
+  role presented as a certificate; a token cannot decide. Approval runs the
+  same placement and secret admission as a service update, then atomically
+  applies the reviewed state in Raft. Each request carries the exact diff of
+  every spec field it changes, with environment values shown as `<hidden>`
+  and their changed keys listed. Scale and stop refuse global services. Requests
+  expire after 15 minutes. A tenant holds at most 32 open and 256 total
+  requests; the oldest decided or expired ones are dropped first, and removing
+  a tenant removes its requests. State/wire format is now v11.
+- Removing a network that a service, or a rollback revision it keeps, still
+  uses now returns 409, as Docker refuses a network in use. Remove the service
+  first. A service write that adds a network or secret another tenant owns is
+  refused in the Raft write itself.
+- `minga validate` and `minga deploy` reject Compose `deploy.labels` before API
+  writes instead of silently dropping those labels.
 - `minga-ctl` gains `manager`, `node`, `network`, `config`, `task`, `info` and
   `version` commands over the existing API, including Raft manager
   add/remove and node drain and labels.
 - The API now reports a draining node as `Spec.Availability: "drain"` instead
   of always `"active"`, and `minga-ctl node update` stops if the node changed
   between its read and its write.
+
 - Tenant egress routes no longer follow redirects or system proxies and
   refuse loopback, link-local, private, shared (`100.64.0.0/10`),
   `0.0.0.0/8`, unspecified and multicast destinations, including through
