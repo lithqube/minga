@@ -3,12 +3,13 @@
 //! Gate 5 exit criteria: a cluster of TLS-credentialed nodes elects a
 //! leader and replicates writes; a peer without a certificate signed by
 //! the cluster CA (no cert, or a foreign CA's cert) cannot join — it
-//! fails the TLS handshake before it can vote.
+//! fails the TLS handshake before it can vote. Neither can a worker that
+//! holds its own node certificate from the same CA (no `minga-manager-<id>`).
 
 use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 
-use minga_state::network::{RaftTlsConfig, MINGA_NODE_NAME};
+use minga_state::network::{manager_name, RaftTlsConfig, MINGA_NODE_NAME};
 use minga_state::types::{ClusterNode, NodeStatus, ResourceSpec};
 use minga_state::StateStore;
 
@@ -43,15 +44,16 @@ impl Pki {
         }
     }
 
-    /// Issues a node certificate and writes ca.pem/node.pem/node-key.pem
-    /// into a fresh subdir; returns the RaftTlsConfig pointing at them.
-    fn issue(&self, name: &str) -> RaftTlsConfig {
+    /// Issues a manager certificate (what `minga tls issue-node --role manager`
+    /// produces) into a fresh subdir; returns the RaftTlsConfig pointing at it.
+    fn issue(&self, name: &str, id: u64) -> RaftTlsConfig {
+        self.issue_with(name, &[MINGA_NODE_NAME.to_string(), manager_name(id)])
+    }
+
+    /// Issues a certificate with exactly `names` as DNS SANs.
+    fn issue_with(&self, name: &str, names: &[String]) -> RaftTlsConfig {
         let key = rcgen::KeyPair::generate().expect("node key");
-        let mut params =
-            rcgen::CertificateParams::new(vec![MINGA_NODE_NAME.to_string()]).expect("params");
-        params.subject_alt_names = vec![rcgen::SanType::DnsName(
-            MINGA_NODE_NAME.try_into().expect("san"),
-        )];
+        let params = rcgen::CertificateParams::new(names.to_vec()).expect("params");
         let cert = params
             .signed_by(&key, &self.ca, &self.ca_key)
             .expect("sign node cert");
@@ -98,8 +100,8 @@ fn sample_node(id: u64, addr: &str) -> ClusterNode {
 #[tokio::test]
 async fn tls_cluster_elects_and_replicates() {
     let pki = Pki::new();
-    let tls1 = pki.issue("n1");
-    let tls2 = pki.issue("n2");
+    let tls1 = pki.issue("n1", 1);
+    let tls2 = pki.issue("n2", 2);
     let [addr1, addr2] = free_addrs();
 
     let dir1 = tempfile::tempdir().unwrap();
@@ -136,7 +138,7 @@ async fn tls_cluster_elects_and_replicates() {
 #[tokio::test]
 async fn uncredentialed_peer_cannot_join() {
     let pki = Pki::new();
-    let tls1 = pki.issue("n1");
+    let tls1 = pki.issue("n1", 1);
     let [addr1, addr2] = free_addrs();
 
     // Node 1 runs with TLS; node 2 connects WITHOUT any credentials.
@@ -162,9 +164,9 @@ async fn uncredentialed_peer_cannot_join() {
 #[tokio::test]
 async fn foreign_ca_peer_cannot_join() {
     let pki = Pki::new();
-    let tls1 = pki.issue("n1");
+    let tls1 = pki.issue("n1", 1);
     let foreign = Pki::new();
-    let tls2_foreign = foreign.issue("n2");
+    let tls2_foreign = foreign.issue("n2", 2);
     let [addr1, addr2] = free_addrs();
 
     let dir1 = tempfile::tempdir().unwrap();
@@ -190,10 +192,44 @@ async fn foreign_ca_peer_cannot_join() {
 }
 
 #[tokio::test]
+async fn worker_certificate_from_the_cluster_ca_cannot_join() {
+    // A tenant-owned worker holds a node certificate from the same CA with the
+    // shared `minga-node` SAN. It must not be accepted as a Raft peer.
+    let pki = Pki::new();
+    let tls1 = pki.issue("n1", 1);
+    let tls2_worker = pki.issue_with(
+        "w2",
+        &[MINGA_NODE_NAME.to_string(), "minga-worker-2".to_string()],
+    );
+    let [addr1, addr2] = free_addrs();
+
+    let dir1 = tempfile::tempdir().unwrap();
+    let _store1 = StateStore::open_secure(1, &addr1, dir1.path(), BTreeMap::new(), tls1)
+        .await
+        .expect("node 1 starts");
+    std::mem::forget(dir1);
+
+    let dir2 = tempfile::tempdir().unwrap();
+    let attempt = StateStore::open_secure(
+        2,
+        &addr2,
+        dir2.path(),
+        BTreeMap::from([(1, addr1.clone())]),
+        tls2_worker,
+    );
+    let joined = tokio::time::timeout(Duration::from_secs(3), attempt).await;
+    assert!(
+        joined.is_err(),
+        "a worker certificate from the cluster CA must not join Raft"
+    );
+    std::mem::forget(dir2);
+}
+
+#[tokio::test]
 async fn world_readable_node_key_is_refused() {
     use std::os::unix::fs::PermissionsExt;
     let pki = Pki::new();
-    let tls = pki.issue("n1");
+    let tls = pki.issue("n1", 1);
     std::fs::set_permissions(&tls.key, std::fs::Permissions::from_mode(0o644)).unwrap();
     let [addr] = free_addrs();
     let dir = tempfile::tempdir().unwrap();

@@ -32,9 +32,8 @@ use crate::TypeConfig;
 
 // --- transport security ---------------------------------------------------------
 
-/// The SAN every Minga node certificate carries. Any cluster peer must
-/// present a certificate signed by the cluster CA with this name — one
-/// identity, no per-node PKI bookkeeping.
+/// The SAN every Minga node certificate carries, manager or worker. It is not
+/// a Raft identity: Raft peers are pinned to `minga-manager-<id>` instead.
 pub const MINGA_NODE_NAME: &str = "minga-node";
 
 /// TLS material for the Raft transport (PEM paths). The same certificate
@@ -43,7 +42,7 @@ pub const MINGA_NODE_NAME: &str = "minga-node";
 pub struct RaftTlsConfig {
     /// PEM file with the cluster CA certificate.
     pub ca_cert: std::path::PathBuf,
-    /// PEM file with this node's certificate (SAN `minga-node`).
+    /// PEM file with this manager's certificate (SAN `minga-manager-<id>`).
     pub cert: std::path::PathBuf,
     /// PEM file with this node's private key.
     pub key: std::path::PathBuf,
@@ -93,8 +92,9 @@ impl RaftTlsConfig {
         }
     }
 
-    /// Client side: verify the peer against the CA and the node SAN, and
-    /// present our certificate (mTLS).
+    /// Client side: verify the peer against the CA, and present our
+    /// certificate (mTLS). The server name is pinned per connection to the
+    /// manager being dialled (see [`manager_name`]).
     pub fn client_config(&self) -> Result<std::sync::Arc<rustls::ClientConfig>, std::io::Error> {
         let mut roots = rustls::RootCertStore::empty();
         for cert in Self::load_cert_chain(&self.ca_cert)? {
@@ -117,9 +117,10 @@ impl RaftTlsConfig {
         Ok(std::sync::Arc::new(config))
     }
 
-    /// Server side: require every peer to present a certificate signed by
-    /// the cluster CA. An uncredentialed peer fails the handshake — it
-    /// cannot vote, replicate, or be forwarded writes.
+    /// Server side: require every peer to present a manager certificate
+    /// (SAN `minga-manager-<id>`) signed by the cluster CA. An uncredentialed
+    /// peer, or a worker holding its own node certificate from the same CA,
+    /// fails the handshake — it cannot vote, replicate, or forward writes.
     pub fn server_config(&self) -> Result<std::sync::Arc<rustls::ServerConfig>, std::io::Error> {
         let mut roots = rustls::RootCertStore::empty();
         for cert in Self::load_cert_chain(&self.ca_cert)? {
@@ -133,6 +134,7 @@ impl RaftTlsConfig {
         )
         .build()
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+        let client_verifier = std::sync::Arc::new(ManagerOnly(client_verifier));
         let certs = Self::load_cert_chain(&self.cert)?;
         let key = Self::load_key(&self.key)?;
         let config = rustls::ServerConfig::builder_with_provider(std::sync::Arc::new(
@@ -144,6 +146,87 @@ impl RaftTlsConfig {
         .with_single_cert(certs, key)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
         Ok(std::sync::Arc::new(config))
+    }
+}
+
+/// Prefix of the SAN `minga tls issue-node --role manager` puts on a manager
+/// certificate. Workers from the same CA get `minga-worker-<id>` instead.
+pub const MANAGER_NAME_PREFIX: &str = "minga-manager-";
+
+/// The SAN that identifies manager `id` on the Raft transport.
+pub fn manager_name(id: u64) -> String {
+    format!("{MANAGER_NAME_PREFIX}{id}")
+}
+
+/// Whether a DER certificate carries a `minga-manager-<digits>` DNS SAN.
+fn has_manager_san(der: &[u8]) -> bool {
+    let Ok((_, cert)) = x509_parser::parse_x509_certificate(der) else {
+        return false;
+    };
+    let Ok(Some(san)) = cert.subject_alternative_name() else {
+        return false;
+    };
+    san.value.general_names.iter().any(|name| {
+        matches!(name, x509_parser::extensions::GeneralName::DNSName(dns)
+            if dns.strip_prefix(MANAGER_NAME_PREFIX)
+                .is_some_and(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit())))
+    })
+}
+
+/// Client verifier that accepts only manager certificates: chain to the
+/// cluster CA (the wrapped WebPKI verifier) plus a `minga-manager-<id>` SAN.
+#[derive(Debug)]
+struct ManagerOnly(std::sync::Arc<dyn rustls::server::danger::ClientCertVerifier>);
+
+impl rustls::server::danger::ClientCertVerifier for ManagerOnly {
+    fn offer_client_auth(&self) -> bool {
+        self.0.offer_client_auth()
+    }
+
+    fn client_auth_mandatory(&self) -> bool {
+        self.0.client_auth_mandatory()
+    }
+
+    fn root_hint_subjects(&self) -> &[rustls::DistinguishedName] {
+        self.0.root_hint_subjects()
+    }
+
+    fn verify_client_cert(
+        &self,
+        end_entity: &rustls::pki_types::CertificateDer<'_>,
+        intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::server::danger::ClientCertVerified, rustls::Error> {
+        let verified = self.0.verify_client_cert(end_entity, intermediates, now)?;
+        if has_manager_san(end_entity) {
+            Ok(verified)
+        } else {
+            Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::ApplicationVerificationFailure,
+            ))
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.0.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.0.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.0.supported_verify_schemes()
     }
 }
 
@@ -276,9 +359,10 @@ impl TcpNetwork {
         let stream = TcpStream::connect(&self.addr).await?;
         let mut stream: BoxStream = match &self.tls {
             Some(config) => {
-                let name = rustls::pki_types::ServerName::try_from(MINGA_NODE_NAME)
-                    .map_err(|e| TransportError::Decode(e.to_string()))?
-                    .to_owned();
+                // Pin the exact manager we dial: `minga-node` alone is also on
+                // tenant worker certificates from the same CA.
+                let name = rustls::pki_types::ServerName::try_from(manager_name(self.target))
+                    .map_err(|e| TransportError::Decode(e.to_string()))?;
                 let connector = tokio_rustls::TlsConnector::from(config.clone());
                 Box::new(connector.connect(name, stream).await?)
             }
@@ -360,16 +444,17 @@ impl RaftNetwork<TypeConfig> for TcpNetwork {
     }
 }
 
-/// Forwards a client write to the leader at `addr`. Returns the applied
-/// [`StateResponse`]; an error means the write did not commit (the peer
-/// is unreachable or no longer leader — retry to rediscover the leader).
+/// Forwards a client write to the leader `leader_id` at `addr`. Returns the
+/// applied [`StateResponse`]; an error means the write did not commit (the
+/// peer is unreachable or no longer leader — retry to rediscover the leader).
 pub(crate) async fn forward_write(
+    leader_id: u64,
     addr: &str,
     cmd: &StateCommand,
     tls: Option<std::sync::Arc<rustls::ClientConfig>>,
 ) -> Result<StateResponse, StateError> {
     let network = TcpNetwork {
-        target: 0,
+        target: leader_id,
         addr: addr.to_string(),
         tls,
     };
