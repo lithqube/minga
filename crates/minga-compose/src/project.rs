@@ -121,6 +121,18 @@ impl Project {
                     ));
                 }
             }
+            for (i, port) in svc.ports.iter().enumerate() {
+                if port.host_ip.is_some() {
+                    errors.push(ComposeError::Unsupported {
+                        path: format!("{at}.ports[{i}]"),
+                        key: "host_ip".to_string(),
+                        note: Some(
+                            "desired state cannot carry the host IP yet, so it would be silently dropped and the port published on every address"
+                                .to_string(),
+                        ),
+                    });
+                }
+            }
             for net in svc.networks.keys() {
                 if net != DEFAULT_NETWORK && !self.networks.contains_key(net) {
                     errors.push(ComposeError::invalid(
