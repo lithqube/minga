@@ -28,6 +28,23 @@ Rust single-binary orchestrator replacing Docker Swarm for edge/on-prem/air-gapp
 - Any `unsafe`, FFI or raw-syscall change (netns, WireGuard, containerd): run `unsafe-checker` and justify each `unsafe` block with a `// SAFETY:` comment.
 - Use `rust-refactor-helper` for renames and signature changes across crates.
 
+## Agent ownership
+
+Two agents share the board. The OMP harness drains it with `/super-board run`. Claude Code plans, audits security and takes the fixes that need a design call. An issue's owner label says which agent may work it.
+
+| Label | Who works it | The other agent |
+|---|---|---|
+| `owner:omp` | OMP, from Ready, through the board lanes | NEVER builds, QAs, reviews or pushes to it. May comment a finding or file a new issue. |
+| `owner:claude-code` | Claude Code, on its own branch and PR | NEVER claims, moves, builds or comments on it. A wave skips it, even in Ready. |
+
+- Read the owner label before you touch an issue, its board card or its PR. No owner label: don't start it; ask the user.
+- Only the user changes an owner label. If an issue needs the other agent, comment why on it and leave the label.
+- Whoever files an issue sets its owner label:
+  - `owner:omp` for a narrow fix in one area with clear acceptance criteria.
+  - `owner:claude-code` for a design call, Raft or bus semantics, a state migration, a policy decision or a change across several crates.
+- One orchestrator per board. Claude Code runs `/super-board run` only when the user asks, and only while no OMP wave is active. Check `.claude/super-board/inflight/workflow-wave.lock` and live lanes first.
+- NEVER clear `.claude/super-board/github-halt.json` set by the other agent without the user. It pauses both agents.
+
 <!-- super-board:begin v3.1.2 (managed; edits inside are overwritten on upgrade) -->
 ## Super Board
 
