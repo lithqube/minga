@@ -111,4 +111,20 @@ Sequential implementation for one developer: B (NATS TLS/transport boundary) →
 - [x] T4 — Tenant-first bus subjects and keys, per-tenant worker ACL, streams and buckets, operator/JWT mode with scoped signing keys per tenant
 - [x] T5 — Quota enforcement and the per-tenant audit trail
 
-**Next planned code work:** Agent Plane Order 2: B6 distributed tenant/service/customer window budgets, then B7 request-rate limits. Phase 15 T3 live proof remains a release-readiness gate; no VM testing before that gate.
+**Next planned code work:** Phase 16 pulls agent-ready operations (Agent Plane D11/D12) forward for v1.3.0, after Phase 15 implementation; Phase 15 T3 tenant-isolation proof remains a release-candidate gate. No VM testing before the candidate is ready. Agent Plane Order 2 (B6 distributed budgets, then B7 rate limits) follows.
+
+## Phase 16: Agent-ready operations and painless management (pre-v1.3.0)
+**Goal:** Make operational facts trustworthy, common failure modes diagnosable, upgrades predictable, and Minga safely usable by automation and AI agents through a typed, tenant-scoped workflow. Agent changes require a separate authorized approver.
+**Depends on:** Phase 15 implementation (tenant identity, scoping, authorization and audit); Phase 15 T3 VM proof remains a release-candidate gate.
+**Requirements:** OPS-VERSION, OPS-RAFT, OPS-COMPOSE, OPS-DOCTOR, OPS-UPGRADE, AGENT-CONTRACT, AGENT-APPROVAL, RC-PROOF
+**Plan:** `.planning/phases/16-agent-ready-operations/16-PLAN.md`
+**Mode:** standard
+**Status:** Planned for v1.3.0
+
+- [ ] 16-01 — Report exact binary/build and persisted Raft membership, leader and quorum; distinguish them from `--peer` bootstrap inputs.
+- [ ] 16-02 — Verify Compose fidelity, including `deploy.labels`; implement supported behavior or reject it before state changes.
+- [ ] 16-03 — Add read-only `minga-ctl doctor` and redacted support evidence.
+- [ ] 16-04 — Add a compatibility/upgrade preflight with backup, migration and rollback guidance; no destructive side effects.
+- [ ] 16-05 — Implement tenant-scoped typed MCP read tools (Agent Plane D11).
+- [ ] 16-06 — Implement same-tenant maker-checker change requests with audit (Agent Plane D12).
+- [ ] 16-07 — At the v1.3.0 release-candidate gate, prove Phase 15 tenant isolation and staging upgrade on the exact candidate. No VM tests before then.

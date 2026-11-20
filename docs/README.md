@@ -24,6 +24,7 @@ Implementation-status notes distinguish what is merged from what remains propose
 - [Agent-plane roadmap](agent-plane-roadmap.md): Order 1 is merged; remaining cross-node budgets/rate limits and later agent features
 - [Sandbox host-capabilities plan](sandbox-host-capabilities-plan.md): Wasmtime runtime limits and grant schema landed; WASI host support remains open
 - [Planning state](../.planning/STATE.md) and [roadmap](../.planning/ROADMAP.md): phases and verification gates on `main`
+- [Pre-v1.3.0 Phase 16 plan](../.planning/phases/16-agent-ready-operations/16-PLAN.md): operations diagnosis, upgrade preflight, and tenant-scoped agent tools with approval
 - [minga-ctl design plan](minga-ctl-plan.md): operator CLI design and implementation boundaries
 - [Production-readiness plan](production-readiness-plan.md): historical single-node readiness work
 - [Resource benchmark](benchmark.md): measured resource comparisons and caveats
