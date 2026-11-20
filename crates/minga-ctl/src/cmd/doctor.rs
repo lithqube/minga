@@ -8,12 +8,14 @@ use std::time::Duration;
 
 use clap::Args;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::Value;
 
 use crate::config::{Resolved, TokenSource};
 use crate::error::CtlError;
-use crate::output::{self, Format, Rows};
+use crate::output::{self, Format};
 use crate::transport::Connection;
+
+use super::report::{self, Finding, Severity, Status};
 
 const BUNDLE_INCLUDED: &[&str] = &[
     "client and server version/build metadata",
@@ -42,53 +44,6 @@ pub struct DoctorArgs {
     /// Seconds each API or readiness probe may take.
     #[arg(long, default_value_t = 5, value_parser = clap::value_parser!(u64).range(1..=60))]
     timeout: u64,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-enum Severity {
-    Info,
-    Warning,
-    Error,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-enum Status {
-    Ok,
-    Degraded,
-    Failed,
-    Unknown,
-}
-
-#[derive(Debug, Serialize)]
-struct Finding {
-    id: &'static str,
-    severity: Severity,
-    status: Status,
-    summary: String,
-    evidence: String,
-    next_action: &'static str,
-}
-
-impl Finding {
-    fn new(
-        id: &'static str,
-        severity: Severity,
-        status: Status,
-        summary: impl Into<String>,
-        evidence: impl Into<String>,
-        next_action: &'static str,
-    ) -> Self {
-        Self {
-            id,
-            severity,
-            status,
-            summary: summary.into(),
-            evidence: evidence.into(),
-            next_action,
-        }
-    }
 }
 
 #[derive(Debug, Serialize)]
@@ -517,15 +472,7 @@ pub async fn run(
         eprintln!("wrote sanitized support bundle to {}", path.display());
     }
     print_report(&report, format, quiet)?;
-    let failed = report
-        .findings
-        .iter()
-        .filter(|finding| finding.severity == Severity::Error && finding.status == Status::Failed)
-        .count();
-    if failed > 0 {
-        return Err(CtlError::HealthFailed { failed });
-    }
-    Ok(())
+    report::exit_status(&report.findings)
 }
 
 async fn collect_inventory(report: &mut DoctorReport, conn: &Connection, timeout: Duration) {
@@ -754,59 +701,16 @@ fn probe_error_evidence(error: &ProbeError) -> String {
 
 fn print_report(report: &DoctorReport, format: Format, quiet: bool) -> Result<(), CtlError> {
     if quiet {
-        let ids = report
-            .findings
-            .iter()
-            .filter(|finding| finding.status != Status::Ok)
-            .map(|finding| finding.id)
-            .collect::<Vec<_>>()
-            .join("\n");
-        return output::say(false, &ids);
+        return report::print_quiet(&report.findings);
     }
     if format == Format::Table {
-        let mut rows = Rows::new(&[
-            "CHECK",
-            "STATUS",
-            "SEVERITY",
-            "SUMMARY",
-            "EVIDENCE",
-            "NEXT ACTION",
-        ]);
-        for finding in &report.findings {
-            let status = format!("{:?}", finding.status).to_lowercase();
-            let severity = format!("{:?}", finding.severity).to_lowercase();
-            rows.push(
-                vec![
-                    finding.id.to_owned(),
-                    status.clone(),
-                    severity.clone(),
-                    finding.summary.clone(),
-                    finding.evidence.clone(),
-                    finding.next_action.to_owned(),
-                ],
-                json!({
-                    "check": finding.id,
-                    "status": status,
-                    "severity": severity,
-                    "summary": finding.summary,
-                    "evidence": finding.evidence,
-                    "next_action": finding.next_action,
-                }),
-            );
-        }
-        return output::print(Format::Table, false, &rows);
+        return output::print(
+            Format::Table,
+            false,
+            &report::finding_rows(&report.findings),
+        );
     }
-    let text = match format {
-        Format::Json => serde_json::to_string_pretty(report)?,
-        Format::Yaml => {
-            serde_yaml::to_string(report).map_err(|error| CtlError::Output(error.to_string()))?
-        }
-        Format::Table => unreachable!(),
-    };
-    let mut stdout = std::io::stdout().lock();
-    writeln!(stdout, "{text}")
-        .and_then(|()| stdout.flush())
-        .map_err(|error| CtlError::Output(format!("write to stdout: {error}")))
+    report::print_structured(report, format)
 }
 
 fn write_bundle(path: &Path, report: &DoctorReport) -> Result<(), CtlError> {
@@ -837,6 +741,7 @@ mod tests {
     use crate::api::ApiClient;
     use crate::config::{Context, Resolved};
     use crate::transport::Connection;
+    use serde_json::json;
 
     #[test]
     fn support_bundle_redacts_secrets_paths_and_endpoints() {

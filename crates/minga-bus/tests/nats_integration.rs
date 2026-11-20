@@ -436,3 +436,43 @@ async fn nats_usage_skips_bad_records_and_keeps_newest() {
         .unwrap()
         .is_empty());
 }
+
+#[tokio::test]
+async fn nats_tenant_event_history_is_filtered_bounded_and_publish_stamped() {
+    let Some(bus) = connect().await else {
+        return;
+    };
+    let tenant = format!("evh{}", std::process::id());
+    let before = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    for (owner, task) in [
+        (tenant.as_str(), "one"),
+        ("evh-other", "two"),
+        (tenant.as_str(), "three"),
+    ] {
+        bus.publish_tenant_event(
+            owner,
+            &format!("minga.{owner}.task.{task}.event"),
+            task.as_bytes(),
+        )
+        .await
+        .expect("failed to publish tenant event");
+    }
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+
+    let events = bus
+        .tenant_event_history(&tenant, 1)
+        .await
+        .expect("failed to read tenant event history");
+    assert_eq!(events.len(), 1);
+    assert_eq!(
+        events[0].subject,
+        format!("minga.{tenant}.task.three.event")
+    );
+    assert_eq!(events[0].payload, b"three");
+    // The publish time, not the time of the read a second later.
+    assert!(events[0].timestamp >= before.saturating_sub(1_000));
+    assert!(events[0].timestamp < before + 1_000);
+}

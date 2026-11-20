@@ -1,6 +1,5 @@
 //! `minga-ctl upgrade preflight`: read-only compatibility and maintenance planning.
 
-use std::io::Write;
 use std::time::Duration;
 
 use clap::{Args, Subcommand};
@@ -9,8 +8,10 @@ use serde_json::{json, Value};
 
 use crate::config::Resolved;
 use crate::error::CtlError;
-use crate::output::{self, Format, Rows};
+use crate::output::{self, Format};
 use crate::transport::Connection;
+
+use super::report::{self, Finding, Severity, Status};
 
 const TARGET_RELEASE: ReleaseMetadata = ReleaseMetadata {
     version: "1.3.0",
@@ -78,32 +79,6 @@ struct PreflightArgs {
     /// Seconds each API request may take.
     #[arg(long, default_value_t = 5, value_parser = clap::value_parser!(u64).range(1..=60))]
     timeout: u64,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-enum Severity {
-    Info,
-    Warning,
-    Error,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-enum Status {
-    Ok,
-    Failed,
-    Unknown,
-}
-
-#[derive(Debug, Serialize)]
-struct Finding {
-    id: &'static str,
-    severity: Severity,
-    status: Status,
-    summary: &'static str,
-    evidence: String,
-    next_action: &'static str,
 }
 
 #[derive(Debug, Serialize)]
@@ -299,7 +274,7 @@ pub async fn run(
         id: "current-binary",
         severity: Severity::Info,
         status: Status::Ok,
-        summary: "current server identity observed",
+        summary: "current server identity observed".into(),
         evidence: format!(
             "server {}; build {}; state format {}",
             report.current.version,
@@ -329,7 +304,7 @@ pub async fn run(
             id: "api-security",
             severity: Severity::Info,
             status: Status::Ok,
-            summary: "selected API context has authentication and protected transport configured",
+            summary: "selected API context has authentication and protected transport configured".into(),
             evidence: format!(
                 "API token configured {}; transport protected by {}",
                 report.current.api_auth_configured,
@@ -346,7 +321,7 @@ pub async fn run(
             id: "api-security",
             severity: Severity::Warning,
             status: Status::Unknown,
-            summary: "selected API context does not prove authenticated protected transport",
+            summary: "selected API context does not prove authenticated protected transport".into(),
             evidence: format!(
                 "API token configured {}; protected transport configured {}",
                 report.current.api_auth_configured, report.current.api_transport_secure
@@ -358,7 +333,7 @@ pub async fn run(
         id: "nats-compatibility",
         severity: Severity::Warning,
         status: Status::Unknown,
-        summary: "target NATS compatibility is known; current external bus is not independently identified",
+        summary: "target NATS compatibility is known; current external bus is not independently identified".into(),
         evidence: format!(
             "target bundle NATS {}; external NATS tested on {}; require JetStream API level {}; current bundled version {}; current external API level not reported",
             target.bundled_nats,
@@ -381,7 +356,7 @@ pub async fn run(
         } else {
             Status::Unknown
         },
-        summary: "legacy resources migrate into the default tenant",
+        summary: "legacy resources migrate into the default tenant".into(),
         evidence: format!(
             "state migration defaults legacy resource ownership to `default` and ensures the default tenant; current tenant count {}",
             report.current.tenant_count.map_or("unavailable".to_owned(), |n| n.to_string())
@@ -392,7 +367,7 @@ pub async fn run(
         id: "release-gate",
         severity: Severity::Warning,
         status: Status::Unknown,
-        summary: "target release is not yet approved for production upgrade",
+        summary: "target release is not yet approved for production upgrade".into(),
         evidence: format!("v{}: {}", target.version, target.release_status),
         next_action: "Wait for the v1.3.0 release candidate and complete the documented candidate gate before any VM or staging upgrade.",
     });
@@ -409,9 +384,9 @@ pub async fn run(
             Status::Unknown
         },
         summary: if report.current.node_count.is_some() && tenants_known {
-            "read-only cluster inventory collected"
+            "read-only cluster inventory collected".into()
         } else {
-            "cluster inventory is incomplete"
+            "cluster inventory is incomplete".into()
         },
         evidence: format!(
             "node count {}; tenant count {}; service names and IDs omitted",
@@ -428,20 +403,7 @@ pub async fn run(
     });
 
     print_report(&report, format, quiet)?;
-    let failed = blocking_findings(&report.findings);
-    if failed > 0 {
-        return Err(CtlError::HealthFailed { failed });
-    }
-    Ok(())
-}
-
-/// Every `Error` finding blocks, including one whose check could not run:
-/// a preflight that cannot confirm a precondition must not exit 0.
-fn blocking_findings(findings: &[Finding]) -> usize {
-    findings
-        .iter()
-        .filter(|finding| finding.severity == Severity::Error)
-        .count()
+    report::exit_status(&report.findings)
 }
 
 async fn request<T>(
@@ -474,7 +436,7 @@ fn raft_finding(raft: Result<&RaftSummary, &str>) -> Finding {
             id: "raft-membership",
             severity: Severity::Error,
             status: Status::Failed,
-            summary: "Raft is not ready for an upgrade",
+            summary: "Raft is not ready for an upgrade".into(),
             evidence: raft_evidence(raft),
             next_action: "Restore leader readiness and recent quorum acknowledgement before planning a coordinated upgrade.",
         },
@@ -485,7 +447,7 @@ fn raft_finding(raft: Result<&RaftSummary, &str>) -> Finding {
                 id: "raft-membership",
                 severity: Severity::Warning,
                 status: Status::Unknown,
-                summary: "Raft membership is observed but quorum is not fully confirmed",
+                summary: "Raft membership is observed but quorum is not fully confirmed".into(),
                 evidence: raft_evidence(raft),
                 next_action: "Confirm all manager processes and quorum on the leader before the maintenance window.",
             }
@@ -494,7 +456,7 @@ fn raft_finding(raft: Result<&RaftSummary, &str>) -> Finding {
             id: "raft-membership",
             severity: Severity::Info,
             status: Status::Ok,
-            summary: "Raft membership and recent quorum are observed",
+            summary: "Raft membership and recent quorum are observed".into(),
             evidence: raft_evidence(raft),
             next_action: "Keep the membership stable during the coordinated manager upgrade.",
         },
@@ -502,7 +464,7 @@ fn raft_finding(raft: Result<&RaftSummary, &str>) -> Finding {
             id: "raft-membership",
             severity: Severity::Error,
             status: Status::Unknown,
-            summary: "Raft membership could not be read",
+            summary: "Raft membership could not be read".into(),
             evidence: format!("The server did not return cluster diagnostics: {reason}"),
             next_action: "Use an authenticated operator context and confirm the membership with `minga-ctl info` before the upgrade.",
         },
@@ -538,7 +500,7 @@ fn state_format_finding(current: Option<u8>, target: u8) -> Finding {
             id: "state-format",
             severity: Severity::Info,
             status: Status::Ok,
-            summary: "persisted state format already matches target",
+            summary: "persisted state format already matches target".into(),
             evidence: format!("current and target format are v{target}"),
             next_action: "No state-format migration is required.",
         },
@@ -546,7 +508,7 @@ fn state_format_finding(current: Option<u8>, target: u8) -> Finding {
             id: "state-format",
             severity: Severity::Info,
             status: Status::Ok,
-            summary: "direct persisted state migration is implemented",
+            summary: "direct persisted state migration is implemented".into(),
             evidence: format!(
                 "format v{version} migrates directly to v{target} on open; Raft peer and worker wire frames require the target format on every node"
             ),
@@ -556,7 +518,7 @@ fn state_format_finding(current: Option<u8>, target: u8) -> Finding {
             id: "state-format",
             severity: Severity::Error,
             status: Status::Failed,
-            summary: "current state format has no migration to target",
+            summary: "current state format has no migration to target".into(),
             evidence: format!(
                 "no migration from format v{version} to v{target}; this build migrates formats v2 through v10"
             ),
@@ -566,7 +528,7 @@ fn state_format_finding(current: Option<u8>, target: u8) -> Finding {
             id: "state-format",
             severity: Severity::Error,
             status: Status::Failed,
-            summary: "current state format is newer than target",
+            summary: "current state format is newer than target".into(),
             evidence: format!(
                 "current format v{version} is newer than target format v{target}; this target cannot read it"
             ),
@@ -576,7 +538,7 @@ fn state_format_finding(current: Option<u8>, target: u8) -> Finding {
             id: "state-format",
             severity: Severity::Error,
             status: Status::Failed,
-            summary: "no supported direct state migration is known",
+            summary: "no supported direct state migration is known".into(),
             evidence: format!(
                 "no direct migration from format v{version} to v{target}; supported migration sources are v2 through v10"
             ),
@@ -586,7 +548,7 @@ fn state_format_finding(current: Option<u8>, target: u8) -> Finding {
             id: "state-format",
             severity: Severity::Error,
             status: Status::Unknown,
-            summary: "current persisted state format could not be established",
+            summary: "current persisted state format could not be established".into(),
             evidence: "The running server did not report its format and its version has no trusted release metadata.".to_owned(),
             next_action: "Do not upgrade until the current state format is confirmed from trusted release metadata or a supported diagnostics endpoint.",
         },
@@ -595,50 +557,10 @@ fn state_format_finding(current: Option<u8>, target: u8) -> Finding {
 
 fn print_report(report: &UpgradeReport, format: Format, quiet: bool) -> Result<(), CtlError> {
     if quiet {
-        let ids = report
-            .findings
-            .iter()
-            .filter(|finding| finding.status != Status::Ok)
-            .map(|finding| finding.id)
-            .collect::<Vec<_>>()
-            .join("\n");
-        return if ids.is_empty() {
-            Ok(())
-        } else {
-            output::say(false, &ids)
-        };
+        return report::print_quiet(&report.findings);
     }
     if format == Format::Table {
-        let mut rows = Rows::new(&[
-            "CHECK",
-            "STATUS",
-            "SEVERITY",
-            "SUMMARY",
-            "EVIDENCE",
-            "NEXT ACTION",
-        ]);
-        for finding in &report.findings {
-            let status = format!("{:?}", finding.status).to_lowercase();
-            let severity = format!("{:?}", finding.severity).to_lowercase();
-            rows.push(
-                vec![
-                    finding.id.to_owned(),
-                    status.clone(),
-                    severity.clone(),
-                    finding.summary.to_owned(),
-                    finding.evidence.clone(),
-                    finding.next_action.to_owned(),
-                ],
-                json!({
-                    "check": finding.id,
-                    "status": status,
-                    "severity": severity,
-                    "summary": finding.summary,
-                    "evidence": finding.evidence,
-                    "next_action": finding.next_action,
-                }),
-            );
-        }
+        let mut rows = report::finding_rows(&report.findings);
         for (index, step) in report.ordered_steps.iter().enumerate() {
             let id = format!("plan-step-{}", index + 1);
             rows.push(
@@ -670,17 +592,7 @@ fn print_report(report: &UpgradeReport, format: Format, quiet: bool) -> Result<(
         );
         return output::print(Format::Table, false, &rows);
     }
-    let text = match format {
-        Format::Json => serde_json::to_string_pretty(report)?,
-        Format::Yaml => {
-            serde_yaml::to_string(report).map_err(|error| CtlError::Output(error.to_string()))?
-        }
-        Format::Table => unreachable!(),
-    };
-    let mut stdout = std::io::stdout().lock();
-    writeln!(stdout, "{text}")
-        .and_then(|()| stdout.flush())
-        .map_err(|error| CtlError::Output(format!("write to stdout: {error}")))
+    report::print_structured(report, format)
 }
 
 #[cfg(test)]
@@ -767,13 +679,13 @@ mod tests {
             id: "release-gate",
             severity: Severity::Warning,
             status: Status::Unknown,
-            summary: "",
+            summary: "".into(),
             evidence: String::new(),
             next_action: "",
         };
-        assert_eq!(blocking_findings(&[unknown_format]), 1);
-        assert_eq!(blocking_findings(&[unread_raft]), 1);
-        assert_eq!(blocking_findings(&[warning]), 0);
-        assert_eq!(blocking_findings(&[state_format_finding(Some(10), 11)]), 0);
+        assert!(report::exit_status(&[unknown_format]).is_err());
+        assert!(report::exit_status(&[unread_raft]).is_err());
+        assert!(report::exit_status(&[warning]).is_ok());
+        assert!(report::exit_status(&[state_format_finding(Some(10), 11)]).is_ok());
     }
 }

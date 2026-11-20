@@ -7,7 +7,9 @@ use std::path::Path;
 
 use minga_api::auth::{ApiRole, ClientIdentity};
 use serde_json::{json, Map, Value};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader as AsyncBufReader};
+use tokio::io::{
+    AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader as AsyncBufReader,
+};
 
 use crate::McpServeArgs;
 
@@ -32,21 +34,20 @@ pub async fn serve(args: McpServeArgs) -> Result<(), String> {
     let mut line = Vec::new();
 
     loop {
-        line.clear();
-        let bytes = input
-            .read_until(b'\n', &mut line)
+        match read_message(&mut input, &mut line)
             .await
-            .map_err(|error| format!("read MCP input: {error}"))?;
-        if bytes == 0 {
-            return Ok(());
-        }
-        if line.len() > MAX_MESSAGE_BYTES {
-            write_response(
-                &mut stdout,
-                jsonrpc_error(Value::Null, -32700, "message exceeds 1 MiB"),
-            )
-            .await?;
-            continue;
+            .map_err(|error| format!("read MCP input: {error}"))?
+        {
+            Incoming::Eof => return Ok(()),
+            Incoming::TooLarge => {
+                write_response(
+                    &mut stdout,
+                    jsonrpc_error(Value::Null, -32700, "message exceeds 1 MiB"),
+                )
+                .await?;
+                continue;
+            }
+            Incoming::Message => {}
         }
 
         let response = match serde_json::from_slice::<Value>(&line) {
@@ -57,6 +58,36 @@ pub async fn serve(args: McpServeArgs) -> Result<(), String> {
             write_response(&mut stdout, response).await?;
         }
     }
+}
+
+enum Incoming {
+    Eof,
+    Message,
+    TooLarge,
+}
+
+/// Reads one newline-delimited message into `line`, holding at most
+/// `MAX_MESSAGE_BYTES + 1` bytes: an oversized line is discarded as it streams.
+async fn read_message<R: AsyncBufRead + Unpin>(
+    input: &mut R,
+    line: &mut Vec<u8>,
+) -> std::io::Result<Incoming> {
+    let limit = MAX_MESSAGE_BYTES as u64 + 1;
+    line.clear();
+    if (&mut *input).take(limit).read_until(b'\n', line).await? == 0 {
+        return Ok(Incoming::Eof);
+    }
+    if line.len() <= MAX_MESSAGE_BYTES {
+        return Ok(Incoming::Message);
+    }
+    while !line.ends_with(b"\n") {
+        line.clear();
+        if (&mut *input).take(limit).read_until(b'\n', line).await? == 0 {
+            break;
+        }
+    }
+    line.clear();
+    Ok(Incoming::TooLarge)
 }
 
 async fn write_response(stdout: &mut tokio::io::Stdout, response: Value) -> Result<(), String> {
@@ -466,6 +497,7 @@ fn required_id<'a>(arguments: &'a Value, key: &str) -> Result<&'a str, &'static 
         .and_then(Value::as_str)
         .ok_or("task_id is required")?;
     if value.is_empty()
+        || value.bytes().all(|byte| byte == b'.')
         || value.len() > 255
         || !value
             .bytes()
@@ -681,6 +713,76 @@ fn tool(name: &str, description: &str, input_schema: Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn offline_server(role: ApiRole) -> McpServer {
+        McpServer {
+            client: reqwest::Client::new(),
+            root: "https://127.0.0.1:1".to_owned(),
+            tenant_id: "tenant-a".to_owned(),
+            role,
+        }
+    }
+
+    async fn call(server: &McpServer, name: &str, arguments: Value) -> Value {
+        server
+            .handle(json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": name, "arguments": arguments}
+            }))
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn tool_calls_outside_the_allow_list_are_refused() {
+        let viewer = offline_server(ApiRole::Viewer);
+        for name in ["deploy", "scale", "../services", "services/x", ""] {
+            let response = call(&viewer, name, json!({})).await;
+            assert_eq!(response["error"]["message"], "unknown tool", "{name}");
+        }
+        // The proposal tool exists only for agent certificates.
+        let response = call(&viewer, "request_change", json!({})).await;
+        assert_eq!(response["error"]["message"], "unknown tool");
+    }
+
+    #[tokio::test]
+    async fn the_tenant_comes_from_the_certificate_not_the_arguments() {
+        let server = offline_server(ApiRole::Agent);
+        let response = call(&server, "tenants", json!({})).await;
+        let text = response["result"]["content"][0]["text"].as_str().unwrap();
+        assert_eq!(text, r#"[{"id":"tenant-a"}]"#);
+        let response = call(&server, "tenants", json!({"tenant_id": "tenant-b"})).await;
+        assert!(response.get("error").is_some());
+        let response = call(&server, "logs", json!({"task_id": ".."})).await;
+        assert_eq!(
+            response["error"]["message"],
+            "task_id contains unsupported characters"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_oversized_message_is_skipped_without_buffering_it() {
+        let mut input = vec![b'a'; MAX_MESSAGE_BYTES + 10];
+        input.extend_from_slice(b"\n{\"jsonrpc\":\"2.0\"}\n");
+        let mut reader = input.as_slice();
+        let mut line = Vec::new();
+        assert!(matches!(
+            read_message(&mut reader, &mut line).await.unwrap(),
+            Incoming::TooLarge
+        ));
+        assert!(line.capacity() <= 2 * (MAX_MESSAGE_BYTES + 1));
+        assert!(matches!(
+            read_message(&mut reader, &mut line).await.unwrap(),
+            Incoming::Message
+        ));
+        assert_eq!(line, b"{\"jsonrpc\":\"2.0\"}\n");
+        assert!(matches!(
+            read_message(&mut reader, &mut line).await.unwrap(),
+            Incoming::Eof
+        ));
+    }
 
     #[test]
     fn mcp_tools_are_read_only_and_have_closed_argument_schemas() {

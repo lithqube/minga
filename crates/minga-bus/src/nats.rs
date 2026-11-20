@@ -1400,12 +1400,15 @@ impl EventBus for NatsBus {
             .get_stream("MINGA_EVENTS")
             .await
             .map_err(|error| BusError::Subscribe(format!("get MINGA_EVENTS: {error}")))?;
+        // shortcut: scans the tenant's retained events (72h) per call, like
+        // tenant_log_history; seek by start sequence if that retention grows.
         let mut consumer = stream
-            .create_consumer(bounded(PullConsumerConfig {
+            .create_consumer(PullConsumerConfig {
                 filter_subjects: vec![subjects::tenant_event_wildcard(tenant_id)],
+                ack_policy: AckPolicy::None,
                 deliver_policy: DeliverPolicy::All,
                 ..Default::default()
-            }))
+            })
             .await
             .map_err(|error| {
                 BusError::Subscribe(format!("tenant event history consumer: {error}"))
@@ -1440,13 +1443,17 @@ impl EventBus for NatsBus {
                         "tenant event subject does not match its filter".into(),
                     ));
                 }
-                message.ack().await.map_err(|error| {
-                    BusError::Subscribe(format!("tenant event history ack: {error}"))
-                })?;
+                // The publish time, not the read time.
+                let timestamp = message
+                    .info()
+                    .map(|info| (info.published.unix_timestamp_nanos() / 1_000_000) as u64)
+                    .map_err(|error| {
+                        BusError::Subscribe(format!("tenant event history metadata: {error}"))
+                    })?;
                 events.push_back(BusEvent {
                     subject: message.subject.to_string(),
                     payload: message.payload.to_vec(),
-                    timestamp: now_millis(),
+                    timestamp,
                 });
                 while events.len() > limit {
                     events.pop_front();

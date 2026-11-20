@@ -1393,6 +1393,62 @@ async fn change_requests_require_distinct_approval_and_apply_atomically() {
 }
 
 #[tokio::test]
+async fn a_decided_or_superseded_request_cannot_apply_again() {
+    let (_dir, path) = written_dir().await;
+    let store = StateStore::open(1, "127.0.0.1:0", &path, BTreeMap::new())
+        .await
+        .unwrap();
+    let decide = |id: &str, actor: &str, approve: bool| {
+        store.decide_change_request(id.into(), "default".into(), actor.into(), approve, 150)
+    };
+
+    // A second decision on an approved request is refused and applies nothing.
+    let request = change_request();
+    store.create_change_request(request.clone()).await.unwrap();
+    decide(&request.id, "deployer", true).await.unwrap();
+    assert!(decide(&request.id, "admin", true).await.is_err());
+    assert!(decide(&request.id, "admin", false).await.is_err());
+    let approved = store
+        .get_change_request(&request.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(approved.status, ChangeRequestStatus::Approved);
+    assert_eq!(approved.reviewer.as_deref(), Some("deployer"));
+    let current = store
+        .get_service(&request.service_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(current.replicas, request.after.replicas);
+
+    // A service changed after the request was made: approval must not
+    // overwrite the newer state.
+    let mut stale = change_request();
+    stale.id = "cr-stale".into();
+    stale.before = current.clone();
+    stale.after = current.clone();
+    stale.after.replicas = 9;
+    store.create_change_request(stale.clone()).await.unwrap();
+    let mut newer = current.clone();
+    newer.replicas = 5;
+    store.upsert_service(newer).await.unwrap();
+    assert!(decide(&stale.id, "deployer", true).await.is_err());
+    let stale = store.get_change_request("cr-stale").await.unwrap().unwrap();
+    assert_eq!(stale.status, ChangeRequestStatus::Superseded);
+    assert_eq!(
+        store
+            .get_service(&request.service_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .replicas,
+        5
+    );
+    store.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn removing_a_tenant_drops_its_change_requests() {
     let (_dir, path) = written_dir().await;
     let store = StateStore::open(1, "127.0.0.1:0", &path, BTreeMap::new())

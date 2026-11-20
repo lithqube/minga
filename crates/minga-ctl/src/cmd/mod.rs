@@ -8,6 +8,7 @@ pub mod image;
 pub mod info;
 pub mod metrics;
 pub mod registry;
+pub(crate) mod report;
 pub mod secret;
 pub mod service;
 pub mod stack;
