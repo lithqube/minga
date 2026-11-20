@@ -109,6 +109,7 @@ Cross-node container traffic remains unavailable until the peer, route and relay
 ## Implementation status (2026-11-19)
 
 - Phase 13 implemented cluster-wide subnet allocation, node WireGuard interfaces, tenant-scoped peer/route assignments, NAT relay through managers, cross-network isolation and ingress publishing. Since ADR 0008 the peer assignment key carries the tenant: `{tenant}.node.{id}.wg`.
+- The Context above records the state before Phase 13. Now the WireGuard listen port is one per node (`--wg-listen`), not one per network. `ports[].mode` is honored: `host` publishes a node-local DNAT on the task's node, and `ingress` (the default) publishes through the mesh on every node. Network `driver_opts` other than `encrypted` fail translation, and `encrypted` is a no-op.
 - T2/T3 live proof passed, including cross-node traffic, relay failover and ingress. Short iperf3 results are topology-specific measurements, not capacity estimates.
 - Multi-manager topologies require reachable manager UDP endpoints. A manager relaying between NAT-isolated workers decrypts and re-encrypts their packets and is a trusted observer.
 - T4 scale (~5,000 workers), IPv6 overlay and IPv6-only underlays are not verified/supported by this ADR.
