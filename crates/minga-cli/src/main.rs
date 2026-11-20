@@ -3041,10 +3041,10 @@ fn project_dir(compose_file: &str) -> Option<std::path::PathBuf> {
     dir.canonicalize().ok()
 }
 
-/// Whether a `host:port` bind address only listens on loopback. Unparsable
-/// addresses count as not loopback, so the caller warns rather than stays quiet.
-/// Whether two CA PEM files share a certificate (or are byte-identical).
-/// Missing files are left to the loaders that report them.
+/// Whether two CA PEM files overlap: byte-identical, sharing a certificate,
+/// or one holding a certificate issued by one in the other (a root and its
+/// intermediate). Issuers match by DN, so unrelated CAs with the same subject
+/// are refused too (fail closed). Missing files are left to the loaders.
 fn cas_overlap(a: &Path, b: &Path) -> Result<bool, String> {
     if !a.exists() || !b.exists() {
         return Ok(false);
@@ -3053,13 +3053,34 @@ fn cas_overlap(a: &Path, b: &Path) -> Result<bool, String> {
         std::fs::read(path).map_err(|error| format!("cannot read CA {}: {error}", path.display()))
     };
     let (a_pem, b_pem) = (read(a)?, read(b)?);
-    let a_certs = pem_certificates(&a_pem);
-    Ok(a_pem == b_pem
-        || pem_certificates(&b_pem)
+    let (a_certs, b_certs) = (pem_certificates(&a_pem), pem_certificates(&b_pem));
+    // (subject, issuer) raw DNs of every parsable certificate in a bundle.
+    let names = |certs: &[Vec<u8>]| -> Vec<(Vec<u8>, Vec<u8>)> {
+        certs
             .iter()
-            .any(|cert| a_certs.contains(cert)))
+            .filter_map(|der| x509_parser::parse_x509_certificate(der).ok())
+            .map(|(_, cert)| {
+                (
+                    cert.subject().as_raw().to_vec(),
+                    cert.issuer().as_raw().to_vec(),
+                )
+            })
+            .collect()
+    };
+    let issued_by = |children: &[(Vec<u8>, Vec<u8>)], parents: &[(Vec<u8>, Vec<u8>)]| {
+        children
+            .iter()
+            .any(|(_, issuer)| parents.iter().any(|(subject, _)| subject == issuer))
+    };
+    let (a_names, b_names) = (names(&a_certs), names(&b_certs));
+    Ok(a_pem == b_pem
+        || b_certs.iter().any(|cert| a_certs.contains(cert))
+        || issued_by(&a_names, &b_names)
+        || issued_by(&b_names, &a_names))
 }
 
+/// Whether a `host:port` bind address only listens on loopback. Unparsable
+/// addresses count as not loopback, so the caller warns rather than stays quiet.
 fn is_loopback_bind(addr: &str) -> bool {
     let host = match addr.strip_prefix('[') {
         Some(rest) => rest.split(']').next().unwrap_or(""),
@@ -3421,13 +3442,26 @@ mod tests {
 
     #[test]
     fn cas_overlap_detects_a_shared_certificate() {
-        let pem = |name: &str| {
-            let key = rcgen::KeyPair::generate().unwrap();
+        let ca_params = |name: &str| {
             let mut params = rcgen::CertificateParams::new(vec![name.to_string()]).unwrap();
             params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-            params.self_signed(&key).unwrap().pem()
+            params.distinguished_name = rcgen::DistinguishedName::new();
+            params
+                .distinguished_name
+                .push(rcgen::DnType::CommonName, name);
+            params
         };
-        let (ca1, ca2) = (pem("ca-one"), pem("ca-two"));
+        let root_key = rcgen::KeyPair::generate().unwrap();
+        let root = ca_params("ca-one").self_signed(&root_key).unwrap();
+        let ca1 = root.pem();
+        let ca2 = ca_params("ca-two")
+            .self_signed(&rcgen::KeyPair::generate().unwrap())
+            .unwrap()
+            .pem();
+        let intermediate = ca_params("ca-one-intermediate")
+            .signed_by(&rcgen::KeyPair::generate().unwrap(), &root, &root_key)
+            .unwrap()
+            .pem();
         let dir = tempdir().unwrap();
         let write = |file: &str, body: &str| {
             let path = dir.path().join(file);
@@ -3442,7 +3476,13 @@ mod tests {
             cas_overlap(&one, &bundle).unwrap(),
             "a bundle containing the CA overlaps"
         );
+        let child = write("intermediate.pem", &intermediate);
+        assert!(
+            cas_overlap(&one, &child).unwrap() && cas_overlap(&child, &one).unwrap(),
+            "a root and an intermediate it issued overlap, in either order"
+        );
         assert!(!cas_overlap(&one, &two).unwrap());
+        assert!(!cas_overlap(&two, &child).unwrap());
         assert!(!cas_overlap(&one, &dir.path().join("missing.pem")).unwrap());
     }
 

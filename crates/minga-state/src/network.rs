@@ -444,9 +444,10 @@ impl RaftNetwork<TypeConfig> for TcpNetwork {
     }
 }
 
-/// Forwards a client write to the leader `leader_id` at `addr`. Returns the
-/// applied [`StateResponse`]; an error means the write did not commit (the
-/// peer is unreachable or no longer leader — retry to rediscover the leader).
+/// Forwards a client write to the leader `leader_id` at `addr`. `Ok` carries
+/// the applied [`StateResponse`]. An error leaves the outcome unknown: the
+/// leader may have committed the write before the reply was lost, so a retry
+/// must tolerate the write having already applied.
 pub(crate) async fn forward_write(
     leader_id: u64,
     addr: &str,
@@ -655,5 +656,34 @@ impl RaftNetwork<TypeConfig> for StubNetwork {
         _option: RPCOption,
     ) -> Result<VoteResponse<u64>, RPCError<u64, BasicNode, RaftError<u64>>> {
         Err(network_err("stub network: vote should never be called"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cert_with(names: &[&str]) -> Vec<u8> {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let names: Vec<String> = names.iter().map(|name| name.to_string()).collect();
+        let params = rcgen::CertificateParams::new(names).unwrap();
+        params.self_signed(&key).unwrap().der().to_vec()
+    }
+
+    #[test]
+    fn only_a_numbered_manager_san_counts() {
+        assert!(has_manager_san(&cert_with(&[
+            "minga-node",
+            &manager_name(1)
+        ])));
+        for names in [
+            &["minga-node", "minga-worker-2"][..],
+            &["minga-manager-"],
+            &["minga-manager-1x"],
+            &["minga-node"],
+        ] {
+            assert!(!has_manager_san(&cert_with(names)), "{names:?}");
+        }
+        assert!(!has_manager_san(b"not a certificate"));
     }
 }

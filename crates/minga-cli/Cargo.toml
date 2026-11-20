@@ -27,6 +27,7 @@ libc.workspace = true
 rand.workspace = true
 rcgen.workspace = true
 rustls-pemfile.workspace = true
+x509-parser.workspace = true
 time.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
