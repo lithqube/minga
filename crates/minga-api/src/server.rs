@@ -2502,6 +2502,25 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(rejected["status"], "rejected");
 
+        // The status filter runs before the limit: the one pending request
+        // (the rollback) is found even behind newer decided ones.
+        let (status, pending) = send_request(
+            router.clone(),
+            request(
+                "GET",
+                "/minga/change-requests?status=pending&limit=1",
+                ApiRole::Viewer,
+                "default",
+                "viewer-a",
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let pending = pending.as_array().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0]["service_id"], "svc-rollback");
+
         let expired_before = store.get_service("svc-a").await.unwrap().unwrap();
         let mut expired_after = expired_before.clone();
         expired_after.replicas += 1;

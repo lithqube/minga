@@ -22,6 +22,9 @@ pub struct ListArgs {
     /// Maximum number of recent requests.
     #[arg(long, default_value_t = 50, value_parser = clap::value_parser!(u8).range(1..=100))]
     limit: u8,
+    /// Only requests still waiting for a decision.
+    #[arg(long)]
+    pending: bool,
 }
 
 #[derive(Debug, Args)]
@@ -38,7 +41,7 @@ pub async fn run(
 ) -> Result<(), CtlError> {
     match command {
         ChangeCommand::List(args) => {
-            let requests = api.tenant_change_requests(args.limit).await?;
+            let requests = api.tenant_change_requests(args.limit, args.pending).await?;
             let rows = requests.as_array().ok_or_else(|| CtlError::Api {
                 status: 502,
                 message: "change request list has an invalid shape".into(),

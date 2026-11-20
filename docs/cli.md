@@ -280,7 +280,7 @@ Through the API:
 | `upgrade preflight --to v1.3.0` | Read-only compatibility, Raft membership/quorum, selected-context auth/transport, backup, NATS, tenant impact, maintenance-order and rollback plan. Unknown release metadata fails closed; no upgrade is started. |
 | `metrics` | The Prometheus metrics the cluster reports. |
 | `agent usage [--customer ID] [--since 30d]` | Uses the context API token as a cluster operator and reports aggregate usage by tenant. The usage API does not expose tenant-scoped request rows; `--customer` is rejected for this caller. Read-only. |
-| `change list [--limit N]`, `change approve ID`, `change reject ID` | Tenant-scoped maker-checker over a direct HTTPS context with a tenant client certificate/key. Listing requires a tenant viewer certificate; approval/rejection additionally require a deployer/admin certificate (a token is refused). Each request lists the spec fields it changes. Approval runs service-update admission, then applies the reviewed desired state atomically. |
+| `change list [--limit N] [--pending]`, `change approve ID`, `change reject ID` | Tenant-scoped maker-checker over a direct HTTPS context with a tenant client certificate/key. Listing requires a tenant viewer certificate; approval/rejection additionally require a deployer/admin certificate (a token is refused). Each request lists the spec fields it changes. Approval runs service-update admission, then applies the reviewed desired state atomically. |
 
 
 `doctor` reports observed status separately from unknowns; it never restarts or
@@ -322,17 +322,17 @@ Exit codes: `0` success, `1` usage or configuration error, `2` API, transport,
 SSH or authentication failure or a failed health check, `3` the named service,
 stack or context does not exist.
 
-Tenant operations are not yet exposed as `minga-ctl` subcommands. Use the
-cluster-operator API for tenant CRUD and node-bound join-token issuance;
-the `minga-ctl` context token must be a cluster-operator credential. The
-`--tls-cert` context setting trusts an HTTPS server CA; it is not a client
-certificate/key option.
+Tenant CRUD and node-bound join-token issuance are not `minga-ctl`
+subcommands yet; use the cluster-operator API for them. The `--tls-cert`
+context setting trusts an HTTPS server CA. A tenant identity is the separate
+`--client-cert`/`--client-key` pair on a direct HTTPS context, which `change`
+uses (it never resolves the context token).
 
-On a cluster with more than one tenant, the context token has no tenant
-identity, so `minga-ctl` commands that touch tenant resources (`stack`,
-`service`, `secret`, `network`, `config` and `task`) fail with 403 until
-`minga-ctl` can present a tenant client certificate. `node`, `manager`, `info`
-and `version` are operator-only and work with an operator token. `node update`
+On a cluster with more than one tenant, a context token has no tenant
+identity, so the token-based commands that touch tenant resources (`stack`,
+`service`, `secret`, `network`, `config` and `task`) fail with 403. `node`,
+`manager`, `info` and `version` are operator-only and work with an operator
+token. `node update`
 re-reads the node before writing and stops if another operator changed it, but
 the API has no revision check, so two writes in the same instant can still
 race.

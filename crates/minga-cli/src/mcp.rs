@@ -60,6 +60,43 @@ pub async fn serve(args: McpServeArgs) -> Result<(), String> {
     }
 }
 
+/// Spends `max_bytes` from the newest entry back, so a large early entry
+/// cannot hide a recent error; the kept entries stay oldest-first. A cut
+/// entry keeps its last bytes and is marked `truncated`, and
+/// `omitted_entries` counts the entries left out entirely.
+fn budget_logs(entries: &[Value], max_bytes: usize) -> Value {
+    let mut kept = Vec::new();
+    let mut remaining = max_bytes;
+    for entry in entries.iter().rev() {
+        if remaining == 0 {
+            break;
+        }
+        let data = entry
+            .get("data")
+            .and_then(Value::as_array)
+            .map(|bytes| {
+                bytes
+                    .iter()
+                    .filter_map(Value::as_u64)
+                    .filter_map(|byte| u8::try_from(byte).ok())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let take = data.len().min(remaining);
+        remaining -= take;
+        kept.push(json!({
+            "task_id": entry.get("task_id"),
+            "stream": entry.get("stream"),
+            "timestamp": entry.get("timestamp"),
+            "data": String::from_utf8_lossy(&data[data.len() - take..]),
+            "truncated": take < data.len()
+        }));
+    }
+    let omitted = entries.len() - kept.len();
+    kept.reverse();
+    json!({"entries": kept, "omitted_entries": omitted})
+}
+
 enum Incoming {
     Eof,
     Message,
@@ -299,34 +336,7 @@ impl McpServer {
         let entries = value
             .as_array()
             .ok_or("log response has an invalid shape")?;
-        let mut result = Vec::with_capacity(entries.len());
-        let mut remaining = MAX_LOG_BYTES;
-        for entry in entries {
-            if remaining == 0 {
-                break;
-            }
-            let data = entry
-                .get("data")
-                .and_then(Value::as_array)
-                .map(|bytes| {
-                    bytes
-                        .iter()
-                        .filter_map(Value::as_u64)
-                        .filter_map(|byte| u8::try_from(byte).ok())
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-            let take = data.len().min(remaining);
-            remaining -= take;
-            result.push(json!({
-                "task_id": entry.get("task_id"),
-                "stream": entry.get("stream"),
-                "timestamp": entry.get("timestamp"),
-                "data": String::from_utf8_lossy(&data[..take]),
-                "truncated": take < data.len()
-            }));
-        }
-        Ok(Value::Array(result))
+        Ok(budget_logs(entries, MAX_LOG_BYTES))
     }
 
     async fn usage(&self, arguments: &Value) -> Result<Value, &'static str> {
@@ -734,6 +744,25 @@ mod tests {
             }))
             .await
             .unwrap()
+    }
+
+    #[test]
+    fn the_log_budget_keeps_the_newest_bytes() {
+        let entry =
+            |text: &str| json!({"stream": "stdout", "data": text.bytes().collect::<Vec<_>>()});
+        let entries = [entry("old-and-large"), entry("mid"), entry("recent error")];
+        let result = budget_logs(&entries, 15);
+        let kept = result["entries"].as_array().unwrap();
+        assert_eq!(result["omitted_entries"], 1);
+        assert_eq!(kept.len(), 2);
+        assert_eq!(kept[0]["data"], "mid");
+        assert_eq!(kept[0]["truncated"], false);
+        assert_eq!(kept[1]["data"], "recent error");
+        // A cut entry keeps its newest bytes.
+        let cut = budget_logs(&[entry("abcdef")], 3);
+        assert_eq!(cut["entries"][0]["data"], "def");
+        assert_eq!(cut["entries"][0]["truncated"], true);
+        assert_eq!(cut["omitted_entries"], 0);
     }
 
     #[tokio::test]

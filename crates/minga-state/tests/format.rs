@@ -1590,6 +1590,69 @@ async fn a_network_a_service_or_its_rollback_uses_cannot_be_removed() {
 }
 
 #[tokio::test]
+async fn approval_rechecks_secrets_the_rollback_restores() {
+    let (_dir, path) = written_dir().await;
+    let store = StateStore::open(1, "127.0.0.1:0", &path, BTreeMap::new())
+        .await
+        .unwrap();
+    // A rollback to a revision naming `secret`, which exists or not.
+    let rollback_to = |id: &str, secret: &str| {
+        let mut current = service(id);
+        current.ports.clear();
+        current.secrets.clear();
+        current.egress = None;
+        let mut previous = current.clone();
+        previous.secrets = vec![SecretRef::new(secret, "/run/secrets/x")];
+        current.previous = Some(Box::new(previous.clone()));
+        let mut request = change_request();
+        request.id = format!("cr-{id}");
+        request.service_id = id.into();
+        request.kind = ChangeKind::Rollback;
+        request.before = current.clone();
+        request.after = previous;
+        current.previous = None;
+        request.after.previous = Some(Box::new(current));
+        request
+    };
+    store
+        .upsert_secret(Secret {
+            id: "kept".into(),
+            tenant_id: "default".into(),
+            name: "kept".into(),
+        })
+        .await
+        .unwrap();
+    for (id, secret, applies) in [("svc-gone", "gone", false), ("svc-kept", "kept", true)] {
+        let request = rollback_to(id, secret);
+        store.upsert_service(request.before.clone()).await.unwrap();
+        store.create_change_request(request.clone()).await.unwrap();
+        let decided = store
+            .decide_change_request(
+                request.id.clone(),
+                "default".into(),
+                "deployer".into(),
+                true,
+                150,
+            )
+            .await;
+        assert_eq!(decided.is_ok(), applies, "{id}");
+        let status = store
+            .get_change_request("default", &request.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status;
+        let expected = if applies {
+            ChangeRequestStatus::Approved
+        } else {
+            ChangeRequestStatus::Pending
+        };
+        assert_eq!(status, expected, "{id}");
+    }
+    store.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn removing_a_tenant_drops_its_change_requests() {
     let (_dir, path) = written_dir().await;
     let store = StateStore::open(1, "127.0.0.1:0", &path, BTreeMap::new())

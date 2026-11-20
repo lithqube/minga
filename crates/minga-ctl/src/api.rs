@@ -153,7 +153,11 @@ impl ApiClient {
     }
 
     /// Lists tenant change requests over mTLS without sending any configured bearer token.
-    pub async fn tenant_change_requests(&self, limit: u8) -> Result<Value, CtlError> {
+    pub async fn tenant_change_requests(
+        &self,
+        limit: u8,
+        pending: bool,
+    ) -> Result<Value, CtlError> {
         if !(1..=100).contains(&limit) {
             return Err(CtlError::Usage("limit must be between 1 and 100".into()));
         }
@@ -161,7 +165,7 @@ impl ApiClient {
         let response = self
             .http
             .get(&url)
-            .query(&[("limit", limit)])
+            .query(&change_request_query(limit, pending))
             .send()
             .await
             .map_err(|error| CtlError::Unreachable {
@@ -523,6 +527,15 @@ pub fn block_on<T>(
         .build()
         .map_err(|e| CtlError::Config(format!("cannot start the async runtime: {e}")))?
         .block_on(future)
+}
+
+/// `?limit=N`, plus `status=pending` when only open requests are wanted.
+fn change_request_query(limit: u8, pending: bool) -> Vec<(&'static str, String)> {
+    let mut query = vec![("limit", limit.to_string())];
+    if pending {
+        query.push(("status", "pending".to_owned()));
+    }
+    query
 }
 
 #[cfg(test)]

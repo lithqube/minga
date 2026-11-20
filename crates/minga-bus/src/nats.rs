@@ -1417,11 +1417,15 @@ impl EventBus for NatsBus {
             .map_err(|error| {
                 BusError::Subscribe(format!("tenant event history consumer: {error}"))
             })?;
-        let mut remaining = consumer
+        // `start` holds the newest `limit` events of the stream as it was when
+        // read, so the first `limit` from it are exactly those; events that
+        // arrive meanwhile come after them and are not read.
+        let mut remaining = (consumer
             .info()
             .await
             .map_err(|error| BusError::Subscribe(format!("tenant event history info: {error}")))?
-            .num_pending as usize;
+            .num_pending as usize)
+            .min(limit);
         let mut events = VecDeque::new();
         while remaining > 0 {
             let mut batch = consumer

@@ -239,6 +239,16 @@ pub async fn run(
             "GET /healthz returned HTTP 200",
             "No action required.",
         )),
+        // Health probes are operator-only: a tenant identity is denied them
+        // on a healthy cluster, which says nothing about the API's health.
+        Ok((status @ (401 | 403), _)) => report.findings.push(Finding::new(
+            "api-liveness",
+            Severity::Warning,
+            Status::Unknown,
+            "API liveness was not checked: this identity may not read it",
+            format!("GET /healthz returned HTTP {status}"),
+            "Run doctor with a cluster-operator context to check API health.",
+        )),
         Ok((status, _)) => report.findings.push(Finding::new(
             "api-liveness",
             Severity::Error,
@@ -290,6 +300,14 @@ pub async fn run(
                 "Check the configured NATS endpoint, credentials and server health.",
             ))
         }
+        Ok((status @ (401 | 403), _)) => report.findings.push(Finding::new(
+            "api-readiness",
+            Severity::Warning,
+            Status::Unknown,
+            "API readiness was not checked: this identity may not read it",
+            format!("GET /readyz returned HTTP {status}"),
+            "Run doctor with a cluster-operator context to check API readiness.",
+        )),
         Ok((status, _)) => report.findings.push(Finding::new(
             "api-readiness",
             Severity::Error,

@@ -144,25 +144,43 @@ fn network_in_use(tx: &redb::WriteTransaction, id: &str) -> Result<bool, Storage
     Ok(false)
 }
 
-/// Whether every network in `ids` exists and belongs to `tenant_id`.
+/// Whether every record in `ids` exists in `definition` and belongs to `tenant_id`.
 #[allow(clippy::result_large_err)]
-fn networks_owned_by(
+fn all_owned_by<T: DeserializeOwned>(
     tx: &redb::WriteTransaction,
-    ids: &[NetworkId],
+    definition: TableDefinition<&str, &[u8]>,
+    ids: &[String],
     tenant_id: &str,
+    tenant_of: impl Fn(&T) -> &str,
 ) -> Result<bool, StorageError<u64>> {
-    let table = tx.open_table(NETWORKS_TABLE).map_err(sm_io_err)?;
+    let table = tx.open_table(definition).map_err(sm_io_err)?;
     for id in ids {
         let Some(value) = table.get(id.as_str()).map_err(sm_io_err)? else {
             return Ok(false);
         };
-        let network: Network = crate::codec::decode(value.value())
+        let record: T = crate::codec::decode(value.value())
             .map_err(|e| sm_storage_err(ErrorSubject::Store, ErrorVerb::Read, e))?;
-        if network.tenant_id != tenant_id {
+        if tenant_of(&record) != tenant_id {
             return Ok(false);
         }
     }
     Ok(true)
+}
+
+/// Every secret a spec names, directly or through an egress route.
+fn secret_references(service: &Service) -> Vec<String> {
+    service
+        .secrets
+        .iter()
+        .map(|reference| reference.secret_id.clone())
+        .chain(
+            service
+                .egress
+                .iter()
+                .flat_map(|policy| policy.secret_ids())
+                .map(str::to_owned),
+        )
+        .collect()
 }
 
 /// Whether `id` already exists under a tenant other than `tenant_id`. Called
@@ -1259,9 +1277,33 @@ impl RedbStateMachine {
                         .filter(|network| !request.before.networks.contains(network))
                         .cloned()
                         .collect();
-                    if !networks_owned_by(tx, &added, &request.tenant_id)? {
+                    if !all_owned_by(
+                        tx,
+                        NETWORKS_TABLE,
+                        &added,
+                        &request.tenant_id,
+                        |n: &Network| &n.tenant_id,
+                    )? {
                         return Ok(StateResponse::Conflict(
                             "the change refers to a network the tenant does not own".into(),
+                        ));
+                    }
+                    // The API checked secrets before proposing; one removed since
+                    // then must not reach the applied spec. The request stays pending.
+                    let current_secrets = secret_references(&request.before);
+                    let added_secrets: Vec<String> = secret_references(&request.after)
+                        .into_iter()
+                        .filter(|secret| !current_secrets.contains(secret))
+                        .collect();
+                    if !all_owned_by(
+                        tx,
+                        SECRETS_TABLE,
+                        &added_secrets,
+                        &request.tenant_id,
+                        |secret: &Secret| &secret.tenant_id,
+                    )? {
+                        return Ok(StateResponse::Conflict(
+                            "the change refers to a secret the tenant does not own".into(),
                         ));
                     }
                     match Self::apply_command(

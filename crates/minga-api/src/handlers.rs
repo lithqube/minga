@@ -261,6 +261,9 @@ pub enum ChangeProposal {
 #[serde(deny_unknown_fields)]
 pub struct ChangeRequestQuery {
     limit: Option<usize>,
+    /// Only requests in this state, filtered before `limit`, so a pending
+    /// request stays findable behind newer decided ones.
+    status: Option<ChangeRequestStatus>,
 }
 
 #[derive(Debug, Serialize)]
@@ -473,6 +476,9 @@ pub async fn list_change_requests(
     let limit = query.limit.unwrap_or(100).clamp(1, 100);
     // Reads only this tenant's key range, which holds at most 256 requests.
     let mut requests = app.store.list_change_requests(tenant_id).await?;
+    if let Some(status) = query.status {
+        requests.retain(|request| request.status == status);
+    }
     requests.sort_unstable_by(|left, right| {
         right
             .created_at_unix
@@ -495,6 +501,24 @@ async fn record_change_audit(app: &AppState, tenant_id: &str, actor: &str, actio
     }
 }
 
+/// The change request from the local replica. A follower can answer a create
+/// (which commits on the leader) before applying it, so a miss waits briefly.
+/// shortcut: up to 2s of replication lag; past that the 404 is honest for this
+/// node, upgrade to a leader read-index if decisions must route through any node.
+async fn committed_change_request(
+    app: &AppState,
+    tenant_id: &str,
+    id: &str,
+) -> ApiResult<Option<ChangeRequest>> {
+    for _ in 0..40 {
+        if let Some(request) = app.store.get_change_request(tenant_id, id).await? {
+            return Ok(Some(request));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    Ok(app.store.get_change_request(tenant_id, id).await?)
+}
+
 async fn decide_change_request(
     app: &AppState,
     caller: &Caller,
@@ -502,7 +526,7 @@ async fn decide_change_request(
     approve: bool,
 ) -> ApiResult<Json<ChangeRequestView>> {
     let tenant_id = tenant_scope(caller)?;
-    let Some(request) = app.store.get_change_request(tenant_id, id).await? else {
+    let Some(request) = committed_change_request(app, tenant_id, id).await? else {
         return Err(not_found("change request", id));
     };
     // Approval writes the reviewed spec directly, so it passes the same

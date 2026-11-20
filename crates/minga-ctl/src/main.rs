@@ -188,7 +188,9 @@ fn run(cli: &Cli) -> Result<(), CtlError> {
             cmd::usage::run(args, &conn, format, quiet).await
         }),
         Command::Change(command) => api::block_on(async {
-            let conn = connect(cli).await?;
+            // Change requests authenticate with the context's client
+            // certificate only, so a failing token supplier must not block them.
+            let conn = transport::connect(&resolve_target(cli)?, cli.debug).await?;
             cmd::change::run(command, &conn.api, format, quiet).await
         }),
         Command::Manager(cmd) => {
