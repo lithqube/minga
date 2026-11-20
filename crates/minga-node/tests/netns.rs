@@ -1009,5 +1009,8 @@ async fn concurrent_bridge_setups_keep_the_filter_jumps() {
     for (network, _) in &networks {
         let _ = sh("ip", &["link", "del", &bridge_name(network)]);
     }
-    assert!(errors.is_empty(), "concurrent ensure_bridge failed: {errors:?}");
+    assert!(
+        errors.is_empty(),
+        "concurrent ensure_bridge failed: {errors:?}"
+    );
 }

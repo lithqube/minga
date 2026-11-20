@@ -1515,6 +1515,9 @@ async fn nat_workers_relay_through_manager_and_use_direct_path_to_reachable_work
     assigned_peer(&manager, &key_b.public_key, None, &["10.242.0.20/32"], 0)?;
     assigned_peer(&standby, &key_a.public_key, None, &["10.242.0.10/32"], 0)?;
     assigned_peer(&standby, &key_b.public_key, None, &["10.242.0.20/32"], 0)?;
+    // Responders know key A before its keepalive peers send the first
+    // handshake; a rejected one is retried only after WireGuard's 5 s timeout.
+    assigned_peer(&reachable, &key_a.public_key, None, &["10.242.0.10/32"], 0)?;
     assigned_peer(
         &worker_a,
         &key_manager.public_key,
@@ -1550,7 +1553,6 @@ async fn nat_workers_relay_through_manager_and_use_direct_path_to_reachable_work
         &["10.242.0.40/32"],
         25,
     )?;
-    assigned_peer(&reachable, &key_a.public_key, None, &["10.242.0.10/32"], 0)?;
 
     for (namespace, addresses) in [
         (&manager, &["10.242.0.10/32", "10.242.0.20/32"][..]),
