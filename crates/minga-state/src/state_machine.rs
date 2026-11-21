@@ -631,16 +631,6 @@ impl RedbStateMachine {
                 if tenant_quota(tx, &node.tenant_id)?.is_none() {
                     return Ok(StateResponse::NotFound);
                 }
-                // A WireGuard key names one peer: a second holder would put the
-                // key twice in every manager's peer set. The answer never says
-                // which node holds it, so it cannot probe other tenants.
-                if let Some(key) = &node.wg_public_key {
-                    if tenant_has_records::<ClusterNode>(tx, NODES_TABLE, key, |other, key| {
-                        other.id != node.id && other.wg_public_key.as_deref() == Some(key)
-                    })? {
-                        return Ok(StateResponse::Conflict(NAME_IN_USE.into()));
-                    }
-                }
                 let mut t = tx.open_table(NODES_TABLE).map_err(sm_io_err)?;
                 let stored = t
                     .get(node.id.to_string().as_str())
@@ -655,6 +645,25 @@ impl RedbStateMachine {
                     .is_some_and(|stored| stored.tenant_id != node.tenant_id)
                 {
                     return Ok(StateResponse::Conflict(NAME_IN_USE.into()));
+                }
+                // A WireGuard key names one peer: a second holder would put the
+                // key twice in every manager's peer set. Only a new or changed
+                // key is checked, so two holders stored before this rule can
+                // still be drained. The answer never says which node holds it.
+                let new_key = node.wg_public_key.as_deref().filter(|key| {
+                    stored
+                        .as_ref()
+                        .is_none_or(|stored| stored.wg_public_key.as_deref() != Some(*key))
+                });
+                if let Some(key) = new_key {
+                    for row in t.iter().map_err(sm_io_err)? {
+                        let (_, value) = row.map_err(sm_io_err)?;
+                        let other: ClusterNode = crate::codec::decode(value.value())
+                            .map_err(|e| sm_storage_err(ErrorSubject::Store, ErrorVerb::Read, e))?;
+                        if other.id != node.id && other.wg_public_key.as_deref() == Some(key) {
+                            return Ok(StateResponse::Conflict(NAME_IN_USE.into()));
+                        }
+                    }
                 }
                 let stored_key = stored.and_then(|stored| stored.nats_user_public_key);
                 // Only SetNodeNatsUserPublicKey changes the key: a full record
@@ -2185,5 +2194,56 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn only_a_new_or_changed_wireguard_key_is_checked_for_a_holder() {
+        const KEY: &str = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=";
+        let dir = tempfile::tempdir().unwrap();
+        let sm = RedbStateMachine::open(dir.path().join("sm.redb")).unwrap();
+        let node = |id: u64, status: NodeStatus| ClusterNode {
+            id,
+            address: format!("10.0.0.{id}:50051"),
+            labels: Default::default(),
+            status,
+            capacity: ResourceSpec {
+                cpus: 1.0,
+                memory_bytes: 1 << 30,
+                gpus: 0,
+            },
+            wg_public_key: Some(KEY.into()),
+            wg_endpoint: None,
+            overlay_ip: None,
+            tenant_id: DEFAULT_TENANT_ID.into(),
+            last_seen_unix: None,
+            role: Default::default(),
+            reserved_ports: Vec::new(),
+            nats_user_public_key: None,
+        };
+        assert_eq!(
+            apply(&sm, StateCommand::UpsertNode(node(1, NodeStatus::Active))),
+            StateResponse::Ok
+        );
+        // Two holders stored before the rule existed.
+        {
+            let db = sm.db.lock().unwrap();
+            let tx = db.begin_write().unwrap();
+            {
+                let mut t = tx.open_table(NODES_TABLE).unwrap();
+                let bytes = crate::codec::encode(&node(2, NodeStatus::Active)).unwrap();
+                t.insert("2", bytes.as_slice()).unwrap();
+            }
+            tx.commit().unwrap();
+        }
+        // The stored holder keeps its key, so it can still be drained.
+        assert_eq!(
+            apply(&sm, StateCommand::UpsertNode(node(2, NodeStatus::Draining))),
+            StateResponse::Ok
+        );
+        // A third node taking the key is refused.
+        assert!(matches!(
+            apply(&sm, StateCommand::UpsertNode(node(3, NodeStatus::Active))),
+            StateResponse::Conflict(_)
+        ));
     }
 }

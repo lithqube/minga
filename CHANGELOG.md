@@ -2,9 +2,13 @@
 
 ## Unreleased
 
-- **Security.** One tenant node can no longer stop managers applying the mesh (#127):
-  - Registering a node with a WireGuard key that another node already holds fails with a 409. The answer does
-    not say which node holds the key.
+- **Security, upgrade check.** One tenant node can no longer stop managers applying the mesh (#127):
+  - A manager refuses to register a node whose WireGuard key another node already holds, logs it, and
+    proposes nothing to Raft. Raft refuses the same for any new or changed key. The refusal never names
+    the holder.
+  - Two nodes stored before upgrading with one key can still be updated and drained, but every node skips
+    both of them as peers. Before upgrading, check that no two nodes share a WireGuard key, and remove the
+    node that copied it.
   - A node applying a WireGuard peer set skips, and logs, only the peers it must not install: an invalid
     key or AllowedIP, or a key or AllowedIP listed under two peers. It applies the rest. Until now one such
     peer rejected the whole set.
