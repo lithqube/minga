@@ -47,6 +47,7 @@ Implementation-status notes distinguish what is merged from what remains propose
 - [Roadmap to v0.1.0](roadmap-v0.1.0.md): the seven release gates (historical, all closed)
 - [NATS/JetStream evaluation](research/nats-evaluation.md): the research behind ADR 0002
 - [Nevia evaluation](research/nevia-evaluation.md): where Minga could fit with the hosted Nevia agent cloud (notes, no decision)
+- [Code Mode evaluation](research/code-mode-evaluation.md): what Minga should take from Cloudflare's Code Mode, and the niche strategy that follows (notes, no decision)
 - [Design document](design.md): link to the living design doc
 - [Wave 9 plan](../Wave-9-PLAN.md): historical wave plan
 
