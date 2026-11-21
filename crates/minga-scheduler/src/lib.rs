@@ -409,10 +409,13 @@ impl Scheduler {
                     minga_state::types::TaskState::Stopped | minga_state::types::TaskState::Failed
                 )
             {
-                if let Some((_, ip)) = primary_task_ip(&task.spec.ips).filter(|(network_id, _)| {
-                    network_by_id
-                        .get(*network_id)
-                        .is_some_and(|network| network.tenant_id == task.tenant_id)
+                if let Some((_, ip)) = primary_task_ip(&task.spec.ips).filter(|(network_id, ip)| {
+                    network_by_id.get(*network_id).is_some_and(|network| {
+                        network.tenant_id == task.tenant_id
+                            && routable_subnet(network, &self.supernet).is_some_and(|subnet| {
+                                ip.parse().is_ok_and(|ip| subnet.contains(ip))
+                            })
+                    })
                 }) {
                     for port in &task.spec.ports {
                         let (Some(published), minga_state::types::PortMode::Ingress) =
@@ -672,6 +675,15 @@ fn overlay_task_statuses(
         .collect()
 }
 
+/// The subnet a network's task addresses may route in: its stored subnet, or
+/// `None` when that breaks the overlay rules (one stored before they existed).
+/// Peer sets and ingress backends both use it.
+fn routable_subnet(network: &Network, supernet: &minga_net::Cidr) -> Option<minga_net::Cidr> {
+    let subnet = minga_net::Cidr::parse(network.subnet.as_deref()?).ok()?;
+    minga_net::overlay::check_network_subnet(&subnet, Some(supernet)).ok()?;
+    Some(subnet)
+}
+
 /// Matches `prepare_network`'s sorted attachment order for published-port backends.
 fn primary_task_ip(ips: &HashMap<String, String>) -> Option<(&str, &str)> {
     ips.iter()
@@ -692,12 +704,7 @@ fn build_wireguard_peer_sets(
         .collect();
     let network_subnets: HashMap<_, _> = networks
         .iter()
-        .filter_map(|network| {
-            let subnet = minga_net::Cidr::parse(network.subnet.as_deref()?).ok()?;
-            // A subnet stored before the API checked it never routes.
-            minga_net::overlay::check_network_subnet(&subnet, Some(supernet)).ok()?;
-            Some((network.id.as_str(), subnet))
-        })
+        .filter_map(|network| Some((network.id.as_str(), routable_subnet(network, supernet)?)))
         .collect();
     // A task address routes only inside its own network's subnet, from a node
     // of that network's tenant.

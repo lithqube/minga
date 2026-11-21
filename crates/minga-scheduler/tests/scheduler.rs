@@ -920,7 +920,7 @@ async fn ingress_backend_projection_tracks_task_movement() {
             name: "default".into(),
             driver: "overlay".into(),
             attachable: false,
-            subnet: Some("10.9.0.0/24".into()),
+            subnet: Some("10.100.9.0/24".into()),
             wg_port: None,
         })
         .await
@@ -975,6 +975,36 @@ async fn ingress_backend_projection_tracks_task_movement() {
             .is_none(),
             "host-mode ports must remain node-local, not enter the ingress mesh"
         );
+    }
+
+    // A task address outside its network's subnet never becomes a backend.
+    let mut forged = make_service("app.forged", 1);
+    forged.ports = vec![PortMapping {
+        target: 80,
+        published: Some(18082),
+        protocol: "tcp".into(),
+        mode: PortMode::Ingress,
+    }];
+    store.upsert_service(forged.clone()).await.unwrap();
+    let mut task =
+        minga_scheduler::place_service(&forged, &[make_node(2, 8.0, 1 << 34)], &[], &[], 0)
+            .remove(0);
+    task.spec.ips.insert("default".into(), "192.168.9.9".into());
+    store.upsert_task(task).await.unwrap();
+    scheduler.reconcile_once().await.unwrap();
+    for node_id in [1, 2] {
+        let key = subjects::kv_assignment_ingress("default", node_id, 18082, "tcp");
+        if let Some(bytes) = bus.get_assignment(&key).await.unwrap() {
+            let assignment: minga_state::types::IngressAssignment =
+                minga_state::codec::decode_wire(&bytes).unwrap();
+            assert!(
+                assignment
+                    .backends
+                    .iter()
+                    .all(|backend| backend.ip != "192.168.9.9"),
+                "an out-of-subnet address became an ingress backend"
+            );
+        }
     }
 
     drop(scheduler);
