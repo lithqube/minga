@@ -631,6 +631,16 @@ impl RedbStateMachine {
                 if tenant_quota(tx, &node.tenant_id)?.is_none() {
                     return Ok(StateResponse::NotFound);
                 }
+                // A WireGuard key names one peer: a second holder would put the
+                // key twice in every manager's peer set. The answer never says
+                // which node holds it, so it cannot probe other tenants.
+                if let Some(key) = &node.wg_public_key {
+                    if tenant_has_records::<ClusterNode>(tx, NODES_TABLE, key, |other, key| {
+                        other.id != node.id && other.wg_public_key.as_deref() == Some(key)
+                    })? {
+                        return Ok(StateResponse::Conflict(NAME_IN_USE.into()));
+                    }
+                }
                 let mut t = tx.open_table(NODES_TABLE).map_err(sm_io_err)?;
                 let stored = t
                     .get(node.id.to_string().as_str())

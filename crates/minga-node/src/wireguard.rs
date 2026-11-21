@@ -7,10 +7,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use minga_bus::{EventBus, KvOp};
-#[cfg(target_os = "linux")]
-use std::collections::HashMap;
 #[cfg(any(target_os = "linux", test))]
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 #[cfg(target_os = "linux")]
 use std::process::Command;
 use tokio_stream::StreamExt;
@@ -349,9 +347,7 @@ async fn apply_peer_assignment(
             .transpose()?
     };
 
-    if let Some(set) = &set {
-        validate_peer_set(set, node_id)?;
-    }
+    let set = set.map(|set| usable_peer_set(&set, node_id)).transpose()?;
     if set.as_ref() == current.as_ref() {
         match set.as_ref() {
             Some(set) if set.peers.is_empty() => return Ok(()),
@@ -364,7 +360,7 @@ async fn apply_peer_assignment(
     }
 
     let network_setup = minga_node_network_setup(key_path);
-    let Some(set) = set else {
+    let Some(mut set) = set else {
         #[cfg(target_os = "linux")]
         remove_interface()?;
         network_setup
@@ -389,7 +385,10 @@ async fn apply_peer_assignment(
     ensure_interface(key_path, listen_port, mtu, node_id, set.peers.len())?;
     #[cfg(target_os = "linux")]
     {
-        apply_peer_diff(&set, current.as_ref())?;
+        let failed = apply_peer_diff(&set, current.as_ref())?;
+        // A peer `wg` refused stays out of the applied set, so the next
+        // assignment retries it instead of matching `current`.
+        set.peers.retain(|peer| !failed.contains(&peer.public_key));
         network_setup
             .setup_wireguard_mesh(&set.networks)
             .await
@@ -425,11 +424,14 @@ fn minga_node_network_setup(key_path: &Path) -> crate::netns::NetworkSetup {
     )
 }
 
+/// Returns `set` without the peers this node must not install. A bad or
+/// conflicting peer is logged and skipped instead of rejecting the whole set,
+/// so one tenant node cannot stop a manager applying every other peer.
 #[cfg(any(target_os = "linux", test))]
-fn validate_peer_set(
+fn usable_peer_set(
     set: &minga_net::wireguard::WireGuardPeerSet,
     node_id: u64,
-) -> Result<(), WireGuardError> {
+) -> Result<minga_net::wireguard::WireGuardPeerSet, WireGuardError> {
     let mesh_error = |error: minga_net::overlay::OverlayError| {
         WireGuardError::InvalidAssignment(error.to_string())
     };
@@ -455,50 +457,83 @@ fn validate_peer_set(
         }
     }
 
-    let mut public_keys = HashSet::new();
-    let mut routed_ips = HashSet::new();
-    for peer in &set.peers {
-        if !minga_net::wireguard::validate_public_key(&peer.public_key) {
-            return Err(WireGuardError::InvalidAssignment(format!(
-                "invalid public key for node {}",
-                peer.node_id
-            )));
-        }
-        if !public_keys.insert(&peer.public_key) {
-            return Err(WireGuardError::InvalidAssignment(format!(
-                "duplicate peer key for node {}",
-                peer.node_id
-            )));
-        }
-        for allowed_ip in &peer.allowed_ips {
-            let (ip, prefix) = allowed_ip.split_once('/').ok_or_else(|| {
-                WireGuardError::InvalidAssignment(format!("invalid AllowedIP {allowed_ip:?}"))
-            })?;
-            let ip = ip.parse::<std::net::Ipv4Addr>().map_err(|_| {
-                WireGuardError::InvalidAssignment(format!(
-                    "AllowedIP must be an IPv4 /32: {allowed_ip:?}"
-                ))
-            })?;
-            if prefix != "32" {
-                return Err(WireGuardError::InvalidAssignment(format!(
-                    "AllowedIP must be an IPv4 /32: {allowed_ip:?}"
-                )));
+    let checked: Vec<_> = set
+        .peers
+        .iter()
+        .map(|peer| {
+            check_peer(peer, own_mesh_ip, &mesh_subnet, &allowed_subnets).inspect_err(|reason| {
+                tracing::warn!(node_id, peer_node_id = peer.node_id, %reason, "skipping WireGuard peer");
+            })
+        })
+        .collect();
+    // WireGuard keeps one peer per key and moves an address listed twice to
+    // the last peer. Neither claimant can be trusted over the other, so every
+    // peer in such a conflict is skipped.
+    let mut key_holders: HashMap<&str, usize> = HashMap::new();
+    let mut ip_holders: HashMap<std::net::Ipv4Addr, usize> = HashMap::new();
+    for (peer, ips) in set.peers.iter().zip(&checked) {
+        if let Ok(ips) = ips {
+            *key_holders.entry(peer.public_key.as_str()).or_default() += 1;
+            for ip in ips {
+                *ip_holders.entry(*ip).or_default() += 1;
             }
-            // WireGuard moves an address listed twice to the last peer, so
-            // a second claim would steal the first peer's traffic.
-            if !routed_ips.insert(ip) {
-                return Err(WireGuardError::InvalidAssignment(format!(
-                    "AllowedIP {allowed_ip:?} is listed under two peers"
-                )));
+        }
+    }
+    let mut usable = set.clone();
+    usable.peers = set
+        .peers
+        .iter()
+        .zip(checked)
+        .filter_map(|(peer, ips)| {
+            let ips = ips.ok()?;
+            let conflict = if key_holders[peer.public_key.as_str()] > 1 {
+                Some("its public key is listed under another peer")
+            } else if ips.iter().any(|ip| ip_holders[ip] > 1) {
+                Some("an AllowedIP is listed twice")
+            } else {
+                None
+            };
+            if let Some(reason) = conflict {
+                tracing::warn!(
+                    node_id,
+                    peer_node_id = peer.node_id,
+                    reason,
+                    "skipping WireGuard peer"
+                );
+                return None;
             }
-            let peer_mesh_ip =
-                minga_net::overlay::mesh_node_ip(peer.node_id).map_err(mesh_error)?;
+            Some(peer.clone())
+        })
+        .collect();
+    Ok(usable)
+}
+
+/// The peer's AllowedIPs, or why this node must not install the peer.
+#[cfg(any(target_os = "linux", test))]
+fn check_peer(
+    peer: &minga_net::wireguard::WireGuardPeerAssignment,
+    own_mesh_ip: std::net::Ipv4Addr,
+    mesh_subnet: &minga_net::Cidr,
+    allowed_subnets: &[minga_net::Cidr],
+) -> Result<Vec<std::net::Ipv4Addr>, String> {
+    if !minga_net::wireguard::validate_public_key(&peer.public_key) {
+        return Err("invalid public key".into());
+    }
+    let peer_mesh_ip =
+        minga_net::overlay::mesh_node_ip(peer.node_id).map_err(|error| error.to_string())?;
+    peer.allowed_ips
+        .iter()
+        .map(|allowed_ip| {
+            let ip = allowed_ip
+                .strip_suffix("/32")
+                .and_then(|ip| ip.parse::<std::net::Ipv4Addr>().ok())
+                .ok_or_else(|| format!("AllowedIP must be an IPv4 /32: {allowed_ip:?}"))?;
             // A peer claiming this node's own mesh address would capture its
             // replies, so no path may carry it.
             if ip == own_mesh_ip {
-                return Err(WireGuardError::InvalidAssignment(format!(
+                return Err(format!(
                     "AllowedIP {allowed_ip:?} is this node's mesh address"
-                )));
+                ));
             }
             // A relay manager forwards for the NAT workers behind it, so it
             // also carries their mesh addresses; a direct peer carries only its own.
@@ -508,13 +543,13 @@ fn validate_peer_set(
                 && ip != peer_mesh_ip
                 && !relayed_mesh_ip
             {
-                return Err(WireGuardError::InvalidAssignment(format!(
+                return Err(format!(
                     "AllowedIP {allowed_ip:?} is outside assigned task and mesh addresses"
-                )));
+                ));
             }
-        }
-    }
-    Ok(())
+            Ok(ip)
+        })
+        .collect()
 }
 
 #[cfg(target_os = "linux")]
@@ -545,9 +580,7 @@ fn interface_is_up() -> Result<bool, WireGuardError> {
 fn apply_peer_diff(
     set: &minga_net::wireguard::WireGuardPeerSet,
     previous: Option<&minga_net::wireguard::WireGuardPeerSet>,
-) -> Result<(), WireGuardError> {
-    use minga_net::wireguard::PeerConfig;
-
+) -> Result<HashSet<String>, WireGuardError> {
     let interface = minga_net::wireguard::WG_INTERFACE_NAME;
     let output = Command::new("wg")
         .args(["show", interface, "allowed-ips"])
@@ -589,6 +622,27 @@ fn apply_peer_diff(
         })
         .collect();
 
+    configure_peers(set, previous, &existing, &endpoints, |args| {
+        run_command(Command::new("wg").args(args))
+    })
+}
+
+/// Brings the interface's peers to `set` through `wg`. A peer `wg` cannot add,
+/// such as one whose endpoint does not resolve, is logged and skipped so the
+/// rest still apply; the keys of skipped peers are returned. Removals still
+/// fail the whole call, so a peer that should be gone is never left behind.
+#[cfg(any(target_os = "linux", test))]
+fn configure_peers(
+    set: &minga_net::wireguard::WireGuardPeerSet,
+    previous: Option<&minga_net::wireguard::WireGuardPeerSet>,
+    existing: &HashMap<String, Vec<String>>,
+    endpoints: &HashMap<String, String>,
+    mut wg: impl FnMut(&[&str]) -> Result<(), WireGuardError>,
+) -> Result<HashSet<String>, WireGuardError> {
+    use minga_net::wireguard::PeerConfig;
+
+    let interface = minga_net::wireguard::WG_INTERFACE_NAME;
+    let mut failed = HashSet::new();
     let desired: HashSet<_> = set
         .peers
         .iter()
@@ -598,7 +652,7 @@ fn apply_peer_diff(
         .keys()
         .filter(|key| !desired.contains(key.as_str()))
     {
-        run_command(Command::new("wg").args(["set", interface, "peer", key, "remove"]))?;
+        wg(&["set", interface, "peer", key, "remove"])?;
     }
     for peer in &set.peers {
         let mut allowed_ips = peer.allowed_ips.clone();
@@ -626,13 +680,7 @@ fn apply_peer_diff(
             continue;
         }
         if allowed_ips_changed || stale_endpoint {
-            run_command(Command::new("wg").args([
-                "set",
-                interface,
-                "peer",
-                &peer.public_key,
-                "remove",
-            ]))?;
+            wg(&["set", interface, "peer", &peer.public_key, "remove"])?;
         }
         let config = PeerConfig {
             public_key: peer.public_key.clone(),
@@ -642,9 +690,12 @@ fn apply_peer_diff(
         };
         let args = config.to_wg_set_args(interface);
         let args: Vec<_> = args.iter().map(String::as_str).collect();
-        run_command(Command::new("wg").args(args))?;
+        if let Err(error) = wg(&args) {
+            tracing::warn!(peer_node_id = peer.node_id, %error, "cannot configure WireGuard peer; skipping it");
+            failed.insert(peer.public_key.clone());
+        }
     }
-    Ok(())
+    Ok(failed)
 }
 
 #[cfg(target_os = "linux")]
@@ -814,12 +865,12 @@ mod tests {
         let mut mesh_address = set.clone();
         mesh_address.networks.clear();
         mesh_address.peers[0].allowed_ips = vec!["10.200.0.2/32".into()];
-        assert!(validate_peer_set(&mesh_address, 1).is_ok());
+        assert_eq!(kept(&mesh_address, 1), [2]);
         let mut ingress_route = set.clone();
         ingress_route.networks[0].local = false;
         ingress_route.networks[0].ingress = true;
         ingress_route.networks[0].subnet = "10.243.0.0/24".into();
-        assert!(validate_peer_set(&ingress_route, 1).is_ok());
+        assert_eq!(kept(&ingress_route, 1), [2]);
         let mut relayed = set.clone();
         relayed
             .networks
@@ -830,8 +881,8 @@ mod tests {
                 relay: true,
                 ingress: false,
             });
-        assert!(validate_peer_set(&relayed, 1).is_ok());
-        assert!(validate_peer_set(&set, 1).is_err());
+        assert_eq!(kept(&relayed, 1), [2]);
+        assert!(kept(&set, 1).is_empty());
     }
 
     #[test]
@@ -860,18 +911,18 @@ mod tests {
             }],
         };
         let relay = relay_set(minga_net::wireguard::WireGuardPeerPath::Relay);
-        assert!(validate_peer_set(&relay, 2).is_ok());
+        assert_eq!(kept(&relay, 2), [1]);
         // A direct peer may carry only its own mesh address.
         let direct = relay_set(minga_net::wireguard::WireGuardPeerPath::Direct);
-        assert!(validate_peer_set(&direct, 2).is_err());
+        assert!(kept(&direct, 2).is_empty());
         // No peer may claim the receiving node's own mesh address.
         let mut hijack = relay;
         hijack.peers[0].allowed_ips.push("10.200.0.2/32".into());
-        assert!(validate_peer_set(&hijack, 2).is_err());
+        assert!(kept(&hijack, 2).is_empty());
     }
 
     #[test]
-    fn an_allowed_ip_listed_under_two_peers_is_refused() {
+    fn an_allowed_ip_listed_under_two_peers_skips_both() {
         let peer = |node_id, allowed_ip: &str| minga_net::wireguard::WireGuardPeerAssignment {
             node_id,
             public_key: KeyPair::generate().public_key,
@@ -890,9 +941,108 @@ mod tests {
                 ingress: false,
             }],
         };
-        assert!(validate_peer_set(&set, 1).is_ok());
+        assert_eq!(kept(&set, 1), [2, 3]);
         set.peers[1].allowed_ips[0] = "10.242.0.10/32".into();
-        let error = validate_peer_set(&set, 1).unwrap_err();
-        assert!(error.to_string().contains("under two peers"), "{error}");
+        assert!(kept(&set, 1).is_empty());
+    }
+
+    fn kept(set: &minga_net::wireguard::WireGuardPeerSet, node_id: u64) -> Vec<u64> {
+        usable_peer_set(set, node_id)
+            .unwrap()
+            .peers
+            .iter()
+            .map(|peer| peer.node_id)
+            .collect()
+    }
+
+    fn shared_peer(
+        node_id: u64,
+        allowed_ip: &str,
+    ) -> minga_net::wireguard::WireGuardPeerAssignment {
+        minga_net::wireguard::WireGuardPeerAssignment {
+            node_id,
+            public_key: KeyPair::generate().public_key,
+            allowed_ips: vec![allowed_ip.into()],
+            endpoint: None,
+            keepalive: 25,
+            path: minga_net::wireguard::WireGuardPeerPath::Direct,
+        }
+    }
+
+    fn shared_set(
+        peers: Vec<minga_net::wireguard::WireGuardPeerAssignment>,
+    ) -> minga_net::wireguard::WireGuardPeerSet {
+        minga_net::wireguard::WireGuardPeerSet {
+            peers,
+            networks: vec![minga_net::wireguard::WireGuardNetworkAssignment {
+                network_id: "shared".into(),
+                subnet: "10.242.0.0/24".into(),
+                local: true,
+                relay: false,
+                ingress: false,
+            }],
+        }
+    }
+
+    #[test]
+    fn one_bad_peer_does_not_block_the_rest_of_the_set() {
+        let mut bad_key = shared_peer(3, "10.242.0.11/32");
+        bad_key.public_key = "not-a-key".into();
+        let set = shared_set(vec![
+            shared_peer(2, "10.242.0.10/32"),
+            bad_key,
+            shared_peer(4, "10.250.0.9/32"),
+            shared_peer(5, "10.242.0.12/32"),
+        ]);
+        assert_eq!(kept(&set, 1), [2, 5]);
+    }
+
+    #[test]
+    fn peers_sharing_a_public_key_are_both_skipped() {
+        let mut copy = shared_peer(3, "10.242.0.11/32");
+        let original = shared_peer(2, "10.242.0.10/32");
+        copy.public_key = original.public_key.clone();
+        let set = shared_set(vec![original, copy, shared_peer(4, "10.242.0.12/32")]);
+        assert_eq!(kept(&set, 1), [4]);
+    }
+
+    #[test]
+    fn a_peer_wg_cannot_add_does_not_abort_the_others() {
+        let mut unresolvable = shared_peer(2, "10.242.0.10/32");
+        unresolvable.endpoint = Some("unresolvable.invalid:51820".into());
+        let reachable = shared_peer(3, "10.242.0.11/32");
+        let set = shared_set(vec![unresolvable.clone(), reachable.clone()]);
+        let mut calls = Vec::new();
+        let failed = configure_peers(&set, None, &HashMap::new(), &HashMap::new(), |args| {
+            calls.push(args.join(" "));
+            if args.contains(&"unresolvable.invalid:51820") {
+                Err(WireGuardError::Command("Name or service not known".into()))
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap();
+        assert_eq!(failed, HashSet::from([unresolvable.public_key]));
+        assert!(
+            calls
+                .iter()
+                .any(|call| call.contains(&reachable.public_key)),
+            "{calls:?}"
+        );
+    }
+
+    #[test]
+    fn a_failed_removal_still_fails_the_whole_apply() {
+        let stale = KeyPair::generate().public_key;
+        let existing = HashMap::from([(stale, vec!["10.242.0.9/32".to_owned()])]);
+        let set = shared_set(vec![shared_peer(3, "10.242.0.11/32")]);
+        let result = configure_peers(&set, None, &existing, &HashMap::new(), |args| {
+            if args.contains(&"remove") {
+                Err(WireGuardError::Command("busy".into()))
+            } else {
+                Ok(())
+            }
+        });
+        assert!(result.is_err());
     }
 }
