@@ -1,0 +1,9 @@
+   Compiling minga-scheduler v1.2.0 (/Users/admin/dev/minga/.claude/worktrees/issue-124-fix/crates/minga-scheduler)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.85s
+     Running tests/scheduler.rs (/Users/admin/dev/minga/target/debug/deps/scheduler-5a7f88256864500a)
+
+running 1 test
+test relay_manager_carries_only_unique_addresses_inside_each_network ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 20 filtered out; finished in 0.80s
+

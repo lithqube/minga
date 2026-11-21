@@ -105,6 +105,8 @@ pub struct StateStore {
     tls_client: Option<std::sync::Arc<rustls::ClientConfig>>,
     /// Serializes membership changes initiated through this store.
     membership_change: tokio::sync::Mutex<()>,
+    /// This manager's `--overlay-supernet`, once set.
+    overlay_supernet: std::sync::OnceLock<minga_net::Cidr>,
 }
 
 /// Membership changes run only on the leader. A follower says which manager
@@ -115,6 +117,20 @@ fn membership_error(e: RaftError<NodeId, ClientWriteError<NodeId, BasicNode>>) -
         None => StateError::Raft(e.to_string()),
     }
 }
+/// The subnet rules for a network write, checked before proposing. The Raft
+/// apply repeats all but the supernet rule: managers may run with different
+/// supernets, and the apply must give every replica the same result.
+fn check_network_subnet_rules(
+    network: &Network,
+    supernet: Option<&minga_net::Cidr>,
+) -> Result<(), String> {
+    let Some(raw) = &network.subnet else {
+        return Ok(());
+    };
+    let subnet = minga_net::Cidr::parse(raw).map_err(|error| error.to_string())?;
+    minga_net::overlay::check_network_subnet(&subnet, supernet)
+}
+
 fn command_error(message: String) -> StateError {
     if let Some(quota) = message.strip_prefix("tenant quota exceeded: ") {
         StateError::QuotaExceeded(quota.to_owned())
@@ -307,6 +323,7 @@ impl StateStore {
             rpc_server,
             tls_client: client_tls,
             membership_change: tokio::sync::Mutex::new(()),
+            overlay_supernet: std::sync::OnceLock::new(),
         };
         if initialized {
             let default_tenant = Tenant {
@@ -853,7 +870,20 @@ impl StateStore {
         self.remove_owned(ObjectKind::Task, id, tenant_id).await
     }
 
+    /// Confines network subnets this store proposes to `supernet` from now
+    /// on; a later call keeps the first value. Managers call it after opening.
+    pub fn set_overlay_supernet(&self, supernet: minga_net::Cidr) {
+        let _ = self.overlay_supernet.set(supernet);
+    }
+
+    /// The overlay supernet set by `set_overlay_supernet`, if any.
+    pub fn overlay_supernet(&self) -> Option<minga_net::Cidr> {
+        self.overlay_supernet.get().copied()
+    }
+
     pub async fn upsert_network(&self, network: Network) -> Result<(), StateError> {
+        check_network_subnet_rules(&network, self.overlay_supernet.get())
+            .map_err(StateError::Raft)?;
         match self.propose(StateCommand::UpsertNetwork(network)).await? {
             StateResponse::Ok | StateResponse::ChangeRequest(_) => Ok(()),
             StateResponse::Conflict(_) => Err(StateError::NameInUse),
@@ -1102,6 +1132,13 @@ impl StateStore {
             if !clashes.is_empty() {
                 return Err(StateError::Conflict(clashes.join(", ")));
             }
+        }
+        // Every network rule runs before the first write, so a refused network
+        // leaves nothing half-imported.
+        for network in &snapshot.networks {
+            check_network_subnet_rules(network, self.overlay_supernet.get()).map_err(|error| {
+                StateError::BadSnapshot(format!("network {}: {error}", network.id))
+            })?;
         }
         let mut tenants = snapshot.tenants;
         if !tenants.iter().any(|tenant| tenant.id == DEFAULT_TENANT_ID) {

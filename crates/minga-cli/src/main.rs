@@ -1717,7 +1717,10 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
         )
         .await
         {
-            Ok(store) => Some(store),
+            Ok(store) => {
+                store.set_overlay_supernet(supernet);
+                Some(store)
+            }
             Err(error) => {
                 eprintln!("error: {error}");
                 return ExitCode::FAILURE;

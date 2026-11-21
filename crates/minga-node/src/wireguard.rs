@@ -456,6 +456,7 @@ fn validate_peer_set(
     }
 
     let mut public_keys = HashSet::new();
+    let mut routed_ips = HashSet::new();
     for peer in &set.peers {
         if !minga_net::wireguard::validate_public_key(&peer.public_key) {
             return Err(WireGuardError::InvalidAssignment(format!(
@@ -481,6 +482,13 @@ fn validate_peer_set(
             if prefix != "32" {
                 return Err(WireGuardError::InvalidAssignment(format!(
                     "AllowedIP must be an IPv4 /32: {allowed_ip:?}"
+                )));
+            }
+            // WireGuard moves an address listed twice to the last peer, so
+            // a second claim would steal the first peer's traffic.
+            if !routed_ips.insert(ip) {
+                return Err(WireGuardError::InvalidAssignment(format!(
+                    "AllowedIP {allowed_ip:?} is listed under two peers"
                 )));
             }
             let peer_mesh_ip =
@@ -860,5 +868,31 @@ mod tests {
         let mut hijack = relay;
         hijack.peers[0].allowed_ips.push("10.200.0.2/32".into());
         assert!(validate_peer_set(&hijack, 2).is_err());
+    }
+
+    #[test]
+    fn an_allowed_ip_listed_under_two_peers_is_refused() {
+        let peer = |node_id, allowed_ip: &str| minga_net::wireguard::WireGuardPeerAssignment {
+            node_id,
+            public_key: KeyPair::generate().public_key,
+            allowed_ips: vec![allowed_ip.into()],
+            endpoint: None,
+            keepalive: 25,
+            path: minga_net::wireguard::WireGuardPeerPath::Direct,
+        };
+        let mut set = minga_net::wireguard::WireGuardPeerSet {
+            peers: vec![peer(2, "10.242.0.10/32"), peer(3, "10.242.0.11/32")],
+            networks: vec![minga_net::wireguard::WireGuardNetworkAssignment {
+                network_id: "shared".into(),
+                subnet: "10.242.0.0/24".into(),
+                local: true,
+                relay: false,
+                ingress: false,
+            }],
+        };
+        assert!(validate_peer_set(&set, 1).is_ok());
+        set.peers[1].allowed_ips[0] = "10.242.0.10/32".into();
+        let error = validate_peer_set(&set, 1).unwrap_err();
+        assert!(error.to_string().contains("under two peers"), "{error}");
     }
 }

@@ -1,0 +1,42 @@
+   Compiling minga-state v1.2.0 (/Users/admin/dev/minga/.claude/worktrees/issue-124-fix/crates/minga-state)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 4.65s
+     Running unittests src/lib.rs (/Users/admin/dev/minga/target/debug/deps/minga_state-29f37d0149ad4a1d)
+
+running 1 test
+test state_machine::tests::upsert_network_apply_uses_only_replica_independent_rules ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 25 filtered out; finished in 0.38s
+
+     Running tests/format.rs (/Users/admin/dev/minga/target/debug/deps/format-d94fb0fbee8bb92a)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 50 filtered out; finished in 0.00s
+
+     Running tests/multi_node.rs (/Users/admin/dev/minga/target/debug/deps/multi_node-3edaae70651d94a3)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 11 filtered out; finished in 0.00s
+
+     Running tests/raft_tls.rs (/Users/admin/dev/minga/target/debug/deps/raft_tls-0879afcdd3feecd5)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.00s
+
+     Running tests/single_node.rs (/Users/admin/dev/minga/target/debug/deps/single_node-c97179fe55d3d839)
+
+running 1 test
+test upsert_network_refuses_subnets_the_overlay_must_not_route ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 19 filtered out; finished in 0.38s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.11s
+     Running tests/single_node.rs (/Users/admin/dev/minga/target/debug/deps/single_node-c97179fe55d3d839)
+
+running 1 test
+test a_snapshot_with_one_refused_network_writes_none ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 19 filtered out; finished in 0.31s
+

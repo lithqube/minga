@@ -866,6 +866,17 @@ impl RedbStateMachine {
                 Ok(StateResponse::Ok)
             }
             StateCommand::UpsertNetwork(net) => {
+                // Only rules that hold on every replica: the overlay supernet is
+                // node-local config, so StateStore::upsert_network checks it
+                // before proposing.
+                if let Some(raw) = &net.subnet {
+                    let checked = minga_net::Cidr::parse(raw)
+                        .map_err(|error| error.to_string())
+                        .and_then(|subnet| minga_net::overlay::check_network_subnet(&subnet, None));
+                    if let Err(error) = checked {
+                        return Ok(StateResponse::Error(error));
+                    }
+                }
                 if owned_by_other_tenant(
                     tx,
                     NETWORKS_TABLE,
@@ -2128,5 +2139,41 @@ mod tests {
         let snapshot = snapshot_of(&mut follower);
         let snap: StateSnapshot = crate::codec::decode(snapshot.snapshot.get_ref()).unwrap();
         assert!(snap.change_requests.is_empty());
+    }
+
+    /// The apply reads no node-local config, so two managers started with
+    /// different `--overlay-supernet` flags agree on every UpsertNetwork entry.
+    #[test]
+    fn upsert_network_apply_uses_only_replica_independent_rules() {
+        let dir = tempfile::tempdir().unwrap();
+        let replicas = [
+            RedbStateMachine::open(dir.path().join("a.redb")).unwrap(),
+            RedbStateMachine::open(dir.path().join("b.redb")).unwrap(),
+        ];
+        let net = |subnet: &str| {
+            StateCommand::UpsertNetwork(Network {
+                id: "n".into(),
+                tenant_id: "default".into(),
+                name: "n".into(),
+                driver: "overlay".into(),
+                attachable: true,
+                subnet: Some(subnet.into()),
+                wg_port: None,
+            })
+        };
+        for sm in &replicas {
+            // Outside any one supernet: the subnet rule passes it (the missing
+            // tenant answers NotFound later).
+            assert!(!matches!(
+                apply(sm, net("192.168.1.0/24")),
+                StateResponse::Error(_)
+            ));
+            for refused in ["10.200.0.0/24", "10.100.9.7/32", "not-a-cidr"] {
+                assert!(
+                    matches!(apply(sm, net(refused)), StateResponse::Error(_)),
+                    "{refused}"
+                );
+            }
+        }
     }
 }

@@ -409,10 +409,13 @@ impl Scheduler {
                     minga_state::types::TaskState::Stopped | minga_state::types::TaskState::Failed
                 )
             {
-                if let Some((_, ip)) = primary_task_ip(&task.spec.ips).filter(|(network_id, _)| {
-                    network_by_id
-                        .get(*network_id)
-                        .is_some_and(|network| network.tenant_id == task.tenant_id)
+                if let Some((_, ip)) = primary_task_ip(&task.spec.ips).filter(|(network_id, ip)| {
+                    network_by_id.get(*network_id).is_some_and(|network| {
+                        network.tenant_id == task.tenant_id
+                            && routable_subnet(network, &self.supernet).is_some_and(|subnet| {
+                                ip.parse().is_ok_and(|ip| subnet.contains(ip))
+                            })
+                    })
                 }) {
                     for port in &task.spec.ports {
                         let (Some(published), minga_state::types::PortMode::Ingress) =
@@ -487,7 +490,7 @@ impl Scheduler {
                     .map_err(|error| SchedulerError::Bus(error.to_string()))?;
             }
         }
-        let peer_sets = build_wireguard_peer_sets(nodes, &tasks, &networks)?;
+        let peer_sets = build_wireguard_peer_sets(nodes, &tasks, &networks, &self.supernet)?;
         for node in nodes {
             let key = format!("{}.node.{}.wg", node.tenant_id, node.id);
             let value = minga_state::codec::encode_wire(
@@ -542,6 +545,30 @@ impl Scheduler {
                      itself, then redeploy; it gets a free /24 (or set a non-overlapping \
                      `ipam` subnet in its Compose file)"
                 );
+            }
+        }
+        // A stored subnet that breaks the overlay rules never routes between
+        // nodes (build_wireguard_peer_sets drops it). Keyed (id, "") so it
+        // shares the report-once set with collision pairs.
+        for net in networks.iter() {
+            let Some(raw) = net.subnet.as_deref() else {
+                continue;
+            };
+            let refused = minga_net::Cidr::parse(raw)
+                .map_err(|error| error.to_string())
+                .and_then(|subnet| {
+                    minga_net::overlay::check_network_subnet(&subnet, Some(&self.supernet))
+                });
+            if let Err(why) = refused {
+                if reported.insert((net.id.clone(), String::new())) {
+                    tracing::error!(
+                        "network {}: {why}, so its tasks do not reach each other across nodes. \
+                         Fix: recreate it with a subnet inside {} (or no `ipam` subnet), or \
+                         widen --overlay-supernet on every node",
+                        net.id,
+                        self.supernet
+                    );
+                }
             }
         }
         Ok(())
@@ -648,6 +675,15 @@ fn overlay_task_statuses(
         .collect()
 }
 
+/// The subnet a network's task addresses may route in: its stored subnet, or
+/// `None` when that breaks the overlay rules (one stored before they existed).
+/// Peer sets and ingress backends both use it.
+fn routable_subnet(network: &Network, supernet: &minga_net::Cidr) -> Option<minga_net::Cidr> {
+    let subnet = minga_net::Cidr::parse(network.subnet.as_deref()?).ok()?;
+    minga_net::overlay::check_network_subnet(&subnet, Some(supernet)).ok()?;
+    Some(subnet)
+}
+
 /// Matches `prepare_network`'s sorted attachment order for published-port backends.
 fn primary_task_ip(ips: &HashMap<String, String>) -> Option<(&str, &str)> {
     ips.iter()
@@ -659,13 +695,50 @@ fn build_wireguard_peer_sets(
     nodes: &[ClusterNode],
     tasks: &[Task],
     networks: &[Network],
+    supernet: &minga_net::Cidr,
 ) -> Result<HashMap<u64, WireGuardPeerSet>, SchedulerError> {
     let node_by_id: HashMap<_, _> = nodes.iter().map(|node| (node.id, node)).collect();
-    let network_ids: HashSet<&str> = networks.iter().map(|network| network.id.as_str()).collect();
     let network_tenants: HashMap<_, _> = networks
         .iter()
         .map(|network| (network.id.as_str(), network.tenant_id.as_str()))
         .collect();
+    let network_subnets: HashMap<_, _> = networks
+        .iter()
+        .filter_map(|network| Some((network.id.as_str(), routable_subnet(network, supernet)?)))
+        .collect();
+    // A task address routes only inside its own network's subnet, from a node
+    // of that network's tenant.
+    let owned = |task: &Task, network_id: &str, ip: &str| {
+        node_by_id
+            .get(&task.node_id)
+            .is_some_and(|node| node.tenant_id == task.tenant_id)
+            && network_tenants.get(network_id) == Some(&task.tenant_id.as_str())
+            && ip.parse().is_ok_and(|ip| {
+                network_subnets
+                    .get(network_id)
+                    .is_some_and(|subnet| subnet.contains(ip))
+            })
+    };
+    let mut claims: HashMap<&str, (HashSet<u64>, HashSet<u64>)> = HashMap::new();
+    for task in tasks {
+        for (network_id, ip) in &task.spec.ips {
+            if owned(task, network_id, ip) {
+                let (all, live) = claims.entry(ip.as_str()).or_default();
+                all.insert(task.node_id);
+                if !task.state.is_terminal() {
+                    live.insert(task.node_id);
+                }
+            }
+        }
+    }
+    // WireGuard hands a /32 listed under two peers to the last one, so an
+    // address two nodes claim goes to its one live claimant, or nowhere.
+    let routed = |task: &Task, network_id: &str, ip: &str| {
+        owned(task, network_id, ip)
+            && claims.get(ip).is_some_and(|(all, live)| {
+                all.len() == 1 || (live.len() == 1 && live.contains(&task.node_id))
+            })
+    };
     let mesh_node_ips: HashMap<_, _> = nodes
         .iter()
         .map(|node| {
@@ -678,23 +751,17 @@ fn build_wireguard_peer_sets(
     let mut ingress_task_ips: HashMap<u64, HashMap<String, Vec<String>>> = HashMap::new();
     if nodes.len() > 1 {
         for task in tasks {
-            if matches!(task.state, TaskState::Stopped | TaskState::Failed)
+            if task.state.is_terminal()
                 || !task.spec.ports.iter().any(|port| {
                     port.published.is_some() && port.mode == minga_state::types::PortMode::Ingress
                 })
             {
                 continue;
             }
-            let Some(node) = node_by_id.get(&task.node_id) else {
-                continue;
-            };
             let Some((network_id, ip)) = primary_task_ip(&task.spec.ips) else {
                 continue;
             };
-            if node.tenant_id != task.tenant_id
-                || network_tenants.get(network_id) != Some(&task.tenant_id.as_str())
-                || ip.parse::<std::net::Ipv4Addr>().is_err()
-            {
+            if !routed(task, network_id, ip) {
                 continue;
             }
             ingress_network_ids.insert(network_id);
@@ -708,17 +775,8 @@ fn build_wireguard_peer_sets(
     }
     let mut task_ips: HashMap<u64, HashMap<String, Vec<String>>> = HashMap::new();
     for task in tasks {
-        let Some(node) = node_by_id.get(&task.node_id) else {
-            continue;
-        };
-        if node.tenant_id != task.tenant_id {
-            continue;
-        }
         for (network_id, ip) in &task.spec.ips {
-            if network_ids.contains(network_id.as_str())
-                && network_tenants.get(network_id.as_str()) == Some(&task.tenant_id.as_str())
-                && ip.parse::<std::net::Ipv4Addr>().is_ok()
-            {
+            if routed(task, network_id, ip) {
                 task_ips
                     .entry(task.node_id)
                     .or_default()
