@@ -552,8 +552,10 @@ pub struct ContainerSpec {
     pub Privileges: Option<Privileges>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ReadOnly: Option<bool>,
+    /// Docker capabilities to drop; refused until OCI translation supports them.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub CapabilityDrop: Option<Vec<String>>,
+    /// Docker process limits; refused until OCI translation supports them.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub Ulimits: Option<Vec<Ulimit>>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -628,10 +630,13 @@ pub struct Privileges {
 /// service create/update refuse it rather than dropping it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Ulimit {
+    /// Docker resource limit name, such as `nofile`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub Name: Option<String>,
+    /// Soft limit value.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub Soft: Option<i64>,
+    /// Hard limit value.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub Hard: Option<i64>,
 }

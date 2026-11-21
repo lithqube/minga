@@ -2495,6 +2495,7 @@ pub async fn fallback() -> ApiResult<StatusCode> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::response::IntoResponse;
     use minga_bus::MemoryBus;
     use minga_state::types::{NodeStatus, Task, TaskSpec, TaskState};
     use std::collections::{BTreeMap, HashMap};
@@ -3169,6 +3170,95 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err, ApiError::BadRequest(_)), "{err:?}");
         assert!(app.store.get_service("bot").await.unwrap().is_none());
+    }
+    #[tokio::test]
+    async fn create_and_update_refuse_unimplemented_hardening_json_with_bad_request() {
+        let (app, _dir) = app_with_node(1.0).await;
+        let cases = [
+            ("read-only", "ReadOnly", serde_json::json!(true)),
+            (
+                "privileges",
+                "Privileges",
+                serde_json::json!({"CredentialSpec": {"Config": "credentialspec.json"}}),
+            ),
+            (
+                "capability-drop",
+                "CapabilityDrop",
+                serde_json::json!(["CAP_NET_RAW"]),
+            ),
+            (
+                "ulimits",
+                "Ulimits",
+                serde_json::json!([{"Name": "nofile", "Soft": 1024, "Hard": 2048}]),
+            ),
+            ("pids", "Pids", serde_json::json!(100)),
+        ];
+        for (name, field, value) in cases {
+            let mut payload = serde_json::json!({
+                "Name": format!("rejected-{name}"),
+                "TaskTemplate": {
+                    "ContainerSpec": {"Image": "nginx:latest"},
+                    "Resources": {"Limits": {}}
+                }
+            });
+            let target = if field == "Pids" {
+                &mut payload["TaskTemplate"]["Resources"]["Limits"]
+            } else {
+                &mut payload["TaskTemplate"]["ContainerSpec"]
+            };
+            target[field] = value;
+            let create_spec: models::ServiceSpec = serde_json::from_value(payload).unwrap();
+            let err = create_service(State(app.clone()), default_caller(), Json(create_spec))
+                .await
+                .unwrap_err();
+            assert_eq!(
+                err.into_response().status(),
+                axum::http::StatusCode::BAD_REQUEST,
+                "{field}"
+            );
+            assert!(
+                app.store
+                    .get_service(&format!("rejected-{name}"))
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "{field}"
+            );
+        }
+
+        let _ = create_service(State(app.clone()), default_caller(), Json(spec("web", 0)))
+            .await
+            .unwrap();
+        let update_spec: models::ServiceSpec = serde_json::from_value(serde_json::json!({
+            "Name": "web",
+            "TaskTemplate": {
+                "ContainerSpec": {
+                    "Image": "alpine:latest",
+                    "ReadOnly": true
+                }
+            }
+        }))
+        .unwrap();
+        let err = update_service(
+            State(app.clone()),
+            default_caller(),
+            Path(("v1.41".to_string(), "web".to_string())),
+            Query(
+                serde_json::from_value::<models::ServiceUpdateQuery>(serde_json::json!({}))
+                    .unwrap(),
+            ),
+            Json(update_spec),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.into_response().status(),
+            axum::http::StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            app.store.get_service("web").await.unwrap().unwrap().image,
+            "nginx:latest"
+        );
     }
 
     #[tokio::test]
