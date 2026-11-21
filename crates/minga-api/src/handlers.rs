@@ -3182,6 +3182,21 @@ mod tests {
                 serde_json::json!({"CredentialSpec": {"Config": "credentialspec.json"}}),
             ),
             (
+                "privileges-seccomp",
+                "Privileges",
+                serde_json::json!({"Seccomp": {"Mode": "custom", "Profile": "{}"}}),
+            ),
+            (
+                "privileges-apparmor",
+                "Privileges",
+                serde_json::json!({"AppArmor": {"Mode": "disabled"}}),
+            ),
+            (
+                "privileges-no-new-privileges",
+                "Privileges",
+                serde_json::json!({"NoNewPrivileges": true}),
+            ),
+            (
                 "capability-drop",
                 "CapabilityDrop",
                 serde_json::json!(["CAP_NET_RAW"]),
@@ -3214,7 +3229,7 @@ mod tests {
             assert_eq!(
                 err.into_response().status(),
                 axum::http::StatusCode::BAD_REQUEST,
-                "{field}"
+                "{name} ({field})"
             );
             assert!(
                 app.store
@@ -3222,7 +3237,7 @@ mod tests {
                     .await
                     .unwrap()
                     .is_none(),
-                "{field}"
+                "{name} ({field})"
             );
         }
 

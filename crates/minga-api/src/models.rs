@@ -617,12 +617,41 @@ pub struct TmpfsOptions {
     pub Mode: Option<u32>,
 }
 
+/// Container security options from the Docker Engine API.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Privileges {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub CredentialSpec: Option<CredentialSpec>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub SELinuxContext: Option<SELinuxContext>,
+    /// Seccomp mode and optional custom profile; not applied by Minga.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub Seccomp: Option<SeccompOptions>,
+    /// AppArmor mode; not applied by Minga.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub AppArmor: Option<AppArmorOptions>,
+    /// Whether to set `no_new_privs`; not applied by Minga.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub NoNewPrivileges: Option<bool>,
+}
+
+/// Docker Seccomp profile settings, which Minga currently refuses when active.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SeccompOptions {
+    /// Mode such as `default`, `unconfined`, or `custom`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub Mode: Option<String>,
+    /// Custom Seccomp profile encoded as JSON.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub Profile: Option<String>,
+}
+
+/// Docker AppArmor settings, which Minga currently refuses when active.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppArmorOptions {
+    /// Mode such as `default` or `disabled`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub Mode: Option<String>,
 }
 
 /// One `Ulimits` entry of a Docker `ContainerSpec` (`{"Name": "nofile",

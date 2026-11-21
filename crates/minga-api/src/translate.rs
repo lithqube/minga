@@ -183,8 +183,8 @@ pub fn service_spec_to_state(spec: &models::ServiceSpec) -> Result<Service, Stri
     // Refuse active hardening fields instead of silently dropping them: the
     // container would run with the defaults while the deployer believes
     // the requested isolation is in effect. Explicit no-ops
-    // (`ReadOnly: false`, empty lists/Privileges, and unlimited `Pids: 0`)
-    // ask for nothing and stay accepted.
+    // (`ReadOnly: false`, empty lists/Privileges, `NoNewPrivileges: false`,
+    // and unlimited `Pids: 0`) ask for nothing and stay accepted.
     if container.ReadOnly == Some(true) {
         return Err(format!(
             "service '{name}': ContainerSpec.ReadOnly is not supported"
@@ -199,7 +199,15 @@ pub fn service_spec_to_state(spec: &models::ServiceSpec) -> Result<Service, Stri
                 || context.Role.is_some()
                 || context.Type.is_some()
                 || context.Level.is_some()
-        })
+        }) || privileges
+            .Seccomp
+            .as_ref()
+            .is_some_and(|options| options.Mode.is_some() || options.Profile.is_some())
+            || privileges
+                .AppArmor
+                .as_ref()
+                .is_some_and(|options| options.Mode.is_some())
+            || privileges.NoNewPrivileges == Some(true)
     }) {
         return Err(format!(
             "service '{name}': ContainerSpec.Privileges is not supported"
@@ -1481,6 +1489,9 @@ mod tests {
                 Registry: None,
             }),
             SELinuxContext: None,
+            Seccomp: None,
+            AppArmor: None,
+            NoNewPrivileges: None,
         });
         let err = service_spec_to_state(&spec).unwrap_err();
         assert!(err.contains("Privileges"), "{err}");
@@ -1495,6 +1506,9 @@ mod tests {
                 Type: None,
                 Level: None,
             }),
+            Seccomp: None,
+            AppArmor: None,
+            NoNewPrivileges: None,
         });
         let err = service_spec_to_state(&spec).unwrap_err();
         assert!(err.contains("Privileges"), "{err}");
@@ -1546,6 +1560,12 @@ mod tests {
                 Type: None,
                 Level: None,
             }),
+            Seccomp: Some(models::SeccompOptions {
+                Mode: None,
+                Profile: None,
+            }),
+            AppArmor: Some(models::AppArmorOptions { Mode: None }),
+            NoNewPrivileges: Some(false),
         });
         spec.TaskTemplate
             .Resources
