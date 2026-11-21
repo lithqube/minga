@@ -1232,19 +1232,43 @@ async fn worker_watch_recovers_without_consumer_info() {
         })
         .await
         .unwrap();
+    // Control: the consumer exists and its config names tenant beta.
+    let config = stream.consumer_info("betaprobe").await.unwrap().config;
+    assert_eq!(config.filter_subject, "$KV.MINGA_ASSIGN.beta.node.9.>");
 
     let worker_config = worker_client_config(dir.path(), &pki);
-    let worker = async_nats::connect_with_options(&url, worker_raw_options(&worker_config))
-        .await
-        .unwrap();
+    let (errors_tx, mut errors) = tokio::sync::mpsc::unbounded_channel();
+    let worker = async_nats::connect_with_options(
+        &url,
+        worker_raw_options(&worker_config).event_callback(move |event| {
+            let errors_tx = errors_tx.clone();
+            async move {
+                if let async_nats::Event::ServerError(error) = event {
+                    let _ = errors_tx.send(error.to_string());
+                }
+            }
+        }),
+    )
+    .await
+    .unwrap();
     let info = tokio::time::timeout(
         Duration::from_secs(2),
         worker.request("$JS.API.CONSUMER.INFO.KV_MINGA_ASSIGN.betaprobe", "".into()),
     )
     .await;
     assert!(
-        !matches!(&info, Ok(Ok(reply)) if String::from_utf8_lossy(&reply.payload).contains(".beta.")),
-        "worker 7 read tenant beta's consumer config: {info:?}"
+        !matches!(&info, Ok(Ok(_))),
+        "worker 7 got an answer about tenant beta's consumer: {info:?}"
+    );
+    // The missing answer must be the server refusing the publish, not a slow server.
+    let refusal = tokio::time::timeout(Duration::from_secs(2), errors.recv())
+        .await
+        .expect("the server reports a permissions violation")
+        .unwrap();
+    assert!(
+        refusal.contains("Permissions Violation")
+            && refusal.contains("$JS.API.CONSUMER.INFO.KV_MINGA_ASSIGN.betaprobe"),
+        "unexpected server error: {refusal}"
     );
     stream.delete_consumer("betaprobe").await.unwrap();
 
