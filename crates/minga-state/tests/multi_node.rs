@@ -39,13 +39,23 @@ where
     }
 }
 
-/// Waits until one of `stores` reports itself leader and returns it.
+/// Waits until every store in `stores` names the same leader and returns it.
+///
+/// Every node bootstraps and campaigns at once, so right after start (or under
+/// load) a deposed leader can still report itself leader until it hears the new
+/// term. Agreement across all stores rules that out.
 async fn leader<'a>(stores: &[&'a StateStore]) -> &'a StateStore {
     let deadline = tokio::time::Instant::now() + WAIT;
     loop {
+        let mut named = Vec::with_capacity(stores.len());
         for store in stores {
-            if store.is_leader().await {
-                return store;
+            named.push(store.current_leader().await);
+        }
+        if let Some(Some(id)) = named.first().copied() {
+            if named.iter().all(|n| *n == Some(id)) {
+                if let Some(store) = stores.iter().find(|s| s.node_id() == id) {
+                    return store;
+                }
             }
         }
         assert!(
