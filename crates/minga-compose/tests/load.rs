@@ -221,6 +221,42 @@ fn dependency_on_disabled_profile_fails() {
 }
 
 #[test]
+fn port_host_ip_short_syntax_is_unsupported() {
+    let err = load(
+        "services:\n  db: {image: db, ports: ['127.0.0.1:5432:5432']}\n",
+        &opts(&[], &[]),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(&err.0[0], ComposeError::Unsupported { path, key, .. } if path == "services.db.ports[0]" && key == "host_ip")
+    );
+}
+
+#[test]
+fn port_host_ip_long_syntax_is_unsupported() {
+    let errs = errors(
+        "services:\n  db:\n    image: db\n    ports:\n      - {target: 5432, published: 5432, host_ip: 127.0.0.1}\n",
+    );
+    assert_eq!(errs.len(), 1);
+    assert!(
+        errs[0].starts_with(
+            "services.db.ports[0]: `host_ip` is part of the Compose spec but not supported yet"
+        ),
+        "unexpected error: {}",
+        errs[0]
+    );
+}
+
+#[test]
+fn ports_without_host_ip_still_load() {
+    let loaded = load(
+        "services:\n  db: {image: db, ports: ['5432:5432', 8080, {target: 5433, published: 5433}]}\n",
+        &opts(&[], &[]),
+    );
+    assert!(loaded.is_ok(), "unexpected errors: {loaded:?}");
+}
+
+#[test]
 fn published_port_conflicts() {
     let errs = errors(
         "services:\n  a: {image: a, ports: ['80:80']}\n  b: {image: b, ports: ['80:8080']}\n",

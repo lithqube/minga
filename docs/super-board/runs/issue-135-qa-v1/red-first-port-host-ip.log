@@ -1,0 +1,25 @@
+running 2 tests
+test port_host_ip_short_syntax_is_unsupported ... FAILED
+test port_host_ip_long_syntax_is_unsupported ... FAILED
+
+failures:
+
+---- port_host_ip_short_syntax_is_unsupported stdout ----
+
+thread 'port_host_ip_short_syntax_is_unsupported' (260265) panicked at crates/minga-compose/tests/load.rs:229:6:
+called `Result::unwrap_err()` on an `Ok` value: Loaded { project: Project { name: None, services: {"db": Service { image: Some("db"), command: None, entrypoint: None, environment: ListOrMap({}), labels: ListOrMap({}), ports: [Port { target: PortRange { start: 5432, end: 5432 }, published: Some(PortRange { start: 5432, end: 5432 }), host_ip: Some("127.0.0.1"), protocol: "tcp", mode: None, name: None, app_protocol: None }], volumes: [], networks: {}, depends_on: {}, healthcheck: None, deploy: None, restart: None, privileged: None, devices: [], cap_add: [], cap_drop: [], user: None, working_dir: None, hostname: None, init: None, read_only: None, secrets: [], configs: [], profiles: [], stop_grace_period: None, stop_signal: None, sysctls: ListOrMap({}), tmpfs: None, ulimits: {}, logging: None, env_file: [], extra_hosts: ListOrMap({}), extensions: {} }}, disabled_services: [], networks: {}, volumes: {}, secrets: {}, configs: {}, extensions: {}, order: ["db"] }, warnings: [] }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- port_host_ip_long_syntax_is_unsupported stdout ----
+
+thread 'port_host_ip_long_syntax_is_unsupported' (260264) panicked at crates/minga-compose/tests/load.rs:28:10:
+expected the file to be rejected: Loaded { project: Project { name: None, services: {"db": Service { image: Some("db"), command: None, entrypoint: None, environment: ListOrMap({}), labels: ListOrMap({}), ports: [Port { target: PortRange { start: 5432, end: 5432 }, published: Some(PortRange { start: 5432, end: 5432 }), host_ip: Some("127.0.0.1"), protocol: "tcp", mode: None, name: None, app_protocol: None }], volumes: [], networks: {}, depends_on: {}, healthcheck: None, deploy: None, restart: None, privileged: None, devices: [], cap_add: [], cap_drop: [], user: None, working_dir: None, hostname: None, init: None, read_only: None, secrets: [], configs: [], profiles: [], stop_grace_period: None, stop_signal: None, sysctls: ListOrMap({}), tmpfs: None, ulimits: {}, logging: None, env_file: [], extra_hosts: ListOrMap({}), extensions: {} }}, disabled_services: [], networks: {}, volumes: {}, secrets: {}, configs: {}, extensions: {}, order: ["db"] }, warnings: [] }
+
+
+failures:
+    port_host_ip_long_syntax_is_unsupported
+    port_host_ip_short_syntax_is_unsupported
+
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 16 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p minga-compose --test load`
