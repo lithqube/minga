@@ -1,0 +1,9 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.17s
+     Running unittests src/lib.rs (/Users/admin/dev/minga/target/debug/deps/minga_node-f8e16470d89d9436)
+
+running 2 tests
+test wireguard::tests::a_failed_removal_still_fails_the_whole_apply ... ok
+test wireguard::tests::a_peer_wg_cannot_add_does_not_abort_the_others ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 167 filtered out; finished in 0.00s
+
