@@ -153,9 +153,7 @@ fn worker_permission_template(tenant_id: &str) -> (Vec<String>, Vec<String>) {
         format!("minga.{tenant_id}.log.node.{node}.>"),
         format!("$KV.MINGA_STATUS_{tenant_id}.node.{node}.task.>"),
         format!("$KV.MINGA_LEASES.{tenant_id}.lease.node.{node}"),
-        "$JS.API.STREAM.INFO.KV_MINGA_ASSIGN".to_string(),
         format!("$JS.API.STREAM.INFO.KV_MINGA_STATUS_{tenant_id}"),
-        "$JS.API.STREAM.INFO.KV_MINGA_LEASES".to_string(),
         "$JS.FC.KV_MINGA_ASSIGN.>".to_string(),
         format!("$JS.API.CONSUMER.CREATE.KV_MINGA_ASSIGN.*.$KV.MINGA_ASSIGN.{tenant_id}.node.{node}.task.>"),
         format!("$JS.API.CONSUMER.CREATE.KV_MINGA_ASSIGN.*.$KV.MINGA_ASSIGN.{tenant_id}.node.{node}.ingress.>"),
@@ -305,6 +303,15 @@ mod tests {
         assert!(subscribe
             .iter()
             .any(|permission| permission == "$KV.MINGA_ASSIGN.tenant-a.node.{{tag(node)}}.wg"));
+    }
+
+    #[test]
+    fn worker_template_cannot_list_shared_bucket_keys() {
+        // STREAM.INFO with `subjects_filter` lists every tenant's keys.
+        let (publish, _) = worker_permission_template("tenant-a");
+        assert!(!publish.iter().any(|permission| permission
+            .starts_with("$JS.API.STREAM.INFO.KV_MINGA_ASSIGN")
+            || permission.starts_with("$JS.API.STREAM.INFO.KV_MINGA_LEASES")));
     }
 
     #[test]

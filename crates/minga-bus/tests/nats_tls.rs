@@ -756,9 +756,9 @@ async fn worker_certificate_cannot_write_assignments_or_other_nodes_status_and_l
         .await
         .expect("worker certificate connects");
     let stream = async_nats::jetstream::new(raw)
-        .get_stream("KV_MINGA_ASSIGN")
+        .get_stream_no_info("KV_MINGA_ASSIGN")
         .await
-        .expect("worker may read stream info");
+        .unwrap();
     // The server, not only the client guard, keeps worker 7 out of other
     // nodes' networks.
     for filter in [
@@ -862,6 +862,135 @@ async fn worker_certificate_cannot_write_assignments_or_other_nodes_status_and_l
             "worker unexpectedly wrote through {subject}: {result:?}"
         );
     }
+}
+
+/// Every subject a `STREAM.INFO` request with `subjects_filter` returns.
+async fn stream_subjects(
+    client: &async_nats::Client,
+    stream: &str,
+    filter: &str,
+) -> Result<Vec<String>, String> {
+    let stream = async_nats::jetstream::new(client.clone())
+        .get_stream_no_info(stream)
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut subjects = stream
+        .info_with_subjects(filter)
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut found = Vec::new();
+    while let Some(entry) = subjects.next().await {
+        found.push(entry.map_err(|error| error.to_string())?.0);
+    }
+    Ok(found)
+}
+
+/// nats-server 2.15.3 answers `STREAM.INFO` with `subjects_filter` with every
+/// matching key. On the shared assignment and lease buckets those keys name
+/// every tenant's nodes, tasks, networks and ingress ports, so a worker must
+/// not be able to send that request at all.
+#[tokio::test]
+async fn worker_cannot_list_other_tenants_keys_through_stream_info() {
+    let _guard = NATS_TEST_LOCK.lock().await;
+    if nats_server_bin().is_none() {
+        panic!("nats-server binary not found - install it to run the TLS suite");
+    }
+
+    let pki = make_pki();
+    let server = start_worker_acl_server(&pki);
+    wait_ready(&server);
+    let dir = tempfile::tempdir().unwrap();
+    let manager_config = manager_client_config(dir.path(), &pki);
+    let url = format!("tls://localhost:{}", server.port);
+    let manager = NatsBus::connect_secure(&url, &manager_config)
+        .await
+        .unwrap();
+    manager.ensure_tenant_resources("default").await.unwrap();
+    manager
+        .put_assignment("default.node.7.task.own", b"own")
+        .await
+        .unwrap();
+    manager
+        .put_assignment("beta.node.9.ingress.8443", b"foreign")
+        .await
+        .unwrap();
+    manager
+        .refresh_tenant_lease("beta", 9, b"foreign-lease")
+        .await
+        .unwrap();
+
+    // What the server returns to a caller allowed to ask: every tenant's keys.
+    let manager_client =
+        async_nats::connect_with_options(&url, manager_config.connect_options().unwrap())
+            .await
+            .unwrap();
+    let listed = stream_subjects(&manager_client, "KV_MINGA_ASSIGN", "$KV.MINGA_ASSIGN.>")
+        .await
+        .unwrap();
+    assert!(listed.contains(&"$KV.MINGA_ASSIGN.beta.node.9.ingress.8443".to_string()));
+    let listed = stream_subjects(&manager_client, "KV_MINGA_LEASES", ">")
+        .await
+        .unwrap();
+    assert!(listed.contains(&"$KV.MINGA_LEASES.beta.lease.node.9".to_string()));
+
+    let worker_config = worker_client_config(dir.path(), &pki);
+    let worker = async_nats::connect_with_options(&url, worker_raw_options(&worker_config))
+        .await
+        .unwrap();
+    for (stream, filter) in [
+        ("KV_MINGA_ASSIGN", "$KV.MINGA_ASSIGN.>"),
+        ("KV_MINGA_ASSIGN", ">"),
+        ("KV_MINGA_LEASES", ">"),
+    ] {
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            stream_subjects(&worker, stream, filter),
+        )
+        .await;
+        assert!(
+            !matches!(result, Ok(Ok(_))),
+            "worker 7 listed {stream} keys with filter {filter}: {result:?}"
+        );
+    }
+
+    // The worker bus still works on the shared buckets without STREAM.INFO.
+    let worker_bus = NatsBus::connect_worker_secure(&url, &worker_config, 7, "default")
+        .await
+        .expect("worker opens the shared buckets without STREAM.INFO");
+    assert_eq!(
+        worker_bus
+            .get_assignment("default.node.7.task.own")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(&b"own"[..])
+    );
+    assert_eq!(
+        worker_bus
+            .get_assignment("default.node.7.task.missing")
+            .await
+            .unwrap(),
+        None
+    );
+    manager
+        .delete_assignment("default.node.7.task.own")
+        .await
+        .unwrap();
+    assert_eq!(
+        worker_bus
+            .get_assignment("default.node.7.task.own")
+            .await
+            .unwrap(),
+        None,
+        "a deleted key reads as absent"
+    );
+    assert!(!worker_bus.is_tenant_node_alive("default", 7).await.unwrap());
+    worker_bus
+        .refresh_tenant_lease("default", 7, b"alive")
+        .await
+        .unwrap();
+    assert!(worker_bus.is_tenant_node_alive("default", 7).await.unwrap());
+    assert!(manager.is_tenant_node_alive("default", 7).await.unwrap());
 }
 
 /// A client presenting a certificate from an untrusted CA is rejected.

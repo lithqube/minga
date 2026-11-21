@@ -201,9 +201,7 @@ pub fn worker_acl(tenant_id: &str, node_id: u64) -> crate::Result<(Vec<String>, 
         own_status.clone(),
         format!("{PREFIX}.{tenant_id}.log.node.{node_id}.*"),
         format!("{PREFIX}.{tenant_id}.usage.>"),
-        "$JS.API.STREAM.INFO.KV_MINGA_ASSIGN".into(),
         format!("$JS.API.STREAM.INFO.KV_{status_bucket}"),
-        "$JS.API.STREAM.INFO.KV_MINGA_LEASES".into(),
         format!("$JS.API.STREAM.INFO.{log_bucket}"),
         format!("$JS.API.DIRECT.GET.KV_{status_bucket}.$KV.{status_bucket}.node.{node_id}.task.>"),
         format!("$JS.API.DIRECT.GET.KV_MINGA_LEASES.{own_lease}"),
@@ -303,6 +301,10 @@ mod tests {
         assert!(subscribe.contains(&"minga.tenant_a.ctl.node.7.ping".to_string()));
         assert!(subscribe.contains(&"minga.tenant_a.ctl.node.7.drain".to_string()));
         assert!(!publish.iter().any(|subject| subject.contains("audit")));
+        // STREAM.INFO with `subjects_filter` lists every key in the bucket.
+        assert!(!publish.iter().any(|subject| subject
+            .starts_with("$JS.API.STREAM.INFO.KV_MINGA_ASSIGN")
+            || subject.starts_with("$JS.API.STREAM.INFO.KV_MINGA_LEASES")));
         assert!(!publish
             .iter()
             .chain(&subscribe)
