@@ -1,0 +1,10 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.19s
+     Running unittests src/lib.rs (/Users/admin/dev/minga/target/debug/deps/minga_node-f8e16470d89d9436)
+
+running 3 tests
+test wireguard::tests::one_bad_peer_does_not_block_the_rest_of_the_set ... ok
+test wireguard::tests::peers_sharing_a_public_key_are_both_skipped ... ok
+test wireguard::tests::an_allowed_ip_listed_under_two_peers_skips_both ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 166 filtered out; finished in 0.00s
+

@@ -879,3 +879,33 @@ async fn importing_a_snapshot_keeps_existing_tenant_quotas() {
     assert_eq!(default.name, "Default");
     store.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn a_wireguard_key_held_by_another_node_is_refused() {
+    let (store, _dir) = test_store("wg-key-unique").await;
+    store
+        .create_tenant(named_tenant("tenant-a", TenantQuotas::default()))
+        .await
+        .unwrap();
+    const KEY: &str = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=";
+    let mut holder = sample_node(1);
+    holder.wg_public_key = Some(KEY.into());
+    store.upsert_node(holder.clone()).await.unwrap();
+    // The holder may re-register under its own key.
+    store.upsert_node(holder).await.unwrap();
+
+    // Another tenant's node may not take the key, and nothing is written.
+    let mut copier = sample_node(2);
+    copier.tenant_id = "tenant-a".into();
+    copier.wg_public_key = Some(KEY.into());
+    assert!(matches!(
+        store.upsert_node(copier.clone()).await,
+        Err(StateError::NameInUse)
+    ));
+    assert!(store.get_node(2).await.unwrap().is_none());
+
+    // Once the holder is gone the key is free again.
+    store.remove_node(1).await.unwrap();
+    store.upsert_node(copier).await.unwrap();
+    store.shutdown().await.unwrap();
+}

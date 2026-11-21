@@ -1,0 +1,540 @@
+   Compiling minga-bus v1.2.0 (/Users/admin/dev/minga/.claude/worktrees/issue-127-build/crates/minga-bus)
+   Compiling minga-scheduler v1.2.0 (/Users/admin/dev/minga/.claude/worktrees/issue-127-build/crates/minga-scheduler)
+   Compiling minga-egress v1.2.0 (/Users/admin/dev/minga/.claude/worktrees/issue-127-build/crates/minga-egress)
+   Compiling minga-node v1.2.0 (/Users/admin/dev/minga/.claude/worktrees/issue-127-build/crates/minga-node)
+   Compiling minga-api v1.2.0 (/Users/admin/dev/minga/.claude/worktrees/issue-127-build/crates/minga-api)
+   Compiling minga-cli v1.2.0 (/Users/admin/dev/minga/.claude/worktrees/issue-127-build/crates/minga-cli)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 13.05s
+     Running unittests src/main.rs (/Users/admin/dev/minga/target/debug/deps/minga-deaa5f85e9e6480e)
+
+running 55 tests
+test mcp::tests::agent_gets_only_a_proposal_write_tool ... ok
+test mcp::tests::task_arguments_reject_path_injection_and_unknown_fields ... ok
+test mcp::tests::output_projections_omit_environment_and_task_errors_and_sort_rows ... ok
+test mcp::tests::event_projection_keeps_metadata_and_omits_payload ... ok
+test mcp::tests::mcp_tools_are_read_only_and_have_closed_argument_schemas ... ok
+test mcp::tests::an_oversized_message_is_skipped_without_buffering_it ... ok
+test mcp::tests::the_log_budget_keeps_the_newest_bytes ... ok
+test mcp::tests::every_tool_list_matches_the_mcp_tool_shape ... ok
+test sidecar::tests::config_contains_required_fields ... ok
+test private::tests::new_and_existing_paths_end_up_owner_only ... ok
+test sidecar::tests::config_honours_restricted_listen_address ... ok
+test bus::tests::tls_url_without_material_is_rejected ... ok
+test sidecar::tests::config_enables_operator_jwt_resolver_without_certificate_mapping ... ok
+test sidecar::tests::config_uses_custom_ports ... ok
+test bus::tests::credentials_file_requires_owner_only_permissions ... ok
+test sidecar::tests::config_with_cluster_tls_emits_separate_route_block ... ok
+test sidecar::tests::config_without_tls_has_no_tls_block ... ok
+test sidecar::tests::config_never_embeds_key_material ... ok
+test sidecar::tests::certificate_mapping_does_not_create_static_worker_users ... ok
+test sidecar::tests::config_with_tls_emits_client_tls_block ... ok
+test sidecar::tests::default_options ... ok
+test sidecar::tests::find_nats_server_returns_path ... ok
+test sidecar::tests::jwt_auth_rejects_missing_tls ... ok
+test sidecar::tests::plaintext_sidecar_rejects_public_listener ... ok
+test sidecar::tests::find_nats_server_env_var ... ok
+test tests::loopback_binds_are_recognised ... ok
+test tests::a_bare_compose_file_name_resolves_against_the_current_directory ... ok
+test tests::manager_certificate_names_cover_local_sidecar_tls_without_expanding_worker_identity ... ok
+test mcp::tests::initialize_and_tools_list_use_mcp_jsonrpc_shapes ... ok
+test mcp::tests::tool_arguments_cannot_add_unlisted_reads ... ok
+test mcp::tests::tool_calls_outside_the_allow_list_are_refused ... ok
+test tests::manager_api_flags_parse ... ok
+test tests::manager_refuses_an_empty_api_token ... ok
+test tests::manager_join_and_route_tls_flags_parse ... ok
+test tests::api_command_parses_as_retired_command ... ok
+test mcp::tests::the_tenant_comes_from_the_certificate_not_the_arguments ... ok
+test tests::managers_require_wireguard_endpoint_when_joining_or_multi_node ... ok
+test tests::manager_rejects_route_port_without_route_tls ... ok
+test tests::manager_refuses_tokenless_api_beyond_loopback ... ok
+test tests::migration_command_defaults_to_dry_run_and_requires_manager_ids ... ok
+test tests::only_wildcard_binds_reach_task_bridge_gateways ... ok
+test tests::port_of_reads_the_bind_port ... ok
+test tests::plaintext_raft_beyond_loopback_is_refused ... ok
+test tests::net_create_rejects_per_network_wg_port ... ok
+test tests::wireguard_node_options_parse ... ok
+test tests::only_manager_certificates_carry_the_route_name ... ok
+test tests::owner_only_reader_rejects_a_fifo_without_blocking ... ok
+test tests::tls_init_join_key_creates_a_private_key_and_refuses_overwrite ... ok
+test tests::worker_accepts_repeatable_agent_directory_roots ... ok
+test tests::cas_overlap_detects_a_shared_certificate ... ok
+test tests::worker_rejects_manager_api_flags ... ok
+test tests::worker_rejects_nats_cluster_port_flag ... ok
+test tests::worker_rejects_peer_flag ... ok
+[97256] 2026/11/21 09:55:25.754554 [INF] Starting nats-server
+[97256] 2026/11/21 09:55:25.754840 [INF]   Version:  2.15.3
+[97256] 2026/11/21 09:55:25.754848 [INF]   Git:      [not set]
+[97256] 2026/11/21 09:55:25.754852 [INF]   Cluster:  minga-test
+[97256] 2026/11/21 09:55:25.754855 [INF]   Name:     minga-1
+[97256] 2026/11/21 09:55:25.754859 [INF]   Node:     11lljj8r
+[97256] 2026/11/21 09:55:25.754866 [INF]   ID:       NBG767SJNG56J3MPXZSQABOOYC3RE4JUH35HSAZYPZZ4CD4H6MX55PZW
+[97256] 2026/11/21 09:55:25.754901 [INF] Using configuration file: /var/folders/24/wlt58ddx4l74l96pl4znxsv40000gp/T/.tmpAOl8tJ/nats/server.conf (sha256:7e99c96f6159e4252d66e5081478652778fc1588f3ba12d27adb5300cc07d4e6)
+[97256] 2026/11/21 09:55:25.755973 [INF] Starting http monitor on 127.0.0.1:56054
+[97256] 2026/11/21 09:55:25.756550 [INF] Starting JetStream
+[97256] 2026/11/21 09:55:25.756726 [INF]     _ ___ _____ ___ _____ ___ ___   _   __  __
+[97256] 2026/11/21 09:55:25.756731 [INF]  _ | | __|_   _/ __|_   _| _ \ __| /_\ |  \/  |
+[97256] 2026/11/21 09:55:25.756734 [INF] | || | _|  | | \__ \ | | |   / _| / _ \| |\/| |
+[97256] 2026/11/21 09:55:25.756737 [INF]  \__/|___| |_| |___/ |_| |_|_\___/_/ \_\_|  |_|
+[97256] 2026/11/21 09:55:25.756740 [INF] 
+[97256] 2026/11/21 09:55:25.756743 [INF]          https://docs.nats.io/jetstream
+[97256] 2026/11/21 09:55:25.756746 [INF] 
+[97256] 2026/11/21 09:55:25.756748 [INF] ---------------- JETSTREAM ----------------
+[97256] 2026/11/21 09:55:25.756751 [INF]   Strict:          true
+[97256] 2026/11/21 09:55:25.756774 [INF]   Max Memory:      64.00 MB
+[97256] 2026/11/21 09:55:25.756778 [INF]   Max Storage:     8.00 GB
+[97256] 2026/11/21 09:55:25.756781 [INF]   Store Directory: "/var/folders/24/wlt58ddx4l74l96pl4znxsv40000gp/T/.tmpAOl8tJ/nats/jetstream/jetstream"
+[97256] 2026/11/21 09:55:25.756784 [INF]   API Level:       5
+[97256] 2026/11/21 09:55:25.756786 [INF] -------------------------------------------
+[97256] 2026/11/21 09:55:25.757360 [INF] Starting JetStream cluster
+[97256] 2026/11/21 09:55:25.757368 [INF] Creating JetStream metadata controller
+[97256] 2026/11/21 09:55:25.759682 [INF] JetStream cluster bootstrapping
+[97256] 2026/11/21 09:55:25.780940 [INF] Took 24.383208ms to start JetStream
+[97256] 2026/11/21 09:55:25.781042 [INF] Listening for client connections on 127.0.0.1:56050
+[97256] 2026/11/21 09:55:25.781056 [INF] Server is ready
+[97256] 2026/11/21 09:55:25.781066 [INF] Cluster name is minga-test
+[97256] 2026/11/21 09:55:25.781201 [INF] Listening for route connections on 0.0.0.0:56058
+[97258] 2026/11/21 09:55:25.828614 [INF] Starting nats-server
+[97258] 2026/11/21 09:55:25.828687 [INF]   Version:  2.15.3
+[97258] 2026/11/21 09:55:25.828692 [INF]   Git:      [not set]
+[97258] 2026/11/21 09:55:25.828695 [INF]   Cluster:  minga-test
+[97258] 2026/11/21 09:55:25.828698 [INF]   Name:     minga-2
+[97258] 2026/11/21 09:55:25.828702 [INF]   Node:     dCnd6u0M
+[97258] 2026/11/21 09:55:25.828705 [INF]   ID:       NAOEUURTR65ENYXERAGD7K6OA6776E2NYYWRID2Y4ZK56MYYCPRZKASQ
+[97258] 2026/11/21 09:55:25.828715 [INF] Using configuration file: /var/folders/24/wlt58ddx4l74l96pl4znxsv40000gp/T/.tmpx1yk5x/nats/server.conf (sha256:29071db395418f70c7632125d61ab4a12800e5434f7d9597e795330e033b54d9)
+[97258] 2026/11/21 09:55:25.828912 [INF] Starting http monitor on 127.0.0.1:56055
+[97258] 2026/11/21 09:55:25.828974 [INF] Starting JetStream
+[97258] 2026/11/21 09:55:25.829118 [INF]     _ ___ _____ ___ _____ ___ ___   _   __  __
+[97258] 2026/11/21 09:55:25.829123 [INF]  _ | | __|_   _/ __|_   _| _ \ __| /_\ |  \/  |
+[97258] 2026/11/21 09:55:25.829127 [INF] | || | _|  | | \__ \ | | |   / _| / _ \| |\/| |
+[97258] 2026/11/21 09:55:25.829130 [INF]  \__/|___| |_| |___/ |_| |_|_\___/_/ \_\_|  |_|
+[97258] 2026/11/21 09:55:25.829133 [INF] 
+[97258] 2026/11/21 09:55:25.829136 [INF]          https://docs.nats.io/jetstream
+[97258] 2026/11/21 09:55:25.829147 [INF] 
+[97258] 2026/11/21 09:55:25.829150 [INF] ---------------- JETSTREAM ----------------
+[97258] 2026/11/21 09:55:25.829153 [INF]   Strict:          true
+[97258] 2026/11/21 09:55:25.829160 [INF]   Max Memory:      64.00 MB
+[97258] 2026/11/21 09:55:25.829164 [INF]   Max Storage:     8.00 GB
+[97258] 2026/11/21 09:55:25.829167 [INF]   Store Directory: "/var/folders/24/wlt58ddx4l74l96pl4znxsv40000gp/T/.tmpx1yk5x/nats/jetstream/jetstream"
+[97258] 2026/11/21 09:55:25.829173 [INF]   API Level:       5
+[97258] 2026/11/21 09:55:25.829176 [INF] -------------------------------------------
+[97258] 2026/11/21 09:55:25.829600 [INF] Starting JetStream cluster
+[97258] 2026/11/21 09:55:25.829609 [INF] Creating JetStream metadata controller
+[97258] 2026/11/21 09:55:25.830693 [INF] JetStream cluster bootstrapping
+[97258] 2026/11/21 09:55:25.842848 [INF] Took 13.866417ms to start JetStream
+[97258] 2026/11/21 09:55:25.842899 [INF] Listening for client connections on 127.0.0.1:56051
+[97258] 2026/11/21 09:55:25.842911 [INF] Server is ready
+[97258] 2026/11/21 09:55:25.842923 [INF] Cluster name is minga-test
+[97258] 2026/11/21 09:55:25.843017 [INF] Listening for route connections on 0.0.0.0:56059
+[97258] 2026/11/21 09:55:25.845640 [INF] 127.0.0.1:56058 - rid:9 - Route connection created (127.0.0.1:56058)
+[97256] 2026/11/21 09:55:25.845904 [INF] 127.0.0.1:56071 - rid:11 - Route connection created
+[97256] 2026/11/21 09:55:25.846652 [ERR] 127.0.0.1:56071 - rid:11 - authentication error
+[97258] 2026/11/21 09:55:25.845959 [INF] 127.0.0.1:56058 - rid:8 - Route connection created (127.0.0.1:56058)
+[97256] 2026/11/21 09:55:25.847052 [INF] 127.0.0.1:56072 - rid:12 - Route connection created
+[97256] 2026/11/21 09:55:25.847880 [INF] 127.0.0.1:56071 - rid:11 - Router connection closed: Authentication Failure
+[97256] 2026/11/21 09:55:25.848053 [ERR] 127.0.0.1:56072 - rid:12 - authentication error
+[97256] 2026/11/21 09:55:25.848216 [INF] 127.0.0.1:56072 - rid:12 - Router connection closed: Authentication Failure
+[97258] 2026/11/21 09:55:25.848272 [ERR] 127.0.0.1:56058 - rid:8 - Route Error 'Authorization Violation'
+[97258] 2026/11/21 09:55:25.848279 [INF] 127.0.0.1:56058 - rid:8 - Router connection closed: Parse Error - Remote: minga-1, Host: 127.0.0.1:56058
+[97258] 2026/11/21 09:55:25.848327 [ERR] 127.0.0.1:56058 - rid:9 - Route Error 'Authorization Violation'
+[97258] 2026/11/21 09:55:25.848336 [INF] 127.0.0.1:56058 - rid:9 - Router connection closed: Parse Error - Remote: minga-1, Host: 127.0.0.1:56058
+[97256] 2026/11/21 09:55:25.882455 [WRN] Waiting for routing to be established...
+[97256] 2026/11/21 09:55:25.924956 [ERR] 127.0.0.1:56060 - rid:9 - TLS route handshake error: read tcp 127.0.0.1:56066->127.0.0.1:56060: read: connection reset by peer
+[97256] 2026/11/21 09:55:25.924983 [INF] 127.0.0.1:56060 - rid:9 - Router connection closed: TLS Handshake Failure - Host: 127.0.0.1:56060
+[97256] 2026/11/21 09:55:25.924959 [ERR] 127.0.0.1:56060 - rid:8 - TLS route handshake error: read tcp 127.0.0.1:56065->127.0.0.1:56060: read: connection reset by peer
+[97256] 2026/11/21 09:55:25.925042 [INF] 127.0.0.1:56060 - rid:8 - Router connection closed: TLS Handshake Failure - Host: 127.0.0.1:56060
+[97260] 2026/11/21 09:55:25.933393 [INF] Starting nats-server
+[97260] 2026/11/21 09:55:25.933476 [INF]   Version:  2.15.3
+[97260] 2026/11/21 09:55:25.933483 [INF]   Git:      [not set]
+[97260] 2026/11/21 09:55:25.933487 [INF]   Cluster:  minga-test
+[97260] 2026/11/21 09:55:25.933492 [INF]   Name:     minga-3
+[97260] 2026/11/21 09:55:25.933496 [INF]   Node:     dGQUVNbB
+[97260] 2026/11/21 09:55:25.933499 [INF]   ID:       NA34TRUWIMO45MWZP7UMF67W6FURGRSPEC5SDNXGEB5NBLZE3JE2N2NI
+[97260] 2026/11/21 09:55:25.933510 [INF] Using configuration file: /var/folders/24/wlt58ddx4l74l96pl4znxsv40000gp/T/.tmpYXk2I8/nats/server.conf (sha256:502de46786338e6d08d55fbb90a8f92b474efc943a69b80df916c4d3db606f8b)
+[97260] 2026/11/21 09:55:25.933781 [INF] Starting http monitor on 127.0.0.1:56056
+[97260] 2026/11/21 09:55:25.933844 [INF] Starting JetStream
+[97260] 2026/11/21 09:55:25.934010 [INF]     _ ___ _____ ___ _____ ___ ___   _   __  __
+[97260] 2026/11/21 09:55:25.934016 [INF]  _ | | __|_   _/ __|_   _| _ \ __| /_\ |  \/  |
+[97260] 2026/11/21 09:55:25.934019 [INF] | || | _|  | | \__ \ | | |   / _| / _ \| |\/| |
+[97260] 2026/11/21 09:55:25.934022 [INF]  \__/|___| |_| |___/ |_| |_|_\___/_/ \_\_|  |_|
+[97260] 2026/11/21 09:55:25.934024 [INF] 
+[97260] 2026/11/21 09:55:25.934028 [INF]          https://docs.nats.io/jetstream
+[97260] 2026/11/21 09:55:25.934030 [INF] 
+[97260] 2026/11/21 09:55:25.934033 [INF] ---------------- JETSTREAM ----------------
+[97260] 2026/11/21 09:55:25.934036 [INF]   Strict:          true
+[97260] 2026/11/21 09:55:25.934043 [INF]   Max Memory:      64.00 MB
+[97260] 2026/11/21 09:55:25.934047 [INF]   Max Storage:     8.00 GB
+[97260] 2026/11/21 09:55:25.934050 [INF]   Store Directory: "/var/folders/24/wlt58ddx4l74l96pl4znxsv40000gp/T/.tmpYXk2I8/nats/jetstream/jetstream"
+[97260] 2026/11/21 09:55:25.934055 [INF]   API Level:       5
+[97260] 2026/11/21 09:55:25.934058 [INF] -------------------------------------------
+[97260] 2026/11/21 09:55:25.934363 [INF] Starting JetStream cluster
+[97260] 2026/11/21 09:55:25.934368 [INF] Creating JetStream metadata controller
+[97260] 2026/11/21 09:55:25.935403 [INF] JetStream cluster bootstrapping
+[97258] 2026/11/21 09:55:25.943952 [WRN] Waiting for routing to be established...
+[97260] 2026/11/21 09:55:25.944876 [INF] Took 11.016541ms to start JetStream
+[97260] 2026/11/21 09:55:25.944931 [INF] Listening for client connections on 127.0.0.1:56052
+[97260] 2026/11/21 09:55:25.944941 [INF] Server is ready
+[97260] 2026/11/21 09:55:25.944949 [INF] Cluster name is minga-test
+[97260] 2026/11/21 09:55:25.945085 [INF] Listening for route connections on 0.0.0.0:56060
+[97260] 2026/11/21 09:55:25.946409 [INF] 127.0.0.1:56058 - rid:8 - Route connection created (127.0.0.1:56058)
+[97256] 2026/11/21 09:55:25.946685 [INF] 127.0.0.1:56077 - rid:14 - Route connection created
+[97260] 2026/11/21 09:55:25.946706 [INF] 127.0.0.1:56058 - rid:9 - Route connection created (127.0.0.1:56058)
+[97256] 2026/11/21 09:55:25.947008 [INF] 127.0.0.1:56078 - rid:13 - Route connection created
+[97260] 2026/11/21 09:55:25.948057 [INF] 127.0.0.1:56058 - rid:10 - Route connection created (127.0.0.1:56058)
+[97256] 2026/11/21 09:55:25.948361 [INF] 127.0.0.1:56079 - rid:15 - Route connection created
+[97260] 2026/11/21 09:55:25.949337 [INF] 127.0.0.1:56058 - rid:11 - Route connection created (127.0.0.1:56058)
+[97256] 2026/11/21 09:55:25.949644 [INF] 127.0.0.1:56080 - rid:16 - Route connection created
+[97256] 2026/11/21 09:55:25.983241 [WRN] JetStream has not established contact with a meta leader
+[97262] 2026/11/21 09:55:26.040687 [INF] Starting nats-server
+[97262] 2026/11/21 09:55:26.041629 [INF]   Version:  2.15.3
+[97262] 2026/11/21 09:55:26.041636 [INF]   Git:      [not set]
+[97262] 2026/11/21 09:55:26.041641 [INF]   Cluster:  minga-test
+[97262] 2026/11/21 09:55:26.041649 [INF]   Name:     minga-4
+[97262] 2026/11/21 09:55:26.041653 [INF]   Node:     QAie30p1
+[97262] 2026/11/21 09:55:26.041656 [INF]   ID:       NAJPJKFQTELWQSNKC2E4TC4JFJMIPVO75G3OX67KNPI3A5QEREG3WSSZ
+[97262] 2026/11/21 09:55:26.041666 [INF] Using configuration file: /var/folders/24/wlt58ddx4l74l96pl4znxsv40000gp/T/.tmpX6YLsy/nats/server.conf (sha256:09f49dab54b08b19a094b12c54deea83109e07a285e0cf4587b51951afb27e0c)
+[97262] 2026/11/21 09:55:26.041883 [INF] Starting http monitor on 127.0.0.1:56057
+[97262] 2026/11/21 09:55:26.041944 [INF] Starting JetStream
+[97262] 2026/11/21 09:55:26.042083 [INF]     _ ___ _____ ___ _____ ___ ___   _   __  __
+[97262] 2026/11/21 09:55:26.042088 [INF]  _ | | __|_   _/ __|_   _| _ \ __| /_\ |  \/  |
+[97262] 2026/11/21 09:55:26.042091 [INF] | || | _|  | | \__ \ | | |   / _| / _ \| |\/| |
+[97262] 2026/11/21 09:55:26.042094 [INF]  \__/|___| |_| |___/ |_| |_|_\___/_/ \_\_|  |_|
+[97262] 2026/11/21 09:55:26.042096 [INF] 
+[97262] 2026/11/21 09:55:26.042099 [INF]          https://docs.nats.io/jetstream
+[97262] 2026/11/21 09:55:26.042102 [INF] 
+[97262] 2026/11/21 09:55:26.042105 [INF] ---------------- JETSTREAM ----------------
+[97262] 2026/11/21 09:55:26.042116 [INF]   Strict:          true
+[97262] 2026/11/21 09:55:26.042123 [INF]   Max Memory:      64.00 MB
+[97262] 2026/11/21 09:55:26.042127 [INF]   Max Storage:     8.00 GB
+[97262] 2026/11/21 09:55:26.042129 [INF]   Store Directory: "/var/folders/24/wlt58ddx4l74l96pl4znxsv40000gp/T/.tmpX6YLsy/nats/jetstream/jetstream"
+[97262] 2026/11/21 09:55:26.042132 [INF]   API Level:       5
+[97262] 2026/11/21 09:55:26.042135 [INF] -------------------------------------------
+[97262] 2026/11/21 09:55:26.042446 [INF] Starting JetStream cluster
+[97262] 2026/11/21 09:55:26.042471 [INF] Creating JetStream metadata controller
+[97262] 2026/11/21 09:55:26.043517 [INF] JetStream cluster bootstrapping
+[97260] 2026/11/21 09:55:26.045564 [WRN] Waiting for routing to be established...
+[97260] 2026/11/21 09:55:26.048672 [WRN] JetStream has not established contact with a meta leader
+[97262] 2026/11/21 09:55:26.052985 [INF] Took 11.034417ms to start JetStream
+[97262] 2026/11/21 09:55:26.053053 [INF] Listening for client connections on 127.0.0.1:56053
+[97262] 2026/11/21 09:55:26.053064 [INF] Server is ready
+[97262] 2026/11/21 09:55:26.053074 [INF] Cluster name is minga-test
+[97262] 2026/11/21 09:55:26.053169 [INF] Listening for route connections on 0.0.0.0:56061
+[97262] 2026/11/21 09:55:26.054433 [INF] 127.0.0.1:56058 - rid:8 - Route connection created (127.0.0.1:56058)
+[97256] 2026/11/21 09:55:26.054747 [INF] 127.0.0.1:56085 - rid:18 - Route connection created
+[97262] 2026/11/21 09:55:26.054750 [INF] 127.0.0.1:56058 - rid:9 - Route connection created (127.0.0.1:56058)
+[97256] 2026/11/21 09:55:26.055050 [INF] 127.0.0.1:56086 - rid:17 - Route connection created
+[97262] 2026/11/21 09:55:26.056161 [INF] 127.0.0.1:56058 - rid:11 - Route connection created (127.0.0.1:56058)
+[97260] 2026/11/21 09:55:26.056310 [INF] 127.0.0.1:56061 - rid:13 - Route connection created (127.0.0.1:56061)
+[97256] 2026/11/21 09:55:26.056462 [INF] 127.0.0.1:56088 - rid:19 - Route connection created
+[97260] 2026/11/21 09:55:26.056804 [INF] 127.0.0.1:56061 - rid:14 - Route connection created (127.0.0.1:56061)
+[97262] 2026/11/21 09:55:26.057400 [INF] 127.0.0.1:56089 - rid:12 - Route connection created
+[97262] 2026/11/21 09:55:26.057419 [INF] 127.0.0.1:56087 - rid:10 - Route connection created
+[97262] 2026/11/21 09:55:26.058117 [INF] 127.0.0.1:56058 - rid:13 - Route connection created (127.0.0.1:56058)
+[97256] 2026/11/21 09:55:26.058429 [INF] 127.0.0.1:56090 - rid:20 - Route connection created
+[97260] 2026/11/21 09:55:26.058792 [INF] 127.0.0.1:56061 - rid:15 - Route connection created (127.0.0.1:56061)
+[97262] 2026/11/21 09:55:26.059089 [INF] 127.0.0.1:56091 - rid:14 - Route connection created
+[97260] 2026/11/21 09:55:26.060286 [INF] 127.0.0.1:56061 - rid:16 - Route connection created (127.0.0.1:56061)
+[97262] 2026/11/21 09:55:26.060592 [INF] 127.0.0.1:56092 - rid:15 - Route connection created
+[97262] 2026/11/21 09:55:26.154040 [WRN] Waiting for routing to be established...
+[97262] 2026/11/21 09:55:26.154126 [WRN] JetStream has not established contact with a meta leader
+[97264] 2026/11/21 09:55:26.284677 [INF] Starting nats-server
+[97264] 2026/11/21 09:55:26.286437 [INF]   Version:  2.15.3
+[97264] 2026/11/21 09:55:26.286452 [INF]   Git:      [not set]
+[97264] 2026/11/21 09:55:26.286459 [INF]   Cluster:  minga-test
+[97264] 2026/11/21 09:55:26.286466 [INF]   Name:     minga-1
+[97264] 2026/11/21 09:55:26.286475 [INF]   Node:     11lljj8r
+[97264] 2026/11/21 09:55:26.286483 [INF]   ID:       NCLU3VGKVSWJPRRNDBGNJWFRHHQRLJTD5EIYPKDRSZ7USIDS6JJEXPKL
+[97264] 2026/11/21 09:55:26.286500 [INF] Using configuration file: /var/folders/24/wlt58ddx4l74l96pl4znxsv40000gp/T/.tmpvxBHsl/nats/server.conf (sha256:a8d51b3905213f0b534bccc2525976864cd228190b5dab515d8d596a47efc1fb)
+[97264] 2026/11/21 09:55:26.286801 [INF] Starting http monitor on 127.0.0.1:56041
+[97264] 2026/11/21 09:55:26.286892 [INF] Starting JetStream
+[97264] 2026/11/21 09:55:26.287114 [INF]     _ ___ _____ ___ _____ ___ ___   _   __  __
+[97264] 2026/11/21 09:55:26.287138 [INF]  _ | | __|_   _/ __|_   _| _ \ __| /_\ |  \/  |
+[97264] 2026/11/21 09:55:26.287143 [INF] | || | _|  | | \__ \ | | |   / _| / _ \| |\/| |
+[97264] 2026/11/21 09:55:26.287158 [INF]  \__/|___| |_| |___/ |_| |_|_\___/_/ \_\_|  |_|
+[97264] 2026/11/21 09:55:26.287338 [INF] 
+[97264] 2026/11/21 09:55:26.287348 [INF]          https://docs.nats.io/jetstream
+[97264] 2026/11/21 09:55:26.287353 [INF] 
+[97264] 2026/11/21 09:55:26.287357 [INF] ---------------- JETSTREAM ----------------
+[97264] 2026/11/21 09:55:26.287361 [INF]   Strict:          true
+[97264] 2026/11/21 09:55:26.287374 [INF]   Max Memory:      64.00 MB
+[97264] 2026/11/21 09:55:26.287380 [INF]   Max Storage:     8.00 GB
+[97264] 2026/11/21 09:55:26.287384 [INF]   Store Directory: "/var/folders/24/wlt58ddx4l74l96pl4znxsv40000gp/T/.tmpvxBHsl/nats/jetstream/jetstream"
+[97264] 2026/11/21 09:55:26.287389 [INF]   API Level:       5
+[97264] 2026/11/21 09:55:26.287394 [INF] -------------------------------------------
+[97264] 2026/11/21 09:55:26.287858 [INF] Starting JetStream cluster
+[97264] 2026/11/21 09:55:26.291648 [INF] Creating JetStream metadata controller
+[97264] 2026/11/21 09:55:26.293231 [INF] JetStream cluster bootstrapping
+[97264] 2026/11/21 09:55:26.302920 [INF] Took 16.019917ms to start JetStream
+[97264] 2026/11/21 09:55:26.303011 [INF] Listening for client connections on 127.0.0.1:56038
+[97264] 2026/11/21 09:55:26.303029 [INF] Server is ready
+[97264] 2026/11/21 09:55:26.303040 [INF] Cluster name is minga-test
+[97264] 2026/11/21 09:55:26.303195 [INF] Listening for route connections on 0.0.0.0:56044
+[97262] 2026/11/21 09:55:26.338265 [INF] JetStream cluster new metadata leader: minga-1/minga-test
+[97260] 2026/11/21 09:55:26.342778 [INF] JetStream cluster new metadata leader: minga-1/minga-test
+[97256] 2026/11/21 09:55:26.369118 [INF] Self is new JetStream cluster metadata leader
+[97264] 2026/11/21 09:55:26.386900 [ERR] 127.0.0.1:56045 - rid:8 - TLS route handshake error: read tcp 127.0.0.1:56115->127.0.0.1:56045: read: connection reset by peer
+[97264] 2026/11/21 09:55:26.387262 [INF] 127.0.0.1:56045 - rid:8 - Router connection closed: TLS Handshake Failure - Host: 127.0.0.1:56045
+[97264] 2026/11/21 09:55:26.392380 [ERR] 127.0.0.1:56045 - rid:10 - TLS route handshake error: read tcp 127.0.0.1:56117->127.0.0.1:56045: read: connection reset by peer
+[97264] 2026/11/21 09:55:26.392424 [INF] 127.0.0.1:56045 - rid:10 - Router connection closed: TLS Handshake Failure - Host: 127.0.0.1:56045
+[97264] 2026/11/21 09:55:26.403697 [WRN] Waiting for routing to be established...
+[97266] 2026/11/21 09:55:26.407452 [INF] Starting nats-server
+[97266] 2026/11/21 09:55:26.407732 [INF]   Version:  2.15.3
+[97266] 2026/11/21 09:55:26.407741 [INF]   Git:      [not set]
+[97266] 2026/11/21 09:55:26.407749 [INF]   Cluster:  minga-test
+[97266] 2026/11/21 09:55:26.407755 [INF]   Name:     minga-2
+[97266] 2026/11/21 09:55:26.407765 [INF]   Node:     dCnd6u0M
+[97266] 2026/11/21 09:55:26.407769 [INF]   ID:       NBNVKPF73MZQI2HZFHGUIKLFGKTTYESEYRS5P2ENQXEO3YGEI7MQSWMH
+[97266] 2026/11/21 09:55:26.407791 [INF] Using configuration file: /var/folders/24/wlt58ddx4l74l96pl4znxsv40000gp/T/.tmpXf4q2T/nats/server.conf (sha256:0e5f525ec80fe3d92a460df528133e9a9a9417fae4b7346d09d59b980f8a8217)
+[97266] 2026/11/21 09:55:26.408225 [INF] Starting http monitor on 127.0.0.1:56042
+[97266] 2026/11/21 09:55:26.408331 [INF] Starting JetStream
+[97266] 2026/11/21 09:55:26.408648 [INF]     _ ___ _____ ___ _____ ___ ___   _   __  __
+[97266] 2026/11/21 09:55:26.408654 [INF]  _ | | __|_   _/ __|_   _| _ \ __| /_\ |  \/  |
+[97266] 2026/11/21 09:55:26.408658 [INF] | || | _|  | | \__ \ | | |   / _| / _ \| |\/| |
+[97266] 2026/11/21 09:55:26.408661 [INF]  \__/|___| |_| |___/ |_| |_|_\___/_/ \_\_|  |_|
+[97266] 2026/11/21 09:55:26.408664 [INF] 
+[97266] 2026/11/21 09:55:26.408672 [INF]          https://docs.nats.io/jetstream
+[97266] 2026/11/21 09:55:26.408675 [INF] 
+[97266] 2026/11/21 09:55:26.408679 [INF] ---------------- JETSTREAM ----------------
+[97266] 2026/11/21 09:55:26.408682 [INF]   Strict:          true
+[97266] 2026/11/21 09:55:26.408717 [INF]   Max Memory:      64.00 MB
+[97266] 2026/11/21 09:55:26.408722 [INF]   Max Storage:     8.00 GB
+[97266] 2026/11/21 09:55:26.408726 [INF]   Store Directory: "/var/folders/24/wlt58ddx4l74l96pl4znxsv40000gp/T/.tmpXf4q2T/nats/jetstream/jetstream"
+[97266] 2026/11/21 09:55:26.408730 [INF]   API Level:       5
+[97266] 2026/11/21 09:55:26.408733 [INF] -------------------------------------------
+[97266] 2026/11/21 09:55:26.409094 [INF] Starting JetStream cluster
+[97266] 2026/11/21 09:55:26.409100 [INF] Creating JetStream metadata controller
+[97266] 2026/11/21 09:55:26.410513 [INF] JetStream cluster bootstrapping
+[97266] 2026/11/21 09:55:26.420037 [INF] Took 11.698042ms to start JetStream
+[97266] 2026/11/21 09:55:26.420128 [INF] Listening for client connections on 127.0.0.1:56039
+[97266] 2026/11/21 09:55:26.420145 [INF] Server is ready
+[97266] 2026/11/21 09:55:26.420156 [INF] Cluster name is minga-test
+[97266] 2026/11/21 09:55:26.420378 [INF] Listening for route connections on 0.0.0.0:56045
+[97266] 2026/11/21 09:55:26.422478 [INF] 127.0.0.1:56044 - rid:9 - Route connection created (127.0.0.1:56044)
+[97264] 2026/11/21 09:55:26.422726 [INF] 127.0.0.1:56125 - rid:13 - Route connection created
+[97266] 2026/11/21 09:55:26.422936 [INF] 127.0.0.1:56044 - rid:11 - Route connection created (127.0.0.1:56044)
+[97264] 2026/11/21 09:55:26.423173 [INF] 127.0.0.1:56122 - rid:14 - Route connection created
+[97266] 2026/11/21 09:55:26.425142 [INF] 127.0.0.1:56044 - rid:12 - Route connection created (127.0.0.1:56044)
+[97264] 2026/11/21 09:55:26.425380 [INF] 127.0.0.1:56126 - rid:15 - Route connection created
+[97266] 2026/11/21 09:55:26.426716 [INF] 127.0.0.1:56044 - rid:13 - Route connection created (127.0.0.1:56044)
+[97264] 2026/11/21 09:55:26.426942 [INF] 127.0.0.1:56127 - rid:16 - Route connection created
+[97264] 2026/11/21 09:55:26.497748 [ERR] 127.0.0.1:56046 - rid:11 - TLS route handshake error: read tcp 127.0.0.1:56114->127.0.0.1:56046: read: connection reset by peer
+[97264] 2026/11/21 09:55:26.497785 [INF] 127.0.0.1:56046 - rid:11 - Router connection closed: TLS Handshake Failure - Host: 127.0.0.1:56046
+[97266] 2026/11/21 09:55:26.497781 [ERR] 127.0.0.1:56046 - rid:10 - TLS route handshake error: read tcp 127.0.0.1:56123->127.0.0.1:56046: read: connection reset by peer
+[97264] 2026/11/21 09:55:26.497826 [ERR] 127.0.0.1:56046 - rid:9 - TLS route handshake error: read tcp 127.0.0.1:56116->127.0.0.1:56046: read: connection reset by peer
+[97264] 2026/11/21 09:55:26.497845 [INF] 127.0.0.1:56046 - rid:9 - Router connection closed: TLS Handshake Failure - Host: 127.0.0.1:56046
+[97266] 2026/11/21 09:55:26.497822 [INF] 127.0.0.1:56046 - rid:10 - Router connection closed: TLS Handshake Failure - Host: 127.0.0.1:56046
+[97266] 2026/11/21 09:55:26.497792 [ERR] 127.0.0.1:56046 - rid:8 - TLS route handshake error: read tcp 127.0.0.1:56124->127.0.0.1:56046: read: connection reset by peer
+[97266] 2026/11/21 09:55:26.497909 [INF] 127.0.0.1:56046 - rid:8 - Router connection closed: TLS Handshake Failure - Host: 127.0.0.1:56046
+[97264] 2026/11/21 09:55:26.504644 [WRN] JetStream has not established contact with a meta leader
+[97268] 2026/11/21 09:55:26.511608 [INF] Starting nats-server
+[97268] 2026/11/21 09:55:26.511706 [INF]   Version:  2.15.3
+[97268] 2026/11/21 09:55:26.511715 [INF]   Git:      [not set]
+[97268] 2026/11/21 09:55:26.511721 [INF]   Cluster:  minga-test
+[97268] 2026/11/21 09:55:26.511726 [INF]   Name:     minga-3
+[97268] 2026/11/21 09:55:26.511731 [INF]   Node:     dGQUVNbB
+[97268] 2026/11/21 09:55:26.511736 [INF]   ID:       NAQIMUQGXYCCZRCML34H3MZZVD42ZEI6F6MTDRM4C5U7NCUDJOB3QU2O
+[97268] 2026/11/21 09:55:26.511753 [INF] Using configuration file: /var/folders/24/wlt58ddx4l74l96pl4znxsv40000gp/T/.tmpgN9gnE/nats/server.conf (sha256:4e0aeae9c74bcae728afa43ec01d745b7a28b22b43c4165cab87ad53f58bc382)
+[97268] 2026/11/21 09:55:26.512093 [INF] Starting http monitor on 127.0.0.1:56043
+[97268] 2026/11/21 09:55:26.512193 [INF] Starting JetStream
+[97268] 2026/11/21 09:55:26.512428 [INF]     _ ___ _____ ___ _____ ___ ___   _   __  __
+[97268] 2026/11/21 09:55:26.512450 [INF]  _ | | __|_   _/ __|_   _| _ \ __| /_\ |  \/  |
+[97268] 2026/11/21 09:55:26.512456 [INF] | || | _|  | | \__ \ | | |   / _| / _ \| |\/| |
+[97268] 2026/11/21 09:55:26.512461 [INF]  \__/|___| |_| |___/ |_| |_|_\___/_/ \_\_|  |_|
+[97268] 2026/11/21 09:55:26.512465 [INF] 
+[97268] 2026/11/21 09:55:26.512470 [INF]          https://docs.nats.io/jetstream
+[97268] 2026/11/21 09:55:26.512474 [INF] 
+[97268] 2026/11/21 09:55:26.512479 [INF] ---------------- JETSTREAM ----------------
+[97268] 2026/11/21 09:55:26.512483 [INF]   Strict:          true
+[97268] 2026/11/21 09:55:26.512494 [INF]   Max Memory:      64.00 MB
+[97268] 2026/11/21 09:55:26.512499 [INF]   Max Storage:     8.00 GB
+[97268] 2026/11/21 09:55:26.512504 [INF]   Store Directory: "/var/folders/24/wlt58ddx4l74l96pl4znxsv40000gp/T/.tmpgN9gnE/nats/jetstream/jetstream"
+[97268] 2026/11/21 09:55:26.512510 [INF]   API Level:       5
+[97268] 2026/11/21 09:55:26.512514 [INF] -------------------------------------------
+[97268] 2026/11/21 09:55:26.512912 [INF] Starting JetStream cluster
+[97268] 2026/11/21 09:55:26.512921 [INF] Creating JetStream metadata controller
+[97268] 2026/11/21 09:55:26.514484 [INF] JetStream cluster bootstrapping
+[97266] 2026/11/21 09:55:26.521103 [WRN] Waiting for routing to be established...
+[97266] 2026/11/21 09:55:26.524776 [WRN] JetStream has not established contact with a meta leader
+[97268] 2026/11/21 09:55:26.524883 [INF] Took 12.680583ms to start JetStream
+[97268] 2026/11/21 09:55:26.524949 [INF] Listening for client connections on 127.0.0.1:56040
+[97268] 2026/11/21 09:55:26.524966 [INF] Server is ready
+[97268] 2026/11/21 09:55:26.524975 [INF] Cluster name is minga-test
+[97268] 2026/11/21 09:55:26.525096 [INF] Listening for route connections on 0.0.0.0:56046
+[97268] 2026/11/21 09:55:26.526808 [INF] 127.0.0.1:56045 - rid:8 - Route connection created (127.0.0.1:56045)
+[97266] 2026/11/21 09:55:26.526984 [INF] 127.0.0.1:56133 - rid:16 - Route connection created
+[97268] 2026/11/21 09:55:26.527131 [INF] 127.0.0.1:56044 - rid:10 - Route connection created (127.0.0.1:56044)
+[97268] 2026/11/21 09:55:26.527248 [INF] 127.0.0.1:56045 - rid:11 - Route connection created (127.0.0.1:56045)
+[97264] 2026/11/21 09:55:26.527359 [INF] 127.0.0.1:56132 - rid:18 - Route connection created
+[97266] 2026/11/21 09:55:26.527494 [INF] 127.0.0.1:56134 - rid:15 - Route connection created
+[97268] 2026/11/21 09:55:26.527546 [INF] 127.0.0.1:56044 - rid:9 - Route connection created (127.0.0.1:56044)
+[97264] 2026/11/21 09:55:26.527655 [INF] 127.0.0.1:56135 - rid:17 - Route connection created
+[97268] 2026/11/21 09:55:26.529422 [INF] 127.0.0.1:56045 - rid:12 - Route connection created (127.0.0.1:56045)
+[97266] 2026/11/21 09:55:26.529646 [INF] 127.0.0.1:56136 - rid:17 - Route connection created
+[97268] 2026/11/21 09:55:26.529813 [INF] 127.0.0.1:56044 - rid:13 - Route connection created (127.0.0.1:56044)
+[97264] 2026/11/21 09:55:26.530041 [INF] 127.0.0.1:56137 - rid:19 - Route connection created
+[97268] 2026/11/21 09:55:26.530969 [INF] 127.0.0.1:56045 - rid:14 - Route connection created (127.0.0.1:56045)
+[97266] 2026/11/21 09:55:26.531163 [INF] 127.0.0.1:56138 - rid:18 - Route connection created
+[97268] 2026/11/21 09:55:26.531378 [INF] 127.0.0.1:56044 - rid:15 - Route connection created (127.0.0.1:56044)
+[97264] 2026/11/21 09:55:26.531582 [INF] 127.0.0.1:56139 - rid:20 - Route connection created
+[97268] 2026/11/21 09:55:26.625243 [WRN] Waiting for routing to be established...
+[97268] 2026/11/21 09:55:26.625410 [WRN] JetStream has not established contact with a meta leader
+[97258] 2026/11/21 09:55:26.858320 [INF] 127.0.0.1:56058 - rid:11 - Route connection created (127.0.0.1:56058)
+[97256] 2026/11/21 09:55:26.859227 [INF] 127.0.0.1:56141 - rid:21 - Route connection created
+[97256] 2026/11/21 09:55:26.859431 [ERR] 127.0.0.1:56141 - rid:21 - authentication error
+[97256] 2026/11/21 09:55:26.859467 [INF] 127.0.0.1:56141 - rid:21 - Router connection closed: Authentication Failure
+[97258] 2026/11/21 09:55:26.859983 [ERR] 127.0.0.1:56058 - rid:11 - Route Error 'Authorization Violation'
+[97258] 2026/11/21 09:55:26.860060 [INF] 127.0.0.1:56058 - rid:11 - Router connection closed: Parse Error - Remote: minga-1, Host: 127.0.0.1:56058
+[97266] 2026/11/21 09:55:26.914328 [INF] JetStream cluster new metadata leader: minga-1/minga-test
+[97268] 2026/11/21 09:55:26.920337 [INF] JetStream cluster new metadata leader: minga-1/minga-test
+[97258] 2026/11/21 09:55:26.921059 [INF] 127.0.0.1:56058 - rid:12 - Route connection created (127.0.0.1:56058)
+[97256] 2026/11/21 09:55:26.921933 [INF] 127.0.0.1:56144 - rid:22 - Route connection created
+[97256] 2026/11/21 09:55:26.922107 [ERR] 127.0.0.1:56144 - rid:22 - authentication error
+[97256] 2026/11/21 09:55:26.925295 [INF] 127.0.0.1:56144 - rid:22 - Router connection closed: Authentication Failure
+[97258] 2026/11/21 09:55:26.925458 [ERR] 127.0.0.1:56058 - rid:12 - Route Error 'Authorization Violation'
+[97258] 2026/11/21 09:55:26.925488 [INF] 127.0.0.1:56058 - rid:12 - Router connection closed: Parse Error - Remote: minga-1, Host: 127.0.0.1:56058
+[97264] 2026/11/21 09:55:26.936994 [INF] Self is new JetStream cluster metadata leader
+[97256] 2026/11/21 09:55:26.937258 [INF] 127.0.0.1:56060 - rid:23 - Route connection created (127.0.0.1:56060)
+[97260] 2026/11/21 09:55:26.937545 [INF] 127.0.0.1:56145 - rid:17 - Route connection created
+[97256] 2026/11/21 09:55:26.938039 [INF] 127.0.0.1:56060 - rid:23 - Router connection closed: Duplicate Route - Remote: minga-3, Host: 127.0.0.1:56060
+[97260] 2026/11/21 09:55:26.938586 [INF] 127.0.0.1:56145 - rid:17 - Router connection closed: Client Closed
+[97256] 2026/11/21 09:55:26.990794 [INF] 127.0.0.1:56060 - rid:24 - Route connection created (127.0.0.1:56060)
+[97260] 2026/11/21 09:55:26.991040 [INF] 127.0.0.1:56146 - rid:18 - Route connection created
+[97256] 2026/11/21 09:55:26.991195 [INF] 127.0.0.1:56060 - rid:24 - Router connection closed: Duplicate Route - Remote: minga-3, Host: 127.0.0.1:56060
+[97260] 2026/11/21 09:55:26.991279 [INF] 127.0.0.1:56146 - rid:18 - Router connection closed: Client Closed
+[97264] 2026/11/21 09:55:27.422729 [INF] 127.0.0.1:56045 - rid:21 - Route connection created (127.0.0.1:56045)
+[97266] 2026/11/21 09:55:27.423248 [INF] 127.0.0.1:56147 - rid:19 - Route connection created
+[97264] 2026/11/21 09:55:27.423488 [INF] 127.0.0.1:56045 - rid:21 - Router connection closed: Duplicate Route - Remote: minga-2, Host: 127.0.0.1:56045
+[97266] 2026/11/21 09:55:27.423642 [INF] 127.0.0.1:56147 - rid:19 - Router connection closed: Client Closed
+[97264] 2026/11/21 09:55:27.470647 [INF] 127.0.0.1:56045 - rid:22 - Route connection created (127.0.0.1:56045)
+[97266] 2026/11/21 09:55:27.471178 [INF] 127.0.0.1:56148 - rid:20 - Route connection created
+[97264] 2026/11/21 09:55:27.471384 [INF] 127.0.0.1:56045 - rid:22 - Router connection closed: Duplicate Route - Remote: minga-2, Host: 127.0.0.1:56045
+[97266] 2026/11/21 09:55:27.471520 [INF] 127.0.0.1:56148 - rid:20 - Router connection closed: Client Closed
+[97268] 2026/11/21 09:55:27.511441 [INF] 127.0.0.1:56149 - rid:17 - Route connection created
+[97266] 2026/11/21 09:55:27.511504 [INF] 127.0.0.1:56046 - rid:21 - Route connection created (127.0.0.1:56046)
+[97266] 2026/11/21 09:55:27.511653 [INF] 127.0.0.1:56046 - rid:21 - Router connection closed: Duplicate Route - Remote: minga-3, Host: 127.0.0.1:56046
+[97268] 2026/11/21 09:55:27.511795 [INF] 127.0.0.1:56149 - rid:17 - Router connection closed: Client Closed
+[97266] 2026/11/21 09:55:27.544070 [INF] 127.0.0.1:56046 - rid:22 - Route connection created (127.0.0.1:56046)
+[97268] 2026/11/21 09:55:27.544460 [INF] 127.0.0.1:56150 - rid:18 - Route connection created
+[97266] 2026/11/21 09:55:27.544733 [INF] 127.0.0.1:56046 - rid:22 - Router connection closed: Duplicate Route - Remote: minga-3, Host: 127.0.0.1:56046
+[97268] 2026/11/21 09:55:27.544883 [INF] 127.0.0.1:56150 - rid:18 - Router connection closed: Client Closed
+[97264] 2026/11/21 09:55:27.546282 [INF] 127.0.0.1:56046 - rid:23 - Route connection created (127.0.0.1:56046)
+[97268] 2026/11/21 09:55:27.546610 [INF] 127.0.0.1:56151 - rid:19 - Route connection created
+[97264] 2026/11/21 09:55:27.546783 [INF] 127.0.0.1:56046 - rid:23 - Router connection closed: Duplicate Route - Remote: minga-3, Host: 127.0.0.1:56046
+[97268] 2026/11/21 09:55:27.546885 [INF] 127.0.0.1:56151 - rid:19 - Router connection closed: Client Closed
+[97264] 2026/11/21 09:55:27.548774 [INF] 127.0.0.1:56046 - rid:24 - Route connection created (127.0.0.1:56046)
+[97268] 2026/11/21 09:55:27.549172 [INF] 127.0.0.1:56152 - rid:20 - Route connection created
+[97264] 2026/11/21 09:55:27.549432 [INF] 127.0.0.1:56046 - rid:24 - Router connection closed: Duplicate Route - Remote: minga-3, Host: 127.0.0.1:56046
+[97268] 2026/11/21 09:55:27.549554 [INF] 127.0.0.1:56152 - rid:20 - Router connection closed: Client Closed
+[97258] 2026/11/21 09:55:27.860451 [WRN] Waiting for routing to be established...
+[97258] 2026/11/21 09:55:27.938965 [INF] 127.0.0.1:56058 - rid:13 - Route connection created (127.0.0.1:56058)
+[97256] 2026/11/21 09:55:27.939886 [INF] 127.0.0.1:56155 - rid:25 - Route connection created
+[97256] 2026/11/21 09:55:27.940099 [ERR] 127.0.0.1:56155 - rid:25 - authentication error
+[97256] 2026/11/21 09:55:27.940152 [INF] 127.0.0.1:56155 - rid:25 - Router connection closed: Authentication Failure
+[97258] 2026/11/21 09:55:27.940327 [ERR] 127.0.0.1:56058 - rid:13 - Route Error 'Authorization Violation'
+[97258] 2026/11/21 09:55:27.940398 [INF] 127.0.0.1:56058 - rid:13 - Router connection closed: Parse Error - Remote: minga-1, Host: 127.0.0.1:56058
+[97258] 2026/11/21 09:55:28.019475 [INF] 127.0.0.1:56058 - rid:14 - Route connection created (127.0.0.1:56058)
+[97256] 2026/11/21 09:55:28.019885 [INF] 127.0.0.1:56156 - rid:26 - Route connection created
+[97256] 2026/11/21 09:55:28.020012 [ERR] 127.0.0.1:56156 - rid:26 - authentication error
+[97256] 2026/11/21 09:55:28.020035 [INF] 127.0.0.1:56156 - rid:26 - Router connection closed: Authentication Failure
+[97258] 2026/11/21 09:55:28.020163 [ERR] 127.0.0.1:56058 - rid:14 - Route Error 'Authorization Violation'
+[97258] 2026/11/21 09:55:28.020180 [INF] 127.0.0.1:56058 - rid:14 - Router connection closed: Parse Error - Remote: minga-1, Host: 127.0.0.1:56058
+[97258] 2026/11/21 09:55:29.009033 [INF] 127.0.0.1:56058 - rid:15 - Route connection created (127.0.0.1:56058)
+[97256] 2026/11/21 09:55:29.009490 [INF] 127.0.0.1:56159 - rid:27 - Route connection created
+[97256] 2026/11/21 09:55:29.009592 [ERR] 127.0.0.1:56159 - rid:27 - authentication error
+[97256] 2026/11/21 09:55:29.009610 [INF] 127.0.0.1:56159 - rid:27 - Router connection closed: Authentication Failure
+[97258] 2026/11/21 09:55:29.009707 [ERR] 127.0.0.1:56058 - rid:15 - Route Error 'Authorization Violation'
+[97258] 2026/11/21 09:55:29.009728 [INF] 127.0.0.1:56058 - rid:15 - Router connection closed: Parse Error - Remote: minga-1, Host: 127.0.0.1:56058
+[97258] 2026/11/21 09:55:29.071745 [INF] 127.0.0.1:56058 - rid:16 - Route connection created (127.0.0.1:56058)
+[97256] 2026/11/21 09:55:29.072526 [INF] 127.0.0.1:56160 - rid:28 - Route connection created
+[97256] 2026/11/21 09:55:29.072678 [ERR] 127.0.0.1:56160 - rid:28 - authentication error
+[97256] 2026/11/21 09:55:29.072754 [INF] 127.0.0.1:56160 - rid:28 - Router connection closed: Authentication Failure
+[97258] 2026/11/21 09:55:29.072878 [ERR] 127.0.0.1:56058 - rid:16 - Route Error 'Authorization Violation'
+[97258] 2026/11/21 09:55:29.072919 [INF] 127.0.0.1:56058 - rid:16 - Router connection closed: Parse Error - Remote: minga-1, Host: 127.0.0.1:56058
+test sidecar::tests::route_peer_without_the_route_name_is_refused ... ok
+[97266] 2026/11/21 09:55:29.624564 [INF] JetStream cluster new stream leader for '$G > MINGA_EVENTS'
+[97268] 2026/11/21 09:55:29.632033 [INF] JetStream cluster new stream leader for '$G > MINGA_LOGS'
+[97264] 2026/11/21 09:55:29.640871 [INF] JetStream cluster new stream leader for '$G > KV_MINGA_STATUS'
+[97264] 2026/11/21 09:55:29.647591 [INF] JetStream cluster new stream leader for '$G > KV_MINGA_ASSIGN'
+[97266] 2026/11/21 09:55:29.653602 [INF] JetStream cluster new stream leader for '$G > KV_MINGA_LEASES'
+[97266] 2026/11/21 09:55:29.663277 [WRN] JetStream cluster detected stream remapping for '$G > MINGA_EVENTS' from "S-R1F-Tkqk3ysI" to "S-R3F-FyXgvhvz"
+[97264] 2026/11/21 09:55:29.677254 [WRN] JetStream cluster detected stream remapping for '$G > KV_MINGA_STATUS' from "S-R1F-FoeBhNBI" to "S-R3F-AhWEymz8"
+[97266] 2026/11/21 09:55:29.690282 [WRN] JetStream cluster detected stream remapping for '$G > KV_MINGA_LEASES' from "S-R1F-Sc34Foc6" to "S-R3F-LAUJfix5"
+[97264] 2026/11/21 09:55:29.702275 [WRN] JetStream cluster detected stream remapping for '$G > KV_MINGA_ASSIGN' from "S-R1F-5uGvo3x5" to "S-R3F-1S6iwhP7"
+[97266] 2026/11/21 09:55:29.735055 [INF] JetStream cluster new stream leader for '$G > MINGA_EVENTS'
+[97264] 2026/11/21 09:55:29.749967 [INF] JetStream cluster new stream leader for '$G > KV_MINGA_STATUS'
+[97266] 2026/11/21 09:55:29.761952 [INF] JetStream cluster new stream leader for '$G > KV_MINGA_LEASES'
+[97264] 2026/11/21 09:55:29.776232 [INF] JetStream cluster new stream leader for '$G > KV_MINGA_ASSIGN'
+[97266] 2026/11/21 09:55:34.752640 [INF] 127.0.0.1:56138 - rid:18 - Router connection closed: Client Closed - Remote: minga-3, Host: 127.0.0.1:56046
+[97264] 2026/11/21 09:55:34.752633 [INF] 127.0.0.1:56139 - rid:20 - Router connection closed: Client Closed - Remote: minga-3, Host: 127.0.0.1:56046
+[97266] 2026/11/21 09:55:34.752833 [INF] 127.0.0.1:56133 - rid:16 - Router connection closed: Client Closed - Remote: minga-3, Host: 127.0.0.1:56046
+[97264] 2026/11/21 09:55:34.752848 [INF] 127.0.0.1:56132 - rid:18 - Router connection closed: Client Closed - Remote: minga-3, Host: 127.0.0.1:56046
+[97266] 2026/11/21 09:55:34.752833 [INF] 127.0.0.1:56134 - rid:15 - Router connection closed: Client Closed - Remote: minga-3, Host: 127.0.0.1:56046
+[97264] 2026/11/21 09:55:34.752881 [INF] 127.0.0.1:56137 - rid:19 - Router connection closed: Client Closed - Remote: minga-3, Host: 127.0.0.1:56046
+[97264] 2026/11/21 09:55:34.752879 [INF] 127.0.0.1:56135 - rid:17 - Router connection closed: Read Error - Remote: minga-3, Host: 127.0.0.1:56046
+[97266] 2026/11/21 09:55:34.752859 [INF] 127.0.0.1:56136 - rid:17 - Router connection closed: Client Closed - Remote: minga-3, Host: 127.0.0.1:56046
+[97266] 2026/11/21 09:55:35.781938 [ERR] Error trying to connect to route (attempt 1): dial tcp 127.0.0.1:56046: connect: connection refused
+[97266] 2026/11/21 09:55:35.793543 [ERR] Error trying to connect to route (attempt 1): dial tcp 127.0.0.1:56046: connect: connection refused
+[97266] 2026/11/21 09:55:35.800061 [ERR] Error trying to connect to route (attempt 1): dial tcp 127.0.0.1:56046: connect: connection refused
+[97264] 2026/11/21 09:55:35.818496 [ERR] Error trying to connect to route (attempt 1): dial tcp 127.0.0.1:56046: connect: connection refused
+[97266] 2026/11/21 09:55:35.826657 [ERR] Error trying to connect to route (attempt 1): dial tcp 127.0.0.1:56046: connect: connection refused
+[97264] 2026/11/21 09:55:35.831172 [ERR] Error trying to connect to route (attempt 1): dial tcp 127.0.0.1:56046: connect: connection refused
+[97264] 2026/11/21 09:55:35.840808 [ERR] Error trying to connect to route (attempt 1): dial tcp 127.0.0.1:56046: connect: connection refused
+[97264] 2026/11/21 09:55:35.844107 [ERR] Error trying to connect to route (attempt 1): dial tcp 127.0.0.1:56046: connect: connection refused
+[97266] 2026/11/21 09:55:36.783870 [ERR] Error trying to connect to route (attempt 2): dial tcp 127.0.0.1:56046: connect: connection refused
+[97266] 2026/11/21 09:55:36.795422 [ERR] Error trying to connect to route (attempt 2): dial tcp 127.0.0.1:56046: connect: connection refused
+[97266] 2026/11/21 09:55:36.801430 [ERR] Error trying to connect to route (attempt 2): dial tcp 127.0.0.1:56046: connect: connection refused
+[97264] 2026/11/21 09:55:36.826402 [ERR] Error trying to connect to route (attempt 2): dial tcp 127.0.0.1:56046: connect: connection refused
+[97266] 2026/11/21 09:55:36.828327 [ERR] Error trying to connect to route (attempt 2): dial tcp 127.0.0.1:56046: connect: connection refused
+[97264] 2026/11/21 09:55:36.832271 [ERR] Error trying to connect to route (attempt 2): dial tcp 127.0.0.1:56046: connect: connection refused
+[97264] 2026/11/21 09:55:36.842496 [ERR] Error trying to connect to route (attempt 2): dial tcp 127.0.0.1:56046: connect: connection refused
+[97264] 2026/11/21 09:55:36.844872 [ERR] Error trying to connect to route (attempt 2): dial tcp 127.0.0.1:56046: connect: connection refused
+[97266] 2026/11/21 09:55:37.790979 [ERR] Error trying to connect to route (attempt 3): dial tcp 127.0.0.1:56046: connect: connection refused
+[97266] 2026/11/21 09:55:37.797178 [ERR] Error trying to connect to route (attempt 3): dial tcp 127.0.0.1:56046: connect: connection refused
+[97266] 2026/11/21 09:55:37.802767 [ERR] Error trying to connect to route (attempt 3): dial tcp 127.0.0.1:56046: connect: connection refused
+[97264] 2026/11/21 09:55:37.832659 [ERR] Error trying to connect to route (attempt 3): dial tcp 127.0.0.1:56046: connect: connection refused
+[97264] 2026/11/21 09:55:37.833192 [ERR] Error trying to connect to route (attempt 3): dial tcp 127.0.0.1:56046: connect: connection refused
+[97266] 2026/11/21 09:55:37.833234 [ERR] Error trying to connect to route (attempt 3): dial tcp 127.0.0.1:56046: connect: connection refused
+[97264] 2026/11/21 09:55:37.844493 [ERR] Error trying to connect to route (attempt 3): dial tcp 127.0.0.1:56046: connect: connection refused
+[97264] 2026/11/21 09:55:37.845368 [ERR] Error trying to connect to route (attempt 3): dial tcp 127.0.0.1:56046: connect: connection refused
+test sidecar::tests::clustered_sidecars_keep_jetstream_available_after_one_manager_stops ... ok
+
+test result: ok. 55 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 12.98s
+
+     Running tests/deploy_e2e.rs (/Users/admin/dev/minga/target/debug/deps/deploy_e2e-b9e90c028908fcd0)
+
+running 6 tests
+test unreachable_api_fails_with_a_clear_message ... ok
+test unplaceable_service_fails_the_deploy ... ok
+test deploy_with_volumes_lands_and_mounts ... ok
+test deploy_keeps_restart_policy_and_agent_spec ... ok
+test deploy_lands_services_and_places_tasks ... ok
+test redeploy_is_idempotent ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.68s
+
+     Running tests/deploy_path_probe.rs (/Users/admin/dev/minga/target/debug/deps/deploy_path_probe-1f47153a84075c93)
+
+running 3 tests
+test service_creation_fails_loudly_when_no_node_is_registered ... ok
+test docker_api_service_creation_lands_in_raft ... ok
+test a_registered_node_lets_the_service_run_end_to_end ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.54s
+
+     Running tests/phase0.rs (/Users/admin/dev/minga/target/debug/deps/phase0-7e970bd4ebb38228)
+
+running 1 test
+test phase0_gate_10_services_3_nodes ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.65s
+
+     Running tests/state_e2e.rs (/Users/admin/dev/minga/target/debug/deps/state_e2e-8de39a96fd2f9b28)
+
+running 5 tests
+test standalone_api_command_points_to_manager_api_bind ... ok
+test export_file_handling ... ok
+test import_conflicts_without_overwrite_and_replaces_with_it ... ok
+test import_refuses_other_format_versions ... ok
+test export_then_import_restores_desired_state ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.72s
+

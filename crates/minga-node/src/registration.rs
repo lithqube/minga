@@ -669,6 +669,29 @@ async fn register_pending_nodes_with_join(
             pending.remove(&node_id);
             continue;
         }
+        // Raft refuses a key another node holds; checking first keeps a node
+        // that renews a copied key to a local read per lease, not a Raft write
+        // per retry tick.
+        if let Some(key) = identity.wg_public_key.as_deref() {
+            match store.list_nodes().await {
+                Ok(nodes) => {
+                    let holds = |node: &ClusterNode| node.wg_public_key.as_deref() == Some(key);
+                    let unchanged = nodes.iter().any(|node| node.id == node_id && holds(node));
+                    if !unchanged && nodes.iter().any(|node| node.id != node_id && holds(node)) {
+                        tracing::warn!(
+                            node_id,
+                            "refusing registration: another node holds its WireGuard key"
+                        );
+                        pending.remove(&node_id);
+                        continue;
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(node_id, error = %error, "cannot check node WireGuard key");
+                    continue;
+                }
+            }
+        }
         match store.get_node(node_id).await {
             Ok(Some(mut node)) => {
                 if node.tenant_id != tenant_id {
@@ -1220,6 +1243,31 @@ mod tests {
         identity.tenant_id = tenant.to_owned();
         identity.join_token = Some(key.issue(node_id, tenant, now, now + 900).unwrap());
         identity
+    }
+
+    #[tokio::test]
+    async fn a_copied_wireguard_key_is_refused_without_a_raft_write() {
+        let (store, _dir) = store().await;
+        wait_for_leader(&store).await;
+        preregister(&store, 1, minga_state::types::DEFAULT_TENANT_ID).await;
+        let bus = minga_bus::MemoryBus::with_lease_ttl(Duration::from_secs(5));
+        let mut stream = bus.watch_leases().await.unwrap();
+        let mut copier = identity(2);
+        copier.wg_public_key = Some(KEY_A.into());
+        let event = publish(&bus, &mut stream, &copier).await;
+        let before = store.last_log_index();
+        let mut registered = HashSet::new();
+        let mut pending = HashMap::new();
+        queue_node_registration(&store, event, &mut registered, &mut pending).await;
+        assert!(pending.contains_key(&2));
+        register_pending_nodes(&store, bus.as_ref(), &mut registered, &mut pending).await;
+
+        assert!(store.get_node(2).await.unwrap().is_none());
+        assert!(
+            pending.is_empty(),
+            "a refused key is not retried every tick"
+        );
+        assert_eq!(store.last_log_index(), before, "no UpsertNode was proposed");
     }
 
     #[tokio::test]
