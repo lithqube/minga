@@ -11,6 +11,7 @@ axum.workspace = true
 minga-bus = { path = "../minga-bus" }
 base64.workspace = true
 chrono.workspace = true
+futures.workspace = true
 minga-net = { path = "../minga-net" }
 minga-scheduler = { path = "../minga-scheduler" }
 minga-state = { path = "../minga-state" }

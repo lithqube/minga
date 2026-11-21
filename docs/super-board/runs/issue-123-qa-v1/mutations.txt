@@ -1,0 +1,18 @@
+Mutation checks, issue #123 QA v1, base head 35f3caa. Each mutant was applied to
+crates/minga-api/src/server.rs, the three tests below were run, then the file was restored.
+
+Command: cargo test -p minga-api --lib -- dripped stalled
+
+M0 per-chunk timeout instead of one deadline for the whole body
+   (timeout_at(deadline, ..) -> timeout(budget, ..))
+   a_body_dripped_byte_by_byte_is_closed_at_its_deadline ... FAILED
+   ("a body dripped byte by byte kept its connection"); the builder's two tests stay green.
+
+M1 body-deadline middleware passes requests through untouched
+   a_stalled_request_body_is_closed_at_its_deadline ... FAILED
+   a_body_dripped_byte_by_byte_is_closed_at_its_deadline ... FAILED
+
+M2 operators (O=*) no longer exempt from the tenant caps
+   a_tenant_holding_its_cap_of_stalled_bodies_locks_out_no_one_else ... FAILED
+
+Restored file: all 3 pass, 5 repeated runs green (~2.3 s each).
