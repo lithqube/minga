@@ -993,6 +993,151 @@ async fn worker_cannot_list_other_tenants_keys_through_stream_info() {
     assert!(manager.is_tenant_node_alive("default", 7).await.unwrap());
 }
 
+/// The other JetStream APIs a worker is granted on the shared buckets carry
+/// the allowed subject in the request subject, but also take a JSON body.
+/// A body asking for other tenants' keys must not get them.
+#[tokio::test]
+async fn worker_cannot_learn_other_tenants_keys_through_request_bodies() {
+    let _guard = NATS_TEST_LOCK.lock().await;
+    if nats_server_bin().is_none() {
+        panic!("nats-server binary not found - install it to run the TLS suite");
+    }
+
+    let pki = make_pki();
+    let server = start_worker_acl_server(&pki);
+    wait_ready(&server);
+    let dir = tempfile::tempdir().unwrap();
+    let manager_config = manager_client_config(dir.path(), &pki);
+    let url = format!("tls://localhost:{}", server.port);
+    let manager = NatsBus::connect_secure(&url, &manager_config)
+        .await
+        .unwrap();
+    manager.ensure_tenant_resources("default").await.unwrap();
+    manager
+        .put_assignment("default.node.7.task.own", b"own")
+        .await
+        .unwrap();
+    for key in ["beta.node.7.task.foreign", "beta.node.9.ingress.8443"] {
+        manager.put_assignment(key, b"foreign").await.unwrap();
+    }
+    manager
+        .refresh_tenant_lease("beta", 7, b"foreign-lease")
+        .await
+        .unwrap();
+
+    let worker_config = worker_client_config(dir.path(), &pki);
+    let worker = async_nats::connect_with_options(&url, worker_raw_options(&worker_config))
+        .await
+        .unwrap();
+    let leaks = |message: &async_nats::Message| {
+        let subject = message
+            .headers
+            .as_ref()
+            .and_then(|headers| headers.get("Nats-Subject"))
+            .map(|value| value.as_str().to_owned())
+            .unwrap_or_default();
+        subject.contains(".beta.")
+            || String::from_utf8_lossy(&message.payload).contains(".beta.")
+            || &message.payload[..] == b"foreign"
+            || &message.payload[..] == b"foreign-lease"
+    };
+
+    // Consumer create: the subject names the worker's own prefix, the body
+    // asks for tenant beta through a filter list.
+    let inbox = "_INBOX.default.7.qa-consumer";
+    let mut delivered = worker.subscribe(inbox).await.unwrap();
+    for (name, config) in [
+        (
+            "qa1",
+            serde_json::json!({"filter_subjects": ["$KV.MINGA_ASSIGN.beta.>"]}),
+        ),
+        (
+            "qa2",
+            serde_json::json!({"filter_subjects": [
+                "$KV.MINGA_ASSIGN.default.node.7.task.>",
+                "$KV.MINGA_ASSIGN.beta.>"
+            ]}),
+        ),
+        (
+            "qa3",
+            serde_json::json!({"filter_subject": "$KV.MINGA_ASSIGN.beta.>"}),
+        ),
+        ("qa4", serde_json::json!({})),
+    ] {
+        let mut config = config;
+        config["name"] = name.into();
+        config["deliver_subject"] = inbox.into();
+        config["deliver_policy"] = "all".into();
+        config["ack_policy"] = "none".into();
+        let body = serde_json::json!({"stream_name": "KV_MINGA_ASSIGN", "config": config});
+        let subject = format!(
+            "$JS.API.CONSUMER.CREATE.KV_MINGA_ASSIGN.{name}.$KV.MINGA_ASSIGN.default.node.7.task.>"
+        );
+        let reply = tokio::time::timeout(
+            Duration::from_secs(2),
+            worker.request(subject, body.to_string().into()),
+        )
+        .await;
+        eprintln!("consumer create {name}: {reply:?}");
+        if let Ok(Ok(reply)) = &reply {
+            let text = String::from_utf8_lossy(&reply.payload);
+            assert!(
+                text.contains("\"error\""),
+                "consumer {name} with body {body} was created: {text}"
+            );
+        }
+    }
+    while let Ok(Some(message)) =
+        tokio::time::timeout(Duration::from_millis(500), delivered.next()).await
+    {
+        assert!(
+            !leaks(&message),
+            "a worker consumer delivered a tenant beta key: {message:?}"
+        );
+    }
+
+    // Direct get, last-by-subject form on the worker's own key, with a body
+    // that asks for a sequence, the next beta key or a batch of last values.
+    for subject in [
+        "$JS.API.DIRECT.GET.KV_MINGA_ASSIGN.$KV.MINGA_ASSIGN.default.node.7.task.own",
+        "$JS.API.DIRECT.GET.KV_MINGA_LEASES.$KV.MINGA_LEASES.default.lease.node.7",
+    ] {
+        for body in [
+            serde_json::json!({"seq": 1}),
+            serde_json::json!({"seq": 2}),
+            serde_json::json!({"seq": 3}),
+            serde_json::json!({"next_by_subj": "$KV.MINGA_ASSIGN.beta.>", "seq": 1}),
+            serde_json::json!({"next_by_subj": "$KV.MINGA_LEASES.beta.>", "seq": 1}),
+            serde_json::json!({"last_by_subj": "$KV.MINGA_ASSIGN.beta.node.7.task.foreign"}),
+            serde_json::json!({"multi_last": [">"], "batch": 10}),
+            serde_json::json!({"seq": 1, "batch": 10}),
+        ] {
+            // A batch answers with several messages, so read them all.
+            let reply_inbox = worker.new_inbox();
+            let mut replies = worker.subscribe(reply_inbox.clone()).await.unwrap();
+            worker
+                .publish_with_reply(subject.to_string(), reply_inbox, body.to_string().into())
+                .await
+                .unwrap();
+            worker.flush().await.unwrap();
+            while let Ok(Some(message)) =
+                tokio::time::timeout(Duration::from_millis(300), replies.next()).await
+            {
+                eprintln!(
+                    "direct get {subject} {body}: {:?} {:?} {:?}",
+                    message.status,
+                    message.description,
+                    String::from_utf8_lossy(&message.payload)
+                );
+                assert!(
+                    !leaks(&message),
+                    "direct get on {subject} with body {body} returned a beta key: {message:?}"
+                );
+            }
+        }
+    }
+}
+
 /// A client presenting a certificate from an untrusted CA is rejected.
 #[tokio::test]
 async fn tls_client_with_wrong_ca_is_rejected() {
