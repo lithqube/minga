@@ -185,7 +185,8 @@ pub fn service_spec_to_state(spec: &models::ServiceSpec) -> Result<Service, Stri
     // the requested isolation is in effect. Explicit no-ops
     // (`ReadOnly: false`, empty lists/Privileges/nested strings,
     // `SELinuxContext.Disable: false`, `NoNewPrivileges: false`, and unlimited
-    // `Pids: 0`) ask for nothing and stay accepted.
+    // `Pids: 0`) ask for nothing and stay accepted. OCI also always enables
+    // `NoNewPrivileges`, so a true value is already enforced by the runtime.
     if container.ReadOnly == Some(true) {
         return Err(format!(
             "service '{name}': ContainerSpec.ReadOnly is not supported"
@@ -234,7 +235,7 @@ pub fn service_spec_to_state(spec: &models::ServiceSpec) -> Result<Service, Stri
                 .Mode
                 .as_deref()
                 .is_some_and(|value| !value.is_empty())
-        }) || privileges.NoNewPrivileges == Some(true)
+        })
     }) {
         return Err(format!(
             "service '{name}': ContainerSpec.Privileges is not supported"
@@ -1568,7 +1569,7 @@ mod tests {
             assert!(err.contains("Pids"), "{err}");
         }
 
-        // Explicit no-ops ask for nothing and stay accepted.
+        // No-op values and fields already enforced by OCI stay accepted.
         let mut spec = sample_docker_spec();
         let container = container(&mut spec);
         container.ReadOnly = Some(false);
@@ -1594,7 +1595,7 @@ mod tests {
             AppArmor: Some(models::AppArmorOptions {
                 Mode: Some(String::new()),
             }),
-            NoNewPrivileges: Some(false),
+            NoNewPrivileges: Some(true),
         });
         spec.TaskTemplate
             .Resources

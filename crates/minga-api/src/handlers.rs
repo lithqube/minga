@@ -3192,11 +3192,6 @@ mod tests {
                 serde_json::json!({"AppArmor": {"Mode": "disabled"}}),
             ),
             (
-                "privileges-no-new-privileges",
-                "Privileges",
-                serde_json::json!({"NoNewPrivileges": true}),
-            ),
-            (
                 "capability-drop",
                 "CapabilityDrop",
                 serde_json::json!(["CAP_NET_RAW"]),
@@ -3240,6 +3235,30 @@ mod tests {
                 "{name} ({field})"
             );
         }
+
+        let no_new_privileges: models::ServiceSpec = serde_json::from_value(serde_json::json!({
+            "Name": "nnp-enabled",
+            "TaskTemplate": {
+                "ContainerSpec": {
+                    "Image": "nginx:latest",
+                    "Privileges": {"NoNewPrivileges": true}
+                }
+            }
+        }))
+        .unwrap();
+        let _ = create_service(
+            State(app.clone()),
+            default_caller(),
+            Json(no_new_privileges),
+        )
+        .await
+        .unwrap();
+        assert!(app
+            .store
+            .get_service("nnp-enabled")
+            .await
+            .unwrap()
+            .is_some());
 
         let _ = create_service(State(app.clone()), default_caller(), Json(spec("web", 0)))
             .await
