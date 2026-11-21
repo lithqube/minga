@@ -12,9 +12,16 @@
     mode. Watches deliver to the worker's own inbox.
   - JWT `DIRECT.GET` on `KV_MINGA_ASSIGN` is limited to the worker's task, ingress, net and wg keys
     instead of every key under its node.
-  - Operator/JWT mode: set every tenant signer's template to the list in
-    `worker_permission_template` and re-sign the account JWT, together with the #130 change below. A
-    manager refuses to start with the old template.
+  - Operator/JWT mode, once for this change and #130 below:
+    1. Set every tenant signer's template to the list in `worker_permission_template`.
+    2. Re-sign the account JWT in `MINGA_NATS_ACCOUNT_JWT_FILE`. A manager refuses to start with the old
+       template.
+    3. With the manager stopped, copy that file over `<MINGA_NATS_RESOLVER_DIR>/<account public key>.jwt`
+       on every manager. The sidecar preloads the resolver claim only when it is missing, so an existing
+       resolver keeps serving the old template. On an external NATS server, push the claim to its
+       resolver instead.
+    4. Start the managers. The leader republishes the revocations stored in Raft onto the new claim, so
+       revoked workers stay revoked.
 
 - **Security, upgrade action needed.** A worker can no longer list other tenants' assignment and lease
   keys (#130):
@@ -29,8 +36,8 @@
     once its manager's sidecar drops the grant.
   - Operator/JWT mode: remove `$JS.API.STREAM.INFO.KV_MINGA_ASSIGN`,
     `$JS.API.STREAM.INFO.KV_MINGA_LEASES` and `$JS.API.CONSUMER.INFO.KV_MINGA_ASSIGN.*` from every tenant
-    signer's permission template and re-sign the account JWT. A manager refuses to start with the old
-    template.
+    signer's permission template, re-sign the account JWT and update the resolver claim, as in the
+    worker grants entry above. A manager refuses to start with the old template.
 
 - **Security, upgrade check.** One tenant node can no longer stop managers applying the mesh (#127):
   - A manager refuses to register a node whose WireGuard key another node already holds, logs it, and
