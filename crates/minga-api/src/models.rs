@@ -552,6 +552,10 @@ pub struct ContainerSpec {
     pub Privileges: Option<Privileges>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ReadOnly: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub CapabilityDrop: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub Ulimits: Option<Vec<Ulimit>>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub Healthcheck: Option<Healthcheck>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
@@ -617,6 +621,19 @@ pub struct Privileges {
     pub CredentialSpec: Option<CredentialSpec>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub SELinuxContext: Option<SELinuxContext>,
+}
+
+/// One `Ulimits` entry of a Docker `ContainerSpec` (`{"Name": "nofile",
+/// "Soft": 1024, "Hard": 2048}`). Not carried into the OCI spec yet;
+/// service create/update refuse it rather than dropping it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Ulimit {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub Name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub Soft: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub Hard: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
