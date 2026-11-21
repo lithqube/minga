@@ -1754,6 +1754,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_body_dripped_byte_by_byte_is_closed_at_its_deadline() {
+        use tokio::io::AsyncWriteExt;
+        let limits = ApiLimits {
+            body: Duration::from_millis(300),
+            ..ApiLimits::default()
+        };
+        let (addr, ca, _dirs) = limited_tls_api(limits, &[]).await;
+        let tenant = client_cert(&ca, "deployer", "default");
+        let mut drip = stalled_body(&addr, &ca.0, &tenant, "/v1.41/services/create", "").await;
+        // Each byte lands well inside the deadline; the whole body does not.
+        let started = tokio::time::Instant::now();
+        while started.elapsed() < Duration::from_secs(3) {
+            if drip.write_all(b" ").await.is_err()
+                || drip.flush().await.is_err()
+                || closed_within(&mut drip, Duration::from_millis(100)).await
+            {
+                break;
+            }
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "a body dripped byte by byte kept its connection"
+        );
+    }
+
+    #[tokio::test]
     async fn a_service_name_cannot_be_taken_over_by_another_tenant() {
         let (_router, store, _dir) = admin_router().await;
         for id in ["tenant-a", "tenant-b"] {

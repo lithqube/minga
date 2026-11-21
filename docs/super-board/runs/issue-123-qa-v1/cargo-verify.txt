@@ -1,0 +1,2062 @@
+    Checking minga-net v1.2.0 (/Users/admin/dev/minga/.claude/worktrees/issue-123-qa/crates/minga-net)
+    Checking minga-telemetry v1.2.0 (/Users/admin/dev/minga/.claude/worktrees/issue-123-qa/crates/minga-telemetry)
+    Checking minga-compose v1.2.0 (/Users/admin/dev/minga/.claude/worktrees/issue-123-qa/crates/minga-compose)
+    Checking minga-sandbox v1.2.0 (/Users/admin/dev/minga/.claude/worktrees/issue-123-qa/crates/minga-sandbox)
+    Checking minga-ctl v1.2.0 (/Users/admin/dev/minga/.claude/worktrees/issue-123-qa/crates/minga-ctl)
+    Checking minga-state v1.2.0 (/Users/admin/dev/minga/.claude/worktrees/issue-123-qa/crates/minga-state)
+    Checking minga-bus v1.2.0 (/Users/admin/dev/minga/.claude/worktrees/issue-123-qa/crates/minga-bus)
+    Checking minga-egress v1.2.0 (/Users/admin/dev/minga/.claude/worktrees/issue-123-qa/crates/minga-egress)
+    Checking minga-scheduler v1.2.0 (/Users/admin/dev/minga/.claude/worktrees/issue-123-qa/crates/minga-scheduler)
+    Checking minga-node v1.2.0 (/Users/admin/dev/minga/.claude/worktrees/issue-123-qa/crates/minga-node)
+    Checking minga-api v1.2.0 (/Users/admin/dev/minga/.claude/worktrees/issue-123-qa/crates/minga-api)
+    Checking minga-cli v1.2.0 (/Users/admin/dev/minga/.claude/worktrees/issue-123-qa/crates/minga-cli)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 9.49s
+   Compiling minga-net v1.2.0 (/Users/admin/dev/minga/.claude/worktrees/issue-123-qa/crates/minga-net)
+   Compiling minga-telemetry v1.2.0 (/Users/admin/dev/minga/.claude/worktrees/issue-123-qa/crates/minga-telemetry)
+   Compiling minga-compose v1.2.0 (/Users/admin/dev/minga/.claude/worktrees/issue-123-qa/crates/minga-compose)
+   Compiling minga-sandbox v1.2.0 (/Users/admin/dev/minga/.claude/worktrees/issue-123-qa/crates/minga-sandbox)
+   Compiling minga-ctl v1.2.0 (/Users/admin/dev/minga/.claude/worktrees/issue-123-qa/crates/minga-ctl)
+   Compiling minga-state v1.2.0 (/Users/admin/dev/minga/.claude/worktrees/issue-123-qa/crates/minga-state)
+   Compiling minga-bus v1.2.0 (/Users/admin/dev/minga/.claude/worktrees/issue-123-qa/crates/minga-bus)
+   Compiling minga-egress v1.2.0 (/Users/admin/dev/minga/.claude/worktrees/issue-123-qa/crates/minga-egress)
+   Compiling minga-scheduler v1.2.0 (/Users/admin/dev/minga/.claude/worktrees/issue-123-qa/crates/minga-scheduler)
+   Compiling minga-api v1.2.0 (/Users/admin/dev/minga/.claude/worktrees/issue-123-qa/crates/minga-api)
+   Compiling minga-node v1.2.0 (/Users/admin/dev/minga/.claude/worktrees/issue-123-qa/crates/minga-node)
+   Compiling minga-cli v1.2.0 (/Users/admin/dev/minga/.claude/worktrees/issue-123-qa/crates/minga-cli)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 35.34s
+     Running unittests src/lib.rs (/Users/admin/dev/minga/target/debug/deps/minga_api-0874cb23fd83458a)
+
+running 137 tests
+test error::tests::no_content_status ... ok
+test error::tests::from_state_error ... ok
+test error::tests::not_found_helper ... ok
+test error::tests::quota_errors_map_to_rate_limit_or_storage_status ... ok
+test error::tests::ok_message_json ... ok
+test error::tests::conflict_status ... ok
+test handlers::tests::cross_tenant_reserved_port_does_not_block_ingress ... ok
+test error::tests::bad_request_status ... ok
+test error::tests::error_response_format ... ok
+test auth::tests::client_identity_reads_role_and_tenant_from_subject ... ok
+test handlers::tests::new_leader_republishes_stored_revocations_once_per_term ... ok
+test handlers::tests::cluster_audit_merges_tenant_trails_by_time ... ok
+test handlers::tests::same_tenant_reserved_port_still_blocks_ingress ... ok
+test handlers::tests::network_subnet_outside_the_overlay_is_refused ... ok
+test handlers::tests::node_join_token_is_signed_for_the_preregistered_tenant ... ok
+test handlers::tests::agent_usage_is_tenant_scoped_and_operator_output_is_aggregate_only ... ok
+test models::node_join_token_tests::debug_output_redacts_the_token_and_seed ... ok
+test models::tests::config_spec_deserialize ... ok
+test handlers::tests::overlapping_ipam_subnet_does_not_disclose_other_networks ... ok
+test models::tests::error_response_serialize ... ok
+test models::tests::labels_match_existence ... ok
+test models::tests::labels_match_key_value ... ok
+test models::tests::labels_match_multiple ... ok
+test models::tests::network_resource_serialize ... ok
+test models::tests::network_create_deserialize ... ok
+test models::tests::node_serialize ... ok
+test models::tests::parse_filters_canonical_go_client_form ... ok
+test models::tests::parse_filters_none ... ok
+test models::tests::parse_filters_invalid_json ... ok
+test models::tests::parse_filters_valid ... ok
+test models::tests::secret_spec_deserialize ... ok
+test models::tests::service_mode_global ... ok
+test models::tests::service_serialize_roundtrip ... ok
+test handlers::tests::deleting_node_fails_closed_when_revocation_bus_is_missing ... ok
+test models::tests::service_spec_deserialize ... ok
+test handlers::tests::operator_registered_node_accepts_tenant_assignment_and_defaults_to_default ... ok
+test handlers::tests::deleting_node_revokes_its_bus_user_before_removing_it ... ok
+test models::tests::task_serialize ... ok
+test models::tests::version_info_serialize ... ok
+test nats_credentials::tests::issued_credentials_are_node_and_tenant_scoped ... ok
+test nats_credentials::tests::effective_worker_permissions_cover_only_its_own_tenant_and_node ... ok
+test nats_credentials::tests::issuer_accepts_sorted_signer_template_permissions ... ok
+test nats_credentials::tests::issuer_rejects_a_template_that_repeats_one_permission_in_place_of_another ... ok
+test nats_credentials::tests::wireguard_watch_permissions_are_limited_to_the_tenant_node_key ... ok
+test nats_credentials::tests::issuer_rejects_missing_tenant_signer ... ok
+test nats_credentials::tests::revocation_claim_contains_the_complete_replicated_key_set ... ok
+test handlers::tests::egress_route_secrets_of_another_tenant_are_not_found ... ok
+test handlers::tests::unknown_network_driver_option_is_refused ... ok
+test handlers::tests::reissuing_node_credentials_revokes_the_previous_nkey ... ok
+test handlers::tests::service_admission_scopes_reserved_ports_to_the_service_tenant ... ok
+test server::tests::api_server_start_and_shutdown ... ok
+test handlers::tests::update_excludes_the_services_own_tasks_from_capacity ... ok
+test server::tests::bearer_auth_rejects_and_accepts ... ok
+test server::tests::a_service_name_cannot_be_taken_over_by_another_tenant ... ok
+test server::tests::a_tenant_holding_its_cap_of_stalled_bodies_locks_out_no_one_else ... ok
+test server::tests::a_body_dripped_byte_by_byte_is_closed_at_its_deadline ... ok
+test server::tests::create_and_list_config ... ok
+test server::tests::client_certificates_scope_docker_routes_to_their_tenant ... ok
+test server::tests::create_and_list_network ... ok
+test server::tests::deciding_a_change_request_needs_a_reviewer_certificate ... ok
+test server::tests::create_and_list_secret ... ok
+test server::tests::create_and_list_service ... ok
+test server::tests::create_node_rejects_duplicates_and_empty_address ... ok
+test server::tests::create_node_registers_and_inspects ... ok
+test server::tests::create_secret_with_inline_data_is_rejected ... ok
+test server::tests::create_service_conflict ... ok
+test server::tests::create_service_fails_loudly_without_nodes ... ok
+test server::tests::delete_service ... ok
+test server::tests::empty_configured_token_never_authenticates ... ok
+test server::tests::fallback_not_found ... ok
+test server::tests::get_info ... ok
+test server::tests::get_service_not_found ... ok
+test server::tests::a_stalled_request_body_is_closed_at_its_deadline ... ok
+test server::tests::list_nodes ... ok
+test server::tests::get_version ... ok
+test server::tests::list_tasks_empty ... ok
+test server::tests::mtls_accepts_ca_signed_clients_and_maps_them_to_roles ... ok
+test server::tests::operator_certificates_need_the_role_the_operation_requires ... ok
+test server::tests::missing_status_does_not_replay_raft_actual_fields ... ok
+test server::tests::ping ... ok
+test server::tests::tenant_audit_is_admin_only_and_tenant_scoped ... ok
+test server::tests::service_filter_by_stack_label ... ok
+test server::tests::the_change_diff_hides_environment_values_but_names_their_keys ... ok
+test server::tests::state_routes_need_the_token_and_check_version_first ... ok
+test server::tests::state_import_round_trips_v9_agents_and_runs_agent_admission ... ok
+test server::tests::change_requests_are_tenant_scoped_and_maker_checker_enforced ... ok
+test server::tests::manager_membership_routes_require_admin_auth_and_change_membership ... ok
+test translate::tests::a_failed_task_reports_its_reason_and_exit_code ... ok
+test translate::tests::a_healthy_task_has_a_message_and_no_error_on_the_wire ... ok
+test translate::tests::a_relative_bind_source_is_refused_and_an_absolute_one_kept ... ok
+test translate::tests::a_task_that_failed_to_start_has_an_error_but_no_exit_code ... ok
+test translate::tests::agent_label_directory_grants_are_bounded ... ok
+test translate::tests::agent_label_must_be_a_json_object ... ok
+test translate::tests::agent_label_with_an_invalid_directory_path_is_refused ... ok
+test translate::tests::agent_label_with_env_but_no_env_grant_is_refused ... ok
+test translate::tests::agent_label_with_unknown_keys_is_refused ... ok
+test translate::tests::config_spec_to_state_translation ... ok
+test translate::tests::config_to_docker_translation ... ok
+test translate::tests::docker_port_publish_mode_defaults_and_round_trips ... ok
+test translate::tests::egress_policy_survives_the_docker_api_round_trip_and_is_validated ... ok
+test translate::tests::host_entries_take_aliases_and_reject_a_bare_ip ... ok
+test translate::tests::network_create_to_state_defaults_translation ... ok
+test translate::tests::network_create_to_state_translation ... ok
+test translate::tests::network_to_docker_with_subnet ... ok
+test translate::tests::network_to_docker_without_subnet ... ok
+test translate::tests::node_to_docker_draining ... ok
+test server::tests::tenant_admin_reaches_audit_and_usage_routes ... ok
+test translate::tests::node_to_docker_leader ... ok
+test translate::tests::node_to_docker_worker ... ok
+test translate::tests::secret_spec_to_state_translation ... ok
+test translate::tests::replicated_job_mode_is_preserved_for_tenant_quota_accounting ... ok
+test translate::tests::secret_to_docker_translation ... ok
+test translate::tests::service_roundtrip ... ok
+test translate::tests::service_secret_references_reject_unsafe_targets_and_options ... ok
+test translate::tests::service_spec_to_state_default_mode ... ok
+test translate::tests::service_spec_to_state_basic ... ok
+test translate::tests::service_spec_to_state_missing_container ... ok
+test translate::tests::service_spec_to_state_global_mode ... ok
+test translate::tests::service_spec_to_state_missing_image ... ok
+test translate::tests::service_spec_to_state_missing_name ... ok
+test translate::tests::service_spec_to_state_no_ports ... ok
+test translate::tests::service_spec_to_state_restart_policy_defaults_and_rounding ... ok
+test translate::tests::service_to_docker_env_excludes_minga_stack ... ok
+test translate::tests::system_info_basic ... ok
+test translate::tests::task_to_docker_failed ... ok
+test translate::tests::task_to_docker_pending ... ok
+test translate::tests::task_to_docker_running ... ok
+test translate::tests::version_info_basic ... ok
+test translate::tests::user_and_update_policy_survive_the_docker_api_round_trip ... ok
+test server::tests::task_view_uses_bus_actual_state_and_keeps_traefik_attachments ... ok
+test server::tests::task_logs_are_bounded_and_scoped_to_the_callers_tenant ... ok
+test server::tests::tenant_crud_requires_admin_and_protects_owned_resources ... ok
+test server::tests::tokenless_api_refuses_browser_shaped_requests ... ok
+test server::tests::tokenless_sole_tenant_caller_reads_inventory_but_cannot_administer ... ok
+test server::tests::update_node_drains_and_relabels ... ok
+test server::tests::update_node_rejects_what_minga_cannot_do ... ok
+test server::tests::diagnostics_report_persisted_voters_and_unreachable_member ... ok
+
+test result: ok. 137 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.18s
+
+     Running tests/integration.rs (/Users/admin/dev/minga/target/debug/deps/integration-081941a451a55e7f)
+
+running 13 tests
+test docker_cli_node_ls_via_testcontainer ... ok
+test docker_cli_service_ls_via_testcontainer ... ok
+test docker_cli_version_via_testcontainer ... ok
+test docker_cli_info_via_testcontainer ... ok
+test info_endpoint_shows_swarm ... ok
+test version_endpoint ... ok
+test ping_endpoint ... ok
+test node_join_credentials_require_mutual_tls ... ok
+test tasks_endpoint_returns_empty_initially ... ok
+test ingress_port_conflicts_return_http_409 ... ok
+test error_responses_are_docker_compatible ... ok
+test service_update_changes_replicas ... ok
+test full_stack_deploy_workflow ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.07s
+
+     Running unittests src/lib.rs (/Users/admin/dev/minga/target/debug/deps/minga_bus-f5137256c6859946)
+
+running 53 tests
+test memory::tests::tenant_request_quota_is_atomic_and_isolated_by_window_and_tenant ... ok
+test memory::tests::same_node_id_in_different_tenants_has_distinct_leases ... ok
+test memory::tests::same_node_id_assignments_and_status_are_isolated_by_tenant ... ok
+test memory::tests::test_lease_per_node ... ok
+test memory::tests::tenant_event_history_is_filtered_and_bounded ... ok
+test memory::tests::tenant_status_and_audit_are_isolated ... ok
+test memory::tests::assignment_watch_includes_existing_values ... ok
+test memory::tests::assignments_are_prefix_scoped_and_deletable ... ok
+test memory::tests::test_log_entry_roundtrip ... ok
+test memory::tests::test_list_status_returns_all_entries ... ok
+test memory::tests::test_log_history_returns_retained_entries ... ok
+test memory::tests::test_log_history_wildcard_covers_all_tasks ... ok
+test memory::tests::test_log_history_tail_keeps_the_last_entries ... ok
+test memory::tests::test_subject_matches_exact ... ok
+test memory::tests::test_subject_matches_gt ... ok
+test memory::tests::test_publish_and_subscribe_events ... ok
+test memory::tests::test_put_and_get_status ... ok
+test memory::tests::test_subject_matches_mixed ... ok
+test memory::tests::test_subject_matches_star ... ok
+test memory::tests::test_request_reply ... ok
+test memory::tests::test_publish_and_subscribe_logs ... ok
+test memory::tests::test_request_no_responder ... ok
+test memory::tests::usage_event_serialization_keeps_integer_cost_and_no_prompt_body ... ok
+test memory::tests::test_subscribe_logs_filters_by_task ... ok
+test nats::legacy_key_tests::only_pre_tenant_node_keys_are_legacy ... ok
+test memory::tests::test_subscribe_logs_wildcard ... ok
+test nats::tests::api_level_warning_only_reports_levels_below_four ... ok
+test memory::tests::test_subscribe_multiple_patterns ... ok
+test nats::tests::bounded_consumer_caps_redelivery ... ok
+test nats::tests::decode_errors_are_poison_others_are_transient ... ok
+test memory::tests::test_watch_status_multiple_keys ... ok
+test subjects::tests::kv_key_formats ... ok
+test subjects::tests::subject_formats ... ok
+test subjects::tests::wildcard_formats ... ok
+test memory::tests::test_watch_status ... ok
+test subjects::tests::worker_acl_rejects_invalid_tenant_names ... ok
+test tests::assignment_watch_uses_exact_keys_or_dot_terminated_prefixes ... ok
+test subjects::tests::worker_acl_is_tenant_and_node_scoped ... ok
+test tests::task_status_decodes_pre_extension_reports ... ok
+test tls::tests::env_rejects_partial_configuration ... ok
+test tls::tests::env_returns_none_when_nothing_is_set ... ok
+test tests::usage_subject_is_tenant_and_service_qualified ... ok
+test memory::tests::usage_query_filters_tenant_customer_time_and_limit_and_deduplicates ... ok
+test tls::tests::seed_list_is_checked_url_by_url ... ok
+test tls::tests::preflight_rejects_missing_files ... ok
+test tls::tests::preflight_rejects_empty_pem ... ok
+test tls::tests::preflight_rejects_empty_server_name ... ok
+test tls::tests::preflight_rejects_world_readable_key ... ok
+test tls::tests::preflight_accepts_valid_material ... ok
+test tls::tests::credentials_builder_rejects_malformed_credentials_without_echoing_them ... ok
+test memory::tests::test_request_timeout ... ok
+test memory::tests::test_lease_alive_and_expired ... ok
+test memory::tests::test_lease_refresh_extends ... ok
+
+test result: ok. 53 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.26s
+
+     Running tests/nats_cluster.rs (/Users/admin/dev/minga/target/debug/deps/nats_cluster-e78273ecb14a6062)
+
+running 1 test
+test replicated_bus_survives_losing_one_server ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.55s
+
+     Running tests/nats_consumer_cap.rs (/Users/admin/dev/minga/target/debug/deps/nats_consumer_cap-6087f83493e00be8)
+
+running 1 test
+test assignment_bucket_accepts_more_consumers_than_the_server_default ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/nats_integration.rs (/Users/admin/dev/minga/target/debug/deps/nats_integration-fc0105fac0cf9980)
+
+running 16 tests
+test common::tests::required_server_unavailability_panics_instead_of_skipping ... ok
+test nats_log_history_is_scoped_to_one_task ... ok
+test nats_log_stream_isolates_task_ids ... ok
+test nats_publish_and_subscribe_logs ... ok
+test nats_connect_creates_streams ... ok
+test nats_log_entries_survive_a_new_subscriber ... ok
+test nats_log_history_returns_the_last_n_entries ... ok
+test nats_log_history_spans_multiple_fetch_batches ... ok
+test nats_publish_and_subscribe_events ... ok
+test nats_list_status_returns_existing_keys ... ok
+test nats_status_kv_roundtrip ... ok
+test nats_tenant_event_history_is_filtered_bounded_and_publish_stamped ... ok
+test nats_usage_cutoff_uses_event_time_not_storage_time ... ok
+test nats_usage_skips_bad_records_and_keeps_newest ... ok
+test nats_watch_status_sees_existing_keys ... ok
+test nats_wildcard_log_subscription_receives_all_tasks ... ok
+
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/nats_lease_expiration.rs (/Users/admin/dev/minga/target/debug/deps/nats_lease_expiration-e1a87424d2dc8f65)
+
+running 2 tests
+test common::tests::required_server_unavailability_panics_instead_of_skipping ... ok
+test jetstream_expiry_makes_a_node_ineligible ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/nats_legacy_upgrade.rs (/Users/admin/dev/minga/target/debug/deps/nats_legacy_upgrade-875dbda4481a9119)
+
+running 3 tests
+test common::tests::required_server_unavailability_panics_instead_of_skipping ... ok
+test connecting_moves_a_pre_tenant_events_stream_to_tenant_subjects ... ok
+test connecting_a_manager_purges_pre_tenant_keys_only ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/nats_runtime.rs (/Users/admin/dev/minga/target/debug/deps/nats_runtime-673869412e48484c)
+
+running 3 tests
+test common::tests::required_server_unavailability_panics_instead_of_skipping ... ok
+test manager_and_worker_api_levels_and_bucket_consumer_limits ... ok
+test assignment_bucket_accepts_more_than_one_thousand_ordered_consumers ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/nats_stream_update.rs (/Users/admin/dev/minga/target/debug/deps/nats_stream_update-0e4e02b0c67702b0)
+
+running 2 tests
+test common::tests::required_server_unavailability_panics_instead_of_skipping ... ok
+test reconnecting_with_a_new_lease_ttl_updates_the_bucket ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/nats_tls.rs (/Users/admin/dev/minga/target/debug/deps/nats_tls-1989d75d3e25d305)
+
+running 10 tests
+test tls_url_host_mismatch_is_rejected ... ok
+test secure_bus_supports_events_status_and_logs ... ok
+test tls_client_without_certificate_is_rejected ... ok
+test plaintext_scheme_is_rejected_in_secure_mode ... ok
+test tls_client_with_valid_certificate_connects ... ok
+test plaintext_client_is_rejected_by_tls_server ... ok
+test tls_client_with_wrong_ca_is_rejected ... ok
+test two_servers_form_a_cluster_over_tls_routes ... ok
+test plaintext_server_still_accepts_plaintext_client ... ok
+test worker_certificate_cannot_write_assignments_or_other_nodes_status_and_leases ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 28.42s
+
+     Running tests/nats_upgrade.rs (/Users/admin/dev/minga/target/debug/deps/nats_upgrade-7ddf23f5d446114f)
+
+running 3 tests
+test upgrade_probe ... ignored, run by scripts/nats-upgrade-proof.sh after each server replacement
+test upgrade_seed ... ignored, run by scripts/nats-upgrade-proof.sh on the old server
+test upgrade_verify ... ignored, run by scripts/nats-upgrade-proof.sh once on the final server
+
+test result: ok. 0 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (/Users/admin/dev/minga/target/debug/deps/minga-80d76dd2daffebaa)
+
+running 55 tests
+test mcp::tests::task_arguments_reject_path_injection_and_unknown_fields ... ok
+test mcp::tests::agent_gets_only_a_proposal_write_tool ... ok
+test mcp::tests::mcp_tools_are_read_only_and_have_closed_argument_schemas ... ok
+test mcp::tests::event_projection_keeps_metadata_and_omits_payload ... ok
+test mcp::tests::output_projections_omit_environment_and_task_errors_and_sort_rows ... ok
+test bus::tests::credentials_file_requires_owner_only_permissions ... ok
+test mcp::tests::an_oversized_message_is_skipped_without_buffering_it ... ok
+test mcp::tests::every_tool_list_matches_the_mcp_tool_shape ... ok
+test mcp::tests::the_log_budget_keeps_the_newest_bytes ... ok
+test bus::tests::tls_url_without_material_is_rejected ... ok
+test sidecar::tests::config_contains_required_fields ... ok
+test sidecar::tests::config_enables_operator_jwt_resolver_without_certificate_mapping ... ok
+test sidecar::tests::config_honours_restricted_listen_address ... ok
+test private::tests::new_and_existing_paths_end_up_owner_only ... ok
+test sidecar::tests::config_uses_custom_ports ... ok
+test sidecar::tests::config_never_embeds_key_material ... ok
+test sidecar::tests::config_with_tls_emits_client_tls_block ... ok
+test sidecar::tests::certificate_mapping_does_not_create_static_worker_users ... ok
+test sidecar::tests::config_without_tls_has_no_tls_block ... ok
+test sidecar::tests::default_options ... ok
+test sidecar::tests::config_with_cluster_tls_emits_separate_route_block ... ok
+test sidecar::tests::jwt_auth_rejects_missing_tls ... ok
+test sidecar::tests::find_nats_server_returns_path ... ok
+test sidecar::tests::plaintext_sidecar_rejects_public_listener ... ok
+test sidecar::tests::find_nats_server_env_var ... ok
+test tests::loopback_binds_are_recognised ... ok
+test tests::a_bare_compose_file_name_resolves_against_the_current_directory ... ok
+test tests::manager_certificate_names_cover_local_sidecar_tls_without_expanding_worker_identity ... ok
+test tests::api_command_parses_as_retired_command ... ok
+test mcp::tests::tool_arguments_cannot_add_unlisted_reads ... ok
+test mcp::tests::tool_calls_outside_the_allow_list_are_refused ... ok
+test mcp::tests::initialize_and_tools_list_use_mcp_jsonrpc_shapes ... ok
+test tests::managers_require_wireguard_endpoint_when_joining_or_multi_node ... ok
+test mcp::tests::the_tenant_comes_from_the_certificate_not_the_arguments ... ok
+test tests::manager_api_flags_parse ... ok
+test tests::net_create_rejects_per_network_wg_port ... ok
+test tests::manager_join_and_route_tls_flags_parse ... ok
+test tests::manager_rejects_route_port_without_route_tls ... ok
+test tests::manager_refuses_an_empty_api_token ... ok
+test tests::only_wildcard_binds_reach_task_bridge_gateways ... ok
+test tests::manager_refuses_tokenless_api_beyond_loopback ... ok
+test tests::plaintext_raft_beyond_loopback_is_refused ... ok
+test tests::migration_command_defaults_to_dry_run_and_requires_manager_ids ... ok
+test tests::port_of_reads_the_bind_port ... ok
+test tests::owner_only_reader_rejects_a_fifo_without_blocking ... ok
+test tests::wireguard_node_options_parse ... ok
+test tests::only_manager_certificates_carry_the_route_name ... ok
+test tests::worker_accepts_repeatable_agent_directory_roots ... ok
+test tests::worker_rejects_nats_cluster_port_flag ... ok
+test tests::tls_init_join_key_creates_a_private_key_and_refuses_overwrite ... ok
+test tests::worker_rejects_manager_api_flags ... ok
+test tests::worker_rejects_peer_flag ... ok
+test tests::cas_overlap_detects_a_shared_certificate ... ok
+[39760] 2026/11/21 22:10:43.400852 [INF] Starting nats-server
+[39760] 2026/11/21 22:10:43.400928 [INF]   Version:  2.15.3
+[39760] 2026/11/21 22:10:43.400935 [INF]   Git:      [not set]
+[39760] 2026/11/21 22:10:43.400939 [INF]   Cluster:  minga-test
+[39760] 2026/11/21 22:10:43.400942 [INF]   Name:     minga-1
+[39760] 2026/11/21 22:10:43.400946 [INF]   Node:     11lljj8r
+[39760] 2026/11/21 22:10:43.400949 [INF]   ID:       NAMRGEQMWGFQXMB5B4ULUB3OD4HTUQRCBLCZGEIW47BVSC7YWMEWFWVP
+[39760] 2026/11/21 22:10:43.400958 [INF] Using configuration file: /var/folders/24/wlt58ddx4l74l96pl4znxsv40000gp/T/.tmpLgu88f/nats/server.conf (sha256:c2d31c6f87723f953ac8617f077609ccb9d31b70d030468d3e55068b5d77d71e)
+[39760] 2026/11/21 22:10:43.401203 [INF] Starting http monitor on 127.0.0.1:55017
+[39760] 2026/11/21 22:10:43.401301 [INF] Starting JetStream
+[39760] 2026/11/21 22:10:43.401561 [INF]     _ ___ _____ ___ _____ ___ ___   _   __  __
+[39760] 2026/11/21 22:10:43.401570 [INF]  _ | | __|_   _/ __|_   _| _ \ __| /_\ |  \/  |
+[39760] 2026/11/21 22:10:43.401575 [INF] | || | _|  | | \__ \ | | |   / _| / _ \| |\/| |
+[39760] 2026/11/21 22:10:43.401578 [INF]  \__/|___| |_| |___/ |_| |_|_\___/_/ \_\_|  |_|
+[39760] 2026/11/21 22:10:43.401582 [INF] 
+[39760] 2026/11/21 22:10:43.401585 [INF]          https://docs.nats.io/jetstream
+[39760] 2026/11/21 22:10:43.401588 [INF] 
+[39760] 2026/11/21 22:10:43.401591 [INF] ---------------- JETSTREAM ----------------
+[39760] 2026/11/21 22:10:43.401594 [INF]   Strict:          true
+[39760] 2026/11/21 22:10:43.401604 [INF]   Max Memory:      64.00 MB
+[39760] 2026/11/21 22:10:43.401608 [INF]   Max Storage:     8.00 GB
+[39760] 2026/11/21 22:10:43.401611 [INF]   Store Directory: "/var/folders/24/wlt58ddx4l74l96pl4znxsv40000gp/T/.tmpLgu88f/nats/jetstream/jetstream"
+[39760] 2026/11/21 22:10:43.401617 [INF]   API Level:       5
+[39760] 2026/11/21 22:10:43.401621 [INF] -------------------------------------------
+[39760] 2026/11/21 22:10:43.401916 [INF] Starting JetStream cluster
+[39760] 2026/11/21 22:10:43.401923 [INF] Creating JetStream metadata controller
+[39760] 2026/11/21 22:10:43.403092 [INF] JetStream cluster bootstrapping
+[39760] 2026/11/21 22:10:43.415985 [INF] Took 14.641833ms to start JetStream
+[39760] 2026/11/21 22:10:43.416043 [INF] Listening for client connections on 127.0.0.1:55013
+[39760] 2026/11/21 22:10:43.416057 [INF] Server is ready
+[39760] 2026/11/21 22:10:43.416069 [INF] Cluster name is minga-test
+[39760] 2026/11/21 22:10:43.416188 [INF] Listening for route connections on 0.0.0.0:55021
+[39762] 2026/11/21 22:10:43.503919 [INF] Starting nats-server
+[39762] 2026/11/21 22:10:43.504005 [INF]   Version:  2.15.3
+[39762] 2026/11/21 22:10:43.504011 [INF]   Git:      [not set]
+[39762] 2026/11/21 22:10:43.504017 [INF]   Cluster:  minga-test
+[39762] 2026/11/21 22:10:43.504021 [INF]   Name:     minga-2
+[39762] 2026/11/21 22:10:43.504026 [INF]   Node:     dCnd6u0M
+[39762] 2026/11/21 22:10:43.504030 [INF]   ID:       NDF75N4JE56VSN5TRFODIK2AMQXJJKEPW3R5V36CR53A4WFVWJ2Z46QS
+[39762] 2026/11/21 22:10:43.504046 [INF] Using configuration file: /var/folders/24/wlt58ddx4l74l96pl4znxsv40000gp/T/.tmp3xGlmC/nats/server.conf (sha256:d158ac78bdb27ca76d3b39fc701416c5ff5a871e49dd52a19f5aeff04c9faeab)
+[39762] 2026/11/21 22:10:43.504275 [INF] Starting http monitor on 127.0.0.1:55018
+[39762] 2026/11/21 22:10:43.504340 [INF] Starting JetStream
+[39762] 2026/11/21 22:10:43.504505 [INF]     _ ___ _____ ___ _____ ___ ___   _   __  __
+[39762] 2026/11/21 22:10:43.504510 [INF]  _ | | __|_   _/ __|_   _| _ \ __| /_\ |  \/  |
+[39762] 2026/11/21 22:10:43.504514 [INF] | || | _|  | | \__ \ | | |   / _| / _ \| |\/| |
+[39762] 2026/11/21 22:10:43.504517 [INF]  \__/|___| |_| |___/ |_| |_|_\___/_/ \_\_|  |_|
+[39762] 2026/11/21 22:10:43.504520 [INF] 
+[39762] 2026/11/21 22:10:43.504523 [INF]          https://docs.nats.io/jetstream
+[39762] 2026/11/21 22:10:43.504534 [INF] 
+[39762] 2026/11/21 22:10:43.504537 [INF] ---------------- JETSTREAM ----------------
+[39762] 2026/11/21 22:10:43.504540 [INF]   Strict:          true
+[39762] 2026/11/21 22:10:43.504548 [INF]   Max Memory:      64.00 MB
+[39762] 2026/11/21 22:10:43.504551 [INF]   Max Storage:     8.00 GB
+[39762] 2026/11/21 22:10:43.504554 [INF]   Store Directory: "/var/folders/24/wlt58ddx4l74l96pl4znxsv40000gp/T/.tmp3xGlmC/nats/jetstream/jetstream"
+[39762] 2026/11/21 22:10:43.504558 [INF]   API Level:       5
+[39762] 2026/11/21 22:10:43.504560 [INF] -------------------------------------------
+[39762] 2026/11/21 22:10:43.504839 [INF] Starting JetStream cluster
+[39762] 2026/11/21 22:10:43.504845 [INF] Creating JetStream metadata controller
+[39762] 2026/11/21 22:10:43.510227 [INF] JetStream cluster bootstrapping
+[39760] 2026/11/21 22:10:43.517077 [WRN] Waiting for routing to be established...
+[39762] 2026/11/21 22:10:43.522995 [INF] Took 18.646625ms to start JetStream
+[39762] 2026/11/21 22:10:43.523086 [INF] Listening for client connections on 127.0.0.1:55014
+[39762] 2026/11/21 22:10:43.523099 [INF] Server is ready
+[39762] 2026/11/21 22:10:43.523110 [INF] Cluster name is minga-test
+[39762] 2026/11/21 22:10:43.523224 [INF] Listening for route connections on 0.0.0.0:55022
+[39762] 2026/11/21 22:10:43.524998 [INF] 127.0.0.1:55021 - rid:8 - Route connection created (127.0.0.1:55021)
+[39762] 2026/11/21 22:10:43.525301 [INF] 127.0.0.1:55021 - rid:9 - Route connection created (127.0.0.1:55021)
+[39760] 2026/11/21 22:10:43.525338 [INF] 127.0.0.1:55034 - rid:12 - Route connection created
+[39760] 2026/11/21 22:10:43.525494 [ERR] 127.0.0.1:55034 - rid:12 - authentication error
+[39760] 2026/11/21 22:10:43.525518 [INF] 127.0.0.1:55034 - rid:12 - Router connection closed: Authentication Failure
+[39760] 2026/11/21 22:10:43.525660 [INF] 127.0.0.1:55035 - rid:11 - Route connection created
+[39762] 2026/11/21 22:10:43.525691 [ERR] 127.0.0.1:55021 - rid:8 - Route Error 'Authorization Violation'
+[39762] 2026/11/21 22:10:43.525702 [INF] 127.0.0.1:55021 - rid:8 - Router connection closed: Parse Error - Remote: minga-1, Host: 127.0.0.1:55021
+[39760] 2026/11/21 22:10:43.525796 [ERR] 127.0.0.1:55035 - rid:11 - authentication error
+[39760] 2026/11/21 22:10:43.525835 [INF] 127.0.0.1:55035 - rid:11 - Router connection closed: Authentication Failure
+[39762] 2026/11/21 22:10:43.525927 [ERR] 127.0.0.1:55021 - rid:9 - Route Error 'Authorization Violation'
+[39762] 2026/11/21 22:10:43.525946 [INF] 127.0.0.1:55021 - rid:9 - Router connection closed: Parse Error - Remote: minga-1, Host: 127.0.0.1:55021
+[39760] 2026/11/21 22:10:43.599321 [ERR] 127.0.0.1:55023 - rid:9 - TLS route handshake error: read tcp 127.0.0.1:55029->127.0.0.1:55023: read: connection reset by peer
+[39760] 2026/11/21 22:10:43.599342 [INF] 127.0.0.1:55023 - rid:9 - Router connection closed: TLS Handshake Failure - Host: 127.0.0.1:55023
+[39760] 2026/11/21 22:10:43.599342 [ERR] 127.0.0.1:55023 - rid:8 - TLS route handshake error: read tcp 127.0.0.1:55028->127.0.0.1:55023: read: connection reset by peer
+[39760] 2026/11/21 22:10:43.599390 [INF] 127.0.0.1:55023 - rid:8 - Router connection closed: TLS Handshake Failure - Host: 127.0.0.1:55023
+[39764] 2026/11/21 22:10:43.608092 [INF] Starting nats-server
+[39764] 2026/11/21 22:10:43.608184 [INF]   Version:  2.15.3
+[39764] 2026/11/21 22:10:43.608189 [INF]   Git:      [not set]
+[39764] 2026/11/21 22:10:43.608194 [INF]   Cluster:  minga-test
+[39764] 2026/11/21 22:10:43.608199 [INF]   Name:     minga-3
+[39764] 2026/11/21 22:10:43.608204 [INF]   Node:     dGQUVNbB
+[39764] 2026/11/21 22:10:43.608207 [INF]   ID:       NDW4RUR6SGP5LPWODUCC2BQUXFT2HBQKPN7MXYQLJNP66AJQP4G42PGB
+[39764] 2026/11/21 22:10:43.608225 [INF] Using configuration file: /var/folders/24/wlt58ddx4l74l96pl4znxsv40000gp/T/.tmpxu6vsj/nats/server.conf (sha256:4b883c6ca3cd846287ad1a95c7334628f001bf670c7c6953f7b1915aa04726af)
+[39764] 2026/11/21 22:10:43.608523 [INF] Starting http monitor on 127.0.0.1:55019
+[39764] 2026/11/21 22:10:43.608599 [INF] Starting JetStream
+[39764] 2026/11/21 22:10:43.608790 [INF]     _ ___ _____ ___ _____ ___ ___   _   __  __
+[39764] 2026/11/21 22:10:43.608796 [INF]  _ | | __|_   _/ __|_   _| _ \ __| /_\ |  \/  |
+[39764] 2026/11/21 22:10:43.608799 [INF] | || | _|  | | \__ \ | | |   / _| / _ \| |\/| |
+[39764] 2026/11/21 22:10:43.608802 [INF]  \__/|___| |_| |___/ |_| |_|_\___/_/ \_\_|  |_|
+[39764] 2026/11/21 22:10:43.608805 [INF] 
+[39764] 2026/11/21 22:10:43.608808 [INF]          https://docs.nats.io/jetstream
+[39764] 2026/11/21 22:10:43.608811 [INF] 
+[39764] 2026/11/21 22:10:43.608814 [INF] ---------------- JETSTREAM ----------------
+[39764] 2026/11/21 22:10:43.608816 [INF]   Strict:          true
+[39764] 2026/11/21 22:10:43.608824 [INF]   Max Memory:      64.00 MB
+[39764] 2026/11/21 22:10:43.608829 [INF]   Max Storage:     8.00 GB
+[39764] 2026/11/21 22:10:43.608831 [INF]   Store Directory: "/var/folders/24/wlt58ddx4l74l96pl4znxsv40000gp/T/.tmpxu6vsj/nats/jetstream/jetstream"
+[39764] 2026/11/21 22:10:43.608835 [INF]   API Level:       5
+[39764] 2026/11/21 22:10:43.608838 [INF] -------------------------------------------
+[39764] 2026/11/21 22:10:43.609131 [INF] Starting JetStream cluster
+[39764] 2026/11/21 22:10:43.609136 [INF] Creating JetStream metadata controller
+[39764] 2026/11/21 22:10:43.610139 [INF] JetStream cluster bootstrapping
+[39764] 2026/11/21 22:10:43.619974 [INF] Took 11.353ms to start JetStream
+[39764] 2026/11/21 22:10:43.620091 [INF] Listening for client connections on 127.0.0.1:55015
+[39764] 2026/11/21 22:10:43.620103 [INF] Server is ready
+[39764] 2026/11/21 22:10:43.620113 [INF] Cluster name is minga-test
+[39764] 2026/11/21 22:10:43.620213 [INF] Listening for route connections on 0.0.0.0:55023
+[39764] 2026/11/21 22:10:43.621566 [INF] 127.0.0.1:55021 - rid:8 - Route connection created (127.0.0.1:55021)
+[39760] 2026/11/21 22:10:43.621853 [INF] 127.0.0.1:55040 - rid:13 - Route connection created
+[39764] 2026/11/21 22:10:43.621913 [INF] 127.0.0.1:55021 - rid:9 - Route connection created (127.0.0.1:55021)
+[39762] 2026/11/21 22:10:43.623090 [WRN] Waiting for routing to be established...
+[39764] 2026/11/21 22:10:43.623524 [INF] 127.0.0.1:55021 - rid:10 - Route connection created (127.0.0.1:55021)
+[39760] 2026/11/21 22:10:43.622462 [INF] 127.0.0.1:55041 - rid:14 - Route connection created
+[39760] 2026/11/21 22:10:43.623853 [INF] 127.0.0.1:55042 - rid:15 - Route connection created
+[39764] 2026/11/21 22:10:43.625224 [INF] 127.0.0.1:55021 - rid:11 - Route connection created (127.0.0.1:55021)
+[39760] 2026/11/21 22:10:43.625537 [INF] 127.0.0.1:55043 - rid:16 - Route connection created
+[39766] 2026/11/21 22:10:43.712620 [INF] Starting nats-server
+[39766] 2026/11/21 22:10:43.712725 [INF]   Version:  2.15.3
+[39766] 2026/11/21 22:10:43.712733 [INF]   Git:      [not set]
+[39766] 2026/11/21 22:10:43.712737 [INF]   Cluster:  minga-test
+[39766] 2026/11/21 22:10:43.712741 [INF]   Name:     minga-4
+[39766] 2026/11/21 22:10:43.712745 [INF]   Node:     QAie30p1
+[39766] 2026/11/21 22:10:43.712748 [INF]   ID:       NCS4TEFBX27PN2WBJZ73URL6526LRIQKQ36Y7FYDGQBRIHOEI56NNLNS
+[39766] 2026/11/21 22:10:43.712758 [INF] Using configuration file: /var/folders/24/wlt58ddx4l74l96pl4znxsv40000gp/T/.tmpUOw9J3/nats/server.conf (sha256:327b6d3b82028692ab526df6c064d0a34377458f4cf5327a832620068e6a94de)
+[39766] 2026/11/21 22:10:43.713050 [INF] Starting http monitor on 127.0.0.1:55020
+[39766] 2026/11/21 22:10:43.713120 [INF] Starting JetStream
+[39766] 2026/11/21 22:10:43.713287 [INF]     _ ___ _____ ___ _____ ___ ___   _   __  __
+[39766] 2026/11/21 22:10:43.713293 [INF]  _ | | __|_   _/ __|_   _| _ \ __| /_\ |  \/  |
+[39766] 2026/11/21 22:10:43.713296 [INF] | || | _|  | | \__ \ | | |   / _| / _ \| |\/| |
+[39766] 2026/11/21 22:10:43.713300 [INF]  \__/|___| |_| |___/ |_| |_|_\___/_/ \_\_|  |_|
+[39766] 2026/11/21 22:10:43.713303 [INF] 
+[39766] 2026/11/21 22:10:43.713306 [INF]          https://docs.nats.io/jetstream
+[39766] 2026/11/21 22:10:43.713309 [INF] 
+[39766] 2026/11/21 22:10:43.713312 [INF] ---------------- JETSTREAM ----------------
+[39766] 2026/11/21 22:10:43.713325 [INF]   Strict:          true
+[39766] 2026/11/21 22:10:43.713331 [INF]   Max Memory:      64.00 MB
+[39766] 2026/11/21 22:10:43.713335 [INF]   Max Storage:     8.00 GB
+[39766] 2026/11/21 22:10:43.713338 [INF]   Store Directory: "/var/folders/24/wlt58ddx4l74l96pl4znxsv40000gp/T/.tmpUOw9J3/nats/jetstream/jetstream"
+[39766] 2026/11/21 22:10:43.713344 [INF]   API Level:       5
+[39766] 2026/11/21 22:10:43.713347 [INF] -------------------------------------------
+[39766] 2026/11/21 22:10:43.713772 [INF] Starting JetStream cluster
+[39766] 2026/11/21 22:10:43.713791 [INF] Creating JetStream metadata controller
+[39766] 2026/11/21 22:10:43.714854 [INF] JetStream cluster bootstrapping
+[39760] 2026/11/21 22:10:43.719974 [WRN] JetStream has not established contact with a meta leader
+[39764] 2026/11/21 22:10:43.721066 [WRN] Waiting for routing to be established...
+[39764] 2026/11/21 22:10:43.721136 [WRN] JetStream has not established contact with a meta leader
+[39766] 2026/11/21 22:10:43.724229 [INF] Took 11.09925ms to start JetStream
+[39766] 2026/11/21 22:10:43.724312 [INF] Listening for client connections on 127.0.0.1:55016
+[39766] 2026/11/21 22:10:43.724324 [INF] Server is ready
+[39766] 2026/11/21 22:10:43.724335 [INF] Cluster name is minga-test
+[39766] 2026/11/21 22:10:43.724462 [INF] Listening for route connections on 0.0.0.0:55024
+[39766] 2026/11/21 22:10:43.725842 [INF] 127.0.0.1:55021 - rid:8 - Route connection created (127.0.0.1:55021)
+[39760] 2026/11/21 22:10:43.726115 [INF] 127.0.0.1:55049 - rid:18 - Route connection created
+[39766] 2026/11/21 22:10:43.726163 [INF] 127.0.0.1:55021 - rid:9 - Route connection created (127.0.0.1:55021)
+[39760] 2026/11/21 22:10:43.726473 [INF] 127.0.0.1:55048 - rid:17 - Route connection created
+[39766] 2026/11/21 22:10:43.727677 [INF] 127.0.0.1:55021 - rid:11 - Route connection created (127.0.0.1:55021)
+[39764] 2026/11/21 22:10:43.727875 [INF] 127.0.0.1:55024 - rid:13 - Route connection created (127.0.0.1:55024)
+[39760] 2026/11/21 22:10:43.727974 [INF] 127.0.0.1:55052 - rid:19 - Route connection created
+[39766] 2026/11/21 22:10:43.728177 [INF] 127.0.0.1:55050 - rid:10 - Route connection created
+[39764] 2026/11/21 22:10:43.728314 [INF] 127.0.0.1:55024 - rid:14 - Route connection created (127.0.0.1:55024)
+[39766] 2026/11/21 22:10:43.728992 [INF] 127.0.0.1:55051 - rid:12 - Route connection created
+[39766] 2026/11/21 22:10:43.729362 [INF] 127.0.0.1:55021 - rid:13 - Route connection created (127.0.0.1:55021)
+[39760] 2026/11/21 22:10:43.729649 [INF] 127.0.0.1:55053 - rid:20 - Route connection created
+[39764] 2026/11/21 22:10:43.730336 [INF] 127.0.0.1:55024 - rid:15 - Route connection created (127.0.0.1:55024)
+[39766] 2026/11/21 22:10:43.730649 [INF] 127.0.0.1:55054 - rid:14 - Route connection created
+[39764] 2026/11/21 22:10:43.732026 [INF] 127.0.0.1:55024 - rid:16 - Route connection created (127.0.0.1:55024)
+[39766] 2026/11/21 22:10:43.732352 [INF] 127.0.0.1:55055 - rid:15 - Route connection created
+[39766] 2026/11/21 22:10:43.825376 [WRN] Waiting for routing to be established...
+[39766] 2026/11/21 22:10:43.826806 [WRN] JetStream has not established contact with a meta leader
+[39768] 2026/11/21 22:10:43.967481 [INF] Starting nats-server
+[39768] 2026/11/21 22:10:43.967613 [INF]   Version:  2.15.3
+[39768] 2026/11/21 22:10:43.967620 [INF]   Git:      [not set]
+[39768] 2026/11/21 22:10:43.967626 [INF]   Cluster:  minga-test
+[39768] 2026/11/21 22:10:43.967631 [INF]   Name:     minga-1
+[39768] 2026/11/21 22:10:43.967638 [INF]   Node:     11lljj8r
+[39768] 2026/11/21 22:10:43.967925 [INF]   ID:       NBJ7PLKH5P26ACPOYKQSW4R6CS2WIZ5MMNFZN6ANPZGKSOEZOAJ7UDZZ
+[39768] 2026/11/21 22:10:43.967969 [INF] Using configuration file: /var/folders/24/wlt58ddx4l74l96pl4znxsv40000gp/T/.tmpeDbs3M/nats/server.conf (sha256:9d681411192c2c35054219e402d0c077f8ada8eff330a45a79fe76e05f2825df)
+[39768] 2026/11/21 22:10:43.969130 [INF] Starting http monitor on 127.0.0.1:55004
+[39768] 2026/11/21 22:10:43.971782 [INF] Starting JetStream
+[39768] 2026/11/21 22:10:43.972111 [INF]     _ ___ _____ ___ _____ ___ ___   _   __  __
+[39768] 2026/11/21 22:10:43.972126 [INF]  _ | | __|_   _/ __|_   _| _ \ __| /_\ |  \/  |
+[39768] 2026/11/21 22:10:43.972130 [INF] | || | _|  | | \__ \ | | |   / _| / _ \| |\/| |
+[39768] 2026/11/21 22:10:43.972133 [INF]  \__/|___| |_| |___/ |_| |_|_\___/_/ \_\_|  |_|
+[39768] 2026/11/21 22:10:43.972136 [INF] 
+[39768] 2026/11/21 22:10:43.972140 [INF]          https://docs.nats.io/jetstream
+[39768] 2026/11/21 22:10:43.972143 [INF] 
+[39768] 2026/11/21 22:10:43.972147 [INF] ---------------- JETSTREAM ----------------
+[39768] 2026/11/21 22:10:43.972150 [INF]   Strict:          true
+[39768] 2026/11/21 22:10:43.972159 [INF]   Max Memory:      64.00 MB
+[39768] 2026/11/21 22:10:43.972163 [INF]   Max Storage:     8.00 GB
+[39768] 2026/11/21 22:10:43.972166 [INF]   Store Directory: "/var/folders/24/wlt58ddx4l74l96pl4znxsv40000gp/T/.tmpeDbs3M/nats/jetstream/jetstream"
+[39768] 2026/11/21 22:10:43.972172 [INF]   API Level:       5
+[39768] 2026/11/21 22:10:43.972175 [INF] -------------------------------------------
+[39768] 2026/11/21 22:10:43.972707 [INF] Starting JetStream cluster
+[39768] 2026/11/21 22:10:43.972774 [INF] Creating JetStream metadata controller
+[39768] 2026/11/21 22:10:43.982066 [INF] JetStream cluster bootstrapping
+[39768] 2026/11/21 22:10:43.991944 [INF] Took 20.139459ms to start JetStream
+[39768] 2026/11/21 22:10:43.992021 [INF] Listening for client connections on 127.0.0.1:55001
+[39768] 2026/11/21 22:10:43.992038 [INF] Server is ready
+[39768] 2026/11/21 22:10:43.992054 [INF] Cluster name is minga-test
+[39768] 2026/11/21 22:10:43.992198 [INF] Listening for route connections on 0.0.0.0:55007
+[39768] 2026/11/21 22:10:44.067694 [ERR] 127.0.0.1:55008 - rid:9 - TLS route handshake error: read tcp 127.0.0.1:55082->127.0.0.1:55008: read: connection reset by peer
+[39768] 2026/11/21 22:10:44.067718 [INF] 127.0.0.1:55008 - rid:9 - Router connection closed: TLS Handshake Failure - Host: 127.0.0.1:55008
+[39768] 2026/11/21 22:10:44.067703 [ERR] 127.0.0.1:55008 - rid:8 - TLS route handshake error: read tcp 127.0.0.1:55079->127.0.0.1:55008: read: connection reset by peer
+[39768] 2026/11/21 22:10:44.067754 [INF] 127.0.0.1:55008 - rid:8 - Router connection closed: TLS Handshake Failure - Host: 127.0.0.1:55008
+[39770] 2026/11/21 22:10:44.077321 [INF] Starting nats-server
+[39770] 2026/11/21 22:10:44.077423 [INF]   Version:  2.15.3
+[39770] 2026/11/21 22:10:44.077430 [INF]   Git:      [not set]
+[39770] 2026/11/21 22:10:44.077433 [INF]   Cluster:  minga-test
+[39770] 2026/11/21 22:10:44.077437 [INF]   Name:     minga-2
+[39770] 2026/11/21 22:10:44.077441 [INF]   Node:     dCnd6u0M
+[39770] 2026/11/21 22:10:44.077444 [INF]   ID:       NAXALPKNPSTUGANLTUJOJYVRXHQCUT6VG367UY2NMUO634S3JUKX2HCF
+[39770] 2026/11/21 22:10:44.077468 [INF] Using configuration file: /var/folders/24/wlt58ddx4l74l96pl4znxsv40000gp/T/.tmp7K2KNB/nats/server.conf (sha256:0324052a2dc13b18eac96527acbcc88e70b16b723eab3ef1da87621bdc48bcbe)
+[39770] 2026/11/21 22:10:44.077730 [INF] Starting http monitor on 127.0.0.1:55005
+[39770] 2026/11/21 22:10:44.077803 [INF] Starting JetStream
+[39770] 2026/11/21 22:10:44.077986 [INF]     _ ___ _____ ___ _____ ___ ___   _   __  __
+[39770] 2026/11/21 22:10:44.077991 [INF]  _ | | __|_   _/ __|_   _| _ \ __| /_\ |  \/  |
+[39770] 2026/11/21 22:10:44.077995 [INF] | || | _|  | | \__ \ | | |   / _| / _ \| |\/| |
+[39770] 2026/11/21 22:10:44.077998 [INF]  \__/|___| |_| |___/ |_| |_|_\___/_/ \_\_|  |_|
+[39770] 2026/11/21 22:10:44.078001 [INF] 
+[39770] 2026/11/21 22:10:44.078004 [INF]          https://docs.nats.io/jetstream
+[39770] 2026/11/21 22:10:44.078007 [INF] 
+[39770] 2026/11/21 22:10:44.078010 [INF] ---------------- JETSTREAM ----------------
+[39770] 2026/11/21 22:10:44.078013 [INF]   Strict:          true
+[39770] 2026/11/21 22:10:44.078024 [INF]   Max Memory:      64.00 MB
+[39770] 2026/11/21 22:10:44.078028 [INF]   Max Storage:     8.00 GB
+[39770] 2026/11/21 22:10:44.078031 [INF]   Store Directory: "/var/folders/24/wlt58ddx4l74l96pl4znxsv40000gp/T/.tmp7K2KNB/nats/jetstream/jetstream"
+[39770] 2026/11/21 22:10:44.078038 [INF]   API Level:       5
+[39770] 2026/11/21 22:10:44.078048 [INF] -------------------------------------------
+[39770] 2026/11/21 22:10:44.078313 [INF] Starting JetStream cluster
+[39770] 2026/11/21 22:10:44.078318 [INF] Creating JetStream metadata controller
+[39770] 2026/11/21 22:10:44.079386 [INF] JetStream cluster bootstrapping
+[39770] 2026/11/21 22:10:44.089836 [INF] Took 12.0255ms to start JetStream
+[39770] 2026/11/21 22:10:44.089912 [INF] Listening for client connections on 127.0.0.1:55002
+[39770] 2026/11/21 22:10:44.089928 [INF] Server is ready
+[39770] 2026/11/21 22:10:44.089938 [INF] Cluster name is minga-test
+[39770] 2026/11/21 22:10:44.090041 [INF] Listening for route connections on 0.0.0.0:55008
+[39770] 2026/11/21 22:10:44.091394 [INF] 127.0.0.1:55007 - rid:10 - Route connection created (127.0.0.1:55007)
+[39768] 2026/11/21 22:10:44.091715 [INF] 127.0.0.1:55090 - rid:13 - Route connection created
+[39768] 2026/11/21 22:10:44.091997 [WRN] Waiting for routing to be established...
+[39770] 2026/11/21 22:10:44.093075 [INF] 127.0.0.1:55007 - rid:11 - Route connection created (127.0.0.1:55007)
+[39768] 2026/11/21 22:10:44.093820 [INF] 127.0.0.1:55089 - rid:14 - Route connection created
+[39770] 2026/11/21 22:10:44.096834 [INF] 127.0.0.1:55007 - rid:12 - Route connection created (127.0.0.1:55007)
+[39768] 2026/11/21 22:10:44.097360 [INF] 127.0.0.1:55091 - rid:15 - Route connection created
+[39770] 2026/11/21 22:10:44.101687 [INF] 127.0.0.1:55007 - rid:13 - Route connection created (127.0.0.1:55007)
+[39768] 2026/11/21 22:10:44.102089 [INF] 127.0.0.1:55092 - rid:16 - Route connection created
+[39764] 2026/11/21 22:10:44.127741 [INF] JetStream cluster new metadata leader: minga-1/minga-test
+[39766] 2026/11/21 22:10:44.143845 [INF] JetStream cluster new metadata leader: minga-1/minga-test
+[39760] 2026/11/21 22:10:44.159884 [INF] Self is new JetStream cluster metadata leader
+[39768] 2026/11/21 22:10:44.174724 [ERR] 127.0.0.1:55009 - rid:10 - TLS route handshake error: read tcp 127.0.0.1:55080->127.0.0.1:55009: read: connection reset by peer
+[39770] 2026/11/21 22:10:44.174775 [ERR] 127.0.0.1:55009 - rid:9 - TLS route handshake error: read tcp 127.0.0.1:55088->127.0.0.1:55009: read: connection reset by peer
+[39770] 2026/11/21 22:10:44.174830 [INF] 127.0.0.1:55009 - rid:9 - Router connection closed: TLS Handshake Failure - Host: 127.0.0.1:55009
+[39768] 2026/11/21 22:10:44.174804 [INF] 127.0.0.1:55009 - rid:10 - Router connection closed: TLS Handshake Failure - Host: 127.0.0.1:55009
+[39770] 2026/11/21 22:10:44.174841 [ERR] 127.0.0.1:55009 - rid:8 - TLS route handshake error: read tcp 127.0.0.1:55087->127.0.0.1:55009: read: connection reset by peer
+[39768] 2026/11/21 22:10:44.174802 [ERR] 127.0.0.1:55009 - rid:11 - TLS route handshake error: read tcp 127.0.0.1:55081->127.0.0.1:55009: read: connection reset by peer
+[39770] 2026/11/21 22:10:44.175192 [INF] 127.0.0.1:55009 - rid:8 - Router connection closed: TLS Handshake Failure - Host: 127.0.0.1:55009
+[39768] 2026/11/21 22:10:44.175216 [INF] 127.0.0.1:55009 - rid:11 - Router connection closed: TLS Handshake Failure - Host: 127.0.0.1:55009
+[39785] 2026/11/21 22:10:44.183646 [INF] Starting nats-server
+[39785] 2026/11/21 22:10:44.183809 [INF]   Version:  2.15.3
+[39785] 2026/11/21 22:10:44.183817 [INF]   Git:      [not set]
+[39785] 2026/11/21 22:10:44.183822 [INF]   Cluster:  minga-test
+[39785] 2026/11/21 22:10:44.183832 [INF]   Name:     minga-3
+[39785] 2026/11/21 22:10:44.183840 [INF]   Node:     dGQUVNbB
+[39785] 2026/11/21 22:10:44.183845 [INF]   ID:       NB2V4UGP2SJNG7SP5MZ37CGNOCOMYNQQXEI3FJGABUJ5FTF3RIAFTNBM
+[39785] 2026/11/21 22:10:44.183865 [INF] Using configuration file: /var/folders/24/wlt58ddx4l74l96pl4znxsv40000gp/T/.tmpc5kYvD/nats/server.conf (sha256:ab358fa6f5166e2f1df37ece2ab313e6fae74f75a7048883e5cd1e95e0edb190)
+[39785] 2026/11/21 22:10:44.184110 [INF] Starting http monitor on 127.0.0.1:55006
+[39785] 2026/11/21 22:10:44.184184 [INF] Starting JetStream
+[39785] 2026/11/21 22:10:44.189114 [INF]     _ ___ _____ ___ _____ ___ ___   _   __  __
+[39785] 2026/11/21 22:10:44.189124 [INF]  _ | | __|_   _/ __|_   _| _ \ __| /_\ |  \/  |
+[39785] 2026/11/21 22:10:44.189141 [INF] | || | _|  | | \__ \ | | |   / _| / _ \| |\/| |
+[39785] 2026/11/21 22:10:44.189145 [INF]  \__/|___| |_| |___/ |_| |_|_\___/_/ \_\_|  |_|
+[39785] 2026/11/21 22:10:44.189149 [INF] 
+[39785] 2026/11/21 22:10:44.189156 [INF]          https://docs.nats.io/jetstream
+[39785] 2026/11/21 22:10:44.189160 [INF] 
+[39785] 2026/11/21 22:10:44.189164 [INF] ---------------- JETSTREAM ----------------
+[39785] 2026/11/21 22:10:44.189168 [INF]   Strict:          true
+[39785] 2026/11/21 22:10:44.189180 [INF]   Max Memory:      64.00 MB
+[39785] 2026/11/21 22:10:44.189184 [INF]   Max Storage:     8.00 GB
+[39785] 2026/11/21 22:10:44.189188 [INF]   Store Directory: "/var/folders/24/wlt58ddx4l74l96pl4znxsv40000gp/T/.tmpc5kYvD/nats/jetstream/jetstream"
+[39785] 2026/11/21 22:10:44.189193 [INF]   API Level:       5
+[39785] 2026/11/21 22:10:44.189197 [INF] -------------------------------------------
+[39770] 2026/11/21 22:10:44.189993 [WRN] Waiting for routing to be established...
+[39768] 2026/11/21 22:10:44.192459 [WRN] JetStream has not established contact with a meta leader
+[39770] 2026/11/21 22:10:44.192624 [WRN] JetStream has not established contact with a meta leader
+[39785] 2026/11/21 22:10:44.192902 [INF] Starting JetStream cluster
+[39785] 2026/11/21 22:10:44.192914 [INF] Creating JetStream metadata controller
+[39785] 2026/11/21 22:10:44.194204 [INF] JetStream cluster bootstrapping
+[39785] 2026/11/21 22:10:44.202816 [INF] Took 13.887667ms to start JetStream
+[39785] 2026/11/21 22:10:44.202884 [INF] Listening for client connections on 127.0.0.1:55003
+[39785] 2026/11/21 22:10:44.202897 [INF] Server is ready
+[39785] 2026/11/21 22:10:44.202903 [INF] Cluster name is minga-test
+[39785] 2026/11/21 22:10:44.203013 [INF] Listening for route connections on 0.0.0.0:55009
+[39785] 2026/11/21 22:10:44.204680 [INF] 127.0.0.1:55008 - rid:10 - Route connection created (127.0.0.1:55008)
+[39785] 2026/11/21 22:10:44.204959 [INF] 127.0.0.1:55007 - rid:8 - Route connection created (127.0.0.1:55007)
+[39785] 2026/11/21 22:10:44.204984 [INF] 127.0.0.1:55008 - rid:11 - Route connection created (127.0.0.1:55008)
+[39785] 2026/11/21 22:10:44.205027 [INF] 127.0.0.1:55007 - rid:9 - Route connection created (127.0.0.1:55007)
+[39768] 2026/11/21 22:10:44.205183 [INF] 127.0.0.1:55098 - rid:18 - Route connection created
+[39770] 2026/11/21 22:10:44.205245 [INF] 127.0.0.1:55097 - rid:16 - Route connection created
+[39768] 2026/11/21 22:10:44.205458 [INF] 127.0.0.1:55100 - rid:17 - Route connection created
+[39770] 2026/11/21 22:10:44.205711 [INF] 127.0.0.1:55099 - rid:15 - Route connection created
+[39785] 2026/11/21 22:10:44.207209 [INF] 127.0.0.1:55007 - rid:12 - Route connection created (127.0.0.1:55007)
+[39768] 2026/11/21 22:10:44.207446 [INF] 127.0.0.1:55101 - rid:19 - Route connection created
+[39785] 2026/11/21 22:10:44.207876 [INF] 127.0.0.1:55008 - rid:13 - Route connection created (127.0.0.1:55008)
+[39770] 2026/11/21 22:10:44.208074 [INF] 127.0.0.1:55102 - rid:17 - Route connection created
+[39785] 2026/11/21 22:10:44.208556 [INF] 127.0.0.1:55007 - rid:14 - Route connection created (127.0.0.1:55007)
+[39768] 2026/11/21 22:10:44.208802 [INF] 127.0.0.1:55103 - rid:20 - Route connection created
+[39785] 2026/11/21 22:10:44.209456 [INF] 127.0.0.1:55008 - rid:15 - Route connection created (127.0.0.1:55008)
+[39770] 2026/11/21 22:10:44.209622 [INF] 127.0.0.1:55104 - rid:18 - Route connection created
+[39785] 2026/11/21 22:10:44.303889 [WRN] Waiting for routing to be established...
+[39785] 2026/11/21 22:10:44.303993 [WRN] JetStream has not established contact with a meta leader
+[39762] 2026/11/21 22:10:44.600235 [INF] 127.0.0.1:55021 - rid:11 - Route connection created (127.0.0.1:55021)
+[39760] 2026/11/21 22:10:44.600574 [INF] 127.0.0.1:55108 - rid:21 - Route connection created
+[39760] 2026/11/21 22:10:44.600653 [ERR] 127.0.0.1:55108 - rid:21 - authentication error
+[39760] 2026/11/21 22:10:44.600666 [INF] 127.0.0.1:55108 - rid:21 - Router connection closed: Authentication Failure
+[39762] 2026/11/21 22:10:44.600788 [ERR] 127.0.0.1:55021 - rid:11 - Route Error 'Authorization Violation'
+[39762] 2026/11/21 22:10:44.600811 [INF] 127.0.0.1:55021 - rid:11 - Router connection closed: Parse Error - Remote: minga-1, Host: 127.0.0.1:55021
+[39760] 2026/11/21 22:10:44.613805 [INF] 127.0.0.1:55023 - rid:22 - Route connection created (127.0.0.1:55023)
+[39764] 2026/11/21 22:10:44.614063 [INF] 127.0.0.1:55109 - rid:17 - Route connection created
+[39760] 2026/11/21 22:10:44.614295 [INF] 127.0.0.1:55023 - rid:22 - Router connection closed: Duplicate Route - Remote: minga-3, Host: 127.0.0.1:55023
+[39764] 2026/11/21 22:10:44.614393 [INF] 127.0.0.1:55109 - rid:17 - Router connection closed: Client Closed
+[39762] 2026/11/21 22:10:44.623101 [INF] 127.0.0.1:55021 - rid:12 - Route connection created (127.0.0.1:55021)
+[39760] 2026/11/21 22:10:44.623537 [INF] 127.0.0.1:55110 - rid:23 - Route connection created
+[39760] 2026/11/21 22:10:44.623606 [ERR] 127.0.0.1:55110 - rid:23 - authentication error
+[39760] 2026/11/21 22:10:44.623627 [INF] 127.0.0.1:55110 - rid:23 - Router connection closed: Authentication Failure
+[39762] 2026/11/21 22:10:44.623738 [ERR] 127.0.0.1:55021 - rid:12 - Route Error 'Authorization Violation'
+[39762] 2026/11/21 22:10:44.623753 [INF] 127.0.0.1:55021 - rid:12 - Router connection closed: Parse Error - Remote: minga-1, Host: 127.0.0.1:55021
+[39760] 2026/11/21 22:10:44.653002 [INF] 127.0.0.1:55023 - rid:24 - Route connection created (127.0.0.1:55023)
+[39764] 2026/11/21 22:10:44.653277 [INF] 127.0.0.1:55111 - rid:18 - Route connection created
+[39760] 2026/11/21 22:10:44.653462 [INF] 127.0.0.1:55023 - rid:24 - Router connection closed: Duplicate Route - Remote: minga-3, Host: 127.0.0.1:55023
+[39764] 2026/11/21 22:10:44.653619 [INF] 127.0.0.1:55111 - rid:18 - Router connection closed: Client Closed
+[39770] 2026/11/21 22:10:44.729914 [INF] JetStream cluster new metadata leader: minga-1/minga-test
+[39785] 2026/11/21 22:10:44.734917 [INF] JetStream cluster new metadata leader: minga-1/minga-test
+[39768] 2026/11/21 22:10:44.749278 [INF] Self is new JetStream cluster metadata leader
+[39768] 2026/11/21 22:10:45.071987 [INF] 127.0.0.1:55008 - rid:21 - Route connection created (127.0.0.1:55008)
+[39770] 2026/11/21 22:10:45.072171 [INF] 127.0.0.1:55112 - rid:19 - Route connection created
+[39768] 2026/11/21 22:10:45.072305 [INF] 127.0.0.1:55008 - rid:21 - Router connection closed: Duplicate Route - Remote: minga-2, Host: 127.0.0.1:55008
+[39770] 2026/11/21 22:10:45.072420 [INF] 127.0.0.1:55112 - rid:19 - Router connection closed: Client Closed
+[39768] 2026/11/21 22:10:45.115482 [INF] 127.0.0.1:55008 - rid:22 - Route connection created (127.0.0.1:55008)
+[39770] 2026/11/21 22:10:45.115657 [INF] 127.0.0.1:55113 - rid:20 - Route connection created
+[39768] 2026/11/21 22:10:45.115756 [INF] 127.0.0.1:55008 - rid:22 - Router connection closed: Duplicate Route - Remote: minga-2, Host: 127.0.0.1:55008
+[39770] 2026/11/21 22:10:45.115829 [INF] 127.0.0.1:55113 - rid:20 - Router connection closed: Client Closed
+[39768] 2026/11/21 22:10:45.208733 [INF] 127.0.0.1:55009 - rid:23 - Route connection created (127.0.0.1:55009)
+[39785] 2026/11/21 22:10:45.208926 [INF] 127.0.0.1:55114 - rid:17 - Route connection created
+[39768] 2026/11/21 22:10:45.209156 [INF] 127.0.0.1:55009 - rid:23 - Router connection closed: Duplicate Route - Remote: minga-3, Host: 127.0.0.1:55009
+[39785] 2026/11/21 22:10:45.209227 [INF] 127.0.0.1:55114 - rid:17 - Router connection closed: Client Closed
+[39770] 2026/11/21 22:10:45.224597 [INF] 127.0.0.1:55009 - rid:21 - Route connection created (127.0.0.1:55009)
+[39785] 2026/11/21 22:10:45.224882 [INF] 127.0.0.1:55115 - rid:18 - Route connection created
+[39770] 2026/11/21 22:10:45.224971 [INF] 127.0.0.1:55009 - rid:21 - Router connection closed: Duplicate Route - Remote: minga-3, Host: 127.0.0.1:55009
+[39785] 2026/11/21 22:10:45.225038 [INF] 127.0.0.1:55115 - rid:18 - Router connection closed: Client Closed
+[39768] 2026/11/21 22:10:45.229883 [INF] 127.0.0.1:55009 - rid:24 - Route connection created (127.0.0.1:55009)
+[39785] 2026/11/21 22:10:45.230061 [INF] 127.0.0.1:55116 - rid:19 - Route connection created
+[39768] 2026/11/21 22:10:45.230185 [INF] 127.0.0.1:55009 - rid:24 - Router connection closed: Duplicate Route - Remote: minga-3, Host: 127.0.0.1:55009
+[39785] 2026/11/21 22:10:45.230246 [INF] 127.0.0.1:55116 - rid:19 - Router connection closed: Client Closed
+[39770] 2026/11/21 22:10:45.237682 [INF] 127.0.0.1:55009 - rid:22 - Route connection created (127.0.0.1:55009)
+[39785] 2026/11/21 22:10:45.237927 [INF] 127.0.0.1:55117 - rid:20 - Route connection created
+[39770] 2026/11/21 22:10:45.238049 [INF] 127.0.0.1:55009 - rid:22 - Router connection closed: Duplicate Route - Remote: minga-3, Host: 127.0.0.1:55009
+[39785] 2026/11/21 22:10:45.238140 [INF] 127.0.0.1:55117 - rid:20 - Router connection closed: Client Closed
+[39762] 2026/11/21 22:10:45.543932 [WRN] Waiting for routing to be established...
+[39762] 2026/11/21 22:10:45.667821 [INF] 127.0.0.1:55021 - rid:13 - Route connection created (127.0.0.1:55021)
+[39760] 2026/11/21 22:10:45.668145 [INF] 127.0.0.1:55120 - rid:25 - Route connection created
+[39760] 2026/11/21 22:10:45.668215 [ERR] 127.0.0.1:55120 - rid:25 - authentication error
+[39760] 2026/11/21 22:10:45.668243 [INF] 127.0.0.1:55120 - rid:25 - Router connection closed: Authentication Failure
+[39762] 2026/11/21 22:10:45.668320 [ERR] 127.0.0.1:55021 - rid:13 - Route Error 'Authorization Violation'
+[39762] 2026/11/21 22:10:45.668340 [INF] 127.0.0.1:55021 - rid:13 - Router connection closed: Parse Error - Remote: minga-1, Host: 127.0.0.1:55021
+[39762] 2026/11/21 22:10:45.675816 [INF] 127.0.0.1:55021 - rid:14 - Route connection created (127.0.0.1:55021)
+[39760] 2026/11/21 22:10:45.676146 [INF] 127.0.0.1:55121 - rid:26 - Route connection created
+[39760] 2026/11/21 22:10:45.676211 [ERR] 127.0.0.1:55121 - rid:26 - authentication error
+[39760] 2026/11/21 22:10:45.676274 [INF] 127.0.0.1:55121 - rid:26 - Router connection closed: Authentication Failure
+[39762] 2026/11/21 22:10:45.676362 [ERR] 127.0.0.1:55021 - rid:14 - Route Error 'Authorization Violation'
+[39762] 2026/11/21 22:10:45.676382 [INF] 127.0.0.1:55021 - rid:14 - Router connection closed: Parse Error - Remote: minga-1, Host: 127.0.0.1:55021
+[39762] 2026/11/21 22:10:46.678517 [INF] 127.0.0.1:55021 - rid:15 - Route connection created (127.0.0.1:55021)
+[39760] 2026/11/21 22:10:46.679006 [INF] 127.0.0.1:55126 - rid:27 - Route connection created
+[39760] 2026/11/21 22:10:46.679099 [ERR] 127.0.0.1:55126 - rid:27 - authentication error
+[39760] 2026/11/21 22:10:46.679114 [INF] 127.0.0.1:55126 - rid:27 - Router connection closed: Authentication Failure
+[39762] 2026/11/21 22:10:46.679235 [ERR] 127.0.0.1:55021 - rid:15 - Route Error 'Authorization Violation'
+[39762] 2026/11/21 22:10:46.679247 [INF] 127.0.0.1:55021 - rid:15 - Router connection closed: Parse Error - Remote: minga-1, Host: 127.0.0.1:55021
+[39762] 2026/11/21 22:10:46.745396 [INF] 127.0.0.1:55021 - rid:16 - Route connection created (127.0.0.1:55021)
+[39760] 2026/11/21 22:10:46.746494 [INF] 127.0.0.1:55127 - rid:28 - Route connection created
+[39760] 2026/11/21 22:10:46.746577 [ERR] 127.0.0.1:55127 - rid:28 - authentication error
+[39760] 2026/11/21 22:10:46.746620 [INF] 127.0.0.1:55127 - rid:28 - Router connection closed: Authentication Failure
+[39762] 2026/11/21 22:10:46.746699 [ERR] 127.0.0.1:55021 - rid:16 - Route Error 'Authorization Violation'
+[39762] 2026/11/21 22:10:46.746719 [INF] 127.0.0.1:55021 - rid:16 - Router connection closed: Parse Error - Remote: minga-1, Host: 127.0.0.1:55021
+test sidecar::tests::route_peer_without_the_route_name_is_refused ... ok
+[39768] 2026/11/21 22:10:47.290636 [INF] JetStream cluster new stream leader for '$G > MINGA_EVENTS'
+[39785] 2026/11/21 22:10:47.294838 [INF] JetStream cluster new stream leader for '$G > MINGA_LOGS'
+[39770] 2026/11/21 22:10:47.299573 [INF] JetStream cluster new stream leader for '$G > KV_MINGA_STATUS'
+[39770] 2026/11/21 22:10:47.304097 [INF] JetStream cluster new stream leader for '$G > KV_MINGA_ASSIGN'
+[39768] 2026/11/21 22:10:47.307371 [INF] JetStream cluster new stream leader for '$G > KV_MINGA_LEASES'
+[39768] 2026/11/21 22:10:47.313186 [WRN] JetStream cluster detected stream remapping for '$G > MINGA_EVENTS' from "S-R1F-zylyvrQa" to "S-R3F-j0rZ05RJ"
+[39770] 2026/11/21 22:10:47.327270 [WRN] JetStream cluster detected stream remapping for '$G > KV_MINGA_STATUS' from "S-R1F-coB55D6p" to "S-R3F-b63Z6oLG"
+[39768] 2026/11/21 22:10:47.341172 [WRN] JetStream cluster detected stream remapping for '$G > KV_MINGA_LEASES' from "S-R1F-uzSOb8Gu" to "S-R3F-lNBcbDE6"
+[39770] 2026/11/21 22:10:47.354949 [WRN] JetStream cluster detected stream remapping for '$G > KV_MINGA_ASSIGN' from "S-R1F-MNa0cLKU" to "S-R3F-SCagwwc2"
+[39768] 2026/11/21 22:10:47.384835 [INF] JetStream cluster new stream leader for '$G > MINGA_EVENTS'
+[39770] 2026/11/21 22:10:47.399691 [INF] JetStream cluster new stream leader for '$G > KV_MINGA_STATUS'
+[39768] 2026/11/21 22:10:47.413802 [INF] JetStream cluster new stream leader for '$G > KV_MINGA_LEASES'
+[39770] 2026/11/21 22:10:47.428899 [INF] JetStream cluster new stream leader for '$G > KV_MINGA_ASSIGN'
+[39768] 2026/11/21 22:10:52.404976 [INF] 127.0.0.1:55103 - rid:20 - Router connection closed: Client Closed - Remote: minga-3, Host: 127.0.0.1:55009
+[39770] 2026/11/21 22:10:52.404972 [INF] 127.0.0.1:55104 - rid:18 - Router connection closed: Client Closed - Remote: minga-3, Host: 127.0.0.1:55009
+[39768] 2026/11/21 22:10:52.405041 [INF] 127.0.0.1:55098 - rid:18 - Router connection closed: Client Closed - Remote: minga-3, Host: 127.0.0.1:55009
+[39768] 2026/11/21 22:10:52.405077 [INF] 127.0.0.1:55101 - rid:19 - Router connection closed: Client Closed - Remote: minga-3, Host: 127.0.0.1:55009
+[39768] 2026/11/21 22:10:52.405098 [INF] 127.0.0.1:55100 - rid:17 - Router connection closed: Client Closed - Remote: minga-3, Host: 127.0.0.1:55009
+[39770] 2026/11/21 22:10:52.405085 [INF] 127.0.0.1:55099 - rid:15 - Router connection closed: Client Closed - Remote: minga-3, Host: 127.0.0.1:55009
+[39770] 2026/11/21 22:10:52.405084 [INF] 127.0.0.1:55097 - rid:16 - Router connection closed: Client Closed - Remote: minga-3, Host: 127.0.0.1:55009
+[39770] 2026/11/21 22:10:52.405092 [INF] 127.0.0.1:55102 - rid:17 - Router connection closed: Client Closed - Remote: minga-3, Host: 127.0.0.1:55009
+[39768] 2026/11/21 22:10:53.424498 [ERR] Error trying to connect to route (attempt 1): dial tcp 127.0.0.1:55009: connect: connection refused
+[39768] 2026/11/21 22:10:53.428767 [ERR] Error trying to connect to route (attempt 1): dial tcp 127.0.0.1:55009: connect: connection refused
+[39770] 2026/11/21 22:10:53.441833 [ERR] Error trying to connect to route (attempt 1): dial tcp 127.0.0.1:55009: connect: connection refused
+[39770] 2026/11/21 22:10:53.441852 [ERR] Error trying to connect to route (attempt 1): dial tcp 127.0.0.1:55009: connect: connection refused
+[39768] 2026/11/21 22:10:53.450688 [ERR] Error trying to connect to route (attempt 1): dial tcp 127.0.0.1:55009: connect: connection refused
+[39768] 2026/11/21 22:10:53.476505 [ERR] Error trying to connect to route (attempt 1): dial tcp 127.0.0.1:55009: connect: connection refused
+[39770] 2026/11/21 22:10:53.479229 [ERR] Error trying to connect to route (attempt 1): dial tcp 127.0.0.1:55009: connect: connection refused
+[39770] 2026/11/21 22:10:53.487690 [ERR] Error trying to connect to route (attempt 1): dial tcp 127.0.0.1:55009: connect: connection refused
+[39768] 2026/11/21 22:10:54.425061 [ERR] Error trying to connect to route (attempt 2): dial tcp 127.0.0.1:55009: connect: connection refused
+[39768] 2026/11/21 22:10:54.429651 [ERR] Error trying to connect to route (attempt 2): dial tcp 127.0.0.1:55009: connect: connection refused
+[39770] 2026/11/21 22:10:54.442701 [ERR] Error trying to connect to route (attempt 2): dial tcp 127.0.0.1:55009: connect: connection refused
+[39770] 2026/11/21 22:10:54.442716 [ERR] Error trying to connect to route (attempt 2): dial tcp 127.0.0.1:55009: connect: connection refused
+[39768] 2026/11/21 22:10:54.451600 [ERR] Error trying to connect to route (attempt 2): dial tcp 127.0.0.1:55009: connect: connection refused
+[39768] 2026/11/21 22:10:54.477805 [ERR] Error trying to connect to route (attempt 2): dial tcp 127.0.0.1:55009: connect: connection refused
+[39770] 2026/11/21 22:10:54.479469 [ERR] Error trying to connect to route (attempt 2): dial tcp 127.0.0.1:55009: connect: connection refused
+[39770] 2026/11/21 22:10:54.488955 [ERR] Error trying to connect to route (attempt 2): dial tcp 127.0.0.1:55009: connect: connection refused
+[39768] 2026/11/21 22:10:55.426708 [ERR] Error trying to connect to route (attempt 3): dial tcp 127.0.0.1:55009: connect: connection refused
+[39768] 2026/11/21 22:10:55.430481 [ERR] Error trying to connect to route (attempt 3): dial tcp 127.0.0.1:55009: connect: connection refused
+[39770] 2026/11/21 22:10:55.445413 [ERR] Error trying to connect to route (attempt 3): dial tcp 127.0.0.1:55009: connect: connection refused
+[39770] 2026/11/21 22:10:55.445568 [ERR] Error trying to connect to route (attempt 3): dial tcp 127.0.0.1:55009: connect: connection refused
+[39768] 2026/11/21 22:10:55.452147 [ERR] Error trying to connect to route (attempt 3): dial tcp 127.0.0.1:55009: connect: connection refused
+[39768] 2026/11/21 22:10:55.478684 [ERR] Error trying to connect to route (attempt 3): dial tcp 127.0.0.1:55009: connect: connection refused
+[39770] 2026/11/21 22:10:55.480000 [ERR] Error trying to connect to route (attempt 3): dial tcp 127.0.0.1:55009: connect: connection refused
+[39770] 2026/11/21 22:10:55.490354 [ERR] Error trying to connect to route (attempt 3): dial tcp 127.0.0.1:55009: connect: connection refused
+test sidecar::tests::clustered_sidecars_keep_jetstream_available_after_one_manager_stops ... ok
+
+test result: ok. 55 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 12.96s
+
+     Running tests/deploy_e2e.rs (/Users/admin/dev/minga/target/debug/deps/deploy_e2e-5ff869209642a5ba)
+
+running 6 tests
+test unreachable_api_fails_with_a_clear_message ... ok
+test unplaceable_service_fails_the_deploy ... ok
+test deploy_with_volumes_lands_and_mounts ... ok
+test deploy_lands_services_and_places_tasks ... ok
+test deploy_keeps_restart_policy_and_agent_spec ... ok
+test redeploy_is_idempotent ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.74s
+
+     Running tests/deploy_path_probe.rs (/Users/admin/dev/minga/target/debug/deps/deploy_path_probe-0fce26b495b8eec0)
+
+running 3 tests
+test service_creation_fails_loudly_when_no_node_is_registered ... ok
+test docker_api_service_creation_lands_in_raft ... ok
+test a_registered_node_lets_the_service_run_end_to_end ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.56s
+
+     Running tests/phase0.rs (/Users/admin/dev/minga/target/debug/deps/phase0-45ad5733a1a7d33a)
+
+running 1 test
+test phase0_gate_10_services_3_nodes ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.22s
+
+     Running tests/state_e2e.rs (/Users/admin/dev/minga/target/debug/deps/state_e2e-1645bde0f8e14462)
+
+running 5 tests
+test standalone_api_command_points_to_manager_api_bind ... ok
+test export_file_handling ... ok
+test import_conflicts_without_overwrite_and_replaces_with_it ... ok
+test import_refuses_other_format_versions ... ok
+test export_then_import_restores_desired_state ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.66s
+
+     Running tests/validate.rs (/Users/admin/dev/minga/target/debug/deps/validate-bfd536551bdf76ba)
+
+running 3 tests
+test validate_rejects_port_host_ip_long_syntax ... ok
+test validate_accepts_ports_without_host_ip ... ok
+test validate_rejects_port_host_ip_short_syntax ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running unittests src/lib.rs (/Users/admin/dev/minga/target/debug/deps/minga_compose-53d99298d900bcbe)
+
+running 27 tests
+test agent::tests::no_extension_returns_none ... ok
+test agent::tests::agent_extension_serde_default ... ok
+test agent::tests::is_agent_detects_extension ... ok
+test agent::tests::extensions_map_preserved ... ok
+test agent::tests::parse_minimal_agent_extension ... ok
+test agent::tests::invalid_extension_returns_error ... ok
+test agent::tests::missing_module_returns_error ... ok
+test agent::tests::parse_full_agent_extension ... ok
+test agent::tests::string_numbers_are_parsed ... ok
+test agent::tests::unknown_keys_rejected ... ok
+test interpolate::tests::escapes_and_lone_dollar ... ok
+test interpolate::tests::alternatives ... ok
+test interpolate::tests::defaults ... ok
+test interpolate::tests::malformed ... ok
+test agent::tests::parses_required_egress_routes_and_models ... ok
+test interpolate::tests::nested_default ... ok
+test interpolate::tests::plain_and_braced ... ok
+test agent::tests::rejects_invalid_egress_route_graph_and_unknown_keys ... ok
+test interpolate::tests::required ... ok
+test interpolate::tests::unset_warns_once ... ok
+test agent::tests::invalid_capability_grants_and_directory_paths_are_rejected ... ok
+test keys::tests::modelled_keys_are_spec_keys ... ok
+test model::tests::short_devices ... ok
+test model::tests::short_ports ... ok
+test model::tests::short_volumes ... ok
+test model::tests::long_port_mode_is_validated ... ok
+test keys::tests::suggests_close_typos_only ... ok
+
+test result: ok. 27 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/load.rs (/Users/admin/dev/minga/target/debug/deps/load-cf1c7f6416a40c5a)
+
+running 18 tests
+test not_a_mapping ... ok
+test global_mode_cannot_set_replicas ... ok
+test port_host_ip_long_syntax_is_unsupported ... ok
+test port_host_ip_short_syntax_is_unsupported ... ok
+test dependency_on_disabled_profile_fails ... ok
+test edge_ai_profile_enables_debug_ui ... ok
+test error_type_is_matchable ... ok
+test dependency_cycles_are_rejected ... ok
+test optional_dependency_on_missing_service_only_warns ... ok
+test published_port_conflicts ... ok
+test secret_needs_exactly_one_source ... ok
+test reports_every_problem_at_once ... ok
+test unsupported_spec_keys_say_why ... ok
+test ports_without_host_ip_still_load ... ok
+test typo_gets_a_suggestion ... ok
+test edge_ai_stack_with_features_swarm_ignores ... ok
+test wordpress_tutorial_stack ... ok
+test wordpress_requires_its_passwords ... ok
+
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (/Users/admin/dev/minga/target/debug/deps/minga_ctl-c954f39905bb575c)
+
+running 99 tests
+test api::tests::the_token_goes_only_to_the_api_root ... ok
+test api::tests::change_request_ids_are_safe_path_segments ... ok
+test cmd::context::tests::mtls_contexts_require_direct_https ... ok
+test cmd::context::tests::a_context_without_a_token_is_labelled_none ... ok
+test cmd::context::tests::a_context_with_a_remote_token_file_is_labelled ... ok
+test api::tests::error_messages_come_from_json_or_plain_text ... ok
+test cmd::context::tests::a_token_command_is_split_on_whitespace ... ok
+test api::tests::statuses_are_classified ... ok
+test cmd::doctor::tests::raft_assessment_marks_stale_quorum_failed_and_unreachable_voters_degraded ... ok
+test cmd::context::tests::a_plain_http_remote_endpoint_is_refused_at_add_time ... ok
+test cmd::doctor::tests::readiness_reasons_distinguish_raft_bus_and_unrecognized_failures ... ok
+test cmd::doctor::tests::api_error_body_is_redacted_from_evidence ... ok
+test cmd::health::tests::replicas_derive_ok_degraded_and_fail ... ok
+test cmd::image::tests::a_bad_target_is_refused_before_anything_runs ... ok
+test cmd::image::tests::targets_follow_flags_then_nodes_then_ssh_then_local ... ok
+test api::tests::client_private_key_must_not_be_group_or_world_readable ... ok
+test cmd::metrics::tests::a_histogram_without_observations_has_no_average ... ok
+test cmd::metrics::tests::special_float_values_parse ... ok
+test cmd::registry::tests::docker_login_keys_match_like_minga ... ok
+test cmd::metrics::tests::parses_names_labels_and_values ... ok
+test cmd::metrics::tests::comments_blank_lines_and_junk_are_skipped ... ok
+test cmd::metrics::tests::label_values_may_hold_escapes_commas_and_braces ... ok
+test cmd::doctor::tests::task_counts_aggregate_failures_without_reading_error_text ... ok
+test cmd::registry::tests::short_names_resolve_to_hosts ... ok
+test cmd::registry::tests::the_default_path_note_names_the_file_and_the_fix ... ok
+test cmd::registry::tests::usernames_cannot_hold_a_colon ... ok
+test cmd::report::tests::only_error_findings_fail_the_command ... ok
+test cmd::metrics::tests::the_summary_follows_the_plan_and_skips_missing_metrics ... ok
+test cmd::service::tests::a_global_service_cannot_be_scaled ... ok
+test cmd::health::tests::only_http_and_https_urls_are_fetched ... ok
+test cmd::service::tests::env_keys_are_split_at_the_first_equals_sign ... ok
+test cmd::service::tests::only_plain_keys_are_printed_or_logged ... ok
+test cmd::service::tests::an_empty_env_is_the_same_as_none ... ok
+test cmd::stack::tests::only_loopback_endpoints_are_this_machine ... ok
+test cmd::service::tests::changes_are_described_without_values ... ok
+test cmd::service::tests::env_order_does_not_make_specs_differ ... ok
+test cmd::stack::tests::the_relay_is_refused_without_a_token ... ok
+test cmd::upgrade::tests::a_check_that_could_not_run_blocks_the_upgrade ... ok
+test cmd::upgrade::tests::raft_finding_fails_closed_and_omits_peer_addresses ... ok
+test cmd::upgrade::tests::state_format_assessment_uses_only_supported_migrations ... ok
+test cmd::usage::tests::operator_rows_render_aggregate_objects_from_the_response_envelope ... ok
+test cmd::upgrade::tests::target_metadata_fails_closed_for_unknown_versions ... ok
+test cmd::usage::tests::since_parser_accepts_expected_units_and_rejects_bad_values ... ok
+test cmd::usage::tests::query_contains_only_customer_and_since_filters ... ok
+test cmd::usage::tests::tenant_rows_render_events_from_the_response_envelope ... ok
+test config::tests::a_query_or_fragment_cannot_smuggle_a_loopback_host ... ok
+test cmd::stack::tests::absolute_and_named_volumes_and_other_keys_pass ... ok
+test config::tests::an_endpoint_behind_an_ssh_target_is_not_checked ... ok
+test cmd::stack::tests::relative_bind_mounts_are_found_in_short_and_long_form ... ok
+test config::tests::an_unknown_context_is_not_found ... ok
+test config::tests::a_group_readable_config_is_refused ... ok
+test config::tests::parse_refuses_an_unknown_field ... ok
+test config::tests::parse_reads_contexts ... ok
+test config::tests::https_to_any_host_is_allowed ... ok
+test config::tests::a_private_config_is_accepted ... ok
+test config::tests::parse_refuses_an_unknown_field_inside_a_context ... ok
+test config::tests::plain_http_to_a_remote_host_is_refused ... ok
+test config::tests::plain_http_to_the_loopback_interface_is_allowed ... ok
+test error::tests::a_failed_health_check_exits_two ... ok
+test error::tests::a_plain_http_endpoint_reports_the_alternative ... ok
+test error::tests::a_readable_config_reports_the_fix ... ok
+test error::tests::an_unreachable_api_reports_the_hint ... ok
+test error::tests::missing_things_exit_three ... ok
+test error::tests::the_token_hint_is_only_for_token_fields ... ok
+test cmd::health::tests::a_refused_scheme_is_a_failed_check_without_a_request ... ok
+test error::tests::transport_errors_exit_two ... ok
+test error::tests::usage_errors_exit_one ... ok
+test output::tests::a_failed_write_is_reported ... ok
+test output::tests::an_empty_table_prints_nothing ... ok
+test cmd::stack::tests::the_relay_forwards_a_tcp_connection_to_the_socket ... ok
+test output::tests::json_output_is_an_array_of_rows ... ok
+test output::tests::the_table_pads_columns ... ok
+test transport::tests::a_bare_token_file_is_the_trimmed_content ... ok
+test transport::tests::a_forward_destination_is_host_and_port ... ok
+test transport::tests::a_forward_destination_must_be_the_targets_loopback ... ok
+test transport::tests::a_socket_directory_must_fit_sun_path_and_parse_in_a_forward ... ok
+test transport::tests::an_empty_file_or_value_is_an_error ... ok
+test transport::tests::an_env_file_gives_the_value_of_the_token_variable ... ok
+test transport::tests::an_env_file_without_the_variable_is_an_error_not_a_token ... ok
+test transport::tests::an_ssh_error_reports_the_last_stderr_line ... ok
+test transport::tests::ids_images_and_paths_follow_the_plan_rules ... ok
+test transport::tests::no_argv_sets_batch_mode_or_host_key_checking ... ok
+test transport::tests::only_fixed_arguments_may_start_with_a_dash ... ok
+test transport::tests::only_the_tcp_nodelay_notice_is_dropped_from_ssh_stderr ... ok
+test transport::tests::quoting_survives_a_single_quote ... ok
+test transport::tests::ssh_targets_follow_the_plan_rule ... ok
+test transport::tests::the_exec_argv_puts_the_target_after_dashes_and_quotes_arguments ... ok
+test transport::tests::the_exec_argv_refuses_shell_syntax ... ok
+test transport::tests::the_tunnel_argv_adds_metrics_only_when_set ... ok
+test transport::tests::the_tunnel_argv_forwards_the_api_to_a_socket ... ok
+test config::tests::a_token_command_runs_without_a_shell ... ok
+test view::tests::a_long_error_is_cut_in_the_table_and_whole_in_json ... ok
+test view::tests::health_is_derived_from_the_healthcheck_and_state ... ok
+test view::tests::modes_and_replicas_are_read ... ok
+test view::tests::task_rows_name_nodes_and_sort_by_id ... ok
+test view::tests::the_hint_counts_tasks_that_are_not_running_and_names_one_service ... ok
+test config::tests::resolve_target_does_not_run_the_token_command ... ok
+test config::tests::a_failing_token_command_is_a_usage_error ... ok
+test cmd::doctor::tests::support_bundle_redacts_secrets_paths_and_endpoints ... ok
+
+test result: ok. 99 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running unittests src/main.rs (/Users/admin/dev/minga/target/debug/deps/minga_ctl-4d9d471661afd77e)
+
+running 4 tests
+test tests::agent_usage_accepts_customer_and_relative_since ... ok
+test tests::the_output_format_defaults_to_table ... ok
+test tests::json_overrides_the_output_format ... ok
+test tests::the_cli_definition_is_valid ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/api.rs (/Users/admin/dev/minga/target/debug/deps/api-961aafff535b1ede)
+
+running 5 tests
+test a_plain_http_remote_endpoint_is_refused_before_connecting ... ok
+test an_unreachable_api_is_exit_two ... ok
+test system_proxies_are_ignored_so_the_token_never_reaches_one ... ok
+test a_wrong_token_is_exit_two_with_the_hint ... ok
+test read_commands_against_a_real_api ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.07s
+
+     Running tests/client.rs (/Users/admin/dev/minga/target/debug/deps/client-a914836fe0cd36d8)
+
+running 3 tests
+test text_reads_health_with_the_token_and_reports_status ... ok
+test a_wrong_token_on_post_is_auth ... ok
+test post_and_delete_round_trip ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.48s
+
+     Running tests/cluster.rs (/Users/admin/dev/minga/target/debug/deps/cluster-3aea1111711e3d24)
+
+running 2 tests
+test missing_node_fails_with_not_found ... ok
+test cluster_resources_round_trip ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.47s
+
+     Running tests/context.rs (/Users/admin/dev/minga/target/debug/deps/context-a8f1d7b294f5fd42)
+
+running 13 tests
+test a_plain_http_remote_endpoint_is_refused ... ok
+test deleting_an_unknown_context_exits_three ... ok
+test json_output_is_an_array ... ok
+test adding_a_context_twice_is_refused ... ok
+test adding_a_context_writes_a_private_config ... ok
+test quiet_output_prints_ids_only ... ok
+test an_unknown_config_key_is_refused ... ok
+test a_group_readable_config_is_refused ... ok
+test listing_contexts_shows_the_current_one ... ok
+test deleting_the_current_context_clears_the_selection ... ok
+test the_config_directory_is_private ... ok
+test quiet_changes_print_nothing ... ok
+test concurrent_adds_keep_every_context ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.11s
+
+     Running tests/health.rs (/Users/admin/dev/minga/target/debug/deps/health-c61aaae2b92fceb9)
+
+running 6 tests
+test a_missing_stack_exits_three ... ok
+test health_reports_the_api_checks ... ok
+test a_failed_check_exits_two ... ok
+test metrics_with_a_wrong_token_exits_two ... ok
+test metrics_lists_real_metric_names ... ok
+test stack_health_checks_replicas_and_label_urls ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.58s
+
+     Running tests/ops_loop.rs (/Users/admin/dev/minga/target/debug/deps/ops_loop-508876252fd0029b)
+
+running 8 tests
+test service_rm_keeps_the_new_revision_when_the_delete_outcome_is_unknown ... ok
+test prune_refuses_a_file_without_services ... ok
+test service_rm_confirms_saves_the_revision_and_deletes ... ok
+test inspect_skips_the_output_with_a_note_when_minga_logs_fails ... ok
+test without_prune_a_note_names_the_services_the_file_lacks ... ok
+test inspect_shows_the_end_of_each_failed_tasks_output ... ok
+test inspect_over_an_unreachable_node_still_shows_the_service ... ok
+test prune_removes_only_this_stacks_absent_services_and_rollback_brings_one_back ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.19s
+
+     Running tests/registry.rs (/Users/admin/dev/minga/target/debug/deps/registry-ee8a0f518fb7c799)
+
+running 13 tests
+test an_empty_stdin_is_exit_1_and_changes_nothing ... ok
+test a_file_that_is_not_json_is_left_unchanged_with_exit_2 ... ok
+test a_login_drops_world_access_and_leaves_no_temporary_file ... ok
+test logout_dockerhub_also_removes_the_docker_login_key ... ok
+test a_google_registry_stores_the_json_key_user ... ok
+test login_ghcr_creates_the_file_0600_with_the_auth_entry ... ok
+test logout_without_a_terminal_needs_yes ... ok
+test a_failing_api_token_command_does_not_block_registry_commands ... ok
+test a_docker_hub_alias_replaces_the_docker_login_entry ... ok
+test a_second_login_keeps_the_mode_of_the_existing_file ... ok
+test list_shows_usernames_and_never_the_secret ... ok
+test other_hosts_and_unknown_keys_survive_and_logout_removes_only_its_host ... ok
+test over_ssh_the_credential_goes_on_stdin_never_in_argv ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.42s
+
+     Running tests/revision_save_failure.rs (/Users/admin/dev/minga/target/debug/deps/revision_save_failure-0361b0abdfe6d70c)
+
+running 1 test
+test a_failed_revision_save_removes_the_old_revision ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.34s
+
+     Running tests/rollback_race.rs (/Users/admin/dev/minga/target/debug/deps/rollback_race-4ef02235fca483fd)
+
+running 1 test
+test rollback_stops_when_the_service_changes_while_confirming ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.35s
+
+     Running tests/ssh.rs (/Users/admin/dev/minga/target/debug/deps/ssh-aca4e16812fe62de)
+
+running 12 tests
+test a_remote_token_file_without_ssh_is_refused_at_add_time ... ok
+test a_target_starting_with_a_dash_is_refused_at_add_time ... ok
+test context_add_applies_the_tunnel_destination_rules ... ok
+test an_empty_env_file_value_is_refused_before_the_tunnel ... ok
+kill: 43197: No such process
+test an_empty_remote_token_is_refused_before_the_tunnel ... ok
+test an_env_file_without_the_variable_is_refused_without_echoing_it ... ok
+test a_failed_tunnel_is_exit_two_with_the_last_ssh_line ... ok
+test an_env_file_remote_token_sends_only_the_value ... ok
+kill: 43220: No such process
+test a_command_runs_through_the_tunnel_with_the_remote_token ... ok
+test a_bare_remote_token_may_contain_equals_signs ... ok
+kill: 43243: No such process
+kill: 43262: No such process
+test a_signal_kills_the_tunnel_and_removes_the_socket_directory ... ok
+kill: 43219: No such process
+test a_hanging_ssh_without_a_terminal_times_out_after_ten_seconds ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 10.27s
+
+     Running tests/task_errors.rs (/Users/admin/dev/minga/target/debug/deps/task_errors-501fdab5c2be9c69)
+
+running 4 tests
+test the_docker_api_reports_the_reason_on_the_task ... ok
+test a_healthy_service_has_no_error_and_no_hint ... ok
+test ps_shows_the_error_last_and_hints_at_what_to_run ... ok
+test inspect_shows_the_spec_and_why_each_task_is_down ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.71s
+
+     Running tests/wrapped.rs (/Users/admin/dev/minga/target/debug/deps/wrapped-3b0a8d189631295e)
+
+running 12 tests
+test secret_put_with_empty_stdin_is_exit_1 ... ok
+test deploy_without_minga_is_exit_1_with_the_hint ... ok
+test deploy_refuses_a_relative_bind_mount_when_the_node_is_another_machine ... ok
+test deploy_exits_2_when_the_read_after_minga_fails ... ok
+test deploy_reports_a_failed_minga_as_exit_2 ... ok
+test a_failed_target_is_exit_2_and_skips_the_declaration ... ok
+test image_pull_runs_on_each_node_and_rm_needs_confirmation ... ok
+test secret_put_sends_the_value_on_stdin_only ... ok
+test service_logs_prefixes_each_line_with_its_task ... ok
+test service_logs_follow_ends_when_stdout_is_closed ... ok
+test deploy_passes_the_token_in_the_environment_and_saves_only_changed_revisions ... ok
+test deploy_over_ssh_relays_the_tunnel_and_passes_the_remote_token ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.37s
+
+     Running tests/writes.rs (/Users/admin/dev/minga/target/debug/deps/writes-c2aa2e65f740d411)
+
+running 3 tests
+test stack_rm_reports_resources_in_use_and_failed_services ... ok
+test stack_rm_removes_services_and_only_named_resources ... ok
+test scale_update_and_rollback_against_a_real_api ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.89s
+
+     Running unittests src/lib.rs (/Users/admin/dev/minga/target/debug/deps/minga_egress-162dad4b21813dc0)
+
+running 93 tests
+test budget::tests::budget_allows ... ok
+test budget::tests::budget_new ... ok
+test budget::tests::budget_consume_exceeds ... ok
+test budget::tests::budget_consume ... ok
+test budget::tests::consume_saturates_on_an_unlimited_budget ... ok
+test budget::tests::tracker_multiple_workloads_independent ... ok
+test budget::tests::tracker_list ... ok
+test budget::tests::a_window_reset_keeps_in_flight_reservations ... ok
+test budget::tests::an_uncapped_reservation_holds_the_rest_of_a_limited_budget ... ok
+test budget::tests::a_reservation_settles_only_against_the_registration_that_issued_it ... ok
+test budget::tests::releasing_a_saturating_hold_keeps_the_others ... ok
+test budget::tests::tracker_not_found ... ok
+test budget::tests::budget_status_fields ... ok
+test budget::tests::reservations_hold_balance_until_settled_or_dropped ... ok
+test budget::tests::tracker_record ... ok
+test budget::tests::tracker_register_and_check ... ok
+test budget::tests::tracker_unregister ... ok
+test budget::tests::tracker_window_reset_on_record ... ok
+test cache::tests::eviction_stats ... ok
+test cache::tests::cache_is_bounded_by_bytes ... ok
+test cache::tests::lru_eviction ... ok
+test cache::tests::clear ... ok
+test cache::tests::get_missing ... ok
+test cache::tests::compute_key_for_workload_varies_with_request ... ok
+test cache::tests::compute_key_for_workload_deterministic ... ok
+test cache::tests::customers_never_share_entries ... ok
+test cache::tests::only_caches_2xx ... ok
+test cache::tests::overwrite_existing_key ... ok
+test cache::tests::put_and_get ... ok
+test cache::tests::stats_tracking ... ok
+test cache::tests::route_and_query_isolate_cache_keys ... ok
+test cache::tests::workload_cache_keys_are_isolated ... ok
+test identity::tests::token_maps_to_workload_until_dropped ... ok
+test proxy::tests::captures_answered_model_from_json_and_streaming_events ... ok
+test proxy::tests::an_anthropic_stream_cut_before_the_final_usage_estimates_the_output ... ok
+test proxy::tests::a_top_level_input_only_usage_does_not_finalize_the_output ... ok
+test proxy::tests::combines_anthropic_sse_usage_from_message_start_and_delta ... ok
+test proxy::tests::debug_never_prints_the_key ... ok
+test proxy::tests::a_usage_event_dropped_after_its_retries_is_counted ... ok
+test cache::tests::ttl_expiration ... ok
+test cache::tests::expiration_stats ... ok
+test proxy::tests::egress_proxy_no_cache ... ok
+test proxy::tests::egress_proxy_new ... ok
+test proxy::tests::health_endpoint ... ok
+test proxy::tests::customers_do_not_share_cached_responses ... ok
+test proxy::tests::client_error_does_not_fall_back_to_another_route ... ok
+test proxy::tests::a_changed_route_does_not_hit_the_old_cache_entry ... ok
+test proxy::tests::json_usage_parser_matches_escaped_top_level_keys ... ok
+test proxy::tests::json_usage_parser_drops_an_oversized_usage_value_and_falls_back ... ok
+test proxy::tests::missing_usage_falls_back_to_response_bytes_over_four ... ok
+test proxy::tests::json_usage_parser_reads_only_the_top_level_field_in_any_chunking ... ok
+test proxy::tests::error_response_no_redaction ... ok
+test proxy::tests::oversized_reported_models_fall_back_to_the_requested_one ... ok
+test proxy::tests::parses_openai_and_anthropic_json_usage ... ok
+test proxy::tests::parses_openai_sse_usage_across_arbitrary_chunks ... ok
+test proxy::tests::parses_sse_usage_across_arbitrary_chunks ... ok
+test proxy::tests::error_response_redacts_secrets ... ok
+test proxy::tests::proxy_config_default ... ok
+test proxy::tests::forwarded_variant_headers_are_part_of_the_cache_key ... ok
+test proxy::tests::injected_key_is_redacted_from_upstream_error_body ... ok
+test proxy::tests::oversized_identifiers_are_rejected ... ok
+test proxy::tests::policy_rejects_disallowed_model_and_unknown_route ... ok
+test proxy::tests::proxy_router_builds ... ok
+test proxy::tests::sse_usage_parser_caps_oversized_event_buffers ... ok
+test proxy::tests::registered_routed_task_first_request_is_admitted ... ok
+test proxy::tests::usage_events_are_body_free_and_cost_is_integer_micros ... ok
+test redact::tests::custom_rule ... ok
+test proxy::tests::rate_limited_route_falls_back_to_secondary ... ok
+test redact::tests::invalid_regex_skipped ... ok
+test proxy::tests::injects_credential_and_strips_client_keys ... ok
+test proxy::tests::spoofed_workload_header_is_rejected ... ok
+test budget::tests::budget_window_reset ... ok
+test proxy::tests::streamed_upstream_chunks_are_forwarded_before_completion_and_not_cached ... ok
+test redact::tests::default_is_with_defaults ... ok
+test proxy::tests::upstream_error_streams_are_buffered_and_redacted_whole ... ok
+test redact::tests::multiple_secrets_in_one_text ... ok
+test redact::tests::no_redaction_needed ... ok
+test redact::tests::redact_anthropic_key ... ok
+test redact::tests::redact_api_key_param ... ok
+test redact::tests::redact_aws_access_key ... ok
+test proxy::tests::routes_refuse_private_destinations_and_redirects_unless_allowed ... ok
+test redact::tests::redact_bearer_token ... ok
+test redact::tests::redact_credit_card ... ok
+test routes::tests::a_rotated_credential_changes_the_revision ... ok
+test redact::tests::redact_email ... ok
+test redact::tests::redact_hex_secret ... ok
+test proxy::tests::concurrent_requests_cannot_spend_the_same_budget ... ok
+test redact::tests::redact_jwt ... ok
+test redact::tests::redact_openai_key ... ok
+test redact::tests::redact_private_key ... ok
+test redact::tests::redact_with_matches ... ok
+test redact::tests::rule_names ... ok
+test proxy::tests::a_client_that_stops_reading_releases_the_reservation ... ok
+
+test result: ok. 93 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.25s
+
+     Running unittests src/lib.rs (/Users/admin/dev/minga/target/debug/deps/minga_net-379399541ad21d7b)
+
+running 77 tests
+test cidr::tests::overlaps_is_symmetric_and_exact ... ok
+test cidr::tests::contains_check ... ok
+test cidr::tests::default_supernet ... ok
+test cidr::tests::slash_31_both_usable ... ok
+test cidr::tests::nth_host_slash_30 ... ok
+test cidr::tests::display ... ok
+test cidr::tests::parse_valid_cidr ... ok
+test cidr::tests::nth_subnet_invalid_prefix ... ok
+test cidr::tests::parse_invalid_cidr ... ok
+test cidr::tests::nth_subnet ... ok
+test cidr::tests::nth_host ... ok
+test cidr::tests::slash_32_single_host ... ok
+test cidr::tests::usable_hosts_iter ... ok
+test cidr::tests::supernet_refused_when_it_overlaps_a_host_route ... ok
+test dns::tests::is_minga_name_check ... ok
+test dns::tests::node_fqdn_format ... ok
+test dns::tests::remove_ip_from_record ... ok
+test dns::tests::add_ip_to_record ... ok
+test dns::tests::remove_record ... ok
+test dns::tests::clear_all ... ok
+test dns::tests::remove_ip_removes_empty_record ... ok
+test dns::tests::list_records_sorted ... ok
+test dns::tests::multiple_services_same_stack ... ok
+test dns::tests::resolve_case_insensitive ... ok
+test dns::tests::resolve_not_found ... ok
+test dns::tests::service_fqdn_format ... ok
+test dns::tests::set_and_resolve ... ok
+test dns::tests::short_name_strips_suffix ... ok
+test dns::tests::task_fqdn_format ... ok
+test dns_server::tests::encode_decode_round_trip ... ok
+test ipam::tests::allocate_and_get ... ok
+test ipam::tests::allocate_idempotent ... ok
+test ipam::tests::allocate_is_deterministic ... ok
+test ipam::tests::different_tasks_get_different_ips ... ok
+test ipam::tests::get_task_reverse_lookup ... ok
+test ipam::tests::ip_in_subnet_range ... ok
+test ipam::tests::free_count ... ok
+test ipam::tests::list_allocations ... ok
+test ipam::tests::release_and_reallocate ... ok
+test ipam::tests::release_nonexistent ... ok
+test ipam::tests::restore_allocations ... ok
+test ipam::tests::restore_ignores_ips_outside_subnet ... ok
+test ipam::tests::small_subnet_exhaustion ... ok
+test overlay::tests::allocate_and_release_ip ... ok
+test overlay::tests::allocate_ip_nonexistent_network ... ok
+test overlay::tests::create_and_get_network ... ok
+test overlay::tests::create_duplicate_network_fails ... ok
+test overlay::tests::create_network_auto_never_reuses_a_subnet ... ok
+test overlay::tests::create_network_auto_subnet ... ok
+test overlay::tests::driver_opts_accept_only_encrypted ... ok
+test overlay::tests::mesh_node_addresses_are_stable_and_unique ... ok
+test overlay::tests::mesh_subnet_is_separate ... ok
+test dns_server::tests::non_minga_without_upstream_refused ... ok
+test dns_server::tests::non_a_minga_query_returns_noerror_empty ... ok
+test dns_server::tests::a_query_known_name_returns_ips ... ok
+test overlay::tests::multiple_networks_independent_ipam ... ok
+test dns_server::tests::unknown_minga_name_returns_noerror_empty ... ok
+test overlay::tests::network_subnet_must_stay_inside_the_supernet_and_off_the_mesh ... ok
+test overlay::tests::register_and_resolve_service ... ok
+test overlay::tests::register_and_unregister_task ... ok
+test overlay::tests::remove_network ... ok
+test overlay::tests::remove_nonexistent_network ... ok
+test overlay::tests::resolve_short_name ... ok
+test dns_server::tests::upstream_proxy_relays_response ... ok
+test wireguard::tests::config_string_format ... ok
+test wireguard::tests::derive_public_invalid_key ... ok
+test wireguard::tests::node_interface_name_is_fixed ... ok
+test wireguard::tests::peer_to_wg_set_args ... ok
+test wireguard::tests::debug_output_redacts_private_key ... ok
+test wireguard::tests::validate_endpoint_invalid ... ok
+test wireguard::tests::validate_endpoint_valid ... ok
+test wireguard::tests::validate_public_key_invalid ... ok
+test wireguard::tests::derive_public_from_private ... ok
+test wireguard::tests::keypairs_are_unique ... ok
+test wireguard::tests::generate_keypair ... ok
+test wireguard::tests::validate_public_key_valid ... ok
+test ipam::tests::allocate_subnet_skips_taken_until_exhausted ... ok
+
+test result: ok. 77 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.28s
+
+     Running unittests src/lib.rs (/Users/admin/dev/minga/target/debug/deps/minga_node-23b2fe2f8526b9fb)
+
+running 169 tests
+test agent::tests::capability_validation_requires_env_grant_and_node_egress ... ok
+test agent::tests::egress_url_reaches_the_sandbox_only_with_the_http_grant ... ok
+test agent::tests::mock_fail_starts ... ok
+test agent::tests::directory_grants_require_a_configured_root ... ok
+test agent::tests::directory_grant_symlink_cannot_escape_configured_root ... ok
+test agent::tests::mock_stop ... ok
+test agent::tests::mock_stop_missing ... ok
+test agent::tests::mock_auto_complete ... ok
+test agent::tests::mock_result_none_for_running ... ok
+test agent::tests::mock_start_and_status ... ok
+test agent::tests::mock_list ... ok
+test agent::tests::shared_executor_works ... ok
+test containerd::client::tests::default_socket_path ... ok
+test containerd::client::tests::client_error_display ... ok
+test containerd::credentials::tests::helper_names_cannot_be_paths ... ok
+test agent::tests::wasmtime_exec_list_empty ... ok
+test agent::tests::http_run_token_carries_the_assignment_tenant_and_budget ... ok
+test agent::tests::wasmtime_exec_stop_cleans_up ... ok
+test containerd::credentials::tests::inline_auths_match_docker_login_keys ... ok
+test containerd::credentials::tests::inline_credential_reads_auths_and_never_runs_a_helper ... ok
+test agent::tests::wasmtime_exec_missing_module ... ok
+test containerd::image::tests::chain_id_hashes_multiple_diff_ids ... ok
+test containerd::image::tests::config_preserves_entrypoint_command_env_and_workdir ... ok
+test containerd::image::tests::keeps_qualified_refs_unchanged ... ok
+test containerd::image::tests::normalizes_digest_refs_without_adding_a_tag ... ok
+test containerd::image::tests::normalizes_docker_hub_short_refs ... ok
+test containerd::image::tests::parses_numeric_users_and_refuses_names ... ok
+test containerd::image::tests::rejects_empty_command_but_keeps_a_named_user_for_the_task_to_replace ... ok
+test containerd::image::tests::selects_linux_host_manifest_from_multi_platform_index ... ok
+test containerd::oci::override_tests::entrypoint_and_command_replace_both ... ok
+test containerd::oci::override_tests::command_replaces_image_cmd_keeps_entrypoint ... ok
+test containerd::oci::override_tests::entrypoint_replaces_image_entrypoint_keeps_cmd ... ok
+test containerd::oci::override_tests::image_defaults_when_no_overrides ... ok
+test containerd::oci::override_tests::rootfs_dirs_lists_overlay_layers_top_first ... ok
+test containerd::oci::override_tests::task_user_prefers_the_task_and_refuses_an_unknown_name ... ok
+test containerd::oci::override_tests::mounts_become_bind_mounts_with_ro_flag ... ok
+test containerd::oci::override_tests::task_user_refuses_a_symlinked_passwd ... ok
+test containerd::oci::tests::preloaded_image_process_defaults_and_task_env_override ... ok
+test containerd::oci::tests::secret_mount_is_read_only_and_confined ... ok
+test containerd::oci::tests::secret_mounts_preserve_existing_mounts ... ok
+test containerd::oci::tests::spec_annotations_include_container_id ... ok
+test containerd::oci::tests::spec_annotations_include_ports ... ok
+test containerd::oci::tests::spec_cpu_limit ... ok
+test containerd::oci::tests::spec_does_not_override_path ... ok
+test containerd::oci::tests::spec_has_default_capabilities ... ok
+test containerd::oci::tests::spec_has_required_fields ... ok
+test containerd::oci::tests::spec_includes_env_sorted ... ok
+test containerd::oci::tests::spec_includes_standard_mounts ... ok
+test containerd::oci::tests::spec_includes_standard_namespaces ... ok
+test containerd::oci::tests::spec_masks_and_protects_kernel_paths ... ok
+test containerd::oci::tests::spec_memory_limit ... ok
+test containerd::oci::tests::spec_no_new_privileges ... ok
+test containerd::oci::override_tests::task_user_resolves_names_from_the_top_layer ... ok
+test containerd::oci::tests::spec_sets_path_if_missing ... ok
+test containerd::oci::tests::spec_serializes_to_json ... ok
+test containerd::oci::tests::spec_without_limits_still_denies_devices ... ok
+test containerd::oci::tests::spec_without_secrets_has_no_secret_mount ... ok
+test containerd::oci::tests::spec_to_any_produces_valid_any ... ok
+test containerd::proto::tests::container_roundtrip ... ok
+test containerd::proto::tests::create_task_request_roundtrip ... ok
+test containerd::proto::tests::descriptor_digest_is_wire_string ... ok
+test containerd::proto::tests::empty_messages_roundtrip ... ok
+test containerd::proto::tests::kill_request_roundtrip ... ok
+test containerd::proto::tests::process_field_numbers_match_containerd ... ok
+test containerd::proto::tests::process_roundtrip ... ok
+test containerd::proto::tests::task_service_paths_use_the_v17_service_name ... ok
+test containerd::runtime::tests::default_constants ... ok
+test containerd::runtime::tests::extra_hosts_without_a_network_refuse_to_start ... ok
+test containerd::runtime::tests::grace_period_is_reasonable ... ok
+test containerd::runtime::tests::host_gateway_becomes_the_bridge_address ... ok
+test containerd::runtime::tests::process_status_mapping ... ok
+test containerd::runtime::tests::required_egress_without_routes_is_refused_not_sent_upstream ... ok
+test failure::tests::a_reason_is_one_line_capped_at_a_character_boundary ... ok
+test failure::tests::a_start_error_is_sanitized_and_has_no_exit_code ... ok
+test failure::tests::an_exit_after_a_healthcheck_kill_keeps_the_cause ... ok
+test failure::tests::credentials_in_a_pull_error_never_survive ... ok
+test failure::tests::exit_reasons_name_the_code_and_a_signal ... ok
+test health::tests::a_pass_reports_once_and_clears_failures ... ok
+test health::tests::first_probe_waits_one_interval_and_never_overlaps ... ok
+test health::tests::none_disables_the_check ... ok
+test health::tests::probe_args_follow_the_compose_forms ... ok
+test health::tests::start_period_failures_do_not_count_until_first_success ... ok
+test agent::tests::a_migrated_v8_agent_with_env_still_starts ... ok
+test agent::tests::wasmtime_exec_echo_module ... ok
+test containerd::runtime::tests::secrets_go_to_the_task_user_at_0400_and_a_failed_chown_stops_the_task ... ok
+test netns_rules::tests::required_egress_drops_non_ipv4_frames_on_the_task_port_only ... ok
+test netns_rules::tests::required_egress_rules_allow_proxy_only_and_cleanup_is_task_scoped ... ok
+test registration::tests::host_capacity_detects_real_values ... ok
+test registration::tests::idle_manager_does_not_advance_raft_log ... ignored, 60-second Raft log index proof
+test agent::tests::directory_grants_are_scoped_to_the_node_tenant ... ok
+test netns_rules::tests::atomic_write_keeps_the_old_state_when_the_write_fails ... ok
+test registration::tests::invalid_joined_record_is_skipped_not_fatal ... ok
+test registration::tests::lease_payload_cannot_assign_a_node_to_another_tenant ... ok
+test containerd::credentials::tests::helper_answers_by_registry_and_gets_the_host_on_stdin ... ok
+test registration::tests::membership_renews_the_bus_lease ... ok
+test containerd::credentials::tests::cred_helpers_beat_creds_store_beat_inline_auths ... ok
+test registration::tests::join_token_for_a_node_without_a_record_is_rejected ... ok
+test registration::tests::a_copied_wireguard_key_is_refused_without_a_raft_write ... ok
+test registration::tests::join_token_expiring_before_commit_is_dropped ... ok
+test registration::tests::durable_join_replaces_a_stale_cached_tenant ... ok
+test registration::tests::lease_tenant_must_match_join_token_tenant ... ok
+test containerd::credentials::tests::helper_not_found_answer_means_anonymous ... ok
+test containerd::credentials::tests::helper_secret_never_reaches_error_text ... ok
+test registration::tests::node_deleted_between_queue_and_commit_is_not_recreated ... ok
+test containerd::credentials::tests::missing_or_failing_helper_is_an_error_naming_it_and_never_anonymous ... ok
+test registration::tests::non_default_node_needs_a_token_for_its_own_tenant ... ok
+test registration::tests::registration_with_invalid_wireguard_fields_is_ignored ... ok
+test runtime::tests::mock_fail_starts ... ok
+test registration::tests::registration_preserves_the_operator_assigned_tenant ... ok
+test runtime::tests::mock_list ... ok
+test runtime::tests::mock_logs_missing_container ... ok
+test runtime::tests::mock_logs_returns_synthetic_output ... ok
+test runtime::tests::mock_logs_tail_limits_output ... ok
+test registration::tests::renewal_does_not_recreate_a_removed_node ... ok
+test registration::tests::renewal_does_not_undrain_a_drained_node ... ok
+test registration::tests::registration_writes_a_live_active_node ... ok
+test runtime::tests::mock_start_and_stop ... ok
+test runtime::tests::mock_stop_missing ... ok
+test runtime::tests::mock_unique_ids ... ok
+test secrets::tests::file_name_is_stable_and_ignores_path_components ... ok
+test secrets::tests::directory_is_refused ... ok
+test registration::tests::renewal_keeps_a_cleared_deadline_after_the_node_committed ... ok
+test secrets::tests::missing_secret_fails_closed ... ok
+test secrets::staging_tests::egress_token_file_is_read_only_and_removed_with_task_staging ... ok
+test secrets::tests::invalid_target_is_refused ... ok
+test secrets::tests::provisioned_ids_lists_stored_secrets ... ok
+test secrets::tests::read_value_trims_trailing_newline ... ok
+test secrets::tests::put_survives_a_stale_temp_file_and_leaves_an_existing_root_alone ... ok
+test secrets::tests::resolve_all_fails_on_first_missing ... ok
+test secrets::staging_tests::rotated_secret_is_visible_to_a_new_task_not_an_old_one ... ok
+test supervisor::assignment_tests::agent_assignment_without_executor_is_not_started ... ok
+test secrets::tests::resolves_a_provisioned_secret ... ok
+test secrets::tests::put_writes_a_value_resolve_accepts_and_rotates_it ... ok
+test supervisor::assignment_tests::agent_assignments_start_stop ... ok
+test supervisor::assignment_tests::assignment_from_older_format_version_is_refused_loudly ... ok
+test secrets::tests::symlink_is_refused ... ok
+test secrets::tests::world_readable_secret_is_refused ... ok
+test supervisor::assignment_tests::dns_records_come_from_network_assignment_entries ... ok
+test supervisor::assignment_tests::bus_unreachable_preserves_tasks_then_stops_only_removed_assignments ... ok
+test supervisor::assignment_tests::completed_agent_result_is_published_as_a_log ... ok
+test supervisor::assignment_tests::assignments_are_node_scoped_idempotent_and_stop_removed_tasks ... ok
+test supervisor::assignment_tests::container_logs_are_not_republished_after_the_cursor_advances ... ok
+test supervisor::assignment_tests::reconcile_does_not_start_a_routed_task_while_the_inventory_is_unknown ... ok
+test supervisor::assignment_tests::reconcile_restarts_a_routed_container_that_startup_recovery_missed ... ok
+test supervisor::assignment_tests::reconcile_keeps_retrying_a_failed_routed_stop_after_its_assignment_is_gone ... ok
+test supervisor::assignment_tests::reconcile_retries_a_failed_routed_stop_before_restarting ... ok
+test supervisor::assignment_tests::startup_adopts_assigned_containers_and_stops_the_rest ... ok
+test supervisor::assignment_tests::start_failure_does_not_crash_and_retries_assignment ... ok
+test supervisor::assignment_tests::supervisor_starts_from_assignment_kv ... ok
+test supervisor::assignment_tests::status_logs_and_restart_follow_assignment ... ok
+test supervisor::assignment_tests::terminal_container_is_not_restarted_while_assignment_remains ... ok
+test wireguard::tests::a_failed_removal_still_fails_the_whole_apply ... ok
+test wireguard::tests::a_peer_wg_cannot_add_does_not_abort_the_others ... ok
+test wireguard::tests::an_allowed_ip_listed_under_two_peers_skips_both ... ok
+test supervisor::assignment_tests::startup_restarts_routed_egress_containers_instead_of_adopting ... ok
+test wireguard::tests::no_interface_is_created_without_peers ... ok
+test wireguard::tests::one_bad_peer_does_not_block_the_rest_of_the_set ... ok
+test wireguard::tests::existing_key_with_broad_permissions_is_restricted ... ok
+test wireguard::tests::peer_allowed_ips_must_belong_to_local_networks ... ok
+test supervisor::assignment_tests::healthcheck_gates_running_then_an_unhealthy_task_restarts ... ok
+test wireguard::tests::peers_sharing_a_public_key_are_both_skipped ... ok
+test wireguard::tests::generated_key_is_private_and_stable_across_restarts ... ok
+test wireguard::tests::relay_manager_may_carry_relayed_workers_mesh_addresses ... ok
+test wireguard::tests::wireguard_assignment_key_is_tenant_scoped ... ok
+test registration::tests::renewal_updates_wireguard_identity_without_overwriting_status ... ok
+test registration::tests::renewal_uses_a_join_committed_by_another_manager ... ok
+test registration::tests::stale_joined_record_requires_a_token_for_the_current_tenant ... ok
+test registration::tests::tokenless_self_enrollment_stops_once_a_second_tenant_exists ... ok
+test wireguard::tests::concurrent_starts_agree_on_one_complete_key ... ok
+
+test result: ok. 168 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 4.31s
+
+     Running tests/containerd.rs (/Users/admin/dev/minga/target/debug/deps/containerd-8946cab9d1f0e315)
+
+running 7 tests
+test containerd_start_list_status_stop ... ok
+test missing_image_fails_after_pull_attempt ... ok
+test containerd_list_empty_when_no_containers ... ok
+test containerd_logs_capture_stdout_and_stderr ... ok
+test containerd_named_user_resolves_from_the_image ... ok
+test containerd_kernel_paths_are_masked_and_read_only ... ok
+test containerd_stop_nonexistent_is_graceful ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/containerd_client.rs (/Users/admin/dev/minga/target/debug/deps/containerd_client-da486ef57781e5bb)
+
+running 6 tests
+test tasks_get_reaches_the_real_service ... ok
+test tasks_list_reaches_the_real_service ... ok
+test images_get_reaches_the_real_service ... ok
+test containers_list_reaches_the_real_service ... ok
+test tasks_create_reaches_the_real_service ... ok
+test tasks_kill_reaches_the_real_service ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/containerd_pull.rs (/Users/admin/dev/minga/target/debug/deps/containerd_pull-01e9f2076ca2a3fa)
+
+running 1 test
+test private_registry_pull_uses_the_docker_config_and_credential_helpers ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/netns.rs (/Users/admin/dev/minga/target/debug/deps/netns-6cbe348ae5cb502c)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/wireguard_netns.rs (/Users/admin/dev/minga/target/debug/deps/wireguard_netns-bbfa1dd897e2d583)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (/Users/admin/dev/minga/target/debug/deps/minga_sandbox-9bbf3d9497aac333)
+
+running 49 tests
+test pool::tests::stats_track_acquires ... ok
+test pool::tests::shutdown_destroys_all_sandboxes ... ok
+test pool::tests::release_returns_to_pool ... ok
+test pool::tests::acquire_fails_when_pool_exhausted ... ok
+test pool::tests::release_unknown_sandbox_is_noop ... ok
+test pool::tests::acquire_creates_on_demand_when_empty ... ok
+test pool::tests::acquire_from_pool ... ok
+test pool::tests::pre_warm_creates_min_sandboxes ... ok
+test pool::tests::run_acquires_and_releases ... ok
+test pool::tests::multiple_acquire_release_cycles ... ok
+test runtime::tests::mock_create_and_destroy ... ok
+test runtime::tests::mock_destroy_missing ... ok
+test runtime::tests::mock_fail_creates ... ok
+test runtime::tests::mock_fail_runs ... ok
+test runtime::tests::mock_list ... ok
+test runtime::tests::mock_run ... ok
+test runtime::tests::mock_run_custom_exit_code ... ok
+test runtime::tests::mock_run_missing ... ok
+test runtime::tests::mock_unique_ids ... ok
+test runtime::tests::spec_default ... ok
+test runtime::tests::status_display ... ok
+test wasmtime_rt::tests::epoch_deadline_adds_one_tick ... ok
+test wasmtime_rt::tests::create_rejects_limits_over_node_maximum ... ok
+test wasmtime_rt::tests::create_empty_module_fails ... ok
+test wasmtime_rt::tests::destroy_missing_sandbox ... ok
+test wasmtime_rt::tests::create_and_destroy ... ok
+test wasmtime_rt::tests::fuel_is_tracked ... ok
+test wasmtime_rt::tests::create_invalid_wasm_fails ... ok
+test wasmtime_rt::tests::create_module_without_run_fails ... ok
+test wasmtime_rt::tests::run_missing_sandbox ... ok
+test wasmtime_rt::tests::create_rejects_oversized_module ... ok
+test wasmtime_rt::tests::list_sandboxes ... ok
+test wasmtime_rt::tests::run_empty_input ... ok
+test wasmtime_rt::tests::run_echo ... ok
+test wasmtime_rt::tests::run_fail_module ... ok
+test wasmtime_rt::tests::run_wasi_module ... ok
+test wasmtime_rt::tests::status_after_failed_run ... ok
+test wasmtime_rt::tests::same_module_reuses_cached_compilation ... ok
+test wasmtime_rt::tests::run_rejects_bad_output_length ... ok
+test wasmtime_rt::tests::store_limits_reject_oversized_table ... ok
+test wasmtime_rt::tests::store_limits_memory_growth ... ok
+test wasmtime_rt::tests::status_after_run ... ok
+test wasmtime_rt::tests::store_limits_reject_second_memory ... ok
+test wasmtime_rt::tests::unique_ids ... ok
+test wasmtime_rt::tests::unmetered_run_reports_fuel_used ... ok
+test wasmtime_rt::tests::create_rejects_beyond_sandbox_cap ... ok
+test wasmtime_rt::tests::epoch_deadline_stops_unmetered_infinite_loop ... ok
+test wasmtime_rt::tests::queue_wait_counts_toward_timeout ... ok
+test wasmtime_rt::tests::in_flight_run_keeps_epoch_ticker_alive ... ok
+
+test result: ok. 49 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.31s
+
+     Running unittests src/lib.rs (/Users/admin/dev/minga/target/debug/deps/minga_scheduler-d606206407f2e009)
+
+running 102 tests
+test constraints::tests::parse_ne ... ok
+test constraints::tests::parse_eq ... ok
+test constraints::tests::parse_errors ... ok
+test constraints::tests::match_node_id ... ok
+test constraints::tests::match_node_role ... ok
+test constraints::tests::missing_label_eq_is_no_match ... ok
+test constraints::tests::missing_label_ne_is_match ... ok
+test constraints::tests::match_label_eq ... ok
+test constraints::tests::matches_str_handles_bad_input ... ok
+test constraints::tests::match_label_ne ... ok
+test constraints::tests::parse_node_id ... ok
+test netassign::tests::missing_network_is_skipped ... ok
+test netassign::tests::colliding_legacy_networks_are_reported_not_moved ... ok
+test netassign::tests::legacy_network_keeps_the_subnet_its_tasks_use ... ok
+test netassign::tests::network_without_stored_subnet_is_an_error ... ok
+test netassign::tests::stopped_tasks_release_their_ip ... ok
+test netassign::tests::never_reuses_a_live_ip ... ok
+test netassign::tests::assigns_deterministic_ip_per_network ... ok
+test placement::tests::check_placeable_allows_zero_replica_scale_down ... ok
+test placement::tests::check_placeable_rejects_on_unmatched_constraints ... ok
+test placement::tests::check_placeable_rejects_when_no_nodes_registered ... ok
+test placement::tests::check_placeable_accepts_placeable_service ... ok
+test placement::tests::constraint_filters_nodes ... ok
+test placement::tests::egress_policy_and_tenant_service_identity_reach_placed_task ... ok
+test placement::tests::existing_tasks_consume_capacity ... ok
+test placement::tests::check_placeable_rejects_on_insufficient_capacity ... ok
+test placement::tests::deterministic_task_ids ... ok
+test placement::tests::global_one_per_node ... ok
+test placement::tests::gpu_constraint_and_capacity ... ok
+test placement::tests::no_eligible_nodes ... ok
+test placement::tests::inactive_nodes_excluded ... ok
+test placement::tests::placement_hard_filters_nodes_to_service_tenant ... ok
+test placement::tests::own_tasks_do_not_evict_the_service_from_a_full_node ... ok
+test placement::tests::replicated_more_replicas_than_nodes ... ok
+test placement::tests::replicated_spread_across_nodes ... ok
+test placement::tests::resource_capacity_respected ... ok
+test placement::tests::raft_last_seen_does_not_determine_node_liveness ... ok
+test placement::tests::stopped_tasks_do_not_consume_capacity ... ok
+test placement::tests::host_mode_ports_hold_one_task_per_node ... ok
+test reconcile::tests::deleted_service_removes_all_tasks ... ok
+test reconcile::tests::global_service_reconcile ... ok
+test reconcile::tests::new_service_creates_tasks ... ok
+test reconcile::tests::a_restart_during_the_rollout_triggers_rollback ... ok
+test reconcile::tests::multiple_services_independent ... ok
+test reconcile::tests::delay_spaces_out_batches ... ok
+test reconcile::tests::no_changes_no_actions ... ok
+test reconcile::tests::host_port_forces_stop_first_but_ingress_keeps_start_first ... ok
+test reconcile::tests::node_becomes_ineligible_removes_task ... ok
+test reconcile::tests::reassigned_task_stays_on_replacement_when_old_node_returns ... ok
+test reconcile::tests::parallelism_limits_tasks_replaced_at_once ... ok
+test reconcile::tests::pause_holds_the_rollout_and_keeps_the_old_task ... ok
+test reconcile::tests::rollout_settles_only_after_the_monitor_window ... ok
+test reconcile::tests::scale_up_creates_only_missing ... ok
+test reconcile::tests::scale_down_removes_excess ... ok
+test reconcile::tests::start_first_update_keeps_old_until_new_runs ... ok
+test reconcile::tests::start_first_leaves_old_running_when_new_fails ... ok
+test reconcile::tests::task_on_missing_node_is_reassigned_to_live_node ... ok
+test placement::tests::revision_ignores_map_order_and_tracks_the_spec ... ok
+test reconcile::tests::stop_first_update_removes_then_creates ... ok
+test secrets::tests::accepts_explicit_target ... ok
+test secrets::tests::deduplicates_identical_reference ... ok
+test secrets::tests::accepts_external_secret_with_default_target ... ok
+test secrets::tests::rejects_duplicate_targets ... ok
+test secrets::tests::rejects_traversal_target ... ok
+test secrets::tests::rejects_undeclared_secret ... ok
+test secrets::tests::rejects_uid_gid_mode ... ok
+test secrets::tests::detects_environment_source_secret ... ok
+test translate::fidelity_tests::string_command_with_unterminated_quote_fails_loudly ... ok
+test translate::fidelity_tests::string_command_and_entrypoint_split_like_compose ... ok
+test secrets::tests::external_secret_has_no_file_source ... ok
+test secrets::tests::detects_file_source_secret ... ok
+test translate::fidelity_tests::port_ranges_expand_to_one_mapping_per_port ... ok
+test translate::tests::memory_case_insensitive ... ok
+test translate::fidelity_tests::compose_fields_reach_state_service ... ok
+test translate::tests::memory_decimals ... ok
+test translate::tests::memory_errors ... ok
+test translate::tests::memory_ib_suffixes ... ok
+test translate::fidelity_tests::network_driver_opts_accept_only_encrypted ... ok
+test translate::tests::memory_plain_bytes ... ok
+test translate::tests::memory_suffixes ... ok
+test translate::tests::parse_duration_secs_compound ... ok
+test translate::tests::parse_duration_secs_invalid ... ok
+test translate::tests::agent_with_egress_policy_is_refused ... ok
+test translate::tests::parse_duration_secs_simple ... ok
+test translate::tests::restart_policy_default_is_none ... ok
+test translate::tests::restart_policy_from_legacy_restart_field ... ok
+test translate::tests::restart_policy_from_deploy ... ok
+test translate::tests::restart_policy_deploy_overrides_legacy ... ok
+test translate::tests::required_egress_policy_survives_compose_translation ... ok
+test translate::tests::translate_agent_service_minimal ... ok
+test translate::tests::translate_agent_service_no_image_needed ... ok
+test translate::tests::translate_container_service_requires_image ... ok
+test translate::tests::translate_agent_service_with_constraints ... ok
+test translate::tests::translate_agent_service_with_resources ... ok
+test translate::tests::translate_container_service_has_no_agent ... ok
+test translate::tests::translate_invalid_agent_extension_fails ... ok
+test translate::tests::translate_mixed_stack ... ok
+test translate::tests::translate_rejects_deploy_labels_before_api_writes ... ok
+test translate::tests::translate_user_and_update_config ... ok
+test translate::tests::translate_agent_service ... ok
+test translate::tests::translate_accepts_named_users_and_rejects_malformed_ones ... ok
+test netassign::tests::three_hundred_networks_get_256_distinct_subnets_then_exhaust ... ok
+
+test result: ok. 102 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.28s
+
+     Running tests/pipeline.rs (/Users/admin/dev/minga/target/debug/deps/pipeline-1ba114c156d039e5)
+
+running 13 tests
+test pipeline_job_mode_fails_loudly ... ok
+test pipeline_rejects_file_backed_secret ... ok
+test pipeline_env_list_and_map_forms ... ok
+test host_publish_mode_survives_compose_translation ... ok
+test agent_service_reconcile_creates_agent_tasks ... ok
+test pipeline_secret_reaches_task_spec ... ok
+test mixed_container_and_agent_pipeline ... ok
+test pipeline_task_states_are_pending ... ok
+test agent_service_full_pipeline ... ok
+test pipeline_scale_and_reconcile ... ok
+test pipeline_with_volumes_secrets_configs ... ok
+test full_pipeline_simple_stack ... ok
+test pipeline_with_constraints_and_global ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/scheduler.rs (/Users/admin/dev/minga/target/debug/deps/scheduler-d8febed14a024691)
+
+running 21 tests
+test bus_lease_controls_node_eligibility ... ok
+test manager_without_endpoint_blocks_multi_node_placement ... ok
+test ingress_backend_and_backendless_workers_peer_both_ways ... ok
+test network_is_projected_only_to_nodes_running_its_tasks ... ok
+test empty_lease_set_does_not_remove_tasks ... ok
+test multi_tenant_placement_and_wireguard_routes_stay_tenant_scoped ... ok
+test one_tenant_at_its_task_quota_does_not_block_other_tenants ... ok
+test ingress_backend_projection_tracks_task_movement ... ok
+test partial_lease_set_after_an_empty_one_does_not_remove_tasks ... ok
+test reconcile_creates_tasks_for_service ... ok
+test reconcile_is_idempotent ... ok
+test reconcile_no_nodes_no_tasks ... ok
+test reconcile_global_service ... ok
+test reconcile_loop_runs_and_converges ... ok
+test reconcile_handles_scale_down ... ok
+test reconcile_removes_tasks_when_service_deleted ... ok
+test reconcile_projects_wireguard_peer_sets_from_live_placement ... ok
+test nat_workers_relay_through_the_lowest_manager_and_fail_over_after_lease_expiry ... ok
+test rollout_refuses_to_restore_an_agent_with_an_egress_policy ... ok
+test rollout_uses_failed_status_from_bus_kv ... ok
+test relay_manager_carries_only_unique_addresses_inside_each_network ... ok
+
+test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.72s
+
+     Running unittests src/lib.rs (/Users/admin/dev/minga/target/debug/deps/minga_state-dfd9fda64fff80ee)
+
+running 27 tests
+test codec::tests::a_defaulted_field_can_be_added_after_data_was_written ... ok
+test codec::tests::the_marker_is_checked_when_a_store_is_opened ... ok
+test join_token::tests::token_rejects_malformed_and_invalid_tenant ... ok
+test codec::tests::a_field_a_newer_build_wrote_is_ignored ... ok
+test codec::tests::wire_frames_carry_the_version_and_refuse_another ... ok
+test types::tests::cross_tenant_ingress_conflict_does_not_disclose_service_id ... ok
+test join_token::tests::token_binds_node_tenant_and_expiry ... ok
+test join_token::tests::token_rejects_a_changed_payload_and_future_issue_time ... ok
+test types::tests::restart_policy_default_is_none ... ok
+test types::tests::only_pre_v9_agent_records_get_an_implicit_env_grant ... ok
+test types::tests::agent_spec_json_roundtrip ... ok
+test types::tests::restart_policy_roundtrip ... ok
+test types::tests::same_tenant_ingress_conflict_names_service ... ok
+test types::tests::taskspec_default_kind_is_container ... ok
+test types::tests::task_spec_roundtrip_carries_secret_references ... ok
+test types::tests::tenant_ids_use_nats_safe_tokens ... ok
+test types::tests::taskspec_roundtrip_with_agent_kind ... ok
+test types::tests::service_roundtrip_with_agent ... ok
+test types::tests::taskspec_with_restart_policy_roundtrip ... ok
+test types::tests::workload_kind_default_is_container ... ok
+test types::tests::workload_kind_roundtrip_agent ... ok
+test types::tests::workload_kind_roundtrip_container ... ok
+test store::tests::data_dir_and_store_files_end_up_owner_only ... ok
+test network::tests::only_a_numbered_manager_san_counts ... ok
+test state_machine::tests::only_a_new_or_changed_wireguard_key_is_checked_for_a_holder ... ok
+test state_machine::tests::upsert_network_apply_uses_only_replica_independent_rules ... ok
+test state_machine::tests::a_snapshot_keeps_change_requests_tenant_keyed ... ok
+
+test result: ok. 27 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.41s
+
+     Running tests/format.rs (/Users/admin/dev/minga/target/debug/deps/format-62dfd7d0c96a16c7)
+
+running 50 tests
+test a_fixture_accepts_added_fields_and_rejects_changed_ones ... ok
+test a_task_failure_reason_is_optional_and_round_trips ... ok
+test a_log_file_without_a_marker_is_refused ... ok
+test a_state_file_without_a_marker_is_refused ... ok
+test a_new_store_gets_the_marker_and_reopens ... ok
+test a_refused_store_is_left_unchanged ... ok
+test a_network_a_service_or_its_rollback_uses_cannot_be_removed ... ok
+test a_decided_or_superseded_request_cannot_apply_again ... ok
+test a_v2_log_file_rewrites_entries_and_preserves_indices ... ok
+test a_v10_store_migrates_and_initializes_change_requests ... ok
+test a_v10_snapshot_keeps_its_egress_policy_without_an_allowance ... ok
+test a_v2_state_file_is_rewritten_and_its_marker_advanced ... ok
+test a_v3_state_file_defaults_legacy_records_to_the_default_tenant ... ok
+test a_v3_log_file_rewrites_entries_and_defaults_tenant_fields ... ok
+test a_v4_log_file_rewrites_entries_and_preserves_tenant_fields ... ok
+test a_v4_state_file_is_migrated_and_seeds_the_default_tenant ... ok
+test a_v7_state_and_log_file_migrate_tenant_revocation_records ... ok
+test a_v5_state_and_log_file_migrate_node_tenants_to_default ... ok
+test a_v6_state_and_log_file_migrate_nats_node_identity ... ok
+test change_request_fixtures ... ok
+test a_v8_state_and_log_file_grant_env_to_legacy_agents ... ok
+test another_tenants_network_is_refused_in_writes_and_approvals ... ok
+test command_fixtures ... ok
+test change_requests_are_keyed_by_tenant_and_check_network_ownership ... ok
+test approval_rechecks_secrets_the_rollback_restores ... ok
+test a_v9_state_and_log_file_migrate_without_egress_policy ... ok
+test a_v9_labelled_snapshot_cannot_smuggle_an_egress_policy_past_the_quota ... ok
+test a_v9_snapshot_imports_at_its_byte_quota_without_egress ... ok
+test change_requests_require_distinct_approval_and_apply_atomically ... ok
+test legacy_tenant_owned_records_default_to_default_tenant ... ok
+test node_fixture ... ok
+test old_cluster_node_without_wireguard_or_reservation_fields_decodes ... ok
+test old_port_mapping_defaults_to_ingress_and_modes_use_lowercase ... ok
+test raft_fixtures ... ok
+test importing_a_v2_portable_snapshot_defaults_fields_and_exports_current ... ok
+test service_fixture ... ok
+test task_fixture ... ok
+test tenant_fixture ... ok
+test tenant_owned_resource_fixtures ... ok
+test importing_a_v3_portable_snapshot_defaults_tenant ... ok
+test importing_a_v4_portable_snapshot_seeds_default_tenant ... ok
+test v3_port_schema_fixtures ... ok
+test a_v8_labelled_snapshot_cannot_smuggle_capabilities_past_the_quota ... ok
+test importing_a_v8_portable_snapshot_grants_env_to_legacy_agents ... ok
+test importing_unsupported_portable_snapshot_versions_is_refused ... ok
+test data_from_a_newer_format_is_refused ... ok
+test removing_a_tenant_drops_its_change_requests ... ok
+test unsupported_older_format_markers_are_refused ... ok
+test a_tenant_keeps_a_bounded_number_of_change_requests ... ok
+test a_v8_snapshot_imports_at_its_byte_quota_and_keeps_the_quota ... ok
+
+test result: ok. 50 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 19.89s
+
+     Running tests/multi_node.rs (/Users/admin/dev/minga/target/debug/deps/multi_node-e1dd0569914f4151)
+
+running 11 tests
+test removing_the_last_manager_is_refused ... ok
+test two_node_cluster ... ok
+test three_nodes_elect_leader ... ok
+test membership_changes_on_a_follower_name_the_leader ... ok
+test follower_writes_forward_to_the_leader ... ok
+test tenant_writes_replicate_to_all_nodes ... ok
+test v1_migration_removes_workers_in_one_membership_change ... ok
+test multiple_writes_replicate ... ok
+test write_replicates_to_all_nodes ... ok
+test cluster_grows_to_five_and_shrinks_without_restart ... ok
+test leader_failover ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.32s
+
+     Running tests/raft_tls.rs (/Users/admin/dev/minga/target/debug/deps/raft_tls-7f57bafa9dea3264)
+
+running 5 tests
+test world_readable_node_key_is_refused ... ok
+test tls_cluster_elects_and_replicates ... ok
+test foreign_ca_peer_cannot_join ... ok
+test worker_certificate_from_the_cluster_ca_cannot_join ... ok
+test uncredentialed_peer_cannot_join ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.72s
+
+     Running tests/single_node.rs (/Users/admin/dev/minga/target/debug/deps/single_node-8f8d846aba0e4df0)
+
+running 21 tests
+test a_snapshot_with_one_refused_network_writes_none ... ok
+test elects_itself_leader ... ok
+test importing_a_snapshot_keeps_existing_tenant_quotas ... ok
+test commit_rejects_a_second_service_on_an_ingress_port ... ok
+test cluster_revocations_survive_tenant_updates_and_deletion ... ok
+test nats_public_key_update_preserves_node_and_missing_node_fails ... ok
+test a_wireguard_key_held_by_another_node_is_refused ... ok
+test a_node_keeps_its_tenant_and_removals_only_touch_the_owners_object ... ok
+test quotas_ignore_stopped_tasks_and_never_block_rewrites ... ok
+test multiple_writes_in_sequence ... ok
+test remove_node ... ok
+test upsert_network_refuses_subnets_the_overlay_must_not_route ... ok
+test upsert_overwrites_existing ... ok
+test state_persists_across_restart ... ok
+test write_and_read_service ... ok
+test write_and_read_node ... ok
+test write_and_read_network_volume_secret_config ... ok
+test tenant_count_and_desired_state_quotas_are_enforced_transactionally ... ok
+test write_and_read_task ... ok
+test writes_under_a_missing_tenant_are_refused_but_default_is_permanent ... ok
+test tenant_crud_is_persisted_and_protects_owned_resources ... ok
+
+test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.24s
+
+     Running unittests src/lib.rs (/Users/admin/dev/minga/target/debug/deps/minga_telemetry-6c6f7f1416d43f7b)
+
+running 9 tests
+test health::tests::clones_share_flags ... ok
+test serve::tests::an_idle_http2_connection_is_closed ... ok
+test serve::tests::a_request_is_served ... ok
+test metrics::tests::usage_counters_export_only_tenant_label ... ok
+test serve::tests::a_partial_http2_preface_is_closed ... ok
+test serve::tests::a_silent_connection_is_closed ... ok
+test serve::tests::a_head_that_never_ends_is_closed ... ok
+test serve::tests::an_idle_keep_alive_connection_is_closed ... ok
+test serve::tests::connections_over_the_cap_wait ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.61s
+
+   Doc-tests minga_api
+
+running 1 test
+test crates/minga-api/src/lib.rs - (line 47) - compile ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.11s
+
+   Doc-tests minga_bus
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests minga_compose
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests minga_ctl
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests minga_egress
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests minga_net
+
+running 1 test
+test crates/minga-net/src/lib.rs - (line 25) ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.33s
+
+   Doc-tests minga_node
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests minga_sandbox
+
+running 1 test
+test crates/minga-sandbox/src/pool.rs - pool (line 17) - compile ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+   Doc-tests minga_scheduler
+
+running 1 test
+test crates/minga-scheduler/src/lib.rs - (line 22) - compile ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+
+   Doc-tests minga_state
+
+running 1 test
+test crates/minga-state/src/lib.rs - (line 18) - compile ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+
+   Doc-tests minga_telemetry
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
