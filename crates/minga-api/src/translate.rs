@@ -180,16 +180,27 @@ pub fn service_spec_to_state(spec: &models::ServiceSpec) -> Result<Service, Stri
         return Err(format!("service '{name}': ContainerSpec.Image is required"));
     }
 
-    // Refuse hardening fields instead of silently dropping them: the
+    // Refuse active hardening fields instead of silently dropping them: the
     // container would run with the defaults while the deployer believes
     // the requested isolation is in effect. Explicit no-ops
-    // (`ReadOnly: false`, empty lists) ask for nothing and stay accepted.
+    // (`ReadOnly: false`, empty lists/Privileges, and unlimited `Pids: 0`)
+    // ask for nothing and stay accepted.
     if container.ReadOnly == Some(true) {
         return Err(format!(
             "service '{name}': ContainerSpec.ReadOnly is not supported"
         ));
     }
-    if container.Privileges.is_some() {
+    if container.Privileges.as_ref().is_some_and(|privileges| {
+        privileges.CredentialSpec.as_ref().is_some_and(|spec| {
+            spec.Config.is_some() || spec.File.is_some() || spec.Registry.is_some()
+        }) || privileges.SELinuxContext.as_ref().is_some_and(|context| {
+            context.Disable.is_some()
+                || context.User.is_some()
+                || context.Role.is_some()
+                || context.Type.is_some()
+                || context.Level.is_some()
+        })
+    }) {
         return Err(format!(
             "service '{name}': ContainerSpec.Privileges is not supported"
         ));
@@ -275,10 +286,11 @@ pub fn service_spec_to_state(spec: &models::ServiceSpec) -> Result<Service, Stri
     // Resources.
     let mut resources = ResourceSpec::default();
     if let Some(res) = &spec.TaskTemplate.Resources {
-        // Pids limits are dropped by the OCI translation; refuse them
-        // like the ContainerSpec hardening fields above.
+        // Non-zero Pids limits are dropped by the OCI translation; refuse
+        // them like the ContainerSpec hardening fields above. Zero is
+        // unlimited in the Docker API.
         for resource_spec in [&res.Limits, &res.Reservations].into_iter().flatten() {
-            if resource_spec.Pids.is_some() {
+            if resource_spec.Pids.is_some_and(|pids| pids != 0) {
                 return Err(format!(
                     "service '{name}': Resources Pids limits are not supported"
                 ));
@@ -1463,8 +1475,26 @@ mod tests {
 
         let mut spec = sample_docker_spec();
         container(&mut spec).Privileges = Some(models::Privileges {
-            CredentialSpec: None,
+            CredentialSpec: Some(models::CredentialSpec {
+                Config: Some("credentialspec.json".to_string()),
+                File: None,
+                Registry: None,
+            }),
             SELinuxContext: None,
+        });
+        let err = service_spec_to_state(&spec).unwrap_err();
+        assert!(err.contains("Privileges"), "{err}");
+
+        let mut spec = sample_docker_spec();
+        container(&mut spec).Privileges = Some(models::Privileges {
+            CredentialSpec: None,
+            SELinuxContext: Some(models::SELinuxContext {
+                Disable: None,
+                User: Some("system_u".to_string()),
+                Role: None,
+                Type: None,
+                Level: None,
+            }),
         });
         let err = service_spec_to_state(&spec).unwrap_err();
         assert!(err.contains("Privileges"), "{err}");
@@ -1503,6 +1533,48 @@ mod tests {
         container.ReadOnly = Some(false);
         container.CapabilityDrop = Some(vec![]);
         container.Ulimits = Some(vec![]);
+        container.Privileges = Some(models::Privileges {
+            CredentialSpec: Some(models::CredentialSpec {
+                Config: None,
+                File: None,
+                Registry: None,
+            }),
+            SELinuxContext: Some(models::SELinuxContext {
+                Disable: None,
+                User: None,
+                Role: None,
+                Type: None,
+                Level: None,
+            }),
+        });
+        spec.TaskTemplate
+            .Resources
+            .as_mut()
+            .unwrap()
+            .Limits
+            .as_mut()
+            .unwrap()
+            .Pids = Some(0);
+        assert!(service_spec_to_state(&spec).is_ok());
+    }
+
+    #[test]
+    fn empty_privileges_and_unlimited_pids_json_are_noops() {
+        let spec: models::ServiceSpec = serde_json::from_str(
+            r#"{
+                "Name": "web",
+                "TaskTemplate": {
+                    "ContainerSpec": {
+                        "Image": "nginx:1.25",
+                        "Privileges": {}
+                    },
+                    "Resources": {
+                        "Limits": {"Pids": 0}
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
         assert!(service_spec_to_state(&spec).is_ok());
     }
 
