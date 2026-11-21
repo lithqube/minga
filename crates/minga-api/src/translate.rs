@@ -180,6 +180,35 @@ pub fn service_spec_to_state(spec: &models::ServiceSpec) -> Result<Service, Stri
         return Err(format!("service '{name}': ContainerSpec.Image is required"));
     }
 
+    // Refuse hardening fields instead of silently dropping them: the
+    // container would run with the defaults while the deployer believes
+    // the requested isolation is in effect. Explicit no-ops
+    // (`ReadOnly: false`, empty lists) ask for nothing and stay accepted.
+    if container.ReadOnly == Some(true) {
+        return Err(format!(
+            "service '{name}': ContainerSpec.ReadOnly is not supported"
+        ));
+    }
+    if container.Privileges.is_some() {
+        return Err(format!(
+            "service '{name}': ContainerSpec.Privileges is not supported"
+        ));
+    }
+    if container
+        .CapabilityDrop
+        .as_ref()
+        .is_some_and(|drops| !drops.is_empty())
+    {
+        return Err(format!(
+            "service '{name}': ContainerSpec.CapabilityDrop is not supported"
+        ));
+    }
+    if container.Ulimits.as_ref().is_some_and(|u| !u.is_empty()) {
+        return Err(format!(
+            "service '{name}': ContainerSpec.Ulimits is not supported"
+        ));
+    }
+
     // Docker's defaults when a field is absent: condition `any`, and
     // MaxAttempts 0 means unlimited. Durations are nanoseconds; state
     // keeps whole seconds, rounded up so a positive delay never becomes 0.
@@ -246,6 +275,15 @@ pub fn service_spec_to_state(spec: &models::ServiceSpec) -> Result<Service, Stri
     // Resources.
     let mut resources = ResourceSpec::default();
     if let Some(res) = &spec.TaskTemplate.Resources {
+        // Pids limits are dropped by the OCI translation; refuse them
+        // like the ContainerSpec hardening fields above.
+        for resource_spec in [&res.Limits, &res.Reservations].into_iter().flatten() {
+            if resource_spec.Pids.is_some() {
+                return Err(format!(
+                    "service '{name}': Resources Pids limits are not supported"
+                ));
+            }
+        }
         if let Some(limits) = &res.Limits {
             if let Some(nano_cpus) = limits.NanoCPUs {
                 resources.cpus = nano_cpus as f64 / 1_000_000_000.0;
@@ -1408,6 +1446,85 @@ mod tests {
         assert!(service_spec_to_state(&spec)
             .unwrap_err()
             .contains("duplicate secret mount"));
+    }
+
+    #[test]
+    fn hardening_fields_are_refused_instead_of_dropped() {
+        // Each field asks for isolation the OCI spec never applies; the
+        // request must fail loudly instead of running without it.
+        fn container(spec: &mut models::ServiceSpec) -> &mut models::ContainerSpec {
+            spec.TaskTemplate.ContainerSpec.as_mut().unwrap()
+        }
+
+        let mut spec = sample_docker_spec();
+        container(&mut spec).ReadOnly = Some(true);
+        let err = service_spec_to_state(&spec).unwrap_err();
+        assert!(err.contains("ReadOnly"), "{err}");
+
+        let mut spec = sample_docker_spec();
+        container(&mut spec).Privileges = Some(models::Privileges {
+            CredentialSpec: None,
+            SELinuxContext: None,
+        });
+        let err = service_spec_to_state(&spec).unwrap_err();
+        assert!(err.contains("Privileges"), "{err}");
+
+        let mut spec = sample_docker_spec();
+        container(&mut spec).CapabilityDrop = Some(vec!["CAP_NET_RAW".to_string()]);
+        let err = service_spec_to_state(&spec).unwrap_err();
+        assert!(err.contains("CapabilityDrop"), "{err}");
+
+        let mut spec = sample_docker_spec();
+        container(&mut spec).Ulimits = Some(vec![models::Ulimit {
+            Name: Some("nofile".to_string()),
+            Soft: Some(1024),
+            Hard: Some(2048),
+        }]);
+        let err = service_spec_to_state(&spec).unwrap_err();
+        assert!(err.contains("Ulimits"), "{err}");
+
+        for in_limits in [true, false] {
+            let mut spec = sample_docker_spec();
+            let resources = spec.TaskTemplate.Resources.as_mut().unwrap();
+            let target = if in_limits {
+                resources.Limits.as_mut().unwrap()
+            } else {
+                resources.Reservations = Some(models::ResourceSpec::default());
+                resources.Reservations.as_mut().unwrap()
+            };
+            target.Pids = Some(100);
+            let err = service_spec_to_state(&spec).unwrap_err();
+            assert!(err.contains("Pids"), "{err}");
+        }
+
+        // Explicit no-ops ask for nothing and stay accepted.
+        let mut spec = sample_docker_spec();
+        let container = container(&mut spec);
+        container.ReadOnly = Some(false);
+        container.CapabilityDrop = Some(vec![]);
+        container.Ulimits = Some(vec![]);
+        assert!(service_spec_to_state(&spec).is_ok());
+    }
+
+    #[test]
+    fn hardening_keys_in_json_are_captured_and_refused() {
+        // CapabilityDrop/Ulimits were previously unmodelled: serde
+        // dropped them before translation ever saw the request.
+        let spec: models::ServiceSpec = serde_json::from_str(
+            r#"{
+                "Name": "web",
+                "TaskTemplate": {
+                    "ContainerSpec": {
+                        "Image": "nginx:1.25",
+                        "CapabilityDrop": ["CAP_NET_RAW"],
+                        "Ulimits": [{"Name": "nofile", "Soft": 1024, "Hard": 2048}]
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        let err = service_spec_to_state(&spec).unwrap_err();
+        assert!(err.contains("CapabilityDrop"), "{err}");
     }
 
     #[test]
