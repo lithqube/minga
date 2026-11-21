@@ -1024,6 +1024,10 @@ async fn worker_cannot_learn_other_tenants_keys_through_request_bodies() {
         .refresh_tenant_lease("beta", 7, b"foreign-lease")
         .await
         .unwrap();
+    manager
+        .refresh_tenant_lease("default", 7, b"own-lease")
+        .await
+        .unwrap();
 
     let worker_config = worker_client_config(dir.path(), &pki);
     let worker = async_nats::connect_with_options(&url, worker_raw_options(&worker_config))
@@ -1041,6 +1045,32 @@ async fn worker_cannot_learn_other_tenants_keys_through_request_bodies() {
             || &message.payload[..] == b"foreign"
             || &message.payload[..] == b"foreign-lease"
     };
+
+    // Control: the same request path, with a body that asks only for the
+    // worker's own prefix, is answered and delivers the worker's own key.
+    let control_inbox = "_INBOX.default.7.qa-control";
+    let mut control = worker.subscribe(control_inbox).await.unwrap();
+    let body = serde_json::json!({"stream_name": "KV_MINGA_ASSIGN", "config": {
+        "name": "qa0",
+        "deliver_subject": control_inbox,
+        "deliver_policy": "all",
+        "ack_policy": "none",
+        "filter_subject": "$KV.MINGA_ASSIGN.default.node.7.task.>",
+    }});
+    let reply = worker
+        .request(
+            "$JS.API.CONSUMER.CREATE.KV_MINGA_ASSIGN.qa0.$KV.MINGA_ASSIGN.default.node.7.task.>",
+            body.to_string().into(),
+        )
+        .await
+        .expect("the worker's own consumer create is answered");
+    let text = String::from_utf8_lossy(&reply.payload);
+    assert!(!text.contains("\"error\""), "own consumer refused: {text}");
+    let own = tokio::time::timeout(Duration::from_secs(2), control.next())
+        .await
+        .expect("the own consumer delivers")
+        .unwrap();
+    assert_eq!(&own.payload[..], b"own");
 
     // Consumer create: the subject names the worker's own prefix, the body
     // asks for tenant beta through a filter list.
@@ -1079,13 +1109,14 @@ async fn worker_cannot_learn_other_tenants_keys_through_request_bodies() {
         )
         .await;
         eprintln!("consumer create {name}: {reply:?}");
-        if let Ok(Ok(reply)) = &reply {
-            let text = String::from_utf8_lossy(&reply.payload);
-            assert!(
-                text.contains("\"error\""),
-                "consumer {name} with body {body} was created: {text}"
-            );
-        }
+        let reply = reply
+            .unwrap_or_else(|_| panic!("consumer {name}: no answer within 2 s"))
+            .unwrap_or_else(|error| panic!("consumer {name}: request failed: {error}"));
+        let text = String::from_utf8_lossy(&reply.payload);
+        assert!(
+            text.contains("\"error\""),
+            "consumer {name} with body {body} was created: {text}"
+        );
     }
     while let Ok(Some(message)) =
         tokio::time::timeout(Duration::from_millis(500), delivered.next()).await
@@ -1098,10 +1129,22 @@ async fn worker_cannot_learn_other_tenants_keys_through_request_bodies() {
 
     // Direct get, last-by-subject form on the worker's own key, with a body
     // that asks for a sequence, the next beta key or a batch of last values.
-    for subject in [
-        "$JS.API.DIRECT.GET.KV_MINGA_ASSIGN.$KV.MINGA_ASSIGN.default.node.7.task.own",
-        "$JS.API.DIRECT.GET.KV_MINGA_LEASES.$KV.MINGA_LEASES.default.lease.node.7",
+    for (subject, own) in [
+        (
+            "$JS.API.DIRECT.GET.KV_MINGA_ASSIGN.$KV.MINGA_ASSIGN.default.node.7.task.own",
+            &b"own"[..],
+        ),
+        (
+            "$JS.API.DIRECT.GET.KV_MINGA_LEASES.$KV.MINGA_LEASES.default.lease.node.7",
+            &b"own-lease"[..],
+        ),
     ] {
+        // Control: an empty body on the same subject returns the worker's own value.
+        let reply = worker
+            .request(subject.to_string(), "".into())
+            .await
+            .unwrap_or_else(|error| panic!("own direct get on {subject}: {error}"));
+        assert_eq!(&reply.payload[..], own, "own direct get on {subject}");
         for body in [
             serde_json::json!({"seq": 1}),
             serde_json::json!({"seq": 2}),
@@ -1120,9 +1163,11 @@ async fn worker_cannot_learn_other_tenants_keys_through_request_bodies() {
                 .await
                 .unwrap();
             worker.flush().await.unwrap();
+            let mut answered = false;
             while let Ok(Some(message)) =
                 tokio::time::timeout(Duration::from_millis(300), replies.next()).await
             {
+                answered = true;
                 eprintln!(
                     "direct get {subject} {body}: {:?} {:?} {:?}",
                     message.status,
@@ -1134,8 +1179,103 @@ async fn worker_cannot_learn_other_tenants_keys_through_request_bodies() {
                     "direct get on {subject} with body {body} returned a beta key: {message:?}"
                 );
             }
+            assert!(
+                answered,
+                "direct get on {subject} with body {body}: no answer"
+            );
         }
     }
+}
+
+/// `CONSUMER.INFO` returns a consumer's config, whose filter subject names the
+/// tenant and node it reads. Workers are not granted it, and the ordered
+/// assignment watch still recovers without it: async-nats recreates a lost
+/// ordered consumer with `CONSUMER.CREATE` only.
+#[tokio::test]
+async fn worker_watch_recovers_without_consumer_info() {
+    let _guard = NATS_TEST_LOCK.lock().await;
+    if nats_server_bin().is_none() {
+        panic!("nats-server binary not found - install it to run the TLS suite");
+    }
+
+    let pki = make_pki();
+    let server = start_worker_acl_server(&pki);
+    wait_ready(&server);
+    let dir = tempfile::tempdir().unwrap();
+    let manager_config = manager_client_config(dir.path(), &pki);
+    let url = format!("tls://localhost:{}", server.port);
+    let manager = NatsBus::connect_secure(&url, &manager_config)
+        .await
+        .unwrap();
+    manager.ensure_tenant_resources("default").await.unwrap();
+    manager
+        .put_assignment("default.node.7.task.before", b"before")
+        .await
+        .unwrap();
+    manager
+        .put_assignment("beta.node.9.task.foreign", b"foreign")
+        .await
+        .unwrap();
+
+    // Tenant beta's consumer, which a worker must not be able to inspect.
+    let manager_client =
+        async_nats::connect_with_options(&url, manager_config.connect_options().unwrap())
+            .await
+            .unwrap();
+    let jetstream = async_nats::jetstream::new(manager_client);
+    let stream = jetstream.get_stream("KV_MINGA_ASSIGN").await.unwrap();
+    stream
+        .create_consumer(async_nats::jetstream::consumer::pull::Config {
+            name: Some("betaprobe".into()),
+            filter_subject: "$KV.MINGA_ASSIGN.beta.node.9.>".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    let worker_config = worker_client_config(dir.path(), &pki);
+    let worker = async_nats::connect_with_options(&url, worker_raw_options(&worker_config))
+        .await
+        .unwrap();
+    let info = tokio::time::timeout(
+        Duration::from_secs(2),
+        worker.request("$JS.API.CONSUMER.INFO.KV_MINGA_ASSIGN.betaprobe", "".into()),
+    )
+    .await;
+    assert!(
+        !matches!(&info, Ok(Ok(reply)) if String::from_utf8_lossy(&reply.payload).contains(".beta.")),
+        "worker 7 read tenant beta's consumer config: {info:?}"
+    );
+    stream.delete_consumer("betaprobe").await.unwrap();
+
+    let worker_bus = NatsBus::connect_worker_secure(&url, &worker_config, 7, "default")
+        .await
+        .unwrap();
+    let mut watch = worker_bus
+        .watch_assignments("default.node.7.task.")
+        .await
+        .expect("worker watches its own prefix");
+    let first = tokio::time::timeout(Duration::from_secs(5), watch.next())
+        .await
+        .expect("watch delivers the existing key")
+        .unwrap();
+    assert_eq!(first.key, "default.node.7.task.before");
+
+    // Drop the worker's consumer under it, as a server restart or consumer
+    // cleanup would, then write a new key: the watch must recreate and deliver.
+    let mut names = stream.consumer_names();
+    while let Some(name) = names.next().await {
+        stream.delete_consumer(&name.unwrap()).await.unwrap();
+    }
+    manager
+        .put_assignment("default.node.7.task.after", b"after")
+        .await
+        .unwrap();
+    let next = tokio::time::timeout(Duration::from_secs(40), watch.next())
+        .await
+        .expect("watch recovers and delivers after its consumer is deleted")
+        .unwrap();
+    assert_eq!(next.key, "default.node.7.task.after");
 }
 
 /// A client presenting a certificate from an untrusted CA is rejected.

@@ -73,7 +73,7 @@ A tenant over quota gets 429 or 507 with the quota named. Quotas are desired sta
 
 - **One `MINGA` account for the control plane**, plus the NATS `SYS` account. Per-tenant accounts are kept for a later tenant bus, where tenant code does connect (agent-plane roadmap F16).
 - **Every subject and key carries the tenant** immediately after the prefix: `minga.<tenant>.task.<id>.status`, `$KV.MINGA_ASSIGN.<tenant>.node.<n>.>`, `$KV.MINGA_LEASES.<tenant>.lease.node.<n>`. Tenant IDs use NATS token characters only (`a–z 0–9 - _`) and never start with `$`.
-- **Worker permissions are tenant-and-node scoped.** Assignment consumers are named with both tenant and node; a worker reads only its own task, network, ingress, WireGuard, lease and status keys, and writes only its own lease, status and logs. It cannot publish shared lifecycle events or audit records. `STREAM.INFO` on shared buckets still reveals bucket size; that is accepted and documented.
+- **Worker permissions are tenant-and-node scoped.** Assignment consumers get random names, and the worker ACL pins each consumer's filter subject to the worker's own tenant and node prefix; on the shared buckets a worker has no `STREAM.INFO` or `CONSUMER.INFO`, which would return other tenants' keys or consumer filters; a worker reads only its own task, network, ingress, WireGuard, lease and status keys, and writes only its own lease, status and logs. It cannot publish shared lifecycle events or audit records. `STREAM.INFO` on shared buckets still reveals bucket size; that is accepted and documented.
 - **Worker resources are tenant-scoped:**
   - `MINGA_LOGS_<tenant>` and `MINGA_STATUS_<tenant>` are worker-writable.
   - `MINGA_USAGE_<tenant>` and `MINGA_BUDGET_<tenant>` are pre-created for tenant accounting.

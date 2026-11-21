@@ -210,7 +210,8 @@ pub fn worker_acl(tenant_id: &str, node_id: u64) -> crate::Result<(Vec<String>, 
         format!("$JS.API.CONSUMER.CREATE.KV_MINGA_ASSIGN.*.{own_ingress}"),
         format!("$JS.API.CONSUMER.CREATE.KV_MINGA_ASSIGN.*.{networks}"),
         format!("$JS.API.CONSUMER.CREATE.KV_MINGA_ASSIGN.*.{own_wireguard}"),
-        "$JS.API.CONSUMER.INFO.KV_MINGA_ASSIGN.*".into(),
+        // No CONSUMER.INFO: it returns any consumer's filter subject, which
+        // names another tenant's node; ordered watches recover with CREATE.
         format!("$JS.API.DIRECT.GET.KV_MINGA_ASSIGN.{own_tasks}"),
         format!("$JS.API.DIRECT.GET.KV_MINGA_ASSIGN.{own_ingress}"),
         format!("$JS.API.DIRECT.GET.KV_MINGA_ASSIGN.{networks}"),

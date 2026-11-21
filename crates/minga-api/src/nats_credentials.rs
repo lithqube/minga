@@ -159,7 +159,8 @@ fn worker_permission_template(tenant_id: &str) -> (Vec<String>, Vec<String>) {
         format!("$JS.API.CONSUMER.CREATE.KV_MINGA_ASSIGN.*.$KV.MINGA_ASSIGN.{tenant_id}.node.{node}.ingress.>"),
         format!("$JS.API.CONSUMER.CREATE.KV_MINGA_ASSIGN.*.$KV.MINGA_ASSIGN.{tenant_id}.node.{node}.net.>"),
         format!("$JS.API.CONSUMER.CREATE.KV_MINGA_ASSIGN.*.$KV.MINGA_ASSIGN.{tenant_id}.node.{node}.wg"),
-        "$JS.API.CONSUMER.INFO.KV_MINGA_ASSIGN.*".to_string(),
+        // No CONSUMER.INFO: it returns any consumer's filter subject, which
+        // names another tenant's node; ordered watches recover with CREATE.
         format!("$JS.API.DIRECT.GET.KV_MINGA_ASSIGN.$KV.MINGA_ASSIGN.{tenant_id}.node.{node}.>"),
         format!("$JS.API.DIRECT.GET.KV_MINGA_STATUS_{tenant_id}.$KV.MINGA_STATUS_{tenant_id}.node.{node}.task.>"),
         format!("$JS.API.DIRECT.GET.KV_MINGA_LEASES.$KV.MINGA_LEASES.{tenant_id}.lease.node.{node}"),
@@ -312,6 +313,10 @@ mod tests {
         assert!(!publish.iter().any(|permission| permission
             .starts_with("$JS.API.STREAM.INFO.KV_MINGA_ASSIGN")
             || permission.starts_with("$JS.API.STREAM.INFO.KV_MINGA_LEASES")));
+        // CONSUMER.INFO returns any consumer's filter, which names its tenant and node.
+        assert!(!publish
+            .iter()
+            .any(|permission| permission.starts_with("$JS.API.CONSUMER.INFO.")));
     }
 
     #[test]
