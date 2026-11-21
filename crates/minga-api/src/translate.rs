@@ -1528,6 +1528,27 @@ mod tests {
     }
 
     #[test]
+    fn ulimits_key_in_json_is_captured_and_refused() {
+        // The combined test above errors on CapabilityDrop first, so it
+        // never proves the Ulimits key binds. A misnamed serde field here
+        // would silently drop Ulimits again — the exact bug being fixed.
+        let spec: models::ServiceSpec = serde_json::from_str(
+            r#"{
+                "Name": "web",
+                "TaskTemplate": {
+                    "ContainerSpec": {
+                        "Image": "nginx:1.25",
+                        "Ulimits": [{"Name": "nofile", "Soft": 1024, "Hard": 2048}]
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        let err = service_spec_to_state(&spec).unwrap_err();
+        assert!(err.contains("Ulimits"), "{err}");
+    }
+
+    #[test]
     fn service_spec_to_state_basic() {
         let spec = sample_docker_spec();
         let svc = service_spec_to_state(&spec).unwrap();
