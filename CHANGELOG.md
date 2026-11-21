@@ -2,12 +2,22 @@
 
 ## Unreleased
 
+- **Security.** One tenant node can no longer stop managers applying the mesh (#127):
+  - Registering a node with a WireGuard key that another node already holds fails with a 409. The answer does
+    not say which node holds the key.
+  - A node applying a WireGuard peer set skips, and logs, only the peers it must not install: an invalid
+    key or AllowedIP, or a key or AllowedIP listed under two peers. It applies the rest. Until now one such
+    peer rejected the whole set.
+  - A peer that `wg` cannot add, for example one whose endpoint does not resolve, is skipped and retried
+    with the next assignment instead of aborting every peer after it.
+
 - **Security, upgrade action needed.** Network subnets are confined to the overlay (#124):
   - Creating a network refuses a subnet outside `--overlay-supernet`, inside the node mesh
     `10.200.0.0/16`, or longer than `/28`, with a 400. Snapshot import refuses the same, before it writes
     anything.
   - WireGuard peer sets carry a task address only inside its own network's subnet, from a node and
-    network of the task's tenant, and under one peer. `validate_peer_set` refuses a duplicate AllowedIP.
+    network of the task's tenant, and under one peer. A node skips every peer that lists a duplicate
+    AllowedIP.
   - A network stored earlier with a subnet outside the supernet stops routing between nodes, and the
     manager logs it once. Before upgrading, widen `--overlay-supernet` on every node to cover any Compose
     `ipam` subnet you use, or recreate those networks inside it.
