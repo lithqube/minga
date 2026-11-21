@@ -2255,9 +2255,11 @@ checksum = "6877bb514081ee2a7ff5ef9de3281f14a4dd4bceac4c09388074a6b5df8a139a"
 name = "minga-api"
 version = "1.2.0"
 dependencies = [
+ "async-nats",
  "axum",
  "base64 0.22.1",
  "chrono",
+ "futures",
  "indexmap 2.14.2",
  "minga-bus",
  "minga-net",

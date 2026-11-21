@@ -243,6 +243,10 @@ fn test_issuer_with_template(
 }
 
 #[cfg(test)]
+#[path = "nats_credentials_jwt_server_tests.rs"]
+mod jwt_server_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use nats_jwt_rs::Claims;
