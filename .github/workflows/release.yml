@@ -93,6 +93,14 @@ jobs:
             exit 1
           fi
 
+      # Cache scope: this job restores and saves no cargo cache, so the
+      # shipped binary compiles from the pinned toolchain and Cargo.lock only.
+      # Swatinem/rust-cache derives its key from the workflow job id (plus
+      # matrix, rustc and lockfile hashes) unless `shared-key` is set, and
+      # ci.yml sets none: its quality/nats jobs write per-job keys that this
+      # `build` job would never have matched anyway. If a cache is added here,
+      # give it a `shared-key` or `prefix-key` no ci.yml job uses, so a
+      # branch-built cache can never feed the tagged release.
       - name: Build the release binary
         run: cargo build --release -p minga-cli --target ${{ matrix.target }}
 
