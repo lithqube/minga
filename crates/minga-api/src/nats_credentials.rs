@@ -153,15 +153,14 @@ fn worker_permission_template(tenant_id: &str) -> (Vec<String>, Vec<String>) {
         format!("minga.{tenant_id}.log.node.{node}.>"),
         format!("$KV.MINGA_STATUS_{tenant_id}.node.{node}.task.>"),
         format!("$KV.MINGA_LEASES.{tenant_id}.lease.node.{node}"),
-        "$JS.API.STREAM.INFO.KV_MINGA_ASSIGN".to_string(),
         format!("$JS.API.STREAM.INFO.KV_MINGA_STATUS_{tenant_id}"),
-        "$JS.API.STREAM.INFO.KV_MINGA_LEASES".to_string(),
         "$JS.FC.KV_MINGA_ASSIGN.>".to_string(),
         format!("$JS.API.CONSUMER.CREATE.KV_MINGA_ASSIGN.*.$KV.MINGA_ASSIGN.{tenant_id}.node.{node}.task.>"),
         format!("$JS.API.CONSUMER.CREATE.KV_MINGA_ASSIGN.*.$KV.MINGA_ASSIGN.{tenant_id}.node.{node}.ingress.>"),
         format!("$JS.API.CONSUMER.CREATE.KV_MINGA_ASSIGN.*.$KV.MINGA_ASSIGN.{tenant_id}.node.{node}.net.>"),
         format!("$JS.API.CONSUMER.CREATE.KV_MINGA_ASSIGN.*.$KV.MINGA_ASSIGN.{tenant_id}.node.{node}.wg"),
-        "$JS.API.CONSUMER.INFO.KV_MINGA_ASSIGN.*".to_string(),
+        // No CONSUMER.INFO: it returns any consumer's filter subject, which
+        // names another tenant's node; ordered watches recover with CREATE.
         format!("$JS.API.DIRECT.GET.KV_MINGA_ASSIGN.$KV.MINGA_ASSIGN.{tenant_id}.node.{node}.>"),
         format!("$JS.API.DIRECT.GET.KV_MINGA_STATUS_{tenant_id}.$KV.MINGA_STATUS_{tenant_id}.node.{node}.task.>"),
         format!("$JS.API.DIRECT.GET.KV_MINGA_LEASES.$KV.MINGA_LEASES.{tenant_id}.lease.node.{node}"),
@@ -244,6 +243,10 @@ fn test_issuer_with_template(
 }
 
 #[cfg(test)]
+#[path = "nats_credentials_jwt_server_tests.rs"]
+mod jwt_server_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use nats_jwt_rs::Claims;
@@ -305,6 +308,19 @@ mod tests {
         assert!(subscribe
             .iter()
             .any(|permission| permission == "$KV.MINGA_ASSIGN.tenant-a.node.{{tag(node)}}.wg"));
+    }
+
+    #[test]
+    fn worker_template_cannot_list_shared_bucket_keys() {
+        // STREAM.INFO with `subjects_filter` lists every tenant's keys.
+        let (publish, _) = worker_permission_template("tenant-a");
+        assert!(!publish.iter().any(|permission| permission
+            .starts_with("$JS.API.STREAM.INFO.KV_MINGA_ASSIGN")
+            || permission.starts_with("$JS.API.STREAM.INFO.KV_MINGA_LEASES")));
+        // CONSUMER.INFO returns any consumer's filter, which names its tenant and node.
+        assert!(!publish
+            .iter()
+            .any(|permission| permission.starts_with("$JS.API.CONSUMER.INFO.")));
     }
 
     #[test]

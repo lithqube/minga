@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+- **Security, upgrade action needed.** A worker can no longer list other tenants' assignment and lease
+  keys (#130):
+  - On nats-server 2.15.3, `STREAM.INFO` with a `subjects_filter` returns every matching key. The worker
+    ACL granted it on the shared `KV_MINGA_ASSIGN` and `KV_MINGA_LEASES` buckets, so a worker could list
+    every tenant's nodes, tasks, networks and ingress ports. Workers no longer get that grant, and open
+    those buckets without it.
+  - `CONSUMER.INFO` on `KV_MINGA_ASSIGN` returned any consumer's config, whose filter subject names
+    another tenant's node. Workers no longer get it; their assignment watches recover with
+    `CONSUMER.CREATE` alone.
+  - Upgrade workers before managers: an older worker still asks for that stream info and cannot connect
+    once its manager's sidecar drops the grant.
+  - Operator/JWT mode: remove `$JS.API.STREAM.INFO.KV_MINGA_ASSIGN`,
+    `$JS.API.STREAM.INFO.KV_MINGA_LEASES` and `$JS.API.CONSUMER.INFO.KV_MINGA_ASSIGN.*` from every tenant
+    signer's permission template and re-sign the account JWT. A manager refuses to start with the old
+    template.
+
 - **Security, upgrade check.** One tenant node can no longer stop managers applying the mesh (#127):
   - A manager refuses to register a node whose WireGuard key another node already holds, logs it, and
     proposes nothing to Raft. Raft refuses the same for any new or changed key. The refusal never names

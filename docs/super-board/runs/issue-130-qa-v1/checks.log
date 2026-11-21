@@ -1,0 +1,343 @@
+    Checking minga-net v1.2.0 (/Users/admin/dev/minga/.claude/worktrees/issue-130-qa/crates/minga-net)
+    Checking openraft v0.9.25
+    Checking async-nats v0.50.0
+    Checking minga-telemetry v1.2.0 (/Users/admin/dev/minga/.claude/worktrees/issue-130-qa/crates/minga-telemetry)
+   Compiling minga-api v1.2.0 (/Users/admin/dev/minga/.claude/worktrees/issue-130-qa/crates/minga-api)
+    Checking minga-compose v1.2.0 (/Users/admin/dev/minga/.claude/worktrees/issue-130-qa/crates/minga-compose)
+    Checking minga-state v1.2.0 (/Users/admin/dev/minga/.claude/worktrees/issue-130-qa/crates/minga-state)
+    Checking minga-bus v1.2.0 (/Users/admin/dev/minga/.claude/worktrees/issue-130-qa/crates/minga-bus)
+    Checking minga-scheduler v1.2.0 (/Users/admin/dev/minga/.claude/worktrees/issue-130-qa/crates/minga-scheduler)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 12.18s
+   Compiling minga-bus v1.2.0 (/Users/admin/dev/minga/.claude/worktrees/issue-130-qa/crates/minga-bus)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 4.51s
+     Running unittests src/lib.rs (/Users/admin/dev/minga/target/debug/deps/minga_bus-87a994c402fe9c4b)
+
+running 53 tests
+test memory::tests::assignment_watch_includes_existing_values ... ok
+test memory::tests::assignments_are_prefix_scoped_and_deletable ... ok
+test memory::tests::same_node_id_assignments_and_status_are_isolated_by_tenant ... ok
+test memory::tests::same_node_id_in_different_tenants_has_distinct_leases ... ok
+test memory::tests::tenant_event_history_is_filtered_and_bounded ... ok
+test memory::tests::tenant_request_quota_is_atomic_and_isolated_by_window_and_tenant ... ok
+test memory::tests::tenant_status_and_audit_are_isolated ... ok
+test memory::tests::test_lease_alive_and_expired ... ok
+test memory::tests::test_lease_per_node ... ok
+test memory::tests::test_lease_refresh_extends ... ok
+test memory::tests::test_list_status_returns_all_entries ... ok
+test memory::tests::test_log_entry_roundtrip ... ok
+test memory::tests::test_log_history_returns_retained_entries ... ok
+test memory::tests::test_log_history_tail_keeps_the_last_entries ... ok
+test memory::tests::test_log_history_wildcard_covers_all_tasks ... ok
+test memory::tests::test_publish_and_subscribe_events ... ok
+test memory::tests::test_publish_and_subscribe_logs ... ok
+test memory::tests::test_put_and_get_status ... ok
+test memory::tests::test_request_no_responder ... ok
+test memory::tests::test_request_reply ... ok
+test memory::tests::test_request_timeout ... ok
+test memory::tests::test_subject_matches_exact ... ok
+test memory::tests::test_subject_matches_gt ... ok
+test memory::tests::test_subject_matches_mixed ... ok
+test memory::tests::test_subject_matches_star ... ok
+test memory::tests::test_subscribe_logs_filters_by_task ... ok
+test memory::tests::test_subscribe_logs_wildcard ... ok
+test memory::tests::test_subscribe_multiple_patterns ... ok
+test memory::tests::test_watch_status ... ok
+test memory::tests::test_watch_status_multiple_keys ... ok
+test memory::tests::usage_event_serialization_keeps_integer_cost_and_no_prompt_body ... ok
+test memory::tests::usage_query_filters_tenant_customer_time_and_limit_and_deduplicates ... ok
+test nats::legacy_key_tests::only_pre_tenant_node_keys_are_legacy ... ok
+test nats::tests::api_level_warning_only_reports_levels_below_four ... ok
+test nats::tests::bounded_consumer_caps_redelivery ... ok
+test nats::tests::decode_errors_are_poison_others_are_transient ... ok
+test subjects::tests::kv_key_formats ... ok
+test subjects::tests::subject_formats ... ok
+test subjects::tests::wildcard_formats ... ok
+test subjects::tests::worker_acl_is_tenant_and_node_scoped ... ok
+test subjects::tests::worker_acl_rejects_invalid_tenant_names ... ok
+test tests::assignment_watch_uses_exact_keys_or_dot_terminated_prefixes ... ok
+test tests::task_status_decodes_pre_extension_reports ... ok
+test tests::usage_subject_is_tenant_and_service_qualified ... ok
+test tls::tests::credentials_builder_rejects_malformed_credentials_without_echoing_them ... ok
+test tls::tests::env_rejects_partial_configuration ... ok
+test tls::tests::env_returns_none_when_nothing_is_set ... ok
+test tls::tests::preflight_accepts_valid_material ... ok
+test tls::tests::preflight_rejects_empty_pem ... ok
+test tls::tests::preflight_rejects_empty_server_name ... ok
+test tls::tests::preflight_rejects_missing_files ... ok
+test tls::tests::preflight_rejects_world_readable_key ... ok
+test tls::tests::seed_list_is_checked_url_by_url ... ok
+
+test result: ok. 53 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.53s
+
+     Running tests/nats_cluster.rs (/Users/admin/dev/minga/target/debug/deps/nats_cluster-34dca1f7b8a1e99e)
+
+running 1 test
+test replicated_bus_survives_losing_one_server ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.66s
+
+     Running tests/nats_consumer_cap.rs (/Users/admin/dev/minga/target/debug/deps/nats_consumer_cap-844e29165b762b1b)
+
+running 1 test
+test assignment_bucket_accepts_more_consumers_than_the_server_default ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/nats_integration.rs (/Users/admin/dev/minga/target/debug/deps/nats_integration-a3d46e65ddb5318f)
+
+running 16 tests
+test common::tests::required_server_unavailability_panics_instead_of_skipping ... ok
+test nats_connect_creates_streams ... ok
+test nats_list_status_returns_existing_keys ... ok
+test nats_log_entries_survive_a_new_subscriber ... ok
+test nats_log_history_is_scoped_to_one_task ... ok
+test nats_log_history_returns_the_last_n_entries ... ok
+test nats_log_history_spans_multiple_fetch_batches ... ok
+test nats_log_stream_isolates_task_ids ... ok
+test nats_publish_and_subscribe_events ... ok
+test nats_publish_and_subscribe_logs ... ok
+test nats_status_kv_roundtrip ... ok
+test nats_tenant_event_history_is_filtered_bounded_and_publish_stamped ... ok
+test nats_usage_cutoff_uses_event_time_not_storage_time ... ok
+test nats_usage_skips_bad_records_and_keeps_newest ... ok
+test nats_watch_status_sees_existing_keys ... ok
+test nats_wildcard_log_subscription_receives_all_tasks ... ok
+
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/nats_lease_expiration.rs (/Users/admin/dev/minga/target/debug/deps/nats_lease_expiration-957946f73416120a)
+
+running 2 tests
+test common::tests::required_server_unavailability_panics_instead_of_skipping ... ok
+test jetstream_expiry_makes_a_node_ineligible ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/nats_legacy_upgrade.rs (/Users/admin/dev/minga/target/debug/deps/nats_legacy_upgrade-113fc58879dfe1f9)
+
+running 3 tests
+test common::tests::required_server_unavailability_panics_instead_of_skipping ... ok
+test connecting_a_manager_purges_pre_tenant_keys_only ... ok
+test connecting_moves_a_pre_tenant_events_stream_to_tenant_subjects ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/nats_runtime.rs (/Users/admin/dev/minga/target/debug/deps/nats_runtime-8ccc75450be29a0c)
+
+running 3 tests
+test assignment_bucket_accepts_more_than_one_thousand_ordered_consumers ... ok
+test common::tests::required_server_unavailability_panics_instead_of_skipping ... ok
+test manager_and_worker_api_levels_and_bucket_consumer_limits ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/nats_stream_update.rs (/Users/admin/dev/minga/target/debug/deps/nats_stream_update-58caacd75db312e7)
+
+running 2 tests
+test common::tests::required_server_unavailability_panics_instead_of_skipping ... ok
+test reconnecting_with_a_new_lease_ttl_updates_the_bucket ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/nats_tls.rs (/Users/admin/dev/minga/target/debug/deps/nats_tls-b6e82d9b64f0952e)
+
+running 12 tests
+test plaintext_client_is_rejected_by_tls_server ... ok
+test plaintext_scheme_is_rejected_in_secure_mode ... ok
+test plaintext_server_still_accepts_plaintext_client ... ok
+test secure_bus_supports_events_status_and_logs ... ok
+test tls_client_with_valid_certificate_connects ... ok
+test tls_client_with_wrong_ca_is_rejected ... ok
+test tls_client_without_certificate_is_rejected ... ok
+test tls_url_host_mismatch_is_rejected ... ok
+test two_servers_form_a_cluster_over_tls_routes ... ok
+test worker_cannot_learn_other_tenants_keys_through_request_bodies ... ok
+test worker_cannot_list_other_tenants_keys_through_stream_info ... ok
+test worker_certificate_cannot_write_assignments_or_other_nodes_status_and_leases ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 40.76s
+
+     Running tests/nats_upgrade.rs (/Users/admin/dev/minga/target/debug/deps/nats_upgrade-85351138f0b8effd)
+
+running 3 tests
+test upgrade_probe ... ignored, run by scripts/nats-upgrade-proof.sh after each server replacement
+test upgrade_seed ... ignored, run by scripts/nats-upgrade-proof.sh on the old server
+test upgrade_verify ... ignored, run by scripts/nats-upgrade-proof.sh once on the final server
+
+test result: ok. 0 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests minga_bus
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Compiling minga-api v1.2.0 (/Users/admin/dev/minga/.claude/worktrees/issue-130-qa/crates/minga-api)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 8.70s
+     Running unittests src/lib.rs (/Users/admin/dev/minga/target/debug/deps/minga_api-9d33684e108747e1)
+
+running 135 tests
+test error::tests::no_content_status ... ok
+test error::tests::from_state_error ... ok
+test error::tests::ok_message_json ... ok
+test error::tests::quota_errors_map_to_rate_limit_or_storage_status ... ok
+test error::tests::not_found_helper ... ok
+test error::tests::bad_request_status ... ok
+test error::tests::conflict_status ... ok
+test handlers::tests::cross_tenant_reserved_port_does_not_block_ingress ... ok
+test error::tests::error_response_format ... ok
+test auth::tests::client_identity_reads_role_and_tenant_from_subject ... ok
+test handlers::tests::deleting_node_fails_closed_when_revocation_bus_is_missing ... ok
+test handlers::tests::agent_usage_is_tenant_scoped_and_operator_output_is_aggregate_only ... ok
+test handlers::tests::same_tenant_reserved_port_still_blocks_ingress ... ok
+test handlers::tests::new_leader_republishes_stored_revocations_once_per_term ... ok
+test handlers::tests::network_subnet_outside_the_overlay_is_refused ... ok
+test handlers::tests::cluster_audit_merges_tenant_trails_by_time ... ok
+test models::node_join_token_tests::debug_output_redacts_the_token_and_seed ... ok
+test models::tests::config_spec_deserialize ... ok
+test models::tests::error_response_serialize ... ok
+test models::tests::labels_match_existence ... ok
+test models::tests::labels_match_key_value ... ok
+test models::tests::labels_match_multiple ... ok
+test handlers::tests::overlapping_ipam_subnet_does_not_disclose_other_networks ... ok
+test models::tests::network_create_deserialize ... ok
+test models::tests::network_resource_serialize ... ok
+test models::tests::node_serialize ... ok
+test handlers::tests::deleting_node_revokes_its_bus_user_before_removing_it ... ok
+test handlers::tests::operator_registered_node_accepts_tenant_assignment_and_defaults_to_default ... ok
+test models::tests::parse_filters_canonical_go_client_form ... ok
+test models::tests::parse_filters_invalid_json ... ok
+test models::tests::parse_filters_none ... ok
+test models::tests::parse_filters_valid ... ok
+test models::tests::service_mode_global ... ok
+test models::tests::secret_spec_deserialize ... ok
+test models::tests::service_serialize_roundtrip ... ok
+test models::tests::version_info_serialize ... ok
+test models::tests::task_serialize ... ok
+test models::tests::service_spec_deserialize ... ok
+test nats_credentials::tests::issuer_rejects_a_template_that_repeats_one_permission_in_place_of_another ... ok
+test nats_credentials::tests::issuer_accepts_sorted_signer_template_permissions ... ok
+test nats_credentials::tests::issued_credentials_are_node_and_tenant_scoped ... ok
+test nats_credentials::tests::effective_worker_permissions_cover_only_its_own_tenant_and_node ... ok
+test nats_credentials::tests::issuer_rejects_missing_tenant_signer ... ok
+test nats_credentials::tests::revocation_claim_contains_the_complete_replicated_key_set ... ok
+test handlers::tests::node_join_token_is_signed_for_the_preregistered_tenant ... ok
+test nats_credentials::tests::wireguard_watch_permissions_are_limited_to_the_tenant_node_key ... ok
+test nats_credentials::tests::worker_template_cannot_list_shared_bucket_keys ... ok
+test handlers::tests::egress_route_secrets_of_another_tenant_are_not_found ... ok
+test handlers::tests::reissuing_node_credentials_revokes_the_previous_nkey ... ok
+test handlers::tests::unknown_network_driver_option_is_refused ... ok
+test handlers::tests::service_admission_scopes_reserved_ports_to_the_service_tenant ... ok
+test server::tests::api_server_start_and_shutdown ... ok
+test handlers::tests::update_excludes_the_services_own_tasks_from_capacity ... ok
+test server::tests::bearer_auth_rejects_and_accepts ... ok
+test server::tests::create_and_list_config ... ok
+test server::tests::a_service_name_cannot_be_taken_over_by_another_tenant ... ok
+test server::tests::client_certificates_scope_docker_routes_to_their_tenant ... ok
+test server::tests::deciding_a_change_request_needs_a_reviewer_certificate ... ok
+test server::tests::create_and_list_secret ... ok
+test server::tests::create_and_list_network ... ok
+test server::tests::create_and_list_service ... ok
+test server::tests::create_node_registers_and_inspects ... ok
+test server::tests::create_node_rejects_duplicates_and_empty_address ... ok
+test server::tests::create_secret_with_inline_data_is_rejected ... ok
+test server::tests::create_service_conflict ... ok
+test server::tests::create_service_fails_loudly_without_nodes ... ok
+test server::tests::delete_service ... ok
+test server::tests::empty_configured_token_never_authenticates ... ok
+test server::tests::fallback_not_found ... ok
+test server::tests::get_info ... ok
+test server::tests::get_version ... ok
+test server::tests::get_service_not_found ... ok
+test server::tests::list_nodes ... ok
+test server::tests::list_tasks_empty ... ok
+test server::tests::missing_status_does_not_replay_raft_actual_fields ... ok
+test server::tests::operator_certificates_need_the_role_the_operation_requires ... ok
+test server::tests::mtls_accepts_ca_signed_clients_and_maps_them_to_roles ... ok
+test server::tests::ping ... ok
+test server::tests::tenant_audit_is_admin_only_and_tenant_scoped ... ok
+test server::tests::state_import_round_trips_v9_agents_and_runs_agent_admission ... ok
+test server::tests::service_filter_by_stack_label ... ok
+test server::tests::state_routes_need_the_token_and_check_version_first ... ok
+test server::tests::the_change_diff_hides_environment_values_but_names_their_keys ... ok
+test server::tests::change_requests_are_tenant_scoped_and_maker_checker_enforced ... ok
+test server::tests::manager_membership_routes_require_admin_auth_and_change_membership ... ok
+test translate::tests::a_failed_task_reports_its_reason_and_exit_code ... ok
+test translate::tests::a_healthy_task_has_a_message_and_no_error_on_the_wire ... ok
+test translate::tests::a_relative_bind_source_is_refused_and_an_absolute_one_kept ... ok
+test translate::tests::a_task_that_failed_to_start_has_an_error_but_no_exit_code ... ok
+test translate::tests::agent_label_directory_grants_are_bounded ... ok
+test translate::tests::agent_label_must_be_a_json_object ... ok
+test translate::tests::agent_label_with_an_invalid_directory_path_is_refused ... ok
+test translate::tests::agent_label_with_env_but_no_env_grant_is_refused ... ok
+test translate::tests::agent_label_with_unknown_keys_is_refused ... ok
+test translate::tests::config_spec_to_state_translation ... ok
+test translate::tests::config_to_docker_translation ... ok
+test translate::tests::docker_port_publish_mode_defaults_and_round_trips ... ok
+test translate::tests::egress_policy_survives_the_docker_api_round_trip_and_is_validated ... ok
+test server::tests::tenant_admin_reaches_audit_and_usage_routes ... ok
+test translate::tests::host_entries_take_aliases_and_reject_a_bare_ip ... ok
+test translate::tests::network_create_to_state_defaults_translation ... ok
+test translate::tests::network_create_to_state_translation ... ok
+test translate::tests::network_to_docker_with_subnet ... ok
+test translate::tests::network_to_docker_without_subnet ... ok
+test translate::tests::node_to_docker_draining ... ok
+test translate::tests::node_to_docker_leader ... ok
+test translate::tests::node_to_docker_worker ... ok
+test translate::tests::secret_spec_to_state_translation ... ok
+test translate::tests::replicated_job_mode_is_preserved_for_tenant_quota_accounting ... ok
+test translate::tests::secret_to_docker_translation ... ok
+test translate::tests::service_roundtrip ... ok
+test translate::tests::service_spec_to_state_basic ... ok
+test translate::tests::service_secret_references_reject_unsafe_targets_and_options ... ok
+test translate::tests::service_spec_to_state_default_mode ... ok
+test translate::tests::service_spec_to_state_global_mode ... ok
+test translate::tests::service_spec_to_state_missing_container ... ok
+test translate::tests::service_spec_to_state_missing_image ... ok
+test translate::tests::service_spec_to_state_missing_name ... ok
+test translate::tests::service_spec_to_state_restart_policy_defaults_and_rounding ... ok
+test translate::tests::service_spec_to_state_no_ports ... ok
+test translate::tests::service_to_docker_env_excludes_minga_stack ... ok
+test translate::tests::system_info_basic ... ok
+test translate::tests::task_to_docker_failed ... ok
+test translate::tests::task_to_docker_pending ... ok
+test translate::tests::task_to_docker_running ... ok
+test translate::tests::user_and_update_policy_survive_the_docker_api_round_trip ... ok
+test translate::tests::version_info_basic ... ok
+test server::tests::task_logs_are_bounded_and_scoped_to_the_callers_tenant ... ok
+test server::tests::task_view_uses_bus_actual_state_and_keeps_traefik_attachments ... ok
+test server::tests::tokenless_api_refuses_browser_shaped_requests ... ok
+test server::tests::update_node_rejects_what_minga_cannot_do ... ok
+test server::tests::tenant_crud_requires_admin_and_protects_owned_resources ... ok
+test server::tests::tokenless_sole_tenant_caller_reads_inventory_but_cannot_administer ... ok
+test server::tests::update_node_drains_and_relabels ... ok
+test server::tests::diagnostics_report_persisted_voters_and_unreachable_member ... ok
+
+test result: ok. 135 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.83s
+
+     Running tests/integration.rs (/Users/admin/dev/minga/target/debug/deps/integration-acacbde759b74259)
+
+running 13 tests
+test docker_cli_version_via_testcontainer ... ok
+test docker_cli_node_ls_via_testcontainer ... ok
+test docker_cli_service_ls_via_testcontainer ... ok
+test docker_cli_info_via_testcontainer ... ok
+test ping_endpoint ... ok
+test version_endpoint ... ok
+test info_endpoint_shows_swarm ... ok
+test node_join_credentials_require_mutual_tls ... ok
+test tasks_endpoint_returns_empty_initially ... ok
+test ingress_port_conflicts_return_http_409 ... ok
+test service_update_changes_replicas ... ok
+test error_responses_are_docker_compatible ... ok
+test full_stack_deploy_workflow ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.95s
+
+   Doc-tests minga_api
+
+running 1 test
+test crates/minga-api/src/lib.rs - (line 47) - compile ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.11s
+

@@ -756,9 +756,9 @@ async fn worker_certificate_cannot_write_assignments_or_other_nodes_status_and_l
         .await
         .expect("worker certificate connects");
     let stream = async_nats::jetstream::new(raw)
-        .get_stream("KV_MINGA_ASSIGN")
+        .get_stream_no_info("KV_MINGA_ASSIGN")
         .await
-        .expect("worker may read stream info");
+        .unwrap();
     // The server, not only the client guard, keeps worker 7 out of other
     // nodes' networks.
     for filter in [
@@ -862,6 +862,444 @@ async fn worker_certificate_cannot_write_assignments_or_other_nodes_status_and_l
             "worker unexpectedly wrote through {subject}: {result:?}"
         );
     }
+}
+
+/// Every subject a `STREAM.INFO` request with `subjects_filter` returns.
+async fn stream_subjects(
+    client: &async_nats::Client,
+    stream: &str,
+    filter: &str,
+) -> Result<Vec<String>, String> {
+    let stream = async_nats::jetstream::new(client.clone())
+        .get_stream_no_info(stream)
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut subjects = stream
+        .info_with_subjects(filter)
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut found = Vec::new();
+    while let Some(entry) = subjects.next().await {
+        found.push(entry.map_err(|error| error.to_string())?.0);
+    }
+    Ok(found)
+}
+
+/// nats-server 2.15.3 answers `STREAM.INFO` with `subjects_filter` with every
+/// matching key. On the shared assignment and lease buckets those keys name
+/// every tenant's nodes, tasks, networks and ingress ports, so a worker must
+/// not be able to send that request at all.
+#[tokio::test]
+async fn worker_cannot_list_other_tenants_keys_through_stream_info() {
+    let _guard = NATS_TEST_LOCK.lock().await;
+    if nats_server_bin().is_none() {
+        panic!("nats-server binary not found - install it to run the TLS suite");
+    }
+
+    let pki = make_pki();
+    let server = start_worker_acl_server(&pki);
+    wait_ready(&server);
+    let dir = tempfile::tempdir().unwrap();
+    let manager_config = manager_client_config(dir.path(), &pki);
+    let url = format!("tls://localhost:{}", server.port);
+    let manager = NatsBus::connect_secure(&url, &manager_config)
+        .await
+        .unwrap();
+    manager.ensure_tenant_resources("default").await.unwrap();
+    manager
+        .put_assignment("default.node.7.task.own", b"own")
+        .await
+        .unwrap();
+    manager
+        .put_assignment("beta.node.9.ingress.8443", b"foreign")
+        .await
+        .unwrap();
+    manager
+        .refresh_tenant_lease("beta", 9, b"foreign-lease")
+        .await
+        .unwrap();
+
+    // What the server returns to a caller allowed to ask: every tenant's keys.
+    let manager_client =
+        async_nats::connect_with_options(&url, manager_config.connect_options().unwrap())
+            .await
+            .unwrap();
+    let listed = stream_subjects(&manager_client, "KV_MINGA_ASSIGN", "$KV.MINGA_ASSIGN.>")
+        .await
+        .unwrap();
+    assert!(listed.contains(&"$KV.MINGA_ASSIGN.beta.node.9.ingress.8443".to_string()));
+    let listed = stream_subjects(&manager_client, "KV_MINGA_LEASES", ">")
+        .await
+        .unwrap();
+    assert!(listed.contains(&"$KV.MINGA_LEASES.beta.lease.node.9".to_string()));
+
+    let worker_config = worker_client_config(dir.path(), &pki);
+    let worker = async_nats::connect_with_options(&url, worker_raw_options(&worker_config))
+        .await
+        .unwrap();
+    for (stream, filter) in [
+        ("KV_MINGA_ASSIGN", "$KV.MINGA_ASSIGN.>"),
+        ("KV_MINGA_ASSIGN", ">"),
+        ("KV_MINGA_LEASES", ">"),
+    ] {
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            stream_subjects(&worker, stream, filter),
+        )
+        .await;
+        assert!(
+            !matches!(result, Ok(Ok(_))),
+            "worker 7 listed {stream} keys with filter {filter}: {result:?}"
+        );
+    }
+
+    // The worker bus still works on the shared buckets without STREAM.INFO.
+    let worker_bus = NatsBus::connect_worker_secure(&url, &worker_config, 7, "default")
+        .await
+        .expect("worker opens the shared buckets without STREAM.INFO");
+    assert_eq!(
+        worker_bus
+            .get_assignment("default.node.7.task.own")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(&b"own"[..])
+    );
+    assert_eq!(
+        worker_bus
+            .get_assignment("default.node.7.task.missing")
+            .await
+            .unwrap(),
+        None
+    );
+    manager
+        .delete_assignment("default.node.7.task.own")
+        .await
+        .unwrap();
+    assert_eq!(
+        worker_bus
+            .get_assignment("default.node.7.task.own")
+            .await
+            .unwrap(),
+        None,
+        "a deleted key reads as absent"
+    );
+    assert!(!worker_bus.is_tenant_node_alive("default", 7).await.unwrap());
+    worker_bus
+        .refresh_tenant_lease("default", 7, b"alive")
+        .await
+        .unwrap();
+    assert!(worker_bus.is_tenant_node_alive("default", 7).await.unwrap());
+    assert!(manager.is_tenant_node_alive("default", 7).await.unwrap());
+}
+
+/// The other JetStream APIs a worker is granted on the shared buckets carry
+/// the allowed subject in the request subject, but also take a JSON body.
+/// A body asking for other tenants' keys must not get them.
+#[tokio::test]
+async fn worker_cannot_learn_other_tenants_keys_through_request_bodies() {
+    let _guard = NATS_TEST_LOCK.lock().await;
+    if nats_server_bin().is_none() {
+        panic!("nats-server binary not found - install it to run the TLS suite");
+    }
+
+    let pki = make_pki();
+    let server = start_worker_acl_server(&pki);
+    wait_ready(&server);
+    let dir = tempfile::tempdir().unwrap();
+    let manager_config = manager_client_config(dir.path(), &pki);
+    let url = format!("tls://localhost:{}", server.port);
+    let manager = NatsBus::connect_secure(&url, &manager_config)
+        .await
+        .unwrap();
+    manager.ensure_tenant_resources("default").await.unwrap();
+    manager
+        .put_assignment("default.node.7.task.own", b"own")
+        .await
+        .unwrap();
+    for key in ["beta.node.7.task.foreign", "beta.node.9.ingress.8443"] {
+        manager.put_assignment(key, b"foreign").await.unwrap();
+    }
+    manager
+        .refresh_tenant_lease("beta", 7, b"foreign-lease")
+        .await
+        .unwrap();
+    manager
+        .refresh_tenant_lease("default", 7, b"own-lease")
+        .await
+        .unwrap();
+
+    let worker_config = worker_client_config(dir.path(), &pki);
+    let worker = async_nats::connect_with_options(&url, worker_raw_options(&worker_config))
+        .await
+        .unwrap();
+    let leaks = |message: &async_nats::Message| {
+        let subject = message
+            .headers
+            .as_ref()
+            .and_then(|headers| headers.get("Nats-Subject"))
+            .map(|value| value.as_str().to_owned())
+            .unwrap_or_default();
+        subject.contains(".beta.")
+            || String::from_utf8_lossy(&message.payload).contains(".beta.")
+            || &message.payload[..] == b"foreign"
+            || &message.payload[..] == b"foreign-lease"
+    };
+
+    // Control: the same request path, with a body that asks only for the
+    // worker's own prefix, is answered and delivers the worker's own key.
+    let control_inbox = "_INBOX.default.7.qa-control";
+    let mut control = worker.subscribe(control_inbox).await.unwrap();
+    let body = serde_json::json!({"stream_name": "KV_MINGA_ASSIGN", "config": {
+        "name": "qa0",
+        "deliver_subject": control_inbox,
+        "deliver_policy": "all",
+        "ack_policy": "none",
+        "filter_subject": "$KV.MINGA_ASSIGN.default.node.7.task.>",
+    }});
+    let reply = worker
+        .request(
+            "$JS.API.CONSUMER.CREATE.KV_MINGA_ASSIGN.qa0.$KV.MINGA_ASSIGN.default.node.7.task.>",
+            body.to_string().into(),
+        )
+        .await
+        .expect("the worker's own consumer create is answered");
+    let text = String::from_utf8_lossy(&reply.payload);
+    assert!(!text.contains("\"error\""), "own consumer refused: {text}");
+    let own = tokio::time::timeout(Duration::from_secs(2), control.next())
+        .await
+        .expect("the own consumer delivers")
+        .unwrap();
+    assert_eq!(&own.payload[..], b"own");
+
+    // Consumer create: the subject names the worker's own prefix, the body
+    // asks for tenant beta through a filter list.
+    let inbox = "_INBOX.default.7.qa-consumer";
+    let mut delivered = worker.subscribe(inbox).await.unwrap();
+    for (name, config) in [
+        (
+            "qa1",
+            serde_json::json!({"filter_subjects": ["$KV.MINGA_ASSIGN.beta.>"]}),
+        ),
+        (
+            "qa2",
+            serde_json::json!({"filter_subjects": [
+                "$KV.MINGA_ASSIGN.default.node.7.task.>",
+                "$KV.MINGA_ASSIGN.beta.>"
+            ]}),
+        ),
+        (
+            "qa3",
+            serde_json::json!({"filter_subject": "$KV.MINGA_ASSIGN.beta.>"}),
+        ),
+        ("qa4", serde_json::json!({})),
+    ] {
+        let mut config = config;
+        config["name"] = name.into();
+        config["deliver_subject"] = inbox.into();
+        config["deliver_policy"] = "all".into();
+        config["ack_policy"] = "none".into();
+        let body = serde_json::json!({"stream_name": "KV_MINGA_ASSIGN", "config": config});
+        let subject = format!(
+            "$JS.API.CONSUMER.CREATE.KV_MINGA_ASSIGN.{name}.$KV.MINGA_ASSIGN.default.node.7.task.>"
+        );
+        let reply = tokio::time::timeout(
+            Duration::from_secs(2),
+            worker.request(subject, body.to_string().into()),
+        )
+        .await;
+        eprintln!("consumer create {name}: {reply:?}");
+        let reply = reply
+            .unwrap_or_else(|_| panic!("consumer {name}: no answer within 2 s"))
+            .unwrap_or_else(|error| panic!("consumer {name}: request failed: {error}"));
+        let text = String::from_utf8_lossy(&reply.payload);
+        assert!(
+            text.contains("\"error\""),
+            "consumer {name} with body {body} was created: {text}"
+        );
+    }
+    while let Ok(Some(message)) =
+        tokio::time::timeout(Duration::from_millis(500), delivered.next()).await
+    {
+        assert!(
+            !leaks(&message),
+            "a worker consumer delivered a tenant beta key: {message:?}"
+        );
+    }
+
+    // Direct get, last-by-subject form on the worker's own key, with a body
+    // that asks for a sequence, the next beta key or a batch of last values.
+    for (subject, own) in [
+        (
+            "$JS.API.DIRECT.GET.KV_MINGA_ASSIGN.$KV.MINGA_ASSIGN.default.node.7.task.own",
+            &b"own"[..],
+        ),
+        (
+            "$JS.API.DIRECT.GET.KV_MINGA_LEASES.$KV.MINGA_LEASES.default.lease.node.7",
+            &b"own-lease"[..],
+        ),
+    ] {
+        // Control: an empty body on the same subject returns the worker's own value.
+        let reply = worker
+            .request(subject.to_string(), "".into())
+            .await
+            .unwrap_or_else(|error| panic!("own direct get on {subject}: {error}"));
+        assert_eq!(&reply.payload[..], own, "own direct get on {subject}");
+        for body in [
+            serde_json::json!({"seq": 1}),
+            serde_json::json!({"seq": 2}),
+            serde_json::json!({"seq": 3}),
+            serde_json::json!({"next_by_subj": "$KV.MINGA_ASSIGN.beta.>", "seq": 1}),
+            serde_json::json!({"next_by_subj": "$KV.MINGA_LEASES.beta.>", "seq": 1}),
+            serde_json::json!({"last_by_subj": "$KV.MINGA_ASSIGN.beta.node.7.task.foreign"}),
+            serde_json::json!({"multi_last": [">"], "batch": 10}),
+            serde_json::json!({"seq": 1, "batch": 10}),
+        ] {
+            // A batch answers with several messages, so read them all.
+            let reply_inbox = worker.new_inbox();
+            let mut replies = worker.subscribe(reply_inbox.clone()).await.unwrap();
+            worker
+                .publish_with_reply(subject.to_string(), reply_inbox, body.to_string().into())
+                .await
+                .unwrap();
+            worker.flush().await.unwrap();
+            let mut answered = false;
+            while let Ok(Some(message)) =
+                tokio::time::timeout(Duration::from_millis(300), replies.next()).await
+            {
+                answered = true;
+                eprintln!(
+                    "direct get {subject} {body}: {:?} {:?} {:?}",
+                    message.status,
+                    message.description,
+                    String::from_utf8_lossy(&message.payload)
+                );
+                assert!(
+                    !leaks(&message),
+                    "direct get on {subject} with body {body} returned a beta key: {message:?}"
+                );
+            }
+            assert!(
+                answered,
+                "direct get on {subject} with body {body}: no answer"
+            );
+        }
+    }
+}
+
+/// `CONSUMER.INFO` returns a consumer's config, whose filter subject names the
+/// tenant and node it reads. Workers are not granted it, and the ordered
+/// assignment watch still recovers without it: async-nats recreates a lost
+/// ordered consumer with `CONSUMER.CREATE` only.
+#[tokio::test]
+async fn worker_watch_recovers_without_consumer_info() {
+    let _guard = NATS_TEST_LOCK.lock().await;
+    if nats_server_bin().is_none() {
+        panic!("nats-server binary not found - install it to run the TLS suite");
+    }
+
+    let pki = make_pki();
+    let server = start_worker_acl_server(&pki);
+    wait_ready(&server);
+    let dir = tempfile::tempdir().unwrap();
+    let manager_config = manager_client_config(dir.path(), &pki);
+    let url = format!("tls://localhost:{}", server.port);
+    let manager = NatsBus::connect_secure(&url, &manager_config)
+        .await
+        .unwrap();
+    manager.ensure_tenant_resources("default").await.unwrap();
+    manager
+        .put_assignment("default.node.7.task.before", b"before")
+        .await
+        .unwrap();
+    manager
+        .put_assignment("beta.node.9.task.foreign", b"foreign")
+        .await
+        .unwrap();
+
+    // Tenant beta's consumer, which a worker must not be able to inspect.
+    let manager_client =
+        async_nats::connect_with_options(&url, manager_config.connect_options().unwrap())
+            .await
+            .unwrap();
+    let jetstream = async_nats::jetstream::new(manager_client);
+    let stream = jetstream.get_stream("KV_MINGA_ASSIGN").await.unwrap();
+    stream
+        .create_consumer(async_nats::jetstream::consumer::pull::Config {
+            name: Some("betaprobe".into()),
+            filter_subject: "$KV.MINGA_ASSIGN.beta.node.9.>".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    // Control: the consumer exists and its config names tenant beta.
+    let config = stream.consumer_info("betaprobe").await.unwrap().config;
+    assert_eq!(config.filter_subject, "$KV.MINGA_ASSIGN.beta.node.9.>");
+
+    let worker_config = worker_client_config(dir.path(), &pki);
+    let (errors_tx, mut errors) = tokio::sync::mpsc::unbounded_channel();
+    let worker = async_nats::connect_with_options(
+        &url,
+        worker_raw_options(&worker_config).event_callback(move |event| {
+            let errors_tx = errors_tx.clone();
+            async move {
+                if let async_nats::Event::ServerError(error) = event {
+                    let _ = errors_tx.send(error.to_string());
+                }
+            }
+        }),
+    )
+    .await
+    .unwrap();
+    let info = tokio::time::timeout(
+        Duration::from_secs(2),
+        worker.request("$JS.API.CONSUMER.INFO.KV_MINGA_ASSIGN.betaprobe", "".into()),
+    )
+    .await;
+    assert!(
+        !matches!(&info, Ok(Ok(_))),
+        "worker 7 got an answer about tenant beta's consumer: {info:?}"
+    );
+    // The missing answer must be the server refusing the publish, not a slow server.
+    let refusal = tokio::time::timeout(Duration::from_secs(2), errors.recv())
+        .await
+        .expect("the server reports a permissions violation")
+        .unwrap();
+    assert!(
+        refusal.contains("Permissions Violation")
+            && refusal.contains("$JS.API.CONSUMER.INFO.KV_MINGA_ASSIGN.betaprobe"),
+        "unexpected server error: {refusal}"
+    );
+    stream.delete_consumer("betaprobe").await.unwrap();
+
+    let worker_bus = NatsBus::connect_worker_secure(&url, &worker_config, 7, "default")
+        .await
+        .unwrap();
+    let mut watch = worker_bus
+        .watch_assignments("default.node.7.task.")
+        .await
+        .expect("worker watches its own prefix");
+    let first = tokio::time::timeout(Duration::from_secs(5), watch.next())
+        .await
+        .expect("watch delivers the existing key")
+        .unwrap();
+    assert_eq!(first.key, "default.node.7.task.before");
+
+    // Drop the worker's consumer under it, as a server restart or consumer
+    // cleanup would, then write a new key: the watch must recreate and deliver.
+    let mut names = stream.consumer_names();
+    while let Some(name) = names.next().await {
+        stream.delete_consumer(&name.unwrap()).await.unwrap();
+    }
+    manager
+        .put_assignment("default.node.7.task.after", b"after")
+        .await
+        .unwrap();
+    let next = tokio::time::timeout(Duration::from_secs(40), watch.next())
+        .await
+        .expect("watch recovers and delivers after its consumer is deleted")
+        .unwrap();
+    assert_eq!(next.key, "default.node.7.task.after");
 }
 
 /// A client presenting a certificate from an untrusted CA is rejected.

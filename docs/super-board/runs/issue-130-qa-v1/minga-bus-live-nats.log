@@ -1,0 +1,165 @@
+    Blocking waiting for file lock on build directory
+   Compiling minga-bus v1.2.0 (/Users/admin/dev/minga/.claude/worktrees/issue-130-qa/crates/minga-bus)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 13.55s
+     Running unittests src/lib.rs (/Users/admin/dev/minga/target/debug/deps/minga_bus-87a994c402fe9c4b)
+
+running 53 tests
+test memory::tests::assignment_watch_includes_existing_values ... ok
+test memory::tests::assignments_are_prefix_scoped_and_deletable ... ok
+test memory::tests::same_node_id_assignments_and_status_are_isolated_by_tenant ... ok
+test memory::tests::same_node_id_in_different_tenants_has_distinct_leases ... ok
+test memory::tests::tenant_event_history_is_filtered_and_bounded ... ok
+test memory::tests::tenant_request_quota_is_atomic_and_isolated_by_window_and_tenant ... ok
+test memory::tests::tenant_status_and_audit_are_isolated ... ok
+test memory::tests::test_lease_alive_and_expired ... ok
+test memory::tests::test_lease_per_node ... ok
+test memory::tests::test_lease_refresh_extends ... ok
+test memory::tests::test_list_status_returns_all_entries ... ok
+test memory::tests::test_log_entry_roundtrip ... ok
+test memory::tests::test_log_history_returns_retained_entries ... ok
+test memory::tests::test_log_history_tail_keeps_the_last_entries ... ok
+test memory::tests::test_log_history_wildcard_covers_all_tasks ... ok
+test memory::tests::test_publish_and_subscribe_events ... ok
+test memory::tests::test_publish_and_subscribe_logs ... ok
+test memory::tests::test_put_and_get_status ... ok
+test memory::tests::test_request_no_responder ... ok
+test memory::tests::test_request_reply ... ok
+test memory::tests::test_request_timeout ... ok
+test memory::tests::test_subject_matches_exact ... ok
+test memory::tests::test_subject_matches_gt ... ok
+test memory::tests::test_subject_matches_mixed ... ok
+test memory::tests::test_subject_matches_star ... ok
+test memory::tests::test_subscribe_logs_filters_by_task ... ok
+test memory::tests::test_subscribe_logs_wildcard ... ok
+test memory::tests::test_subscribe_multiple_patterns ... ok
+test memory::tests::test_watch_status ... ok
+test memory::tests::test_watch_status_multiple_keys ... ok
+test memory::tests::usage_event_serialization_keeps_integer_cost_and_no_prompt_body ... ok
+test memory::tests::usage_query_filters_tenant_customer_time_and_limit_and_deduplicates ... ok
+test nats::legacy_key_tests::only_pre_tenant_node_keys_are_legacy ... ok
+test nats::tests::api_level_warning_only_reports_levels_below_four ... ok
+test nats::tests::bounded_consumer_caps_redelivery ... ok
+test nats::tests::decode_errors_are_poison_others_are_transient ... ok
+test subjects::tests::kv_key_formats ... ok
+test subjects::tests::subject_formats ... ok
+test subjects::tests::wildcard_formats ... ok
+test subjects::tests::worker_acl_is_tenant_and_node_scoped ... ok
+test subjects::tests::worker_acl_rejects_invalid_tenant_names ... ok
+test tests::assignment_watch_uses_exact_keys_or_dot_terminated_prefixes ... ok
+test tests::task_status_decodes_pre_extension_reports ... ok
+test tests::usage_subject_is_tenant_and_service_qualified ... ok
+test tls::tests::credentials_builder_rejects_malformed_credentials_without_echoing_them ... ok
+test tls::tests::env_rejects_partial_configuration ... ok
+test tls::tests::env_returns_none_when_nothing_is_set ... ok
+test tls::tests::preflight_accepts_valid_material ... ok
+test tls::tests::preflight_rejects_empty_pem ... ok
+test tls::tests::preflight_rejects_empty_server_name ... ok
+test tls::tests::preflight_rejects_missing_files ... ok
+test tls::tests::preflight_rejects_world_readable_key ... ok
+test tls::tests::seed_list_is_checked_url_by_url ... ok
+
+test result: ok. 53 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.54s
+
+     Running tests/nats_cluster.rs (/Users/admin/dev/minga/target/debug/deps/nats_cluster-34dca1f7b8a1e99e)
+
+running 1 test
+test replicated_bus_survives_losing_one_server ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.68s
+
+     Running tests/nats_consumer_cap.rs (/Users/admin/dev/minga/target/debug/deps/nats_consumer_cap-844e29165b762b1b)
+
+running 1 test
+test assignment_bucket_accepts_more_consumers_than_the_server_default ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.90s
+
+     Running tests/nats_integration.rs (/Users/admin/dev/minga/target/debug/deps/nats_integration-a3d46e65ddb5318f)
+
+running 16 tests
+test common::tests::required_server_unavailability_panics_instead_of_skipping ... ok
+test nats_connect_creates_streams ... ok
+test nats_list_status_returns_existing_keys ... ok
+test nats_log_entries_survive_a_new_subscriber ... ok
+test nats_log_history_is_scoped_to_one_task ... ok
+test nats_log_history_returns_the_last_n_entries ... ok
+test nats_log_history_spans_multiple_fetch_batches ... ok
+test nats_log_stream_isolates_task_ids ... ok
+test nats_publish_and_subscribe_events ... ok
+test nats_publish_and_subscribe_logs ... ok
+test nats_status_kv_roundtrip ... ok
+test nats_tenant_event_history_is_filtered_bounded_and_publish_stamped ... ok
+test nats_usage_cutoff_uses_event_time_not_storage_time ... ok
+test nats_usage_skips_bad_records_and_keeps_newest ... ok
+test nats_watch_status_sees_existing_keys ... ok
+test nats_wildcard_log_subscription_receives_all_tasks ... ok
+
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.31s
+
+     Running tests/nats_lease_expiration.rs (/Users/admin/dev/minga/target/debug/deps/nats_lease_expiration-957946f73416120a)
+
+running 2 tests
+test common::tests::required_server_unavailability_panics_instead_of_skipping ... ok
+test jetstream_expiry_makes_a_node_ineligible ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.31s
+
+     Running tests/nats_legacy_upgrade.rs (/Users/admin/dev/minga/target/debug/deps/nats_legacy_upgrade-113fc58879dfe1f9)
+
+running 3 tests
+test common::tests::required_server_unavailability_panics_instead_of_skipping ... ok
+test connecting_a_manager_purges_pre_tenant_keys_only ... ok
+test connecting_moves_a_pre_tenant_events_stream_to_tenant_subjects ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 8.09s
+
+     Running tests/nats_runtime.rs (/Users/admin/dev/minga/target/debug/deps/nats_runtime-8ccc75450be29a0c)
+
+running 3 tests
+test assignment_bucket_accepts_more_than_one_thousand_ordered_consumers ... ok
+test common::tests::required_server_unavailability_panics_instead_of_skipping ... ok
+test manager_and_worker_api_levels_and_bucket_consumer_limits ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.34s
+
+     Running tests/nats_stream_update.rs (/Users/admin/dev/minga/target/debug/deps/nats_stream_update-58caacd75db312e7)
+
+running 2 tests
+test common::tests::required_server_unavailability_panics_instead_of_skipping ... ok
+test reconnecting_with_a_new_lease_ttl_updates_the_bucket ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+     Running tests/nats_tls.rs (/Users/admin/dev/minga/target/debug/deps/nats_tls-b6e82d9b64f0952e)
+
+running 12 tests
+test plaintext_client_is_rejected_by_tls_server ... ok
+test plaintext_scheme_is_rejected_in_secure_mode ... ok
+test plaintext_server_still_accepts_plaintext_client ... ok
+test secure_bus_supports_events_status_and_logs ... ok
+test tls_client_with_valid_certificate_connects ... ok
+test tls_client_with_wrong_ca_is_rejected ... ok
+test tls_client_without_certificate_is_rejected ... ok
+test tls_url_host_mismatch_is_rejected ... ok
+test two_servers_form_a_cluster_over_tls_routes ... ok
+test worker_cannot_learn_other_tenants_keys_through_request_bodies ... ok
+test worker_cannot_list_other_tenants_keys_through_stream_info ... ok
+test worker_certificate_cannot_write_assignments_or_other_nodes_status_and_leases ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 40.68s
+
+     Running tests/nats_upgrade.rs (/Users/admin/dev/minga/target/debug/deps/nats_upgrade-85351138f0b8effd)
+
+running 3 tests
+test upgrade_probe ... ignored, run by scripts/nats-upgrade-proof.sh after each server replacement
+test upgrade_seed ... ignored, run by scripts/nats-upgrade-proof.sh on the old server
+test upgrade_verify ... ignored, run by scripts/nats-upgrade-proof.sh once on the final server
+
+test result: ok. 0 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests minga_bus
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

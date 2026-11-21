@@ -1,0 +1,40 @@
+   Compiling minga-bus v1.2.0 (/Users/admin/dev/minga/.claude/worktrees/issue-130-qa/crates/minga-bus)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.22s
+     Running tests/nats_tls.rs (/Users/admin/dev/minga/target/debug/deps/nats_tls-b6e82d9b64f0952e)
+
+running 12 tests
+test plaintext_client_is_rejected_by_tls_server ... ok
+test plaintext_scheme_is_rejected_in_secure_mode ... ok
+test plaintext_server_still_accepts_plaintext_client ... ok
+test secure_bus_supports_events_status_and_logs ... ok
+test tls_client_with_valid_certificate_connects ... ok
+test tls_client_with_wrong_ca_is_rejected ... ok
+test tls_client_without_certificate_is_rejected ... ok
+test tls_url_host_mismatch_is_rejected ... ok
+test two_servers_form_a_cluster_over_tls_routes ... ok
+test worker_cannot_learn_other_tenants_keys_through_request_bodies ... consumer create qa1: Ok(Ok(Message { subject: Subject { bytes: b"_INBOX.default.7.SL9ceiquLEtsqND2miebfx.SL9ceiquLEtsqND2miebbi" }, reply: None, payload: b"{\"type\":\"io.nats.jetstream.api.v1.consumer_create_response\",\"error\":{\"code\":400,\"err_code\":10137,\"description\":\"consumer with multiple subject filters cannot use subject based API\"}}", headers: None, status: None, description: None, length: 244 }))
+consumer create qa2: Ok(Ok(Message { subject: Subject { bytes: b"_INBOX.default.7.SL9ceiquLEtsqND2miebfx.SL9ceiquLEtsqND2miebkC" }, reply: None, payload: b"{\"type\":\"io.nats.jetstream.api.v1.consumer_create_response\",\"error\":{\"code\":400,\"err_code\":10137,\"description\":\"consumer with multiple subject filters cannot use subject based API\"}}", headers: None, status: None, description: None, length: 244 }))
+consumer create qa3: Ok(Ok(Message { subject: Subject { bytes: b"_INBOX.default.7.SL9ceiquLEtsqND2miebfx.SL9ceiquLEtsqND2mieboR" }, reply: None, payload: b"{\"type\":\"io.nats.jetstream.api.v1.consumer_create_response\",\"error\":{\"code\":400,\"err_code\":10131,\"description\":\"Consumer create request did not match filtered subject from create subject\"}}", headers: None, status: None, description: None, length: 251 }))
+consumer create qa4: Ok(Ok(Message { subject: Subject { bytes: b"_INBOX.default.7.SL9ceiquLEtsqND2miebfx.SL9ceiquLEtsqND2miebsg" }, reply: None, payload: b"{\"type\":\"io.nats.jetstream.api.v1.consumer_create_response\",\"error\":{\"code\":400,\"err_code\":10131,\"description\":\"Consumer create request did not match filtered subject from create subject\"}}", headers: None, status: None, description: None, length: 251 }))
+direct get $JS.API.DIRECT.GET.KV_MINGA_ASSIGN.$KV.MINGA_ASSIGN.default.node.7.task.own {"seq":1}: Some(408) Some("Bad Request") ""
+direct get $JS.API.DIRECT.GET.KV_MINGA_ASSIGN.$KV.MINGA_ASSIGN.default.node.7.task.own {"seq":2}: Some(408) Some("Bad Request") ""
+direct get $JS.API.DIRECT.GET.KV_MINGA_ASSIGN.$KV.MINGA_ASSIGN.default.node.7.task.own {"seq":3}: Some(408) Some("Bad Request") ""
+direct get $JS.API.DIRECT.GET.KV_MINGA_ASSIGN.$KV.MINGA_ASSIGN.default.node.7.task.own {"next_by_subj":"$KV.MINGA_ASSIGN.beta.>","seq":1}: Some(408) Some("Bad Request") ""
+direct get $JS.API.DIRECT.GET.KV_MINGA_ASSIGN.$KV.MINGA_ASSIGN.default.node.7.task.own {"next_by_subj":"$KV.MINGA_LEASES.beta.>","seq":1}: Some(408) Some("Bad Request") ""
+direct get $JS.API.DIRECT.GET.KV_MINGA_ASSIGN.$KV.MINGA_ASSIGN.default.node.7.task.own {"last_by_subj":"$KV.MINGA_ASSIGN.beta.node.7.task.foreign"}: Some(408) Some("Bad Request") ""
+direct get $JS.API.DIRECT.GET.KV_MINGA_ASSIGN.$KV.MINGA_ASSIGN.default.node.7.task.own {"batch":10,"multi_last":[">"]}: Some(408) Some("Bad Request") ""
+direct get $JS.API.DIRECT.GET.KV_MINGA_ASSIGN.$KV.MINGA_ASSIGN.default.node.7.task.own {"batch":10,"seq":1}: Some(408) Some("Bad Request") ""
+direct get $JS.API.DIRECT.GET.KV_MINGA_LEASES.$KV.MINGA_LEASES.default.lease.node.7 {"seq":1}: Some(408) Some("Bad Request") ""
+direct get $JS.API.DIRECT.GET.KV_MINGA_LEASES.$KV.MINGA_LEASES.default.lease.node.7 {"seq":2}: Some(408) Some("Bad Request") ""
+direct get $JS.API.DIRECT.GET.KV_MINGA_LEASES.$KV.MINGA_LEASES.default.lease.node.7 {"seq":3}: Some(408) Some("Bad Request") ""
+direct get $JS.API.DIRECT.GET.KV_MINGA_LEASES.$KV.MINGA_LEASES.default.lease.node.7 {"next_by_subj":"$KV.MINGA_ASSIGN.beta.>","seq":1}: Some(408) Some("Bad Request") ""
+direct get $JS.API.DIRECT.GET.KV_MINGA_LEASES.$KV.MINGA_LEASES.default.lease.node.7 {"next_by_subj":"$KV.MINGA_LEASES.beta.>","seq":1}: Some(408) Some("Bad Request") ""
+direct get $JS.API.DIRECT.GET.KV_MINGA_LEASES.$KV.MINGA_LEASES.default.lease.node.7 {"last_by_subj":"$KV.MINGA_ASSIGN.beta.node.7.task.foreign"}: Some(408) Some("Bad Request") ""
+direct get $JS.API.DIRECT.GET.KV_MINGA_LEASES.$KV.MINGA_LEASES.default.lease.node.7 {"batch":10,"multi_last":[">"]}: Some(408) Some("Bad Request") ""
+direct get $JS.API.DIRECT.GET.KV_MINGA_LEASES.$KV.MINGA_LEASES.default.lease.node.7 {"batch":10,"seq":1}: Some(408) Some("Bad Request") ""
+ok
+test worker_cannot_list_other_tenants_keys_through_stream_info ... ok
+test worker_certificate_cannot_write_assignments_or_other_nodes_status_and_leases ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 41.07s
+

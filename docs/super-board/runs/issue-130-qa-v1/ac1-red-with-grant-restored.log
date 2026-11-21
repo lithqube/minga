@@ -1,0 +1,22 @@
+   Compiling minga-bus v1.2.0 (/Users/admin/dev/minga/.claude/worktrees/issue-130-qa/crates/minga-bus)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.93s
+     Running tests/nats_tls.rs (/Users/admin/dev/minga/target/debug/deps/nats_tls-b6e82d9b64f0952e)
+
+running 1 test
+test worker_cannot_list_other_tenants_keys_through_stream_info ... FAILED
+
+failures:
+
+---- worker_cannot_list_other_tenants_keys_through_stream_info stdout ----
+
+thread 'worker_cannot_list_other_tenants_keys_through_stream_info' (2211243) panicked at crates/minga-bus/tests/nats_tls.rs:950:9:
+worker 7 listed KV_MINGA_ASSIGN keys with filter $KV.MINGA_ASSIGN.>: Ok(Ok(["$KV.MINGA_ASSIGN.beta.node.9.ingress.8443", "$KV.MINGA_ASSIGN.default.node.7.task.own"]))
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    worker_cannot_list_other_tenants_keys_through_stream_info
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 11 filtered out; finished in 0.46s
+
+error: test failed, to rerun pass `-p minga-bus --test nats_tls`
