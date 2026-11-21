@@ -1152,8 +1152,10 @@ async fn check_service_secrets(
     {
         match app.store.get_secret(secret_id).await? {
             Some(secret) if secret.tenant_id == tenant_id => {}
-            Some(_) => return Err(not_found("secret", secret_id)),
-            None => {
+            // A secret another tenant owns is answered like an absent one:
+            // otherwise the caller can probe foreign secret names (ADR 0008
+            // §2 — a tenant never learns another tenant's object exists).
+            _ => {
                 return Err(bad_request(format!(
                     "secret `{secret_id}` is not declared; create its metadata and provision it on eligible nodes first"
                 )))
@@ -3169,6 +3171,62 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err, ApiError::BadRequest(_)), "{err:?}");
         assert!(app.store.get_service("bot").await.unwrap().is_none());
+    }
+
+    /// Regression for the cross-tenant existence oracle: a service that
+    /// references a secret owned by another tenant must get the same answer
+    /// as one referencing an undeclared secret (ADR 0008 §2).
+    #[tokio::test]
+    async fn foreign_secret_reference_gets_the_same_answer_as_an_absent_one() {
+        let (app, _dir) = app_with_node(1.0).await;
+        app.store
+            .create_tenant(Tenant {
+                nats_revoked_user_public_keys: Vec::new(),
+                id: "acme".into(),
+                name: "Acme".into(),
+                quotas: Default::default(),
+                created_at: 1,
+            })
+            .await
+            .unwrap();
+        app.store
+            .upsert_secret(minga_state::types::Secret {
+                id: "acme-key".into(),
+                tenant_id: "acme".into(),
+                name: "acme-key".into(),
+            })
+            .await
+            .unwrap();
+
+        let svc_with = |secret_id: &str| {
+            let mut svc = translate::service_spec_to_state(&spec("web", 0)).unwrap();
+            svc.secrets = vec![minga_state::types::SecretRef::new(
+                secret_id,
+                "/run/secrets/key",
+            )];
+            svc
+        };
+
+        let foreign = check_service_secrets(&app, "default", &svc_with("acme-key"))
+            .await
+            .unwrap_err();
+        let absent = check_service_secrets(&app, "default", &svc_with("missing-key"))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(foreign, ApiError::BadRequest(_)),
+            "foreign secret must be indistinguishable from an absent one: {foreign:?}"
+        );
+        assert_eq!(
+            foreign.to_string().replace("acme-key", "<id>"),
+            absent.to_string().replace("missing-key", "<id>"),
+            "status and message must match apart from the caller-supplied name"
+        );
+
+        // The owner's own secret still passes the check.
+        check_service_secrets(&app, "acme", &svc_with("acme-key"))
+            .await
+            .expect("own secret");
     }
 
     #[tokio::test]
