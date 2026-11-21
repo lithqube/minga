@@ -14,14 +14,14 @@
     instead of every key under its node.
   - Operator/JWT mode, once for this change and #130 below:
     1. Set every tenant signer's template to the list in `worker_permission_template`.
-    2. Re-sign the account JWT in `MINGA_NATS_ACCOUNT_JWT_FILE`. A manager refuses to start with the old
-       template.
-    3. With the manager stopped, copy that file over `<MINGA_NATS_RESOLVER_DIR>/<account public key>.jwt`
-       on every manager. The sidecar preloads the resolver claim only when it is missing, so an existing
-       resolver keeps serving the old template. On an external NATS server, push the claim to its
-       resolver instead.
-    4. Start the managers. The leader republishes the revocations stored in Raft onto the new claim, so
-       revoked workers stay revoked.
+    2. Copy the `revocations` of the current resolver claim, `<MINGA_NATS_RESOLVER_DIR>/<account public
+       key>.jwt`, into the new account claim. Then re-sign the account JWT in
+       `MINGA_NATS_ACCOUNT_JWT_FILE`. A claim without them lets removed workers connect until the leader
+       republishes. A manager refuses to start with the old template.
+    3. With the manager stopped, copy that file over the resolver claim on every manager. The sidecar
+       preloads the resolver claim only when it is missing, so an existing resolver keeps serving the
+       old template. On an external NATS server, push the claim to its resolver instead.
+    4. Start the managers. The leader also republishes the revocations stored in Raft onto the claim.
 
 - **Security, upgrade action needed.** A worker can no longer list other tenants' assignment and lease
   keys (#130):
