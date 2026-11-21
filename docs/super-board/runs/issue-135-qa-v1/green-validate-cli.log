@@ -1,0 +1,11 @@
+    Blocking waiting for file lock on build directory
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 12.92s
+     Running tests/validate.rs (/Users/admin/dev/minga/target/debug/deps/validate-8972749157e7c57d)
+
+running 3 tests
+test validate_rejects_port_host_ip_long_syntax ... ok
+test validate_accepts_ports_without_host_ip ... ok
+test validate_rejects_port_host_ip_short_syntax ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.89s
+

@@ -1,0 +1,35 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.55s
+     Running tests/validate.rs (/Users/admin/dev/minga/target/debug/deps/validate-8972749157e7c57d)
+
+running 3 tests
+test validate_rejects_port_host_ip_short_syntax ... FAILED
+test validate_accepts_ports_without_host_ip ... ok
+test validate_rejects_port_host_ip_long_syntax ... FAILED
+
+failures:
+
+---- validate_rejects_port_host_ip_short_syntax stdout ----
+
+thread 'validate_rejects_port_host_ip_short_syntax' (927162) panicked at crates/minga-cli/tests/validate.rs:27:5:
+validate should fail:
+services in startup order:
+  db               db                                       1 replica(s)  ports 5432->5432/tcp
+
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- validate_rejects_port_host_ip_long_syntax stdout ----
+
+thread 'validate_rejects_port_host_ip_long_syntax' (927161) panicked at crates/minga-cli/tests/validate.rs:39:5:
+validate should fail:
+services in startup order:
+  db               db                                       1 replica(s)  ports 5432->5432/tcp
+
+
+
+failures:
+    validate_rejects_port_host_ip_long_syntax
+    validate_rejects_port_host_ip_short_syntax
+
+test result: FAILED. 1 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.98s
+
+error: test failed, to rerun pass `-p minga-cli --test validate`
