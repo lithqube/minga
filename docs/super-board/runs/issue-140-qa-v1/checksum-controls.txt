@@ -1,0 +1,8 @@
+# Positive control (2026-11-21T08:20:03Z): fresh tarballs verified with the workflow's exact command shape (sha256sum -c -)
+nats-server-v2.14.10-linux-amd64.tar.gz: OK
+nats-server-v2.15.3-linux-amd64.tar.gz: OK
+
+# Negative control: one byte flipped at offset 12345 of the v2.15.3 archive
+corrupt.tar.gz: FAILED
+sha256sum: WARNING: 1 computed checksum(s) did NOT match
+exit=1 (must be non-zero) — a corrupted/replaced archive is rejected before extraction

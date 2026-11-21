@@ -1,0 +1,7 @@
+# actionlint 1.7.12 on the PR head b7c2ab5
+
+release.yml: clean
+
+ci.yml: 2 pre-existing SC2094 info notes in the private-registry heredoc at ci.yml:162
+(identical notes on origin/main at ci.yml:151, same step). Not introduced by this PR;
+changed sections (lines 29-36, 50-58, 72-78) clean.

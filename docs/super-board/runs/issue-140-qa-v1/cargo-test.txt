@@ -1,0 +1,201 @@
+# cargo gate (board verify_commands) on PR head b7c2ab5 — 2026-11-21T08:25:47Z
+# CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=/Users/admin/dev/minga/target
+
+cargo fmt --all --check: OK
+cargo clippy --all-targets -- -D warnings: OK
+cargo test --workspace: exit 0, 63 suites 'test result: ok', 0 failed
+
+note: an earlier run of the same command hit a transient E0463 in the minga-api doctest
+(can't find crate for minga_bus) caused by a concurrent build sharing CARGO_TARGET_DIR;
+the doctest passes in isolation and the full suite is green here.
+
+## per-suite results
+     Running unittests src/lib.rs (/Users/admin/dev/minga/target/debug/deps/minga_api-8e789bd8de5d3cb3)
+test result: ok. 133 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.71s
+
+     Running tests/integration.rs (/Users/admin/dev/minga/target/debug/deps/integration-4a28a0cb1da07fdf)
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.97s
+
+     Running unittests src/lib.rs (/Users/admin/dev/minga/target/debug/deps/minga_bus-95de9696fb7b1748)
+test result: ok. 53 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.26s
+
+     Running tests/nats_cluster.rs (/Users/admin/dev/minga/target/debug/deps/nats_cluster-ae4709c234bff825)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.68s
+
+     Running tests/nats_consumer_cap.rs (/Users/admin/dev/minga/target/debug/deps/nats_consumer_cap-e64e2d36b5b5309d)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/nats_integration.rs (/Users/admin/dev/minga/target/debug/deps/nats_integration-d59c34ce64f1037d)
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/nats_lease_expiration.rs (/Users/admin/dev/minga/target/debug/deps/nats_lease_expiration-e103fbe162f98cf2)
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/nats_legacy_upgrade.rs (/Users/admin/dev/minga/target/debug/deps/nats_legacy_upgrade-fc632d672c64b54f)
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/nats_runtime.rs (/Users/admin/dev/minga/target/debug/deps/nats_runtime-51e1c3a3925fbae2)
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/nats_stream_update.rs (/Users/admin/dev/minga/target/debug/deps/nats_stream_update-6dd3f1b87167681b)
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/nats_tls.rs (/Users/admin/dev/minga/target/debug/deps/nats_tls-7f00de9a1f0db498)
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 28.89s
+
+     Running tests/nats_upgrade.rs (/Users/admin/dev/minga/target/debug/deps/nats_upgrade-10e5c227a985ad21)
+test result: ok. 0 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (/Users/admin/dev/minga/target/debug/deps/minga-7a0ef0bcfd78bc8f)
+test result: ok. 55 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 16.01s
+
+     Running tests/deploy_e2e.rs (/Users/admin/dev/minga/target/debug/deps/deploy_e2e-a4aea149bd29091f)
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.78s
+
+     Running tests/deploy_path_probe.rs (/Users/admin/dev/minga/target/debug/deps/deploy_path_probe-d44fd02a80e21509)
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.54s
+
+     Running tests/phase0.rs (/Users/admin/dev/minga/target/debug/deps/phase0-1814044d06123951)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.82s
+
+     Running tests/state_e2e.rs (/Users/admin/dev/minga/target/debug/deps/state_e2e-e73300bc920b410e)
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.77s
+
+     Running unittests src/lib.rs (/Users/admin/dev/minga/target/debug/deps/minga_compose-53d99298d900bcbe)
+test result: ok. 27 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/load.rs (/Users/admin/dev/minga/target/debug/deps/load-cf1c7f6416a40c5a)
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running unittests src/lib.rs (/Users/admin/dev/minga/target/debug/deps/minga_ctl-8cb1ea2adbadb9cf)
+test result: ok. 99 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running unittests src/main.rs (/Users/admin/dev/minga/target/debug/deps/minga_ctl-ed63bac0a7dbf259)
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/api.rs (/Users/admin/dev/minga/target/debug/deps/api-880d9b88bc0e944d)
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.98s
+
+     Running tests/client.rs (/Users/admin/dev/minga/target/debug/deps/client-034c9a9670ab5a30)
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.53s
+
+     Running tests/cluster.rs (/Users/admin/dev/minga/target/debug/deps/cluster-2fc420b1637e64b4)
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.51s
+
+     Running tests/context.rs (/Users/admin/dev/minga/target/debug/deps/context-b15b5a8d3c102e44)
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.11s
+
+     Running tests/health.rs (/Users/admin/dev/minga/target/debug/deps/health-363eb40fb18429d5)
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.62s
+
+     Running tests/ops_loop.rs (/Users/admin/dev/minga/target/debug/deps/ops_loop-136dbb6a6849c1d2)
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.20s
+
+     Running tests/registry.rs (/Users/admin/dev/minga/target/debug/deps/registry-e4af1f444b76b640)
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.34s
+
+     Running tests/revision_save_failure.rs (/Users/admin/dev/minga/target/debug/deps/revision_save_failure-b51da522fa58ce1a)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.36s
+
+     Running tests/rollback_race.rs (/Users/admin/dev/minga/target/debug/deps/rollback_race-6cec86c8add607c0)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.34s
+
+     Running tests/ssh.rs (/Users/admin/dev/minga/target/debug/deps/ssh-d7f85e36ab3b72b8)
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 10.10s
+
+     Running tests/task_errors.rs (/Users/admin/dev/minga/target/debug/deps/task_errors-750a0f235c5cfe83)
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.72s
+
+     Running tests/wrapped.rs (/Users/admin/dev/minga/target/debug/deps/wrapped-7a20b891c7937daa)
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.17s
+
+     Running tests/writes.rs (/Users/admin/dev/minga/target/debug/deps/writes-65bc87c851fc84ce)
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.22s
+
+     Running unittests src/lib.rs (/Users/admin/dev/minga/target/debug/deps/minga_egress-b33f07227fee30c2)
+test result: ok. 93 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.25s
+
+     Running unittests src/lib.rs (/Users/admin/dev/minga/target/debug/deps/minga_net-379399541ad21d7b)
+test result: ok. 76 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.27s
+
+     Running unittests src/lib.rs (/Users/admin/dev/minga/target/debug/deps/minga_node-e3673cc3e8a7164e)
+test result: ok. 162 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 5.00s
+
+     Running tests/containerd.rs (/Users/admin/dev/minga/target/debug/deps/containerd-17bae47a7ce2a707)
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+     Running tests/containerd_client.rs (/Users/admin/dev/minga/target/debug/deps/containerd_client-e66a563e6f7e2007)
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/containerd_pull.rs (/Users/admin/dev/minga/target/debug/deps/containerd_pull-14ee5ea66b4c5cb9)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/netns.rs (/Users/admin/dev/minga/target/debug/deps/netns-bdae7c509e9e85e7)
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/wireguard_netns.rs (/Users/admin/dev/minga/target/debug/deps/wireguard_netns-ebe92aefac3d13ac)
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (/Users/admin/dev/minga/target/debug/deps/minga_sandbox-9bbf3d9497aac333)
+test result: ok. 49 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.43s
+
+     Running unittests src/lib.rs (/Users/admin/dev/minga/target/debug/deps/minga_scheduler-a200d749133f6a9b)
+test result: ok. 102 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.27s
+
+     Running tests/pipeline.rs (/Users/admin/dev/minga/target/debug/deps/pipeline-d8be8723d9f292ab)
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/scheduler.rs (/Users/admin/dev/minga/target/debug/deps/scheduler-0b5a8a6554390f0c)
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.54s
+
+     Running unittests src/lib.rs (/Users/admin/dev/minga/target/debug/deps/minga_state-20f4ff6dd2e01eaa)
+test result: ok. 25 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.39s
+
+     Running tests/format.rs (/Users/admin/dev/minga/target/debug/deps/format-442323de69e79967)
+test result: ok. 50 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 29.24s
+
+     Running tests/multi_node.rs (/Users/admin/dev/minga/target/debug/deps/multi_node-cad60232d26f8468)
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.65s
+
+     Running tests/raft_tls.rs (/Users/admin/dev/minga/target/debug/deps/raft_tls-79df2a434d9a4627)
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.76s
+
+     Running tests/single_node.rs (/Users/admin/dev/minga/target/debug/deps/single_node-8875e01ca7220930)
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.31s
+
+     Running unittests src/lib.rs (/Users/admin/dev/minga/target/debug/deps/minga_telemetry-6c6f7f1416d43f7b)
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.61s
+
+   Doc-tests minga_api
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+
+   Doc-tests minga_bus
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests minga_compose
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests minga_ctl
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests minga_egress
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests minga_net
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.39s
+
+   Doc-tests minga_node
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests minga_sandbox
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+
+   Doc-tests minga_scheduler
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.15s
+
+   Doc-tests minga_state
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.24s
+
+   Doc-tests minga_telemetry
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
