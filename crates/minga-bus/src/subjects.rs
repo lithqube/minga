@@ -178,6 +178,9 @@ pub fn worker_inbox_prefix(tenant_id: &str, node_id: u64) -> String {
 }
 
 /// NATS permissions for a tenant/node worker identity: `(publish, subscribe)`.
+///
+/// Operator/JWT mode grants the same list through minga-api's signer
+/// template; its `jwt_template_matches_the_worker_acl` test fails if they drift.
 pub fn worker_acl(tenant_id: &str, node_id: u64) -> crate::Result<(Vec<String>, Vec<String>)> {
     minga_state::types::Tenant::validate_id(tenant_id)
         .map_err(|error| crate::BusError::Other(format!("invalid tenant ID: {error}")))?;
@@ -195,14 +198,13 @@ pub fn worker_acl(tenant_id: &str, node_id: u64) -> crate::Result<(Vec<String>, 
         "$KV.MINGA_ASSIGN.{}>",
         kv_assignment_node_network_prefix(tenant_id, node_id)
     );
-    let log_bucket = format!("MINGA_LOGS_{tenant_id}");
     let publish = vec![
         own_lease.clone(),
         own_status.clone(),
-        format!("{PREFIX}.{tenant_id}.log.node.{node_id}.*"),
+        // `>`, not `*`: task IDs are `<service>.<slot>.<revision>`.
+        format!("{PREFIX}.{tenant_id}.log.node.{node_id}.>"),
         format!("{PREFIX}.{tenant_id}.usage.>"),
         format!("$JS.API.STREAM.INFO.KV_{status_bucket}"),
-        format!("$JS.API.STREAM.INFO.{log_bucket}"),
         format!("$JS.API.DIRECT.GET.KV_{status_bucket}.$KV.{status_bucket}.node.{node_id}.task.>"),
         format!("$JS.API.DIRECT.GET.KV_MINGA_LEASES.{own_lease}"),
         "$JS.FC.KV_MINGA_ASSIGN.>".into(),
@@ -219,10 +221,10 @@ pub fn worker_acl(tenant_id: &str, node_id: u64) -> crate::Result<(Vec<String>, 
     ];
     let own_ping = format!("{PREFIX}.{tenant_id}.ctl.node.{node_id}.ping");
     let own_drain = format!("{PREFIX}.{tenant_id}.ctl.node.{node_id}.drain");
+    // Watches are ordered push consumers delivering to the inbox, so a worker
+    // needs no `$KV.*` or `$JS.ACK.*` subscription.
     let subscribe = vec![
         format!("{}.>", worker_inbox_prefix(tenant_id, node_id)),
-        "$JS.ACK.KV_MINGA_ASSIGN.>".into(),
-        "$JS.ACK.KV_MINGA_LEASES.>".into(),
         own_ping,
         own_drain,
     ];
@@ -293,7 +295,6 @@ mod tests {
         let (publish, subscribe) = worker_acl("tenant_a", 7).unwrap();
         assert!(publish.contains(&"$KV.MINGA_LEASES.tenant_a.lease.node.7".to_string()));
         assert!(publish.contains(&"minga.tenant_a.usage.>".to_string()));
-        assert!(subscribe.contains(&"$JS.ACK.KV_MINGA_ASSIGN.>".to_string()));
         assert!(subscribe.contains(&"_INBOX.tenant_a.7.>".to_string()));
         assert!(!subscribe.iter().any(|subject| subject == "_INBOX.>"));
         assert!(!subscribe

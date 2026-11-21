@@ -149,8 +149,10 @@ fn permission_lists_match(actual: &[String], expected: &[String]) -> bool {
 
 fn worker_permission_template(tenant_id: &str) -> (Vec<String>, Vec<String>) {
     let node = "{{tag(node)}}";
+    // The same grants as `minga_bus::subjects::worker_acl` in mTLS mode.
     let publish = vec![
         format!("minga.{tenant_id}.log.node.{node}.>"),
+        format!("minga.{tenant_id}.usage.>"),
         format!("$KV.MINGA_STATUS_{tenant_id}.node.{node}.task.>"),
         format!("$KV.MINGA_LEASES.{tenant_id}.lease.node.{node}"),
         format!("$JS.API.STREAM.INFO.KV_MINGA_STATUS_{tenant_id}"),
@@ -161,17 +163,15 @@ fn worker_permission_template(tenant_id: &str) -> (Vec<String>, Vec<String>) {
         format!("$JS.API.CONSUMER.CREATE.KV_MINGA_ASSIGN.*.$KV.MINGA_ASSIGN.{tenant_id}.node.{node}.wg"),
         // No CONSUMER.INFO: it returns any consumer's filter subject, which
         // names another tenant's node; ordered watches recover with CREATE.
-        format!("$JS.API.DIRECT.GET.KV_MINGA_ASSIGN.$KV.MINGA_ASSIGN.{tenant_id}.node.{node}.>"),
+        format!("$JS.API.DIRECT.GET.KV_MINGA_ASSIGN.$KV.MINGA_ASSIGN.{tenant_id}.node.{node}.task.>"),
+        format!("$JS.API.DIRECT.GET.KV_MINGA_ASSIGN.$KV.MINGA_ASSIGN.{tenant_id}.node.{node}.ingress.>"),
+        format!("$JS.API.DIRECT.GET.KV_MINGA_ASSIGN.$KV.MINGA_ASSIGN.{tenant_id}.node.{node}.net.>"),
+        format!("$JS.API.DIRECT.GET.KV_MINGA_ASSIGN.$KV.MINGA_ASSIGN.{tenant_id}.node.{node}.wg"),
         format!("$JS.API.DIRECT.GET.KV_MINGA_STATUS_{tenant_id}.$KV.MINGA_STATUS_{tenant_id}.node.{node}.task.>"),
         format!("$JS.API.DIRECT.GET.KV_MINGA_LEASES.$KV.MINGA_LEASES.{tenant_id}.lease.node.{node}"),
     ];
+    // Watches deliver to the worker inbox, so no `$KV.*` subscription.
     let subscribe = vec![
-        format!("$KV.MINGA_ASSIGN.{tenant_id}.node.{node}.task.>"),
-        format!("$KV.MINGA_ASSIGN.{tenant_id}.node.{node}.ingress.>"),
-        format!("$KV.MINGA_ASSIGN.{tenant_id}.node.{node}.net.>"),
-        format!("$KV.MINGA_ASSIGN.{tenant_id}.node.{node}.wg"),
-        format!("$KV.MINGA_STATUS_{tenant_id}.node.{node}.task.>"),
-        format!("$KV.MINGA_LEASES.{tenant_id}.lease.node.{node}"),
         format!("minga.{tenant_id}.ctl.node.{node}.ping"),
         format!("minga.{tenant_id}.ctl.node.{node}.drain"),
         format!("_INBOX.{tenant_id}.{node}.>"),
@@ -250,6 +250,7 @@ mod jwt_server_tests;
 mod tests {
     use super::*;
     use nats_jwt_rs::Claims;
+    use std::collections::BTreeSet;
 
     #[test]
     fn issued_credentials_are_node_and_tenant_scoped() {
@@ -305,9 +306,77 @@ mod tests {
         assert!(publish
             .iter()
             .any(|permission| permission == create_consumer));
-        assert!(subscribe
+        assert!(publish.iter().any(|permission| {
+            permission
+            == "$JS.API.DIRECT.GET.KV_MINGA_ASSIGN.$KV.MINGA_ASSIGN.tenant-a.node.{{tag(node)}}.wg"
+        }));
+        assert!(!publish.iter().chain(&subscribe).any(
+            |permission| permission.contains("$KV.MINGA_ASSIGN.tenant-a.node.{{tag(node)}}.>")
+        ));
+    }
+
+    #[test]
+    fn jwt_template_matches_the_worker_acl() {
+        let issuer = test_issuer("tenant-a");
+        let (jwt_publish, jwt_subscribe) = effective_worker_permissions(&issuer, "tenant-a", 7);
+        let (acl_publish, acl_subscribe) = minga_bus::subjects::worker_acl("tenant-a", 7).unwrap();
+        // Both modes run the same worker code, so they need the same grants. A
+        // grant one mode really needs alone is listed here with its reason.
+        for (what, jwt, acl) in [
+            ("publish", &jwt_publish, &acl_publish),
+            ("subscribe", &jwt_subscribe, &acl_subscribe),
+        ] {
+            let jwt: BTreeSet<_> = jwt.iter().collect();
+            let acl: BTreeSet<_> = acl.iter().collect();
+            let jwt_only: Vec<_> = jwt.difference(&acl).collect();
+            let acl_only: Vec<_> = acl.difference(&jwt).collect();
+            assert!(
+                jwt_only.is_empty() && acl_only.is_empty(),
+                "{what} grants differ: JWT template only {jwt_only:?}, mTLS ACL only {acl_only:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_worker_grant_is_pinned_to_its_tenant_and_node() {
+        // Grants wider than one node, and why each is safe.
+        let tenant_wide = [
+            // Opening the tenant's own status bucket.
+            "$JS.API.STREAM.INFO.KV_MINGA_STATUS_tenant-a",
+            // Usage subjects name the service, not the node.
+            "minga.tenant-a.usage.>",
+            // Flow-control replies to ordered watches name only the random consumer.
+            "$JS.FC.KV_MINGA_ASSIGN.>",
+        ];
+        let issuer = test_issuer("tenant-a");
+        let (jwt_publish, jwt_subscribe) = effective_worker_permissions(&issuer, "tenant-a", 7);
+        let (acl_publish, acl_subscribe) = minga_bus::subjects::worker_acl("tenant-a", 7).unwrap();
+        for grant in jwt_publish
             .iter()
-            .any(|permission| permission == "$KV.MINGA_ASSIGN.tenant-a.node.{{tag(node)}}.wg"));
+            .chain(&jwt_subscribe)
+            .chain(&acl_publish)
+            .chain(&acl_subscribe)
+        {
+            if tenant_wide.contains(&grant.as_str()) {
+                continue;
+            }
+            // The consumer name is random; the filter subject after it is pinned.
+            let subject = grant
+                .strip_prefix("$JS.API.CONSUMER.CREATE.KV_MINGA_ASSIGN.*.")
+                .unwrap_or(grant);
+            // Tenant and node must both come before the first wildcard.
+            let pinned: Vec<_> = subject
+                .split('.')
+                .take_while(|token| *token != "*" && *token != ">")
+                .collect();
+            assert!(
+                pinned
+                    .iter()
+                    .any(|token| *token == "tenant-a" || token.ends_with("_tenant-a")),
+                "{grant} is not pinned to the tenant"
+            );
+            assert!(pinned.contains(&"7"), "{grant} is not pinned to the node");
+        }
     }
 
     #[test]
@@ -413,16 +482,14 @@ mod tests {
             .iter()
             .chain(&subscribe)
             .all(|permission| !permission.contains("{{")));
-        for own in [
-            "$KV.MINGA_ASSIGN.tenant-a.node.7.task.t1",
-            "$KV.MINGA_ASSIGN.tenant-a.node.7.wg",
-            "minga.tenant-a.ctl.node.7.drain",
-        ] {
+        for own in ["_INBOX.tenant-a.7.reply", "minga.tenant-a.ctl.node.7.drain"] {
             assert!(allows(&subscribe, own), "{own} should be subscribable");
         }
         for own in [
             "$KV.MINGA_STATUS_tenant-a.node.7.task.t1",
-            "minga.tenant-a.log.node.7.t1",
+            "minga.tenant-a.log.node.7.web.1.3",
+            "$JS.API.DIRECT.GET.KV_MINGA_ASSIGN.$KV.MINGA_ASSIGN.tenant-a.node.7.task.t1",
+            "$JS.API.DIRECT.GET.KV_MINGA_ASSIGN.$KV.MINGA_ASSIGN.tenant-a.node.7.wg",
         ] {
             assert!(allows(&publish, own), "{own} should be publishable");
         }

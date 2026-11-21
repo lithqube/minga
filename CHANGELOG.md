@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- **Fix, upgrade action needed.** mTLS and operator/JWT workers get the same NATS grants, and a test keeps
+  them in step:
+  - mTLS workers can publish task logs. Their ACL allowed one subject token after the node, so it refused
+    every task ID, which is `<service>.<slot>.<revision>`.
+  - JWT workers can publish usage events: the signer template lacked `minga.<tenant>.usage.>`.
+  - Both lists drop grants no worker uses: `$JS.ACK.KV_MINGA_ASSIGN.>`, `$JS.ACK.KV_MINGA_LEASES.>` and
+    `$JS.API.STREAM.INFO.MINGA_LOGS_<tenant>` in mTLS mode, and the direct `$KV.*` subscriptions in JWT
+    mode. Watches deliver to the worker's own inbox.
+  - JWT `DIRECT.GET` on `KV_MINGA_ASSIGN` is limited to the worker's task, ingress, net and wg keys
+    instead of every key under its node.
+  - Operator/JWT mode: set every tenant signer's template to the list in
+    `worker_permission_template` and re-sign the account JWT, together with the #130 change below. A
+    manager refuses to start with the old template.
+
 - **Security, upgrade action needed.** A worker can no longer list other tenants' assignment and lease
   keys (#130):
   - On nats-server 2.15.3, `STREAM.INFO` with a `subjects_filter` returns every matching key. The worker
