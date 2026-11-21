@@ -729,13 +729,88 @@ impl ApiTlsConfig {
     }
 }
 
+/// Limits of the API listener on top of the connection limits every Minga
+/// listener has.
+#[derive(Debug, Clone, Copy)]
+struct ApiLimits {
+    connection: minga_telemetry::serve::Limits,
+    /// A request body must arrive in full within this time. The header-read
+    /// timeout ends with the head, so without it a body that never completes
+    /// holds its connection slot for good.
+    body: Duration,
+    /// `POST /state` carries up to 64 MiB, so it gets longer.
+    state_import_body: Duration,
+    /// TLS connections one certificate tenant may hold at once.
+    per_tenant_connections: usize,
+    /// TLS connection slots only cluster operators (`O=*`) may use.
+    operator_reserve: usize,
+}
+
+impl Default for ApiLimits {
+    fn default() -> Self {
+        Self {
+            connection: minga_telemetry::serve::Limits::default(),
+            body: Duration::from_secs(30),
+            state_import_body: Duration::from_secs(300),
+            per_tenant_connections: 128,
+            operator_reserve: 64,
+        }
+    }
+}
+
+/// Fails a request body that has not fully arrived by its deadline, so the
+/// extractor reading it errors and the connection closes.
+fn with_body_deadline(router: Router, limits: ApiLimits) -> Router {
+    use futures::StreamExt;
+    router.layer(axum::middleware::from_fn(
+        move |request: axum::extract::Request, next: axum::middleware::Next| async move {
+            let budget = if request.uri().path().split('/').nth(2) == Some("state") {
+                limits.state_import_body
+            } else {
+                limits.body
+            };
+            let deadline = tokio::time::Instant::now() + budget;
+            let request = request.map(|body| {
+                axum::body::Body::from_stream(futures::stream::unfold(
+                    Some(body.into_data_stream()),
+                    move |stream| async move {
+                        let mut stream = stream?;
+                        match tokio::time::timeout_at(deadline, stream.next()).await {
+                            Ok(chunk) => chunk.map(|chunk| (chunk, Some(stream))),
+                            Err(_) => {
+                                Some((Err(axum::Error::new("request body deadline passed")), None))
+                            }
+                        }
+                    },
+                ))
+            });
+            next.run(request).await
+        },
+    ))
+}
+
 async fn serve_tls_bounded(
     listener: TcpListener,
     router: Router,
     acceptor: TlsAcceptor,
-    limits: minga_telemetry::serve::Limits,
+    limits: ApiLimits,
 ) {
-    let slots = Arc::new(tokio::sync::Semaphore::new(limits.max_connections));
+    let slots = Arc::new(tokio::sync::Semaphore::new(
+        limits.connection.max_connections,
+    ));
+    // Tenants share all slots but the operator reserve, and each tenant gets
+    // at most its own cap, so one tenant cannot lock out the others (#123).
+    let tenant_slots = Arc::new(tokio::sync::Semaphore::new(
+        limits
+            .connection
+            .max_connections
+            .saturating_sub(limits.operator_reserve),
+    ));
+    // shortcut: one entry per tenant name a CA-signed certificate carried, never
+    // pruned; prune idle entries if certificates ever name unbounded tenants.
+    let per_tenant: Arc<
+        std::sync::Mutex<std::collections::HashMap<Option<String>, Arc<tokio::sync::Semaphore>>>,
+    > = Arc::default();
     // Dropping the set, when the server's task is aborted, aborts every open
     // connection with it.
     let mut connections = tokio::task::JoinSet::new();
@@ -755,16 +830,19 @@ async fn serve_tls_bounded(
         };
         let acceptor = acceptor.clone();
         let router = router.clone();
+        let tenant_slots = tenant_slots.clone();
+        let per_tenant = per_tenant.clone();
         connections.spawn(async move {
             let _permit = permit;
-            if tokio::time::timeout(limits.header_read_timeout, stream.readable())
+            let header_read_timeout = limits.connection.header_read_timeout;
+            if tokio::time::timeout(header_read_timeout, stream.readable())
                 .await
                 .is_err()
             {
                 return;
             }
             let Ok(Ok(stream)) =
-                tokio::time::timeout(limits.header_read_timeout, acceptor.accept(stream)).await
+                tokio::time::timeout(header_read_timeout, acceptor.accept(stream)).await
             else {
                 return;
             };
@@ -776,14 +854,37 @@ async fn serve_tls_bounded(
             else {
                 return;
             };
-            let router = match ClientIdentity::from_certificate(cert) {
+            let identity = ClientIdentity::from_certificate(cert);
+            let tenant = identity
+                .as_ref()
+                .and_then(|identity| identity.tenant.clone());
+            let _tenant_permits = if tenant.as_deref() == Some("*") {
+                None
+            } else {
+                let own = per_tenant
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .entry(tenant.clone())
+                    .or_insert_with(|| {
+                        Arc::new(tokio::sync::Semaphore::new(limits.per_tenant_connections))
+                    })
+                    .clone();
+                let (Ok(own), Ok(shared)) =
+                    (own.try_acquire_owned(), tenant_slots.try_acquire_owned())
+                else {
+                    tracing::debug!(?tenant, "TLS API connection over the tenant cap");
+                    return;
+                };
+                Some((own, shared))
+            };
+            let router = match identity {
                 Some(identity) => router.layer(Extension(identity)),
                 None => router.layer(Extension(InvalidClientIdentity)),
             };
             // HTTP/1.1 only, like the plaintext listeners: no ALPN is offered
             // and an HTTP/2 preface is rejected within the header timeout.
             if let Err(error) =
-                minga_telemetry::serve::serve_connection(stream, router, limits).await
+                minga_telemetry::serve::serve_connection(stream, router, limits.connection).await
             {
                 tracing::debug!(%error, "TLS API connection closed");
             }
@@ -945,16 +1046,18 @@ impl ApiServer {
             })
         };
         let ready_state = Arc::new(ready_state);
-        let router =
-            build_router_with_app_state(app_state, ready_state, auth_token, acceptor.is_some());
-        let limits = minga_telemetry::serve::Limits::default();
+        let limits = ApiLimits::default();
+        let router = with_body_deadline(
+            build_router_with_app_state(app_state, ready_state, auth_token, acceptor.is_some()),
+            limits,
+        );
         let handle = if let Some(acceptor) = acceptor {
             tokio::spawn(serve_tls_bounded(listener, router, acceptor, limits))
         } else {
             tokio::spawn(minga_telemetry::serve::serve_bounded(
                 listener,
                 router,
-                limits,
+                limits.connection,
                 std::future::pending(),
             ))
         };
@@ -1448,6 +1551,206 @@ mod tests {
         .await;
         assert!(closed.is_ok(), "an idle HTTP/2 connection stayed open");
         api.shutdown();
+    }
+
+    /// A TLS API on `limits` whose store also knows `tenants`.
+    async fn limited_tls_api(
+        limits: ApiLimits,
+        tenants: &[&str],
+    ) -> (
+        String,
+        (rcgen::Certificate, rcgen::KeyPair),
+        [tempfile::TempDir; 2],
+    ) {
+        use std::os::unix::fs::PermissionsExt;
+        let ca = test_ca();
+        let server = test_leaf(
+            &ca,
+            &["localhost"],
+            &[(rcgen::DnType::CommonName, "minga-api")],
+            rcgen::ExtendedKeyUsagePurpose::ServerAuth,
+        );
+        let files = tempfile::tempdir().unwrap();
+        let write = |name: &str, pem: String, mode: u32| {
+            let path = files.path().join(name);
+            std::fs::write(&path, pem).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+            path
+        };
+        let tls = ApiTlsConfig {
+            cert: write("server.pem", server.0.pem(), 0o644),
+            key: write("server-key.pem", server.1.serialize_pem(), 0o600),
+            client_ca: write("ca.pem", ca.0.pem(), 0o644),
+        };
+        let (_router, store, dir) = admin_router().await;
+        for &id in tenants {
+            store
+                .upsert_tenant(minga_state::types::Tenant {
+                    nats_revoked_user_public_keys: Vec::new(),
+                    id: id.into(),
+                    name: id.into(),
+                    quotas: Default::default(),
+                    created_at: 1,
+                })
+                .await
+                .unwrap();
+        }
+        let router = with_body_deadline(
+            build_router_with_app_state(
+                Arc::new(AppState::with_bus(store, MemoryBus::new())),
+                Arc::new(ReadyState::new()),
+                Some("admin-token".to_string()),
+                true,
+            ),
+            limits,
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let acceptor = TlsAcceptor::from(tls.server_config().unwrap());
+        tokio::spawn(serve_tls_bounded(listener, router, acceptor, limits));
+        (addr, ca, [files, dir])
+    }
+
+    fn client_cert(
+        ca: &(rcgen::Certificate, rcgen::KeyPair),
+        role: &str,
+        tenant: &str,
+    ) -> (rcgen::Certificate, rcgen::KeyPair) {
+        test_leaf(
+            ca,
+            &[],
+            &[
+                (rcgen::DnType::CommonName, "client"),
+                (rcgen::DnType::OrganizationalUnitName, role),
+                (rcgen::DnType::OrganizationName, tenant),
+            ],
+            rcgen::ExtendedKeyUsagePurpose::ClientAuth,
+        )
+    }
+
+    /// Opens a connection, waits for one served request so the server has
+    /// counted it, then starts a POST to `path` whose body never completes.
+    /// `headers` are extra request header lines, each ending in CRLF.
+    async fn stalled_body(
+        addr: &str,
+        ca: &rcgen::Certificate,
+        client: &(rcgen::Certificate, rcgen::KeyPair),
+        path: &str,
+        headers: &str,
+    ) -> tokio_rustls::client::TlsStream<tokio::net::TcpStream> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut tls = tls_connect(addr, ca, Some(client)).await.unwrap();
+        tls.write_all(b"GET /v1.41/version HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        let mut buf = [0u8; 16];
+        assert!(tls.read(&mut buf).await.unwrap() > 0);
+        let head = format!(
+            "POST {path} HTTP/1.1\r\nHost: localhost\r\n{headers}Content-Type: application/json\r\nContent-Length: 100\r\n\r\n{{"
+        );
+        tls.write_all(head.as_bytes()).await.unwrap();
+        tls
+    }
+
+    /// Reads until the server closes the connection; false after `within`.
+    async fn closed_within(
+        tls: &mut tokio_rustls::client::TlsStream<tokio::net::TcpStream>,
+        within: Duration,
+    ) -> bool {
+        let mut buf = [0u8; 1024];
+        tokio::time::timeout(within, async {
+            loop {
+                match tokio::io::AsyncReadExt::read(tls, &mut buf).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(_) => {}
+                }
+            }
+        })
+        .await
+        .is_ok()
+    }
+
+    #[tokio::test]
+    async fn a_tenant_holding_its_cap_of_stalled_bodies_locks_out_no_one_else() {
+        let limits = ApiLimits {
+            connection: minga_telemetry::serve::Limits {
+                max_connections: 6,
+                ..Default::default()
+            },
+            per_tenant_connections: 2,
+            operator_reserve: 2,
+            ..ApiLimits::default()
+        };
+        let (addr, ca, _dirs) = limited_tls_api(limits, &["tenant-a", "tenant-b"]).await;
+        let tenant_a = client_cert(&ca, "deployer", "tenant-a");
+        let tenant_b = client_cert(&ca, "deployer", "tenant-b");
+        let operator = client_cert(&ca, "admin", "*");
+        let create = "/v1.41/services/create";
+
+        let _a1 = stalled_body(&addr, &ca.0, &tenant_a, create, "").await;
+        let _a2 = stalled_body(&addr, &ca.0, &tenant_a, create, "").await;
+        // Tenant A is at its cap; tenant B and the operator are not.
+        assert_eq!(
+            tls_status(&addr, &ca.0, Some(&tenant_a), "/v1.41/version").await,
+            None
+        );
+        assert_eq!(
+            tls_status(&addr, &ca.0, Some(&tenant_b), "/v1.41/version").await,
+            Some(200)
+        );
+        assert_eq!(
+            tls_status(&addr, &ca.0, Some(&operator), "/minga/tenants").await,
+            Some(200)
+        );
+        // With every tenant slot held, the operator reserve still serves.
+        let _b1 = stalled_body(&addr, &ca.0, &tenant_b, create, "").await;
+        let _b2 = stalled_body(&addr, &ca.0, &tenant_b, create, "").await;
+        let tenant_c = client_cert(&ca, "deployer", "tenant-c");
+        assert_eq!(
+            tls_status(&addr, &ca.0, Some(&tenant_c), "/v1.41/version").await,
+            None
+        );
+        assert_eq!(
+            tls_status(&addr, &ca.0, Some(&operator), "/minga/tenants").await,
+            Some(200)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stalled_request_body_is_closed_at_its_deadline() {
+        let limits = ApiLimits {
+            body: Duration::from_millis(300),
+            state_import_body: Duration::from_millis(1500),
+            per_tenant_connections: 1,
+            ..ApiLimits::default()
+        };
+        // A sole default tenant, so the API token may import state.
+        let (addr, ca, _dirs) = limited_tls_api(limits, &[]).await;
+        let tenant = client_cert(&ca, "deployer", "default");
+        let create = "/v1.41/services/create";
+        let mut stalled = stalled_body(&addr, &ca.0, &tenant, create, "").await;
+        assert!(
+            closed_within(&mut stalled, Duration::from_secs(2)).await,
+            "a stalled body kept its connection"
+        );
+        // Its slot is free again: the tenant's cap is one connection.
+        assert_eq!(
+            tls_status(&addr, &ca.0, Some(&tenant), "/v1.41/version").await,
+            Some(200)
+        );
+
+        // `/state` import gets longer, but not forever.
+        let operator = client_cert(&ca, "admin", "*");
+        let token = "Authorization: Bearer admin-token\r\n";
+        let mut import = stalled_body(&addr, &ca.0, &operator, "/v1.41/state", token).await;
+        assert!(
+            !closed_within(&mut import, Duration::from_millis(800)).await,
+            "a /state import got only the default body deadline"
+        );
+        assert!(
+            closed_within(&mut import, Duration::from_secs(3)).await,
+            "a stalled /state import kept its connection"
+        );
     }
 
     #[tokio::test]
