@@ -96,13 +96,113 @@ const REPLICATED: [&str; 4] = [
 // NatsBus
 // ---------------------------------------------------------------------------
 
+/// A KV bucket every tenant shares (`MINGA_ASSIGN`, `MINGA_LEASES`).
+///
+/// A worker holds only a stream handle: opening a `Store` costs a STREAM.INFO
+/// call, and with `subjects_filter` that call lists every tenant's keys, so
+/// the worker ACL does not grant it.
+// Two per bus, so the variant size gap costs nothing.
+#[allow(clippy::large_enum_variant)]
+enum SharedKv {
+    Manager(jetstream::kv::Store),
+    Worker {
+        stream: jetstream::stream::Stream<()>,
+        prefix: String,
+    },
+}
+
+impl SharedKv {
+    async fn worker(js: &JetStream, bucket: &str) -> Result<Self> {
+        let stream = js
+            .get_stream_no_info(format!("KV_{bucket}"))
+            .await
+            .map_err(|error| BusError::Kv(format!("open {bucket}: {error}")))?;
+        Ok(Self::Worker {
+            stream,
+            prefix: format!("$KV.{bucket}."),
+        })
+    }
+
+    fn prefix(&self) -> &str {
+        match self {
+            Self::Manager(store) => &store.prefix,
+            Self::Worker { prefix, .. } => prefix,
+        }
+    }
+
+    fn store(&self, operation: &str) -> Result<&jetstream::kv::Store> {
+        match self {
+            Self::Manager(store) => Ok(store),
+            Self::Worker { .. } => Err(BusError::Other(format!(
+                "worker bus cannot {operation}: manager-only operation"
+            ))),
+        }
+    }
+
+    async fn get(&self, key: &str) -> std::result::Result<Option<Bytes>, String> {
+        let stream = match self {
+            Self::Manager(store) => return store.get(key).await.map_err(|e| e.to_string()),
+            Self::Worker { stream, .. } => stream,
+        };
+        match stream
+            .direct_get_last_for_subject(format!("{}{key}", self.prefix()))
+            .await
+        {
+            // Delete and purge tombstones, and server markers, mean no value.
+            Ok(message) => Ok(match message.headers.get("KV-Operation") {
+                Some(op) if op.as_str() != "PUT" => None,
+                _ if message.headers.get("Nats-Marker-Reason").is_some() => None,
+                _ => Some(message.payload),
+            }),
+            Err(error) if error.kind() == jetstream::stream::DirectGetErrorKind::NotFound => {
+                Ok(None)
+            }
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
+    async fn put(
+        &self,
+        js: &JetStream,
+        key: String,
+        value: Bytes,
+    ) -> std::result::Result<(), String> {
+        if let Self::Manager(store) = self {
+            return store
+                .put(key, value)
+                .await
+                .map(drop)
+                .map_err(|e| e.to_string());
+        }
+        js.publish(format!("{}{key}", self.prefix()), value)
+            .await
+            .map_err(|e| e.to_string())?
+            .await
+            .map(drop)
+            .map_err(|e| e.to_string())
+    }
+
+    async fn create_consumer(
+        &self,
+        config: jetstream::consumer::push::OrderedConfig,
+    ) -> std::result::Result<
+        jetstream::consumer::Consumer<jetstream::consumer::push::OrderedConfig>,
+        jetstream::stream::ConsumerError,
+    > {
+        match self {
+            Self::Manager(store) => store.stream.create_consumer(config).await,
+            Self::Worker { stream, .. } => stream.create_consumer(config).await,
+        }
+    }
+}
+
 /// NATS/JetStream event bus.
 pub struct NatsBus {
     client: Client,
     js: JetStream,
     status_kv: jetstream::kv::Store,
-    assignments_kv: jetstream::kv::Store,
-    leases_kv: jetstream::kv::Store,
+    assignments_kv: SharedKv,
+    leases_kv: SharedKv,
     api_level: Option<usize>,
     worker_node_id: Option<u64>,
     worker_tenant_id: Option<String>,
@@ -304,12 +404,11 @@ impl NatsBus {
         let filter = crate::assignment_watch_filter(prefix);
         let consumer = self
             .assignments_kv
-            .stream
             .create_consumer(jetstream::consumer::push::OrderedConfig {
                 name: Some(name),
                 deliver_subject: inbox,
                 description: Some("assignment consumer".to_string()),
-                filter_subject: format!("{}{filter}", self.assignments_kv.prefix),
+                filter_subject: format!("{}{filter}", self.assignments_kv.prefix()),
                 replay_policy: jetstream::consumer::ReplayPolicy::Instant,
                 deliver_policy,
                 ..Default::default()
@@ -325,7 +424,7 @@ impl NatsBus {
     }
 
     fn assignment_event(&self, message: &jetstream::Message) -> Option<KvEvent> {
-        kv_event(&self.assignments_kv.prefix, message)
+        kv_event(self.assignments_kv.prefix(), message)
     }
 
     /// Raises the [`REPLICATED`] streams and buckets to `replicas` copies.
@@ -877,14 +976,8 @@ impl NatsBus {
             .get_key_value(&status_bucket)
             .await
             .map_err(|error| BusError::Kv(format!("open {status_bucket}: {error}")))?;
-        let assignments_kv = js
-            .get_key_value("MINGA_ASSIGN")
-            .await
-            .map_err(|error| BusError::Kv(format!("open MINGA_ASSIGN: {error}")))?;
-        let leases_kv = js
-            .get_key_value("MINGA_LEASES")
-            .await
-            .map_err(|error| BusError::Kv(format!("open MINGA_LEASES: {error}")))?;
+        let assignments_kv = SharedKv::worker(&js, "MINGA_ASSIGN").await?;
+        let leases_kv = SharedKv::worker(&js, "MINGA_LEASES").await?;
         Ok(Arc::new(Self {
             client,
             js,
@@ -909,11 +1002,7 @@ impl NatsBus {
     async fn setup_when_ready(
         js: &JetStream,
         lease_ttl: Duration,
-    ) -> Result<(
-        jetstream::kv::Store,
-        jetstream::kv::Store,
-        jetstream::kv::Store,
-    )> {
+    ) -> Result<(jetstream::kv::Store, SharedKv, SharedKv)> {
         const MAX_ATTEMPTS: u32 = 20;
         for attempt in 1..=MAX_ATTEMPTS {
             match Self::setup_all(js, lease_ttl).await {
@@ -930,11 +1019,7 @@ impl NatsBus {
     async fn setup_all(
         js: &JetStream,
         lease_ttl: Duration,
-    ) -> Result<(
-        jetstream::kv::Store,
-        jetstream::kv::Store,
-        jetstream::kv::Store,
-    )> {
+    ) -> Result<(jetstream::kv::Store, SharedKv, SharedKv)> {
         Self::setup_streams(js).await?;
         let status_kv = Self::setup_kv(js, "MINGA_STATUS", Duration::ZERO).await?;
         let assignments_kv = Self::setup_kv(js, "MINGA_ASSIGN", Duration::ZERO).await?;
@@ -943,7 +1028,11 @@ impl NatsBus {
         for kv in [&status_kv, &assignments_kv] {
             purge_legacy_keys(kv).await;
         }
-        Ok((status_kv, assignments_kv, leases_kv))
+        Ok((
+            status_kv,
+            SharedKv::Manager(assignments_kv),
+            SharedKv::Manager(leases_kv),
+        ))
     }
 
     async fn setup_streams(js: &JetStream) -> Result<()> {
@@ -1485,6 +1574,7 @@ impl EventBus for NatsBus {
     async fn put_assignment(&self, key: &str, value: &[u8]) -> Result<()> {
         self.require_manager("write assignments")?;
         self.assignments_kv
+            .store("write assignments")?
             .put(key.to_string(), Bytes::copy_from_slice(value))
             .await
             .map_err(|error| BusError::Kv(format!("put assignment {key}: {error}")))?;
@@ -1494,7 +1584,7 @@ impl EventBus for NatsBus {
     async fn get_assignment(&self, key: &str) -> Result<Option<Vec<u8>>> {
         self.check_worker_key(key)?;
         self.assignments_kv
-            .get(key.to_string())
+            .get(key)
             .await
             .map(|value| value.map(|bytes| bytes.to_vec()))
             .map_err(|error| BusError::Kv(format!("get assignment {key}: {error}")))
@@ -1533,6 +1623,7 @@ impl EventBus for NatsBus {
     async fn delete_assignment(&self, key: &str) -> Result<()> {
         self.require_manager("delete assignments")?;
         self.assignments_kv
+            .store("delete assignments")?
             .delete(key.to_string())
             .await
             .map_err(|error| BusError::Kv(format!("delete assignment {key}: {error}")))
@@ -1541,7 +1632,7 @@ impl EventBus for NatsBus {
     async fn watch_assignments(&self, prefix: &str) -> Result<KvStream> {
         self.check_worker_watch(prefix)?;
         let (_, messages) = self.assignment_consumer(prefix, DeliverPolicy::All).await?;
-        let prefix_subject = self.assignments_kv.prefix.clone();
+        let prefix_subject = self.assignments_kv.prefix().to_owned();
         let prefix = prefix.to_string();
         let stream = messages.filter_map(move |message| {
             let prefix_subject = prefix_subject.clone();
@@ -1747,7 +1838,7 @@ impl EventBus for NatsBus {
         }
         let key = subjects::kv_lease(tenant_id, node_id);
         self.leases_kv
-            .put(key, Bytes::copy_from_slice(registration))
+            .put(&self.js, key, Bytes::copy_from_slice(registration))
             .await
             .map_err(|error| BusError::Lease(format!("refresh {tenant_id}/{node_id}: {error}")))?;
         Ok(())
@@ -1774,7 +1865,7 @@ impl EventBus for NatsBus {
         }
         Ok(self
             .leases_kv
-            .get(subjects::kv_lease(tenant_id, node_id))
+            .get(&subjects::kv_lease(tenant_id, node_id))
             .await
             .map_err(|error| BusError::Lease(format!("get {tenant_id}/{node_id}: {error}")))?
             .is_some())
@@ -1793,6 +1884,7 @@ impl EventBus for NatsBus {
         self.require_manager("list leases")?;
         let mut keys = self
             .leases_kv
+            .store("list leases")?
             .keys()
             .await
             .map_err(|error| BusError::Lease(format!("list: {error}")))?;
@@ -1813,6 +1905,7 @@ impl EventBus for NatsBus {
         // nodes have already joined.
         let watcher = self
             .leases_kv
+            .store("watch leases")?
             .watch_all_from_revision(1)
             .await
             .map_err(|e| BusError::Lease(format!("watch: {e}")))?;
