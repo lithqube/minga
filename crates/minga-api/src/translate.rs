@@ -183,31 +183,58 @@ pub fn service_spec_to_state(spec: &models::ServiceSpec) -> Result<Service, Stri
     // Refuse active hardening fields instead of silently dropping them: the
     // container would run with the defaults while the deployer believes
     // the requested isolation is in effect. Explicit no-ops
-    // (`ReadOnly: false`, empty lists/Privileges, `NoNewPrivileges: false`,
-    // and unlimited `Pids: 0`) ask for nothing and stay accepted.
+    // (`ReadOnly: false`, empty lists/Privileges/nested strings,
+    // `SELinuxContext.Disable: false`, `NoNewPrivileges: false`, and unlimited
+    // `Pids: 0`) ask for nothing and stay accepted.
     if container.ReadOnly == Some(true) {
         return Err(format!(
             "service '{name}': ContainerSpec.ReadOnly is not supported"
         ));
     }
+
     if container.Privileges.as_ref().is_some_and(|privileges| {
         privileges.CredentialSpec.as_ref().is_some_and(|spec| {
-            spec.Config.is_some() || spec.File.is_some() || spec.Registry.is_some()
+            spec.Config
+                .as_deref()
+                .is_some_and(|value| !value.is_empty())
+                || spec.File.as_deref().is_some_and(|value| !value.is_empty())
+                || spec
+                    .Registry
+                    .as_deref()
+                    .is_some_and(|value| !value.is_empty())
         }) || privileges.SELinuxContext.as_ref().is_some_and(|context| {
-            context.Disable.is_some()
-                || context.User.is_some()
-                || context.Role.is_some()
-                || context.Type.is_some()
-                || context.Level.is_some()
-        }) || privileges
-            .Seccomp
-            .as_ref()
-            .is_some_and(|options| options.Mode.is_some() || options.Profile.is_some())
-            || privileges
-                .AppArmor
-                .as_ref()
-                .is_some_and(|options| options.Mode.is_some())
-            || privileges.NoNewPrivileges == Some(true)
+            context.Disable == Some(true)
+                || context
+                    .User
+                    .as_deref()
+                    .is_some_and(|value| !value.is_empty())
+                || context
+                    .Role
+                    .as_deref()
+                    .is_some_and(|value| !value.is_empty())
+                || context
+                    .Type
+                    .as_deref()
+                    .is_some_and(|value| !value.is_empty())
+                || context
+                    .Level
+                    .as_deref()
+                    .is_some_and(|value| !value.is_empty())
+        }) || privileges.Seccomp.as_ref().is_some_and(|options| {
+            options
+                .Mode
+                .as_deref()
+                .is_some_and(|value| !value.is_empty())
+                || options
+                    .Profile
+                    .as_deref()
+                    .is_some_and(|value| !value.is_empty())
+        }) || privileges.AppArmor.as_ref().is_some_and(|options| {
+            options
+                .Mode
+                .as_deref()
+                .is_some_and(|value| !value.is_empty())
+        }) || privileges.NoNewPrivileges == Some(true)
     }) {
         return Err(format!(
             "service '{name}': ContainerSpec.Privileges is not supported"
@@ -1549,22 +1576,24 @@ mod tests {
         container.Ulimits = Some(vec![]);
         container.Privileges = Some(models::Privileges {
             CredentialSpec: Some(models::CredentialSpec {
-                Config: None,
-                File: None,
-                Registry: None,
+                Config: Some(String::new()),
+                File: Some(String::new()),
+                Registry: Some(String::new()),
             }),
             SELinuxContext: Some(models::SELinuxContext {
-                Disable: None,
-                User: None,
-                Role: None,
-                Type: None,
-                Level: None,
+                Disable: Some(false),
+                User: Some(String::new()),
+                Role: Some(String::new()),
+                Type: Some(String::new()),
+                Level: Some(String::new()),
             }),
             Seccomp: Some(models::SeccompOptions {
-                Mode: None,
-                Profile: None,
+                Mode: Some(String::new()),
+                Profile: Some(String::new()),
             }),
-            AppArmor: Some(models::AppArmorOptions { Mode: None }),
+            AppArmor: Some(models::AppArmorOptions {
+                Mode: Some(String::new()),
+            }),
             NoNewPrivileges: Some(false),
         });
         spec.TaskTemplate
@@ -1591,6 +1620,40 @@ mod tests {
                     "Resources": {
                         "Limits": {"Pids": 0}
                     }
+                }
+            }"#,
+        )
+        .unwrap();
+        assert!(service_spec_to_state(&spec).is_ok());
+    }
+
+    #[test]
+    fn inactive_privilege_values_and_unlimited_pids_json_are_noops() {
+        let spec: models::ServiceSpec = serde_json::from_str(
+            r#"{
+                "Name": "web",
+                "TaskTemplate": {
+                    "ContainerSpec": {
+                        "Image": "nginx:1.25",
+                        "Privileges": {
+                            "CredentialSpec": {
+                                "Config": "",
+                                "File": "",
+                                "Registry": ""
+                            },
+                            "SELinuxContext": {
+                                "Disable": false,
+                                "User": "",
+                                "Role": "",
+                                "Type": "",
+                                "Level": ""
+                            },
+                            "Seccomp": {"Mode": "", "Profile": ""},
+                            "AppArmor": {"Mode": ""},
+                            "NoNewPrivileges": false
+                        }
+                    },
+                    "Resources": {"Limits": {"Pids": 0}}
                 }
             }"#,
         )
