@@ -424,6 +424,41 @@ fn worker_raw_options(config: &NatsTlsConfig) -> async_nats::ConnectOptions {
         .custom_inbox_prefix(minga_bus::subjects::worker_inbox_prefix("default", 7))
 }
 
+/// A raw worker client that records every server error it is sent, so a
+/// missing answer can be told apart from a refused publish.
+async fn raw_worker(
+    url: &str,
+    config: &NatsTlsConfig,
+) -> (
+    async_nats::Client,
+    tokio::sync::mpsc::UnboundedReceiver<String>,
+) {
+    let (errors_tx, errors) = tokio::sync::mpsc::unbounded_channel();
+    let options = worker_raw_options(config).event_callback(move |event| {
+        let errors_tx = errors_tx.clone();
+        async move {
+            if let async_nats::Event::ServerError(error) = event {
+                let _ = errors_tx.send(error.to_string());
+            }
+        }
+    });
+    let client = async_nats::connect_with_options(url, options)
+        .await
+        .unwrap();
+    (client, errors)
+}
+
+async fn expect_refusal(errors: &mut tokio::sync::mpsc::UnboundedReceiver<String>, subject: &str) {
+    let refusal = tokio::time::timeout(Duration::from_secs(2), errors.recv())
+        .await
+        .unwrap_or_else(|_| panic!("{subject}: the server reported no permissions violation"))
+        .unwrap();
+    assert!(
+        refusal.contains("Permissions Violation") && refusal.contains(subject),
+        "{subject}: unexpected server error: {refusal}"
+    );
+}
+
 fn start_worker_acl_server(pki: &Pki) -> TlsServer {
     let dir = tempfile::tempdir().unwrap();
     let ca_path = dir.path().join("ca.pem");
@@ -639,6 +674,18 @@ async fn worker_certificate_cannot_write_assignments_or_other_nodes_status_and_l
         })
         .await
         .expect("worker publishes its tenant's usage");
+    // Where the log and usage grants stop. `NatsBus` refuses these before
+    // the wire, so only a raw client shows the server does too.
+    let (raw, mut errors) = raw_worker(&url, &worker_config).await;
+    for subject in [
+        "minga.default.log.node.8.web.1.3",
+        "minga.beta.log.node.7.web.1.3",
+        "minga.beta.usage.web",
+    ] {
+        raw.publish(subject, "x".into()).await.unwrap();
+        raw.flush().await.unwrap();
+        expect_refusal(&mut errors, subject).await;
+    }
     assert_eq!(
         worker_bus
             .get_assignment("default.node.7.task.allowed")
@@ -1263,20 +1310,7 @@ async fn worker_watch_recovers_without_consumer_info() {
     assert_eq!(config.filter_subject, "$KV.MINGA_ASSIGN.beta.node.9.>");
 
     let worker_config = worker_client_config(dir.path(), &pki);
-    let (errors_tx, mut errors) = tokio::sync::mpsc::unbounded_channel();
-    let worker = async_nats::connect_with_options(
-        &url,
-        worker_raw_options(&worker_config).event_callback(move |event| {
-            let errors_tx = errors_tx.clone();
-            async move {
-                if let async_nats::Event::ServerError(error) = event {
-                    let _ = errors_tx.send(error.to_string());
-                }
-            }
-        }),
-    )
-    .await
-    .unwrap();
+    let (worker, mut errors) = raw_worker(&url, &worker_config).await;
     let info = tokio::time::timeout(
         Duration::from_secs(2),
         worker.request("$JS.API.CONSUMER.INFO.KV_MINGA_ASSIGN.betaprobe", "".into()),
@@ -1287,15 +1321,11 @@ async fn worker_watch_recovers_without_consumer_info() {
         "worker 7 got an answer about tenant beta's consumer: {info:?}"
     );
     // The missing answer must be the server refusing the publish, not a slow server.
-    let refusal = tokio::time::timeout(Duration::from_secs(2), errors.recv())
-        .await
-        .expect("the server reports a permissions violation")
-        .unwrap();
-    assert!(
-        refusal.contains("Permissions Violation")
-            && refusal.contains("$JS.API.CONSUMER.INFO.KV_MINGA_ASSIGN.betaprobe"),
-        "unexpected server error: {refusal}"
-    );
+    expect_refusal(
+        &mut errors,
+        "$JS.API.CONSUMER.INFO.KV_MINGA_ASSIGN.betaprobe",
+    )
+    .await;
     stream.delete_consumer("betaprobe").await.unwrap();
 
     let worker_bus = NatsBus::connect_worker_secure(&url, &worker_config, 7, "default")
