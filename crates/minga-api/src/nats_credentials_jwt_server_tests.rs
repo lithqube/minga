@@ -446,6 +446,18 @@ async fn jwt_worker_cannot_learn_other_tenants_keys() {
 
     let (worker, mut errors) = raw_worker(&url, &tls, &worker_creds).await;
 
+    // Where the log and usage grants stop. `NatsBus` refuses these before
+    // the wire, so only a raw client shows the server does too.
+    for subject in [
+        "minga.default.log.node.8.web.1.3",
+        "minga.beta.log.node.7.web.1.3",
+        "minga.beta.usage.web",
+    ] {
+        worker.publish(subject, "x".into()).await.unwrap();
+        worker.flush().await.unwrap();
+        expect_refusal(&mut errors, subject, subject).await;
+    }
+
     // APIs the template does not grant: refused by the server, not just silent.
     for (what, subject, body) in [
         (

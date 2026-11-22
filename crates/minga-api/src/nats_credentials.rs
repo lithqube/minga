@@ -320,8 +320,8 @@ mod tests {
         let issuer = test_issuer("tenant-a");
         let (jwt_publish, jwt_subscribe) = effective_worker_permissions(&issuer, "tenant-a", 7);
         let (acl_publish, acl_subscribe) = minga_bus::subjects::worker_acl("tenant-a", 7).unwrap();
-        // Both modes run the same worker code, so they need the same grants. A
-        // grant one mode really needs alone is listed here with its reason.
+        // Both modes run the same worker code, so the grants must be equal, with
+        // no exceptions. A grant only one mode needs fails here by design.
         for (what, jwt, acl) in [
             ("publish", &jwt_publish, &acl_publish),
             ("subscribe", &jwt_subscribe, &acl_subscribe),
@@ -348,6 +348,14 @@ mod tests {
             // Flow-control replies to ordered watches name only the random consumer.
             "$JS.FC.KV_MINGA_ASSIGN.>",
         ];
+        let pinned_prefixes = [
+            "minga.tenant-a.log.node.7",
+            "minga.tenant-a.ctl.node.7",
+            "$KV.MINGA_ASSIGN.tenant-a.node.7",
+            "$KV.MINGA_STATUS_tenant-a.node.7",
+            "$KV.MINGA_LEASES.tenant-a.lease.node.7",
+            "_INBOX.tenant-a.7",
+        ];
         let issuer = test_issuer("tenant-a");
         let (jwt_publish, jwt_subscribe) = effective_worker_permissions(&issuer, "tenant-a", 7);
         let (acl_publish, acl_subscribe) = minga_bus::subjects::worker_acl("tenant-a", 7).unwrap();
@@ -360,22 +368,24 @@ mod tests {
             if tenant_wide.contains(&grant.as_str()) {
                 continue;
             }
-            // The consumer name is random; the filter subject after it is pinned.
-            let subject = grant
-                .strip_prefix("$JS.API.CONSUMER.CREATE.KV_MINGA_ASSIGN.*.")
-                .unwrap_or(grant);
-            // Tenant and node must both come before the first wildcard.
-            let pinned: Vec<_> = subject
-                .split('.')
-                .take_while(|token| *token != "*" && *token != ">")
-                .collect();
+            // A JetStream API grant is pinned by the subject it names: the
+            // consumer filter (after the random consumer name) or the key read.
+            let subject = [
+                "$JS.API.CONSUMER.CREATE.KV_MINGA_ASSIGN.*.",
+                "$JS.API.DIRECT.GET.KV_MINGA_ASSIGN.",
+                "$JS.API.DIRECT.GET.KV_MINGA_STATUS_tenant-a.",
+                "$JS.API.DIRECT.GET.KV_MINGA_LEASES.",
+            ]
+            .iter()
+            .find_map(|api| grant.strip_prefix(api))
+            .unwrap_or(grant);
+            // Each subject starts with its tenant then node, in that place.
             assert!(
-                pinned
+                pinned_prefixes
                     .iter()
-                    .any(|token| *token == "tenant-a" || token.ends_with("_tenant-a")),
-                "{grant} is not pinned to the tenant"
+                    .any(|prefix| subject == *prefix || subject.starts_with(&format!("{prefix}."))),
+                "{grant} is not pinned to tenant-a and node 7"
             );
-            assert!(pinned.contains(&"7"), "{grant} is not pinned to the node");
         }
     }
 

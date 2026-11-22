@@ -4,9 +4,15 @@
 
 - **Fix, upgrade action needed.** mTLS and operator/JWT workers get the same NATS grants, and a test keeps
   them in step:
-  - mTLS workers can publish task logs. Their ACL allowed one subject token after the node, so it refused
-    every task ID, which is `<service>.<slot>.<revision>`.
-  - JWT workers can publish usage events: the signer template lacked `minga.<tenant>.usage.>`.
+  - Widened grant: mTLS workers can publish task logs. Their ACL now allows any subject under their own
+    node's log prefix, `minga.<tenant>.log.node.<n>.>`, instead of one token. The old grant refused every
+    task ID, which is `<service>.<slot>.<revision>`. Other nodes' and tenants' log subjects stay refused.
+  - JWT workers can publish usage events: the signer template lacked `minga.<tenant>.usage.>`. In both
+    modes a node can publish usage for any service of its own tenant, and can reuse a `Nats-Msg-Id`, so
+    JetStream may drop a later record with that ID as a duplicate. Other tenants' usage stays refused.
+  - A connected worker keeps the grants it authenticated with until it reconnects. Restarting the
+    managers restarts their sidecars, which reconnects every worker; on an external NATS server,
+    reconnect the workers yourself after updating its ACL or account claim.
   - Both lists drop grants no worker uses: `$JS.ACK.KV_MINGA_ASSIGN.>`, `$JS.ACK.KV_MINGA_LEASES.>` and
     `$JS.API.STREAM.INFO.MINGA_LOGS_<tenant>` in mTLS mode, and the direct `$KV.*` subscriptions in JWT
     mode. Watches deliver to the worker's own inbox.
