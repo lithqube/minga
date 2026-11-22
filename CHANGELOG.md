@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+- **Security, upgrade check.** Two networks can no longer hold overlapping subnets, and a network with
+  running tasks can no longer be removed (#125):
+  - `UpsertNetwork` is refused in the Raft apply, not only in the API, when its subnet overlaps another
+    network's, in any tenant. The answer is the same for every tenant and never names the other network.
+    A network that already stores its subnet can still be rewritten, so a pair that overlapped before this
+    change keeps working.
+  - Deleting a network is refused (409) while a running task still holds an IP on it, not only while a
+    service names it.
+  - The leader no longer gives a network without a subnet the /24 its old tasks use when another network
+    already stores it, or when an earlier network in the same pass just took it. It assigns a free /24 and
+    logs the network; redeploy its services to move them. Of two old networks whose tasks share a /24, the
+    first keeps it. Both were already breaking each other's bridges. Check before upgrading for networks
+    that share a subnet; the scheduler logs each pair.
+  - `minga state import` refuses a snapshot whose networks overlap, before writing anything.
+  - These are apply refusals that older managers do not have, so mixed-version managers can hold
+    different state for the same entry (#157). During a rolling upgrade, do not create or delete
+    networks until every manager runs this version, and know that the leader also writes subnets by
+    itself for any network that has none (networks created before subnets were stored), so finish the
+    upgrade promptly.
+  - A service on a network that still has no subnet gets no task until the leader stores one, so a task
+    never persists without an IP.
+
 - **Fix, upgrade action needed.** mTLS and operator/JWT workers get the same NATS grants, and a test keeps
   them in step:
   - Widened grant: mTLS workers can publish task logs. Their ACL now allows any subject under their own
