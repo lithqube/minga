@@ -544,14 +544,29 @@ impl NatsBus {
     }
 
     async fn raise_replicas(&self, replicas: usize) -> Result<()> {
-        let mut names: Vec<String> = REPLICATED.iter().map(|name| name.to_string()).collect();
-        names.extend(
-            self.assignment_tenants()
-                .await?
-                .into_iter()
-                .map(|tenant| format!("{ASSIGN_STREAM_PREFIX}{tenant}")),
-        );
-        for name in names.iter().map(String::as_str) {
+        // The shared streams first, the lease bucket among them, then the
+        // tenants' assignment buckets listed after that. A tenant created in
+        // between is listed, or reads the raised lease count when it is
+        // created (`match_lease_replicas`), so none stays below it.
+        self.raise_streams(REPLICATED.iter().map(|name| name.to_string()), replicas)
+            .await?;
+        let tenant_streams: Vec<String> = self
+            .assignment_tenants()
+            .await?
+            .into_iter()
+            .map(|tenant| format!("{ASSIGN_STREAM_PREFIX}{tenant}"))
+            .collect();
+        self.raise_streams(tenant_streams.into_iter(), replicas)
+            .await
+    }
+
+    async fn raise_streams(
+        &self,
+        names: impl Iterator<Item = String>,
+        replicas: usize,
+    ) -> Result<()> {
+        for name in names {
+            let name = name.as_str();
             let mut stream = self
                 .js
                 .get_stream(name)
@@ -1861,8 +1876,20 @@ impl EventBus for NatsBus {
         if prefix.is_empty() {
             // Only a manager gets here: a worker's prefix is always its own.
             let mut all = Vec::new();
+            // The only caller is the scheduler's sweep of stale keys. A tenant
+            // whose bucket cannot be listed (a full consumer limit, say) is
+            // skipped and logged, so it cannot stop the sweep of the others,
+            // and its keys are left alone: they are not in the result, so no
+            // caller can mistake them for absent and delete them.
             for tenant in self.assignment_tenants().await? {
-                all.extend(self.list_tenant_assignments(&tenant, "").await?);
+                match self.list_tenant_assignments(&tenant, "").await {
+                    Ok(entries) => all.extend(entries),
+                    Err(error) => tracing::warn!(
+                        %tenant,
+                        %error,
+                        "cannot list a tenant's assignments; leaving its stale keys for a later pass"
+                    ),
+                }
             }
             return Ok(all);
         }

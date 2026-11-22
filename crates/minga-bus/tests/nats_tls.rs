@@ -1352,9 +1352,17 @@ async fn worker_watch_recovers_without_consumer_info() {
 
     // Drop the worker's consumer under it, as a server restart or consumer
     // cleanup would, then write a new key: the watch must recreate and deliver.
-    let mut names = stream.consumer_names();
+    // The worker's watch is on the default tenant's bucket; `stream` is beta's.
+    let default_stream = jetstream
+        .get_stream("KV_MINGA_ASSIGN_default")
+        .await
+        .unwrap();
+    let mut names = default_stream.consumer_names();
     while let Some(name) = names.next().await {
-        stream.delete_consumer(&name.unwrap()).await.unwrap();
+        default_stream
+            .delete_consumer(&name.unwrap())
+            .await
+            .unwrap();
     }
     manager
         .put_assignment("default.node.7.task.after", b"after")

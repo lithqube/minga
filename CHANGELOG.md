@@ -18,6 +18,29 @@
     refused until you `DELETE` it, which removes them.
   - The delete request's own audit record is written to the tenant's audit stream and goes with it.
 
+- **Security, upgrade check.** Two networks can no longer hold overlapping subnets, and a network with
+  running tasks can no longer be removed (#125):
+  - `UpsertNetwork` is refused in the Raft apply, not only in the API, when its subnet overlaps another
+    network's, in any tenant. The answer is the same for every tenant and never names the other network.
+    A network that already stores its subnet can still be rewritten, so a pair that overlapped before this
+    change keeps working.
+  - Deleting a network is refused (409) while a running task still holds an IP on it, not only while a
+    service names it.
+  - The leader no longer gives a network without a subnet the /24 its old tasks use when another network
+    already stores it, or when an earlier network in the same pass just took it. It assigns a free /24 and
+    logs the network; redeploy its services to move them. Of two old networks whose tasks share a /24, the
+    first keeps it. Both were already breaking each other's bridges. Check before upgrading for networks
+    that share a subnet; the scheduler logs each pair.
+  - `minga state import` refuses a snapshot whose networks overlap, before writing anything.
+  - These are apply refusals that older managers do not have, so mixed-version managers can hold
+    different state for the same entry (#157). During a rolling upgrade, do not create or delete
+    networks until every manager runs this version, and know that the leader also writes subnets by
+    itself for any network that has none (networks created before subnets were stored), so finish the
+    upgrade promptly.
+  - A service on a network that still has no subnet gets no task until the leader stores one, so a task
+    never persists without an IP.
+
+
 - **Security, upgrade action needed: flag day.** Each tenant now has its own assignment bucket (#131):
   - A worker could create consumers of any name, durable ones included, on the one shared
     `KV_MINGA_ASSIGN` stream, and its ACL cannot count them. Filling the stream-wide limit stopped other
@@ -32,12 +55,14 @@
   - Order: stop nothing, upgrade every manager, then every worker. After the managers, a node shows no new
     assignments until it runs this version.
   - Operator/JWT mode, as for the entries below: set every tenant signer's template to the list in
-    `worker_permission_template`, re-sign the account JWT, copy the `revocations` of the current resolver
-    claim into it, and push it to every manager's resolver before starting the managers. A manager
-    refuses to start with the old template.
+    `worker_permission_template`, copy the `revocations` of the current resolver claim into the account
+    claim, then re-sign the account JWT, and push it to every manager's resolver before starting the
+    managers. A manager refuses to start with the old template.
   - The old shared `KV_MINGA_ASSIGN` stream is no longer written or granted. It keeps every tenant's old
     assignments, so delete it once every node runs this version (`nats stream rm KV_MINGA_ASSIGN`). Until
-    then, rolling the managers back works.
+    then, and only while no worker runs this version, rolling the managers back works. A worker already
+    upgraded reads `KV_MINGA_ASSIGN_<tenant>`, which an older manager never writes, so after a manager
+    rollback it gets no assignments until the managers are upgraded again.
   - The 5,000 limit is the most one tenant's workers can fill; a tenant with more than 2,500 nodes
     needs it raised on its bucket.
 

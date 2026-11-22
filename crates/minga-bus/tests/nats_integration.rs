@@ -502,6 +502,59 @@ async fn nats_tenant_event_history_is_filtered_bounded_and_publish_stamped() {
     assert_eq!(all.len(), 22, "fewer than `limit` events returns them all");
 }
 
+/// The scheduler sweeps every tenant's assignments for stale keys. A tenant
+/// whose bucket is at its consumer limit cannot be listed, and that must not
+/// stop the sweep of the others or make its own keys look absent.
+#[tokio::test]
+async fn one_tenants_full_assignment_bucket_does_not_stop_the_global_listing() {
+    let Some(bus) = connect().await else {
+        return;
+    };
+    let pid = std::process::id();
+    let (full, fine) = (format!("full{pid}"), format!("fine{pid}"));
+    for tenant in [&full, &fine] {
+        bus.ensure_tenant_resources(tenant).await.unwrap();
+        bus.put_assignment(&format!("{tenant}.node.7.task.t"), b"stale")
+            .await
+            .unwrap();
+    }
+    // Fill the bucket: one consumer allowed, and one held.
+    let js = bus.jetstream();
+    let stream = js
+        .get_stream(format!("KV_MINGA_ASSIGN_{full}"))
+        .await
+        .unwrap();
+    let mut config = stream.cached_info().config.clone();
+    config.max_consumers = 1;
+    js.update_stream(config).await.unwrap();
+    stream
+        .create_consumer(async_nats::jetstream::consumer::pull::Config {
+            durable_name: Some("squat".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert!(
+        bus.list_assignments(&format!("{full}.")).await.is_err(),
+        "the full bucket still lists"
+    );
+
+    let all = bus.list_assignments("").await.expect("the sweep survives");
+    assert!(all
+        .iter()
+        .any(|(key, _)| key == &format!("{fine}.node.7.task.t")));
+    assert!(
+        !all.iter()
+            .any(|(key, _)| key.starts_with(&format!("{full}."))),
+        "an unreadable tenant's keys are reported as present or absent"
+    );
+    for tenant in [&full, &fine] {
+        js.delete_stream(format!("KV_MINGA_ASSIGN_{tenant}"))
+            .await
+            .unwrap();
+    }
+}
+
 /// Seeds every place a tenant keeps data on the bus.
 async fn seed_tenant(bus: &NatsBus, tenant: &str, node: u64) {
     bus.ensure_tenant_resources(tenant).await.unwrap();
