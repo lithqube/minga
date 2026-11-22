@@ -260,6 +260,7 @@ pub enum ChangeProposal {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ChangeRequestQuery {
+    id: Option<String>,
     limit: Option<usize>,
     /// Only requests in this state, filtered before `limit`, so a pending
     /// request stays findable behind newer decided ones.
@@ -510,10 +511,11 @@ pub async fn create_change_request(
             if before.agent.is_some()
                 || image.trim().is_empty()
                 || image.len() > 512
+                || !image.is_ascii()
                 || image.chars().any(char::is_control)
             {
                 return Err(bad_request(
-                    "deploy requires a container image of 1–512 printable bytes",
+                    "deploy requires a container image of 1–512 printable ASCII bytes",
                 ));
             }
             let mut prior = before.clone();
@@ -581,6 +583,9 @@ pub async fn list_change_requests(
     let limit = query.limit.unwrap_or(100).clamp(1, 100);
     // Reads only this tenant's key range, which holds at most 256 requests.
     let mut requests = app.store.list_change_requests(tenant_id).await?;
+    if let Some(id) = query.id {
+        requests.retain(|request| request.id == id);
+    }
     if let Some(status) = query.status {
         requests.retain(|request| request.status == status);
     }

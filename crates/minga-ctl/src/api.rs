@@ -161,11 +161,35 @@ impl ApiClient {
         if !(1..=100).contains(&limit) {
             return Err(CtlError::Usage("limit must be between 1 and 100".into()));
         }
+        self.read_change_requests(change_request_query(limit, pending))
+            .await
+    }
+
+    /// Reads one tenant proposal before asking the reviewer to approve it.
+    pub async fn tenant_change_request(&self, id: &str) -> Result<Value, CtlError> {
+        if !valid_change_request_id(id) {
+            return Err(CtlError::Usage("invalid change request ID".into()));
+        }
+        let requests = self
+            .read_change_requests(vec![("id", id.to_owned())])
+            .await?;
+        requests
+            .as_array()
+            .and_then(|rows| rows.iter().find(|row| row["id"] == id))
+            .cloned()
+            .ok_or_else(|| CtlError::NotFound {
+                kind: "change request",
+                name: id.to_owned(),
+                context: self.context.clone(),
+            })
+    }
+
+    async fn read_change_requests(&self, query: Vec<(&str, String)>) -> Result<Value, CtlError> {
         let url = format!("{}/minga/change-requests", self.root);
         let response = self
             .http
             .get(&url)
-            .query(&change_request_query(limit, pending))
+            .query(&query)
             .send()
             .await
             .map_err(|error| CtlError::Unreachable {

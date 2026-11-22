@@ -1,5 +1,8 @@
 //! `minga-ctl change`: inspect and decide tenant-scoped agent proposals.
 
+use std::fmt::Write as _;
+use std::io::Write as _;
+
 use clap::{Args, Subcommand};
 use serde_json::Value;
 
@@ -12,7 +15,7 @@ pub enum ChangeCommand {
     /// List change requests visible to the tenant in the client certificate.
     List(ListArgs),
     /// Approve and atomically apply a pending change request.
-    Approve(DecisionArgs),
+    Approve(ApproveArgs),
     /// Reject a pending change request.
     Reject(DecisionArgs),
 }
@@ -25,6 +28,15 @@ pub struct ListArgs {
     /// Only requests still waiting for a decision.
     #[arg(long)]
     pending: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct ApproveArgs {
+    #[command(flatten)]
+    decision: DecisionArgs,
+    /// Do not ask for confirmation (the diff is still printed to stderr).
+    #[arg(long)]
+    yes: bool,
 }
 
 #[derive(Debug, Args)]
@@ -59,18 +71,7 @@ pub async fn run(
                     .and_then(Value::as_u64)
                     .map(|value| value.to_string())
                     .unwrap_or_default();
-                // Field names only; `-o json` has the before/after values.
-                let changes = request
-                    .get("changed_fields")
-                    .and_then(Value::as_array)
-                    .map(|fields| {
-                        fields
-                            .iter()
-                            .filter_map(Value::as_str)
-                            .collect::<Vec<_>>()
-                            .join(",")
-                    })
-                    .unwrap_or_default();
+                let changes = review_diff(request)?;
                 output.push(
                     vec![
                         id.clone(),
@@ -83,30 +84,91 @@ pub async fn run(
                     request.clone(),
                 );
             }
-            output::print(format, quiet, &output)?;
-        }
-        ChangeCommand::Approve(args) | ChangeCommand::Reject(args) => {
-            let approve = matches!(command, ChangeCommand::Approve(_));
-            let request = api.decide_tenant_change_request(&args.id, approve).await?;
-            let status = string_field(&request, "status");
-            let verb = if approve { "approved" } else { "rejected" };
-            if format != Format::Table {
-                output::print_value(format, quiet, &request)?;
+            if format == Format::Json {
+                print_json(&serde_json::to_value(&output.values)?)?;
             } else {
-                output::say(
-                    quiet,
-                    &format!("change request {} {verb} ({status})", args.id),
-                )?;
+                output::print(format, quiet, &output)?;
             }
+        }
+        ChangeCommand::Approve(args) => {
+            let request = api.tenant_change_request(&args.decision.id).await?;
+            let summary = format!(
+                "change request {}: {}",
+                args.decision.id,
+                review_diff(&request)?
+            );
+            // Always show review evidence, including with --quiet or --yes.
+            writeln!(std::io::stderr().lock(), "{summary}")
+                .map_err(|error| CtlError::Output(error.to_string()))?;
+            super::service::confirm("change approve", args.yes, "Approve this change?")?;
+            decide(api, &args.decision.id, true, format, quiet).await?;
+        }
+        ChangeCommand::Reject(args) => {
+            decide(api, &args.id, false, format, quiet).await?;
         }
     }
     Ok(())
 }
 
 fn string_field(value: &Value, field: &str) -> String {
-    value
-        .get(field)
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_owned()
+    let text = value.get(field).and_then(Value::as_str).unwrap_or_default();
+    let quoted = ascii_json(&Value::String(text.to_owned()).to_string());
+    quoted[1..quoted.len() - 1].to_owned()
+}
+
+async fn decide(
+    api: &ApiClient,
+    id: &str,
+    approve: bool,
+    format: Format,
+    quiet: bool,
+) -> Result<(), CtlError> {
+    let request = api.decide_tenant_change_request(id, approve).await?;
+    let status = string_field(&request, "status");
+    let verb = if approve { "approved" } else { "rejected" };
+    match format {
+        Format::Json => print_json(&request),
+        Format::Yaml => output::print_value(format, quiet, &request),
+        Format::Table => output::say(quiet, &format!("change request {id} {verb} ({status})")),
+    }
+}
+
+fn review_diff(request: &Value) -> Result<String, CtlError> {
+    let changes = request
+        .get("changes")
+        .and_then(Value::as_array)
+        .ok_or_else(|| CtlError::Api {
+            status: 502,
+            message: "change request has no reviewable diff; upgrade the server".into(),
+        })?;
+    changes
+        .iter()
+        .map(|change| {
+            Ok(format!(
+                "{}: {} -> {}",
+                string_field(change, "field"),
+                ascii_json(&serde_json::to_string(&change["before"])?),
+                ascii_json(&serde_json::to_string(&change["after"])?)
+            ))
+        })
+        .collect::<Result<Vec<_>, CtlError>>()
+        .map(|lines| lines.join("; "))
+}
+
+fn print_json(value: &Value) -> Result<(), CtlError> {
+    output::say(false, &ascii_json(&serde_json::to_string_pretty(value)?))
+}
+
+// Escape every non-ASCII code point, including all Unicode format characters.
+// JSON UTF-16 escapes preserve the exact values for structured-output consumers.
+fn ascii_json(text: &str) -> String {
+    let mut escaped = String::new();
+    for unit in text.encode_utf16() {
+        if unit < 128 {
+            escaped.push(char::from(unit as u8));
+        } else {
+            let _ = write!(escaped, "\\u{unit:04x}");
+        }
+    }
+    escaped
 }

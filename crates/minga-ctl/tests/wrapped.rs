@@ -701,3 +701,90 @@ fn image_pull_runs_on_each_node_and_rm_needs_confirmation() {
     let (code, _, err) = env.run(&["image", "pull", "bad;id", "--ssh", "n1"], &[], b"");
     assert_eq!(code, 1, "stderr: {err}");
 }
+
+fn change_review_fixture() -> Value {
+    json!({"id":"cr-review", "service_id":"web", "kind":"deploy", "status":"pending",
+        "changed_fields":["image","replicas"], "changes":[
+            {"field":"image","before":"web:1","after":"web:\u{202e}2\u{e0001}"},
+            {"field":"replicas","before":1,"after":2}]})
+}
+
+#[test]
+fn change_review_list_shows_values_and_escapes_unicode() {
+    let env = Env::new();
+    for format in ["table", "json"] {
+        let fixture = json!([change_review_fixture()]);
+        let (url, _) = fake_api(vec![(200, fixture.to_string())]);
+        let (code, out, err) = env.run(
+            &["-o", format, "change", "list"],
+            &[("MINGA_CTL_ENDPOINT", &url)],
+            b"",
+        );
+        assert_eq!(code, 0, "{err}");
+        assert!(out.contains("web:1") && out.contains("web:"), "{out}");
+        assert!(
+            out.contains("\\u202e") && !out.contains('\u{202e}'),
+            "{out}"
+        );
+        if format == "json" {
+            assert_eq!(serde_json::from_str::<Value>(&out).unwrap(), fixture);
+        } else {
+            assert!(out.contains("replicas: 1 -> 2"), "{out}");
+        }
+    }
+}
+
+#[test]
+fn change_review_approval_reads_diff_before_confirmation_or_yes() {
+    let env = Env::new();
+    for yes in [false, true] {
+        let mut decided = change_review_fixture();
+        decided["status"] = json!("approved");
+        let mut replies = vec![(200, json!([change_review_fixture()]).to_string())];
+        if yes {
+            replies.push((200, decided.to_string()));
+        }
+        let (url, heads) = fake_api(replies);
+        let mut args = vec!["change", "approve", "cr-review"];
+        if yes {
+            args.push("--yes");
+        }
+        let (code, _, err) = env.run(&args, &[("MINGA_CTL_ENDPOINT", &url)], b"");
+        assert_eq!(code, if yes { 0 } else { 1 }, "{err}");
+        assert!(
+            err.contains("web:1") && err.contains("\\u202e") && !err.contains('\u{202e}'),
+            "{err}"
+        );
+        if !yes {
+            assert!(err.contains("needs confirmation"), "{err}");
+        }
+        let heads = heads.lock().unwrap();
+        assert_eq!(heads.len(), if yes { 2 } else { 1 });
+        assert!(
+            heads[0].starts_with("GET /minga/change-requests?"),
+            "{heads:?}"
+        );
+        assert!(heads[0].contains("id=cr-review"), "{heads:?}");
+        if yes {
+            assert!(heads[1].starts_with("POST /minga/change-requests/cr-review/approve "));
+        }
+    }
+}
+
+#[test]
+fn change_review_cannot_approve_missing_or_unreviewable_requests() {
+    let env = Env::new();
+    for fixture in [
+        json!([]),
+        json!([{"id":"cr-review","changed_fields":["image"]}]),
+    ] {
+        let (url, heads) = fake_api(vec![(200, fixture.to_string())]);
+        let (code, _, err) = env.run(
+            &["change", "approve", "cr-review", "--yes"],
+            &[("MINGA_CTL_ENDPOINT", &url)],
+            b"",
+        );
+        assert_ne!(code, 0, "{err}");
+        assert_eq!(heads.lock().unwrap().len(), 1);
+    }
+}
