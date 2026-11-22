@@ -13,15 +13,17 @@
   - JWT `DIRECT.GET` on `KV_MINGA_ASSIGN` is limited to the worker's task, ingress, net and wg keys
     instead of every key under its node.
   - Operator/JWT mode, once for this change and #130 below:
-    1. Set every tenant signer's template to the list in `worker_permission_template`.
-    2. Copy the `revocations` of the current resolver claim, `<MINGA_NATS_RESOLVER_DIR>/<account public
+    1. Stop every manager. While they are down, no node removal or credential reissue can add a
+       revocation.
+    2. Set every tenant signer's template to the list in `worker_permission_template`.
+    3. Copy the `revocations` of the current resolver claim, `<MINGA_NATS_RESOLVER_DIR>/<account public
        key>.jwt`, into the new account claim. Then re-sign the account JWT in
        `MINGA_NATS_ACCOUNT_JWT_FILE`. A claim without them lets removed workers connect until the leader
        republishes. A manager refuses to start with the old template.
-    3. With the manager stopped, copy that file over the resolver claim on every manager. The sidecar
-       preloads the resolver claim only when it is missing, so an existing resolver keeps serving the
-       old template. On an external NATS server, push the claim to its resolver instead.
-    4. Start the managers. The leader also republishes the revocations stored in Raft onto the claim.
+    4. Copy that file over the resolver claim on every manager. The sidecar preloads the resolver claim
+       only when it is missing, so an existing resolver keeps serving the old template. On an external
+       NATS server, push the claim to its resolver instead.
+    5. Start the managers. The leader also republishes the revocations stored in Raft onto the claim.
 
 - **Security, upgrade action needed.** A worker can no longer list other tenants' assignment and lease
   keys (#130):
