@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 
 use futures::StreamExt;
 use minga_bus::tls::NatsTlsConfig;
-use minga_bus::{EventBus, LogEntry, NatsBus};
+use minga_bus::{EventBus, LogEntry, NatsBus, UsageEvent};
 
 // Parallel tests select ephemeral ports before the child binds; without
 // serialization another test can grab the same port and produce a false
@@ -613,6 +613,32 @@ async fn worker_certificate_cannot_write_assignments_or_other_nodes_status_and_l
         .expect("watch remains open");
     assert_eq!(event.key, "default.node.7.task.allowed");
     assert_eq!(event.value.as_deref(), Some(&b"assignment"[..]));
+    // Task IDs are `<service>.<slot>.<revision>`, several subject tokens.
+    let task = "web.1.3";
+    worker_bus
+        .publish_tenant_node_log("default", 7, task, &LogEntry::stdout(task, "up"))
+        .await
+        .expect("worker publishes its own task's logs");
+    worker_bus
+        .publish_usage(&UsageEvent {
+            request_id: "req-1".into(),
+            tenant_id: "default".into(),
+            service_id: "web".into(),
+            task_id: task.into(),
+            customer_id: "customer".into(),
+            route: "chat".into(),
+            requested_model: "model".into(),
+            answered_model: "model".into(),
+            input_tokens: 1,
+            output_tokens: 1,
+            cache_hit: false,
+            latency_ms: 1,
+            status: 200,
+            occurred_at_unix_ms: 1,
+            cost_micros: None,
+        })
+        .await
+        .expect("worker publishes its tenant's usage");
     assert_eq!(
         worker_bus
             .get_assignment("default.node.7.task.allowed")

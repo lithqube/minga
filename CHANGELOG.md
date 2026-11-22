@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+- **Fix, upgrade action needed.** mTLS and operator/JWT workers get the same NATS grants, and a test keeps
+  them in step:
+  - mTLS workers can publish task logs. Their ACL allowed one subject token after the node, so it refused
+    every task ID, which is `<service>.<slot>.<revision>`.
+  - JWT workers can publish usage events: the signer template lacked `minga.<tenant>.usage.>`.
+  - Both lists drop grants no worker uses: `$JS.ACK.KV_MINGA_ASSIGN.>`, `$JS.ACK.KV_MINGA_LEASES.>` and
+    `$JS.API.STREAM.INFO.MINGA_LOGS_<tenant>` in mTLS mode, and the direct `$KV.*` subscriptions in JWT
+    mode. Watches deliver to the worker's own inbox.
+  - JWT `DIRECT.GET` on `KV_MINGA_ASSIGN` is limited to the worker's task, ingress, net and wg keys
+    instead of every key under its node.
+  - Operator/JWT mode, once for this change and #130 below:
+    1. Stop every manager. While they are down, no node removal or credential reissue can add a
+       revocation.
+    2. Set every tenant signer's template to the list in `worker_permission_template`.
+    3. Copy the `revocations` of the current resolver claim, `<MINGA_NATS_RESOLVER_DIR>/<account public
+       key>.jwt`, into the new account claim. Then re-sign the account JWT in
+       `MINGA_NATS_ACCOUNT_JWT_FILE`. A claim without them lets removed workers connect until the leader
+       republishes. A manager refuses to start with the old template.
+    4. Copy that file over the resolver claim on every manager. The sidecar preloads the resolver claim
+       only when it is missing, so an existing resolver keeps serving the old template. On an external
+       NATS server, push the claim to its resolver instead.
+    5. Start the managers. The leader also republishes the revocations stored in Raft onto the claim.
+
 - **Security, upgrade action needed.** A worker can no longer list other tenants' assignment and lease
   keys (#130):
   - On nats-server 2.15.3, `STREAM.INFO` with a `subjects_filter` returns every matching key. The worker
@@ -15,8 +38,8 @@
     once its manager's sidecar drops the grant.
   - Operator/JWT mode: remove `$JS.API.STREAM.INFO.KV_MINGA_ASSIGN`,
     `$JS.API.STREAM.INFO.KV_MINGA_LEASES` and `$JS.API.CONSUMER.INFO.KV_MINGA_ASSIGN.*` from every tenant
-    signer's permission template and re-sign the account JWT. A manager refuses to start with the old
-    template.
+    signer's permission template, re-sign the account JWT and update the resolver claim, as in the
+    worker grants entry above. A manager refuses to start with the old template.
 
 - **Security, upgrade check.** One tenant node can no longer stop managers applying the mesh (#127):
   - A manager refuses to register a node whose WireGuard key another node already holds, logs it, and

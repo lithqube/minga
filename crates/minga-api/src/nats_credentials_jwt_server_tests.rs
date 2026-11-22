@@ -11,7 +11,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use futures::StreamExt;
-use minga_bus::{tls::NatsTlsConfig, EventBus, NatsBus};
+use minga_bus::{tls::NatsTlsConfig, EventBus, LogEntry, NatsBus, UsageEvent};
 use nats_jwt_rs::{
     account::{Account, JetStreamLimits, OperatorLimits},
     operator::Operator,
@@ -21,6 +21,27 @@ use nats_jwt_rs::{
 use nkeys::KeyPair;
 
 use super::{worker_permission_template, NatsCredentialIssuer};
+
+/// A usage record as a worker node's egress proxy publishes it.
+fn usage_event(tenant_id: &str, task_id: &str) -> UsageEvent {
+    UsageEvent {
+        request_id: "req-1".into(),
+        tenant_id: tenant_id.into(),
+        service_id: "web".into(),
+        task_id: task_id.into(),
+        customer_id: "customer".into(),
+        route: "chat".into(),
+        requested_model: "model".into(),
+        answered_model: "model".into(),
+        input_tokens: 1,
+        output_tokens: 1,
+        cache_hit: false,
+        latency_ms: 1,
+        status: 200,
+        occurred_at_unix_ms: 1,
+        cost_micros: None,
+    }
+}
 
 /// Same `.creds` layout `NatsCredentialIssuer::issue` writes.
 fn creds_file(jwt: &str, seed: &str) -> String {
@@ -412,6 +433,16 @@ async fn jwt_worker_cannot_learn_other_tenants_keys() {
         .refresh_tenant_lease("default", 7, b"alive")
         .await
         .unwrap();
+    // Task IDs are `<service>.<slot>.<revision>`, several subject tokens.
+    let task = "web.1.3";
+    worker_bus
+        .publish_tenant_node_log("default", 7, task, &LogEntry::stdout(task, "up"))
+        .await
+        .expect("a JWT worker publishes its own task's logs");
+    worker_bus
+        .publish_usage(&usage_event("default", task))
+        .await
+        .expect("a JWT worker publishes its tenant's usage");
 
     let (worker, mut errors) = raw_worker(&url, &tls, &worker_creds).await;
 
