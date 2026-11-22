@@ -23,6 +23,10 @@
     upgrade promptly.
   - A service on a network that still has no subnet gets no task until the leader stores one, so a task
     never persists without an IP.
+  - Removing a stack's services leaves their tasks for the leader's next pass to reap, and a network they
+    hold an address on cannot be removed until then. `minga-ctl stack rm --with <network>` now waits up to
+    15 seconds for that, instead of reporting the network in use; `DELETE /networks/<id>` still answers 409
+    in the meantime.
 
 - **Fix, upgrade action needed.** mTLS and operator/JWT workers get the same NATS grants, and a test keeps
   them in step:
