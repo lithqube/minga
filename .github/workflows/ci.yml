@@ -15,6 +15,13 @@ env:
 jobs:
   quality:
     name: fmt, clippy, workspace tests
+    strategy:
+      matrix:
+        include: &current-nats
+          # SHA-256 from the release SHA256SUMS; matches release.yml.
+          - &current-nats-pin
+            nats-version: v2.15.3
+            nats_sha256: 32e18c1e78d7ef4f86e483070eef3abb2647c3d4d67e29668077c7ad81da0797
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -28,11 +35,12 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
 
       - name: Install nats-server (bus tests require the binary)
+        env:
+          NATS_VERSION: ${{ matrix.nats-version }}
         run: |
-          # SHA-256 from the release's SHA256SUMS; matches release.yml.
-          archive="nats-server-v2.15.3-linux-amd64.tar.gz"
-          curl -fsSL -o "$archive" "https://github.com/nats-io/nats-server/releases/download/v2.15.3/$archive"
-          echo "32e18c1e78d7ef4f86e483070eef3abb2647c3d4d67e29668077c7ad81da0797  $archive" | sha256sum -c -
+          archive="nats-server-${NATS_VERSION}-linux-amd64.tar.gz"
+          curl -fsSL -o "$archive" "https://github.com/nats-io/nats-server/releases/download/${NATS_VERSION}/$archive"
+          echo "${{ matrix.nats_sha256 }}  $archive" | sha256sum -c -
           sudo tar -xzf "$archive" -C /usr/local/bin --strip-components=1 --wildcards '*/nats-server'
           nats-server --version
 
@@ -55,8 +63,7 @@ jobs:
           # replaced archive fails before it is extracted.
           - nats-version: v2.14.10
             nats_sha256: 464f118a8aecf293e405514c1ab2c197a5d9209e58e36a5d05ad9577e5ee9b99
-          - nats-version: v2.15.3
-            nats_sha256: 32e18c1e78d7ef4f86e483070eef3abb2647c3d4d67e29668077c7ad81da0797
+          - *current-nats-pin
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -98,7 +105,10 @@ jobs:
         run: cargo test -p minga-bus
 
   nats-upgrade:
-    name: NATS store upgrade 2.10.22 to 2.15.3 (plan 14-04)
+    name: NATS store upgrade 2.10.22 to ${{ matrix.nats-version }} (plan 14-04)
+    strategy:
+      matrix:
+        include: *current-nats
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -123,10 +133,10 @@ jobs:
             "nats-$1/nats-server" --version
           }
           fetch v2.10.22 db0b3ccbe4cbdd3872ae7486ec4f6b0f85824632a0789f4da2e0a8518390483e
-          fetch v2.15.3 32e18c1e78d7ef4f86e483070eef3abb2647c3d4d67e29668077c7ad81da0797
+          fetch "${{ matrix.nats-version }}" "${{ matrix.nats_sha256 }}"
 
       - name: Single-server and rolling three-server upgrade
-        run: scripts/nats-upgrade-proof.sh nats-v2.10.22/nats-server nats-v2.15.3/nats-server all
+        run: scripts/nats-upgrade-proof.sh nats-v2.10.22/nats-server nats-${{ matrix.nats-version }}/nats-server all
 
   containerd:
     name: Daemon-backed tests (never silently skipped)
