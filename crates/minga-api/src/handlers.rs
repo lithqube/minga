@@ -2592,7 +2592,7 @@ mod tests {
     async fn a_deleted_tenant_leaves_no_bus_resources_and_its_id_can_be_reused() {
         let (app, _dir) = app_with_node(1.0).await;
         let bus = app.bus.clone().unwrap();
-        create_tenant(State(app.clone()), default_caller(), tenant_request("acme"))
+        let _ = create_tenant(State(app.clone()), default_caller(), tenant_request("acme"))
             .await
             .unwrap();
         assert!(bus.tenant_resources_exist("acme").await.unwrap());
@@ -2605,7 +2605,7 @@ mod tests {
         assert!(bus.list_audit("acme", 10).await.unwrap().is_empty());
 
         // The ID is free again, with a fresh audit trail.
-        create_tenant(State(app.clone()), default_caller(), tenant_request("acme"))
+        let _ = create_tenant(State(app.clone()), default_caller(), tenant_request("acme"))
             .await
             .unwrap();
         let trail = bus.list_audit("acme", 10).await.unwrap();
@@ -2637,7 +2637,7 @@ mod tests {
             .unwrap();
         assert_eq!(status, StatusCode::NO_CONTENT);
         assert!(!bus.tenant_resources_exist("ghost").await.unwrap());
-        create_tenant(
+        let _ = create_tenant(
             State(app.clone()),
             default_caller(),
             tenant_request("ghost"),
