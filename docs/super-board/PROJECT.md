@@ -71,7 +71,7 @@ Multi-tenancy is part of every change ([ADR 0008](../adr/0008-multi-tenancy.md))
 ## Build and verify
 
 - Before committing: `cargo fmt --all`, `cargo clippy --all-targets -- -D warnings`, `cargo test` ([`AGENTS.md`](../../AGENTS.md)).
-- In a worktree, build with `CARGO_TARGET_DIR=<main checkout>/target`. A worktree's own `target/` grows to 20 to 50 GB ([`AGENTS.md`](../../AGENTS.md)).
+- Each worktree builds in its own `target/` with `CARGO_INCREMENTAL=0`. Never share a target dir between worktrees: a test can link another branch's crates ([`AGENTS.md`](../../AGENTS.md)).
 - The board's verify command is `verify_commands` in the gitignored `.claude/super-board/configs/minga.json`; it runs the same three steps with `cargo test --workspace`.
 - Linux-only netns, containerd and WireGuard tests run in CI jobs `netns` and `containerd` ([`ci.yml`](../../.github/workflows/ci.yml)).
 - Any `unsafe`, FFI or raw-syscall change needs a `// SAFETY:` comment and `unsafe-checker` ([`AGENTS.md`](../../AGENTS.md)).
