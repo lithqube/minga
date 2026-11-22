@@ -237,8 +237,33 @@ impl Scheduler {
             minga_state::types::unix_now(),
         );
 
+        // A network still without a subnet (its write was refused, or the
+        // supernet is full) cannot give a task an IP, and a task created
+        // without one keeps none while it stays on its node. Wait for the
+        // subnet and plan the task again on a later pass.
+        let unsubnetted: std::collections::HashSet<&str> = networks
+            .iter()
+            .filter(|network| network.subnet.is_none())
+            .map(|network| network.id.as_str())
+            .collect();
         for action in &actions {
             match action {
+                ReconcileAction::CreateTask(task)
+                    if services.iter().any(|service| {
+                        service.id == task.service_id
+                            && service.agent.is_none()
+                            && service
+                                .networks
+                                .iter()
+                                .any(|network| unsubnetted.contains(network.as_str()))
+                    }) =>
+                {
+                    tracing::warn!(
+                        task = %task.id,
+                        service = %task.service_id,
+                        "a network of the service has no subnet yet; not creating the task"
+                    );
+                }
                 ReconcileAction::CreateTask(task) => {
                     tracing::info!(
                         task = %task.id,

@@ -358,6 +358,78 @@ async fn two_legacy_networks_on_one_subnet_end_up_on_two_subnets() {
 }
 
 #[tokio::test]
+async fn no_task_is_created_while_its_network_has_no_subnet() {
+    // A two-/24 supernet leaves the third network without a subnet, as a
+    // refused subnet write would. A task created now would keep no IP.
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(
+        StateStore::open(1, "127.0.0.1:0", dir.path(), BTreeMap::new())
+            .await
+            .unwrap(),
+    );
+    store.upsert_node(make_node(1, 8.0, 1 << 34)).await.unwrap();
+    for id in ["a", "b", "c"] {
+        store
+            .upsert_network(minga_state::types::Network {
+                id: id.to_string(),
+                tenant_id: "default".to_string(),
+                name: id.to_string(),
+                driver: "overlay".to_string(),
+                attachable: false,
+                subnet: None,
+                wg_port: None,
+            })
+            .await
+            .unwrap();
+    }
+    let mut web = make_service("app.web", 1);
+    web.networks = vec!["c".to_string()];
+    store.upsert_service(web).await.unwrap();
+    let bus = MemoryBus::new();
+    bus.refresh_lease(1, b"registration").await.unwrap();
+    let scheduler = Scheduler::with_bus(store.clone(), bus.clone())
+        .with_supernet(minga_net::Cidr::parse("10.100.0.0/23").unwrap());
+
+    scheduler.reconcile_once().await.unwrap();
+    assert!(store
+        .get_network("c")
+        .await
+        .unwrap()
+        .unwrap()
+        .subnet
+        .is_none());
+    assert!(
+        store.list_tasks().await.unwrap().is_empty(),
+        "a task was created without a subnet to take its IP from"
+    );
+
+    // The subnet frees up; the next pass plans the task, with an address in it.
+    store.remove_network("a".into(), "default").await.unwrap();
+    scheduler.reconcile_once().await.unwrap();
+    let subnet = store.get_network("c").await.unwrap().unwrap().subnet;
+    assert_eq!(subnet.as_deref(), Some("10.100.0.0/24"));
+    let tasks = store.list_tasks().await.unwrap();
+    assert_eq!(tasks.len(), 1);
+    assert!(
+        tasks[0]
+            .spec
+            .ips
+            .get("c")
+            .is_some_and(|ip| ip.starts_with("10.100.0.")),
+        "{:?}",
+        tasks[0].spec.ips
+    );
+
+    drop(scheduler);
+    Arc::try_unwrap(store)
+        .ok()
+        .expect("scheduler dropped")
+        .shutdown()
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
 async fn network_is_projected_only_to_nodes_running_its_tasks() {
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(

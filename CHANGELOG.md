@@ -18,7 +18,11 @@
   - `minga state import` refuses a snapshot whose networks overlap, before writing anything.
   - These are apply refusals that older managers do not have, so mixed-version managers can hold
     different state for the same entry (#157). During a rolling upgrade, do not create or delete
-    networks until every manager runs this version.
+    networks until every manager runs this version, and know that the leader also writes subnets by
+    itself for any network that has none (networks created before subnets were stored), so finish the
+    upgrade promptly.
+  - A service on a network that still has no subnet gets no task until the leader stores one, so a task
+    never persists without an IP.
 
 - **Fix, upgrade action needed.** mTLS and operator/JWT workers get the same NATS grants, and a test keeps
   them in step:
