@@ -199,6 +199,20 @@ async fn replicated_bus_survives_losing_one_server() {
     // A tenant created after the raise starts at the cluster's replica count.
     bus.ensure_tenant_resources("later").await.unwrap();
     assert_eq!(replicas(&bus, "KV_MINGA_ASSIGN_later").await, 3);
+    // A bucket left below the lease count, as a stale config write could leave
+    // it, is repaired the next time a manager sets the tenant up.
+    let js = bus.jetstream();
+    let mut lagging = js.get_stream("KV_MINGA_ASSIGN_later").await.unwrap();
+    let mut config = lagging.info().await.unwrap().config.clone();
+    config.num_replicas = 1;
+    js.update_stream(config).await.unwrap();
+    assert_eq!(replicas(&bus, "KV_MINGA_ASSIGN_later").await, 1);
+    let second_manager = NatsBus::connect(&seeds).await.expect("second manager");
+    second_manager
+        .ensure_tenant_resources("later")
+        .await
+        .unwrap();
+    assert_eq!(replicas(&bus, "KV_MINGA_ASSIGN_later").await, 3);
 
     // New copies catch up for a moment after scaling; writes can time out.
     eventually("put", || bus.put_status("internal.ha-test", b"running")).await;

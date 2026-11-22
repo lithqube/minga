@@ -1358,12 +1358,15 @@ async fn worker_watch_recovers_without_consumer_info() {
         .await
         .unwrap();
     let mut names = default_stream.consumer_names();
+    let mut deleted = 0;
     while let Some(name) = names.next().await {
         default_stream
             .delete_consumer(&name.unwrap())
             .await
             .unwrap();
+        deleted += 1;
     }
+    assert!(deleted > 0, "the worker's watch had no consumer to delete");
     manager
         .put_assignment("default.node.7.task.after", b"after")
         .await
