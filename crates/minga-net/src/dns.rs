@@ -21,6 +21,12 @@ use std::net::Ipv4Addr;
 /// The internal DNS domain suffix.
 pub const MINGA_DOMAIN: &str = "minga.local";
 
+/// Source addresses of tasks under a required egress policy. The bridge DNS
+/// answers these only for local names, so it never forwards their queries to
+/// an upstream resolver (a channel around the egress proxy). The node updates
+/// the set as it applies and removes each task's egress rules.
+pub type LocalOnlySources = std::sync::Arc<std::sync::RwLock<std::collections::HashSet<Ipv4Addr>>>;
+
 /// A DNS record store for the overlay.
 #[derive(Debug, Default)]
 pub struct DnsStore {

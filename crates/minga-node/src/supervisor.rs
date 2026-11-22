@@ -468,7 +468,13 @@ impl Supervisor {
             *net.current_binds.lock().unwrap() = binds;
             return;
         }
-        match minga_net::DnsServer::start(binds.clone(), net.dns_store.clone(), net.upstream).await
+        match minga_net::DnsServer::start(
+            binds.clone(),
+            net.dns_store.clone(),
+            net.upstream,
+            net.setup.local_only_dns(),
+        )
+        .await
         {
             Ok(server) => {
                 tracing::info!(binds = ?binds, "dns: service discovery listening");
