@@ -1072,3 +1072,60 @@ fn build_wireguard_peer_sets(
     }
     Ok(peer_sets)
 }
+
+#[cfg(test)]
+mod subnet_race_tests {
+    use super::*;
+    use minga_state::types::Network;
+    use std::collections::BTreeMap;
+
+    fn network(id: &str, subnet: Option<&str>) -> Network {
+        Network {
+            id: id.to_string(),
+            tenant_id: "default".to_string(),
+            name: id.to_string(),
+            driver: "overlay".to_string(),
+            attachable: false,
+            subnet: subnet.map(String::from),
+            wg_port: None,
+        }
+    }
+
+    /// A network created after the pass read state holds the /24 the pass picks.
+    /// The pass reads one snapshot, so a stale one, which leaves that network
+    /// out, stands in for the race: the Raft apply refuses the write.
+    #[tokio::test]
+    async fn a_refused_subnet_write_leaves_the_network_without_one_until_a_later_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            StateStore::open(1, "127.0.0.1:0", dir.path(), BTreeMap::new())
+                .await
+                .unwrap(),
+        );
+        store
+            .upsert_network(network("held", Some("10.100.0.0/24")))
+            .await
+            .unwrap();
+        store.upsert_network(network("late", None)).await.unwrap();
+        let scheduler = Scheduler::new(store.clone());
+
+        let mut stale = vec![network("late", None)];
+        scheduler.fill_subnets(&mut stale, &[]).await.unwrap();
+        assert_eq!(stale[0].subnet, None, "the refused subnet is still planned");
+        let stored = store.get_network("late").await.unwrap().unwrap();
+        assert_eq!(stored.subnet, None, "the refused subnet was stored");
+
+        // The retry reads current state and picks a free /24.
+        let mut fresh = store.list_networks().await.unwrap();
+        scheduler.fill_subnets(&mut fresh, &[]).await.unwrap();
+        let stored = store.get_network("late").await.unwrap().unwrap();
+        assert_eq!(stored.subnet.as_deref(), Some("10.100.1.0/24"));
+        drop(scheduler);
+        Arc::try_unwrap(store)
+            .ok()
+            .expect("scheduler dropped")
+            .shutdown()
+            .await
+            .unwrap();
+    }
+}
