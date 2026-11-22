@@ -63,6 +63,7 @@ impl From<minga_state::StateError> for ApiError {
             E::Conflict(_)
             | E::PortConflict(_)
             | E::NameInUse
+            | E::SubnetOverlap
             | E::Membership(_)
             | E::NotLeader(_) => ApiError::Conflict(e.to_string()),
             E::NotFound(_) => ApiError::NotFound(e.to_string()),

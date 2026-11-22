@@ -144,6 +144,62 @@ fn network_in_use(tx: &redb::WriteTransaction, id: &str) -> Result<bool, Storage
     Ok(false)
 }
 
+/// Whether a non-terminal task still holds an IP on network `id`.
+#[allow(clippy::result_large_err)]
+fn network_has_live_tasks(
+    tx: &redb::WriteTransaction,
+    id: &str,
+) -> Result<bool, StorageError<u64>> {
+    let table = tx.open_table(TASKS_TABLE).map_err(sm_io_err)?;
+    for row in table.iter().map_err(sm_io_err)? {
+        let (_, value) = row.map_err(sm_io_err)?;
+        let task: Task = crate::codec::decode(value.value())
+            .map_err(|e| sm_storage_err(ErrorSubject::Store, ErrorVerb::Read, e))?;
+        if !task.state.is_terminal() && task.spec.ips.contains_key(id) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Whether `net`'s subnet overlaps the stored subnet of another network, in
+/// any tenant. A subnet the network already stores is not rechecked, so a
+/// pair that overlapped before this rule existed can still be updated.
+#[allow(clippy::result_large_err)]
+fn subnet_overlaps_other_network(
+    tx: &redb::WriteTransaction,
+    net: &Network,
+) -> Result<bool, StorageError<u64>> {
+    let Some(subnet) = net
+        .subnet
+        .as_deref()
+        .and_then(|raw| minga_net::Cidr::parse(raw).ok())
+    else {
+        return Ok(false);
+    };
+    let table = tx.open_table(NETWORKS_TABLE).map_err(sm_io_err)?;
+    let mut others = Vec::new();
+    for row in table.iter().map_err(sm_io_err)? {
+        let (key, value) = row.map_err(sm_io_err)?;
+        let other: Network = crate::codec::decode(value.value())
+            .map_err(|e| sm_storage_err(ErrorSubject::Store, ErrorVerb::Read, e))?;
+        if key.value() == net.id {
+            if other.subnet == net.subnet {
+                return Ok(false);
+            }
+        } else {
+            others.push(other);
+        }
+    }
+    Ok(others.iter().any(|other| {
+        other
+            .subnet
+            .as_deref()
+            .and_then(|raw| minga_net::Cidr::parse(raw).ok())
+            .is_some_and(|theirs| theirs.overlaps(&subnet))
+    }))
+}
+
 /// Whether every record in `ids` exists in `definition` and belongs to `tenant_id`.
 #[allow(clippy::result_large_err)]
 fn all_owned_by<T: DeserializeOwned>(
@@ -228,6 +284,8 @@ fn owned_by_other_tenant<T: DeserializeOwned>(
 }
 
 const NAME_IN_USE: &str = "name is already in use";
+/// Public so the store can tell this refusal from [`NAME_IN_USE`].
+pub(crate) const SUBNET_OVERLAP: &str = "network subnet overlaps an existing cluster network";
 
 /// The tenant field every tenant-owned record carries; JSON ignores the rest.
 #[derive(serde::Deserialize)]
@@ -905,6 +963,12 @@ impl RedbStateMachine {
                 )? {
                     return Ok(StateResponse::Conflict(NAME_IN_USE.into()));
                 }
+                // Checked here as well as in the API: two writes that each passed
+                // the API check can still commit overlapping subnets. The answer
+                // never says whose network it overlaps.
+                if subnet_overlaps_other_network(tx, net)? {
+                    return Ok(StateResponse::Conflict(SUBNET_OVERLAP.into()));
+                }
                 let Some(quotas) = tenant_quota(tx, &net.tenant_id)? else {
                     return Ok(StateResponse::NotFound);
                 };
@@ -1169,6 +1233,14 @@ impl RedbStateMachine {
                 if *kind == ObjectKind::Network && network_in_use(tx, id)? {
                     return Ok(StateResponse::Conflict(format!(
                         "network {id} is in use by a service"
+                    )));
+                }
+                // A task that outlives its service still holds an IP in the
+                // subnet; a network recreated over it could hand that subnet out
+                // again.
+                if *kind == ObjectKind::Network && network_has_live_tasks(tx, id)? {
+                    return Ok(StateResponse::Conflict(format!(
+                        "network {id} is in use by a task"
                     )));
                 }
                 let mut t = tx.open_table(definition).map_err(sm_io_err)?;

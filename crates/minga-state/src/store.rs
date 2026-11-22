@@ -886,6 +886,9 @@ impl StateStore {
             .map_err(StateError::Raft)?;
         match self.propose(StateCommand::UpsertNetwork(network)).await? {
             StateResponse::Ok | StateResponse::ChangeRequest(_) => Ok(()),
+            StateResponse::Conflict(message) if message == crate::state_machine::SUBNET_OVERLAP => {
+                Err(StateError::SubnetOverlap)
+            }
             StateResponse::Conflict(_) => Err(StateError::NameInUse),
             StateResponse::Error(message) => Err(command_error(message)),
             StateResponse::NotFound => Err(StateError::NotFound("tenant".into())),

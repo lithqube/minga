@@ -250,6 +250,92 @@ async fn upsert_network_refuses_subnets_the_overlay_must_not_route() {
 }
 
 #[tokio::test]
+async fn upsert_network_refuses_a_subnet_another_network_holds() {
+    let (store, _dir) = test_store("upsert_network_overlap").await;
+    let net = |id: &str, subnet: Option<&str>| Network {
+        id: id.to_string(),
+        tenant_id: "default".to_string(),
+        name: id.to_string(),
+        driver: "overlay".to_string(),
+        attachable: true,
+        subnet: subnet.map(String::from),
+        wg_port: None,
+    };
+    store
+        .upsert_network(net("a", Some("10.100.5.0/24")))
+        .await
+        .unwrap();
+    for (id, subnet) in [
+        ("same", "10.100.5.0/24"),
+        ("inner", "10.100.5.128/25"),
+        ("outer", "10.100.4.0/23"),
+    ] {
+        let error = store
+            .upsert_network(net(id, Some(subnet)))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, StateError::SubnetOverlap),
+            "{id}: {error:?}"
+        );
+        assert!(
+            store.get_network(id).await.unwrap().is_none(),
+            "{id} stored"
+        );
+    }
+    // Rewriting the holder, a free subnet and a network with no subnet yet are fine.
+    store
+        .upsert_network(net("a", Some("10.100.5.0/24")))
+        .await
+        .unwrap();
+    store
+        .upsert_network(net("free", Some("10.100.6.0/24")))
+        .await
+        .unwrap();
+    store.upsert_network(net("none", None)).await.unwrap();
+    // A network may not move onto another's subnet either.
+    let error = store
+        .upsert_network(net("free", Some("10.100.5.0/25")))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, StateError::SubnetOverlap), "{error:?}");
+    store.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_network_with_a_live_task_cannot_be_removed() {
+    let (store, _dir) = test_store("network_live_task_remove").await;
+    let net = Network {
+        id: "net".to_string(),
+        tenant_id: "default".to_string(),
+        name: "net".to_string(),
+        driver: "overlay".to_string(),
+        attachable: true,
+        subnet: Some("10.100.5.0/24".to_string()),
+        wg_port: None,
+    };
+    store.upsert_network(net.clone()).await.unwrap();
+    let mut task = sample_task("t1", "orphan", 1);
+    task.state = TaskState::Running;
+    task.spec.ips.insert("net".into(), "10.100.5.2".into());
+    store.upsert_task(task.clone()).await.unwrap();
+
+    let error = store
+        .remove_network("net".into(), "default")
+        .await
+        .unwrap_err();
+    assert!(matches!(error, StateError::Conflict(_)), "{error:?}");
+    assert!(store.get_network("net").await.unwrap().is_some());
+
+    // Once the task is terminal the network goes, and its subnet is free again.
+    task.state = TaskState::Stopped;
+    store.upsert_task(task).await.unwrap();
+    store.remove_network("net".into(), "default").await.unwrap();
+    assert!(store.get_network("net").await.unwrap().is_none());
+    store.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn write_and_read_network_volume_secret_config() {
     let (store, _dir) = test_store("write_and_read_all_types").await;
 

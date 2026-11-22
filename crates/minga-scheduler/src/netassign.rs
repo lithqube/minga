@@ -23,6 +23,11 @@ pub enum NetAssignError {
     Subnet(NetworkId, String),
     #[error("IPAM error on network {0}: {1}")]
     Ipam(NetworkId, IpamError),
+    #[error(
+        "network {0}: its running tasks hold addresses in {1}, which another network already \
+         stores, so it gets a new subnet. Stop and redeploy its services to move them onto it"
+    )]
+    RestoreRefused(NetworkId, String),
 }
 
 /// The subnet stored for a network. A network without one is an error:
@@ -47,6 +52,12 @@ pub fn fill_subnets(
     supernet: &Cidr,
 ) -> (Vec<usize>, Vec<NetAssignError>) {
     let mut changed = Vec::new();
+    let stored: Vec<Cidr> = networks
+        .iter()
+        .filter_map(|n| Cidr::parse(n.subnet.as_deref()?).ok())
+        .collect();
+    let mut taken = stored.clone();
+    let mut errors = Vec::new();
     for (i, net) in networks.iter_mut().enumerate() {
         if net.subnet.is_some() {
             continue;
@@ -57,15 +68,26 @@ pub fn fill_subnets(
             .find_map(|t| t.spec.ips.get(&net.id)?.parse::<Ipv4Addr>().ok());
         if let Some(ip) = live_ip {
             let base = Ipv4Addr::from(u32::from(ip) & !0xff);
-            net.subnet = Some(format!("{base}/24"));
+            // Restoring a /24 a network already stores would give two networks
+            // (and possibly two tenants) the same task IPs; leave it to the
+            // allocation below, which hands out a free one. Two networks that
+            // both lack a subnet and share live tasks in one /24 keep it, as
+            // before: moving either would orphan its running tasks.
+            let Ok(restored) = Cidr::parse(&format!("{base}/24")) else {
+                continue;
+            };
+            if stored.iter().any(|other| other.overlaps(&restored)) {
+                errors.push(NetAssignError::RestoreRefused(
+                    net.id.clone(),
+                    restored.to_cidr_string(),
+                ));
+                continue;
+            }
+            net.subnet = Some(restored.to_cidr_string());
+            taken.push(restored);
             changed.push(i);
         }
     }
-    let mut taken: Vec<Cidr> = networks
-        .iter()
-        .filter_map(|n| Cidr::parse(n.subnet.as_deref()?).ok())
-        .collect();
-    let mut errors = Vec::new();
     for (i, net) in networks.iter_mut().enumerate() {
         if net.subnet.is_some() {
             continue;
@@ -188,6 +210,15 @@ mod tests {
     }
 
     #[test]
+    fn a_live_tasks_subnet_is_restored_when_free() {
+        let mut nets = vec![network("old", None)];
+        let tasks = vec![task("t1", &[("old", "10.100.5.9")])];
+        let supernet = Cidr::parse("10.100.0.0/16").unwrap();
+        fill_subnets(&mut nets, &tasks, &supernet);
+        assert_eq!(nets[0].subnet.as_deref(), Some("10.100.5.0/24"));
+    }
+
+    #[test]
     fn assigns_deterministic_ip_per_network() {
         let nets = vec![network("shop_default", Some("10.100.5.0/24"))];
         let a = assign_task_ips("shop.web.1", &["shop_default".to_string()], &nets, &[]).unwrap();
@@ -243,14 +274,30 @@ mod tests {
     }
 
     #[test]
-    fn colliding_legacy_networks_are_reported_not_moved() {
+    fn a_network_never_restores_a_subnet_another_stores() {
         let mut nets = vec![network("a", None), network("b", Some("10.100.7.0/24"))];
         let tasks = vec![task("a.web.1", &[("a", "10.100.7.20")])];
-        fill_subnets(&mut nets, &tasks, &supernet());
-        assert_eq!(nets[0].subnet.as_deref(), Some("10.100.7.0/24"));
-        let hits = subnet_collisions(&nets);
-        assert_eq!(hits.len(), 1);
-        assert_eq!((hits[0].0.as_str(), hits[0].1.as_str()), ("a", "b"));
+        let (changed, errors) = fill_subnets(&mut nets, &tasks, &supernet());
+        assert_eq!(changed, vec![0]);
+        assert!(matches!(
+            errors.as_slice(),
+            [NetAssignError::RestoreRefused(id, _)] if id == "a"
+        ));
+        assert_ne!(nets[0].subnet.as_deref(), Some("10.100.7.0/24"));
+        assert!(subnet_collisions(&nets).is_empty());
+    }
+
+    #[test]
+    fn legacy_networks_sharing_a_live_subnet_both_keep_it() {
+        let mut nets = vec![network("a", None), network("b", None)];
+        let tasks = vec![
+            task("a.web.1", &[("a", "10.100.7.20")]),
+            task("b.web.1", &[("b", "10.100.7.30")]),
+        ];
+        let (_, errors) = fill_subnets(&mut nets, &tasks, &supernet());
+        assert!(errors.is_empty());
+        assert_eq!(nets[0].subnet, nets[1].subnet);
+        assert_eq!(subnet_collisions(&nets).len(), 1);
     }
 
     #[test]

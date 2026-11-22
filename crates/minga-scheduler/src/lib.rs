@@ -534,7 +534,16 @@ impl Scheduler {
         for i in changed {
             let net = &networks[i];
             tracing::info!(network = %net.id, subnet = ?net.subnet, "network subnet assigned");
-            self.state.upsert_network(net.clone()).await?;
+            match self.state.upsert_network(net.clone()).await {
+                Ok(()) => {}
+                // A network created since this pass read state took the subnet;
+                // the next pass picks another. One tenant's race must not stop
+                // reconciliation for the rest.
+                Err(StateError::SubnetOverlap) => {
+                    tracing::warn!(network = %net.id, "assigned subnet was taken meanwhile; retrying next pass");
+                }
+                Err(error) => return Err(error.into()),
+            }
         }
         let mut reported = self.reported.lock().unwrap_or_else(|e| e.into_inner());
         for (a, b, sa, sb) in netassign::subnet_collisions(networks) {
