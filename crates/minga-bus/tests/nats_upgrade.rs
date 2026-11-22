@@ -28,7 +28,7 @@ const REPLICATED: [&str; 4] = [
     "MINGA_EVENTS",
     "KV_MINGA_STATUS",
     "KV_MINGA_LEASES",
-    "KV_MINGA_ASSIGN",
+    "KV_MINGA_ASSIGN_upgrade",
 ];
 
 fn url() -> String {
@@ -85,6 +85,8 @@ async fn upgrade_seed() {
     let bus = NatsBus::connect_with_ttl(&url(), SEED_LEASE_TTL)
         .await
         .expect("connect to the old server");
+    // The tenant's assignment bucket, so the raise below covers it.
+    bus.ensure_tenant_resources("upgrade").await.unwrap();
     if replicas() > 1 {
         bus.ensure_replicas(replicas())
             .await
@@ -195,7 +197,11 @@ async fn upgrade_verify() {
         );
     }
     // Buckets the old server created get the 2.15 consumer cap lifted.
-    for bucket in ["KV_MINGA_ASSIGN", "KV_MINGA_STATUS", "KV_MINGA_LEASES"] {
+    for bucket in [
+        "KV_MINGA_ASSIGN_upgrade",
+        "KV_MINGA_STATUS",
+        "KV_MINGA_LEASES",
+    ] {
         let mut stream = js.get_stream(bucket).await.unwrap();
         let config = stream.info().await.unwrap().config.clone();
         assert!(

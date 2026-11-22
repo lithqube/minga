@@ -382,13 +382,13 @@ async fn jwt_worker_cannot_learn_other_tenants_keys() {
     .await
     .unwrap();
     let stream = async_nats::jetstream::new(manager_client)
-        .get_stream("KV_MINGA_ASSIGN")
+        .get_stream("KV_MINGA_ASSIGN_beta")
         .await
         .unwrap();
     stream
         .create_consumer(async_nats::jetstream::consumer::pull::Config {
             name: Some("betaprobe".into()),
-            filter_subject: "$KV.MINGA_ASSIGN.beta.node.7.>".into(),
+            filter_subject: "$KV.MINGA_ASSIGN_beta.beta.node.7.>".into(),
             ..Default::default()
         })
         .await
@@ -462,7 +462,12 @@ async fn jwt_worker_cannot_learn_other_tenants_keys() {
     for (what, subject, body) in [
         (
             "STREAM.INFO listing assignment keys",
-            "$JS.API.STREAM.INFO.KV_MINGA_ASSIGN",
+            "$JS.API.STREAM.INFO.KV_MINGA_ASSIGN_default",
+            serde_json::json!({"subjects_filter": ">"}),
+        ),
+        (
+            "STREAM.INFO on another tenant's assignment bucket",
+            "$JS.API.STREAM.INFO.KV_MINGA_ASSIGN_beta",
             serde_json::json!({"subjects_filter": ">"}),
         ),
         (
@@ -477,17 +482,17 @@ async fn jwt_worker_cannot_learn_other_tenants_keys() {
         ),
         (
             "CONSUMER.INFO on another tenant's consumer",
-            "$JS.API.CONSUMER.INFO.KV_MINGA_ASSIGN.betaprobe",
+            "$JS.API.CONSUMER.INFO.KV_MINGA_ASSIGN_beta.betaprobe",
             serde_json::json!({}),
         ),
         (
             "CONSUMER.CREATE naming another tenant's prefix",
-            "$JS.API.CONSUMER.CREATE.KV_MINGA_ASSIGN.x.$KV.MINGA_ASSIGN.beta.node.7.task.>",
+            "$JS.API.CONSUMER.CREATE.KV_MINGA_ASSIGN_beta.x.$KV.MINGA_ASSIGN_beta.beta.node.7.task.>",
             serde_json::json!({}),
         ),
         (
             "DIRECT.GET of another tenant's key",
-            "$JS.API.DIRECT.GET.KV_MINGA_ASSIGN.$KV.MINGA_ASSIGN.beta.node.7.task.foreign",
+            "$JS.API.DIRECT.GET.KV_MINGA_ASSIGN_beta.$KV.MINGA_ASSIGN_beta.beta.node.7.task.foreign",
             serde_json::json!({}),
         ),
         (
@@ -526,11 +531,11 @@ async fn jwt_worker_cannot_learn_other_tenants_keys() {
     for (name, filter) in [
         (
             "p1",
-            serde_json::json!({"filter_subjects": ["$KV.MINGA_ASSIGN.beta.>"]}),
+            serde_json::json!({"filter_subjects": ["$KV.MINGA_ASSIGN_beta.beta.>"]}),
         ),
         (
             "p2",
-            serde_json::json!({"filter_subject": "$KV.MINGA_ASSIGN.beta.>"}),
+            serde_json::json!({"filter_subject": "$KV.MINGA_ASSIGN_beta.beta.>"}),
         ),
         ("p3", serde_json::json!({})),
     ] {
@@ -539,9 +544,9 @@ async fn jwt_worker_cannot_learn_other_tenants_keys() {
         config["deliver_subject"] = inbox.into();
         config["deliver_policy"] = "all".into();
         config["ack_policy"] = "none".into();
-        let body = serde_json::json!({"stream_name": "KV_MINGA_ASSIGN", "config": config});
+        let body = serde_json::json!({"stream_name": "KV_MINGA_ASSIGN_default", "config": config});
         let subject = format!(
-            "$JS.API.CONSUMER.CREATE.KV_MINGA_ASSIGN.{name}.$KV.MINGA_ASSIGN.default.node.7.task.>"
+            "$JS.API.CONSUMER.CREATE.KV_MINGA_ASSIGN_default.{name}.$KV.MINGA_ASSIGN_default.default.node.7.task.>"
         );
         let reply = worker
             .request(subject, body.to_string().into())
@@ -554,13 +559,13 @@ async fn jwt_worker_cannot_learn_other_tenants_keys() {
         );
     }
     for subject in [
-        "$JS.API.DIRECT.GET.KV_MINGA_ASSIGN.$KV.MINGA_ASSIGN.default.node.7.task.own",
+        "$JS.API.DIRECT.GET.KV_MINGA_ASSIGN_default.$KV.MINGA_ASSIGN_default.default.node.7.task.own",
         "$JS.API.DIRECT.GET.KV_MINGA_LEASES.$KV.MINGA_LEASES.default.lease.node.7",
     ] {
         for body in [
             serde_json::json!({"seq": 1}),
-            serde_json::json!({"next_by_subj": "$KV.MINGA_ASSIGN.beta.>", "seq": 1}),
-            serde_json::json!({"last_by_subj": "$KV.MINGA_ASSIGN.beta.node.7.task.foreign"}),
+            serde_json::json!({"next_by_subj": "$KV.MINGA_ASSIGN_beta.beta.>", "seq": 1}),
+            serde_json::json!({"last_by_subj": "$KV.MINGA_ASSIGN_beta.beta.node.7.task.foreign"}),
             serde_json::json!({"multi_last": [">"], "batch": 10}),
         ] {
             let reply = worker
@@ -576,7 +581,7 @@ async fn jwt_worker_cannot_learn_other_tenants_keys() {
 
     // Subscribing to another tenant's KV subjects is refused, and a new beta
     // write reaches nothing the worker holds.
-    let foreign = "$KV.MINGA_ASSIGN.beta.node.7.task.>";
+    let foreign = "$KV.MINGA_ASSIGN_beta.beta.node.7.task.>";
     let mut foreign_sub = worker.subscribe(foreign).await.unwrap();
     worker.flush().await.unwrap();
     expect_refusal(&mut errors, "subscription to beta keys", foreign).await;

@@ -56,20 +56,8 @@ async fn connecting_a_manager_purges_pre_tenant_keys_only() {
     NatsBus::connect(url).await.expect("first connect");
     let client = async_nats::connect(url).await.expect("connect");
     let js = async_nats::jetstream::new(client);
-    let assign = js.get_key_value("MINGA_ASSIGN").await.expect("assign");
     let status = js.get_key_value("MINGA_STATUS").await.expect("status");
-    for key in ["node.41.task.old", "node.41.wg"] {
-        assign.put(key, "old".into()).await.unwrap();
-    }
     status.put("node.41.task.old", "old".into()).await.unwrap();
-    assign
-        .put("default.node.41.task.new", "new".into())
-        .await
-        .unwrap();
-    assign
-        .put("node.node.41.task.tenant-named-node", "new".into())
-        .await
-        .unwrap();
     status
         .put("internal.node-join.41", "default".into())
         .await
@@ -77,15 +65,6 @@ async fn connecting_a_manager_purges_pre_tenant_keys_only() {
 
     NatsBus::connect(url).await.expect("reconnect");
 
-    for key in ["node.41.task.old", "node.41.wg"] {
-        assert!(assign.get(key).await.unwrap().is_none(), "{key} kept");
-    }
     assert!(status.get("node.41.task.old").await.unwrap().is_none());
-    for key in [
-        "default.node.41.task.new",
-        "node.node.41.task.tenant-named-node",
-    ] {
-        assert!(assign.get(key).await.unwrap().is_some(), "{key} purged");
-    }
     assert!(status.get("internal.node-join.41").await.unwrap().is_some());
 }

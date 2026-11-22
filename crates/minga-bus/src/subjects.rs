@@ -177,6 +177,13 @@ pub fn worker_inbox_prefix(tenant_id: &str, node_id: u64) -> String {
     format!("_INBOX.{tenant_id}.{node_id}")
 }
 
+/// A tenant's assignment bucket. Each tenant has its own so that the consumers
+/// a worker creates, which its ACL cannot count, fill only its own tenant's
+/// consumer limit and never another tenant's.
+pub fn assignment_bucket(tenant_id: &str) -> String {
+    format!("MINGA_ASSIGN_{tenant_id}")
+}
+
 /// NATS permissions for a tenant/node worker identity: `(publish, subscribe)`.
 ///
 /// Operator/JWT mode grants the same list through minga-api's signer
@@ -185,17 +192,18 @@ pub fn worker_acl(tenant_id: &str, node_id: u64) -> crate::Result<(Vec<String>, 
     minga_state::types::Tenant::validate_id(tenant_id)
         .map_err(|error| crate::BusError::Other(format!("invalid tenant ID: {error}")))?;
     let status_bucket = format!("MINGA_STATUS_{tenant_id}");
+    let assign_bucket = assignment_bucket(tenant_id);
     let own_status = format!("$KV.{status_bucket}.node.{node_id}.task.>");
     let own_lease = format!("$KV.MINGA_LEASES.{}", kv_lease(tenant_id, node_id));
     let own_tasks = format!(
-        "$KV.MINGA_ASSIGN.{}>",
+        "$KV.{assign_bucket}.{}>",
         kv_assignment_node_prefix(tenant_id, node_id)
     );
     let own_ingress_prefix = kv_assignment_ingress_prefix(tenant_id, node_id);
-    let own_ingress = format!("$KV.MINGA_ASSIGN.{own_ingress_prefix}>");
-    let own_wireguard = format!("$KV.MINGA_ASSIGN.{tenant_id}.node.{node_id}.wg");
+    let own_ingress = format!("$KV.{assign_bucket}.{own_ingress_prefix}>");
+    let own_wireguard = format!("$KV.{assign_bucket}.{tenant_id}.node.{node_id}.wg");
     let networks = format!(
-        "$KV.MINGA_ASSIGN.{}>",
+        "$KV.{assign_bucket}.{}>",
         kv_assignment_node_network_prefix(tenant_id, node_id)
     );
     let publish = vec![
@@ -207,17 +215,17 @@ pub fn worker_acl(tenant_id: &str, node_id: u64) -> crate::Result<(Vec<String>, 
         format!("$JS.API.STREAM.INFO.KV_{status_bucket}"),
         format!("$JS.API.DIRECT.GET.KV_{status_bucket}.$KV.{status_bucket}.node.{node_id}.task.>"),
         format!("$JS.API.DIRECT.GET.KV_MINGA_LEASES.{own_lease}"),
-        "$JS.FC.KV_MINGA_ASSIGN.>".into(),
-        format!("$JS.API.CONSUMER.CREATE.KV_MINGA_ASSIGN.*.{own_tasks}"),
-        format!("$JS.API.CONSUMER.CREATE.KV_MINGA_ASSIGN.*.{own_ingress}"),
-        format!("$JS.API.CONSUMER.CREATE.KV_MINGA_ASSIGN.*.{networks}"),
-        format!("$JS.API.CONSUMER.CREATE.KV_MINGA_ASSIGN.*.{own_wireguard}"),
+        format!("$JS.FC.KV_{assign_bucket}.>"),
+        format!("$JS.API.CONSUMER.CREATE.KV_{assign_bucket}.*.{own_tasks}"),
+        format!("$JS.API.CONSUMER.CREATE.KV_{assign_bucket}.*.{own_ingress}"),
+        format!("$JS.API.CONSUMER.CREATE.KV_{assign_bucket}.*.{networks}"),
+        format!("$JS.API.CONSUMER.CREATE.KV_{assign_bucket}.*.{own_wireguard}"),
         // No CONSUMER.INFO: it returns any consumer's filter subject, which
         // names another tenant's node; ordered watches recover with CREATE.
-        format!("$JS.API.DIRECT.GET.KV_MINGA_ASSIGN.{own_tasks}"),
-        format!("$JS.API.DIRECT.GET.KV_MINGA_ASSIGN.{own_ingress}"),
-        format!("$JS.API.DIRECT.GET.KV_MINGA_ASSIGN.{networks}"),
-        format!("$JS.API.DIRECT.GET.KV_MINGA_ASSIGN.{own_wireguard}"),
+        format!("$JS.API.DIRECT.GET.KV_{assign_bucket}.{own_tasks}"),
+        format!("$JS.API.DIRECT.GET.KV_{assign_bucket}.{own_ingress}"),
+        format!("$JS.API.DIRECT.GET.KV_{assign_bucket}.{networks}"),
+        format!("$JS.API.DIRECT.GET.KV_{assign_bucket}.{own_wireguard}"),
     ];
     let own_ping = format!("{PREFIX}.{tenant_id}.ctl.node.{node_id}.ping");
     let own_drain = format!("{PREFIX}.{tenant_id}.ctl.node.{node_id}.drain");
@@ -299,7 +307,7 @@ mod tests {
         assert!(!subscribe.iter().any(|subject| subject == "_INBOX.>"));
         assert!(!subscribe
             .iter()
-            .any(|subject| subject.starts_with("$KV.MINGA_ASSIGN.")));
+            .any(|subject| subject.starts_with("$KV.MINGA_ASSIGN")));
         assert!(subscribe.contains(&"minga.tenant_a.ctl.node.7.ping".to_string()));
         assert!(subscribe.contains(&"minga.tenant_a.ctl.node.7.drain".to_string()));
         assert!(!publish.iter().any(|subject| subject.contains("audit")));

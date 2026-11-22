@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+- **Security, upgrade action needed: flag day.** Each tenant now has its own assignment bucket (#131):
+  - A worker could create consumers of any name, durable ones included, on the one shared
+    `KV_MINGA_ASSIGN` stream, and its ACL cannot count them. Filling the stream-wide limit stopped other
+    tenants' nodes reading their assignments. Assignments now live in `KV_MINGA_ASSIGN_<tenant>`
+    (`$KV.MINGA_ASSIGN_<tenant>.<tenant>.node.<n>.>`), capped at 5,000 consumers, so a tenant's workers
+    can fill only that tenant's bucket. Keys are unchanged. Managers create the bucket with the tenant,
+    at the cluster's replica count.
+  - Workers cannot read assignments across this change. A worker of this version needs a manager of this
+    version to have created its tenant's bucket; a worker of the previous version loses its grants when
+    its manager's sidecar restarts. Running containers keep running, but no assignment reaches a node,
+    so nothing is placed, moved or stopped on it until it is upgraded.
+  - Order: stop nothing, upgrade every manager, then every worker. After the managers, a node shows no new
+    assignments until it runs this version.
+  - Operator/JWT mode, as for the entries below: set every tenant signer's template to the list in
+    `worker_permission_template`, re-sign the account JWT, copy the `revocations` of the current resolver
+    claim into it, and push it to every manager's resolver before starting the managers. A manager
+    refuses to start with the old template.
+  - The old shared `KV_MINGA_ASSIGN` stream is no longer written or granted. It keeps every tenant's old
+    assignments, so delete it once every node runs this version (`nats stream rm KV_MINGA_ASSIGN`). Until
+    then, rolling the managers back works.
+  - The 5,000 limit is the most one tenant's workers can fill; a tenant with more than 2,500 nodes
+    needs it raised on its bucket.
+
 - **Fix, upgrade action needed.** mTLS and operator/JWT workers get the same NATS grants, and a test keeps
   them in step:
   - Widened grant: mTLS workers can publish task logs. Their ACL now allows any subject under their own
