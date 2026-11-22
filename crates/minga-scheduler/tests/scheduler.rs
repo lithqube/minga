@@ -282,6 +282,82 @@ async fn multi_tenant_placement_and_wireguard_routes_stay_tenant_scoped() {
 }
 
 #[tokio::test]
+async fn two_legacy_networks_on_one_subnet_end_up_on_two_subnets() {
+    // Both predate stored subnets and their live tasks sit in one /24. The
+    // Raft apply refuses a second network on a subnet, so the leader keeps
+    // the first and moves the second, and later passes change nothing.
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(
+        StateStore::open(1, "127.0.0.1:0", dir.path(), BTreeMap::new())
+            .await
+            .unwrap(),
+    );
+    store.upsert_node(make_node(1, 8.0, 1 << 34)).await.unwrap();
+    for id in ["a", "b"] {
+        store
+            .upsert_network(minga_state::types::Network {
+                id: id.to_string(),
+                tenant_id: "default".to_string(),
+                name: id.to_string(),
+                driver: "overlay".to_string(),
+                attachable: false,
+                subnet: None,
+                wg_port: None,
+            })
+            .await
+            .unwrap();
+        store
+            .upsert_task(minga_state::types::Task {
+                id: format!("{id}.web.1"),
+                tenant_id: "default".to_string(),
+                service_id: format!("{id}.web"),
+                node_id: 1,
+                state: minga_state::types::TaskState::Running,
+                spec: minga_state::types::TaskSpec {
+                    ips: HashMap::from([(id.to_string(), "10.100.7.20".to_string())]),
+                    ..Default::default()
+                },
+                restarts: 0,
+                running_since_unix: None,
+                last_error: None,
+                last_exit_code: None,
+            })
+            .await
+            .unwrap();
+    }
+    let bus = MemoryBus::new();
+    bus.refresh_lease(1, b"registration").await.unwrap();
+    let scheduler = Scheduler::with_bus(store.clone(), bus.clone());
+    let subnets = |store: Arc<StateStore>| async move {
+        let mut networks = store.list_networks().await.unwrap();
+        networks.sort_by(|x, y| x.id.cmp(&y.id));
+        networks
+            .into_iter()
+            .map(|n| n.subnet.expect("every network has a subnet"))
+            .collect::<Vec<_>>()
+    };
+
+    scheduler.reconcile_once().await.unwrap();
+    let first = subnets(store.clone()).await;
+    assert_eq!(first[0], "10.100.7.0/24");
+    assert_ne!(first[1], first[0]);
+    scheduler.reconcile_once().await.unwrap();
+    assert_eq!(
+        subnets(store.clone()).await,
+        first,
+        "a later pass moved one"
+    );
+
+    drop(scheduler);
+    Arc::try_unwrap(store)
+        .ok()
+        .expect("scheduler dropped")
+        .shutdown()
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
 async fn network_is_projected_only_to_nodes_running_its_tasks() {
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(

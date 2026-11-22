@@ -532,15 +532,18 @@ impl Scheduler {
             tracing::error!(error = %e, "cannot assign a network subnet");
         }
         for i in changed {
-            let net = &networks[i];
+            let net = networks[i].clone();
             tracing::info!(network = %net.id, subnet = ?net.subnet, "network subnet assigned");
             match self.state.upsert_network(net.clone()).await {
                 Ok(()) => {}
-                // A network created since this pass read state took the subnet;
-                // the next pass picks another. One tenant's race must not stop
+                // A network created since this pass read state took the subnet.
+                // It has none until the next pass picks another, and plans no
+                // task IP from the refused one: an IP outside the stored subnet
+                // would persist and never route. One tenant's race must not stop
                 // reconciliation for the rest.
                 Err(StateError::SubnetOverlap) => {
                     tracing::warn!(network = %net.id, "assigned subnet was taken meanwhile; retrying next pass");
+                    networks[i].subnet = None;
                 }
                 Err(error) => return Err(error.into()),
             }

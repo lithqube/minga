@@ -946,6 +946,44 @@ async fn a_snapshot_with_one_refused_network_writes_none() {
 }
 
 #[tokio::test]
+async fn a_snapshot_with_overlapping_networks_is_refused_before_any_write() {
+    let (store, _dir) = test_store("import-overlapping-networks").await;
+    let net = |id: &str, subnet: &str| Network {
+        id: id.to_string(),
+        tenant_id: "default".to_string(),
+        name: id.to_string(),
+        driver: "overlay".to_string(),
+        attachable: true,
+        subnet: Some(subnet.to_string()),
+        wg_port: None,
+    };
+    store
+        .upsert_network(net("held", "10.100.9.0/24"))
+        .await
+        .unwrap();
+    // Two networks of one snapshot on a subnet, then one on a stored subnet.
+    for networks in [
+        vec![net("a", "10.100.7.0/24"), net("b", "10.100.7.0/24")],
+        vec![net("a", "10.100.1.0/24"), net("c", "10.100.9.128/25")],
+    ] {
+        let mut snapshot = store.export().await.unwrap();
+        snapshot.networks = networks;
+        let error = store.import(snapshot, true).await.unwrap_err();
+        assert!(matches!(error, StateError::BadSnapshot(_)), "{error:?}");
+        assert!(
+            store.get_network("a").await.unwrap().is_none(),
+            "partial import"
+        );
+    }
+    // The stored holder re-importing its own subnet is fine.
+    let mut snapshot = store.export().await.unwrap();
+    snapshot.networks = vec![net("held", "10.100.9.0/24"), net("a", "10.100.1.0/24")];
+    store.import(snapshot, true).await.unwrap();
+    assert!(store.get_network("a").await.unwrap().is_some());
+    store.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn importing_a_snapshot_keeps_existing_tenant_quotas() {
     let (store, _dir) = test_store("import-quotas").await;
     let quotas = TenantQuotas {

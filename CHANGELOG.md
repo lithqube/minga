@@ -11,11 +11,14 @@
   - Deleting a network is refused (409) while a running task still holds an IP on it, not only while a
     service names it.
   - The leader no longer gives a network without a subnet the /24 its old tasks use when another network
-    already stores that /24. It assigns a free one and logs the network; redeploy its services to move
-    them. Check before upgrading for networks that share a subnet: both stay writable, and the scheduler
-    logs each pair.
-  - These are apply refusals that older managers do not have. During a rolling upgrade, finish the
-    upgrade before creating networks (see #157).
+    already stores it, or when an earlier network in the same pass just took it. It assigns a free /24 and
+    logs the network; redeploy its services to move them. Of two old networks whose tasks share a /24, the
+    first keeps it. Both were already breaking each other's bridges. Check before upgrading for networks
+    that share a subnet; the scheduler logs each pair.
+  - `minga state import` refuses a snapshot whose networks overlap, before writing anything.
+  - These are apply refusals that older managers do not have, so mixed-version managers can hold
+    different state for the same entry (#157). During a rolling upgrade, do not create or delete
+    networks until every manager runs this version.
 
 - **Fix, upgrade action needed.** mTLS and operator/JWT workers get the same NATS grants, and a test keeps
   them in step:
