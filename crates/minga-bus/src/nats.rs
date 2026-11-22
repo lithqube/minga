@@ -722,7 +722,24 @@ impl NatsBus {
     }
     /// Gives `stream` at least as many replicas as the shared lease bucket,
     /// which `ensure_replicas` sizes to the cluster.
+    ///
+    /// A write here carries a full stream config read a moment earlier, so one
+    /// that lands after `ensure_replicas` raised both streams further would
+    /// lower this one again. Each pass re-reads both counts and repairs the
+    /// stream until it is at least the lease bucket's, then stops.
     async fn match_lease_replicas(&self, stream: &str) -> Result<()> {
+        for _ in 0..5 {
+            if self.match_lease_replicas_once(stream).await? {
+                return Ok(());
+            }
+        }
+        tracing::warn!(stream, "replica count did not settle at the lease bucket's");
+        Ok(())
+    }
+
+    /// One pass of `match_lease_replicas`; whether the stream was already
+    /// at least as replicated as the lease bucket.
+    async fn match_lease_replicas_once(&self, stream: &str) -> Result<bool> {
         let replicas = self
             .js
             .get_stream("KV_MINGA_LEASES")
@@ -744,14 +761,15 @@ impl NatsBus {
             .map_err(|error| BusError::Other(format!("{stream} info: {error}")))?
             .config
             .clone();
-        if config.num_replicas < replicas {
-            config.num_replicas = replicas;
-            self.js
-                .update_stream(config)
-                .await
-                .map_err(|error| BusError::Other(format!("{stream} replicas: {error}")))?;
+        if config.num_replicas >= replicas {
+            return Ok(true);
         }
-        Ok(())
+        config.num_replicas = replicas;
+        self.js
+            .update_stream(config)
+            .await
+            .map_err(|error| BusError::Other(format!("{stream} replicas: {error}")))?;
+        Ok(false)
     }
 
     pub async fn configure_tenant_quota(
