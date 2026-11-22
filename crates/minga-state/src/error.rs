@@ -41,6 +41,10 @@ pub enum StateError {
     /// never says whose, so it cannot be used to probe other tenants.
     #[error("name is already in use")]
     NameInUse,
+    /// A network subnet overlaps another network's. The message never says
+    /// whose, so it cannot be used to probe other tenants.
+    #[error("network subnet overlaps an existing cluster network")]
+    SubnetOverlap,
     /// A tenant resource limit rejected a desired-state write.
     #[error("tenant quota exceeded: {0}")]
     QuotaExceeded(String),
