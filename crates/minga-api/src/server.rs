@@ -1244,6 +1244,49 @@ mod tests {
         send_request(router, operator_request(req)).await
     }
 
+    #[tokio::test]
+    async fn metrics_preserve_usage_for_operators_only() {
+        let (router, _store, _dir) = admin_router().await;
+        minga_telemetry::METRICS.record_agent_usage("api-metrics-tenant", 11, 13, 17);
+        minga_telemetry::METRICS
+            .agent_usage_events_dropped_total
+            .with_label_values(&["api-metrics-tenant"])
+            .inc();
+        let req = || {
+            Request::builder()
+                .uri("/metrics")
+                .body(Body::empty())
+                .unwrap()
+        };
+        let (status, body) = send_operator_request(router.clone(), req()).await;
+        assert_eq!(status, StatusCode::OK);
+        let text = body.as_str().unwrap();
+        for family in [
+            "requests",
+            "input_tokens",
+            "output_tokens",
+            "cost_micros",
+            "events_dropped",
+        ] {
+            assert!(
+                text.contains(&format!(
+                    "minga_agent_usage_{family}_total{{tenant=\"api-metrics-tenant\"}}"
+                )),
+                "missing {family}: {text}"
+            );
+        }
+        let mut tenant_request = req();
+        tenant_request.extensions_mut().insert(ClientIdentity {
+            name: "tenant-admin".into(),
+            role: Some(ApiRole::Admin),
+            tenant: Some("default".into()),
+        });
+        let (status, _) = send_request(router.clone(), tenant_request).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let (status, _) = send_request(router, req()).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
     fn service_record(id: &str, tenant_id: &str) -> minga_state::types::Service {
         minga_state::types::Service {
             id: id.into(),
