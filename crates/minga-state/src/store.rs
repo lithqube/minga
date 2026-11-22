@@ -886,6 +886,9 @@ impl StateStore {
             .map_err(StateError::Raft)?;
         match self.propose(StateCommand::UpsertNetwork(network)).await? {
             StateResponse::Ok | StateResponse::ChangeRequest(_) => Ok(()),
+            StateResponse::Conflict(message) if message == crate::state_machine::SUBNET_OVERLAP => {
+                Err(StateError::SubnetOverlap)
+            }
             StateResponse::Conflict(_) => Err(StateError::NameInUse),
             StateResponse::Error(message) => Err(command_error(message)),
             StateResponse::NotFound => Err(StateError::NotFound("tenant".into())),
@@ -1140,6 +1143,12 @@ impl StateStore {
                 StateError::BadSnapshot(format!("network {}: {error}", network.id))
             })?;
         }
+        // The apply refuses a network whose subnet overlaps another's, so replay
+        // that rule here: a legacy snapshot with two networks on one subnet is
+        // refused whole instead of stopping partway. A network written
+        // concurrently after this check can still make the apply refuse one.
+        check_import_subnet_overlaps(&self.list_networks().await?, &snapshot.networks)
+            .map_err(StateError::BadSnapshot)?;
         let mut tenants = snapshot.tenants;
         if !tenants.iter().any(|tenant| tenant.id == DEFAULT_TENANT_ID) {
             tenants.push(Tenant {
@@ -1193,6 +1202,37 @@ impl StateStore {
         }
         Ok(())
     }
+}
+
+/// Applies the `UpsertNetwork` overlap rule to `incoming`, in order, over the
+/// `existing` networks. A network keeping its stored subnet is not rechecked.
+fn check_import_subnet_overlaps(existing: &[Network], incoming: &[Network]) -> Result<(), String> {
+    let mut subnets: BTreeMap<&str, Option<&str>> = existing
+        .iter()
+        .map(|network| (network.id.as_str(), network.subnet.as_deref()))
+        .collect();
+    for network in incoming {
+        let subnet = network.subnet.as_deref();
+        if subnets.get(network.id.as_str()) != Some(&subnet) {
+            if let Some(mine) = subnet.and_then(|raw| minga_net::Cidr::parse(raw).ok()) {
+                let clash = subnets.iter().any(|(id, theirs)| {
+                    *id != network.id
+                        && theirs
+                            .and_then(|raw| minga_net::Cidr::parse(raw).ok())
+                            .is_some_and(|theirs| theirs.overlaps(&mine))
+                });
+                if clash {
+                    return Err(format!(
+                        "network {}: {}",
+                        network.id,
+                        StateError::SubnetOverlap
+                    ));
+                }
+            }
+        }
+        subnets.insert(network.id.as_str(), subnet);
+    }
+    Ok(())
 }
 
 /// Refuses a legacy service (nested `previous` included) carrying fields its

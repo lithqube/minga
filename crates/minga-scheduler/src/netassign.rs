@@ -23,6 +23,11 @@ pub enum NetAssignError {
     Subnet(NetworkId, String),
     #[error("IPAM error on network {0}: {1}")]
     Ipam(NetworkId, IpamError),
+    #[error(
+        "network {0}: its running tasks hold addresses in {1}, which another network already \
+         stores, so it gets a new subnet. Stop and redeploy its services to move them onto it"
+    )]
+    RestoreRefused(NetworkId, String),
 }
 
 /// The subnet stored for a network. A network without one is an error:
@@ -38,7 +43,8 @@ fn subnet_for(network: &Network) -> Result<Cidr, NetAssignError> {
 /// it changed, plus one error per network it could not place.
 ///
 /// A network created before subnets were stored, with live tasks, keeps
-/// the /24 its tasks already use (the old per-ID hash), so nothing moves.
+/// the /24 its tasks already use (the old per-ID hash), so nothing moves,
+/// unless another network already holds that /24 (see [`NetAssignError::RestoreRefused`]).
 /// Every other network gets the first /24 of `supernet` that no network
 /// overlaps.
 pub fn fill_subnets(
@@ -47,6 +53,11 @@ pub fn fill_subnets(
     supernet: &Cidr,
 ) -> (Vec<usize>, Vec<NetAssignError>) {
     let mut changed = Vec::new();
+    let mut taken: Vec<Cidr> = networks
+        .iter()
+        .filter_map(|n| Cidr::parse(n.subnet.as_deref()?).ok())
+        .collect();
+    let mut errors = Vec::new();
     for (i, net) in networks.iter_mut().enumerate() {
         if net.subnet.is_some() {
             continue;
@@ -57,15 +68,27 @@ pub fn fill_subnets(
             .find_map(|t| t.spec.ips.get(&net.id)?.parse::<Ipv4Addr>().ok());
         if let Some(ip) = live_ip {
             let base = Ipv4Addr::from(u32::from(ip) & !0xff);
-            net.subnet = Some(format!("{base}/24"));
+            let Ok(restored) = Cidr::parse(&format!("{base}/24")) else {
+                continue;
+            };
+            // The Raft apply refuses a subnet that overlaps another network's, so
+            // restoring one that is stored, or that an earlier network in this
+            // pass just restored, would be refused there and leave this
+            // network's tasks outside its subnet. Give it a free /24 here
+            // instead, and report it. Of two networks whose live tasks share a
+            // /24, the first keeps it and the second has to be redeployed.
+            if taken.iter().any(|other| other.overlaps(&restored)) {
+                errors.push(NetAssignError::RestoreRefused(
+                    net.id.clone(),
+                    restored.to_cidr_string(),
+                ));
+                continue;
+            }
+            net.subnet = Some(restored.to_cidr_string());
+            taken.push(restored);
             changed.push(i);
         }
     }
-    let mut taken: Vec<Cidr> = networks
-        .iter()
-        .filter_map(|n| Cidr::parse(n.subnet.as_deref()?).ok())
-        .collect();
-    let mut errors = Vec::new();
     for (i, net) in networks.iter_mut().enumerate() {
         if net.subnet.is_some() {
             continue;
@@ -188,6 +211,15 @@ mod tests {
     }
 
     #[test]
+    fn a_live_tasks_subnet_is_restored_when_free() {
+        let mut nets = vec![network("old", None)];
+        let tasks = vec![task("t1", &[("old", "10.100.5.9")])];
+        let supernet = Cidr::parse("10.100.0.0/16").unwrap();
+        fill_subnets(&mut nets, &tasks, &supernet);
+        assert_eq!(nets[0].subnet.as_deref(), Some("10.100.5.0/24"));
+    }
+
+    #[test]
     fn assigns_deterministic_ip_per_network() {
         let nets = vec![network("shop_default", Some("10.100.5.0/24"))];
         let a = assign_task_ips("shop.web.1", &["shop_default".to_string()], &nets, &[]).unwrap();
@@ -243,14 +275,37 @@ mod tests {
     }
 
     #[test]
-    fn colliding_legacy_networks_are_reported_not_moved() {
+    fn a_network_never_restores_a_subnet_another_stores() {
         let mut nets = vec![network("a", None), network("b", Some("10.100.7.0/24"))];
         let tasks = vec![task("a.web.1", &[("a", "10.100.7.20")])];
-        fill_subnets(&mut nets, &tasks, &supernet());
+        let (changed, errors) = fill_subnets(&mut nets, &tasks, &supernet());
+        assert_eq!(changed, vec![0]);
+        assert!(matches!(
+            errors.as_slice(),
+            [NetAssignError::RestoreRefused(id, _)] if id == "a"
+        ));
+        assert_ne!(nets[0].subnet.as_deref(), Some("10.100.7.0/24"));
+        assert!(subnet_collisions(&nets).is_empty());
+    }
+
+    #[test]
+    fn of_two_legacy_networks_sharing_a_live_subnet_only_the_first_keeps_it() {
+        // The Raft apply refuses a second network on the same subnet, so the
+        // pass must not propose one.
+        let mut nets = vec![network("a", None), network("b", None)];
+        let tasks = vec![
+            task("a.web.1", &[("a", "10.100.7.20")]),
+            task("b.web.1", &[("b", "10.100.7.30")]),
+        ];
+        let (changed, errors) = fill_subnets(&mut nets, &tasks, &supernet());
+        assert_eq!(changed, vec![0, 1]);
+        assert!(matches!(
+            errors.as_slice(),
+            [NetAssignError::RestoreRefused(id, _)] if id == "b"
+        ));
         assert_eq!(nets[0].subnet.as_deref(), Some("10.100.7.0/24"));
-        let hits = subnet_collisions(&nets);
-        assert_eq!(hits.len(), 1);
-        assert_eq!((hits[0].0.as_str(), hits[0].1.as_str()), ("a", "b"));
+        assert_ne!(nets[1].subnet, nets[0].subnet);
+        assert!(subnet_collisions(&nets).is_empty());
     }
 
     #[test]
