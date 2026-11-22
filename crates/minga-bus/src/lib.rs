@@ -412,6 +412,16 @@ pub trait EventBus: Send + Sync {
         tenant_id: &str,
         quotas: &minga_state::types::TenantQuotas,
     ) -> Result<()>;
+    /// Whether the tenant still owns a stream or bucket on the bus, so a
+    /// tenant is not created over a previous owner's data. A bus that keeps
+    /// nothing per tenant has none.
+    async fn tenant_resources_exist(&self, _tenant_id: &str) -> Result<bool> {
+        Ok(false)
+    }
+    /// Deletes everything the tenant has on the bus. Safe to repeat.
+    async fn delete_tenant_resources(&self, _tenant_id: &str) -> Result<()> {
+        Ok(())
+    }
 
     async fn put_assignment(&self, key: &str, value: &[u8]) -> Result<()>;
     async fn get_assignment(&self, key: &str) -> Result<Option<Vec<u8>>>;

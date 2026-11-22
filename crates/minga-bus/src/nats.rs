@@ -705,6 +705,118 @@ impl NatsBus {
             .insert(tenant_id.to_owned());
         Ok(())
     }
+    /// Every stream a tenant owns on the bus (a KV bucket is the stream
+    /// `KV_<bucket>`). The shared buckets and `MINGA_EVENTS` hold the rest of
+    /// its data, see `delete_tenant_resources`.
+    fn tenant_streams(tenant_id: &str) -> [String; 7] {
+        [
+            format!("MINGA_LOGS_{tenant_id}"),
+            format!("MINGA_AUDIT_{tenant_id}"),
+            format!("MINGA_USAGE_{tenant_id}"),
+            format!("KV_MINGA_STATUS_{tenant_id}"),
+            format!("KV_MINGA_USAGE_{tenant_id}"),
+            format!("KV_MINGA_BUDGET_{tenant_id}"),
+            format!("KV_{}", subjects::assignment_bucket(tenant_id)),
+        ]
+    }
+
+    async fn stream_exists(&self, name: &str) -> Result<bool> {
+        // Not `get_stream_no_info`: that never asks the server.
+        match self.js.get_stream(name).await {
+            Ok(_) => Ok(true),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    jetstream::context::GetStreamErrorKind::JetStream(inner)
+                        if inner.error_code() == jetstream::ErrorCode::STREAM_NOT_FOUND
+                ) =>
+            {
+                Ok(false)
+            }
+            Err(error) => Err(BusError::Other(format!("{name}: {error}"))),
+        }
+    }
+
+    /// Whether the tenant still owns a stream or bucket on the bus.
+    pub async fn tenant_resources_exist(&self, tenant_id: &str) -> Result<bool> {
+        validate_tenant_id(tenant_id)?;
+        for name in Self::tenant_streams(tenant_id) {
+            if self.stream_exists(&name).await? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Deletes everything the tenant has on the bus: its own streams and
+    /// buckets, its events in `MINGA_EVENTS`, its leases, and the node-join
+    /// records that name it in the shared status bucket. Without this a tenant
+    /// created later under the same ID would inherit the old owner's audit,
+    /// logs, usage and status. Safe to repeat.
+    pub async fn delete_tenant_resources(&self, tenant_id: &str) -> Result<()> {
+        validate_tenant_id(tenant_id)?;
+        self.require_manager("delete tenant bus resources")?;
+        self.ensured_tenants.lock().unwrap().remove(tenant_id);
+        self.manager_assignments_kv
+            .lock()
+            .unwrap()
+            .remove(tenant_id);
+        for name in Self::tenant_streams(tenant_id) {
+            if let Err(error) = self.js.delete_stream(&name).await {
+                // Gone already, or a concurrent delete won.
+                if self.stream_exists(&name).await? {
+                    return Err(BusError::Other(format!("delete {name}: {error}")));
+                }
+            }
+        }
+        self.js
+            .get_stream("MINGA_EVENTS")
+            .await
+            .map_err(|error| BusError::Other(format!("MINGA_EVENTS: {error}")))?
+            .purge()
+            .filter(format!("minga.{tenant_id}.>"))
+            .await
+            .map_err(|error| BusError::Other(format!("purge {tenant_id} events: {error}")))?;
+        let lease_prefix = format!("{tenant_id}.lease.");
+        let leases = self.leases_kv.store("delete tenant leases")?;
+        let mut keys = leases
+            .keys()
+            .await
+            .map_err(|error| BusError::Kv(format!("lease keys: {error}")))?;
+        while let Some(key) = keys.next().await {
+            let key = key.map_err(|error| BusError::Kv(format!("lease keys: {error}")))?;
+            if key.starts_with(&lease_prefix) {
+                leases
+                    .purge(&key)
+                    .await
+                    .map_err(|error| BusError::Kv(format!("purge {key}: {error}")))?;
+            }
+        }
+        let mut keys = self
+            .status_kv
+            .keys()
+            .await
+            .map_err(|error| BusError::Kv(format!("status keys: {error}")))?;
+        while let Some(key) = keys.next().await {
+            let key = key.map_err(|error| BusError::Kv(format!("status keys: {error}")))?;
+            if !key.starts_with(subjects::NODE_JOIN_PREFIX) {
+                continue;
+            }
+            let joined = self
+                .status_kv
+                .get(&key)
+                .await
+                .map_err(|error| BusError::Kv(format!("get {key}: {error}")))?;
+            if joined.as_deref() == Some(tenant_id.as_bytes()) {
+                self.status_kv
+                    .purge(&key)
+                    .await
+                    .map_err(|error| BusError::Kv(format!("purge {key}: {error}")))?;
+            }
+        }
+        Ok(())
+    }
+
     /// Gives `stream` at least as many replicas as the shared lease bucket,
     /// which `ensure_replicas` sizes to the cluster.
     async fn match_lease_replicas(&self, stream: &str) -> Result<()> {
@@ -1713,6 +1825,14 @@ impl EventBus for NatsBus {
         quotas: &minga_state::types::TenantQuotas,
     ) -> Result<()> {
         NatsBus::configure_tenant_quota(self, tenant_id, quotas).await
+    }
+
+    async fn tenant_resources_exist(&self, tenant_id: &str) -> Result<bool> {
+        NatsBus::tenant_resources_exist(self, tenant_id).await
+    }
+
+    async fn delete_tenant_resources(&self, tenant_id: &str) -> Result<()> {
+        NatsBus::delete_tenant_resources(self, tenant_id).await
     }
 
     async fn put_assignment(&self, key: &str, value: &[u8]) -> Result<()> {

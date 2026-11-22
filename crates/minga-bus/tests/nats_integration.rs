@@ -501,3 +501,99 @@ async fn nats_tenant_event_history_is_filtered_bounded_and_publish_stamped() {
     let all = bus.tenant_event_history(&tenant, 100).await.unwrap();
     assert_eq!(all.len(), 22, "fewer than `limit` events returns them all");
 }
+
+/// Seeds every place a tenant keeps data on the bus.
+async fn seed_tenant(bus: &NatsBus, tenant: &str, node: u64) {
+    bus.ensure_tenant_resources(tenant).await.unwrap();
+    bus.append_audit(minga_bus::AuditRecord {
+        tenant_id: tenant.to_string(),
+        actor: "operator".into(),
+        action: "tenant.test".into(),
+        resource_path: format!("/tenants/{tenant}"),
+        occurred_at_unix: 1_700_000_000,
+    })
+    .await
+    .unwrap();
+    bus.put_tenant_status(tenant, "node.7.task.t", b"running")
+        .await
+        .unwrap();
+    bus.put_assignment(&format!("{tenant}.node.7.task.t"), b"assigned")
+        .await
+        .unwrap();
+    bus.publish_tenant_event(tenant, &format!("minga.{tenant}.task.t.event"), b"event")
+        .await
+        .unwrap();
+    bus.refresh_tenant_lease(tenant, 7, b"registration")
+        .await
+        .unwrap();
+    // The shared status bucket records which tenant a node joined.
+    bus.put_status(&format!("internal.node-join.{node}"), tenant.as_bytes())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn deleting_a_tenant_removes_everything_it_had_on_the_bus() {
+    let Some(bus) = connect().await else {
+        return;
+    };
+    let pid = std::process::id();
+    let (gone, kept) = (format!("gone{pid}"), format!("kept{pid}"));
+    let (gone_node, kept_node) = (u64::from(pid) * 10 + 1, u64::from(pid) * 10 + 2);
+    seed_tenant(&bus, &gone, gone_node).await;
+    seed_tenant(&bus, &kept, kept_node).await;
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    assert!(bus.tenant_resources_exist(&gone).await.unwrap());
+
+    bus.delete_tenant_resources(&gone).await.unwrap();
+    assert!(!bus.tenant_resources_exist(&gone).await.unwrap());
+    // Repeating it, as after a delete that failed partway, is harmless.
+    bus.delete_tenant_resources(&gone).await.unwrap();
+
+    // The same ID later is a fresh tenant: none of the old owner's data.
+    bus.ensure_tenant_resources(&gone).await.unwrap();
+    assert!(bus.list_audit(&gone, 10).await.unwrap().is_empty());
+    assert!(bus.list_tenant_status(&gone).await.unwrap().is_empty());
+    assert!(bus
+        .list_assignments(&format!("{gone}."))
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(bus
+        .tenant_event_history(&gone, 10)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(!bus.is_tenant_node_alive(&gone, 7).await.unwrap());
+    assert_eq!(
+        bus.get_status(&format!("internal.node-join.{gone_node}"))
+            .await
+            .unwrap(),
+        None,
+        "the node-join record outlived its tenant"
+    );
+
+    // Another tenant is untouched.
+    assert_eq!(bus.list_audit(&kept, 10).await.unwrap().len(), 1);
+    assert_eq!(bus.list_tenant_status(&kept).await.unwrap().len(), 1);
+    assert_eq!(
+        bus.list_assignments(&format!("{kept}."))
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(bus.tenant_event_history(&kept, 10).await.unwrap().len(), 1);
+    assert!(bus.is_tenant_node_alive(&kept, 7).await.unwrap());
+    assert_eq!(
+        bus.get_status(&format!("internal.node-join.{kept_node}"))
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(kept.as_bytes())
+    );
+
+    for tenant in [&gone, &kept] {
+        bus.delete_tenant_resources(tenant).await.unwrap();
+    }
+}

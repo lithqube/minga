@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+- **Security.** Deleting a tenant now deletes everything it had on the bus (#132):
+  - Before, only the Raft record went. Its audit, log, usage, status and budget streams and buckets, its
+    events, its leases and its node-join records stayed, and a tenant created later under the same ID
+    reattached them: the new owner read the old owner's audit trail, logs and status.
+  - `DELETE /minga/tenants/<id>` now removes, after the tenant leaves Raft, its streams and buckets
+    (`MINGA_LOGS_`, `MINGA_AUDIT_`, `MINGA_USAGE_`, `KV_MINGA_STATUS_`, `KV_MINGA_USAGE_`,
+    `KV_MINGA_BUDGET_`, `KV_MINGA_ASSIGN_` plus the tenant), its subjects in `MINGA_EVENTS`, its leases, and
+    the node-join records naming it in the shared status bucket.
+  - If the bus cleanup fails, the call returns 503 and the tenant is already gone. Repeat the `DELETE`: it
+    finishes the cleanup (404 only when nothing is left).
+  - Creating a tenant is refused (409) while bus resources of that ID exist, so a delete that never ran or
+    failed cannot leak into a new tenant. A create that fails after making the resources removes them again.
+  - Tenants deleted by an earlier version left their resources behind. Creating one of those IDs is now
+    refused until you `DELETE` it, which removes them.
+  - The delete request's own audit record is written to the tenant's audit stream and goes with it.
+
 - **Security, upgrade action needed: flag day.** Each tenant now has its own assignment bucket (#131):
   - A worker could create consumers of any name, durable ones included, on the one shared
     `KV_MINGA_ASSIGN` stream, and its ACL cannot count them. Filling the stream-wide limit stopped other

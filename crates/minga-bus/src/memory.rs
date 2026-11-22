@@ -74,6 +74,8 @@ pub struct MemoryBus {
     /// Retained usage events, deduplicated by tenant and request ID.
     usage: Mutex<Vec<crate::UsageEvent>>,
     usage_ids: Mutex<HashSet<(String, String)>>,
+    /// Tenants whose bus resources were configured and not yet deleted.
+    tenant_resources: Mutex<HashSet<String>>,
 }
 struct Lease {
     refreshed_at: Instant,
@@ -96,6 +98,7 @@ impl MemoryBus {
         let (tenant_logs_tx, _) = broadcast::channel(CHANNEL_CAPACITY);
         Arc::new(Self {
             events_tx,
+            tenant_resources: Mutex::new(HashSet::new()),
             tenant_events: Mutex::new(VecDeque::new()),
             assignments: Mutex::new(HashMap::new()),
             assignment_tx,
@@ -191,7 +194,30 @@ impl EventBus for MemoryBus {
         tenant_id: &str,
         _quotas: &minga_state::types::TenantQuotas,
     ) -> Result<()> {
-        validate_tenant_id(tenant_id)
+        validate_tenant_id(tenant_id)?;
+        self.tenant_resources
+            .lock()
+            .unwrap()
+            .insert(tenant_id.to_owned());
+        Ok(())
+    }
+    async fn tenant_resources_exist(&self, tenant_id: &str) -> Result<bool> {
+        validate_tenant_id(tenant_id)?;
+        Ok(self.tenant_resources.lock().unwrap().contains(tenant_id))
+    }
+    async fn delete_tenant_resources(&self, tenant_id: &str) -> Result<()> {
+        validate_tenant_id(tenant_id)?;
+        self.tenant_resources.lock().unwrap().remove(tenant_id);
+        self.tenant_events
+            .lock()
+            .unwrap()
+            .retain(|(tenant, _)| tenant != tenant_id);
+        self.tenant_audit.lock().unwrap().remove(tenant_id);
+        self.tenant_status
+            .lock()
+            .unwrap()
+            .retain(|(tenant, _), _| tenant != tenant_id);
+        Ok(())
     }
     async fn publish_tenant_event(
         &self,
