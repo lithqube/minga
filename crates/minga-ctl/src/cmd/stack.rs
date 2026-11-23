@@ -204,6 +204,18 @@ fn compose_services(file: &str, stack: &str) -> Result<BTreeSet<String>, CtlErro
         .collect())
 }
 
+/// Whether service `id` is one of the file's `names` (`<stack>.<service>`). A
+/// tenant other than `default` has its services' IDs qualified with the tenant,
+/// `acme.<stack>.<service>`, and a tenant ID never contains a dot.
+fn named_in_file(id: &str, names: &BTreeSet<String>) -> bool {
+    names.contains(id)
+        || names.iter().any(|name| {
+            id.strip_suffix(name.as_str())
+                .and_then(|tenant| tenant.strip_suffix('.'))
+                .is_some_and(|tenant| !tenant.is_empty() && !tenant.contains('.'))
+        })
+}
+
 /// `deploy` steps 1 to 5 (plan 5.2).
 async fn deploy(conn: &Connection, args: &DeployArgs<'_>, quiet: bool) -> Result<(), CtlError> {
     let DeployArgs {
@@ -239,7 +251,7 @@ async fn deploy(conn: &Connection, args: &DeployArgs<'_>, quiet: bool) -> Result
     }
     let absent: Vec<String> = in_file
         .iter()
-        .flat_map(|names| before.keys().filter(|id| !names.contains(*id)))
+        .flat_map(|names| before.keys().filter(|id| !named_in_file(id, names)))
         .cloned()
         .collect();
     if prune && !absent.is_empty() {
@@ -613,11 +625,14 @@ const REFERENCES: [(&str, &str); 6] = [
     ("/Spec/TaskTemplate/ContainerSpec/Configs", "ConfigName"),
 ];
 
-/// A network, config or secret whose ID starts with `<stack>_`.
+/// A network, config or secret whose name or ID starts with `<stack>_`. A
+/// tenant other than `default` has IDs qualified with the tenant
+/// (`acme.app_default`) and the stack's own name for it is `app_default`.
 struct Candidate {
     kind: &'static str,
     collection: &'static str,
     id: String,
+    name: String,
 }
 
 /// `rm`: only services carry the stack label, so only services are known to
@@ -656,11 +671,16 @@ async fn rm(
     for (kind, collection) in KINDS {
         for item in view::items(&client.get(collection, None).await?) {
             let id = item["ID"].as_str().or(item["Id"].as_str()).unwrap_or("");
-            if id.starts_with(&prefix) {
+            let name = item["Name"]
+                .as_str()
+                .or(item["Spec"]["Name"].as_str())
+                .unwrap_or(id);
+            if id.starts_with(&prefix) || name.starts_with(&prefix) {
                 candidates.push(Candidate {
                     kind,
                     collection,
                     id: id.to_string(),
+                    name: name.to_string(),
                 });
             }
         }
@@ -673,15 +693,19 @@ async fn rm(
         .filter(|s| view::stack_of(s) != Some(stack))
         .collect();
     let mut named: Vec<&Candidate> = Vec::new();
-    for id in with {
-        let Some(candidate) = candidates.iter().find(|c| &c.id == id) else {
+    for given in with {
+        let Some(candidate) = candidates
+            .iter()
+            .find(|c| &c.id == given || &c.name == given)
+        else {
             return Err(CtlError::Usage(format!(
-                "refusing --with {id}: not a network, config or secret of stack `{stack}` (its ID must start with `{prefix}`); nothing removed"
+                "refusing --with {given}: not a network, config or secret of stack `{stack}` (its name must start with `{prefix}`); nothing removed"
             )));
         };
+        let id = candidate.id.as_str();
         if let Some(user) = outside.iter().find(|s| refers_to(s, id)) {
             return Err(CtlError::Usage(format!(
-                "refusing --with {id}: {} `{id}` is used by service `{}` outside stack `{stack}`; nothing removed",
+                "refusing --with {given}: {} `{given}` is used by service `{}` outside stack `{stack}`; nothing removed",
                 candidate.kind,
                 view::id(user)
             )));
@@ -882,6 +906,21 @@ mod tests {
 
     fn yaml(text: &str) -> serde_yaml::Value {
         serde_yaml::from_str(text).unwrap()
+    }
+
+    #[test]
+    fn a_tenants_qualified_service_ids_are_matched_to_the_files_names() {
+        let names: BTreeSet<String> = ["app.web", "app.db"].map(String::from).into();
+        // The default tenant's IDs are the names; another tenant's carry its ID.
+        assert!(named_in_file("app.web", &names));
+        assert!(named_in_file("acme.app.db", &names));
+        // Services the file does not name, in either form, are absent.
+        assert!(!named_in_file("app.cache", &names));
+        assert!(!named_in_file("acme.app.cache", &names));
+        // A suffix match alone is not enough: the prefix is one tenant token.
+        assert!(!named_in_file("x.y.app.web", &names));
+        assert!(!named_in_file(".app.web", &names));
+        assert!(!named_in_file("acmeapp.web", &names));
     }
 
     #[test]
