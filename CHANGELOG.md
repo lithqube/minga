@@ -10,6 +10,14 @@ Changes on `main` after `v1.3.0-rc.1`. They go into 1.3.0.
   - `0.0.0.0` and `::` mean every address. An IPv6 address is carried and stored, but the node publishes through IPv4 rules only, so it logs a warning and does not publish that port (it is never widened to every address).
   - One published port and protocol still belongs to one service in the cluster, whatever its `host_ip`.
   - **Upgrade action:** this adds a field to the persisted port record, so the state and wire format is now v12. A v11 store (including 1.3.0-rc.1) migrates in place on open, a port without `host_ip` keeps meaning every address, and a v11 snapshot still imports. Every node must change together; a v11 node refuses v12 Raft messages and assignments, so none can publish a port wider than its `host_ip`. A v12 store cannot be opened by the previous binary: take the backup first.
+- **No upgrade action.** The Raft apply rules are versioned (#157, [ADR 0009](https://github.com/lithqube/minga/blob/main/docs/adr/0009-raft-apply-rule-versions.md)):
+  - A replicated apply-rule level (1 today, every refusal through 1.3.0-rc.1) decides which refusals the apply
+    makes, so a manager rebuilt from the log, or on a newer build, gets the result the cluster committed.
+  - Nothing is gated yet and the level stays 1, so there is no step now. The first release that adds an apply
+    refusal will say: upgrade every manager, check that none is old, then raise the level once. There is no
+    command to raise it yet (#188); a manager that implements a lower level stops at the raise instead of
+    diverging.
+  - Stores and snapshots written before this keep their meaning: an absent level is 1.
 - **Security, no upgrade action.** `minga-ctl change approve` shows what it will apply before it asks (#134):
   - It prints the redacted before and after value of every changed field to stderr, then asks for confirmation.
     Scripts must pass `--yes`.

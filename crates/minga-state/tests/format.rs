@@ -1301,6 +1301,8 @@ async fn a_v11_store_migrates_and_a_port_without_host_ip_still_means_every_addre
     let web = store.get_service("shop.web").await.unwrap().unwrap();
     assert_eq!(web.ports, vec![port()]);
     assert_eq!(web.ports[0].host_ip, None);
+    // The apply-rule level (#157) lives in sm_meta beside the marker; a v11 store has none, which is level 1.
+    assert_eq!(store.apply_rules().await.unwrap(), 1);
     // A port that sets one survives the next restart.
     let mut narrow = service("shop.narrow");
     narrow.ports[0].published = Some(8081);

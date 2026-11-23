@@ -81,6 +81,14 @@ pub enum StateCommand {
         id: String,
         tenant_id: TenantId,
     },
+
+    /// Raises the apply-rule level every replica uses from this log index on
+    /// (ADR 0009). It only goes up. A build that implements fewer levels stops
+    /// applying instead of applying later entries under older rules. Propose
+    /// it only once every manager runs a build that implements `level`.
+    SetApplyRules {
+        level: u32,
+    },
 }
 
 /// The tenant-owned tables [`StateCommand::RemoveOwned`] can delete from.

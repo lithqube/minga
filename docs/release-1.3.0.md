@@ -196,6 +196,34 @@ this path has not been run as a live upgrade.
   follow those entries, including the flag-day order for the assignment
   buckets and the deletion of the old shared `KV_MINGA_ASSIGN` stream.
 
+### Later upgrades: apply rules
+
+1.3.0 adds a replicated apply-rule level ([ADR 0009](adr/0009-raft-apply-rule-versions.md)).
+It starts at 1, which is every apply-time refusal in this release, so **an
+upgrade to 1.3.0 has no step for it**. The level exists for the first later
+release that adds a refusal to the Raft apply, because a manager that replays
+the log (a new or replaced manager) or runs a newer build would otherwise
+answer a committed entry with an error that an older manager applied as `Ok`.
+That release's notes will name the step. The order is:
+
+1. Upgrade every manager. Until the level is raised, the new build applies
+   every entry by the old rules, so managers of different builds that share a
+   state format agree. Builds of a different state format still refuse each
+   other, as above.
+2. Check that every manager runs the new build.
+3. Raise the level, once. 1.3.0 has no `minga-ctl` command or API route for
+   this; [#188](https://github.com/lithqube/minga/issues/188) adds one, and no
+   release may gate a rule before it lands.
+
+Do not raise it while a manager is still old: a manager that implements a lower
+level stops applying at that entry instead of applying it by older rules. The
+level never goes down, so a raise is not undone by a downgrade; do not roll a
+manager back to a build from before 1.3.0 after one.
+
+A unit test replays a log on a live and on a rebuilt replica and shows the
+same results before and after a raise. No live rolling upgrade has exercised it,
+and no rule is gated yet.
+
 ## Known issues and limits in this candidate
 
 Open against the 1.3.0 milestone when this was cut. Each needs a decision

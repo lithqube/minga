@@ -255,6 +255,41 @@ pub fn service_spec_to_state(spec: &models::ServiceSpec) -> Result<Service, Stri
             "service '{name}': ContainerSpec.Ulimits is not supported"
         ));
     }
+    // Same rule for the eight fields the model used to drop. No-ops: empty
+    // map/list, `Init: false`, `Isolation: "default"`/empty, `OomScoreAdj: 0`.
+    let non_empty = |list: &Option<Vec<String>>| list.as_ref().is_some_and(|l| !l.is_empty());
+    let refused = [
+        (
+            "Sysctls",
+            container.Sysctls.as_ref().is_some_and(|m| !m.is_empty()),
+        ),
+        ("CapabilityAdd", non_empty(&container.CapabilityAdd)),
+        ("Init", container.Init == Some(true)),
+        (
+            "Isolation",
+            container
+                .Isolation
+                .as_deref()
+                .is_some_and(|v| !v.is_empty() && !v.eq_ignore_ascii_case("default")),
+        ),
+        ("Groups", non_empty(&container.Groups)),
+        (
+            "DNSConfig",
+            container.DNSConfig.as_ref().is_some_and(|dns| {
+                non_empty(&dns.Nameservers) || non_empty(&dns.Search) || non_empty(&dns.Options)
+            }),
+        ),
+        (
+            "Dir",
+            container.Dir.as_deref().is_some_and(|v| !v.is_empty()),
+        ),
+        ("OomScoreAdj", container.OomScoreAdj.is_some_and(|v| v != 0)),
+    ];
+    if let Some((field, _)) = refused.iter().find(|(_, active)| *active) {
+        return Err(format!(
+            "service '{name}': ContainerSpec.{field} is not supported"
+        ));
+    }
 
     // Docker's defaults when a field is absent: condition `any`, and
     // MaxAttempts 0 means unlimited. Durations are nanoseconds; state
@@ -1703,6 +1738,91 @@ mod tests {
         .unwrap();
         let err = service_spec_to_state(&spec).unwrap_err();
         assert!(err.contains("Ulimits"), "{err}");
+    }
+
+    /// Translate a `ContainerSpec` JSON fragment; parsing from JSON proves the
+    /// Docker key binds, so a misnamed serde field would fail these tests.
+    fn translate_container_fields(fields: &str) -> Result<(), String> {
+        let spec: models::ServiceSpec = serde_json::from_str(&format!(
+            r#"{{"Name": "web", "TaskTemplate": {{"ContainerSpec": {{"Image": "nginx:1.25", {fields}}}}}}}"#
+        ))
+        .unwrap();
+        service_spec_to_state(&spec).map(|_| ())
+    }
+
+    #[test]
+    fn sysctls_are_refused() {
+        let err =
+            translate_container_fields(r#""Sysctls": {"net.ipv4.ip_forward": "0"}"#).unwrap_err();
+        assert!(err.contains("Sysctls"), "{err}");
+    }
+
+    #[test]
+    fn capability_add_is_refused() {
+        let err = translate_container_fields(r#""CapabilityAdd": ["CAP_NET_ADMIN"]"#).unwrap_err();
+        assert!(err.contains("CapabilityAdd"), "{err}");
+    }
+
+    #[test]
+    fn init_true_is_refused() {
+        let err = translate_container_fields(r#""Init": true"#).unwrap_err();
+        assert!(err.contains("Init"), "{err}");
+    }
+
+    #[test]
+    fn non_default_isolation_is_refused() {
+        let err = translate_container_fields(r#""Isolation": "hyperv""#).unwrap_err();
+        assert!(err.contains("Isolation"), "{err}");
+    }
+
+    #[test]
+    fn groups_are_refused() {
+        let err = translate_container_fields(r#""Groups": ["docker"]"#).unwrap_err();
+        assert!(err.contains("Groups"), "{err}");
+    }
+
+    #[test]
+    fn dns_config_is_refused() {
+        for body in [
+            r#""DNSConfig": {"Nameservers": ["1.1.1.1"]}"#,
+            r#""DNSConfig": {"Search": ["example.com"]}"#,
+            r#""DNSConfig": {"Options": ["ndots:1"]}"#,
+        ] {
+            let err = translate_container_fields(body).unwrap_err();
+            assert!(err.contains("DNSConfig"), "{body}: {err}");
+        }
+    }
+
+    #[test]
+    fn dir_is_refused() {
+        let err = translate_container_fields(r#""Dir": "/srv""#).unwrap_err();
+        assert!(err.contains("Dir"), "{err}");
+    }
+
+    #[test]
+    fn non_zero_oom_score_adj_is_refused() {
+        for body in [r#""OomScoreAdj": 500"#, r#""OomScoreAdj": -500"#] {
+            let err = translate_container_fields(body).unwrap_err();
+            assert!(err.contains("OomScoreAdj"), "{body}: {err}");
+        }
+    }
+
+    #[test]
+    fn dropped_field_noops_are_accepted() {
+        for body in [
+            r#""Sysctls": {}"#,
+            r#""CapabilityAdd": []"#,
+            r#""Init": false"#,
+            r#""Isolation": "default""#,
+            r#""Isolation": """#,
+            r#""Groups": []"#,
+            r#""DNSConfig": {}"#,
+            r#""DNSConfig": {"Nameservers": [], "Search": [], "Options": []}"#,
+            r#""Dir": """#,
+            r#""OomScoreAdj": 0"#,
+        ] {
+            assert!(translate_container_fields(body).is_ok(), "{body}");
+        }
     }
 
     #[test]
