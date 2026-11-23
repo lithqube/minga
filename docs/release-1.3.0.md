@@ -91,18 +91,26 @@ upgraded worker no longer votes. This candidate has not shown that the
 conversion commits when the managers are a minority of the voters, so treat
 that shape as unsupported.
 
-Count the voters before upgrading anything, from your own inventory and the
-1.2.0 API, which can list nodes but cannot report Raft membership: in 1.2.0
-every `minga manager`, every `minga worker` and every `minga api` process is a
-voter. `docker node ls` against the 1.2.0 API lists the managers and workers;
-add the `minga api` processes you run. The managers (the `minga manager`
-processes, which you upgrade first) must be a majority of that total. `minga
-api` is retired in 1.3.0, so it never counts toward the managers.
-`minga migrate-v1` without `--apply` and `upgrade preflight` run only against
-an upgraded manager, as a second check before you apply the conversion. If the
-managers are not a majority of the voters, or you cannot rehearse the upgrade
-on a copy first, use
-[the export and import path](#when-the-managers-are-not-a-majority) instead.
+**1.2.0 cannot tell you its voter set.** Its API reports leader status and
+node counts from the node registry, which is not the Raft membership: nodes
+can be registered through the API without being voters, and Raft initializes
+its voter set from each node's ID and `--peer` list when the store is created,
+so current flags do not prove it for a store that already exists. In 1.2.0
+every `minga manager`, `minga worker` and `minga api` process that opened a
+store is a voter, and `minga api` is retired in 1.3.0, so it never counts
+toward the managers. Counting `docker node ls` rows plus your `minga api`
+processes gives an estimate that can be wrong in either direction.
+
+**Fail closed.** Use the in-place conversion only when the voter set is
+certain: a single host with one `minga manager` that was started without
+`--peer`, no workers and no `minga api` process, so the manager is the only
+voter. For every other cluster, including one where your count shows a manager
+majority, use [the export and import path](#when-the-managers-are-not-a-majority)
+unless you can show from each node's data directory and original flags that
+its voter set is exactly the nodes you counted, and have rehearsed the upgrade
+on a copy. `minga migrate-v1` without `--apply` and `upgrade preflight` run
+only against an upgraded manager, as a second check before applying; they
+cannot replace this one.
 
 1. Upgrade the managers first, then, on the leader, change membership once to
    the manager set, removing worker voters. `minga migrate-v1` previews that
@@ -136,8 +144,14 @@ the old binary. The way back is the copy you took first:
 
 This follows from how the stores and the wire format behave and from the
 backup guide. **It has not been rehearsed**, not in a live run and not in CI,
-so rehearse it on a copy of the cluster before the window, and do not start
-the window without the copy.
+so rehearse it before the window, on a disposable copy of the cluster, and do
+not start the window without the copy. A rehearsal should:
+
+1. Restore each node's cold data directory with its original node ID, address,
+   flags and certificates.
+2. Start the 1.2.0 binaries and wait for a leader to be elected.
+3. Check quorum, perform a Raft write (deploy a test service), and check that
+   the state is what it was when the copy was taken.
 
 #### When the managers are not a majority
 
