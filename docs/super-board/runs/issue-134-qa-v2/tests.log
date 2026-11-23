@@ -1,0 +1,637 @@
+   Compiling aws-lc-sys v0.47.0
+   Compiling h2 v0.4.20
+   Compiling cranelift-codegen-meta v0.137.2
+   Compiling tracing-subscriber v0.3.23
+   Compiling x509-parser v0.16.0
+   Compiling protobuf v2.28.0
+   Compiling rustix v1.1.5
+   Compiling cranelift-isle v0.137.2
+   Compiling tracing-futures v0.2.5
+   Compiling x25519-dalek v2.0.1
+   Compiling crossbeam-channel v0.5.17
+   Compiling webpki-roots v0.26.11
+   Compiling darling_core v0.20.11
+   Compiling cobs v0.3.0
+   Compiling symlink v0.1.0
+   Compiling maplit v1.0.2
+   Compiling leb128fmt v0.1.0
+   Compiling virtue v0.0.18
+   Compiling hashbrown v0.16.1
+   Compiling bincode_derive v2.0.1
+   Compiling gimli v0.33.0
+   Compiling tracing-appender v0.2.5
+   Compiling openraft v0.9.25
+   Compiling postcard v1.1.3
+   Compiling minga-net v1.2.0 (/Users/admin/dev/minga/.claude/worktrees/issue-134-qa/crates/minga-net)
+   Compiling cranelift-assembler-x64 v0.137.2
+   Compiling darling_macro v0.20.11
+   Compiling cranelift-codegen v0.137.2
+   Compiling prometheus v0.13.4
+   Compiling cranelift-bforest v0.137.2
+   Compiling rand v0.10.3
+   Compiling target-lexicon v0.13.6
+   Compiling redb v2.6.4
+   Compiling portable-atomic v1.15.0
+   Compiling nuid v0.5.0
+   Compiling hyper v1.12.0
+   Compiling tryhard v0.5.2
+   Compiling hmac v0.12.1
+   Compiling serde_nanos v0.1.4
+   Compiling crc32fast v1.5.3
+   Compiling rustc-hash v2.1.3
+   Compiling unsafe-libyaml v0.2.11
+   Compiling arbitrary v1.5.0
+   Compiling hyper-util v0.1.21
+   Compiling unty v0.0.4
+   Compiling hex v0.4.3
+   Compiling bincode v2.0.1
+   Compiling cranelift-control v0.137.2
+   Compiling serde_yaml v0.9.34+deprecated
+   Compiling regalloc2 v0.15.3
+   Compiling darling v0.20.11
+   Compiling pulley-interpreter v50.0.2
+   Compiling tower-http v0.6.11
+   Compiling axum v0.7.9
+   Compiling semver v1.0.28
+   Compiling hybrid-array v0.4.15
+   Compiling crossbeam-epoch v0.9.21
+   Compiling outref v0.5.2
+   Compiling vsimd v0.8.0
+   Compiling wasmparser v0.261.0
+   Compiling derive_builder_core v0.20.2
+   Compiling base64-simd v0.8.0
+   Compiling bytes-utils v0.1.4
+   Compiling crossbeam-deque v0.8.8
+   Compiling termcolor v1.4.1
+   Compiling cmov v0.5.4
+   Compiling derive_builder_macro v0.20.2
+   Compiling ctutils v0.4.8
+   Compiling aws-smithy-types v1.9.4
+   Compiling object v0.40.0
+   Compiling crypto-common v0.2.2
+   Compiling block-buffer v0.12.1
+   Compiling minga-telemetry v1.2.0 (/Users/admin/dev/minga/.claude/worktrees/issue-134-qa/crates/minga-telemetry)
+   Compiling wasm-encoder v0.261.0
+   Compiling aws-smithy-async v1.3.1
+   Compiling aws-smithy-runtime-api-macros v1.2.0
+   Compiling wasmtime-internal-versioned-export-macros v50.0.2
+   Compiling wasmtime-internal-component-util v50.0.2
+   Compiling either v1.19.0
+   Compiling rayon-core v1.13.0
+   Compiling const-oid v0.10.3
+   Compiling wasmtime-internal-unwinder v50.0.2
+   Compiling digest v0.11.3
+   Compiling itertools v0.14.0
+   Compiling aws-smithy-runtime-api v1.22.0
+   Compiling derive_builder v0.20.2
+   Compiling minga-compose v1.2.0 (/Users/admin/dev/minga/.claude/worktrees/issue-134-qa/crates/minga-compose)
+   Compiling wasm-encoder v0.262.0
+   Compiling indexmap v1.9.3
+   Compiling mach2 v0.6.0
+   Compiling foldhash v0.1.5
+   Compiling minga-api v1.2.0 (/Users/admin/dev/minga/.claude/worktrees/issue-134-qa/crates/minga-api)
+   Compiling unicode-width v0.2.2
+   Compiling wasmprinter v0.261.0
+   Compiling wasmtime-internal-cranelift v50.0.2
+   Compiling wast v262.0.0
+   Compiling hashbrown v0.15.5
+   Compiling prost-derive v0.13.5
+   Compiling nats-jwt-rs v0.1.1
+   Compiling wasmtime-environ v50.0.2
+   Compiling wasmtime v50.0.2
+   Compiling cpufeatures v0.3.1
+   Compiling fastrand v2.5.0
+   Compiling hashbrown v0.12.3
+   Compiling tempfile v3.27.0
+   Compiling sha2 v0.11.1
+   Compiling prost v0.13.5
+   Compiling rayon v1.12.0
+   Compiling lru v0.12.5
+   Compiling aws-smithy-http v0.64.3
+   Compiling aws-credential-types v1.3.1
+   Compiling hmac v0.13.0
+   Compiling wasmtime-internal-jit-icache-coherence v50.0.2
+   Compiling async-stream-impl v0.3.6
+   Compiling rtoolbox v0.0.6
+   Compiling aws-sigv4 v1.6.6
+   Compiling rpassword v7.5.5
+   Compiling tower v0.4.13
+   Compiling hyper-timeout v0.5.2
+   Compiling socket2 v0.5.10
+   Compiling async-stream v0.3.6
+   Compiling prost-types v0.13.5
+   Compiling darling_core v0.24.1
+   Compiling memchr v2.8.3
+   Compiling structmeta-derive v0.3.0
+   Compiling tonic v0.12.3
+   Compiling home v0.5.12
+   Compiling wat v1.262.0
+   Compiling aho-corasick v1.1.5
+   Compiling hyperlocal v0.9.1
+   Compiling xattr v1.6.1
+   Compiling filetime v0.2.29
+   Compiling structmeta v0.3.0
+   Compiling tokio-tar v0.3.1
+   Compiling etcetera v0.8.0
+   Compiling docker_credential v1.4.0
+   Compiling regex-automata v0.4.18
+   Compiling pem v3.0.6
+   Compiling yasna v0.5.2
+   Compiling rcgen v0.13.2
+   Compiling darling_macro v0.24.1
+   Compiling darling v0.24.1
+   Compiling regex v1.13.1
+   Compiling serde_with_macros v3.24.0
+   Compiling parse-display-derive v0.9.1
+   Compiling serde_with v3.24.0
+   Compiling parse-display v0.9.1
+   Compiling bollard-stubs v1.47.1-rc.27.3.1
+   Compiling aws-lc-rs v1.19.0
+   Compiling rustls v0.23.46
+   Compiling rustls-webpki v0.103.16
+   Compiling cranelift-frontend v0.137.2
+   Compiling cranelift-native v0.137.2
+   Compiling tokio-rustls v0.26.6
+   Compiling hyper-rustls v0.27.10
+   Compiling tokio-websockets v0.10.1
+   Compiling minga-state v1.2.0 (/Users/admin/dev/minga/.claude/worktrees/issue-134-qa/crates/minga-state)
+   Compiling reqwest v0.12.28
+   Compiling bollard v0.18.1
+   Compiling async-nats v0.50.0
+   Compiling minga-ctl v1.2.0 (/Users/admin/dev/minga/.claude/worktrees/issue-134-qa/crates/minga-ctl)
+   Compiling testcontainers v0.23.3
+   Compiling minga-bus v1.2.0 (/Users/admin/dev/minga/.claude/worktrees/issue-134-qa/crates/minga-bus)
+   Compiling minga-sandbox v1.2.0 (/Users/admin/dev/minga/.claude/worktrees/issue-134-qa/crates/minga-sandbox)
+   Compiling minga-scheduler v1.2.0 (/Users/admin/dev/minga/.claude/worktrees/issue-134-qa/crates/minga-scheduler)
+   Compiling minga-egress v1.2.0 (/Users/admin/dev/minga/.claude/worktrees/issue-134-qa/crates/minga-egress)
+   Compiling minga-node v1.2.0 (/Users/admin/dev/minga/.claude/worktrees/issue-134-qa/crates/minga-node)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 42.60s
+     Running unittests src/lib.rs (target/debug/deps/minga_api-0ce0b8346358129d)
+
+running 147 tests
+test error::tests::no_content_status ... ok
+test error::tests::not_found_helper ... ok
+test error::tests::ok_message_json ... ok
+test error::tests::quota_errors_map_to_rate_limit_or_storage_status ... ok
+test error::tests::from_state_error ... ok
+test error::tests::bad_request_status ... ok
+test error::tests::conflict_status ... ok
+test error::tests::error_response_format ... ok
+test handlers::tests::cross_tenant_reserved_port_does_not_block_ingress ... ok
+test auth::tests::client_identity_reads_role_and_tenant_from_subject ... ok
+test handlers::tests::agent_usage_is_tenant_scoped_and_operator_output_is_aggregate_only ... ok
+test handlers::tests::create_and_update_refuse_unimplemented_hardening_json_with_bad_request ... ok
+test handlers::tests::deleting_node_fails_closed_when_revocation_bus_is_missing ... ok
+test handlers::tests::same_tenant_reserved_port_still_blocks_ingress ... ok
+test handlers::tests::cluster_audit_merges_tenant_trails_by_time ... ok
+test handlers::tests::operator_registered_node_accepts_tenant_assignment_and_defaults_to_default ... ok
+test handlers::tests::network_subnet_outside_the_overlay_is_refused ... ok
+test handlers::tests::deleting_node_revokes_its_bus_user_before_removing_it ... ok
+test models::node_join_token_tests::debug_output_redacts_the_token_and_seed ... ok
+test models::tests::config_spec_deserialize ... ok
+test models::tests::error_response_serialize ... ok
+test models::tests::labels_match_existence ... ok
+test models::tests::labels_match_key_value ... ok
+test models::tests::labels_match_multiple ... ok
+test models::tests::network_create_deserialize ... ok
+test models::tests::network_resource_serialize ... ok
+test models::tests::node_serialize ... ok
+test models::tests::parse_filters_canonical_go_client_form ... ok
+test models::tests::parse_filters_invalid_json ... ok
+test models::tests::parse_filters_none ... ok
+test models::tests::parse_filters_valid ... ok
+test models::tests::secret_spec_deserialize ... ok
+test models::tests::service_mode_global ... ok
+test models::tests::service_spec_deserialize ... ok
+test models::tests::service_serialize_roundtrip ... ok
+test models::tests::task_serialize ... ok
+test models::tests::version_info_serialize ... ok
+test nats_credentials::tests::effective_worker_permissions_cover_only_its_own_tenant_and_node ... ok
+test nats_credentials::tests::every_worker_grant_is_pinned_to_its_tenant_and_node ... ok
+test nats_credentials::tests::issued_credentials_are_node_and_tenant_scoped ... ok
+test nats_credentials::tests::issuer_accepts_sorted_signer_template_permissions ... ok
+test handlers::tests::node_join_token_is_signed_for_the_preregistered_tenant ... ok
+test nats_credentials::tests::issuer_rejects_a_template_that_repeats_one_permission_in_place_of_another ... ok
+test handlers::tests::new_leader_republishes_stored_revocations_once_per_term ... ok
+test handlers::tests::egress_route_secrets_of_another_tenant_are_not_found ... ok
+test nats_credentials::tests::wireguard_watch_permissions_are_limited_to_the_tenant_node_key ... ok
+test nats_credentials::tests::worker_template_cannot_list_shared_bucket_keys ... ok
+test nats_credentials::tests::issuer_rejects_missing_tenant_signer ... ok
+test nats_credentials::tests::jwt_template_matches_the_worker_acl ... ok
+test nats_credentials::tests::revocation_claim_contains_the_complete_replicated_key_set ... ok
+test handlers::tests::unknown_network_driver_option_is_refused ... ok
+test handlers::tests::overlapping_ipam_subnet_does_not_disclose_other_networks ... ok
+test handlers::tests::service_admission_scopes_reserved_ports_to_the_service_tenant ... ok
+test handlers::tests::reissuing_node_credentials_revokes_the_previous_nkey ... ok
+test handlers::tests::update_excludes_the_services_own_tasks_from_capacity ... ok
+test server::tests::a_service_name_cannot_be_taken_over_by_another_tenant ... ok
+test server::tests::a_tenant_holding_its_cap_of_stalled_bodies_locks_out_no_one_else ... ok
+test server::tests::a_body_dripped_byte_by_byte_is_closed_at_its_deadline ... ok
+test server::tests::api_server_start_and_shutdown ... ok
+test server::tests::bearer_auth_rejects_and_accepts ... ok
+test server::tests::client_certificates_scope_docker_routes_to_their_tenant ... ok
+test server::tests::create_and_list_config ... ok
+test server::tests::create_and_list_network ... ok
+test server::tests::create_and_list_secret ... ok
+test server::tests::deciding_a_change_request_needs_a_reviewer_certificate ... ok
+test server::tests::create_node_rejects_duplicates_and_empty_address ... ok
+test server::tests::create_and_list_service ... ok
+test server::tests::create_node_registers_and_inspects ... ok
+test server::tests::create_secret_with_inline_data_is_rejected ... ok
+test server::tests::create_service_conflict ... ok
+test server::tests::create_service_fails_loudly_without_nodes ... ok
+test server::tests::delete_service ... ok
+test server::tests::empty_configured_token_never_authenticates ... ok
+test server::tests::a_stalled_request_body_is_closed_at_its_deadline ... ok
+test server::tests::fallback_not_found ... ok
+test server::tests::get_info ... ok
+test server::tests::get_version ... ok
+test server::tests::get_service_not_found ... ok
+test server::tests::list_nodes ... ok
+test server::tests::list_tasks_empty ... ok
+test server::tests::missing_status_does_not_replay_raft_actual_fields ... ok
+test server::tests::operator_certificates_need_the_role_the_operation_requires ... ok
+test server::tests::ping ... ok
+test server::tests::mtls_accepts_ca_signed_clients_and_maps_them_to_roles ... ok
+test server::tests::change_requests_are_tenant_scoped_and_maker_checker_enforced ... ok
+test server::tests::service_filter_by_stack_label ... ok
+test server::tests::tenant_audit_is_admin_only_and_tenant_scoped ... ok
+test server::tests::the_change_diff_hides_environment_values_but_names_their_keys ... ok
+test server::tests::state_routes_need_the_token_and_check_version_first ... ok
+test server::tests::state_import_round_trips_v9_agents_and_runs_agent_admission ... ok
+test server::tests::manager_membership_routes_require_admin_auth_and_change_membership ... ok
+test server::tests::tenant_admin_reaches_audit_and_usage_routes ... ok
+test translate::tests::a_failed_task_reports_its_reason_and_exit_code ... ok
+test translate::tests::a_healthy_task_has_a_message_and_no_error_on_the_wire ... ok
+test translate::tests::a_relative_bind_source_is_refused_and_an_absolute_one_kept ... ok
+test server::tests::task_view_uses_bus_actual_state_and_keeps_traefik_attachments ... ok
+test translate::tests::a_task_that_failed_to_start_has_an_error_but_no_exit_code ... ok
+test translate::tests::agent_label_must_be_a_json_object ... ok
+test translate::tests::agent_label_directory_grants_are_bounded ... ok
+test translate::tests::agent_label_with_an_invalid_directory_path_is_refused ... ok
+test translate::tests::agent_label_with_env_but_no_env_grant_is_refused ... ok
+test translate::tests::agent_label_with_unknown_keys_is_refused ... ok
+test translate::tests::config_spec_to_state_translation ... ok
+test server::tests::task_logs_are_bounded_and_scoped_to_the_callers_tenant ... ok
+test translate::tests::config_to_docker_translation ... ok
+test translate::tests::docker_port_publish_mode_defaults_and_round_trips ... ok
+test translate::tests::empty_privileges_and_unlimited_pids_json_are_noops ... ok
+test translate::tests::egress_policy_survives_the_docker_api_round_trip_and_is_validated ... ok
+test translate::tests::hardening_fields_are_refused_instead_of_dropped ... ok
+test translate::tests::hardening_keys_in_json_are_captured_and_refused ... ok
+test translate::tests::host_entries_take_aliases_and_reject_a_bare_ip ... ok
+test translate::tests::inactive_privilege_values_and_unlimited_pids_json_are_noops ... ok
+test translate::tests::network_create_to_state_defaults_translation ... ok
+test translate::tests::network_create_to_state_translation ... ok
+test translate::tests::network_to_docker_with_subnet ... ok
+test translate::tests::network_to_docker_without_subnet ... ok
+test translate::tests::node_to_docker_draining ... ok
+test translate::tests::node_to_docker_leader ... ok
+test translate::tests::node_to_docker_worker ... ok
+test translate::tests::secret_spec_to_state_translation ... ok
+test translate::tests::replicated_job_mode_is_preserved_for_tenant_quota_accounting ... ok
+test translate::tests::secret_to_docker_translation ... ok
+test translate::tests::service_roundtrip ... ok
+test translate::tests::service_spec_to_state_basic ... ok
+test translate::tests::service_spec_to_state_default_mode ... ok
+test translate::tests::service_secret_references_reject_unsafe_targets_and_options ... ok
+test translate::tests::service_spec_to_state_global_mode ... ok
+test translate::tests::service_spec_to_state_missing_container ... ok
+test translate::tests::service_spec_to_state_missing_image ... ok
+test translate::tests::service_spec_to_state_missing_name ... ok
+test translate::tests::service_spec_to_state_no_ports ... ok
+test translate::tests::service_spec_to_state_restart_policy_defaults_and_rounding ... ok
+test translate::tests::service_to_docker_env_excludes_minga_stack ... ok
+test translate::tests::system_info_basic ... ok
+test translate::tests::task_to_docker_failed ... ok
+test translate::tests::task_to_docker_pending ... ok
+test translate::tests::task_to_docker_running ... ok
+test translate::tests::ulimits_key_in_json_is_captured_and_refused ... ok
+test translate::tests::version_info_basic ... ok
+test translate::tests::user_and_update_policy_survive_the_docker_api_round_trip ... ok
+test server::tests::tokenless_api_refuses_browser_shaped_requests ... ok
+test server::tests::tokenless_sole_tenant_caller_reads_inventory_but_cannot_administer ... ok
+test server::tests::update_node_drains_and_relabels ... ok
+test server::tests::update_node_rejects_what_minga_cannot_do ... ok
+test server::tests::tenant_crud_requires_admin_and_protects_owned_resources ... ok
+test server::tests::diagnostics_report_persisted_voters_and_unreachable_member ... ok
+test nats_credentials::jwt_server_tests::jwt_worker_cannot_learn_other_tenants_keys ... ok
+
+test result: ok. 147 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 18.07s
+
+     Running tests/integration.rs (target/debug/deps/integration-de389a4fe0e160bb)
+
+running 13 tests
+test info_endpoint_shows_swarm ... ok
+test ping_endpoint ... ok
+test error_responses_are_docker_compatible ... ok
+test ingress_port_conflicts_return_http_409 ... ok
+test node_join_credentials_require_mutual_tls ... ok
+test docker_cli_node_ls_via_testcontainer ... ok
+test docker_cli_info_via_testcontainer ... ok
+test docker_cli_version_via_testcontainer ... ok
+test docker_cli_service_ls_via_testcontainer ... ok
+test full_stack_deploy_workflow ... ok
+test service_update_changes_replicas ... ok
+test version_endpoint ... ok
+test tasks_endpoint_returns_empty_initially ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.32s
+
+     Running unittests src/lib.rs (target/debug/deps/minga_ctl-c954f39905bb575c)
+
+running 99 tests
+test api::tests::error_messages_come_from_json_or_plain_text ... ok
+test api::tests::statuses_are_classified ... ok
+test api::tests::the_token_goes_only_to_the_api_root ... ok
+test cmd::context::tests::a_context_with_a_remote_token_file_is_labelled ... ok
+test cmd::context::tests::a_context_without_a_token_is_labelled_none ... ok
+test cmd::context::tests::mtls_contexts_require_direct_https ... ok
+test cmd::context::tests::a_plain_http_remote_endpoint_is_refused_at_add_time ... ok
+test api::tests::change_request_ids_are_safe_path_segments ... ok
+test cmd::context::tests::a_token_command_is_split_on_whitespace ... ok
+test cmd::doctor::tests::api_error_body_is_redacted_from_evidence ... ok
+test cmd::doctor::tests::raft_assessment_marks_stale_quorum_failed_and_unreachable_voters_degraded ... ok
+test cmd::doctor::tests::readiness_reasons_distinguish_raft_bus_and_unrecognized_failures ... ok
+test cmd::health::tests::replicas_derive_ok_degraded_and_fail ... ok
+test cmd::doctor::tests::task_counts_aggregate_failures_without_reading_error_text ... ok
+test cmd::health::tests::only_http_and_https_urls_are_fetched ... ok
+test cmd::metrics::tests::a_histogram_without_observations_has_no_average ... ok
+test cmd::metrics::tests::comments_blank_lines_and_junk_are_skipped ... ok
+test cmd::metrics::tests::label_values_may_hold_escapes_commas_and_braces ... ok
+test cmd::metrics::tests::special_float_values_parse ... ok
+test api::tests::client_private_key_must_not_be_group_or_world_readable ... ok
+test cmd::image::tests::a_bad_target_is_refused_before_anything_runs ... ok
+test cmd::metrics::tests::parses_names_labels_and_values ... ok
+test cmd::image::tests::targets_follow_flags_then_nodes_then_ssh_then_local ... ok
+test cmd::registry::tests::docker_login_keys_match_like_minga ... ok
+test cmd::registry::tests::short_names_resolve_to_hosts ... ok
+test cmd::registry::tests::the_default_path_note_names_the_file_and_the_fix ... ok
+test cmd::registry::tests::usernames_cannot_hold_a_colon ... ok
+test cmd::metrics::tests::the_summary_follows_the_plan_and_skips_missing_metrics ... ok
+test cmd::report::tests::only_error_findings_fail_the_command ... ok
+test cmd::service::tests::a_global_service_cannot_be_scaled ... ok
+test cmd::service::tests::env_keys_are_split_at_the_first_equals_sign ... ok
+test cmd::service::tests::only_plain_keys_are_printed_or_logged ... ok
+test cmd::service::tests::env_order_does_not_make_specs_differ ... ok
+test cmd::service::tests::changes_are_described_without_values ... ok
+test cmd::service::tests::an_empty_env_is_the_same_as_none ... ok
+test cmd::stack::tests::only_loopback_endpoints_are_this_machine ... ok
+test cmd::stack::tests::the_relay_is_refused_without_a_token ... ok
+test cmd::upgrade::tests::a_check_that_could_not_run_blocks_the_upgrade ... ok
+test cmd::upgrade::tests::raft_finding_fails_closed_and_omits_peer_addresses ... ok
+test cmd::upgrade::tests::state_format_assessment_uses_only_supported_migrations ... ok
+test cmd::upgrade::tests::target_metadata_fails_closed_for_unknown_versions ... ok
+test cmd::usage::tests::operator_rows_render_aggregate_objects_from_the_response_envelope ... ok
+test cmd::usage::tests::since_parser_accepts_expected_units_and_rejects_bad_values ... ok
+test cmd::usage::tests::query_contains_only_customer_and_since_filters ... ok
+test cmd::usage::tests::tenant_rows_render_events_from_the_response_envelope ... ok
+test cmd::stack::tests::absolute_and_named_volumes_and_other_keys_pass ... ok
+test config::tests::a_query_or_fragment_cannot_smuggle_a_loopback_host ... ok
+test cmd::stack::tests::relative_bind_mounts_are_found_in_short_and_long_form ... ok
+test config::tests::an_endpoint_behind_an_ssh_target_is_not_checked ... ok
+test config::tests::an_unknown_context_is_not_found ... ok
+test config::tests::https_to_any_host_is_allowed ... ok
+test config::tests::parse_reads_contexts ... ok
+test config::tests::parse_refuses_an_unknown_field ... ok
+test config::tests::parse_refuses_an_unknown_field_inside_a_context ... ok
+test config::tests::plain_http_to_a_remote_host_is_refused ... ok
+test config::tests::plain_http_to_the_loopback_interface_is_allowed ... ok
+test error::tests::a_failed_health_check_exits_two ... ok
+test config::tests::a_group_readable_config_is_refused ... ok
+test error::tests::a_plain_http_endpoint_reports_the_alternative ... ok
+test error::tests::a_readable_config_reports_the_fix ... ok
+test error::tests::an_unreachable_api_reports_the_hint ... ok
+test error::tests::missing_things_exit_three ... ok
+test error::tests::the_token_hint_is_only_for_token_fields ... ok
+test error::tests::transport_errors_exit_two ... ok
+test error::tests::usage_errors_exit_one ... ok
+test output::tests::an_empty_table_prints_nothing ... ok
+test output::tests::json_output_is_an_array_of_rows ... ok
+test config::tests::a_private_config_is_accepted ... ok
+test output::tests::a_failed_write_is_reported ... ok
+test transport::tests::a_bare_token_file_is_the_trimmed_content ... ok
+test transport::tests::a_forward_destination_is_host_and_port ... ok
+test transport::tests::a_forward_destination_must_be_the_targets_loopback ... ok
+test transport::tests::a_socket_directory_must_fit_sun_path_and_parse_in_a_forward ... ok
+test output::tests::the_table_pads_columns ... ok
+test transport::tests::an_empty_file_or_value_is_an_error ... ok
+test transport::tests::an_env_file_gives_the_value_of_the_token_variable ... ok
+test cmd::health::tests::a_refused_scheme_is_a_failed_check_without_a_request ... ok
+test transport::tests::an_env_file_without_the_variable_is_an_error_not_a_token ... ok
+test transport::tests::an_ssh_error_reports_the_last_stderr_line ... ok
+test transport::tests::ids_images_and_paths_follow_the_plan_rules ... ok
+test transport::tests::no_argv_sets_batch_mode_or_host_key_checking ... ok
+test transport::tests::only_fixed_arguments_may_start_with_a_dash ... ok
+test cmd::stack::tests::the_relay_forwards_a_tcp_connection_to_the_socket ... ok
+test transport::tests::only_the_tcp_nodelay_notice_is_dropped_from_ssh_stderr ... ok
+test transport::tests::quoting_survives_a_single_quote ... ok
+test transport::tests::ssh_targets_follow_the_plan_rule ... ok
+test transport::tests::the_exec_argv_puts_the_target_after_dashes_and_quotes_arguments ... ok
+test transport::tests::the_exec_argv_refuses_shell_syntax ... ok
+test transport::tests::the_tunnel_argv_adds_metrics_only_when_set ... ok
+test transport::tests::the_tunnel_argv_forwards_the_api_to_a_socket ... ok
+test view::tests::a_long_error_is_cut_in_the_table_and_whole_in_json ... ok
+test view::tests::modes_and_replicas_are_read ... ok
+test view::tests::health_is_derived_from_the_healthcheck_and_state ... ok
+test view::tests::the_hint_counts_tasks_that_are_not_running_and_names_one_service ... ok
+test view::tests::task_rows_name_nodes_and_sort_by_id ... ok
+test config::tests::resolve_target_does_not_run_the_token_command ... ok
+test config::tests::a_failing_token_command_is_a_usage_error ... ok
+test config::tests::a_token_command_runs_without_a_shell ... ok
+test cmd::doctor::tests::support_bundle_redacts_secrets_paths_and_endpoints ... ok
+
+test result: ok. 99 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running unittests src/main.rs (target/debug/deps/minga_ctl-4d9d471661afd77e)
+
+running 4 tests
+test tests::json_overrides_the_output_format ... ok
+test tests::the_output_format_defaults_to_table ... ok
+test tests::agent_usage_accepts_customer_and_relative_since ... ok
+test tests::the_cli_definition_is_valid ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/api.rs (target/debug/deps/api-961aafff535b1ede)
+
+running 5 tests
+test a_plain_http_remote_endpoint_is_refused_before_connecting ... ok
+test an_unreachable_api_is_exit_two ... ok
+test system_proxies_are_ignored_so_the_token_never_reaches_one ... ok
+test a_wrong_token_is_exit_two_with_the_hint ... ok
+test read_commands_against_a_real_api ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.87s
+
+     Running tests/client.rs (target/debug/deps/client-a914836fe0cd36d8)
+
+running 3 tests
+test text_reads_health_with_the_token_and_reports_status ... ok
+test a_wrong_token_on_post_is_auth ... ok
+test post_and_delete_round_trip ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.50s
+
+     Running tests/cluster.rs (target/debug/deps/cluster-3aea1111711e3d24)
+
+running 2 tests
+test missing_node_fails_with_not_found ... ok
+test cluster_resources_round_trip ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.44s
+
+     Running tests/context.rs (target/debug/deps/context-a8f1d7b294f5fd42)
+
+running 13 tests
+test a_plain_http_remote_endpoint_is_refused ... ok
+test deleting_an_unknown_context_exits_three ... ok
+test adding_a_context_writes_a_private_config ... ok
+test adding_a_context_twice_is_refused ... ok
+test json_output_is_an_array ... ok
+test deleting_the_current_context_clears_the_selection ... ok
+test an_unknown_config_key_is_refused ... ok
+test a_group_readable_config_is_refused ... ok
+test listing_contexts_shows_the_current_one ... ok
+test quiet_output_prints_ids_only ... ok
+test the_config_directory_is_private ... ok
+test quiet_changes_print_nothing ... ok
+test concurrent_adds_keep_every_context ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s
+
+     Running tests/health.rs (target/debug/deps/health-c61aaae2b92fceb9)
+
+running 6 tests
+test metrics_with_a_wrong_token_exits_two ... ok
+test a_missing_stack_exits_three ... ok
+test a_failed_check_exits_two ... ok
+test metrics_lists_real_metric_names ... ok
+test health_reports_the_api_checks ... ok
+test stack_health_checks_replicas_and_label_urls ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.59s
+
+     Running tests/ops_loop.rs (target/debug/deps/ops_loop-508876252fd0029b)
+
+running 8 tests
+test service_rm_keeps_the_new_revision_when_the_delete_outcome_is_unknown ... ok
+test prune_refuses_a_file_without_services ... ok
+test service_rm_confirms_saves_the_revision_and_deletes ... ok
+test inspect_skips_the_output_with_a_note_when_minga_logs_fails ... ok
+test without_prune_a_note_names_the_services_the_file_lacks ... ok
+test inspect_shows_the_end_of_each_failed_tasks_output ... ok
+test inspect_over_an_unreachable_node_still_shows_the_service ... ok
+test prune_removes_only_this_stacks_absent_services_and_rollback_brings_one_back ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.16s
+
+     Running tests/registry.rs (target/debug/deps/registry-ee8a0f518fb7c799)
+
+running 13 tests
+test an_empty_stdin_is_exit_1_and_changes_nothing ... ok
+test a_file_that_is_not_json_is_left_unchanged_with_exit_2 ... ok
+test a_login_drops_world_access_and_leaves_no_temporary_file ... ok
+test logout_dockerhub_also_removes_the_docker_login_key ... ok
+test a_google_registry_stores_the_json_key_user ... ok
+test a_second_login_keeps_the_mode_of_the_existing_file ... ok
+test a_docker_hub_alias_replaces_the_docker_login_entry ... ok
+test logout_without_a_terminal_needs_yes ... ok
+test login_ghcr_creates_the_file_0600_with_the_auth_entry ... ok
+test a_failing_api_token_command_does_not_block_registry_commands ... ok
+test list_shows_usernames_and_never_the_secret ... ok
+test other_hosts_and_unknown_keys_survive_and_logout_removes_only_its_host ... ok
+test over_ssh_the_credential_goes_on_stdin_never_in_argv ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.37s
+
+     Running tests/revision_save_failure.rs (target/debug/deps/revision_save_failure-0361b0abdfe6d70c)
+
+running 1 test
+test a_failed_revision_save_removes_the_old_revision ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.35s
+
+     Running tests/rollback_race.rs (target/debug/deps/rollback_race-4ef02235fca483fd)
+
+running 1 test
+test rollback_stops_when_the_service_changes_while_confirming ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.36s
+
+     Running tests/ssh.rs (target/debug/deps/ssh-aca4e16812fe62de)
+
+running 12 tests
+test a_remote_token_file_without_ssh_is_refused_at_add_time ... ok
+test a_target_starting_with_a_dash_is_refused_at_add_time ... ok
+test context_add_applies_the_tunnel_destination_rules ... ok
+test an_empty_env_file_value_is_refused_before_the_tunnel ... ok
+test an_empty_remote_token_is_refused_before_the_tunnel ... ok
+test a_bare_remote_token_may_contain_equals_signs ... ok
+test an_env_file_remote_token_sends_only_the_value ... ok
+test an_env_file_without_the_variable_is_refused_without_echoing_it ... ok
+kill: 90577: No such process
+test a_failed_tunnel_is_exit_two_with_the_last_ssh_line ... ok
+kill: 90576: No such process
+test a_command_runs_through_the_tunnel_with_the_remote_token ... ok
+kill: 90594: No such process
+kill: 90603: No such process
+test a_signal_kills_the_tunnel_and_removes_the_socket_directory ... ok
+kill: 90575: No such process
+test a_hanging_ssh_without_a_terminal_times_out_after_ten_seconds ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 10.45s
+
+     Running tests/task_errors.rs (target/debug/deps/task_errors-501fdab5c2be9c69)
+
+running 4 tests
+test a_healthy_service_has_no_error_and_no_hint ... ok
+test the_docker_api_reports_the_reason_on_the_task ... ok
+test ps_shows_the_error_last_and_hints_at_what_to_run ... ok
+test inspect_shows_the_spec_and_why_each_task_is_down ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.89s
+
+     Running tests/wrapped.rs (target/debug/deps/wrapped-3b0a8d189631295e)
+
+running 15 tests
+test change_review_list_shows_values_and_escapes_unicode ... ok
+test change_review_approval_reads_diff_before_confirmation_or_yes ... ok
+test change_review_cannot_approve_missing_or_unreviewable_requests ... ok
+test deploy_without_minga_is_exit_1_with_the_hint ... ok
+test secret_put_with_empty_stdin_is_exit_1 ... ok
+test deploy_refuses_a_relative_bind_mount_when_the_node_is_another_machine ... ok
+test deploy_reports_a_failed_minga_as_exit_2 ... ok
+test a_failed_target_is_exit_2_and_skips_the_declaration ... ok
+test service_logs_follow_ends_when_stdout_is_closed ... ok
+test deploy_exits_2_when_the_read_after_minga_fails ... ok
+test service_logs_prefixes_each_line_with_its_task ... ok
+test deploy_passes_the_token_in_the_environment_and_saves_only_changed_revisions ... ok
+test image_pull_runs_on_each_node_and_rm_needs_confirmation ... ok
+test secret_put_sends_the_value_on_stdin_only ... ok
+test deploy_over_ssh_relays_the_tunnel_and_passes_the_remote_token ... ok
+
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.43s
+
+     Running tests/writes.rs (target/debug/deps/writes-c2aa2e65f740d411)
+
+running 3 tests
+test stack_rm_reports_resources_in_use_and_failed_services ... ok
+test stack_rm_removes_services_and_only_named_resources ... ok
+test scale_update_and_rollback_against_a_real_api ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.09s
+
+   Doc-tests minga_api
+
+running 1 test
+test crates/minga-api/src/lib.rs - (line 47) - compile ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.14s
+
+   Doc-tests minga_ctl
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
