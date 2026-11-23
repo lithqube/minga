@@ -237,6 +237,18 @@ impl EventBus for MemoryBus {
                 .keys()
                 .any(|(tenant, _)| tenant == tenant_id)
             || self
+                .tenant_api_requests
+                .lock()
+                .unwrap()
+                .keys()
+                .any(|(tenant, _)| tenant == tenant_id)
+            || self
+                .usage_ids
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(tenant, _)| tenant == tenant_id)
+            || self
                 .assignments
                 .lock()
                 .unwrap()
@@ -1023,6 +1035,44 @@ mod tests {
         assert!(bus.tenant_resources_exist("kept").await.unwrap());
         assert_eq!(bus.list_audit("kept", 10).await.unwrap().len(), 1);
         assert!(bus.is_tenant_node_alive("kept", 1).await.unwrap());
+    }
+
+    /// Each kind of retained data alone is enough for the ID to be taken, and
+    /// deleting the tenant frees it.
+    #[tokio::test]
+    async fn each_kind_of_retained_data_alone_keeps_a_tenant_id_taken() {
+        let bus = MemoryBus::new();
+        bus.check_tenant_request_quota("counter", 100, 10)
+            .await
+            .unwrap();
+        bus.publish_tenant_node_log(
+            "logs",
+            1,
+            "web.1.abc",
+            &LogEntry::stdout("web.1.abc", "line"),
+        )
+        .await
+        .unwrap();
+        for tenant in ["counter", "logs"] {
+            assert!(
+                bus.tenant_resources_exist(tenant).await.unwrap(),
+                "{tenant}"
+            );
+            bus.delete_tenant_resources(tenant).await.unwrap();
+            assert!(
+                !bus.tenant_resources_exist(tenant).await.unwrap(),
+                "{tenant}"
+            );
+        }
+        // The counter is gone too: the window starts from zero for a new owner.
+        assert!(bus
+            .check_tenant_request_quota("counter", 100, 1)
+            .await
+            .unwrap());
+        assert!(!bus
+            .check_tenant_request_quota("counter", 100, 1)
+            .await
+            .unwrap());
     }
 
     #[tokio::test]
