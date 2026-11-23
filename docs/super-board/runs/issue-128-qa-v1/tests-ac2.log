@@ -1,0 +1,8 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.18s
+     Running unittests src/lib.rs (target/debug/deps/minga_api-da942c4024aff82c)
+
+running 1 test
+test handlers::tests::own_missing_secret_returns_404_on_inspect_and_delete ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 159 filtered out; finished in 0.36s
+
