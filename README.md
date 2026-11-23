@@ -10,6 +10,8 @@ Named after the [minga](https://en.wikipedia.org/wiki/Minga) of Chiloé, where a
 
 > **Latest release: `v1.2.0`.** The release's capabilities and verification limits are in the [release notes](docs/release-1.2.0.md).
 >
+> **Release candidate: `v1.3.0-rc.1`** (pre-release, not the latest release). Read its [release notes](docs/release-1.3.0.md), including [what is not yet verified](docs/release-1.3.0.md#not-yet-verified), before trying it.
+>
 > **Current `main` is unreleased** ([`02c578c`](https://github.com/lithqube/minga/commit/02c578c22295ad88148ca696ed7ee755821e3148), PR [#103](https://github.com/lithqube/minga/pull/103)). It contains:
 >
 > - **Multi-node networking (Phase 13):** kernel WireGuard overlay, manager relay for NAT-isolated workers, cross-node ingress and same-network task isolation. T2/T3 live proofs passed; T4 scale has not been measured.
@@ -333,6 +335,7 @@ Next, in order (rationale in [docs/architecture.md](docs/architecture.md)):
 - [CLI reference](docs/cli.md): every `minga` and `minga-ctl` command, its flags and environment variables, and which deploy command to use
 - [Supported topologies](docs/topologies.md): single host, from a workstation, air-gapped, Talos, container image and multi-node, with what each needs and how far it is verified
 - [Resource benchmark](docs/benchmark.md): idle memory, CPU and process counts against Docker Compose and Swarm
+- [Release notes: v1.3.0 (candidate rc.1)](docs/release-1.3.0.md)
 - [Release notes: v1.2.0](docs/release-1.2.0.md)
 - [Release notes: v1.1.0](docs/release-1.1.0.md)
 - [Release notes: v1.0.2](docs/release-1.0.2.md)

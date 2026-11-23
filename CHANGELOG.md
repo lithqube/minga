@@ -1,7 +1,38 @@
 # Changelog
 
-## Unreleased
+## [1.3.0-rc.1] — 2026-11-23
 
+Release candidate for 1.3.0, cut for the staging and tenant-isolation runs
+that gate the release (see [the release notes](https://github.com/lithqube/minga/blob/v1.3.0-rc.1/docs/release-1.3.0.md)).
+It is a pre-release: `releases/latest` still points at 1.2.0. 1.3.0 is tagged
+from the same code once those runs pass, and this section becomes `[1.3.0]`.
+
+1.3.0 moves Raft to the managers alone, adds the WireGuard overlay and routing
+mesh, bundles nats-server 2.15.3, isolates tenants end to end, adds the
+agent egress and usage plane, and adds operator tooling for agents. Read the
+[upgrade notes](https://github.com/lithqube/minga/blob/v1.3.0-rc.1/docs/release-1.3.0.md#upgrade-notes)
+before upgrading a 1.2.0 cluster: it is one coordinated window, and several
+changes refuse to start on settings that used to log a warning.
+
+### Upgrading
+- State from 1.2.0 migrates in place to format v11. Upgrade every node in one
+  window; nodes of different formats refuse each other. Back up first, and note
+  that an older binary refuses a newer store.
+- Managers first, then workers (workers stop voting and join as NATS clients).
+  The conversion is a Raft write, and 1.2.0 cannot report its voters, so
+  export the state and import it into a fresh cluster. A single host may
+  convert in place only if the upgraded manager becomes leader on its own and
+  accepts a write. The way back is a cold copy of each data directory, which
+  has not been rehearsed (see the release notes). Reissue
+  manager and NATS route certificates before upgrading; see below.
+- A manager refuses to start on a non-loopback API without a token or client
+  TLS, on an empty token, and on plaintext Raft off loopback.
+- Entries below marked "upgrade action needed" also describe changes between
+  unreleased builds of `main`, such as the per-tenant assignment buckets and
+  the NATS operator/JWT mode. They apply only to a cluster that ran one of
+  those builds; a 1.2.0 cluster gets the end state in one step.
+
+### Changes
 - **Security, no upgrade action.** Object names are unique per tenant, not cluster-wide (#129):
   - Services, networks, secrets and configs were keyed by their bare name across the whole cluster. Another
     tenant's name answered 409 "name is already in use" on create, so a tenant could learn that a name was
@@ -104,31 +135,6 @@
   - The 5,000 limit is the most one tenant's workers can fill; a tenant with more than 2,500 nodes
     needs it raised on its bucket.
 
-
-- **Security, upgrade action needed: flag day.** Each tenant now has its own assignment bucket (#131):
-  - A worker could create consumers of any name, durable ones included, on the one shared
-    `KV_MINGA_ASSIGN` stream, and its ACL cannot count them. Filling the stream-wide limit stopped other
-    tenants' nodes reading their assignments. Assignments now live in `KV_MINGA_ASSIGN_<tenant>`
-    (`$KV.MINGA_ASSIGN_<tenant>.<tenant>.node.<n>.>`), capped at 5,000 consumers, so a tenant's workers
-    can fill only that tenant's bucket. Keys are unchanged. Managers create the bucket with the tenant,
-    at the cluster's replica count.
-  - Workers cannot read assignments across this change. A worker of this version needs a manager of this
-    version to have created its tenant's bucket; a worker of the previous version loses its grants when
-    its manager's sidecar restarts. Running containers keep running, but no assignment reaches a node,
-    so nothing is placed, moved or stopped on it until it is upgraded.
-  - Order: stop nothing, upgrade every manager, then every worker. After the managers, a node shows no new
-    assignments until it runs this version.
-  - Operator/JWT mode, as for the entries below: set every tenant signer's template to the list in
-    `worker_permission_template`, copy the `revocations` of the current resolver claim into the account
-    claim, then re-sign the account JWT, and push it to every manager's resolver before starting the
-    managers. A manager refuses to start with the old template.
-  - The old shared `KV_MINGA_ASSIGN` stream is no longer written or granted. It keeps every tenant's old
-    assignments, so delete it once every node runs this version (`nats stream rm KV_MINGA_ASSIGN`). Until
-    then, and only while no worker runs this version, rolling the managers back works. A worker already
-    upgraded reads `KV_MINGA_ASSIGN_<tenant>`, which an older manager never writes, so after a manager
-    rollback it gets no assignments until the managers are upgraded again.
-  - The 5,000 limit is the most one tenant's workers can fill; a tenant with more than 2,500 nodes
-    needs it raised on its bucket.
 
 - **Fix, upgrade action needed.** mTLS and operator/JWT workers get the same NATS grants, and a test keeps
   them in step:
@@ -491,7 +497,6 @@
   lowest-ID healthy manager. Multi-node managers require a reachable
   `--wg-endpoint`; relays decrypt and re-encrypt traffic and can inspect
   container payloads.
-
 
 ## [1.2.0] — 2026-11-13
 
