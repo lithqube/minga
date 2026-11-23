@@ -39,6 +39,45 @@
     upgrade promptly.
   - A service on a network that still has no subnet gets no task until the leader stores one, so a task
     never persists without an IP.
+  - Removing a stack's services leaves their tasks for the leader's next pass to reap, and a network they
+    hold an address on cannot be removed until then. `minga-ctl stack rm --with <network>` now waits up to
+    15 seconds for that, instead of reporting the network in use; `DELETE /networks/<id>` still answers 409
+    in the meantime.
+
+- **Security.** A task under a required egress policy can no longer reach an upstream resolver through
+  the bridge DNS (#136):
+  - The bridge DNS answered every name for any task, forwarding names it did not know to the node's
+    upstream resolver, so a required-egress task could send data out in DNS queries around the egress
+    proxy. It now answers such a task only for local names (services, tasks, `minga.local`); any other
+    name gets REFUSED and reaches no upstream, over UDP and TCP.
+  - Tasks without a required policy keep recursive DNS. Required-egress tasks lose it: reach outside
+    names through the egress proxy, which resolves them on the host.
+  - A node restart keeps the confinement: it is rebuilt from the task's egress state file.
+
+- **Security, upgrade action needed: flag day.** Each tenant now has its own assignment bucket (#131):
+  - A worker could create consumers of any name, durable ones included, on the one shared
+    `KV_MINGA_ASSIGN` stream, and its ACL cannot count them. Filling the stream-wide limit stopped other
+    tenants' nodes reading their assignments. Assignments now live in `KV_MINGA_ASSIGN_<tenant>`
+    (`$KV.MINGA_ASSIGN_<tenant>.<tenant>.node.<n>.>`), capped at 5,000 consumers, so a tenant's workers
+    can fill only that tenant's bucket. Keys are unchanged. Managers create the bucket with the tenant,
+    at the cluster's replica count.
+  - Workers cannot read assignments across this change. A worker of this version needs a manager of this
+    version to have created its tenant's bucket; a worker of the previous version loses its grants when
+    its manager's sidecar restarts. Running containers keep running, but no assignment reaches a node,
+    so nothing is placed, moved or stopped on it until it is upgraded.
+  - Order: stop nothing, upgrade every manager, then every worker. After the managers, a node shows no new
+    assignments until it runs this version.
+  - Operator/JWT mode, as for the entries below: set every tenant signer's template to the list in
+    `worker_permission_template`, copy the `revocations` of the current resolver claim into the account
+    claim, then re-sign the account JWT, and push it to every manager's resolver before starting the
+    managers. A manager refuses to start with the old template.
+  - The old shared `KV_MINGA_ASSIGN` stream is no longer written or granted. It keeps every tenant's old
+    assignments, so delete it once every node runs this version (`nats stream rm KV_MINGA_ASSIGN`). Until
+    then, and only while no worker runs this version, rolling the managers back works. A worker already
+    upgraded reads `KV_MINGA_ASSIGN_<tenant>`, which an older manager never writes, so after a manager
+    rollback it gets no assignments until the managers are upgraded again.
+  - The 5,000 limit is the most one tenant's workers can fill; a tenant with more than 2,500 nodes
+    needs it raised on its bucket.
 
 
 - **Security, upgrade action needed: flag day.** Each tenant now has its own assignment bucket (#131):

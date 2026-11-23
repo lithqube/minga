@@ -274,6 +274,26 @@ impl Metrics {
         &self.registry
     }
 
+    /// Encode only families that contain no tenant-labelled samples.
+    pub(crate) fn gather_without_tenants(&self) -> Result<String, MetricsError> {
+        let families: Vec<_> = self
+            .registry
+            .gather()
+            .into_iter()
+            .filter(|family| {
+                !family.get_metric().iter().any(|metric| {
+                    metric
+                        .get_label()
+                        .iter()
+                        .any(|label| label.get_name() == "tenant")
+                })
+            })
+            .collect();
+        let mut buffer = Vec::new();
+        TextEncoder::new().encode(&families, &mut buffer)?;
+        Ok(String::from_utf8(buffer)?)
+    }
+
     /// Encode metrics in Prometheus text format.
     pub fn gather(&self) -> Result<String, MetricsError> {
         let metric_families = self.registry.gather();

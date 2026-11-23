@@ -214,6 +214,14 @@ the SAN `minga-nats-route` (`minga tls issue-node --role manager` from the route
 CA adds it), so a certificate that merely chains to the route CA cannot join. Preload workload images on **every** node: convert the
 preload Job to a DaemonSet.
 
+### Metrics access
+
+The `--metrics-bind` listener is unauthenticated. Firewall its port (default in
+these examples: TCP `9100`) so only trusted operator monitoring systems can
+reach it; other tenants' nodes must not be able to connect, even on the private
+network. It excludes tenant-labelled metric families. Scrape the authenticated,
+operator-only API `/metrics` for per-tenant agent usage and cost counters.
+
 ### Changing Minga's configuration later
 
 Re-`apply-config` the full `controlplane.yaml` (with the documents) after edits.
