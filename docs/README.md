@@ -28,6 +28,7 @@ Implementation-status notes distinguish what is merged from what remains propose
 - [minga-ctl design plan](minga-ctl-plan.md): operator CLI design and implementation boundaries
 - [Production-readiness plan](production-readiness-plan.md): historical single-node readiness work
 - [Resource benchmark](benchmark.md): measured resource comparisons and caveats
+- [Release notes: v1.3.0 (candidate rc.1)](release-1.3.0.md)
 - [Release notes: v1.2.0](release-1.2.0.md)
 - [Release notes: v1.1.0](release-1.1.0.md)
 - [Release notes: v1.0.2](release-1.0.2.md)
