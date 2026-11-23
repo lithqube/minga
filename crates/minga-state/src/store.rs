@@ -694,6 +694,29 @@ impl StateStore {
             StateResponse::Error(message) => Err(StateError::Raft(message)),
         }
     }
+    /// The apply-rule level this replica applies entries under (ADR 0009).
+    pub async fn apply_rules(&self) -> Result<u32, StateError> {
+        self.reader.apply_rules().await.map_err(StateError::storage)
+    }
+
+    /// Raises the apply-rule level for the whole cluster (ADR 0009). Call it
+    /// only after every manager runs a build that implements `level`: a
+    /// manager that does not stops applying at this entry.
+    pub async fn set_apply_rules(&self, level: u32) -> Result<(), StateError> {
+        if level > crate::codec::APPLY_RULES_VERSION {
+            return Err(StateError::ApplyRules(format!(
+                "this build implements apply rules up to level {}",
+                crate::codec::APPLY_RULES_VERSION
+            )));
+        }
+        match self.propose(StateCommand::SetApplyRules { level }).await? {
+            StateResponse::Conflict(message) | StateResponse::Error(message) => {
+                Err(StateError::ApplyRules(message))
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// Records a revoked node NKey in permanent cluster state.
     pub async fn record_nats_user_revocation(
         &self,

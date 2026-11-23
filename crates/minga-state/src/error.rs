@@ -48,6 +48,9 @@ pub enum StateError {
     /// A tenant resource limit rejected a desired-state write.
     #[error("tenant quota exceeded: {0}")]
     QuotaExceeded(String),
+    /// A change to the apply-rule level was refused.
+    #[error("{0}")]
+    ApplyRules(String),
     /// A portable snapshot this build cannot read.
     #[error("{0}")]
     BadSnapshot(String),
