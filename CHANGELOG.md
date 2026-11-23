@@ -27,6 +27,22 @@
   - `minga-ctl stack rm --with` and `stack deploy --prune` now match a tenant's resources by name as well
     as ID. Before, `--prune` would have taken every service of a non-default tenant's stack for stale.
 
+- **Security.** Deleting a tenant now deletes everything it had on the bus (#132):
+  - Before, only the Raft record went. Its audit, log, usage, status and budget streams and buckets, its
+    events, its leases and its node-join records stayed, and a tenant created later under the same ID
+    reattached them: the new owner read the old owner's audit trail, logs and status.
+  - `DELETE /minga/tenants/<id>` now removes, after the tenant leaves Raft, its streams and buckets
+    (`MINGA_LOGS_`, `MINGA_AUDIT_`, `MINGA_USAGE_`, `KV_MINGA_STATUS_`, `KV_MINGA_USAGE_`,
+    `KV_MINGA_BUDGET_`, `KV_MINGA_ASSIGN_` plus the tenant), its subjects in `MINGA_EVENTS`, its leases, and
+    the node-join records naming it in the shared status bucket.
+  - If the bus cleanup fails, the call returns 503 and the tenant is already gone. Repeat the `DELETE`: it
+    finishes the cleanup (404 only when nothing is left).
+  - Creating a tenant is refused (409) while bus resources of that ID exist, so a delete that never ran or
+    failed cannot leak into a new tenant. A create that fails after making the resources removes them again.
+  - Tenants deleted by an earlier version left their resources behind. Creating one of those IDs is now
+    refused until you `DELETE` it, which removes them.
+  - The delete request's own audit record is written to the tenant's audit stream and goes with it.
+
 - **Security, upgrade check.** Two networks can no longer hold overlapping subnets, and a network with
   running tasks can no longer be removed (#125):
   - `UpsertNetwork` is refused in the Raft apply, not only in the API, when its subnet overlaps another
@@ -62,6 +78,32 @@
   - Tasks without a required policy keep recursive DNS. Required-egress tasks lose it: reach outside
     names through the egress proxy, which resolves them on the host.
   - A node restart keeps the confinement: it is rebuilt from the task's egress state file.
+
+- **Security, upgrade action needed: flag day.** Each tenant now has its own assignment bucket (#131):
+  - A worker could create consumers of any name, durable ones included, on the one shared
+    `KV_MINGA_ASSIGN` stream, and its ACL cannot count them. Filling the stream-wide limit stopped other
+    tenants' nodes reading their assignments. Assignments now live in `KV_MINGA_ASSIGN_<tenant>`
+    (`$KV.MINGA_ASSIGN_<tenant>.<tenant>.node.<n>.>`), capped at 5,000 consumers, so a tenant's workers
+    can fill only that tenant's bucket. Keys are unchanged. Managers create the bucket with the tenant,
+    at the cluster's replica count.
+  - Workers cannot read assignments across this change. A worker of this version needs a manager of this
+    version to have created its tenant's bucket; a worker of the previous version loses its grants when
+    its manager's sidecar restarts. Running containers keep running, but no assignment reaches a node,
+    so nothing is placed, moved or stopped on it until it is upgraded.
+  - Order: stop nothing, upgrade every manager, then every worker. After the managers, a node shows no new
+    assignments until it runs this version.
+  - Operator/JWT mode, as for the entries below: set every tenant signer's template to the list in
+    `worker_permission_template`, copy the `revocations` of the current resolver claim into the account
+    claim, then re-sign the account JWT, and push it to every manager's resolver before starting the
+    managers. A manager refuses to start with the old template.
+  - The old shared `KV_MINGA_ASSIGN` stream is no longer written or granted. It keeps every tenant's old
+    assignments, so delete it once every node runs this version (`nats stream rm KV_MINGA_ASSIGN`). Until
+    then, and only while no worker runs this version, rolling the managers back works. A worker already
+    upgraded reads `KV_MINGA_ASSIGN_<tenant>`, which an older manager never writes, so after a manager
+    rollback it gets no assignments until the managers are upgraded again.
+  - The 5,000 limit is the most one tenant's workers can fill; a tenant with more than 2,500 nodes
+    needs it raised on its bucket.
+
 
 - **Security, upgrade action needed: flag day.** Each tenant now has its own assignment bucket (#131):
   - A worker could create consumers of any name, durable ones included, on the one shared

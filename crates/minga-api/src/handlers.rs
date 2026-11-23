@@ -210,20 +210,80 @@ pub async fn create_tenant(
         created_at: unix_now(),
     };
     Tenant::validate_id(&tenant.id).map_err(bad_request)?;
+    // One tenant create or delete at a time in this process: two creates of an
+    // ID could otherwise both pass the checks below, and the one that loses the
+    // store write would then delete the bus resources the winner just made.
+    // Other managers are not covered; the store write still decides a race.
+    let _lifecycle = TENANT_LIFECYCLE.lock().await;
     if app.store.get_tenant(&tenant.id).await?.is_some() {
         return Err(conflict(format!("tenant {} already exists", tenant.id)));
     }
-    configure_tenant_bus(&app, &tenant).await?;
-    append_tenant_audit(
-        &app,
-        &tenant.id,
-        &caller.name,
-        "tenant.create.requested",
-        &format!("/tenants/{}", tenant.id),
-    )
-    .await?;
-    app.store.create_tenant(tenant.clone()).await?;
+    // A tenant that was deleted leaves nothing behind, so anything found here
+    // belongs to a previous owner (or to a delete that failed halfway), and a
+    // new tenant must not inherit its audit trail, logs, usage or status.
+    let bus = app.bus.as_ref().ok_or_else(|| {
+        ApiError::Unavailable("tenant bus resource manager is not configured".into())
+    })?;
+    if bus
+        .tenant_resources_exist(&tenant.id)
+        .await
+        .map_err(|error| ApiError::Unavailable(format!("cannot check bus resources: {error}")))?
+    {
+        return Err(conflict(format!(
+            "tenant {} left bus resources behind; delete the tenant again to remove them, then retry",
+            tenant.id
+        )));
+    }
+    let provisioned: ApiResult<()> = async {
+        configure_tenant_bus(&app, &tenant).await?;
+        append_tenant_audit(
+            &app,
+            &tenant.id,
+            &caller.name,
+            "tenant.create.requested",
+            &format!("/tenants/{}", tenant.id),
+        )
+        .await
+    }
+    .await;
+    // (error, whether the tenant is certainly not in the store)
+    let created = match provisioned {
+        Ok(()) => app
+            .store
+            .create_tenant(tenant.clone())
+            .await
+            .map_err(|error| (definitely_not_created(&error), ApiError::from(error))),
+        Err(error) => Err((true, error)),
+    };
+    if let Err((undo, error)) = created {
+        if undo {
+            // Undo whatever the steps above made on the bus, or the retry
+            // would be refused as a leftover.
+            if let Err(cleanup) = bus.delete_tenant_resources(&tenant.id).await {
+                tracing::warn!(tenant = %tenant.id, error = %cleanup, "cannot remove bus resources of a tenant that was not created");
+            }
+        } else {
+            // A timed-out write may still have committed. Deleting the bus
+            // resources of a tenant that now exists would be worse than a
+            // leftover: a retry finds the tenant, or is told to delete it.
+            tracing::warn!(tenant = %tenant.id, "tenant create outcome unknown; keeping its bus resources");
+        }
+        return Err(error);
+    }
     Ok((StatusCode::CREATED, Json(tenant)))
+}
+
+/// Whether a failed tenant write certainly did not commit and left no tenant
+/// that owns the bus resources: the store refused the request itself. Any other
+/// error, a timeout or a lost leader say, leaves the outcome open. A conflict
+/// is not here: it means the tenant exists, created by another request, and
+/// the resources are then its own.
+fn definitely_not_created(error: &minga_state::StateError) -> bool {
+    use minga_state::StateError as E;
+    matches!(
+        error,
+        E::InvalidTenant(_) | E::NotFound(_) | E::QuotaExceeded(_) | E::BadSnapshot(_)
+    )
 }
 
 async fn append_tenant_audit(
@@ -734,22 +794,48 @@ async fn configure_tenant_bus(app: &AppState, tenant: &Tenant) -> ApiResult<()> 
         })
 }
 
-/// Deletes an empty tenant.
+/// Deletes an empty tenant, then everything it has on the bus.
+///
+/// A delete that failed after the tenant left Raft can be repeated: the tenant
+/// is gone, its bus resources are not, and that is enough to finish the job.
 pub async fn delete_tenant(
     State(app): State<Arc<AppState>>,
     Extension(caller): Extension<Caller>,
     Path(id): Path<String>,
 ) -> ApiResult<StatusCode> {
-    append_tenant_audit(
-        &app,
-        &id,
-        &caller.name,
-        "tenant.delete.requested",
-        &format!("/tenants/{id}"),
-    )
-    .await?;
-    app.store.remove_tenant(&id).await?;
+    Tenant::validate_id(&id).map_err(bad_request)?;
+    let _lifecycle = TENANT_LIFECYCLE.lock().await;
+    if app.store.get_tenant(&id).await?.is_some() {
+        append_tenant_audit(
+            &app,
+            &id,
+            &caller.name,
+            "tenant.delete.requested",
+            &format!("/tenants/{id}"),
+        )
+        .await?;
+        app.store.remove_tenant(&id).await?;
+    } else if !tenant_bus_resources_exist(&app, &id).await? {
+        return Err(not_found("tenant", &id));
+    }
+    let bus = app.bus.as_ref().ok_or_else(|| {
+        ApiError::Unavailable("tenant bus resource manager is not configured".into())
+    })?;
+    bus.delete_tenant_resources(&id).await.map_err(|error| {
+        ApiError::Unavailable(format!(
+            "tenant {id} was removed but its bus resources were not: {error}; delete it again to retry"
+        ))
+    })?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+async fn tenant_bus_resources_exist(app: &AppState, tenant_id: &str) -> ApiResult<bool> {
+    let Some(bus) = app.bus.as_ref() else {
+        return Ok(false);
+    };
+    bus.tenant_resources_exist(tenant_id)
+        .await
+        .map_err(|error| ApiError::Unavailable(format!("cannot check bus resources: {error}")))
 }
 
 /// `GET /v{version}/audit` — list only the authenticated tenant's audit trail.
@@ -1575,6 +1661,9 @@ pub async fn create_node(
 /// shortcut: process-local; revocation runs only on the Raft leader, so move
 /// this into Raft if credential issuance ever runs on followers.
 pub(crate) static NODE_CREDENTIALS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Serializes tenant create and delete in this process, see `create_tenant`.
+static TENANT_LIFECYCLE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// `POST /minga/nodes/{id}/join-token` — mint a tenant-bound token and NATS credentials.
 pub async fn issue_node_join_token(
@@ -2967,6 +3056,120 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(created.ID, "has space");
+    }
+
+    fn tenant_request(id: &str) -> Json<CreateTenantRequest> {
+        Json(CreateTenantRequest {
+            id: id.into(),
+            name: id.into(),
+            quotas: Default::default(),
+        })
+    }
+
+    #[tokio::test]
+    async fn a_deleted_tenant_leaves_no_bus_resources_and_its_id_can_be_reused() {
+        let (app, _dir) = app_with_node(1.0).await;
+        let bus = app.bus.clone().unwrap();
+        let _ = create_tenant(State(app.clone()), default_caller(), tenant_request("acme"))
+            .await
+            .unwrap();
+        assert!(bus.tenant_resources_exist("acme").await.unwrap());
+
+        let status = delete_tenant(State(app.clone()), default_caller(), Path("acme".into()))
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert!(!bus.tenant_resources_exist("acme").await.unwrap());
+        assert!(bus.list_audit("acme", 10).await.unwrap().is_empty());
+
+        // The ID is free again, with a fresh audit trail.
+        let _ = create_tenant(State(app.clone()), default_caller(), tenant_request("acme"))
+            .await
+            .unwrap();
+        let trail = bus.list_audit("acme", 10).await.unwrap();
+        assert_eq!(trail.len(), 1);
+        assert_eq!(trail[0].action, "tenant.create.requested");
+    }
+
+    #[tokio::test]
+    async fn a_tenant_is_not_created_over_leftover_bus_resources_and_a_second_delete_clears_them() {
+        let (app, _dir) = app_with_node(1.0).await;
+        let bus = app.bus.clone().unwrap();
+        // What a delete that failed on the bus leaves: no tenant, resources.
+        bus.configure_tenant_quota("ghost", &Default::default())
+            .await
+            .unwrap();
+
+        let error = create_tenant(
+            State(app.clone()),
+            default_caller(),
+            tenant_request("ghost"),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, ApiError::Conflict(_)), "{error:?}");
+        assert!(app.store.get_tenant("ghost").await.unwrap().is_none());
+
+        let status = delete_tenant(State(app.clone()), default_caller(), Path("ghost".into()))
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert!(!bus.tenant_resources_exist("ghost").await.unwrap());
+        let _ = create_tenant(
+            State(app.clone()),
+            default_caller(),
+            tenant_request("ghost"),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn two_creates_of_one_tenant_leave_the_winner_its_bus_resources() {
+        let (app, _dir) = app_with_node(1.0).await;
+        let bus = app.bus.clone().unwrap();
+        let (first, second) = tokio::join!(
+            create_tenant(State(app.clone()), default_caller(), tenant_request("race")),
+            create_tenant(State(app.clone()), default_caller(), tenant_request("race")),
+        );
+        let outcomes = [first.is_ok(), second.is_ok()];
+        assert_eq!(outcomes.iter().filter(|ok| **ok).count(), 1, "{outcomes:?}");
+        // The loser did not roll back what the winner made.
+        assert!(app.store.get_tenant("race").await.unwrap().is_some());
+        assert!(bus.tenant_resources_exist("race").await.unwrap());
+        assert_eq!(bus.list_audit("race", 10).await.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn only_a_store_refusal_proves_a_tenant_was_not_created() {
+        use minga_state::StateError as E;
+        assert!(definitely_not_created(&E::QuotaExceeded("tenants".into())));
+        assert!(definitely_not_created(&E::InvalidTenant("bad".into())));
+        // The tenant exists, made by another request: its resources are not ours to delete.
+        assert!(!definitely_not_created(&E::Conflict("exists".into())));
+        assert!(!definitely_not_created(&E::NameInUse));
+        // A timeout or a lost leader may follow a write that committed.
+        assert!(!definitely_not_created(&E::Storage(
+            "write timed out".into()
+        )));
+        assert!(!definitely_not_created(&E::Raft("closed".into())));
+        assert!(!definitely_not_created(&E::NotLeader(None)));
+    }
+
+    #[tokio::test]
+    async fn deleting_an_unknown_tenant_is_not_found_and_creates_nothing() {
+        let (app, _dir) = app_with_node(1.0).await;
+        let bus = app.bus.clone().unwrap();
+        let error = delete_tenant(State(app.clone()), default_caller(), Path("nope".into()))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ApiError::NotFound(_)), "{error:?}");
+        assert!(!bus.tenant_resources_exist("nope").await.unwrap());
+        assert!(bus.list_audit("nope", 10).await.unwrap().is_empty());
+        let error = delete_tenant(State(app), default_caller(), Path("bad.id".into()))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ApiError::BadRequest(_)), "{error:?}");
     }
 
     #[tokio::test]

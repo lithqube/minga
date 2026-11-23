@@ -23,11 +23,20 @@ async fn jetstream_expiry_makes_a_node_ineligible() {
     assert!(bus.is_alive(91).await.unwrap());
 
     let mut leases = bus.watch_leases().await.unwrap();
-    let snapshot = tokio::time::timeout(Duration::from_secs(1), leases.next())
-        .await
-        .expect("lease watch did not replay the current entry")
-        .expect("lease watch ended");
-    assert_eq!(snapshot.key, minga_bus::subjects::kv_lease("default", 91));
+    // The server is shared with other tests, whose lease entries (and the
+    // purge markers they leave) replay first; find this node's entry.
+    let key = minga_bus::subjects::kv_lease("default", 91);
+    let snapshot = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let event = leases.next().await.expect("lease watch ended");
+            if event.key == key {
+                break event;
+            }
+        }
+    })
+    .await
+    .expect("lease watch did not replay the current entry");
+    assert_eq!(snapshot.key, key);
     assert_eq!(
         snapshot.value.as_deref(),
         Some(b"registration payload".as_slice())
