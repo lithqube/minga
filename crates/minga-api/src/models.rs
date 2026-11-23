@@ -558,6 +558,30 @@ pub struct ContainerSpec {
     /// Docker process limits; refused until OCI translation supports them.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub Ulimits: Option<Vec<Ulimit>>,
+    /// Kernel parameters for the container; refused until OCI translation supports them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub Sysctls: Option<HashMap<String, String>>,
+    /// Docker capabilities to add; refused until OCI translation supports them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub CapabilityAdd: Option<Vec<String>>,
+    /// Run an init process as PID 1; `true` is refused, `false` is a no-op.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub Init: Option<bool>,
+    /// Windows isolation mode; anything but `default` is refused.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub Isolation: Option<String>,
+    /// Supplementary groups for the container user; refused until supported.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub Groups: Option<Vec<String>>,
+    /// Container DNS settings; refused when any list is non-empty.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub DNSConfig: Option<DNSConfig>,
+    /// Working directory override; refused until supported.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub Dir: Option<String>,
+    /// OOM score adjustment; non-zero is refused, `0` is the default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub OomScoreAdj: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub Healthcheck: Option<Healthcheck>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
@@ -668,6 +692,18 @@ pub struct Ulimit {
     /// Hard limit value.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub Hard: Option<i64>,
+}
+
+/// Docker `DNSConfig` of a `ContainerSpec`. Not carried into the OCI spec yet;
+/// service create/update refuse any non-empty list rather than dropping it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DNSConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub Nameservers: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub Search: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub Options: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
