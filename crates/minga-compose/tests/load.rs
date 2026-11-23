@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use minga_compose::{
     load, load_path, ComposeError, Condition, DeployMode, DeviceCount, LoadOptions, PortRange,
-    StringOrList, Ulimit, VolumeKind,
+    StringOrList, VolumeKind,
 };
 
 fn fixture(name: &str) -> PathBuf {
@@ -69,7 +69,7 @@ fn wordpress_requires_its_passwords() {
 }
 
 #[test]
-fn edge_ai_stack_with_features_swarm_ignores() {
+fn edge_ai_stack_loads() {
     let loaded = load_path(
         fixture("edge-ai.yaml"),
         &opts(&[("INFERENCE_REPLICAS", "2")], &[]),
@@ -103,15 +103,7 @@ fn edge_ai_stack_with_features_swarm_ignores() {
     let gpu = &reservations.devices[0];
     assert_eq!(gpu.count, Some(DeviceCount::Count(1)));
     assert_eq!(gpu.capabilities, ["gpu"]);
-    assert_eq!(inference.ulimits["memlock"], Ulimit::Single(-1));
-    assert_eq!(
-        inference.ulimits["nofile"],
-        Ulimit::Range {
-            soft: 65536,
-            hard: 65536
-        }
-    );
-    assert!(matches!(inference.command, Some(StringOrList::List(ref args)) if args.len() == 4));
+    assert!(matches!(&inference.command, Some(StringOrList::List(args)) if args.len() == 4));
 
     let api = &p.services["agent-api"];
     let dep = &api.depends_on["inference"];
@@ -124,11 +116,6 @@ fn edge_ai_stack_with_features_swarm_ignores() {
 
     let sensors = &p.services["sensors"];
     assert_eq!(sensors.deploy.as_ref().unwrap().mode, DeployMode::Global);
-    assert_eq!(sensors.devices[0].permissions.as_deref(), Some("rw"));
-    assert_eq!(
-        sensors.sysctls.0["net.core.somaxconn"].as_deref(),
-        Some("1024")
-    );
 }
 
 #[test]
@@ -299,4 +286,124 @@ fn error_type_is_matchable() {
     )
     .unwrap_err();
     assert!(matches!(&err.0[0], ComposeError::Unsupported { key, .. } if key == "container_name"));
+}
+
+/// Helper: load a yaml string that must fail for each unsupported key, returning
+/// the first matching Unsupported key string, or panics.
+fn unsupported_key(yaml: &str) -> String {
+    let err =
+        load(yaml, &opts(&[], &[])).expect_err("expected Unsupported error but load succeeded");
+    for e in &err.0 {
+        if let ComposeError::Unsupported { key, .. } = e {
+            return key.clone();
+        }
+    }
+    panic!("no Unsupported variant found; errors: {err}");
+}
+
+#[test]
+fn hardening_cap_add_is_rejected() {
+    assert_eq!(
+        unsupported_key("services:\n  s:\n    image: i\n    cap_add: [SYS_RAWIO]\n"),
+        "cap_add"
+    );
+}
+
+#[test]
+fn hardening_cap_drop_is_rejected() {
+    assert_eq!(
+        unsupported_key("services:\n  s:\n    image: i\n    cap_drop: [ALL]\n"),
+        "cap_drop"
+    );
+}
+
+#[test]
+fn hardening_read_only_is_rejected() {
+    assert_eq!(
+        unsupported_key("services:\n  s:\n    image: i\n    read_only: true\n"),
+        "read_only"
+    );
+}
+
+#[test]
+fn hardening_ulimits_is_rejected() {
+    assert_eq!(
+        unsupported_key("services:\n  s:\n    image: i\n    ulimits:\n      nofile: 65536\n"),
+        "ulimits"
+    );
+}
+
+#[test]
+fn hardening_privileged_true_is_rejected() {
+    assert_eq!(
+        unsupported_key("services:\n  s:\n    image: i\n    privileged: true\n"),
+        "privileged"
+    );
+}
+
+#[test]
+fn hardening_privileged_false_is_rejected() {
+    // Presence alone triggers rejection, regardless of value.
+    assert_eq!(
+        unsupported_key("services:\n  s:\n    image: i\n    privileged: false\n"),
+        "privileged"
+    );
+}
+
+#[test]
+fn hardening_devices_is_rejected() {
+    assert_eq!(
+        unsupported_key(
+            "services:\n  s:\n    image: i\n    devices:\n      - /dev/ttyUSB0:/dev/ttyUSB0:rw\n"
+        ),
+        "devices"
+    );
+}
+
+#[test]
+fn hardening_sysctls_is_rejected() {
+    assert_eq!(
+        unsupported_key(
+            "services:\n  s:\n    image: i\n    sysctls:\n      net.core.somaxconn: 1024\n"
+        ),
+        "sysctls"
+    );
+}
+
+#[test]
+fn hardening_tmpfs_is_rejected() {
+    assert_eq!(
+        unsupported_key("services:\n  s:\n    image: i\n    tmpfs: /tmp\n"),
+        "tmpfs"
+    );
+}
+
+#[test]
+fn hardening_init_is_rejected() {
+    assert_eq!(
+        unsupported_key("services:\n  s:\n    image: i\n    init: true\n"),
+        "init"
+    );
+}
+
+#[test]
+fn hardening_deploy_pids_is_rejected() {
+    // deploy.resources.limits.pids is a nested hardening key.
+    assert_eq!(
+        unsupported_key(
+            "services:\n  s:\n    image: i\n    deploy:\n      resources:\n        limits:\n          pids: 100\n"
+        ),
+        "pids"
+    );
+}
+
+#[test]
+fn supported_compose_file_loads_without_hardening_errors() {
+    // The revised edge-ai.yaml must load cleanly (no hardening errors).
+    let loaded = load_path(
+        fixture("edge-ai.yaml"),
+        &opts(&[("INFERENCE_REPLICAS", "2")], &[]),
+    )
+    .expect("edge-ai.yaml should load without errors after removing hardening keys");
+    assert_eq!(loaded.project.name.as_deref(), Some("plant-7"));
 }
