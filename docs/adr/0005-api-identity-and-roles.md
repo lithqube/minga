@@ -1,6 +1,6 @@
 # ADR 0005: API Identity, Roles and Audit
 
-**Status:** Proposed
+**Status:** Accepted — partially implemented
 **Date:** 2026-11-12
 **Deciders:** Ferru
 
@@ -153,14 +153,16 @@ As in `docs/minga-ctl-plan.md` section 2.4: SOC 2 attests an organisation's cont
 
 ## Implementation status (2026-11-19)
 
-The original proposal is only partially implemented; the ADR remains proposed.
+The original proposal is only partially implemented.
 Current main has optional TLS and client-CA validation on the manager API,
 client certificates carrying caller/role/tenant identity, role-aware API
 authorization, and audit events for tenant-scoped state changes (see
 [ADR 0008](0008-multi-tenancy.md)). Bearer-token authentication remains the
 cluster-operator compatibility path.
 
-Still open from this proposal: server-side service revisions/conflict
-detection and client-certificate/key support in `minga-ctl` contexts. The
-current CLI uses bearer tokens and can trust an HTTPS server CA, but cannot
-present an API client certificate.
+`minga-ctl` contexts accept `--client-cert` and `--client-key` for a direct
+HTTPS context. Those contexts currently serve the tenant-scoped `change`
+(maker-checker) commands; every other command still uses the context token.
+
+Still open from this proposal: server-side service revisions and conflict
+detection, and client-certificate use by the rest of `minga-ctl`.

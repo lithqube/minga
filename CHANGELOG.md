@@ -1,5 +1,17 @@
 # Changelog
 
+## [Unreleased]
+
+Changes on `main` after `v1.3.0-rc.1`. They go into 1.3.0.
+
+### Changes
+- **Security, no upgrade action.** `minga-ctl change approve` shows what it will apply before it asks (#134):
+  - It prints the redacted before and after value of every changed field to stderr, then asks for confirmation.
+    Scripts must pass `--yes`.
+  - Table and JSON output escape non-ASCII characters, and a proposal image must be printable ASCII.
+  - The manager's change-request list accepts an ID filter, applied to the caller's tenant before paging, so a
+    proposal outside the newest page can still be fetched for approval.
+
 ## [1.3.0-rc.1] — 2026-11-23
 
 Release candidate for 1.3.0, cut for the staging and tenant-isolation runs

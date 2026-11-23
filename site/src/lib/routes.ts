@@ -7,6 +7,12 @@ const routes: Record<string, string> = {
   'docs/README.md': '/docs/',
   'docs/architecture.md': '/architecture/',
   'docs/talos-deployment.md': '/docs/talos-deployment/',
+  'docs/cli.md': '/docs/cli/',
+  'docs/topologies.md': '/docs/topologies/',
+  'docs/backup.md': '/docs/backup/',
+  'docs/agent-usage.md': '/docs/agent-usage/',
+  'docs/release-1.3.0.md': '/docs/release-1.3.0/',
+  'docs/release-1.2.0.md': '/docs/release-1.2.0/',
   'docs/design.md': '/docs/design/',
   'docs/research/nats-evaluation.md': '/docs/research/nats-evaluation/',
 };

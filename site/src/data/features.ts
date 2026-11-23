@@ -1,4 +1,4 @@
-// Feature list. Every entry maps to a capability that ships in v1.2.0; `caveat` says where it stops.
+// Feature list. Every entry maps to a capability that ships in v1.2.0 or v1.3.0-rc.1; `caveat` says where it stops.
 // The two `lead` entries are what an evaluator replacing Swarm checks first, so they get the large
 // treatment; the rest are a compact list (DESIGN.md §5.8, antislop R-14).
 export interface Feature {
@@ -20,7 +20,7 @@ export const features: Feature[] = [
     lead: true,
     icon: 'api',
     title: 'Speaks the Swarm API',
-    body: 'A Docker Engine API v1.41 subset: docker stack deploy, docker service ls and the Traefik v3 swarm provider work against minga api, so your tooling stays.',
+    body: 'A Docker Engine API v1.41 subset: docker stack deploy, docker service ls and the Traefik v3 swarm provider work against the manager’s API (minga api in v1.2.0), so your tooling stays.',
     caveat: 'A subset, not the full API.',
     href: '/docs/examples/#docker-cli',
     linkLabel: 'See the docker CLI example',

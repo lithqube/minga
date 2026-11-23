@@ -8,8 +8,8 @@ export interface Faq {
 export const faq: Faq[] = [
   {
     q: 'Is Minga production-ready?',
-    a: 'It is v1.2.0, aimed at single-host production. It is tested on macOS and in Linux CI, including the containerd suites and a real-kernel check of the published-port paths; this build has not yet been run on a real staging node. v1.2.0 fixes the findings of a source security audit: owner-only keys and data, task network isolation, Docker’s masked <code>/proc</code> paths, listener timeouts, and a bus that can only start what Raft assigns. v1.1.0 adds versioned state that later upgrades keep, backup and restore, a recorded reason for failed tasks (last error and exit code for containers, the start error for agent tasks), image pulls through containerd’s own API with Docker credential helpers, and published ports that only redirect traffic addressed to the node. Cross-node container networking, joining a running cluster and per-operator API roles are not there yet.',
-    sources: ['README.md', 'CHANGELOG.md', 'docs/release-1.2.0.md'],
+    a: 'It is v1.2.0, aimed at single-host production. It is tested on macOS and in Linux CI, including the containerd suites and a real-kernel check of the published-port paths; this build has not yet been run on a real staging node. v1.2.0 fixes the findings of a source security audit: owner-only keys and data, task network isolation, Docker’s masked <code>/proc</code> paths, listener timeouts, and a bus that can only start what Raft assigns. v1.1.0 adds versioned state that later upgrades keep, backup and restore, a recorded reason for failed tasks (last error and exit code for containers, the start error for agent tasks), image pulls through containerd’s own API with Docker credential helpers, and published ports that only redirect traffic addressed to the node. In v1.2.0, cross-node container networking, joining a running cluster and per-operator API roles are not there yet. v1.3.0-rc.1 is a pre-release candidate that adds them (managers-only Raft, a WireGuard overlay, tenant isolation, client-certificate API roles); read its release notes, including what is not yet verified, before using it.',
+    sources: ['README.md', 'CHANGELOG.md', 'docs/release-1.2.0.md', 'docs/release-1.3.0.md'],
   },
   {
     q: 'Do my Compose files work unchanged?',
@@ -18,7 +18,7 @@ export const faq: Faq[] = [
   },
   {
     q: 'Can I keep using the docker CLI and Traefik?',
-    a: 'Yes, against <code>minga api</code>: <code>docker stack deploy</code>, <code>docker service ls</code>, <code>docker node ls</code> and the Traefik v3 swarm provider. With a token set, the CLI sends it through <code>"HttpHeaders": {"Authorization": "Bearer &lt;token&gt;"}</code> in <code>~/.docker/config.json</code>. Traefik sends the token as its Basic-auth password. Set a token on any API reachable off loopback: without one, anyone who can reach the port controls the cluster.',
+    a: 'Yes, against the manager’s API (<code>minga manager --api-bind</code>; in v1.2.0 a separate <code>minga api</code> process): <code>docker stack deploy</code>, <code>docker service ls</code>, <code>docker node ls</code> and the Traefik v3 swarm provider. With a token set, the CLI sends it through <code>"HttpHeaders": {"Authorization": "Bearer &lt;token&gt;"}</code> in <code>~/.docker/config.json</code>. Traefik sends the token as its Basic-auth password. Set a token on any API reachable off loopback: without one, anyone who can reach the port controls the cluster.',
     sources: ['README.md', 'docs/talos-deployment.md', 'docs/release-1.2.0.md'],
   },
   {
@@ -43,13 +43,13 @@ export const faq: Faq[] = [
   },
   {
     q: 'Why does one host run two processes?',
-    a: 'In v1.2.0, <code>minga api</code> is its own Raft voter, so the manager and the API peer with each other. In the target design the API folds into the manager.',
-    sources: ['README.md', 'docs/architecture.md'],
+    a: 'It does not any more. In v1.2.0, <code>minga api</code> was its own Raft voter, so one host ran two processes that peered with each other. In v1.3.0-rc.1 <code>minga api</code> is retired: the manager serves the Docker Engine API in the same process, and <code>minga api</code> exits with a pointer to <code>minga manager --api-bind</code>.',
+    sources: ['README.md', 'docs/architecture.md', 'docs/release-1.3.0.md'],
   },
   {
     q: 'Can I run more than one node?',
-    a: 'The control plane works across nodes: Raft with mTLS, plus scheduling. Four limits apply: every node must be listed with <code>--peer</code> and started together, all nodes run the same version, containers on different nodes cannot reach each other yet, and every manager and worker must use one external TLS NATS server.',
-    sources: ['README.md', 'docs/architecture.md'],
+    a: 'In v1.3.0-rc.1, yes. Only managers vote in Raft (mTLS), and managers can join and leave a running cluster. Workers are JetStream clients that open no Raft store, and containers on different nodes reach each other over a WireGuard overlay. Live proofs of the overlay passed; scale has not been measured, and the tenant-isolation proof is still pending. NATS runs as each manager’s sidecar, clustered over route TLS, or as an external TLS server. All nodes must move to a new version together. In v1.2.0, every node is a Raft voter listed with <code>--peer</code>, containers on different nodes cannot reach each other, and every manager and worker must use one external TLS NATS server.',
+    sources: ['README.md', 'docs/architecture.md', 'docs/topologies.md', 'docs/release-1.3.0.md'],
   },
   {
     q: 'Does it need Docker, Kubernetes or etcd?',
@@ -78,12 +78,12 @@ export const faq: Faq[] = [
   },
   {
     q: 'Is it secure? Is it compliant?',
-    a: 'Raft mTLS, an API bearer token, NATS TLS, a built-in CA (<code>minga tls</code>) and content-addressed secret staging are implemented, and registry credentials stay off command lines. The API has one shared token, with no per-operator identity, roles or server-side audit yet (designed in ADR 0005, not built). Keep <code>:2375</code> and the Raft ports on a private network: the API token is what stands between the network and container creation. FIPS, SOC 2, VS-NfD and NATO are not assessed.',
+    a: 'Raft mTLS, an API bearer token, NATS TLS, a built-in CA (<code>minga tls</code>) and content-addressed secret staging are implemented, and registry credentials stay off command lines. In v1.2.0 the API has one shared token and no per-operator identity, roles or server-side audit. In v1.3.0-rc.1 it also accepts client certificates that carry the caller, a role (viewer, deployer or admin) and a tenant, and audits tenant-scoped state changes; the token remains the cluster-operator path (ADR 0005, partially implemented). Keep <code>:2375</code> and the Raft ports on a private network: the API token is what stands between the network and container creation. FIPS, SOC 2, VS-NfD and NATO are not assessed.',
     sources: ['CHANGELOG.md', 'README.md', 'docs/adr/0005-api-identity-and-roles.md'],
   },
   {
     q: 'What are agent workloads?',
-    a: 'Compose services with <code>x-minga-agent</code> run as WASM modules under wasmtime with fuel and timeout limits, and their LLM calls go through an egress proxy with token budgets. Today the guest is pure compute: no WASI, network, env or clock, and memory limits are not enforced. Nodes need <code>--sandbox-runtime wasmtime</code>.',
+    a: 'Compose services with <code>x-minga-agent</code> run as WASM modules under wasmtime with fuel and timeout limits, and their LLM calls go through an egress proxy with token budgets. Today the guest is pure compute: no WASI, network, env or clock. Fuel, timeout and memory limits are enforced in v1.3.0-rc.1. Nodes need <code>--sandbox-runtime wasmtime</code>.',
     sources: ['docs/adr/0003-agent-workloads.md', 'README.md'],
   },
 ];

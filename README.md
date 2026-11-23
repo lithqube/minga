@@ -12,7 +12,7 @@ Named after the [minga](https://en.wikipedia.org/wiki/Minga) of Chiloé, where a
 >
 > **Release candidate: `v1.3.0-rc.1`** (pre-release, not the latest release). Read its [release notes](docs/release-1.3.0.md), including [what is not yet verified](docs/release-1.3.0.md#not-yet-verified), before trying it.
 >
-> **Current `main` is unreleased** ([`02c578c`](https://github.com/lithqube/minga/commit/02c578c22295ad88148ca696ed7ee755821e3148), PR [#103](https://github.com/lithqube/minga/pull/103)). It contains:
+> **`main` is ahead of `v1.2.0`.** The release candidate and `main` contain the following; `main` adds only one change on top of `v1.3.0-rc.1`: `minga-ctl change approve` shows the proposed values before approval ([#179](https://github.com/lithqube/minga/pull/179)).
 >
 > - **Multi-node networking (Phase 13):** kernel WireGuard overlay, manager relay for NAT-isolated workers, cross-node ingress and same-network task isolation. T2/T3 live proofs passed; T4 scale has not been measured.
 > - **Tenant isolation (Phase 15):** tenant-scoped API identities, resources, NATS permissions and quotas; worker enrollment binds nodes to tenants. T1–T5 implementation is merged. The end-to-end proof that tenant B cannot place on tenant A's node remains deferred until release readiness.
@@ -25,7 +25,7 @@ Named after the [minga](https://en.wikipedia.org/wiki/Minga) of Chiloé, where a
 > - Tenant isolation.
 > - API client-certificate roles and audit.
 >
-> These are current-main features, not part of the v1.2.0 release.
+> These are in `v1.3.0-rc.1` and on `main`, not in the v1.2.0 release.
 >
 > Other current limits: no seccomp profile; Raft TLS without mTLS still warns rather than refusing off-loopback; `minga-ctl` client-certificate contexts currently support tenant-scoped change-request workflows over direct HTTPS.
 >
@@ -190,6 +190,8 @@ sudo install -m 0755 target/release/minga /usr/local/bin/minga
 # Optional: preload images (air-gapped sites, private registries); otherwise a task pulls what it needs
 sudo ctr -n minga images pull docker.io/library/nginx:1.27
 ```
+
+> The steps below use the `v1.3.0-rc.1` layout, where one `minga manager` process serves the API. `releases/latest` is still `v1.2.0`, whose `minga manager` does not accept `--api-bind`: the API there is a second process, `minga api` (see the [v1.2.0 release notes](docs/release-1.2.0.md)). To follow these steps, install the candidate: `curl -fsSL https://github.com/lithqube/minga/releases/download/v1.3.0-rc.1/install.sh | sh -s -- --version v1.3.0-rc.1`.
 
 Start one manager process. It is the Raft voter, scheduler, supervisor,
 Docker Engine API and NATS sidecar:

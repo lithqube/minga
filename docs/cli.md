@@ -79,7 +79,8 @@ The API waits for catch-up before promotion. Remove it with
 | `--nats-token`, `MINGA_NATS_TOKEN` | none | Development-only plaintext-loopback token authentication. Mutually exclusive with NATS JWT credentials. |
 | `MINGA_NATS_CREDENTIALS_FILE` | none | Owner-only NATS user `.creds` file for operator/JWT authentication; requires mTLS. |
 | `--nats-replicas <N>` | `1` | Copies of the event, status, lease, and assignment streams/buckets. Set 3 or 5 on a cluster with at least that many servers. Works with external NATS or route-TLS sidecars. |
-
+| `--nats-server-cert <PEM>`, `--nats-server-key <PEM>`, `--nats-client-ca <PEM>` | none | Manager only. Client-facing TLS for the built-in NATS sidecar; client certificates are required for transport. |
+| `--nats-listen-addr <ADDR>` | loopback | Manager only. Address of the built-in sidecar's listener; a non-loopback address requires TLS. |
 | `--nats-cluster-route <URL>` | none | Repeat for existing sidecar routes, e.g. `nats://manager-1:6222`. Requires route TLS. |
 | `--nats-cluster-cert`, `--nats-cluster-key`, `--nats-cluster-ca` | none | Route certificate, key, and peer CA for the built-in sidecar; required together and separate from client-facing TLS. The route CA must be an independent root, never in the same chain as `--nats-client-ca` (worker certificates chain to the client CA, and a route bypasses per-tenant permissions); create it with its own `minga tls init-ca`. Issue the route certificate with `minga tls issue-node --role manager` from the route CA: routes accept only a peer certificate with the SAN `minga-nats-route`, and a manager refuses to start with a route certificate that lacks it. NATS matches that name in any SAN type (DNS, email, URI) or the subject, so if you use another PKI, no CA under the route root may issue it to anything but a manager. A manager also refuses a route CA that shares a certificate with the client CA or directly issued it (or the reverse). `--nats-cluster-port` defaults to `6222`. |
 | `--label <KEY=VALUE>` | none | Advertised to the cluster; matched by `node.labels.KEY` placement constraints. |
@@ -112,7 +113,7 @@ local TLS client and `minga-manager-ID` for remote clients. Set
 `MINGA_NATS_TLS_SERVER_NAME=localhost` on a manager using its built-in sidecar;
 on workers, use the manager hostname from the URL (for example,
 `minga-manager-1`) so it matches the manager certificate SAN. Set
-`MINGA_NATS_TLS_CA`, `MINGA_NATS_TLS_CERT` and `MINGA_NATS_TLS_KEY`, then run:
+`MINGA_NATS_TLS_CA`, `MINGA_NATS_TLS_CERT` and `MINGA_NATS_TLS_KEY`.
 
 If NATS user JWT authentication is enabled, also set
 `MINGA_NATS_CREDENTIALS_FILE` to an owner-only `.creds` file. JWT credentials
@@ -147,9 +148,15 @@ and `MINGA_NATS_CREDENTIALS_FILE` on the worker. Issuing again revokes the
 node's previous NATS credentials. Tokens expire after 15 minutes; the manager
 records the tenant binding after the first valid lease.
 
+Both file settings also exist as flags: `--join-token-key-file` (managers) for
+`MINGA_JOIN_TOKEN_KEY_FILE`, and `--join-token-file` (workers) for
+`MINGA_NODE_JOIN_TOKEN_FILE`.
+
 The worker's NATS identity must be restricted to its own lease key
 (`lease.node.ID`) by certificate mapping or JWT permissions. The join token
 does not replace NATS subject authorization.
+
+With the certificates and settings above in place, start the worker:
 
 ```bash
 minga worker --node-id ID --nats-url tls://minga-manager-1:4222,tls://minga-manager-2:4222
@@ -182,7 +189,8 @@ certificate flags, or previous Raft data directory is needed.
 | `minga tls issue-node ...`, `tls issue-client ... --tenant TENANT` | Issues node identity or API client certificates. Client certificates encode caller, role and tenant (`*` for cluster operators). | Anywhere secure |
 | `minga agent ls` | Lists agent tasks from the bus. | Anywhere that reaches NATS |
 | `minga sandbox run ...`, `minga sandbox info` | Runs a WASM module once or lists available runtimes. | Anywhere |
-| `minga egress ...` | Starts a standalone egress proxy. | Anywhere |
+| `minga egress [--bind ADDR] [--upstream URL] [--default-budget TOKENS] [--budget-window SECS] [--no-cache] [--secret-store DIR] [--credential ID] [--credential-header authorization\|x-api-key]` | Starts a standalone egress proxy (defaults: `0.0.0.0:8080`, `https://api.openai.com`, 1,000,000 tokens per 3,600 s, cache on). | Anywhere |
+| `minga mcp serve --api-url URL --ca-cert PEM --client-cert PEM --client-key PEM` | Starts a read-only, tenant-scoped MCP server on stdio, using a tenant API client certificate (key mode `0600`). Each flag has an env var: `MINGA_API_URL`, `MINGA_API_CA`, `MINGA_CLIENT_CERT`, `MINGA_CLIENT_KEY`. See [agent-plane-roadmap.md](agent-plane-roadmap.md). | Wherever the agent runs |
 | `minga net ...`, `minga wg ...` | Inspects/plans overlay addresses and WireGuard keys/config; these helpers do not change cluster state or configure a host interface. | Anywhere |
 
 `deploy` and `state` take `--api-url` (or `MINGA_API_URL`, default
@@ -361,6 +369,7 @@ race.
 | `MINGA_METRICS_BIND` | Node roles | Same as `--metrics-bind`. |
 | `MINGA_LOG_LEVEL` | All `minga` processes | Log filter, such as `info` or `minga_node=debug` (default `info`). |
 | `DOCKER_CONFIG` | Image pulls | Directory of the Docker `config.json` with registry credentials. |
+| `MINGA_API_CA`, `MINGA_CLIENT_CERT`, `MINGA_CLIENT_KEY` | `minga mcp serve` | CA, tenant client certificate and key for the manager API (the `MINGA_API_URL` above is the URL). |
 | `MINGA_CTL_CONTEXT`, `MINGA_CTL_ENDPOINT`, `MINGA_CTL_TOKEN` | `minga-ctl` | Override the context, its endpoint and its token. |
 | `MINGA_BIN` | `minga-ctl stack deploy` | The `minga` binary to run locally. |
 | `XDG_CONFIG_HOME` | `minga-ctl` | Where the config file lives. |

@@ -105,7 +105,8 @@ export const milestones: Milestone[] = [
     source: 'CHANGELOG.md',
   },
   {
-    version: 'Unreleased',
+    version: 'v1.3.0-rc.1',
+    date: '2026-11-23',
     status: 'shipped',
     title: 'Managers-only Raft',
     features: [
@@ -121,7 +122,8 @@ export const milestones: Milestone[] = [
     source: 'CHANGELOG.md',
   },
   {
-    version: 'Unreleased',
+    version: 'v1.3.0-rc.1',
+    date: '2026-11-23',
     status: 'shipped',
     title: 'Tenants and API identity',
     features: [
@@ -138,7 +140,8 @@ export const milestones: Milestone[] = [
     source: 'CHANGELOG.md',
   },
   {
-    version: 'Unreleased',
+    version: 'v1.3.0-rc.1',
+    date: '2026-11-23',
     status: 'shipped',
     title: 'WireGuard mesh',
     features: [

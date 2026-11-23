@@ -31,7 +31,7 @@ const terminal = `$ cargo build --release -p minga-cli
 $ sudo install -m 0755 target/release/minga /usr/local/bin/minga
 $ sudo ctr -n minga images pull docker.io/library/nginx:1.27
 $ minga validate -c compose.yaml
-# with minga manager and minga api running (see the quickstart):
+# with minga manager running (see the quickstart):
 $ MINGA_API_TOKEN=change-me minga deploy -c compose.yaml shop
 
 ${deployOutput.split('\n').slice(3).join('\n')}`;
@@ -109,7 +109,7 @@ ${deployOutput.split('\n').slice(3).join('\n')}`;
           </li>
           <li>
             <strong>Your Docker tooling keeps working.</strong> <code>docker stack deploy</code>,{' '}
-            <code>docker service ls</code> and the Traefik v3 swarm provider run against <code>minga api</code>.
+            <code>docker service ls</code> and the Traefik v3 swarm provider run against the manager’s API.
           </li>
           <li>
             <strong>Failures are loud.</strong> Unknown Compose keys are rejected, an unplaceable deploy returns HTTP
@@ -128,8 +128,8 @@ ${deployOutput.split('\n').slice(3).join('\n')}`;
           <h3>How it works</h3>
           <ol class="steps">
             <li>
-              <code>minga deploy</code> posts networks, secrets and services to <code>minga api</code>, a Docker Engine
-              API v1.41 subset.
+              <code>minga deploy</code> posts networks, secrets and services to <code>minga manager</code>’s API, a
+              Docker Engine API v1.41 subset.
             </li>
             <li>
               The API checks the service is placeable (409 if not) and writes desired state to Raft; writes forward to
