@@ -49,6 +49,14 @@ const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(3);
 /// Receive buffer size; covers EDNS-sized datagrams.
 const MAX_DATAGRAM: usize = 4096;
 
+/// An idle TCP connection is dropped after this long without completing its
+/// length-prefixed query or response (mirrors the bounded-listener timeouts
+/// in `minga-telemetry::serve`).
+const TCP_IO_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// TCP connections served at once; further ones are dropped on accept.
+const MAX_TCP_CONNECTIONS: usize = 128;
+
 /// A DNS server answering overlay queries on one or more bind addresses.
 ///
 /// Dropping the server does not stop the listener tasks; call
@@ -99,7 +107,7 @@ impl DnsServer {
         self.addrs.clone()
     }
 
-    /// Stops all listener tasks.
+    /// Stops all listener tasks and aborts their open TCP connections.
     pub async fn shutdown(self) {
         for task in &self.tasks {
             task.abort();
@@ -146,12 +154,42 @@ async fn tcp_loop(
     upstream: Option<SocketAddr>,
     local_only: LocalOnlySources,
 ) {
+    // Cap on the connections served at once: a permit is held for the life
+    // of each connection and released when it ends.
+    let slots = Arc::new(tokio::sync::Semaphore::new(MAX_TCP_CONNECTIONS));
+    // The set owns the connection tasks: dropping it, when the listener
+    // task is aborted, aborts every open connection with it.
+    let mut connections = tokio::task::JoinSet::new();
     loop {
-        match listener.accept().await {
-            Ok((stream, peer)) => {
+        tokio::select! {
+            biased;
+            completed = connections.join_next(), if !connections.is_empty() => {
+                if let Some(Err(e)) = completed {
+                    warn!(error = %e, "DNS TCP task failed");
+                }
+            }
+            accepted = listener.accept() => {
+                let (stream, peer) = match accepted {
+                    Ok(accepted) => accepted,
+                    Err(e) => {
+                        warn!(error = %e, "DNS TCP accept error; stopping listener");
+                        return;
+                    }
+                };
+                // Over the cap: refuse by closing the fresh connection
+                // instead of letting it idle in the kernel backlog.
+                let permit = match slots.clone().try_acquire_owned() {
+                    Ok(permit) => permit,
+                    Err(_) => {
+                        debug!("DNS TCP connection over cap; dropping");
+                        drop(stream);
+                        continue;
+                    }
+                };
                 let store = Arc::clone(&store);
                 let local_only = Arc::clone(&local_only);
-                tokio::spawn(async move {
+                connections.spawn(async move {
+                    let _permit = permit;
                     if let Err(e) =
                         handle_tcp_conn(stream, store, upstream, peer.ip(), local_only).await
                     {
@@ -159,16 +197,14 @@ async fn tcp_loop(
                     }
                 });
             }
-            Err(e) => {
-                warn!(error = %e, "DNS TCP accept error; stopping listener");
-                return;
-            }
         }
     }
 }
 
 /// Handles a single TCP connection: one length-prefixed query (RFC 1035
-/// §4.2.2), one response, then close.
+/// §4.2.2), one response, then close. Every read and write is bounded by
+/// [`TCP_IO_TIMEOUT`], and a length prefix above [`MAX_DATAGRAM`] is
+/// rejected before its buffer is allocated.
 async fn handle_tcp_conn(
     mut stream: TcpStream,
     store: Arc<RwLock<DnsStore>>,
@@ -177,15 +213,38 @@ async fn handle_tcp_conn(
     local_only: LocalOnlySources,
 ) -> io::Result<()> {
     let mut len_buf = [0u8; 2];
-    stream.read_exact(&mut len_buf).await?;
+    read_with_timeout(&mut stream, &mut len_buf).await?;
     let len = u16::from_be_bytes(len_buf) as usize;
+    // Match the resolver's UDP/EDNS receive budget before allocating a body.
+    if len > MAX_DATAGRAM {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "DNS TCP query exceeds maximum length",
+        ));
+    }
     let mut buf = vec![0u8; len];
-    stream.read_exact(&mut buf).await?;
+    read_with_timeout(&mut stream, &mut buf).await?;
     if let Some(resp) = handle_query(&buf, &store, upstream, source, &local_only).await {
-        stream.write_all(&(resp.len() as u16).to_be_bytes()).await?;
-        stream.write_all(&resp).await?;
+        write_with_timeout(&mut stream, &(resp.len() as u16).to_be_bytes()).await?;
+        write_with_timeout(&mut stream, &resp).await?;
     }
     Ok(())
+}
+
+/// Reads exactly `buf.len()` bytes, closing an idle connection after
+/// [`TCP_IO_TIMEOUT`].
+async fn read_with_timeout(stream: &mut TcpStream, buf: &mut [u8]) -> io::Result<()> {
+    tokio::time::timeout(TCP_IO_TIMEOUT, stream.read_exact(buf))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "idle DNS TCP connection"))?
+        .map(|_| ())
+}
+
+/// Writes all of `buf`, with the same [`TCP_IO_TIMEOUT`] bound as reads.
+async fn write_with_timeout(stream: &mut TcpStream, buf: &[u8]) -> io::Result<()> {
+    tokio::time::timeout(TCP_IO_TIMEOUT, stream.write_all(buf))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "idle DNS TCP connection"))?
 }
 
 // ---------------------------------------------------------------------------
@@ -722,6 +781,121 @@ mod tests {
             RCODE_NOERROR
         );
 
+        server.shutdown().await;
+    }
+
+    async fn tcp_test_server() -> (DnsServer, SocketAddr) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let server = DnsServer::start(
+            vec![addr],
+            Arc::new(RwLock::new(DnsStore::new())),
+            None,
+            LocalOnlySources::default(),
+        )
+        .await
+        .unwrap();
+        (server, addr)
+    }
+
+    async fn assert_tcp_closed(stream: &mut TcpStream, wait: Duration) {
+        let mut byte = [0];
+        match tokio::time::timeout(wait, stream.read(&mut byte)).await {
+            Ok(Ok(0)) | Ok(Err(_)) => {}
+            other => panic!("expected connection closure, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn tcp_idle_connection_is_closed() {
+        let (server, addr) = tcp_test_server().await;
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        assert_tcp_closed(&mut stream, Duration::from_secs(6)).await;
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn tcp_connections_over_cap_are_closed() {
+        let (server, addr) = tcp_test_server().await;
+        let mut held = Vec::new();
+        for _ in 0..128 {
+            held.push(TcpStream::connect(addr).await.unwrap());
+        }
+        let mut excess = TcpStream::connect(addr).await.unwrap();
+        assert_tcp_closed(&mut excess, Duration::from_secs(1)).await;
+        for stream in &held {
+            let err = stream.try_read(&mut [0]).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+        }
+        // A different bridge has its own connection budget.
+        let (other, other_addr) = tcp_test_server().await;
+        let query = encode_query(7, "web.plant-7.minga.local", QTYPE_A);
+        assert_eq!(parse_response(&query_tcp(other_addr, &query).await).id, 7);
+        other.shutdown().await;
+
+        // Completing a held query must make capacity available again.
+        let mut completing = held.pop().unwrap();
+        completing
+            .write_all(&(query.len() as u16).to_be_bytes())
+            .await
+            .unwrap();
+        completing.write_all(&query).await.unwrap();
+        let mut response = Vec::new();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            completing.read_to_end(&mut response),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(parse_response(&response[2..]).id, 7);
+        assert_eq!(parse_response(&query_tcp(addr, &query).await).id, 7);
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn tcp_shutdown_closes_open_connections() {
+        let (server, addr) = tcp_test_server().await;
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        stream.write_all(&[0]).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        server.shutdown().await;
+        assert_tcp_closed(&mut stream, Duration::from_secs(1)).await;
+    }
+
+    #[tokio::test]
+    async fn tcp_oversized_prefix_is_rejected_without_a_body() {
+        let (server, addr) = tcp_test_server().await;
+        for length in [4097u16, u16::MAX] {
+            let mut stream = TcpStream::connect(addr).await.unwrap();
+            stream.write_all(&length.to_be_bytes()).await.unwrap();
+            assert_tcp_closed(&mut stream, Duration::from_secs(1)).await;
+        }
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn tcp_maximum_length_query_is_answered() {
+        let (server, addr) = tcp_test_server().await;
+        let mut query = encode_query(8, "web.plant-7.minga.local", QTYPE_A);
+        query.resize(4096, 0);
+        let reply = parse_response(&query_tcp(addr, &query).await);
+        assert_eq!((reply.id, reply.rcode), (8, RCODE_NOERROR));
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn tcp_partial_prefix_and_body_time_out() {
+        let (server, addr) = tcp_test_server().await;
+        let mut prefix = TcpStream::connect(addr).await.unwrap();
+        prefix.write_all(&[0]).await.unwrap();
+        let mut body = TcpStream::connect(addr).await.unwrap();
+        body.write_all(&[0, 32, 0]).await.unwrap();
+        tokio::join!(
+            assert_tcp_closed(&mut prefix, Duration::from_secs(6)),
+            assert_tcp_closed(&mut body, Duration::from_secs(6)),
+        );
         server.shutdown().await;
     }
 }
