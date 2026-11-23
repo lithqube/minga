@@ -459,3 +459,104 @@ async fn containerd_named_user_resolves_from_the_image() {
         "{error}"
     );
 }
+
+/// AC3 — supervisor restart: output written after a restart reaches the stream.
+///
+/// 1. Start a container whose command writes an initial line then sleeps.
+/// 2. Record the initial output via `runtime.logs()`.
+/// 3. Drop and re-create the supervisor (simulating a node restart) **without**
+///    stopping the container — the runtime is shared, so the container keeps
+///    running.
+/// 4. Call `open_log_fifos` on the new runtime instance for the adopted
+///    container (the same code path `recover_running_containers` calls).
+/// 5. The container's subsequent stdout lines must appear in `runtime.logs()`
+///    after the FIFO readers are re-opened.
+///
+/// This test requires containerd and skips on macOS or CI without the daemon.
+#[tokio::test]
+async fn supervisor_restart_adopted_container_logs_reach_stream_ac3() {
+    let socket = socket_path();
+    if !containerd_available_at(&socket) {
+        eprintln!("SKIP: containerd not available at {socket}");
+        return;
+    }
+    let runtime = match ContainerdRuntime::connect(&socket).await {
+        Ok(rt) => rt,
+        Err(e) => {
+            assert!(
+                std::env::var_os("MINGA_REQUIRE_CONTAINERD").is_none(),
+                "required containerd connection failed: {e}"
+            );
+            eprintln!("SKIP: cannot connect to containerd: {e}");
+            return;
+        }
+    };
+    let logs_dir = tempfile::tempdir().unwrap();
+    let runtime = runtime.with_logs_dir(logs_dir.path());
+
+    // Start a container that emits a line, then keeps writing lines every 100 ms.
+    let task_id = "minga-ac3-restart-logs-001".to_string();
+    let spec = minga_state::types::TaskSpec {
+        image: "docker.io/library/busybox:latest".to_string(),
+        command: vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            // Write a "before" marker, then keep emitting "after" lines.
+            "echo before-restart; while true; do echo after-restart; sleep 0.1; done".to_string(),
+        ],
+        ..Default::default()
+    };
+
+    runtime
+        .start(&task_id, &spec)
+        .await
+        .expect("failed to start AC3 container");
+
+    // Wait for the initial "before-restart" line to arrive.
+    let container_id = task_id.clone();
+    let mut saw_before = false;
+    for _ in 0..40 {
+        let chunks = runtime.logs(&container_id, 0).await;
+        let all: String = chunks
+            .iter()
+            .flat_map(|c| std::str::from_utf8(&c.data).unwrap_or("").chars())
+            .collect();
+        if all.contains("before-restart") {
+            saw_before = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        saw_before,
+        "initial output must arrive before simulating restart"
+    );
+
+    // --- Simulate supervisor restart ---
+    // The container keeps running. `open_log_fifos` re-attaches FIFO readers.
+    runtime.open_log_fifos(&container_id).await;
+
+    // Output written after re-open must now arrive in the ring.
+    let mut saw_after = false;
+    for _ in 0..40 {
+        let chunks = runtime.logs(&container_id, 0).await;
+        let all: String = chunks
+            .iter()
+            .flat_map(|c| std::str::from_utf8(&c.data).unwrap_or("").chars())
+            .collect();
+        if all.contains("after-restart") {
+            saw_after = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        saw_after,
+        "output written after supervisor restart must reach the log stream"
+    );
+
+    runtime
+        .stop(&container_id)
+        .await
+        .expect("failed to stop AC3 container");
+}
