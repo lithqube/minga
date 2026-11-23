@@ -233,8 +233,16 @@ fn build_dns_store(assignments: &[NetworkAssignment], node_id: NodeId) -> minga_
             let Ok(ip) = task.ip.parse::<std::net::Ipv4Addr>() else {
                 continue;
             };
+            // `service_name` is the bare Compose name; the scheduler owns
+            // that. Docker semantics: it resolves as a record of its own,
+            // because musl images do not apply `search` domains.
             store.add(&task.service_name, ip);
             store.add(format!("tasks.{}", task.service_name), ip);
+            // v1.3.0-rc.1 resolved only `<stack>.<service>`; stacks edited
+            // to that form keep working.
+            if !task.stack.is_empty() {
+                store.add(format!("{}.{}", task.stack, task.service_name), ip);
+            }
             store.add(
                 minga_net::dns::service_fqdn(&task.service_name, &task.stack),
                 ip,
@@ -2359,5 +2367,10 @@ mod assignment_tests {
                 std::net::Ipv4Addr::new(10, 0, 0, 11)
             ]
         );
+        // The bare name, `tasks.<service>` and the `<stack>.<service>` form
+        // v1.3.0-rc.1 answered to resolve to the same tasks.
+        for name in ["web", "tasks.web", "plant.web"] {
+            assert_eq!(dns.resolve(name).len(), 2, "{name}");
+        }
     }
 }

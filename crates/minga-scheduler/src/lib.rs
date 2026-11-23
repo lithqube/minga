@@ -395,12 +395,13 @@ impl Scheduler {
                         .map(|network| (*network).clone())
                 })
                 .collect();
+            let stack = service.env.get("MINGA_STACK").cloned().unwrap_or_default();
             let assignment = TaskAssignment {
                 task_id: task.id.clone(),
                 node_id: task.node_id,
                 service_id: task.service_id.clone(),
-                service_name: service.name.clone(),
-                stack: service.env.get("MINGA_STACK").cloned().unwrap_or_default(),
+                service_name: dns_service_name(&service.name, &stack).to_owned(),
+                stack,
                 spec: task.spec.clone(),
                 networks: task_networks,
             };
@@ -422,7 +423,7 @@ impl Scheduler {
                         .push(NetworkDnsTask {
                             node_id: task.node_id,
                             task_id: task.id.clone(),
-                            service_name: service.name.clone(),
+                            service_name: assignment.service_name.clone(),
                             stack: assignment.stack.clone(),
                             ip: ip.clone(),
                         });
@@ -631,6 +632,19 @@ impl Scheduler {
             tokio::time::sleep(interval).await;
         }
     }
+}
+
+/// The name a service's tasks answer to in DNS: the bare Compose service name.
+///
+/// A service stored through the API is named `<stack>.<service>` in every
+/// tenant (the tenant qualifies only the ID), so the stack prefix comes off
+/// here, once. Nodes register what they are sent and must not strip again: a
+/// service called `shop.db` in stack `shop` would lose its own prefix.
+fn dns_service_name<'a>(name: &'a str, stack: &str) -> &'a str {
+    name.strip_prefix(stack)
+        .and_then(|rest| rest.strip_prefix('.'))
+        .filter(|bare| !stack.is_empty() && !bare.is_empty())
+        .unwrap_or(name)
 }
 
 /// One tenant at its quota must not stop reconciliation for every tenant:
@@ -1127,5 +1141,27 @@ mod subnet_race_tests {
             .shutdown()
             .await
             .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod dns_service_name_tests {
+    use super::dns_service_name;
+
+    #[test]
+    fn only_the_stack_prefix_comes_off_and_only_once() {
+        for (name, stack, bare) in [
+            ("shop.db", "shop", "db"),
+            // A Compose service that is itself called `shop.db`.
+            ("shop.shop.db", "shop", "shop.db"),
+            // Already bare, no stack, or merely starting with the stack's name.
+            ("db", "shop", "db"),
+            ("shop.db", "", "shop.db"),
+            ("shopdb", "shop", "shopdb"),
+            ("shop_db", "shop", "shop_db"),
+            ("shop.", "shop", "shop."),
+        ] {
+            assert_eq!(dns_service_name(name, stack), bare, "{name} in {stack:?}");
+        }
     }
 }
