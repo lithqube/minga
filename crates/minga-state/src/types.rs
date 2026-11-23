@@ -1256,6 +1256,20 @@ mod tests {
     }
 
     #[test]
+    fn one_service_cannot_publish_a_port_twice_even_on_different_host_ips() {
+        let mut service = service_with_ingress_port("tenant-a.web", "tenant-a");
+        let mut narrow = service.ports[0].clone();
+        narrow.host_ip = Some("127.0.0.1".parse().unwrap());
+        narrow.target = 81;
+        service.ports.push(narrow);
+
+        assert_eq!(
+            published_port_conflict(&service, []).as_deref(),
+            Some("port 8080/tcp is published more than once")
+        );
+    }
+
+    #[test]
     fn workload_kind_default_is_container() {
         assert_eq!(WorkloadKind::default(), WorkloadKind::Container);
     }

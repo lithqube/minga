@@ -1565,7 +1565,10 @@ impl NetworkSetup {
         }
 
         for port in ports {
-            if port.mode == minga_state::types::PortMode::Host {
+            // An IPv6 address installs no rule below, so it cannot collide.
+            if port.mode == minga_state::types::PortMode::Host
+                && HostMatch::of(port.host_ip) != HostMatch::Unsupported
+            {
                 if let Some(published) = port.published {
                     self.check_port_free(&port.protocol, published)?;
                 }

@@ -26,7 +26,7 @@ numbers in the list; the changelog has the detail and the upgrade steps.
 | Tenant hardening | Names unique per tenant; a deleted tenant's bus data is deleted; one tenant cannot list another's keys, exhaust its consumers, stall managers with a duplicate WireGuard key, take its subnets or ports, or read its metrics; required-egress tasks get no recursive DNS | #119, #147, #149, #152, #158, #167 to #171, #174 to #177, #182 |
 | Agents | WASM sandbox hardened with epoch timeouts, memory caps and a shared module cache; explicit capability grants; egress proxy with routes, budgets, redirects and private destinations refused, and usage events | #101 to #103, #105, #106, #108 |
 | Operations | `minga-ctl` gains `manager`, `node`, `network`, `config`, `task`, `info`, `doctor` and `upgrade preflight`; `minga mcp serve` gives agents tenant-scoped reads; changes proposed by an agent need approval by a distinct deployer or admin identity | #112, #114 |
-| Compose | `ports` host IPs reach desired state and publish on that node address only (#162); `deploy.labels` are rejected instead of silently dropped; container hardening fields the runtime does not implement are refused with 400 | #155, #159, #162 |
+| Compose | `ports` host IPs reach desired state and publish on that IPv4 node address only (an IPv6 host IP is accepted and stored but not published) (#162); `deploy.labels` are rejected instead of silently dropped; container hardening fields the runtime does not implement are refused with 400 | #155, #159, #162 |
 | Build and CI | The nats-server checksum is verified in CI, the release build no longer caches Rust artifacts, one shared NATS version pin | #156, #166, #172 |
 
 ## Upgrade notes
@@ -188,7 +188,7 @@ this path has not been run as a live upgrade.
 - **Network removal** returns 409 while a service, a rollback revision or a
   running task still uses the network. `minga-ctl stack rm --with` waits up to
   15 seconds for the stack's tasks to be reaped.
-- **Compose** rejects `deploy.labels` it used to drop. `ports` host IPs are published on that address only (#162); state is format 12, so every node changes together.
+- **Compose** rejects `deploy.labels` it used to drop. `ports` host IPs are published on that IPv4 address only; an IPv6 host IP is accepted and stored but not published (#162). State is format 12, so every node changes together.
 - **Unreleased builds.** Entries in the changelog marked "upgrade action
   needed" also describe changes between unreleased builds of `main`: the
   per-tenant assignment buckets, the NATS operator/JWT mode and the worker ACL

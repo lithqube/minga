@@ -10,7 +10,7 @@ Minga keeps two kinds of state. **Desired state** (services, networks, volumes, 
 
 | Field | Content |
 |---|---|
-| `format_version` | Persisted-format version of the build that exported it (`minga_state::codec::FORMAT_VERSION`, 11 today) |
+| `format_version` | Persisted-format version of the build that exported it (`minga_state::codec::FORMAT_VERSION`, 12 today) |
 | `exported_at_unix` | Export time |
 | `services` | Full service specs: image, replicas, env, ports, mounts, networks, restart and update policy, secret references, labels, healthcheck |
 | `networks` | Overlay networks (name, driver, subnet) |
@@ -56,7 +56,7 @@ minga state import minga-state.json --api-url http://127.0.0.1:2375
 Import writes through Raft in dependency order: networks, secrets, configs, volumes, then services.
 
 - If any service in the file already exists, nothing is written and the API answers **409**. Pass `--overwrite` to replace those services with the file's version. Networks, volumes, secrets and configs are always upserted.
-- A file with a higher `format_version` than the running build is refused (use the newer binary). The current version 11 imports directly; versions 2 through 10 are migrated on import. Version 11 adds the durable agent change-request table; portable exports still contain desired resources only. Each service's egress policy, rollback targets included, is checked with the same rules as Compose `x-minga-egress`.
+- A file with a higher `format_version` than the running build is refused (use the newer binary). The current version 12 imports directly; versions 2 through 11 are migrated on import. Version 11 added the durable agent change-request table and version 12 the port host address; portable exports still contain desired resources only. Each service's egress policy, rollback targets included, is checked with the same rules as Compose `x-minga-egress`.
 - Tasks are not imported. The scheduler places tasks for the restored specs. Not verified: how running tasks of a service replaced with `--overwrite` are rolled over; test that on a spare cluster first.
 
 `GET` and `POST /v1.41/state` require the configured cluster-operator API token. Tenant client certificates do not grant access to this cluster-wide resource export.

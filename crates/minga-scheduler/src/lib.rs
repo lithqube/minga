@@ -101,6 +101,17 @@ pub fn task_with_actual_status(mut task: Task, report: Option<&TaskStatusReport>
     task
 }
 
+/// The address two overlapping tasks agree to publish a port on: a restricted
+/// address always wins over "every address", and of two restricted ones the
+/// lower is used, so the result never depends on task order and a restricted
+/// port is never published wider.
+fn narrower(a: Option<std::net::IpAddr>, b: Option<std::net::IpAddr>) -> Option<std::net::IpAddr> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (one, None) | (None, one) => one,
+    }
+}
+
 /// The host address of a published port and the backends behind it.
 type HostBackends = (
     Option<std::net::IpAddr>,
@@ -376,8 +387,10 @@ impl Scheduler {
         let node_by_id: HashMap<_, _> = nodes.iter().map(|node| (node.id, node)).collect();
         let mut network_tasks: HashMap<&str, Vec<NetworkDnsTask>> = HashMap::new();
         // One published port/protocol belongs to one service (an ingress port
-        // is unique in the cluster), so its host address is the same on every
-        // backend.
+        // is unique in the cluster, and the store refuses a repeat inside one
+        // service), but tasks of two revisions overlap during a rollout and
+        // may differ in `host_ip`. [`narrower`] merges them without depending
+        // on task order.
         let mut ingress_backends: HashMap<(String, u16, String), HostBackends> = HashMap::new();
         let mut desired = HashSet::new();
         for task in &tasks {
@@ -457,7 +470,7 @@ impl Scheduler {
                         let entry = ingress_backends
                             .entry((task.tenant_id.clone(), published, port.protocol.clone()))
                             .or_default();
-                        entry.0 = port.host_ip;
+                        entry.0 = narrower(entry.0, port.host_ip);
                         entry.1.push(minga_state::types::IngressBackend {
                             node_id: task.node_id,
                             ip: ip.to_owned(),
@@ -1079,6 +1092,25 @@ fn build_wireguard_peer_sets(
         );
     }
     Ok(peer_sets)
+}
+
+#[cfg(test)]
+mod narrower_tests {
+    use super::narrower;
+    use std::net::IpAddr;
+
+    #[test]
+    fn a_restricted_address_never_becomes_every_address_whatever_the_task_order() {
+        let ip = |s: &str| Some(s.parse::<IpAddr>().unwrap());
+        let (loopback, lan) = (ip("127.0.0.1"), ip("10.0.0.5"));
+        for (a, b) in [(None, loopback), (loopback, None), (lan, None), (None, lan)] {
+            assert_eq!(narrower(a, b), a.or(b), "{a:?} then {b:?}");
+        }
+        // Two restricted addresses agree on the lower one in either order.
+        assert_eq!(narrower(loopback, lan), lan);
+        assert_eq!(narrower(lan, loopback), lan);
+        assert_eq!(narrower(None, None), None);
+    }
 }
 
 #[cfg(test)]
