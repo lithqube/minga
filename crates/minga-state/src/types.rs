@@ -60,6 +60,50 @@ impl Tenant {
         Ok(())
     }
 
+    /// The cluster-wide ID of the service, network, secret or config that
+    /// `tenant_id` calls `name`. The `default` tenant keeps the bare name, as
+    /// every object created before names were scoped does; any other tenant's
+    /// objects get `<tenant>.<name>`, so two tenants can each have a `web`.
+    /// `.` cannot occur in a tenant ID, so the first dot always splits them.
+    pub fn object_id(tenant_id: &str, name: &str) -> String {
+        if tenant_id == DEFAULT_TENANT_ID {
+            name.to_owned()
+        } else {
+            format!("{tenant_id}.{name}")
+        }
+    }
+
+    /// Longest qualified object ID: task IDs add `.<slot>.<revision>` to a
+    /// service ID, and containerd refuses identifiers over 76 characters.
+    pub const MAX_OBJECT_ID_LEN: usize = 64;
+
+    /// Checks a client-chosen name before it is qualified. The `default`
+    /// tenant is not checked, so names that worked before keep working.
+    pub fn validate_object_name(tenant_id: &str, name: &str) -> Result<(), String> {
+        if tenant_id == DEFAULT_TENANT_ID {
+            return Ok(());
+        }
+        let mut chars = name.chars();
+        let first_ok = chars.next().is_some_and(|c| c.is_ascii_alphanumeric());
+        if !first_ok
+            || !chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+            || name.ends_with('.')
+        {
+            return Err(format!(
+                "name `{name}` must start with a letter or digit and use only letters, digits, '.', '_' and '-'"
+            ));
+        }
+        let id = Self::object_id(tenant_id, name);
+        if id.len() > Self::MAX_OBJECT_ID_LEN {
+            return Err(format!(
+                "name `{name}` is too long: with the tenant it makes {} characters, at most {} are allowed",
+                id.len(),
+                Self::MAX_OBJECT_ID_LEN
+            ));
+        }
+        Ok(())
+    }
+
     /// Tenant IDs use the same safe token alphabet as NATS subjects.
     pub fn validate_id(id: &str) -> Result<(), &'static str> {
         if id.is_empty()
@@ -408,6 +452,32 @@ impl EgressPolicy {
                     .map(String::as_str)
                     .collect(),
             })
+    }
+}
+
+impl EgressPolicy {
+    /// The same secret IDs as [`EgressPolicy::secret_ids`], to be rewritten in place.
+    pub fn secret_ids_mut(&mut self) -> Vec<&mut String> {
+        let mut ids = Vec::new();
+        for route in &mut self.routes {
+            match route.auth.as_mut() {
+                Some(EgressAuth::Bearer { secret } | EgressAuth::ApiKey { secret }) => {
+                    ids.push(secret);
+                }
+                Some(EgressAuth::AwsSigv4 {
+                    access_key_secret,
+                    secret_key_secret,
+                    session_token_secret,
+                    ..
+                }) => {
+                    ids.push(access_key_secret);
+                    ids.push(secret_key_secret);
+                    ids.extend(session_token_secret.as_mut());
+                }
+                None => {}
+            }
+        }
+        ids
     }
 }
 
@@ -1041,6 +1111,64 @@ pub struct Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn object_ids_are_bare_for_default_and_qualified_for_other_tenants() {
+        assert_eq!(Tenant::object_id(DEFAULT_TENANT_ID, "web"), "web");
+        assert_eq!(Tenant::object_id("acme", "web"), "acme.web");
+        assert_eq!(Tenant::object_id("acme", "app.web"), "acme.app.web");
+        // Two tenants' same name never share an ID, and a tenant's ID has no dot to confuse the split.
+        assert_ne!(
+            Tenant::object_id("acme", "web"),
+            Tenant::object_id("beta", "web")
+        );
+        assert!(Tenant::validate_id("a.b").is_err());
+    }
+
+    #[test]
+    fn object_names_of_other_tenants_are_checked_and_default_is_not() {
+        assert!(Tenant::validate_object_name("acme", "app_db-1.x").is_ok());
+        for bad in ["", " x", "x y", "-x", ".x", "x.", "a/b", "é"] {
+            assert!(
+                Tenant::validate_object_name("acme", bad).is_err(),
+                "{bad:?}"
+            );
+        }
+        // 64 characters with the tenant and its dot is the most.
+        let longest = "n".repeat(Tenant::MAX_OBJECT_ID_LEN - "acme.".len());
+        assert!(Tenant::validate_object_name("acme", &longest).is_ok());
+        assert!(Tenant::validate_object_name("acme", &format!("{longest}n")).is_err());
+        assert!(Tenant::validate_object_name(DEFAULT_TENANT_ID, "any name at all").is_ok());
+    }
+
+    #[test]
+    fn egress_secret_ids_can_be_rewritten_in_place() {
+        let mut policy = EgressPolicy {
+            required: false,
+            routes: vec![EgressRoute {
+                name: "r".into(),
+                upstream_url: "https://example.test".into(),
+                auth: Some(EgressAuth::AwsSigv4 {
+                    access_key_secret: "a".into(),
+                    secret_key_secret: "b".into(),
+                    session_token_secret: Some("c".into()),
+                    region: "r".into(),
+                    service: "s".into(),
+                }),
+                fallback: vec![],
+                input_price_micros_per_million: None,
+                output_price_micros_per_million: None,
+            }],
+            models: vec![],
+        };
+        for id in policy.secret_ids_mut() {
+            id.insert_str(0, "acme.");
+        }
+        assert_eq!(
+            policy.secret_ids().collect::<Vec<_>>(),
+            ["acme.a", "acme.b", "acme.c"]
+        );
+    }
 
     #[test]
     fn tenant_ids_use_nats_safe_tokens() {

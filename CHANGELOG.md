@@ -2,6 +2,31 @@
 
 ## Unreleased
 
+- **Security, no upgrade action.** Object names are unique per tenant, not cluster-wide (#129):
+  - Services, networks, secrets and configs were keyed by their bare name across the whole cluster. Another
+    tenant's name answered 409 "name is already in use" on create, so a tenant could learn that a name was
+    taken and claim one another tenant's stack needed. Two tenants could not both have a `web` or a
+    `db_password`.
+  - A tenant other than `default` now gets the ID `<tenant>.<name>` for what it creates (`acme.web`); the
+    `default` tenant keeps bare names. The API accepts a name or an ID and resolves it to the caller's own
+    object, so clients and Compose files change nothing. IDs a client reads back are the qualified ones.
+  - Another tenant's name is now the same as no name: reading it is 404, creating it succeeds, and a
+    service that refers to a network or secret only another tenant has gets the same "not declared" answer
+    as for one nobody has. (A secret of another tenant used to be a 404 there; that difference showed that
+    it existed.)
+  - Nothing existing is rewritten. Objects created before this keep their bare ID, stay owned by their
+    tenant and are still found by name, so there is no state migration and the format version stays 11.
+    A rolling upgrade is safe: an older manager reads qualified IDs as opaque IDs.
+  - Names of a tenant other than `default` must start with a letter or digit and use only letters, digits,
+    `.`, `_` and `-`, and the qualified ID may be at most 64 characters, so task IDs stay valid
+    container IDs. The `default` tenant is not checked.
+  - Node-local secret values of a non-default tenant are provisioned under the qualified ID, the
+    `SecretID` the API shows (`acme.db_password`), not under the bare name.
+  - Collision corner: a legacy bare ID, or a `default` name with a dot, can equal another tenant's
+    qualified ID; the later creation is refused with 409 "name is already in use".
+  - `minga-ctl stack rm --with` and `stack deploy --prune` now match a tenant's resources by name as well
+    as ID. Before, `--prune` would have taken every service of a non-default tenant's stack for stale.
+
 - **Security.** Deleting a tenant now deletes everything it had on the bus (#132):
   - Before, only the Raft record went. Its audit, log, usage, status and budget streams and buckets, its
     events, its leases and its node-join records stayed, and a tenant created later under the same ID

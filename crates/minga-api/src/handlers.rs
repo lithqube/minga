@@ -210,6 +210,11 @@ pub async fn create_tenant(
         created_at: unix_now(),
     };
     Tenant::validate_id(&tenant.id).map_err(bad_request)?;
+    // One tenant create or delete at a time in this process: two creates of an
+    // ID could otherwise both pass the checks below, and the one that loses the
+    // store write would then delete the bus resources the winner just made.
+    // Other managers are not covered; the store write still decides a race.
+    let _lifecycle = TENANT_LIFECYCLE.lock().await;
     if app.store.get_tenant(&tenant.id).await?.is_some() {
         return Err(conflict(format!("tenant {} already exists", tenant.id)));
     }
@@ -229,21 +234,27 @@ pub async fn create_tenant(
             tenant.id
         )));
     }
-    configure_tenant_bus(&app, &tenant).await?;
-    append_tenant_audit(
-        &app,
-        &tenant.id,
-        &caller.name,
-        "tenant.create.requested",
-        &format!("/tenants/{}", tenant.id),
-    )
-    .await?;
-    if let Err(error) = app.store.create_tenant(tenant.clone()).await {
-        // Undo the resources made above, or the retry would be refused as a leftover.
+    let created: ApiResult<()> = async {
+        configure_tenant_bus(&app, &tenant).await?;
+        append_tenant_audit(
+            &app,
+            &tenant.id,
+            &caller.name,
+            "tenant.create.requested",
+            &format!("/tenants/{}", tenant.id),
+        )
+        .await?;
+        app.store.create_tenant(tenant.clone()).await?;
+        Ok(())
+    }
+    .await;
+    if let Err(error) = created {
+        // Undo whatever the steps above made on the bus, or the retry would be
+        // refused as a leftover.
         if let Err(cleanup) = bus.delete_tenant_resources(&tenant.id).await {
             tracing::warn!(tenant = %tenant.id, error = %cleanup, "cannot remove bus resources of a tenant that was not created");
         }
-        return Err(error.into());
+        return Err(error);
     }
     Ok((StatusCode::CREATED, Json(tenant)))
 }
@@ -511,12 +522,10 @@ pub async fn create_change_request(
     if service_id.is_empty() || service_id.len() > 400 {
         return Err(bad_request("service_id must be between 1 and 400 bytes"));
     }
-    let before = app
-        .store
-        .get_service(&service_id)
+    let before = find_service(&app, tenant_id, &service_id)
         .await?
-        .filter(|service| service.tenant_id == tenant_id)
         .ok_or_else(|| not_found("service", &service_id))?;
+    let service_id = before.id.clone();
     // A global service runs one task per eligible node and ignores
     // `replicas`, so a replica change would be approved but never take effect.
     if matches!(kind, ChangeKind::Scale | ChangeKind::Stop)
@@ -768,6 +777,7 @@ pub async fn delete_tenant(
     Path(id): Path<String>,
 ) -> ApiResult<StatusCode> {
     Tenant::validate_id(&id).map_err(bad_request)?;
+    let _lifecycle = TENANT_LIFECYCLE.lock().await;
     if app.store.get_tenant(&id).await?.is_some() {
         append_tenant_audit(
             &app,
@@ -1183,8 +1193,93 @@ fn name_matches(name: &str, filters: &[String]) -> bool {
     filters.is_empty() || filters.iter().any(|f| f == name)
 }
 
-/// Every secret a service names, in `secrets` or an egress route, must be
-/// declared and owned by the caller's tenant; another tenant's is a 404.
+/// The IDs `tenant_id`'s object called `given` can have: `given` itself (a
+/// legacy bare ID, or an ID a client read back from the API) or the ID a new
+/// object of that name gets (`Tenant::object_id`). The caller keeps only a
+/// record its own tenant owns, so another tenant's object of the same name is
+/// indistinguishable from none.
+fn id_candidates(tenant_id: &str, given: &str) -> Vec<String> {
+    let qualified = Tenant::object_id(tenant_id, given);
+    if qualified == given {
+        vec![given.to_owned()]
+    } else {
+        vec![given.to_owned(), qualified]
+    }
+}
+
+async fn find_service(
+    app: &AppState,
+    tenant_id: &str,
+    given: &str,
+) -> ApiResult<Option<StateService>> {
+    for id in id_candidates(tenant_id, given) {
+        if let Some(found) = app.store.get_service(&id).await? {
+            if found.tenant_id == tenant_id {
+                return Ok(Some(found));
+            }
+        }
+    }
+    Ok(None)
+}
+
+async fn find_network(
+    app: &AppState,
+    tenant_id: &str,
+    given: &str,
+) -> ApiResult<Option<minga_state::types::Network>> {
+    for id in id_candidates(tenant_id, given) {
+        if let Some(found) = app.store.get_network(&id).await? {
+            if found.tenant_id == tenant_id {
+                return Ok(Some(found));
+            }
+        }
+    }
+    Ok(None)
+}
+
+async fn find_secret(
+    app: &AppState,
+    tenant_id: &str,
+    given: &str,
+) -> ApiResult<Option<minga_state::types::Secret>> {
+    for id in id_candidates(tenant_id, given) {
+        if let Some(found) = app.store.get_secret(&id).await? {
+            if found.tenant_id == tenant_id {
+                return Ok(Some(found));
+            }
+        }
+    }
+    Ok(None)
+}
+
+async fn find_config(
+    app: &AppState,
+    tenant_id: &str,
+    given: &str,
+) -> ApiResult<Option<minga_state::types::Config>> {
+    for id in id_candidates(tenant_id, given) {
+        if let Some(found) = app.store.get_config(&id).await? {
+            if found.tenant_id == tenant_id {
+                return Ok(Some(found));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// The ID of the caller's own declared secret `given`. One answer for a
+/// secret that is absent and one that only another tenant has.
+async fn declared_secret_id(app: &AppState, tenant_id: &str, given: &str) -> ApiResult<String> {
+    match find_secret(app, tenant_id, given).await? {
+        Some(secret) => Ok(secret.id),
+        None => Err(bad_request(format!(
+            "secret `{given}` is not declared; create its metadata and provision it on eligible nodes first"
+        ))),
+    }
+}
+
+/// Checks that every secret a stored service names, in `secrets` or an egress
+/// route, is declared by the caller's tenant. The IDs are already resolved.
 async fn check_service_secrets(
     app: &AppState,
     tenant_id: &str,
@@ -1197,14 +1292,33 @@ async fn check_service_secrets(
         .map(|reference| reference.secret_id.as_str())
         .chain(egress_secrets)
     {
-        match app.store.get_secret(secret_id).await? {
-            Some(secret) if secret.tenant_id == tenant_id => {}
-            Some(_) => return Err(not_found("secret", secret_id)),
-            None => {
-                return Err(bad_request(format!(
-                    "secret `{secret_id}` is not declared; create its metadata and provision it on eligible nodes first"
-                )))
-            }
+        declared_secret_id(app, tenant_id, secret_id).await?;
+    }
+    Ok(())
+}
+
+/// Rewrites every network, secret and egress route secret a service names, as
+/// a client wrote it (a name or an ID), to the ID of the caller's own object.
+/// A network or secret the caller's tenant does not have is refused, whether
+/// it is absent or another tenant's.
+async fn resolve_service_references(
+    app: &AppState,
+    tenant_id: &str,
+    svc: &mut StateService,
+) -> ApiResult<()> {
+    for network_id in &mut svc.networks {
+        let given = network_id.clone();
+        let network = find_network(app, tenant_id, &given)
+            .await?
+            .ok_or_else(|| not_found("network", &given))?;
+        *network_id = network.id;
+    }
+    for reference in &mut svc.secrets {
+        reference.secret_id = declared_secret_id(app, tenant_id, &reference.secret_id).await?;
+    }
+    if let Some(policy) = svc.egress.as_mut() {
+        for secret_id in policy.secret_ids_mut() {
+            *secret_id = declared_secret_id(app, tenant_id, secret_id).await?;
         }
     }
     Ok(())
@@ -1520,6 +1634,9 @@ pub async fn create_node(
 /// shortcut: process-local; revocation runs only on the Raft leader, so move
 /// this into Raft if credential issuance ever runs on followers.
 pub(crate) static NODE_CREDENTIALS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Serializes tenant create and delete in this process, see `create_tenant`.
+static TENANT_LIFECYCLE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// `POST /minga/nodes/{id}/join-token` — mint a tenant-bound token and NATS credentials.
 pub async fn issue_node_join_token(
@@ -1839,17 +1956,12 @@ pub async fn create_service(
     let tenant_id = tenant_scope(&caller)?;
     let mut svc = translate::service_spec_to_state(&spec).map_err(ApiError::BadRequest)?;
     svc.tenant_id = tenant_id.to_owned();
-    check_service_secrets(&app, tenant_id, &svc).await?;
-    for network_id in &svc.networks {
-        let network = app.store.get_network(network_id).await?;
-        if !network.is_some_and(|network| network.tenant_id == tenant_id) {
-            return Err(not_found("network", network_id));
-        }
-    }
-
-    if app.store.get_service(&svc.id).await?.is_some() {
+    Tenant::validate_object_name(tenant_id, &svc.name).map_err(bad_request)?;
+    if find_service(&app, tenant_id, &svc.name).await?.is_some() {
         return Err(conflict("service ID already exists"));
     }
+    svc.id = Tenant::object_id(tenant_id, &svc.name);
+    resolve_service_references(&app, tenant_id, &mut svc).await?;
 
     ensure_placeable(&app, &svc, None).await?;
 
@@ -1966,13 +2078,7 @@ pub async fn update_service(
     }
     svc.check_agent_egress()
         .map_err(|e| bad_request(format!("service '{id}': {e}")))?;
-    check_service_secrets(&app, tenant_id, &svc).await?;
-    for network_id in &svc.networks {
-        let network = app.store.get_network(network_id).await?;
-        if !network.is_some_and(|network| network.tenant_id == tenant_id) {
-            return Err(not_found("network", network_id));
-        }
-    }
+    resolve_service_references(&app, tenant_id, &mut svc).await?;
     svc.id = existing.id.clone();
     svc.name = existing.name.clone();
 
@@ -2233,23 +2339,22 @@ pub async fn create_network(
     Json(req): Json<models::NetworkCreateRequest>,
 ) -> ApiResult<(StatusCode, Json<models::NetworkCreateResponse>)> {
     let tenant_id = tenant_scope(&caller)?;
-    if let Some(network) = app.store.get_network(&req.Name).await? {
-        if network.tenant_id == tenant_id {
-            return Ok((
-                StatusCode::CREATED,
-                Json(models::NetworkCreateResponse {
-                    ID: network.id,
-                    Warning: None,
-                }),
-            ));
-        }
-        return Err(conflict("network name is already in use"));
+    if let Some(network) = find_network(&app, tenant_id, &req.Name).await? {
+        return Ok((
+            StatusCode::CREATED,
+            Json(models::NetworkCreateResponse {
+                ID: network.id,
+                Warning: None,
+            }),
+        ));
     }
+    Tenant::validate_object_name(tenant_id, &req.Name).map_err(bad_request)?;
 
     minga_net::overlay::check_driver_opts(&req.Name, req.Options.keys().map(String::as_str))
         .map_err(bad_request)?;
     let mut net = translate::network_create_to_state(&req);
     net.tenant_id = tenant_id.to_owned();
+    net.id = Tenant::object_id(tenant_id, &req.Name);
     // An explicit subnet must stay inside the overlay and not overlap another
     // network's. Networks without one get theirs from the leader's next
     // reconcile pass.
@@ -2290,11 +2395,8 @@ pub async fn get_network(
     Path((_version, id)): Path<(String, String)>,
 ) -> ApiResult<Json<models::NetworkResource>> {
     let tenant_id = tenant_scope(&caller)?;
-    let net = app
-        .store
-        .get_network(&id)
+    let net = find_network(&app, tenant_id, &id)
         .await?
-        .filter(|network| network.tenant_id == tenant_id)
         .ok_or_else(|| not_found("network", &id))?;
 
     Ok(Json(translate::network_to_docker(&net)))
@@ -2307,11 +2409,8 @@ pub async fn delete_network(
     Path((_version, id)): Path<(String, String)>,
 ) -> ApiResult<StatusCode> {
     let tenant_id = tenant_scope(&caller)?;
-    let net = app
-        .store
-        .get_network(&id)
+    let net = find_network(&app, tenant_id, &id)
         .await?
-        .filter(|network| network.tenant_id == tenant_id)
         .ok_or_else(|| not_found("network", &id))?;
 
     app.store
@@ -2377,12 +2476,14 @@ pub async fn create_secret(
         ));
     }
 
-    if app.store.get_secret(&spec.Name).await?.is_some() {
+    if find_secret(&app, tenant_id, &spec.Name).await?.is_some() {
         return Err(conflict("secret ID already exists"));
     }
+    Tenant::validate_object_name(tenant_id, &spec.Name).map_err(bad_request)?;
 
     let mut secret = translate::secret_spec_to_state(&spec);
     secret.tenant_id = tenant_id.to_owned();
+    secret.id = Tenant::object_id(tenant_id, &spec.Name);
     app.store.upsert_secret(secret.clone()).await?;
 
     tracing::info!(tenant = %tenant_id, secret = %secret.id, "secret created via API");
@@ -2400,11 +2501,8 @@ pub async fn get_secret(
     Path((_version, id)): Path<(String, String)>,
 ) -> ApiResult<Json<models::Secret>> {
     let tenant_id = tenant_scope(&caller)?;
-    let secret = app
-        .store
-        .get_secret(&id)
+    let secret = find_secret(&app, tenant_id, &id)
         .await?
-        .filter(|secret| secret.tenant_id == tenant_id)
         .ok_or_else(|| not_found("secret", &id))?;
 
     Ok(Json(translate::secret_to_docker(&secret)))
@@ -2417,11 +2515,8 @@ pub async fn delete_secret(
     Path((_version, id)): Path<(String, String)>,
 ) -> ApiResult<StatusCode> {
     let tenant_id = tenant_scope(&caller)?;
-    let secret = app
-        .store
-        .get_secret(&id)
+    let secret = find_secret(&app, tenant_id, &id)
         .await?
-        .filter(|secret| secret.tenant_id == tenant_id)
         .ok_or_else(|| not_found("secret", &id))?;
 
     app.store
@@ -2472,12 +2567,14 @@ pub async fn create_config(
     Json(spec): Json<models::ConfigSpec>,
 ) -> ApiResult<(StatusCode, Json<models::ConfigCreateResponse>)> {
     let tenant_id = tenant_scope(&caller)?;
-    if app.store.get_config(&spec.Name).await?.is_some() {
+    if find_config(&app, tenant_id, &spec.Name).await?.is_some() {
         return Err(conflict("config ID already exists"));
     }
+    Tenant::validate_object_name(tenant_id, &spec.Name).map_err(bad_request)?;
 
     let mut config = translate::config_spec_to_state(&spec);
     config.tenant_id = tenant_id.to_owned();
+    config.id = Tenant::object_id(tenant_id, &spec.Name);
     app.store.upsert_config(config.clone()).await?;
 
     tracing::info!(tenant = %tenant_id, config = %config.id, "config created via API");
@@ -2495,11 +2592,8 @@ pub async fn get_config(
     Path((_version, id)): Path<(String, String)>,
 ) -> ApiResult<Json<models::Config>> {
     let tenant_id = tenant_scope(&caller)?;
-    let config = app
-        .store
-        .get_config(&id)
+    let config = find_config(&app, tenant_id, &id)
         .await?
-        .filter(|config| config.tenant_id == tenant_id)
         .ok_or_else(|| not_found("config", &id))?;
 
     Ok(Json(translate::config_to_docker(&config)))
@@ -2512,11 +2606,8 @@ pub async fn delete_config(
     Path((_version, id)): Path<(String, String)>,
 ) -> ApiResult<StatusCode> {
     let tenant_id = tenant_scope(&caller)?;
-    let config = app
-        .store
-        .get_config(&id)
+    let config = find_config(&app, tenant_id, &id)
         .await?
-        .filter(|config| config.tenant_id == tenant_id)
         .ok_or_else(|| not_found("config", &id))?;
 
     app.store
@@ -2578,6 +2669,366 @@ mod tests {
             .await
             .unwrap();
         (Arc::new(AppState::with_bus(store, MemoryBus::new())), dir)
+    }
+
+    fn caller_in(tenant: &str) -> Extension<Caller> {
+        Extension(Caller {
+            name: "test".into(),
+            role: crate::auth::ApiRole::Admin,
+            tenant_id: Some(tenant.into()),
+            cluster_operator: false,
+        })
+    }
+
+    async fn add_tenant(app: &Arc<AppState>, id: &str) {
+        app.store
+            .create_tenant(Tenant {
+                nats_revoked_user_public_keys: Vec::new(),
+                id: id.into(),
+                name: id.into(),
+                quotas: Default::default(),
+                created_at: 1,
+            })
+            .await
+            .unwrap();
+    }
+
+    fn body<T: serde::de::DeserializeOwned>(value: serde_json::Value) -> Json<T> {
+        Json(serde_json::from_value(value).unwrap())
+    }
+
+    /// A service with no replicas, so it needs no node, that names a network and a secret.
+    fn named_service(name: &str, network: &str, secret: &str) -> serde_json::Value {
+        serde_json::json!({
+            "Name": name,
+            "TaskTemplate": {
+                "ContainerSpec": {
+                    "Image": "nginx:latest",
+                    "Secrets": [{
+                        "SecretID": secret,
+                        "SecretName": secret,
+                        "File": {"Name": secret, "UID": "0", "GID": "0", "Mode": 0}
+                    }]
+                },
+                "Networks": [{"Target": network}]
+            },
+            "Mode": {"Replicated": {"Replicas": 0}}
+        })
+    }
+
+    fn version_path(id: &str) -> Path<(String, String)> {
+        Path(("v1.41".to_string(), id.to_string()))
+    }
+
+    #[tokio::test]
+    async fn two_tenants_can_each_create_the_same_names() {
+        let (app, _dir) = app_with_node(1.0).await;
+        for tenant in ["acme", "beta"] {
+            add_tenant(&app, tenant).await;
+        }
+        let mut created = Vec::new();
+        for tenant in ["default", "acme", "beta"] {
+            let (_, Json(network)) = create_network(
+                State(app.clone()),
+                caller_in(tenant),
+                net_req("shared", serde_json::json!({})),
+            )
+            .await
+            .unwrap();
+            let (_, Json(secret)) = create_secret(
+                State(app.clone()),
+                caller_in(tenant),
+                body(serde_json::json!({"Name": "db"})),
+            )
+            .await
+            .unwrap();
+            let (_, Json(config)) = create_config(
+                State(app.clone()),
+                caller_in(tenant),
+                body(serde_json::json!({"Name": "cfg", "Data": "eA=="})),
+            )
+            .await
+            .unwrap();
+            let (_, Json(service)) = create_service(
+                State(app.clone()),
+                caller_in(tenant),
+                body(named_service("web", "shared", "db")),
+            )
+            .await
+            .unwrap();
+            // The service holds the IDs of this tenant's own network and secret.
+            let stored = app.store.get_service(&service.ID).await.unwrap().unwrap();
+            assert_eq!(stored.tenant_id, tenant);
+            assert_eq!(stored.networks, std::slice::from_ref(&network.ID));
+            assert_eq!(stored.secrets[0].secret_id, secret.ID);
+            created.push((network.ID, secret.ID, config.ID, service.ID));
+        }
+        let ids = |prefix: &str| {
+            ["shared", "db", "cfg", "web"].map(|name| {
+                if prefix.is_empty() {
+                    name.to_string()
+                } else {
+                    format!("{prefix}.{name}")
+                }
+            })
+        };
+        // The default tenant keeps bare IDs; the others are qualified, so they differ.
+        for (got, prefix) in created.iter().zip(["", "acme", "beta"]) {
+            assert_eq!([&got.0, &got.1, &got.2, &got.3], ids(prefix).each_ref());
+        }
+
+        // Each tenant reads and removes its own by name, and no other.
+        let Json(secret) = get_secret(State(app.clone()), caller_in("acme"), version_path("db"))
+            .await
+            .unwrap();
+        assert_eq!(secret.ID, "acme.db");
+        delete_config(State(app.clone()), caller_in("acme"), version_path("cfg"))
+            .await
+            .unwrap();
+        assert!(app.store.get_config("acme.cfg").await.unwrap().is_none());
+        assert!(app.store.get_config("beta.cfg").await.unwrap().is_some());
+        assert!(app.store.get_config("cfg").await.unwrap().is_some());
+        // Creating a name the tenant already has is still a conflict.
+        let error = create_secret(
+            State(app.clone()),
+            caller_in("acme"),
+            body(serde_json::json!({"Name": "db"})),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, ApiError::Conflict(_)), "{error:?}");
+    }
+
+    #[tokio::test]
+    async fn another_tenants_name_is_the_same_as_no_name() {
+        let (app, _dir) = app_with_node(1.0).await;
+        for tenant in ["acme", "beta"] {
+            add_tenant(&app, tenant).await;
+        }
+        let _ = create_secret(
+            State(app.clone()),
+            caller_in("acme"),
+            body(serde_json::json!({"Name": "only-acme"})),
+        )
+        .await
+        .unwrap();
+        // Beta reads it and refers to it exactly as it would an absent name.
+        let foreign = get_secret(
+            State(app.clone()),
+            caller_in("beta"),
+            version_path("only-acme"),
+        )
+        .await
+        .unwrap_err();
+        let absent = get_secret(
+            State(app.clone()),
+            caller_in("beta"),
+            version_path("nobody"),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(foreign, ApiError::NotFound(_)), "{foreign:?}");
+        assert!(matches!(absent, ApiError::NotFound(_)), "{absent:?}");
+        let network = create_network(
+            State(app.clone()),
+            caller_in("beta"),
+            net_req("n", serde_json::json!({})),
+        )
+        .await
+        .unwrap();
+        let refers = |secret: &str| body::<models::ServiceSpec>(named_service("svc", "n", secret));
+        let foreign = create_service(State(app.clone()), caller_in("beta"), refers("only-acme"))
+            .await
+            .unwrap_err();
+        let absent = create_service(State(app.clone()), caller_in("beta"), refers("nobody"))
+            .await
+            .unwrap_err();
+        let (ApiError::BadRequest(foreign), ApiError::BadRequest(absent)) = (foreign, absent)
+        else {
+            panic!("a foreign and an absent secret must both be refused as not declared");
+        };
+        assert_eq!(
+            foreign.replace("only-acme", "X"),
+            absent.replace("nobody", "X")
+        );
+        drop(network);
+        // And beta can create a name acme holds, as it could an absent one.
+        let (status, Json(created)) = create_secret(
+            State(app.clone()),
+            caller_in("beta"),
+            body(serde_json::json!({"Name": "only-acme"})),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            (status, created.ID.as_str()),
+            (StatusCode::CREATED, "beta.only-acme")
+        );
+    }
+
+    #[tokio::test]
+    async fn objects_stored_with_a_bare_id_are_still_found_by_name_by_their_tenant_only() {
+        let (app, _dir) = app_with_node(1.0).await;
+        for tenant in ["acme", "beta"] {
+            add_tenant(&app, tenant).await;
+        }
+        // What a cluster upgraded from before names were scoped holds.
+        app.store
+            .upsert_secret(minga_state::types::Secret {
+                id: "legacy".into(),
+                tenant_id: "acme".into(),
+                name: "legacy".into(),
+            })
+            .await
+            .unwrap();
+        let Json(found) = get_secret(
+            State(app.clone()),
+            caller_in("acme"),
+            version_path("legacy"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(found.ID, "legacy");
+        let error = get_secret(
+            State(app.clone()),
+            caller_in("beta"),
+            version_path("legacy"),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, ApiError::NotFound(_)), "{error:?}");
+        // It is acme's name: acme cannot make a second one, beta can make its own.
+        let error = create_secret(
+            State(app.clone()),
+            caller_in("acme"),
+            body(serde_json::json!({"Name": "legacy"})),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, ApiError::Conflict(_)), "{error:?}");
+        let (_, Json(own)) = create_secret(
+            State(app.clone()),
+            caller_in("beta"),
+            body(serde_json::json!({"Name": "legacy"})),
+        )
+        .await
+        .unwrap();
+        assert_eq!(own.ID, "beta.legacy");
+        // A service of acme that names `legacy` gets the stored ID.
+        let _ = create_network(
+            State(app.clone()),
+            caller_in("acme"),
+            net_req("n", serde_json::json!({})),
+        )
+        .await
+        .unwrap();
+        let (_, Json(service)) = create_service(
+            State(app.clone()),
+            caller_in("acme"),
+            body(named_service("svc", "n", "legacy")),
+        )
+        .await
+        .unwrap();
+        let stored = app.store.get_service(&service.ID).await.unwrap().unwrap();
+        assert_eq!(stored.secrets[0].secret_id, "legacy");
+        assert_eq!(stored.networks, ["acme.n"]);
+    }
+
+    #[tokio::test]
+    async fn a_v11_snapshot_keeps_its_ownership_and_its_names_still_resolve() {
+        let (app, _dir) = app_with_node(1.0).await;
+        add_tenant(&app, "acme").await;
+        add_tenant(&app, "beta").await;
+        let mut service = translate::service_spec_to_state(&spec("app.web", 0)).unwrap();
+        service.tenant_id = "acme".into();
+        service.secrets = vec![minga_state::types::SecretRef::new(
+            "app_db",
+            "/run/secrets/db",
+        )];
+        let snapshot = serde_json::to_value(minga_state::StateSnapshot {
+            format_version: minga_state::codec::FORMAT_VERSION,
+            exported_at_unix: 0,
+            tenants: vec![],
+            services: vec![service],
+            networks: vec![],
+            volumes: vec![],
+            secrets: vec![minga_state::types::Secret {
+                id: "app_db".into(),
+                tenant_id: "acme".into(),
+                name: "app_db".into(),
+            }],
+            configs: vec![],
+        })
+        .unwrap();
+        let _ = import_state(
+            State(app.clone()),
+            caller_in("acme"),
+            Query(ImportQuery { overwrite: false }),
+            Json(snapshot),
+        )
+        .await
+        .expect("a snapshot of bare IDs imports");
+        assert_eq!(
+            app.store
+                .get_secret("app_db")
+                .await
+                .unwrap()
+                .unwrap()
+                .tenant_id,
+            "acme"
+        );
+        assert_eq!(
+            app.store
+                .get_service("app.web")
+                .await
+                .unwrap()
+                .unwrap()
+                .tenant_id,
+            "acme"
+        );
+        let Json(secret) = get_secret(
+            State(app.clone()),
+            caller_in("acme"),
+            version_path("app_db"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(secret.ID, "app_db");
+        assert!(get_secret(
+            State(app.clone()),
+            caller_in("beta"),
+            version_path("app_db")
+        )
+        .await
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn names_are_checked_before_a_tenant_qualifies_them() {
+        let (app, _dir) = app_with_node(1.0).await;
+        add_tenant(&app, "acme").await;
+        for name in ["has space", "-leading", "trailing.", "a/b", &"n".repeat(70)] {
+            let error = create_secret(
+                State(app.clone()),
+                caller_in("acme"),
+                body(serde_json::json!({"Name": name})),
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                matches!(error, ApiError::BadRequest(_)),
+                "{name}: {error:?}"
+            );
+        }
+        // The default tenant keeps accepting what it always did.
+        let (_, Json(created)) = create_secret(
+            State(app.clone()),
+            default_caller(),
+            body(serde_json::json!({"Name": "has space"})),
+        )
+        .await
+        .unwrap();
+        assert_eq!(created.ID, "has space");
     }
 
     fn tenant_request(id: &str) -> Json<CreateTenantRequest> {
@@ -2644,6 +3095,22 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn two_creates_of_one_tenant_leave_the_winner_its_bus_resources() {
+        let (app, _dir) = app_with_node(1.0).await;
+        let bus = app.bus.clone().unwrap();
+        let (first, second) = tokio::join!(
+            create_tenant(State(app.clone()), default_caller(), tenant_request("race")),
+            create_tenant(State(app.clone()), default_caller(), tenant_request("race")),
+        );
+        let outcomes = [first.is_ok(), second.is_ok()];
+        assert_eq!(outcomes.iter().filter(|ok| **ok).count(), 1, "{outcomes:?}");
+        // The loser did not roll back what the winner made.
+        assert!(app.store.get_tenant("race").await.unwrap().is_some());
+        assert!(bus.tenant_resources_exist("race").await.unwrap());
+        assert_eq!(bus.list_audit("race", 10).await.unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -3151,7 +3618,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn egress_route_secrets_of_another_tenant_are_not_found() {
+    async fn egress_route_secrets_of_another_tenant_are_not_declared() {
         let (app, _dir) = app_with_node(1.0).await;
         let mut node = app.store.get_node(1).await.unwrap().unwrap();
         node.labels.insert(
@@ -3212,7 +3679,25 @@ mod tests {
         let err = create_service(State(app.clone()), default_caller(), Json(docker.clone()))
             .await
             .unwrap_err();
-        assert!(matches!(err, ApiError::NotFound(_)), "{err:?}");
+        // Another tenant's secret and an absent one get the same answer, apart
+        // from the name the caller wrote.
+        let ApiError::BadRequest(foreign) = err else {
+            panic!("want a not-declared answer, got {err:?}");
+        };
+        let mut absent_svc = svc.clone();
+        absent_svc.egress = Some(egress_policy("absent-key"));
+        let absent_spec = translate::service_to_docker(&absent_svc).Spec;
+        let ApiError::BadRequest(absent) =
+            create_service(State(app.clone()), default_caller(), Json(absent_spec))
+                .await
+                .unwrap_err()
+        else {
+            panic!("an absent secret is not declared");
+        };
+        assert_eq!(
+            foreign.replace("acme-key", "X"),
+            absent.replace("absent-key", "X")
+        );
 
         // The caller's own secrets pass the ownership check.
         svc.egress = Some(egress_policy("default-key"));

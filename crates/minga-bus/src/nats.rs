@@ -776,14 +776,6 @@ impl NatsBus {
             .lock()
             .unwrap()
             .remove(tenant_id);
-        for name in Self::tenant_streams(tenant_id) {
-            if let Err(error) = self.js.delete_stream(&name).await {
-                // Gone already, or a concurrent delete won.
-                if self.stream_exists(&name).await? {
-                    return Err(BusError::Other(format!("delete {name}: {error}")));
-                }
-            }
-        }
         self.js
             .get_stream("MINGA_EVENTS")
             .await
@@ -817,16 +809,36 @@ impl NatsBus {
             if !key.starts_with(subjects::NODE_JOIN_PREFIX) {
                 continue;
             }
-            let joined = self
+            let Some(entry) = self
                 .status_kv
-                .get(&key)
+                .entry(&key)
                 .await
-                .map_err(|error| BusError::Kv(format!("get {key}: {error}")))?;
-            if joined.as_deref() == Some(tenant_id.as_bytes()) {
-                self.status_kv
-                    .purge(&key)
+                .map_err(|error| BusError::Kv(format!("get {key}: {error}")))?
+            else {
+                continue;
+            };
+            if entry.value.as_ref() == tenant_id.as_bytes() {
+                // Only while the key is still the revision read: a node ID the
+                // deleted tenant had may have joined another tenant since, and
+                // that newer record must stay. A refusal means it changed.
+                if let Err(error) = self
+                    .status_kv
+                    .purge_expect_revision(&key, Some(entry.revision))
                     .await
-                    .map_err(|error| BusError::Kv(format!("purge {key}: {error}")))?;
+                {
+                    tracing::debug!(%key, %error, "node-join record changed during tenant cleanup; kept");
+                }
+            }
+        }
+        // Last, so that a failure above leaves a stream behind and the tenant
+        // still shows as having resources: a repeated delete then finishes the
+        // cleanup, and a create over the leftovers is refused.
+        for name in Self::tenant_streams(tenant_id) {
+            if let Err(error) = self.js.delete_stream(&name).await {
+                // Gone already, or a concurrent delete won.
+                if self.stream_exists(&name).await? {
+                    return Err(BusError::Other(format!("delete {name}: {error}")));
+                }
             }
         }
         Ok(())

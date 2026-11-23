@@ -203,7 +203,27 @@ impl EventBus for MemoryBus {
     }
     async fn tenant_resources_exist(&self, tenant_id: &str) -> Result<bool> {
         validate_tenant_id(tenant_id)?;
-        Ok(self.tenant_resources.lock().unwrap().contains(tenant_id))
+        // Configured, or holding data some write kept without configuring it.
+        Ok(self.tenant_resources.lock().unwrap().contains(tenant_id)
+            || self.tenant_audit.lock().unwrap().contains_key(tenant_id)
+            || self
+                .tenant_status
+                .lock()
+                .unwrap()
+                .keys()
+                .any(|(tenant, _)| tenant == tenant_id)
+            || self
+                .tenant_events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(tenant, _)| tenant == tenant_id)
+            || self
+                .usage
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|event| event.tenant_id == tenant_id))
     }
     async fn delete_tenant_resources(&self, tenant_id: &str) -> Result<()> {
         validate_tenant_id(tenant_id)?;
@@ -214,6 +234,26 @@ impl EventBus for MemoryBus {
             .retain(|(tenant, _)| tenant != tenant_id);
         self.tenant_audit.lock().unwrap().remove(tenant_id);
         self.tenant_status
+            .lock()
+            .unwrap()
+            .retain(|(tenant, _), _| tenant != tenant_id);
+        self.tenant_log_history
+            .lock()
+            .unwrap()
+            .retain(|(tenant, _), _| tenant != tenant_id);
+        self.tenant_api_requests
+            .lock()
+            .unwrap()
+            .retain(|(tenant, _), _| tenant != tenant_id);
+        self.usage
+            .lock()
+            .unwrap()
+            .retain(|event| event.tenant_id != tenant_id);
+        self.usage_ids
+            .lock()
+            .unwrap()
+            .retain(|(tenant, _)| tenant != tenant_id);
+        self.leases
             .lock()
             .unwrap()
             .retain(|(tenant, _), _| tenant != tenant_id);
@@ -914,6 +954,40 @@ mod tests {
     use super::*;
     use crate::subjects;
     use futures::StreamExt;
+
+    #[tokio::test]
+    async fn a_tenants_retained_data_counts_as_resources_and_deleting_clears_all_of_it() {
+        let bus = MemoryBus::new();
+        for tenant in ["gone", "kept"] {
+            bus.append_audit(crate::AuditRecord {
+                tenant_id: tenant.into(),
+                actor: "operator".into(),
+                action: "tenant.test".into(),
+                resource_path: format!("/tenants/{tenant}"),
+                occurred_at_unix: 1,
+            })
+            .await
+            .unwrap();
+            bus.put_tenant_status(tenant, "node.1.task.t", b"running")
+                .await
+                .unwrap();
+            bus.refresh_tenant_lease(tenant, 1, b"registration")
+                .await
+                .unwrap();
+        }
+        // Nothing was configured, yet data is retained, so the ID is not free.
+        assert!(bus.tenant_resources_exist("gone").await.unwrap());
+
+        bus.delete_tenant_resources("gone").await.unwrap();
+        assert!(!bus.tenant_resources_exist("gone").await.unwrap());
+        assert!(bus.list_audit("gone", 10).await.unwrap().is_empty());
+        assert!(bus.list_tenant_status("gone").await.unwrap().is_empty());
+        assert!(!bus.is_tenant_node_alive("gone", 1).await.unwrap());
+        // Another tenant keeps everything.
+        assert!(bus.tenant_resources_exist("kept").await.unwrap());
+        assert_eq!(bus.list_audit("kept", 10).await.unwrap().len(), 1);
+        assert!(bus.is_tenant_node_alive("kept", 1).await.unwrap());
+    }
 
     #[tokio::test]
     async fn tenant_event_history_is_filtered_and_bounded() {
