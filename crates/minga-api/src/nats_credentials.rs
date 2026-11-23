@@ -156,17 +156,17 @@ fn worker_permission_template(tenant_id: &str) -> (Vec<String>, Vec<String>) {
         format!("$KV.MINGA_STATUS_{tenant_id}.node.{node}.task.>"),
         format!("$KV.MINGA_LEASES.{tenant_id}.lease.node.{node}"),
         format!("$JS.API.STREAM.INFO.KV_MINGA_STATUS_{tenant_id}"),
-        "$JS.FC.KV_MINGA_ASSIGN.>".to_string(),
-        format!("$JS.API.CONSUMER.CREATE.KV_MINGA_ASSIGN.*.$KV.MINGA_ASSIGN.{tenant_id}.node.{node}.task.>"),
-        format!("$JS.API.CONSUMER.CREATE.KV_MINGA_ASSIGN.*.$KV.MINGA_ASSIGN.{tenant_id}.node.{node}.ingress.>"),
-        format!("$JS.API.CONSUMER.CREATE.KV_MINGA_ASSIGN.*.$KV.MINGA_ASSIGN.{tenant_id}.node.{node}.net.>"),
-        format!("$JS.API.CONSUMER.CREATE.KV_MINGA_ASSIGN.*.$KV.MINGA_ASSIGN.{tenant_id}.node.{node}.wg"),
+        format!("$JS.FC.KV_MINGA_ASSIGN_{tenant_id}.>"),
+        format!("$JS.API.CONSUMER.CREATE.KV_MINGA_ASSIGN_{tenant_id}.*.$KV.MINGA_ASSIGN_{tenant_id}.{tenant_id}.node.{node}.task.>"),
+        format!("$JS.API.CONSUMER.CREATE.KV_MINGA_ASSIGN_{tenant_id}.*.$KV.MINGA_ASSIGN_{tenant_id}.{tenant_id}.node.{node}.ingress.>"),
+        format!("$JS.API.CONSUMER.CREATE.KV_MINGA_ASSIGN_{tenant_id}.*.$KV.MINGA_ASSIGN_{tenant_id}.{tenant_id}.node.{node}.net.>"),
+        format!("$JS.API.CONSUMER.CREATE.KV_MINGA_ASSIGN_{tenant_id}.*.$KV.MINGA_ASSIGN_{tenant_id}.{tenant_id}.node.{node}.wg"),
         // No CONSUMER.INFO: it returns any consumer's filter subject, which
         // names another tenant's node; ordered watches recover with CREATE.
-        format!("$JS.API.DIRECT.GET.KV_MINGA_ASSIGN.$KV.MINGA_ASSIGN.{tenant_id}.node.{node}.task.>"),
-        format!("$JS.API.DIRECT.GET.KV_MINGA_ASSIGN.$KV.MINGA_ASSIGN.{tenant_id}.node.{node}.ingress.>"),
-        format!("$JS.API.DIRECT.GET.KV_MINGA_ASSIGN.$KV.MINGA_ASSIGN.{tenant_id}.node.{node}.net.>"),
-        format!("$JS.API.DIRECT.GET.KV_MINGA_ASSIGN.$KV.MINGA_ASSIGN.{tenant_id}.node.{node}.wg"),
+        format!("$JS.API.DIRECT.GET.KV_MINGA_ASSIGN_{tenant_id}.$KV.MINGA_ASSIGN_{tenant_id}.{tenant_id}.node.{node}.task.>"),
+        format!("$JS.API.DIRECT.GET.KV_MINGA_ASSIGN_{tenant_id}.$KV.MINGA_ASSIGN_{tenant_id}.{tenant_id}.node.{node}.ingress.>"),
+        format!("$JS.API.DIRECT.GET.KV_MINGA_ASSIGN_{tenant_id}.$KV.MINGA_ASSIGN_{tenant_id}.{tenant_id}.node.{node}.net.>"),
+        format!("$JS.API.DIRECT.GET.KV_MINGA_ASSIGN_{tenant_id}.$KV.MINGA_ASSIGN_{tenant_id}.{tenant_id}.node.{node}.wg"),
         format!("$JS.API.DIRECT.GET.KV_MINGA_STATUS_{tenant_id}.$KV.MINGA_STATUS_{tenant_id}.node.{node}.task.>"),
         format!("$JS.API.DIRECT.GET.KV_MINGA_LEASES.$KV.MINGA_LEASES.{tenant_id}.lease.node.{node}"),
     ];
@@ -301,18 +301,19 @@ mod tests {
     fn wireguard_watch_permissions_are_limited_to_the_tenant_node_key() {
         let (publish, subscribe) = worker_permission_template("tenant-a");
         let create_consumer =
-            "$JS.API.CONSUMER.CREATE.KV_MINGA_ASSIGN.*.$KV.MINGA_ASSIGN.tenant-a.node.{{tag(node)}}.wg";
+            "$JS.API.CONSUMER.CREATE.KV_MINGA_ASSIGN_tenant-a.*.$KV.MINGA_ASSIGN_tenant-a.tenant-a.node.{{tag(node)}}.wg";
 
         assert!(publish
             .iter()
             .any(|permission| permission == create_consumer));
         assert!(publish.iter().any(|permission| {
             permission
-            == "$JS.API.DIRECT.GET.KV_MINGA_ASSIGN.$KV.MINGA_ASSIGN.tenant-a.node.{{tag(node)}}.wg"
+            == "$JS.API.DIRECT.GET.KV_MINGA_ASSIGN_tenant-a.$KV.MINGA_ASSIGN_tenant-a.tenant-a.node.{{tag(node)}}.wg"
         }));
-        assert!(!publish.iter().chain(&subscribe).any(
-            |permission| permission.contains("$KV.MINGA_ASSIGN.tenant-a.node.{{tag(node)}}.>")
-        ));
+        assert!(
+            !publish.iter().chain(&subscribe).any(|permission| permission
+                .contains("$KV.MINGA_ASSIGN_tenant-a.tenant-a.node.{{tag(node)}}.>"))
+        );
     }
 
     #[test]
@@ -346,12 +347,12 @@ mod tests {
             // Usage subjects name the service, not the node.
             "minga.tenant-a.usage.>",
             // Flow-control replies to ordered watches name only the random consumer.
-            "$JS.FC.KV_MINGA_ASSIGN.>",
+            "$JS.FC.KV_MINGA_ASSIGN_tenant-a.>",
         ];
         let pinned_prefixes = [
             "minga.tenant-a.log.node.7",
             "minga.tenant-a.ctl.node.7",
-            "$KV.MINGA_ASSIGN.tenant-a.node.7",
+            "$KV.MINGA_ASSIGN_tenant-a.tenant-a.node.7",
             "$KV.MINGA_STATUS_tenant-a.node.7",
             "$KV.MINGA_LEASES.tenant-a.lease.node.7",
             "_INBOX.tenant-a.7",
@@ -371,8 +372,8 @@ mod tests {
             // A JetStream API grant is pinned by the subject it names: the
             // consumer filter (after the random consumer name) or the key read.
             let subject = [
-                "$JS.API.CONSUMER.CREATE.KV_MINGA_ASSIGN.*.",
-                "$JS.API.DIRECT.GET.KV_MINGA_ASSIGN.",
+                "$JS.API.CONSUMER.CREATE.KV_MINGA_ASSIGN_tenant-a.*.",
+                "$JS.API.DIRECT.GET.KV_MINGA_ASSIGN_tenant-a.",
                 "$JS.API.DIRECT.GET.KV_MINGA_STATUS_tenant-a.",
                 "$JS.API.DIRECT.GET.KV_MINGA_LEASES.",
             ]
@@ -498,16 +499,16 @@ mod tests {
         for own in [
             "$KV.MINGA_STATUS_tenant-a.node.7.task.t1",
             "minga.tenant-a.log.node.7.web.1.3",
-            "$JS.API.DIRECT.GET.KV_MINGA_ASSIGN.$KV.MINGA_ASSIGN.tenant-a.node.7.task.t1",
-            "$JS.API.DIRECT.GET.KV_MINGA_ASSIGN.$KV.MINGA_ASSIGN.tenant-a.node.7.wg",
+            "$JS.API.DIRECT.GET.KV_MINGA_ASSIGN_tenant-a.$KV.MINGA_ASSIGN_tenant-a.tenant-a.node.7.task.t1",
+            "$JS.API.DIRECT.GET.KV_MINGA_ASSIGN_tenant-a.$KV.MINGA_ASSIGN_tenant-a.tenant-a.node.7.wg",
         ] {
             assert!(allows(&publish, own), "{own} should be publishable");
         }
         for foreign in [
-            "$KV.MINGA_ASSIGN.tenant-a.node.8.task.t1",
-            "$KV.MINGA_ASSIGN.tenant-b.node.7.task.t1",
-            "$KV.MINGA_ASSIGN.tenant-a.node.8.wg",
-            "$KV.MINGA_ASSIGN.tenant-b.node.7.wg",
+            "$KV.MINGA_ASSIGN_tenant-a.tenant-a.node.8.task.t1",
+            "$KV.MINGA_ASSIGN_tenant-b.tenant-b.node.7.task.t1",
+            "$KV.MINGA_ASSIGN_tenant-a.tenant-a.node.8.wg",
+            "$KV.MINGA_ASSIGN_tenant-b.tenant-b.node.7.wg",
             "$KV.MINGA_STATUS_tenant-a.node.8.task.t1",
             "$KV.MINGA_STATUS_tenant-b.node.7.task.t1",
             "$KV.MINGA_LEASES.tenant-a.lease.node.8",
@@ -518,9 +519,9 @@ mod tests {
             "minga.tenant-b.log.node.7.t1",
             "_INBOX.tenant-a.8.reply",
             "_INBOX.tenant-b.7.reply",
-            "$JS.API.CONSUMER.CREATE.KV_MINGA_ASSIGN.c.$KV.MINGA_ASSIGN.tenant-a.node.8.task.>",
-            "$JS.API.CONSUMER.CREATE.KV_MINGA_ASSIGN.c.$KV.MINGA_ASSIGN.tenant-b.node.7.wg",
-            "$JS.API.DIRECT.GET.KV_MINGA_ASSIGN.$KV.MINGA_ASSIGN.tenant-a.node.8.task.t1",
+            "$JS.API.CONSUMER.CREATE.KV_MINGA_ASSIGN_tenant-a.c.$KV.MINGA_ASSIGN_tenant-a.tenant-a.node.8.task.>",
+            "$JS.API.CONSUMER.CREATE.KV_MINGA_ASSIGN_tenant-b.c.$KV.MINGA_ASSIGN_tenant-b.tenant-b.node.7.wg",
+            "$JS.API.DIRECT.GET.KV_MINGA_ASSIGN_tenant-a.$KV.MINGA_ASSIGN_tenant-a.tenant-a.node.8.task.t1",
             "$JS.API.DIRECT.GET.KV_MINGA_STATUS_tenant-b.$KV.MINGA_STATUS_tenant-b.node.7.task.t1",
         ] {
             assert!(

@@ -18,7 +18,7 @@
 //!
 //! | Bucket | Keys | Purpose |
 //! |---|---|---|
-//! | `MINGA_ASSIGN` | `<tenant>.node.{id}.task.{id}`, `.net.{id}`, `.ingress.*`, `.wg` | Manager-authored tenant/node assignments |
+//! | `MINGA_ASSIGN_<tenant>` | `<tenant>.node.{id}.task.{id}`, `.net.{id}`, `.ingress.*`, `.wg` | Manager-authored node assignments, one bucket per tenant |
 //! | `MINGA_LEASES` | `<tenant>.lease.node.{id}` | Tenant-scoped, server-expiring registration lease |
 //! | `MINGA_STATUS_<tenant>` | `node.{id}.task.{id}` | Tenant-scoped actual task status |
 //! | `MINGA_USAGE_<tenant>`, `MINGA_BUDGET_<tenant>` | Accounting keys | Tenant quota buckets |
@@ -76,6 +76,12 @@ const NAK_DELAY: Duration = Duration::from_secs(5);
 /// watches each, plus listings) with 10x headroom; raise it if a cluster
 /// outgrows that.
 const BUCKET_MAX_CONSUMERS: i32 = 100_000;
+/// Consumer limit of a tenant's assignment bucket. A worker can create
+/// consumers of any name there, and its ACL cannot count them, so this is the
+/// most one tenant can make: other tenants' buckets are unaffected.
+/// shortcut: two watches each for 2,500 nodes; raise it for a tenant with more.
+const TENANT_ASSIGN_MAX_CONSUMERS: i32 = 5_000;
+const ASSIGN_STREAM_PREFIX: &str = "KV_MINGA_ASSIGN_";
 const EVENT_SUBJECTS: [&str; 3] = ["minga.*.node.>", "minga.*.task.>", "minga.*.egress.>"];
 const DEFAULT_TENANT_STREAM_MAX_BYTES: i64 = 512 * 1024 * 1024;
 const MAX_TENANT_STREAM_MAX_BYTES: i64 = 10 * 1024 * 1024 * 1024;
@@ -83,26 +89,23 @@ const DEFAULT_TENANT_STREAM_MAX_AGE: Duration = Duration::from_secs(24 * 3600);
 const MAX_TENANT_STREAM_MAX_AGE: Duration = Duration::from_secs(365 * 24 * 3600);
 
 /// Streams (KV buckets are `KV_`-prefixed streams) that losing one NATS
-/// server must not lose. Shared and per-tenant log streams stay at one replica:
+/// server must not lose. Each tenant's assignment bucket is replicated too. Shared and per-tenant log streams stay at one replica:
 /// they are best effort, and edge disks are small.
-const REPLICATED: [&str; 4] = [
-    "MINGA_EVENTS",
-    "KV_MINGA_STATUS",
-    "KV_MINGA_LEASES",
-    "KV_MINGA_ASSIGN",
-];
+const REPLICATED: [&str; 3] = ["MINGA_EVENTS", "KV_MINGA_STATUS", "KV_MINGA_LEASES"];
 
 // ---------------------------------------------------------------------------
 // NatsBus
 // ---------------------------------------------------------------------------
 
-/// A KV bucket every tenant shares (`MINGA_ASSIGN`, `MINGA_LEASES`).
+/// A KV bucket as a manager or a worker opens it: a worker holds a stream
+/// handle only (`MINGA_LEASES`, and its own tenant's `MINGA_ASSIGN_<tenant>`).
 ///
 /// A worker holds only a stream handle: opening a `Store` costs a STREAM.INFO
 /// call, and with `subjects_filter` that call lists every tenant's keys, so
 /// the worker ACL does not grant it.
 // Two per bus, so the variant size gap costs nothing.
 #[allow(clippy::large_enum_variant)]
+#[derive(Clone)]
 enum SharedKv {
     Manager(jetstream::kv::Store),
     Worker {
@@ -201,7 +204,10 @@ pub struct NatsBus {
     client: Client,
     js: JetStream,
     status_kv: jetstream::kv::Store,
-    assignments_kv: SharedKv,
+    /// A worker's own tenant's assignment bucket. Managers have none and open
+    /// one bucket per tenant on demand, see `assign_kv`.
+    worker_assignments_kv: Option<SharedKv>,
+    manager_assignments_kv: std::sync::Mutex<std::collections::HashMap<String, SharedKv>>,
     leases_kv: SharedKv,
     api_level: Option<usize>,
     worker_node_id: Option<u64>,
@@ -396,19 +402,19 @@ impl NatsBus {
     /// worker ACL constrains the filter subject to that node's key prefix.
     async fn assignment_consumer(
         &self,
+        kv: &SharedKv,
         prefix: &str,
         deliver_policy: DeliverPolicy,
     ) -> Result<(u64, jetstream::consumer::push::Ordered)> {
         let inbox = self.client.new_inbox();
         let name = inbox.rsplit('.').next().unwrap_or_default().to_owned();
         let filter = crate::assignment_watch_filter(prefix);
-        let consumer = self
-            .assignments_kv
+        let consumer = kv
             .create_consumer(jetstream::consumer::push::OrderedConfig {
                 name: Some(name),
                 deliver_subject: inbox,
                 description: Some("assignment consumer".to_string()),
-                filter_subject: format!("{}{filter}", self.assignments_kv.prefix()),
+                filter_subject: format!("{}{filter}", kv.prefix()),
                 replay_policy: jetstream::consumer::ReplayPolicy::Instant,
                 deliver_policy,
                 ..Default::default()
@@ -423,8 +429,88 @@ impl NatsBus {
         Ok((pending, messages))
     }
 
-    fn assignment_event(&self, message: &jetstream::Message) -> Option<KvEvent> {
-        kv_event(self.assignments_kv.prefix(), message)
+    /// The tenant an assignment key or prefix belongs to: its first token.
+    fn assignment_tenant(key: &str) -> Result<&str> {
+        let tenant = key.split('.').next().unwrap_or_default();
+        validate_tenant_id(tenant)?;
+        Ok(tenant)
+    }
+
+    /// The assignment bucket of `tenant_id`. A worker has only its own
+    /// tenant's; a manager opens a tenant's on first use and keeps the handle.
+    async fn assign_kv(&self, tenant_id: &str) -> Result<SharedKv> {
+        validate_tenant_id(tenant_id)?;
+        if let Some(kv) = &self.worker_assignments_kv {
+            return match self.worker_tenant_id.as_deref() {
+                Some(own) if own == tenant_id => Ok(kv.clone()),
+                _ => Err(BusError::Kv(
+                    "worker cannot access another tenant's assignments".into(),
+                )),
+            };
+        }
+        if let Some(kv) = self.manager_assignments_kv.lock().unwrap().get(tenant_id) {
+            return Ok(kv.clone());
+        }
+        self.ensure_tenant_resources(tenant_id).await?;
+        let bucket = subjects::assignment_bucket(tenant_id);
+        let store = self
+            .js
+            .get_key_value(&bucket)
+            .await
+            .map_err(|error| BusError::Kv(format!("open {bucket}: {error}")))?;
+        let kv = SharedKv::Manager(store);
+        self.manager_assignments_kv
+            .lock()
+            .unwrap()
+            .insert(tenant_id.to_owned(), kv.clone());
+        Ok(kv)
+    }
+
+    /// The tenants that have an assignment bucket.
+    async fn assignment_tenants(&self) -> Result<Vec<String>> {
+        let mut names = self.js.stream_names();
+        let mut tenants = Vec::new();
+        while let Some(name) = names.next().await {
+            let name = name.map_err(|error| BusError::Kv(format!("list streams: {error}")))?;
+            if let Some(tenant) = name.strip_prefix(ASSIGN_STREAM_PREFIX) {
+                tenants.push(tenant.to_owned());
+            }
+        }
+        Ok(tenants)
+    }
+
+    async fn list_tenant_assignments(
+        &self,
+        tenant_id: &str,
+        prefix: &str,
+    ) -> Result<Vec<(String, Vec<u8>)>> {
+        let kv = self.assign_kv(tenant_id).await?;
+        let (pending, mut messages) = self
+            .assignment_consumer(&kv, prefix, DeliverPolicy::LastPerSubject)
+            .await?;
+        // Keyed, so a key updated mid-listing yields its latest value once.
+        let mut entries = std::collections::BTreeMap::new();
+        if pending == 0 {
+            return Ok(Vec::new());
+        }
+        while let Some(message) = messages.next().await {
+            let message =
+                message.map_err(|error| BusError::Kv(format!("list assignments: {error}")))?;
+            let left = message
+                .info()
+                .map_err(|error| BusError::Kv(format!("assignment info: {error}")))?
+                .pending;
+            if let Some(event) = kv_event(kv.prefix(), &message) {
+                match event.value {
+                    Some(value) => entries.insert(event.key, value),
+                    None => entries.remove(&event.key),
+                };
+            }
+            if left == 0 {
+                break;
+            }
+        }
+        Ok(entries.into_iter().collect())
     }
 
     /// Raises the [`REPLICATED`] streams and buckets to `replicas` copies.
@@ -458,7 +544,29 @@ impl NatsBus {
     }
 
     async fn raise_replicas(&self, replicas: usize) -> Result<()> {
-        for name in REPLICATED {
+        // The shared streams first, the lease bucket among them, then the
+        // tenants' assignment buckets listed after that. A tenant created in
+        // between is listed, or reads the raised lease count when it is
+        // created (`match_lease_replicas`), so none stays below it.
+        self.raise_streams(REPLICATED.iter().map(|name| name.to_string()), replicas)
+            .await?;
+        let tenant_streams: Vec<String> = self
+            .assignment_tenants()
+            .await?
+            .into_iter()
+            .map(|tenant| format!("{ASSIGN_STREAM_PREFIX}{tenant}"))
+            .collect();
+        self.raise_streams(tenant_streams.into_iter(), replicas)
+            .await
+    }
+
+    async fn raise_streams(
+        &self,
+        names: impl Iterator<Item = String>,
+        replicas: usize,
+    ) -> Result<()> {
+        for name in names {
+            let name = name.as_str();
             let mut stream = self
                 .js
                 .get_stream(name)
@@ -548,6 +656,17 @@ impl NatsBus {
         if self.ensured_tenants.lock().unwrap().contains(tenant_id) {
             return Ok(());
         }
+        let assign_bucket = subjects::assignment_bucket(tenant_id);
+        Self::setup_kv_with_cap(
+            &self.js,
+            &assign_bucket,
+            Duration::ZERO,
+            TENANT_ASSIGN_MAX_CONSUMERS,
+        )
+        .await?;
+        // A tenant created after `ensure_replicas` would otherwise keep one copy.
+        self.match_lease_replicas(&format!("KV_{assign_bucket}"))
+            .await?;
         for (bucket, age) in [
             (format!("MINGA_STATUS_{tenant_id}"), Duration::ZERO),
             (
@@ -601,6 +720,58 @@ impl NatsBus {
             .insert(tenant_id.to_owned());
         Ok(())
     }
+    /// Gives `stream` at least as many replicas as the shared lease bucket,
+    /// which `ensure_replicas` sizes to the cluster.
+    ///
+    /// A write here carries a full stream config read a moment earlier, so one
+    /// that lands after `ensure_replicas` raised both streams further would
+    /// lower this one again. Each pass re-reads both counts and repairs the
+    /// stream until it is at least the lease bucket's, then stops.
+    async fn match_lease_replicas(&self, stream: &str) -> Result<()> {
+        for _ in 0..5 {
+            if self.match_lease_replicas_once(stream).await? {
+                return Ok(());
+            }
+        }
+        tracing::warn!(stream, "replica count did not settle at the lease bucket's");
+        Ok(())
+    }
+
+    /// One pass of `match_lease_replicas`; whether the stream was already
+    /// at least as replicated as the lease bucket.
+    async fn match_lease_replicas_once(&self, stream: &str) -> Result<bool> {
+        let replicas = self
+            .js
+            .get_stream("KV_MINGA_LEASES")
+            .await
+            .map_err(|error| BusError::Other(format!("KV_MINGA_LEASES: {error}")))?
+            .info()
+            .await
+            .map_err(|error| BusError::Other(format!("KV_MINGA_LEASES info: {error}")))?
+            .config
+            .num_replicas;
+        let mut handle = self
+            .js
+            .get_stream(stream)
+            .await
+            .map_err(|error| BusError::Other(format!("{stream}: {error}")))?;
+        let mut config = handle
+            .info()
+            .await
+            .map_err(|error| BusError::Other(format!("{stream} info: {error}")))?
+            .config
+            .clone();
+        if config.num_replicas >= replicas {
+            return Ok(true);
+        }
+        config.num_replicas = replicas;
+        self.js
+            .update_stream(config)
+            .await
+            .map_err(|error| BusError::Other(format!("{stream} replicas: {error}")))?;
+        Ok(false)
+    }
+
     pub async fn configure_tenant_quota(
         &self,
         tenant_id: &str,
@@ -785,14 +956,15 @@ impl NatsBus {
             .map_err(|e| BusError::Connection(e.to_string()))?;
         let js = jetstream::new(client.clone());
 
-        let (status_kv, assignments_kv, leases_kv) = Self::setup_when_ready(&js, lease_ttl).await?;
+        let (status_kv, leases_kv) = Self::setup_when_ready(&js, lease_ttl).await?;
         let api_level = Self::read_api_level(&js, &client).await;
 
         Ok(Arc::new(Self {
             client,
             js,
             status_kv,
-            assignments_kv,
+            worker_assignments_kv: None,
+            manager_assignments_kv: Default::default(),
             leases_kv,
             api_level,
             worker_node_id: None,
@@ -827,15 +999,15 @@ impl NatsBus {
 
         let js = jetstream::new(client.clone());
 
-        let (status_kv, assignments_kv, leases_kv) =
-            Self::setup_when_ready(&js, DEFAULT_LEASE_TTL).await?;
+        let (status_kv, leases_kv) = Self::setup_when_ready(&js, DEFAULT_LEASE_TTL).await?;
         let api_level = Self::read_api_level(&js, &client).await;
 
         Ok(Arc::new(Self {
             client,
             js,
             status_kv,
-            assignments_kv,
+            worker_assignments_kv: None,
+            manager_assignments_kv: Default::default(),
             leases_kv,
             api_level,
             worker_node_id: None,
@@ -861,14 +1033,15 @@ impl NatsBus {
 
         let js = jetstream::new(client.clone());
 
-        let (status_kv, assignments_kv, leases_kv) = Self::setup_when_ready(&js, lease_ttl).await?;
+        let (status_kv, leases_kv) = Self::setup_when_ready(&js, lease_ttl).await?;
         let api_level = Self::read_api_level(&js, &client).await;
 
         Ok(Arc::new(Self {
             client,
             js,
             status_kv,
-            assignments_kv,
+            worker_assignments_kv: None,
+            manager_assignments_kv: Default::default(),
             leases_kv,
             api_level,
             worker_node_id: None,
@@ -929,14 +1102,14 @@ impl NatsBus {
                 .await
                 .map_err(|error| BusError::Connection(format!("TLS connection failed: {error}")))?;
         let js = jetstream::new(client.clone());
-        let (status_kv, assignments_kv, leases_kv) =
-            Self::setup_when_ready(&js, DEFAULT_LEASE_TTL).await?;
+        let (status_kv, leases_kv) = Self::setup_when_ready(&js, DEFAULT_LEASE_TTL).await?;
         let api_level = Self::read_api_level(&js, &client).await;
         Ok(Arc::new(Self {
             client,
             js,
             status_kv,
-            assignments_kv,
+            worker_assignments_kv: None,
+            manager_assignments_kv: Default::default(),
             leases_kv,
             api_level,
             worker_node_id: None,
@@ -976,13 +1149,14 @@ impl NatsBus {
             .get_key_value(&status_bucket)
             .await
             .map_err(|error| BusError::Kv(format!("open {status_bucket}: {error}")))?;
-        let assignments_kv = SharedKv::worker(&js, "MINGA_ASSIGN").await?;
+        let assignments_kv = SharedKv::worker(&js, &subjects::assignment_bucket(tenant_id)).await?;
         let leases_kv = SharedKv::worker(&js, "MINGA_LEASES").await?;
         Ok(Arc::new(Self {
             client,
             js,
             status_kv,
-            assignments_kv,
+            worker_assignments_kv: Some(assignments_kv),
+            manager_assignments_kv: Default::default(),
             leases_kv,
             api_level: None,
             worker_node_id: Some(node_id),
@@ -1002,7 +1176,7 @@ impl NatsBus {
     async fn setup_when_ready(
         js: &JetStream,
         lease_ttl: Duration,
-    ) -> Result<(jetstream::kv::Store, SharedKv, SharedKv)> {
+    ) -> Result<(jetstream::kv::Store, SharedKv)> {
         const MAX_ATTEMPTS: u32 = 20;
         for attempt in 1..=MAX_ATTEMPTS {
             match Self::setup_all(js, lease_ttl).await {
@@ -1019,20 +1193,13 @@ impl NatsBus {
     async fn setup_all(
         js: &JetStream,
         lease_ttl: Duration,
-    ) -> Result<(jetstream::kv::Store, SharedKv, SharedKv)> {
+    ) -> Result<(jetstream::kv::Store, SharedKv)> {
         Self::setup_streams(js).await?;
         let status_kv = Self::setup_kv(js, "MINGA_STATUS", Duration::ZERO).await?;
-        let assignments_kv = Self::setup_kv(js, "MINGA_ASSIGN", Duration::ZERO).await?;
         let leases_kv = Self::setup_kv(js, "MINGA_LEASES", lease_ttl).await?;
-        // Leases expire on their own; these two buckets keep keys forever.
-        for kv in [&status_kv, &assignments_kv] {
-            purge_legacy_keys(kv).await;
-        }
-        Ok((
-            status_kv,
-            SharedKv::Manager(assignments_kv),
-            SharedKv::Manager(leases_kv),
-        ))
+        // Leases expire on their own; the status bucket keeps keys forever.
+        purge_legacy_keys(&status_kv).await;
+        Ok((status_kv, SharedKv::Manager(leases_kv)))
     }
 
     async fn setup_streams(js: &JetStream) -> Result<()> {
@@ -1099,6 +1266,15 @@ impl NatsBus {
         bucket: &str,
         max_age: Duration,
     ) -> Result<jetstream::kv::Store> {
+        Self::setup_kv_with_cap(js, bucket, max_age, BUCKET_MAX_CONSUMERS).await
+    }
+
+    async fn setup_kv_with_cap(
+        js: &JetStream,
+        bucket: &str,
+        max_age: Duration,
+        max_consumers: i32,
+    ) -> Result<jetstream::kv::Store> {
         // Get before create: an update would reset replicas raised by
         // `ensure_replicas` back to one.
         if let Ok(mut store) = js.get_key_value(bucket).await {
@@ -1121,7 +1297,7 @@ impl NatsBus {
                         .map_err(|e| BusError::Kv(format!("{bucket} max age: {e}")))?;
                 }
             }
-            Self::lift_consumer_cap(js, bucket, &mut store).await?;
+            Self::lift_consumer_cap(js, bucket, &mut store, max_consumers).await?;
             return Ok(store);
         }
         let config = KvConfig {
@@ -1134,7 +1310,7 @@ impl NatsBus {
             .create_key_value(config)
             .await
             .map_err(|e| BusError::Kv(format!("{bucket}: {e}")))?;
-        Self::lift_consumer_cap(js, bucket, &mut store).await?;
+        Self::lift_consumer_cap(js, bucket, &mut store, max_consumers).await?;
         Ok(store)
     }
 
@@ -1146,6 +1322,7 @@ impl NatsBus {
         js: &JetStream,
         bucket: &str,
         store: &mut jetstream::kv::Store,
+        max_consumers: i32,
     ) -> Result<()> {
         let mut config = store
             .stream
@@ -1154,10 +1331,10 @@ impl NatsBus {
             .map_err(|e| BusError::Kv(format!("{bucket} info: {e}")))?
             .config
             .clone();
-        if config.max_consumers >= BUCKET_MAX_CONSUMERS {
+        if config.max_consumers >= max_consumers {
             return Ok(());
         }
-        config.max_consumers = BUCKET_MAX_CONSUMERS;
+        config.max_consumers = max_consumers;
         if let Err(error) = js.update_stream(config).await {
             // Servers before 2.12.5 refuse to change max_consumers after
             // creation, but they also have no default cap to lift.
@@ -1573,7 +1750,8 @@ impl EventBus for NatsBus {
 
     async fn put_assignment(&self, key: &str, value: &[u8]) -> Result<()> {
         self.require_manager("write assignments")?;
-        self.assignments_kv
+        self.assign_kv(Self::assignment_tenant(key)?)
+            .await?
             .store("write assignments")?
             .put(key.to_string(), Bytes::copy_from_slice(value))
             .await
@@ -1583,7 +1761,8 @@ impl EventBus for NatsBus {
 
     async fn get_assignment(&self, key: &str) -> Result<Option<Vec<u8>>> {
         self.check_worker_key(key)?;
-        self.assignments_kv
+        self.assign_kv(Self::assignment_tenant(key)?)
+            .await?
             .get(key)
             .await
             .map(|value| value.map(|bytes| bytes.to_vec()))
@@ -1592,37 +1771,34 @@ impl EventBus for NatsBus {
 
     async fn list_assignments(&self, prefix: &str) -> Result<Vec<(String, Vec<u8>)>> {
         self.check_worker_prefix(prefix)?;
-        let (pending, mut messages) = self
-            .assignment_consumer(prefix, DeliverPolicy::LastPerSubject)
-            .await?;
-        // Keyed, so a key updated mid-listing yields its latest value once.
-        let mut entries = std::collections::BTreeMap::new();
-        if pending == 0 {
-            return Ok(Vec::new());
-        }
-        while let Some(message) = messages.next().await {
-            let message =
-                message.map_err(|error| BusError::Kv(format!("list assignments: {error}")))?;
-            let left = message
-                .info()
-                .map_err(|error| BusError::Kv(format!("assignment info: {error}")))?
-                .pending;
-            if let Some(event) = self.assignment_event(&message) {
-                match event.value {
-                    Some(value) => entries.insert(event.key, value),
-                    None => entries.remove(&event.key),
-                };
+        if prefix.is_empty() {
+            // Only a manager gets here: a worker's prefix is always its own.
+            let mut all = Vec::new();
+            // The only caller is the scheduler's sweep of stale keys. A tenant
+            // whose bucket cannot be listed (a full consumer limit, say) is
+            // skipped and logged, so it cannot stop the sweep of the others,
+            // and its keys are left alone: they are not in the result, so no
+            // caller can mistake them for absent and delete them.
+            for tenant in self.assignment_tenants().await? {
+                match self.list_tenant_assignments(&tenant, "").await {
+                    Ok(entries) => all.extend(entries),
+                    Err(error) => tracing::warn!(
+                        %tenant,
+                        %error,
+                        "cannot list a tenant's assignments; leaving its stale keys for a later pass"
+                    ),
+                }
             }
-            if left == 0 {
-                break;
-            }
+            return Ok(all);
         }
-        Ok(entries.into_iter().collect())
+        self.list_tenant_assignments(Self::assignment_tenant(prefix)?, prefix)
+            .await
     }
 
     async fn delete_assignment(&self, key: &str) -> Result<()> {
         self.require_manager("delete assignments")?;
-        self.assignments_kv
+        self.assign_kv(Self::assignment_tenant(key)?)
+            .await?
             .store("delete assignments")?
             .delete(key.to_string())
             .await
@@ -1631,8 +1807,11 @@ impl EventBus for NatsBus {
 
     async fn watch_assignments(&self, prefix: &str) -> Result<KvStream> {
         self.check_worker_watch(prefix)?;
-        let (_, messages) = self.assignment_consumer(prefix, DeliverPolicy::All).await?;
-        let prefix_subject = self.assignments_kv.prefix().to_owned();
+        let kv = self.assign_kv(Self::assignment_tenant(prefix)?).await?;
+        let (_, messages) = self
+            .assignment_consumer(&kv, prefix, DeliverPolicy::All)
+            .await?;
+        let prefix_subject = kv.prefix().to_owned();
         let prefix = prefix.to_string();
         let stream = messages.filter_map(move |message| {
             let prefix_subject = prefix_subject.clone();

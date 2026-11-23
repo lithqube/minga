@@ -829,14 +829,14 @@ async fn worker_certificate_cannot_write_assignments_or_other_nodes_status_and_l
         .await
         .expect("worker certificate connects");
     let stream = async_nats::jetstream::new(raw)
-        .get_stream_no_info("KV_MINGA_ASSIGN")
+        .get_stream_no_info("KV_MINGA_ASSIGN_default")
         .await
         .unwrap();
     // The server, not only the client guard, keeps worker 7 out of other
     // nodes' networks.
     for filter in [
-        "$KV.MINGA_ASSIGN.default.node.8.net.>",
-        "$KV.MINGA_ASSIGN.default.node.8.net.foreign",
+        "$KV.MINGA_ASSIGN_default.default.node.8.net.>",
+        "$KV.MINGA_ASSIGN_default.default.node.8.net.foreign",
     ] {
         let created = tokio::time::timeout(
             Duration::from_secs(2),
@@ -858,7 +858,7 @@ async fn worker_certificate_cannot_write_assignments_or_other_nodes_status_and_l
             stream.create_consumer(async_nats::jetstream::consumer::push::OrderedConfig {
                 name: name.clone(),
                 deliver_subject: "_INBOX.peek".to_string(),
-                filter_subject: "$KV.MINGA_ASSIGN.>".to_string(),
+                filter_subject: "$KV.MINGA_ASSIGN_default.>".to_string(),
                 ..Default::default()
             }),
         )
@@ -914,11 +914,11 @@ async fn worker_certificate_cannot_write_assignments_or_other_nodes_status_and_l
     assert!(worker_bus.is_tenant_node_alive("default", 7).await.unwrap());
 
     for subject in [
-        "$KV.MINGA_ASSIGN.default.node.7.task.forbidden",
-        "$KV.MINGA_ASSIGN.default.node.7.wg",
+        "$KV.MINGA_ASSIGN_default.default.node.7.task.forbidden",
+        "$KV.MINGA_ASSIGN_default.default.node.7.wg",
         "$KV.MINGA_LEASES.default.lease.node.8",
         "$KV.MINGA_STATUS_default.node.8.task.forbidden",
-        "$KV.MINGA_ASSIGN.beta.node.7.task.foreign-tenant",
+        "$KV.MINGA_ASSIGN_beta.beta.node.7.task.foreign-tenant",
         "minga.default.task.foreign.event",
         "minga.default.audit",
     ] {
@@ -997,10 +997,14 @@ async fn worker_cannot_list_other_tenants_keys_through_stream_info() {
         async_nats::connect_with_options(&url, manager_config.connect_options().unwrap())
             .await
             .unwrap();
-    let listed = stream_subjects(&manager_client, "KV_MINGA_ASSIGN", "$KV.MINGA_ASSIGN.>")
-        .await
-        .unwrap();
-    assert!(listed.contains(&"$KV.MINGA_ASSIGN.beta.node.9.ingress.8443".to_string()));
+    let listed = stream_subjects(
+        &manager_client,
+        "KV_MINGA_ASSIGN_beta",
+        "$KV.MINGA_ASSIGN_beta.>",
+    )
+    .await
+    .unwrap();
+    assert!(listed.contains(&"$KV.MINGA_ASSIGN_beta.beta.node.9.ingress.8443".to_string()));
     let listed = stream_subjects(&manager_client, "KV_MINGA_LEASES", ">")
         .await
         .unwrap();
@@ -1011,8 +1015,10 @@ async fn worker_cannot_list_other_tenants_keys_through_stream_info() {
         .await
         .unwrap();
     for (stream, filter) in [
-        ("KV_MINGA_ASSIGN", "$KV.MINGA_ASSIGN.>"),
-        ("KV_MINGA_ASSIGN", ">"),
+        ("KV_MINGA_ASSIGN_default", "$KV.MINGA_ASSIGN_default.>"),
+        ("KV_MINGA_ASSIGN_default", ">"),
+        ("KV_MINGA_ASSIGN_beta", "$KV.MINGA_ASSIGN_beta.>"),
+        ("KV_MINGA_ASSIGN_beta", ">"),
         ("KV_MINGA_LEASES", ">"),
     ] {
         let result = tokio::time::timeout(
@@ -1123,16 +1129,16 @@ async fn worker_cannot_learn_other_tenants_keys_through_request_bodies() {
     // worker's own prefix, is answered and delivers the worker's own key.
     let control_inbox = "_INBOX.default.7.qa-control";
     let mut control = worker.subscribe(control_inbox).await.unwrap();
-    let body = serde_json::json!({"stream_name": "KV_MINGA_ASSIGN", "config": {
+    let body = serde_json::json!({"stream_name": "KV_MINGA_ASSIGN_default", "config": {
         "name": "qa0",
         "deliver_subject": control_inbox,
         "deliver_policy": "all",
         "ack_policy": "none",
-        "filter_subject": "$KV.MINGA_ASSIGN.default.node.7.task.>",
+        "filter_subject": "$KV.MINGA_ASSIGN_default.default.node.7.task.>",
     }});
     let reply = worker
         .request(
-            "$JS.API.CONSUMER.CREATE.KV_MINGA_ASSIGN.qa0.$KV.MINGA_ASSIGN.default.node.7.task.>",
+            "$JS.API.CONSUMER.CREATE.KV_MINGA_ASSIGN_default.qa0.$KV.MINGA_ASSIGN_default.default.node.7.task.>",
             body.to_string().into(),
         )
         .await
@@ -1152,18 +1158,18 @@ async fn worker_cannot_learn_other_tenants_keys_through_request_bodies() {
     for (name, config) in [
         (
             "qa1",
-            serde_json::json!({"filter_subjects": ["$KV.MINGA_ASSIGN.beta.>"]}),
+            serde_json::json!({"filter_subjects": ["$KV.MINGA_ASSIGN_beta.beta.>"]}),
         ),
         (
             "qa2",
             serde_json::json!({"filter_subjects": [
-                "$KV.MINGA_ASSIGN.default.node.7.task.>",
-                "$KV.MINGA_ASSIGN.beta.>"
+                "$KV.MINGA_ASSIGN_default.default.node.7.task.>",
+                "$KV.MINGA_ASSIGN_beta.beta.>"
             ]}),
         ),
         (
             "qa3",
-            serde_json::json!({"filter_subject": "$KV.MINGA_ASSIGN.beta.>"}),
+            serde_json::json!({"filter_subject": "$KV.MINGA_ASSIGN_beta.beta.>"}),
         ),
         ("qa4", serde_json::json!({})),
     ] {
@@ -1172,9 +1178,9 @@ async fn worker_cannot_learn_other_tenants_keys_through_request_bodies() {
         config["deliver_subject"] = inbox.into();
         config["deliver_policy"] = "all".into();
         config["ack_policy"] = "none".into();
-        let body = serde_json::json!({"stream_name": "KV_MINGA_ASSIGN", "config": config});
+        let body = serde_json::json!({"stream_name": "KV_MINGA_ASSIGN_default", "config": config});
         let subject = format!(
-            "$JS.API.CONSUMER.CREATE.KV_MINGA_ASSIGN.{name}.$KV.MINGA_ASSIGN.default.node.7.task.>"
+            "$JS.API.CONSUMER.CREATE.KV_MINGA_ASSIGN_default.{name}.$KV.MINGA_ASSIGN_default.default.node.7.task.>"
         );
         let reply = tokio::time::timeout(
             Duration::from_secs(2),
@@ -1204,7 +1210,7 @@ async fn worker_cannot_learn_other_tenants_keys_through_request_bodies() {
     // that asks for a sequence, the next beta key or a batch of last values.
     for (subject, own) in [
         (
-            "$JS.API.DIRECT.GET.KV_MINGA_ASSIGN.$KV.MINGA_ASSIGN.default.node.7.task.own",
+            "$JS.API.DIRECT.GET.KV_MINGA_ASSIGN_default.$KV.MINGA_ASSIGN_default.default.node.7.task.own",
             &b"own"[..],
         ),
         (
@@ -1222,9 +1228,9 @@ async fn worker_cannot_learn_other_tenants_keys_through_request_bodies() {
             serde_json::json!({"seq": 1}),
             serde_json::json!({"seq": 2}),
             serde_json::json!({"seq": 3}),
-            serde_json::json!({"next_by_subj": "$KV.MINGA_ASSIGN.beta.>", "seq": 1}),
+            serde_json::json!({"next_by_subj": "$KV.MINGA_ASSIGN_beta.beta.>", "seq": 1}),
             serde_json::json!({"next_by_subj": "$KV.MINGA_LEASES.beta.>", "seq": 1}),
-            serde_json::json!({"last_by_subj": "$KV.MINGA_ASSIGN.beta.node.7.task.foreign"}),
+            serde_json::json!({"last_by_subj": "$KV.MINGA_ASSIGN_beta.beta.node.7.task.foreign"}),
             serde_json::json!({"multi_last": [">"], "batch": 10}),
             serde_json::json!({"seq": 1, "batch": 10}),
         ] {
@@ -1296,24 +1302,27 @@ async fn worker_watch_recovers_without_consumer_info() {
             .await
             .unwrap();
     let jetstream = async_nats::jetstream::new(manager_client);
-    let stream = jetstream.get_stream("KV_MINGA_ASSIGN").await.unwrap();
+    let stream = jetstream.get_stream("KV_MINGA_ASSIGN_beta").await.unwrap();
     stream
         .create_consumer(async_nats::jetstream::consumer::pull::Config {
             name: Some("betaprobe".into()),
-            filter_subject: "$KV.MINGA_ASSIGN.beta.node.9.>".into(),
+            filter_subject: "$KV.MINGA_ASSIGN_beta.beta.node.9.>".into(),
             ..Default::default()
         })
         .await
         .unwrap();
     // Control: the consumer exists and its config names tenant beta.
     let config = stream.consumer_info("betaprobe").await.unwrap().config;
-    assert_eq!(config.filter_subject, "$KV.MINGA_ASSIGN.beta.node.9.>");
+    assert_eq!(config.filter_subject, "$KV.MINGA_ASSIGN_beta.beta.node.9.>");
 
     let worker_config = worker_client_config(dir.path(), &pki);
     let (worker, mut errors) = raw_worker(&url, &worker_config).await;
     let info = tokio::time::timeout(
         Duration::from_secs(2),
-        worker.request("$JS.API.CONSUMER.INFO.KV_MINGA_ASSIGN.betaprobe", "".into()),
+        worker.request(
+            "$JS.API.CONSUMER.INFO.KV_MINGA_ASSIGN_beta.betaprobe",
+            "".into(),
+        ),
     )
     .await;
     assert!(
@@ -1323,7 +1332,7 @@ async fn worker_watch_recovers_without_consumer_info() {
     // The missing answer must be the server refusing the publish, not a slow server.
     expect_refusal(
         &mut errors,
-        "$JS.API.CONSUMER.INFO.KV_MINGA_ASSIGN.betaprobe",
+        "$JS.API.CONSUMER.INFO.KV_MINGA_ASSIGN_beta.betaprobe",
     )
     .await;
     stream.delete_consumer("betaprobe").await.unwrap();
@@ -1343,10 +1352,21 @@ async fn worker_watch_recovers_without_consumer_info() {
 
     // Drop the worker's consumer under it, as a server restart or consumer
     // cleanup would, then write a new key: the watch must recreate and deliver.
-    let mut names = stream.consumer_names();
+    // The worker's watch is on the default tenant's bucket; `stream` is beta's.
+    let default_stream = jetstream
+        .get_stream("KV_MINGA_ASSIGN_default")
+        .await
+        .unwrap();
+    let mut names = default_stream.consumer_names();
+    let mut deleted = 0;
     while let Some(name) = names.next().await {
-        stream.delete_consumer(&name.unwrap()).await.unwrap();
+        default_stream
+            .delete_consumer(&name.unwrap())
+            .await
+            .unwrap();
+        deleted += 1;
     }
+    assert!(deleted > 0, "the worker's watch had no consumer to delete");
     manager
         .put_assignment("default.node.7.task.after", b"after")
         .await
@@ -1356,6 +1376,109 @@ async fn worker_watch_recovers_without_consumer_info() {
         .expect("watch recovers and delivers after its consumer is deleted")
         .unwrap();
     assert_eq!(next.key, "default.node.7.task.after");
+}
+
+/// Asks the server to create a consumer on `KV_MINGA_ASSIGN_default` as `worker`, the
+/// way a hostile worker holding its own credentials could, and returns the
+/// server's answer.
+async fn worker_creates_consumer(
+    worker: &async_nats::Client,
+    name: &str,
+    config: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let subject = format!(
+        "$JS.API.CONSUMER.CREATE.KV_MINGA_ASSIGN_default.{name}.$KV.MINGA_ASSIGN_default.default.node.7.task.>"
+    );
+    let body = serde_json::json!({
+        "stream_name": "KV_MINGA_ASSIGN_default",
+        "config": config,
+        "action": "",
+    });
+    let reply = tokio::time::timeout(
+        Duration::from_secs(5),
+        worker.request(subject, body.to_string().into()),
+    )
+    .await
+    .map_err(|_| "no answer".to_string())?
+    .map_err(|error| error.to_string())?;
+    serde_json::from_slice(&reply.payload).map_err(|error| error.to_string())
+}
+
+/// A worker can create consumers of any name on its tenant's assignment
+/// bucket, and its ACL cannot count them. They must fill only that tenant's
+/// consumer limit: another tenant's nodes still list their assignments.
+#[tokio::test]
+async fn worker_cannot_exhaust_another_tenants_assignment_consumers() {
+    let _guard = NATS_TEST_LOCK.lock().await;
+    let pki = make_pki();
+    let server = start_worker_acl_server(&pki);
+    wait_ready(&server);
+    let dir = tempfile::tempdir().unwrap();
+    let manager_config = manager_client_config(dir.path(), &pki);
+    let url = format!("tls://localhost:{}", server.port);
+    let manager = NatsBus::connect_secure(&url, &manager_config)
+        .await
+        .unwrap();
+    for tenant in ["default", "beta"] {
+        manager.ensure_tenant_resources(tenant).await.unwrap();
+    }
+    manager
+        .put_assignment("beta.node.9.task.victim", b"beta")
+        .await
+        .unwrap();
+
+    // Shrink the cap so the test fills it in moments; production sets 5,000.
+    let manager_client =
+        async_nats::connect_with_options(&url, manager_config.connect_options().unwrap())
+            .await
+            .unwrap();
+    let jetstream = async_nats::jetstream::new(manager_client);
+    let mut default_stream = jetstream
+        .get_stream("KV_MINGA_ASSIGN_default")
+        .await
+        .unwrap();
+    let mut config = default_stream.info().await.unwrap().config.clone();
+    assert_eq!(config.max_consumers, 5_000, "the production per-tenant cap");
+    config.max_consumers = 12;
+    jetstream.update_stream(config).await.unwrap();
+
+    let worker_config = worker_client_config(dir.path(), &pki);
+    let (worker, _errors) = raw_worker(&url, &worker_config).await;
+    let mut created = 0;
+    for i in 0..30 {
+        let name = format!("squat{i}");
+        let answer = worker_creates_consumer(
+            &worker,
+            &name,
+            serde_json::json!({
+                "name": name,
+                "durable_name": name,
+                "filter_subject": "$KV.MINGA_ASSIGN_default.default.node.7.task.>",
+                "ack_policy": "none",
+                "deliver_policy": "all",
+            }),
+        )
+        .await
+        .unwrap();
+        if answer.get("error").is_none() {
+            created += 1;
+        }
+    }
+    assert_eq!(created, 12, "the worker is stopped by its own tenant's cap");
+    // The limit it reached is its own tenant's: that bucket is full.
+    assert!(
+        manager.list_assignments("default.").await.is_err(),
+        "the squatted tenant still creates consumers"
+    );
+
+    // Tenant beta, with a different bucket, is untouched.
+    let listed = manager.list_assignments("beta.node.9.task.").await.unwrap();
+    assert_eq!(
+        listed,
+        vec![("beta.node.9.task.victim".to_string(), b"beta".to_vec())]
+    );
+    let beta_watch = manager.watch_assignments("beta.node.9.task.").await;
+    assert!(beta_watch.is_ok(), "tenant beta cannot open a watch");
 }
 
 /// A client presenting a certificate from an untrusted CA is rejected.

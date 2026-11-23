@@ -1,7 +1,8 @@
 //! nats-server 2.15 caps a stream at 1,000 consumers unless the stream sets
-//! `max_consumers`. Every worker holds two watches on `KV_MINGA_ASSIGN`, so
+//! `max_consumers`. Every worker holds two watches on its tenant's
+//! `KV_MINGA_ASSIGN_<tenant>`, so
 //! the cap would stop new workers from watching their assignments at about
-//! 500 workers. The buckets Minga creates must not be capped.
+//! 500 workers. The buckets Minga creates must not be capped at that.
 //!
 //! Set MINGA_TEST_NATS_URL to run against a local JetStream server of the
 //! version under test; otherwise a Docker image is used.
@@ -21,10 +22,15 @@ async fn assignment_bucket_accepts_more_consumers_than_the_server_default() {
         return;
     };
     let bus = NatsBus::connect(&url).await.expect("connect to NATS");
+    bus.ensure_tenant_resources("default").await.unwrap();
 
     let client = async_nats::connect(&url).await.expect("connect");
     let js = async_nats::jetstream::new(client);
-    for bucket in ["KV_MINGA_ASSIGN", "KV_MINGA_STATUS", "KV_MINGA_LEASES"] {
+    for bucket in [
+        "KV_MINGA_ASSIGN_default",
+        "KV_MINGA_STATUS",
+        "KV_MINGA_LEASES",
+    ] {
         let mut stream = js.get_stream(bucket).await.expect("bucket stream");
         let config = stream.info().await.expect("stream info").config.clone();
         // -1 means "server default" on 2.15, which is the 1,000 cap.
@@ -36,7 +42,7 @@ async fn assignment_bucket_accepts_more_consumers_than_the_server_default() {
     }
 
     let stream = js
-        .get_stream("KV_MINGA_ASSIGN")
+        .get_stream("KV_MINGA_ASSIGN_default")
         .await
         .expect("assign stream");
     let mut consumers = Vec::with_capacity(OVER_DEFAULT_CAP);
@@ -47,12 +53,12 @@ async fn assignment_bucket_accepts_more_consumers_than_the_server_default() {
                 ..Default::default()
             })
             .await
-            .unwrap_or_else(|e| panic!("consumer {i} on KV_MINGA_ASSIGN: {e}"));
+            .unwrap_or_else(|e| panic!("consumer {i} on KV_MINGA_ASSIGN_default: {e}"));
         consumers.push(consumer);
     }
     // A worker's watch is one more consumer on the same stream.
     let _watch = bus
-        .watch_assignments("")
+        .watch_assignments("default.")
         .await
         .expect("a watch still opens past the server's default cap");
 }

@@ -31,7 +31,11 @@ async fn manager_and_worker_api_levels_and_bucket_consumer_limits() {
         "workers must not query account info"
     );
 
-    for bucket in ["MINGA_ASSIGN", "MINGA_STATUS", "MINGA_LEASES"] {
+    for (bucket, cap) in [
+        ("MINGA_ASSIGN_runtime", 5_000),
+        ("MINGA_STATUS", 100_000),
+        ("MINGA_LEASES", 100_000),
+    ] {
         let mut stream = manager
             .jetstream()
             .get_stream(format!("KV_{bucket}"))
@@ -42,7 +46,7 @@ async fn manager_and_worker_api_levels_and_bucket_consumer_limits() {
             .await
             .unwrap_or_else(|error| panic!("inspect KV_{bucket}: {error}"));
         assert_eq!(
-            info.config.max_consumers, 100_000,
+            info.config.max_consumers, cap,
             "KV_{bucket} must override the NATS server default consumer cap"
         );
     }
@@ -54,9 +58,10 @@ async fn assignment_bucket_accepts_more_than_one_thousand_ordered_consumers() {
         return;
     };
     let manager = NatsBus::connect(&url).await.expect("connect manager");
+    manager.ensure_tenant_resources("capacity").await.unwrap();
     let stream = manager
         .jetstream()
-        .get_stream("KV_MINGA_ASSIGN")
+        .get_stream("KV_MINGA_ASSIGN_capacity")
         .await
         .expect("assignment stream");
     let client = async_nats::connect(url.as_ref().as_ref())
@@ -76,7 +81,7 @@ async fn assignment_bucket_accepts_more_than_one_thousand_ordered_consumers() {
             .create_consumer(async_nats::jetstream::consumer::push::OrderedConfig {
                 name: Some(format!("minga-cap-{run_id}-{index}")),
                 deliver_subject: inbox,
-                filter_subject: "$KV.MINGA_ASSIGN.>".to_string(),
+                filter_subject: "$KV.MINGA_ASSIGN_capacity.>".to_string(),
                 ..Default::default()
             })
             .await

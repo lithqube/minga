@@ -9,7 +9,7 @@ flowchart LR
   subgraph managers["Managers: the only Raft voters"]
     API["Docker Engine API"] --> R[("Raft<br/>desired state + placement")]
     S["Scheduler"] --> R
-    S -- per-node assignments --> A[("MINGA_ASSIGN KV")]
+    S -- per-node assignments --> A[("MINGA_ASSIGN_tenant KV")]
   end
   J[("NATS JetStream<br/>tenant-scoped events · logs · status · leases · usage")]
   M["Manager supervisor"] --> J
@@ -27,7 +27,7 @@ flowchart LR
 | Placement (tasks with node and IPs) | Raft | Only the elected manager leader schedules. |
 | Task lifecycle and failure details | `MINGA_STATUS` JetStream KV | Supervisors write actual state; rollouts and Docker API task views combine it with Raft desired state. |
 | Node liveness and registration | `MINGA_LEASES` JetStream KV | Server-stamped leases expire after 30 seconds. The leader registers first sightings in Raft without overwriting operator labels or availability. |
-| Per-node task and network assignments | `MINGA_ASSIGN` JetStream KV | The leader projects placement; workers read only their own assignment keys. It is rebuilt from Raft after election. |
+| Per-node task and network assignments | `MINGA_ASSIGN_<tenant>` JetStream KV, one bucket per tenant | The leader projects placement; workers read only their own assignment keys. It is rebuilt from Raft after election. |
 | Tenant ownership and identity | Raft + API certificates | Tenant-owned resources are filtered before listing; workers use tenant-and-node-scoped NATS credentials. Cluster operators have cross-tenant administrative access, not workload access. |
 | Egress and usage | Worker-local proxy + tenant JetStream streams | Opt-in per worker (`--egress-bind`, see [agent egress and usage](agent-usage.md)). Route/model policies are enforced at the proxy. Token budgets apply only to agent runs with `token_budget` and are checked at request admission, not as a cap on provider spend; routed containers are not token-limited yet. Usage events and metrics omit prompts and response bodies. |
 | Lifecycle events, logs and agent results | JetStream | `minga logs` reads the retained log backlog from the tenant's `MINGA_LOGS_<tenant>` stream; the unscoped `MINGA_LOGS` stream keeps only legacy records. Log streams are single-replica; they are not HA storage. |
@@ -93,7 +93,7 @@ flowchart LR
   subgraph managers["Managers: the only Raft voters"]
     API["Docker Engine API"] --> R[("Raft<br/>tenant-owned desired state + placement")]
     S["Scheduler"] --> R
-    S -- tenant/node-scoped assignments --> A[("MINGA_ASSIGN KV")]
+    S -- tenant/node-scoped assignments --> A[("MINGA_ASSIGN_tenant KV")]
   end
   J[("NATS JetStream<br/>tenant-scoped status · logs · usage · audit")]
   M["Manager supervisor"] --> J
