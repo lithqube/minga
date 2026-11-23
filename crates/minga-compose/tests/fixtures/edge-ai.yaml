@@ -1,6 +1,6 @@
 # An edge site running an inference service on a GPU, an agent API in front
 # of it, a sensor reader that needs a serial device, and an optional debug UI.
-# Uses the keys Docker Swarm ignores today.
+# Uses keys Docker Swarm handles and Minga carries end to end.
 name: plant-7
 
 x-defaults: &defaults
@@ -40,11 +40,6 @@ services:
             - driver: nvidia
               count: 1
               capabilities: [gpu]
-    ulimits:
-      memlock: -1
-      nofile:
-        soft: 65536
-        hard: 65536
     x-minga-budget:
       tokens_per_day: 2000000
 
@@ -79,12 +74,6 @@ services:
   sensors:
     <<: *defaults
     image: registry.local/sensor-reader:2.1
-    privileged: false
-    devices:
-      - /dev/ttyUSB0:/dev/ttyUSB0:rw
-    cap_add: [SYS_RAWIO]
-    sysctls:
-      net.core.somaxconn: 1024
     deploy:
       mode: global
 

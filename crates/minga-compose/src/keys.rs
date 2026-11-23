@@ -114,13 +114,10 @@ const SPEC_SERVICE: &[&str] = &[
 
 /// Service keys Minga parses today. Must match the fields of `model::Service`.
 pub(crate) const MODELLED_SERVICE: &[&str] = &[
-    "cap_add",
-    "cap_drop",
     "command",
     "configs",
     "depends_on",
     "deploy",
-    "devices",
     "entrypoint",
     "env_file",
     "environment",
@@ -128,24 +125,34 @@ pub(crate) const MODELLED_SERVICE: &[&str] = &[
     "healthcheck",
     "hostname",
     "image",
-    "init",
     "labels",
     "logging",
     "networks",
     "ports",
-    "privileged",
     "profiles",
-    "read_only",
     "restart",
     "secrets",
     "stop_grace_period",
     "stop_signal",
-    "sysctls",
-    "tmpfs",
-    "ulimits",
     "user",
     "volumes",
     "working_dir",
+];
+
+/// Hardening keys that are part of the Compose spec but not yet carried
+/// end-to-end by Minga. Any service mapping that contains one of these keys
+/// is rejected with `Unsupported`, regardless of the value (presence-based).
+/// `deploy.resources.limits.pids` is handled separately via [`check_deploy_pids`].
+const HARDENING_SERVICE: &[&str] = &[
+    "cap_add",
+    "cap_drop",
+    "devices",
+    "init",
+    "privileged",
+    "read_only",
+    "sysctls",
+    "tmpfs",
+    "ulimits",
 ];
 
 /// Why some spec keys are not supported, where there is more to say than "not yet".
@@ -189,6 +196,8 @@ pub(crate) fn check_and_strip(
                     MODELLED_SERVICE,
                     errors,
                 );
+                check_hardening(svc, &format!("services.{name}"), errors);
+                check_deploy_pids(svc, &format!("services.{name}"), errors);
             }
         }
     }
@@ -203,6 +212,45 @@ pub(crate) fn check_and_strip(
         }
     }
     (top_ext, service_ext)
+}
+/// Rejects any service key listed in `HARDENING_SERVICE` that is present in the
+/// raw YAML mapping. Presence-based: any value, including `false` and `[]`, is
+/// rejected. The key is also removed so typed parsing does not see it.
+fn check_hardening(svc: &mut Mapping, path: &str, errors: &mut Vec<ComposeError>) {
+    for &key in HARDENING_SERVICE {
+        let yaml_key = Value::String(key.to_string());
+        if svc.contains_key(&yaml_key) {
+            errors.push(ComposeError::Unsupported {
+                path: path.to_string(),
+                key: key.to_string(),
+                note: None,
+            });
+            svc.remove(&yaml_key);
+        }
+    }
+}
+
+/// Rejects `deploy.resources.limits.pids` when it is present under a service.
+/// Removes the key so typed parsing does not emit a secondary error.
+fn check_deploy_pids(svc: &mut Mapping, path: &str, errors: &mut Vec<ComposeError>) {
+    let pids_key = Value::String("pids".to_string());
+    let Some(Value::Mapping(deploy)) = svc.get_mut("deploy") else {
+        return;
+    };
+    let Some(Value::Mapping(resources)) = deploy.get_mut("resources") else {
+        return;
+    };
+    let Some(Value::Mapping(limits)) = resources.get_mut("limits") else {
+        return;
+    };
+    if limits.contains_key(&pids_key) {
+        errors.push(ComposeError::Unsupported {
+            path: format!("{path}.deploy.resources.limits"),
+            key: "pids".to_string(),
+            note: None,
+        });
+        limits.remove(&pids_key);
+    }
 }
 
 fn strip_extensions(map: &mut Mapping) -> IndexMap<String, Value> {
