@@ -24,6 +24,16 @@
   - A service on a network that still has no subnet gets no task until the leader stores one, so a task
     never persists without an IP.
 
+- **Security.** A task under a required egress policy can no longer reach an upstream resolver through
+  the bridge DNS (#136):
+  - The bridge DNS answered every name for any task, forwarding names it did not know to the node's
+    upstream resolver, so a required-egress task could send data out in DNS queries around the egress
+    proxy. It now answers such a task only for local names (services, tasks, `minga.local`); any other
+    name gets REFUSED and reaches no upstream, over UDP and TCP.
+  - Tasks without a required policy keep recursive DNS. Required-egress tasks lose it: reach outside
+    names through the egress proxy, which resolves them on the host.
+  - A node restart keeps the confinement: it is rebuilt from the task's egress state file.
+
 - **Fix, upgrade action needed.** mTLS and operator/JWT workers get the same NATS grants, and a test keeps
   them in step:
   - Widened grant: mTLS workers can publish task logs. Their ACL now allows any subject under their own

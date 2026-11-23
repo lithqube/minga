@@ -15,12 +15,16 @@
 //! - Everything else is proxied verbatim (raw datagram) to the upstream
 //!   resolver over UDP, preserving the query ID.
 //! - With no upstream configured, non-overlay queries get REFUSED.
+//! - Queries from a source in [`LocalOnlySources`] (a task under a required
+//!   egress policy) are answered the same way for local names, but a
+//!   non-local name gets REFUSED and reaches no upstream: recursion would be
+//!   a channel around the egress proxy, which resolves names on the host.
 //!
 //! The wire format (header, question, A records) is hand-rolled; no DNS
 //! crates are used.
 
 use std::io;
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -29,7 +33,7 @@ use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
-use crate::dns::{is_minga_name, DnsStore};
+use crate::dns::{is_minga_name, DnsStore, LocalOnlySources};
 
 /// TTL (seconds) for synthesized A records.
 const ANSWER_TTL_SECS: u32 = 60;
@@ -58,11 +62,13 @@ impl DnsServer {
     /// Binds UDP+TCP listeners on each `bind` address (one per bridge
     /// gateway IP). `store` is shared and read per-query; `upstream`
     /// (e.g. `127.0.0.53:53` from `/etc/resolv.conf`) receives
-    /// non-`minga.local` queries via UDP proxying.
+    /// non-`minga.local` queries via UDP proxying, except from sources in
+    /// `local_only`, which get REFUSED for them.
     pub async fn start(
         binds: Vec<SocketAddr>,
         store: Arc<RwLock<DnsStore>>,
         upstream: Option<SocketAddr>,
+        local_only: LocalOnlySources,
     ) -> io::Result<Self> {
         let mut tasks = Vec::new();
         let mut addrs = Vec::new();
@@ -72,13 +78,15 @@ impl DnsServer {
             addrs.push(udp.local_addr()?);
 
             let store_udp = Arc::clone(&store);
+            let local_only_udp = Arc::clone(&local_only);
             tasks.push(tokio::spawn(async move {
-                udp_loop(udp, store_udp, upstream).await;
+                udp_loop(udp, store_udp, upstream, local_only_udp).await;
             }));
 
             let store_tcp = Arc::clone(&store);
+            let local_only_tcp = Arc::clone(&local_only);
             tasks.push(tokio::spawn(async move {
-                tcp_loop(tcp, store_tcp, upstream).await;
+                tcp_loop(tcp, store_tcp, upstream, local_only_tcp).await;
             }));
         }
         Ok(Self { tasks, addrs })
@@ -106,12 +114,19 @@ impl DnsServer {
 // Listener loops
 // ---------------------------------------------------------------------------
 
-async fn udp_loop(socket: UdpSocket, store: Arc<RwLock<DnsStore>>, upstream: Option<SocketAddr>) {
+async fn udp_loop(
+    socket: UdpSocket,
+    store: Arc<RwLock<DnsStore>>,
+    upstream: Option<SocketAddr>,
+    local_only: LocalOnlySources,
+) {
     let mut buf = vec![0u8; MAX_DATAGRAM];
     loop {
         match socket.recv_from(&mut buf).await {
             Ok((n, peer)) => {
-                if let Some(resp) = handle_query(&buf[..n], &store, upstream).await {
+                if let Some(resp) =
+                    handle_query(&buf[..n], &store, upstream, peer.ip(), &local_only).await
+                {
                     if let Err(e) = socket.send_to(&resp, peer).await {
                         debug!(error = %e, %peer, "failed to send DNS response");
                     }
@@ -129,13 +144,17 @@ async fn tcp_loop(
     listener: TcpListener,
     store: Arc<RwLock<DnsStore>>,
     upstream: Option<SocketAddr>,
+    local_only: LocalOnlySources,
 ) {
     loop {
         match listener.accept().await {
-            Ok((stream, _)) => {
+            Ok((stream, peer)) => {
                 let store = Arc::clone(&store);
+                let local_only = Arc::clone(&local_only);
                 tokio::spawn(async move {
-                    if let Err(e) = handle_tcp_conn(stream, store, upstream).await {
+                    if let Err(e) =
+                        handle_tcp_conn(stream, store, upstream, peer.ip(), local_only).await
+                    {
                         debug!(error = %e, "DNS TCP connection failed");
                     }
                 });
@@ -154,13 +173,15 @@ async fn handle_tcp_conn(
     mut stream: TcpStream,
     store: Arc<RwLock<DnsStore>>,
     upstream: Option<SocketAddr>,
+    source: IpAddr,
+    local_only: LocalOnlySources,
 ) -> io::Result<()> {
     let mut len_buf = [0u8; 2];
     stream.read_exact(&mut len_buf).await?;
     let len = u16::from_be_bytes(len_buf) as usize;
     let mut buf = vec![0u8; len];
     stream.read_exact(&mut buf).await?;
-    if let Some(resp) = handle_query(&buf, &store, upstream).await {
+    if let Some(resp) = handle_query(&buf, &store, upstream, source, &local_only).await {
         stream.write_all(&(resp.len() as u16).to_be_bytes()).await?;
         stream.write_all(&resp).await?;
     }
@@ -177,6 +198,8 @@ async fn handle_query(
     datagram: &[u8],
     store: &Arc<RwLock<DnsStore>>,
     upstream: Option<SocketAddr>,
+    source: IpAddr,
+    local_only: &LocalOnlySources,
 ) -> Option<Vec<u8>> {
     let q = match Question::parse(datagram) {
         Ok(q) => q,
@@ -202,6 +225,19 @@ async fn handle_query(
         // NOERROR even when empty: never NXDOMAIN for overlay names, so
         // containers don't retry search domains (Docker DNS semantics).
         return Some(build_response(datagram, &q, &ips, RCODE_NOERROR));
+    }
+    // A source that is not a plain IPv4 address cannot be a listed task, and
+    // a poisoned set must fail closed: REFUSED, never an upstream query.
+    let confined = match source {
+        IpAddr::V4(ip) => local_only
+            .read()
+            .map(|set| set.contains(&ip))
+            .unwrap_or(true),
+        IpAddr::V6(_) => false,
+    };
+    if confined {
+        debug!(name = %q.name, %source, "dns: non-local query refused under a required egress policy");
+        return Some(build_response(datagram, &q, &[], RCODE_REFUSED));
     }
     if let Some(upstream) = upstream {
         proxy_udp(datagram, upstream).await
@@ -437,6 +473,7 @@ mod tests {
             vec!["127.0.0.1:0".parse().unwrap()],
             Arc::new(RwLock::new(store)),
             None,
+            LocalOnlySources::default(),
         )
         .await
         .unwrap();
@@ -461,6 +498,7 @@ mod tests {
             vec!["127.0.0.1:0".parse().unwrap()],
             Arc::new(RwLock::new(DnsStore::new())),
             None,
+            LocalOnlySources::default(),
         )
         .await
         .unwrap();
@@ -490,6 +528,7 @@ mod tests {
             vec!["127.0.0.1:0".parse().unwrap()],
             Arc::new(RwLock::new(store)),
             None,
+            LocalOnlySources::default(),
         )
         .await
         .unwrap();
@@ -514,6 +553,7 @@ mod tests {
             vec!["127.0.0.1:0".parse().unwrap()],
             Arc::new(RwLock::new(DnsStore::new())),
             None,
+            LocalOnlySources::default(),
         )
         .await
         .unwrap();
@@ -553,6 +593,7 @@ mod tests {
             vec!["127.0.0.1:0".parse().unwrap()],
             Arc::new(RwLock::new(DnsStore::new())),
             Some(upstream_addr),
+            LocalOnlySources::default(),
         )
         .await
         .unwrap();
@@ -563,6 +604,123 @@ mod tests {
         assert_eq!(parsed.id, 0x77, "query ID must be preserved");
         assert_eq!(parsed.rcode, RCODE_NOERROR);
         assert_eq!(parsed.ips, vec![Ipv4Addr::new(93, 184, 216, 34)]);
+
+        server.shutdown().await;
+    }
+
+    /// A source set holding loopback, which is where the tests' queries come from.
+    fn confined_loopback() -> LocalOnlySources {
+        let set = LocalOnlySources::default();
+        set.write().unwrap().insert(Ipv4Addr::LOCALHOST);
+        set
+    }
+
+    /// Sends one length-prefixed query to `addr` over TCP and returns the reply.
+    async fn query_tcp(addr: SocketAddr, query: &[u8]) -> Vec<u8> {
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        stream
+            .write_all(&(query.len() as u16).to_be_bytes())
+            .await
+            .unwrap();
+        stream.write_all(query).await.unwrap();
+        let mut len = [0u8; 2];
+        tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut len))
+            .await
+            .expect("timed out waiting for DNS response")
+            .unwrap();
+        let mut reply = vec![0u8; u16::from_be_bytes(len) as usize];
+        stream.read_exact(&mut reply).await.unwrap();
+        reply
+    }
+
+    #[tokio::test]
+    async fn a_confined_source_gets_local_names_but_no_upstream() {
+        // An upstream that must never be asked.
+        let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut store = DnsStore::new();
+        let ips = vec![Ipv4Addr::new(10, 100, 1, 10)];
+        store.set("web.plant-7.minga.local", ips.clone());
+        let store = Arc::new(RwLock::new(store));
+        let upstream_addr = upstream.local_addr().unwrap();
+        let server = DnsServer::start(
+            vec!["127.0.0.1:0".parse().unwrap()],
+            Arc::clone(&store),
+            Some(upstream_addr),
+            confined_loopback(),
+        )
+        .await
+        .unwrap();
+        let addr = server.local_addrs()[0];
+        // The server's TCP listener has its own ephemeral port in tests.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tcp_addr = listener.local_addr().unwrap();
+        let tcp = tokio::spawn(tcp_loop(
+            listener,
+            store,
+            Some(upstream_addr),
+            confined_loopback(),
+        ));
+
+        let local = parse_response(
+            &query_udp(addr, &encode_query(1, "web.plant-7.minga.local", QTYPE_A)).await,
+        );
+        assert_eq!((local.rcode, local.ips), (RCODE_NOERROR, ips));
+
+        // A name that would carry data out, over UDP and over TCP.
+        let tunnel = encode_query(2, "c2VjcmV0.exfil.example.com", QTYPE_A);
+        for reply in [
+            query_udp(addr, &tunnel).await,
+            query_tcp(tcp_addr, &tunnel).await,
+        ] {
+            let parsed = parse_response(&reply);
+            assert_eq!(parsed.id, 2);
+            assert_eq!(parsed.rcode, RCODE_REFUSED);
+            assert!(parsed.ips.is_empty());
+        }
+        let mut buf = vec![0u8; MAX_DATAGRAM];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), upstream.recv_from(&mut buf))
+                .await
+                .is_err(),
+            "the upstream resolver was queried"
+        );
+
+        tcp.abort();
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_source_leaving_the_set_is_proxied_again() {
+        let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; MAX_DATAGRAM];
+            let (n, peer) = upstream.recv_from(&mut buf).await.unwrap();
+            let mut resp = buf[..n].to_vec();
+            resp[2] |= 0x80;
+            upstream.send_to(&resp, peer).await.unwrap();
+        });
+        let confined = confined_loopback();
+        let server = DnsServer::start(
+            vec!["127.0.0.1:0".parse().unwrap()],
+            Arc::new(RwLock::new(DnsStore::new())),
+            Some(upstream_addr),
+            Arc::clone(&confined),
+        )
+        .await
+        .unwrap();
+        let addr = server.local_addrs()[0];
+        let query = encode_query(3, "example.com", QTYPE_A);
+
+        assert_eq!(
+            parse_response(&query_udp(addr, &query).await).rcode,
+            RCODE_REFUSED
+        );
+        confined.write().unwrap().clear();
+        assert_eq!(
+            parse_response(&query_udp(addr, &query).await).rcode,
+            RCODE_NOERROR
+        );
 
         server.shutdown().await;
     }

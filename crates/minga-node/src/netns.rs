@@ -737,6 +737,10 @@ pub struct NetworkSetup {
     legacy_ingress_cleaned: std::sync::Mutex<bool>,
     /// Gateway port that required-egress tasks may reach the proxy on.
     egress_proxy_port: u16,
+    /// Addresses of tasks under a required egress policy. The bridge DNS
+    /// refuses their non-local queries. Kept with the egress state files:
+    /// added when the rules are applied or recovered, removed at teardown.
+    local_only_dns: minga_net::LocalOnlySources,
 }
 /// The netns handle path. `/var/run/netns` is the one location every tool
 /// (`ip`, runc, `nsenter`) agrees on; `IPNETNS_DIR` indirection proved
@@ -784,6 +788,26 @@ impl NetworkSetup {
                 .to_vec(),
             legacy_ingress_cleaned: std::sync::Mutex::new(false),
             egress_proxy_port: EGRESS_PROXY_PORT,
+            local_only_dns: Default::default(),
+        }
+    }
+
+    /// The set the node's DNS server shares with this setup.
+    pub fn local_only_dns(&self) -> minga_net::LocalOnlySources {
+        std::sync::Arc::clone(&self.local_only_dns)
+    }
+
+    fn set_local_only_dns(&self, ips: &[Ipv4Addr], confined: bool) {
+        let mut set = self
+            .local_only_dns
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        for ip in ips {
+            if confined {
+                set.insert(*ip);
+            } else {
+                set.remove(ip);
+            }
         }
     }
 
@@ -1503,6 +1527,9 @@ impl NetworkSetup {
         // task whose tables may be installed for one that never had them.
         state.required_egress = true;
         write_atomic(&state_path, &serde_json::to_vec(&state)?).await?;
+        // Before the rules exist, so the task never has recursive DNS once it
+        // is confined at the packet level.
+        self.set_local_only_dns(&state.ips, true);
         run_nft_script(&egress_policy_script(
             &egress_table_name(task_id),
             &state.ips,
@@ -1711,6 +1738,10 @@ impl NetworkSetup {
         }
         let _ = tokio::fs::remove_file(&state_path).await;
         let _ = tokio::fs::remove_file(&marker).await;
+        // Only now: while a teardown fails, the task's namespace may live on.
+        if let Some(state) = &state {
+            self.set_local_only_dns(&state.ips, false);
+        }
         Ok(())
     }
 
@@ -1849,6 +1880,7 @@ impl NetworkSetup {
                 ensure_task_source_rules(veth, *ip).await?;
             }
             if state.required_egress {
+                self.set_local_only_dns(&state.ips, true);
                 if state.ips.len() != state.bridges.len()
                     || state.ips.len() != state.gateways.len()
                     || state.ips.len() != state.veths.len()
