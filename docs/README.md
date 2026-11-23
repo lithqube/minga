@@ -12,8 +12,8 @@
 - [ADR 0002: Event bus: NATS/JetStream](adr/0002-event-bus-nats.md)
 - [ADR 0003: Agent workloads](adr/0003-agent-workloads.md): WASM execution and remaining host-capability limits
 - [ADR 0004: Observability](adr/0004-observability.md)
-- [ADR 0005: API identity, roles and audit](adr/0005-api-identity-and-roles.md): partially implemented; server revisions and client-certificate support in `minga-ctl` remain open
-- [ADR 0006: Workers leave Raft](adr/0006-workers-leave-raft.md)
+- [ADR 0005: API identity, roles and audit](adr/0005-api-identity-and-roles.md): partially implemented; server-side revisions and client-certificate use beyond `minga-ctl change` remain open
+- [ADR 0006: Workers leave Raft](adr/0006-workers-leave-raft.md): implemented in v1.3.0
 - [ADR 0007: WireGuard and routing mesh](adr/0007-wireguard-mesh.md): implemented in Phase 13; scale limits remain
 - [ADR 0008: Multi-tenancy and isolation](adr/0008-multi-tenancy.md): T1–T5 implementation complete; T3 live proof remains open
 
@@ -32,11 +32,13 @@ Implementation-status notes distinguish what is merged from what remains propose
 - [Release notes: v1.2.0](release-1.2.0.md)
 - [Release notes: v1.1.0](release-1.1.0.md)
 - [Release notes: v1.0.2](release-1.0.2.md)
+- [Release notes: v1.0.1](release-1.0.1.md)
 
 ## Deployment
 
 - [Supported topologies](topologies.md): single host, workstation, air-gapped, Talos, container image and multi-node; requirements, proof and limits
 - [CLI reference](cli.md): `minga` and `minga-ctl` commands, environment, tenant enrollment and agent usage
+- [Agent usage](agent-usage.md): usage events, the usage API, egress routes and `minga-ctl agent usage`
 - [Backup and restore](backup.md): state export/import scope and the data it leaves out
 - [Quick start: one Linux host](../README.md#quick-start-one-linux-host)
 - [systemd unit](../scripts/minga.service) and [environment example](../scripts/minga.env.example)

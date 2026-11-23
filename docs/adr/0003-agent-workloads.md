@@ -123,12 +123,12 @@ The reconcile loop (`raft_reconcile`), command dispatch (`execute_command`), and
 
 ### 6. CLI wiring (minga-cli)
 
-New flags on `minga node`:
+New flags on `minga manager` and `minga worker` (written when the roles were still a single `minga node` command):
 
 | Flag | Purpose |
 |---|---|
 | `--sandbox-runtime mock\|wasmtime` | Select agent executor backend (default: mock) |
-| `--module-dir PATH` | Directory containing WASM modules (default: `./modules`) |
+| `--module-dir PATH` | Directory containing WASM modules (default: `/var/lib/minga/modules`) |
 | `--egress-bind ADDR` | Start the egress proxy on this address |
 | `--egress-upstream URL` | LLM API upstream for the egress proxy |
 

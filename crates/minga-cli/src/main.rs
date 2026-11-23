@@ -331,35 +331,38 @@ struct NodeArgs {
     /// Tenant bound to this node's NATS credentials and leases.
     #[arg(long, env = "MINGA_TENANT_ID", default_value = "default")]
     tenant_id: String,
-    /// Address to bind the Raft RPC server (e.g. 0.0.0.0:50051).
+    /// Manager only: address to bind the Raft RPC server (e.g. 0.0.0.0:50051).
     #[arg(long)]
     bind: Option<String>,
-    /// Data directory for Raft state (raft_log.redb, state.redb).
+    /// Data directory: manager Raft state (raft_log.redb, state.redb), plus
+    /// node-local files. Workers open no Raft files.
     #[arg(long, default_value = "/var/lib/minga")]
     data_dir: String,
-    /// Peer node as id=address (repeatable). Include all other nodes.
+    /// Manager only: peer node as id=address (repeatable). Include all other
+    /// nodes when bootstrapping; cannot be combined with --join.
     #[arg(long = "peer")]
     peers: Vec<String>,
-    /// Start as an uninitialized manager and wait to be added to a cluster.
+    /// Manager only: start uninitialized and wait to be added to a cluster.
     #[arg(long)]
     join: bool,
-    /// PEM file with the cluster CA certificate. Enables mTLS on the Raft
-    /// transport; all three raft-tls flags are required together.
+    /// Manager only: PEM file with the cluster CA certificate. Enables mTLS on
+    /// the Raft transport; all three raft-tls flags are required together.
     #[arg(long)]
     raft_tls_ca: Option<String>,
-    /// PEM file with this node's Raft certificate (SAN `minga-node`).
+    /// Manager only: PEM file with this node's Raft certificate (SAN
+    /// `minga-manager-<id>`, from `minga tls issue-node --role manager`).
     #[arg(long)]
     raft_tls_cert: Option<String>,
-    /// PEM file with this node's Raft private key.
+    /// Manager only: PEM file with this node's Raft private key.
     #[arg(long)]
     raft_tls_key: Option<String>,
-    /// Certificate presented by clients connecting to the Docker API.
+    /// Manager only: certificate presented by clients connecting to the Docker API.
     #[arg(long)]
     api_tls_cert: Option<String>,
-    /// Private key for --api-tls-cert.
+    /// Manager only: private key for --api-tls-cert.
     #[arg(long)]
     api_tls_key: Option<String>,
-    /// CA certificate used to verify API client certificates.
+    /// Manager only: CA certificate used to verify API client certificates.
     #[arg(long)]
     api_client_ca: Option<String>,
     /// Node label as key=value (repeatable). Advertised to the cluster and
@@ -379,28 +382,36 @@ struct NodeArgs {
     /// same token on manager and worker; certificate mapping replaces tokens.
     #[arg(long, env = "MINGA_NATS_TOKEN")]
     nats_token: Option<String>,
-    /// Client-facing TLS for the built-in NATS sidecar; client certificates
-    /// are required for transport while operator/JWT credentials authorize users.
+    /// Manager only: client-facing TLS certificate for the built-in NATS
+    /// sidecar; client certificates are required for transport while
+    /// operator/JWT credentials authorize users.
     #[arg(long)]
     nats_server_cert: Option<String>,
+    /// Manager only: private key for --nats-server-cert.
     #[arg(long)]
     nats_server_key: Option<String>,
+    /// Manager only: CA that signs NATS client certificates.
     #[arg(long)]
     nats_client_ca: Option<String>,
-    /// Address for the built-in sidecar listener (non-loopback requires TLS).
+    /// Manager only: address for the built-in sidecar listener (non-loopback
+    /// requires TLS).
     #[arg(long)]
     nats_listen_addr: Option<String>,
-    /// Existing NATS cluster route to join (repeatable, `nats://host:6222`).
+    /// Manager only: existing NATS cluster route to join (repeatable,
+    /// `nats://host:6222`).
     #[arg(long = "nats-cluster-route")]
     nats_cluster_routes: Vec<String>,
-    /// Route TLS certificate, private key, and peer CA (all required together).
+    /// Manager only: route TLS certificate, private key and peer CA (all
+    /// required together).
     #[arg(long)]
     nats_cluster_cert: Option<String>,
+    /// Manager only: route TLS private key.
     #[arg(long)]
     nats_cluster_key: Option<String>,
+    /// Manager only: route TLS peer CA.
     #[arg(long)]
     nats_cluster_ca: Option<String>,
-    /// NATS cluster route listener port (requires route TLS).
+    /// Manager only: NATS cluster route listener port (requires route TLS).
     #[arg(long)]
     nats_cluster_port: Option<u16>,
     /// Copies kept of event, status, lease, and assignment streams/buckets.
@@ -460,34 +471,34 @@ struct NodeArgs {
     /// (e.g. 0.0.0.0:9100). Not served when unset.
     #[arg(long, env = "MINGA_METRICS_BIND")]
     metrics_bind: Option<String>,
-    /// Bind address for the Docker Engine API. Managers default to 0.0.0.0:2375.
+    /// Manager only: bind address for the Docker Engine API (default 0.0.0.0:2375).
     #[arg(long)]
     api_bind: Option<String>,
-    /// Token required on API requests. Prefer MINGA_API_TOKEN to keep it out of process listings.
+    /// Manager only: token required on API requests. Prefer MINGA_API_TOKEN to keep it out of process listings.
     #[arg(long, env = "MINGA_API_TOKEN")]
     api_token: Option<String>,
-    /// Owner-only 32-byte join-token signing key; use the same key on every manager.
+    /// Manager only: owner-only 32-byte join-token signing key; use the same key on every manager.
     #[arg(long, env = "MINGA_JOIN_TOKEN_KEY_FILE")]
     join_token_key_file: Option<String>,
-    /// Owner-only NATS operator JWT used by the built-in full resolver.
+    /// Manager only: owner-only NATS operator JWT used by the built-in full resolver.
     #[arg(long, env = "MINGA_NATS_OPERATOR_JWT")]
     nats_operator_jwt: Option<String>,
-    /// Full account resolver directory for the built-in sidecar.
+    /// Manager only: full account resolver directory for the built-in sidecar.
     #[arg(long, env = "MINGA_NATS_RESOLVER_DIR")]
     nats_resolver_dir: Option<String>,
-    /// Owner-only control-plane account JWT.
+    /// Manager only: owner-only control-plane account JWT.
     #[arg(long, env = "MINGA_NATS_ACCOUNT_JWT_FILE")]
     nats_account_jwt_file: Option<String>,
-    /// Owner-only control-plane account identity NKey seed.
+    /// Manager only: owner-only control-plane account identity NKey seed.
     #[arg(long, env = "MINGA_NATS_ACCOUNT_SEED_FILE")]
     nats_account_seed_file: Option<String>,
-    /// Owner-only directory containing `{tenant-id}` scoped signer seed files.
+    /// Manager only: owner-only directory containing `{tenant-id}` scoped signer seed files.
     #[arg(long, env = "MINGA_NATS_TENANT_SIGNER_DIR")]
     nats_tenant_signer_dir: Option<String>,
-    /// Owner-only credentials for a user in the NATS system account.
+    /// Manager only: owner-only credentials for a user in the NATS system account.
     #[arg(long, env = "MINGA_NATS_SYS_CREDENTIALS_FILE")]
     nats_sys_credentials_file: Option<String>,
-    /// Owner-only file containing the worker's tenant-bound join token.
+    /// Worker only: owner-only file containing the worker's tenant-bound join token.
     #[arg(long, env = "MINGA_NODE_JOIN_TOKEN_FILE")]
     join_token_file: Option<String>,
     /// Range each network's /24 is allocated from (by the Raft leader).

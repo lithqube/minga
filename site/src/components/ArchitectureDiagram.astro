@@ -8,7 +8,7 @@ const { variant, caption } = Astro.props;
 
 const heroSteps = [
   'compose.yaml',
-  'minga api: Docker Engine API v1.41',
+  'minga manager: Docker Engine API v1.41',
   'Raft log: desired state + placement',
   'scheduler (Raft leader) places tasks',
   'JetStream: Assign command',
@@ -16,10 +16,10 @@ const heroSteps = [
   'containerd runs the container',
 ];
 const processSteps = [
-  'minga deploy and the docker CLI or Traefik call minga api (Docker Engine API v1.41, bearer token).',
-  'minga api and minga manager are Raft peers over mTLS: desired state and placement live in the Raft log (openraft + redb).',
-  'The manager runs the scheduler and the node supervisor, and spawns nats-server as a child process.',
-  'Workers run only the supervisor. Commands, task status and logs travel over NATS JetStream with TLS.',
+  'minga deploy and the docker CLI or Traefik call minga manager (Docker Engine API v1.41, bearer token or client certificate).',
+  'Only managers vote in Raft, over mTLS: desired state and placement live in the Raft log (openraft + redb). Further managers join and leave a running cluster.',
+  'Each manager serves the API, runs the scheduler and the node supervisor, and spawns nats-server as a child process.',
+  'Workers run only the supervisor and open no Raft store. Assignments, leases, task status and logs travel over NATS JetStream with TLS.',
   'Each supervisor drives containerd over gRPC; minga logs reads the retained log stream.',
 ];
 ---
@@ -42,7 +42,7 @@ const processSteps = [
           </text>
           <rect x="290" y="20" width="250" height="56" />
           <text x="415" y="45">
-            minga api
+            minga manager
           </text>
           <text class="sub" x="415" y="63">
             Docker Engine API v1.41
@@ -146,17 +146,17 @@ const processSteps = [
 
         <rect x="20" y="140" width="300" height="64" />
         <text x="170" y="167">
-          minga api
+          minga manager
         </text>
         <text class="sub" x="170" y="187">
-          Docker Engine API · own Raft voter
+          API · Raft voter · scheduler
         </text>
         <rect x="400" y="140" width="300" height="64" />
         <text x="550" y="167">
-          minga manager
+          more managers
         </text>
         <text class="sub" x="550" y="187">
-          scheduler + supervisor
+          optional · Raft voters
         </text>
         <line x1="320" y1="166" x2="396" y2="166" />
         <line x1="400" y1="180" x2="324" y2="180" />
@@ -169,7 +169,7 @@ const processSteps = [
           nats-server (JetStream)
         </text>
         <text class="sub" x="550" y="305">
-          child process of the manager · TLS
+          child process of each manager · TLS
         </text>
         <rect x="20" y="262" width="300" height="56" />
         <text x="170" y="287">

@@ -1,10 +1,12 @@
 # ADR 0006: Workers Leave Raft
 
-**Status:** Proposed  
+**Status:** Accepted — implemented in v1.3.0-rc.1  
 **Date:** 2026-11-15  
 **Deciders:** Ferru
 
 ## Context
+
+This ADR is implemented in v1.3.0 (see the [release notes](../release-1.3.0.md)); the Context describes v1.2.0, before the change.
 
 In v1.2.0, managers, workers, and `minga api` each open a `StateStore`. A pristine store initializes Raft from the `--peer` list, so nodes without peers can bootstrap separate clusters. Every node is a voter, including workers whose links may be intermittent. Node liveness, task lifecycle, and worker dispatch also depend on each process's Raft replica.
 

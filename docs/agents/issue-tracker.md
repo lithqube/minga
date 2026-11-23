@@ -44,8 +44,8 @@ For recurring PR fixes, keep these sections. Context names the permitting shared
 and prior failing input/action; Evidence cites the prior PRs/findings. Fix names the intended
 prevention, not an implementation plan. An AC requires the retained behavioral witness:
 old failure for the reported reason, corrected pass and behavior-preserving refactor survival.
-See [correction prevention](../../super-collect/references/correction-prevention.md).
+See [correction prevention](../../.agents/skills/super-collect/references/correction-prevention.md).
 
-When an unsettled design triggers [design preflight](design-preflight.md), keep the
+When an unsettled design triggers [design preflight](../../.agents/skills/super-board/references/design-preflight.md), keep the
 approved choice and short rationale in Context, or link its applicable spec/ADR there.
 Keep the same sections. Lint saves only the exact issue edit the user approves.
