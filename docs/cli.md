@@ -302,7 +302,7 @@ response bodies are not copied into findings.
 The upgrade preflight uses the server's reported state format or known release
 metadata, and says when the format was inferred. Any error-severity finding,
 including a check that could not run, makes it exit non-zero. Its current v1.3.0 target metadata is planned, not release approval.
-The v1.2.0 format-v10 to v1.3.0 format-v11 path is supported by checked-in
+The v1.2.0 format-v10 to v1.3.0 format-v12 path is supported by checked-in
 migrations, but all Minga roles must move together because peer and worker
 wire frames are versioned. External NATS must meet JetStream API level 4; its
 version is not inferred from readiness.

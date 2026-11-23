@@ -43,7 +43,7 @@ fails closed when it cannot check something. Its diagnostics endpoints are new
 in 1.3.0, so run it against an upgraded manager, not a 1.2.0 one.
 
 **State migrates in place, one way.** 1.2.0 state is format 2; 1.3.0 is format
-11. Opening a store migrates state and Raft logs from v2 through v10, and a
+12. Opening a store migrates state and Raft logs from v2 through v11, and a
 binary of an older format refuses a store of a newer one. Nodes of different
 formats refuse each other's Raft messages, so every node must change together.
 Take the backup in [docs/backup.md](backup.md) first, including the Raft data
@@ -188,7 +188,7 @@ this path has not been run as a live upgrade.
 - **Network removal** returns 409 while a service, a rollback revision or a
   running task still uses the network. `minga-ctl stack rm --with` waits up to
   15 seconds for the stack's tasks to be reaped.
-- **Compose** rejects `deploy.labels` it used to drop. `ports` host IPs are published on that address only (#162); upgrade every node before deploying a file that uses one.
+- **Compose** rejects `deploy.labels` it used to drop. `ports` host IPs are published on that address only (#162); state is format 12, so every node changes together.
 - **Unreleased builds.** Entries in the changelog marked "upgrade action
   needed" also describe changes between unreleased builds of `main`: the
   per-tenant assignment buckets, the NATS operator/JWT mode and the worker ACL

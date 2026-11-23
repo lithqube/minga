@@ -39,8 +39,8 @@ Supported auth schemes are `bearer`, `api_key`, and `aws_sigv4`. SigV4 uses the 
 `x-minga-egress` applies to container services only. An `x-minga-agent` service cannot declare it yet, because agent egress tokens carry no route policy: Compose translation, Docker API create and update (including a policy kept from the stored service) and state import refuse the combination instead of running the agent without the policy.
 
 Service and task egress policies were added in state format v10; Minga's
-current persisted and wire format is v11, which adds the Raft-backed change
-request table. Peers and workers require coordinated upgrades.
+current persisted and wire format is v12 (v11 added the Raft-backed change
+request table, v12 the port host address). Peers and workers require coordinated upgrades.
 
 `bearer` sets `Authorization: Bearer …`; `api_key` sets `x-api-key`. The proxy replaces any workload-supplied values for the selected auth headers.
 
