@@ -37,6 +37,9 @@ Changes on `main` after `v1.3.0-rc.1`. They go into 1.3.0.
   - The manager's change-request list accepts an ID filter, applied to the caller's tenant before paging, so a
     proposal outside the newest page can still be fetched for approval.
 
+### Security
+- **`minga deploy` and `minga-ctl stack deploy` no longer print env values (#195), no upgrade action.** The deploy plan printed to stdout before each API call now lists env key names only. Values stay available in the Compose file and through the API; none appear in terminal scrollback, CI logs, or shell history.
+
 ## [1.3.0-rc.1] — 2026-11-23
 
 Release candidate for 1.3.0, cut for the staging and tenant-isolation runs
