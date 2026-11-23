@@ -234,7 +234,7 @@ pub async fn create_tenant(
             tenant.id
         )));
     }
-    let created: ApiResult<()> = async {
+    let provisioned: ApiResult<()> = async {
         configure_tenant_bus(&app, &tenant).await?;
         append_tenant_audit(
             &app,
@@ -243,20 +243,49 @@ pub async fn create_tenant(
             "tenant.create.requested",
             &format!("/tenants/{}", tenant.id),
         )
-        .await?;
-        app.store.create_tenant(tenant.clone()).await?;
-        Ok(())
+        .await
     }
     .await;
-    if let Err(error) = created {
-        // Undo whatever the steps above made on the bus, or the retry would be
-        // refused as a leftover.
-        if let Err(cleanup) = bus.delete_tenant_resources(&tenant.id).await {
-            tracing::warn!(tenant = %tenant.id, error = %cleanup, "cannot remove bus resources of a tenant that was not created");
+    // (error, whether the tenant is certainly not in the store)
+    let created = match provisioned {
+        Ok(()) => app
+            .store
+            .create_tenant(tenant.clone())
+            .await
+            .map_err(|error| (definitely_not_created(&error), ApiError::from(error))),
+        Err(error) => Err((true, error)),
+    };
+    if let Err((undo, error)) = created {
+        if undo {
+            // Undo whatever the steps above made on the bus, or the retry
+            // would be refused as a leftover.
+            if let Err(cleanup) = bus.delete_tenant_resources(&tenant.id).await {
+                tracing::warn!(tenant = %tenant.id, error = %cleanup, "cannot remove bus resources of a tenant that was not created");
+            }
+        } else {
+            // A timed-out write may still have committed. Deleting the bus
+            // resources of a tenant that now exists would be worse than a
+            // leftover: a retry finds the tenant, or is told to delete it.
+            tracing::warn!(tenant = %tenant.id, "tenant create outcome unknown; keeping its bus resources");
         }
         return Err(error);
     }
     Ok((StatusCode::CREATED, Json(tenant)))
+}
+
+/// Whether a failed tenant write certainly did not commit: the store refused
+/// it. Any other error, a timeout or a lost leader say, leaves the outcome open.
+fn definitely_not_created(error: &minga_state::StateError) -> bool {
+    use minga_state::StateError as E;
+    matches!(
+        error,
+        E::InvalidTenant(_)
+            | E::NotFound(_)
+            | E::Conflict(_)
+            | E::NameInUse
+            | E::QuotaExceeded(_)
+            | E::BadSnapshot(_)
+    )
 }
 
 async fn append_tenant_audit(
@@ -3111,6 +3140,20 @@ mod tests {
         assert!(app.store.get_tenant("race").await.unwrap().is_some());
         assert!(bus.tenant_resources_exist("race").await.unwrap());
         assert_eq!(bus.list_audit("race", 10).await.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn only_a_store_refusal_proves_a_tenant_was_not_created() {
+        use minga_state::StateError as E;
+        assert!(definitely_not_created(&E::NameInUse));
+        assert!(definitely_not_created(&E::Conflict("x".into())));
+        assert!(definitely_not_created(&E::QuotaExceeded("tenants".into())));
+        // A timeout or a lost leader may follow a write that committed.
+        assert!(!definitely_not_created(&E::Storage(
+            "write timed out".into()
+        )));
+        assert!(!definitely_not_created(&E::Raft("closed".into())));
+        assert!(!definitely_not_created(&E::NotLeader(None)));
     }
 
     #[tokio::test]

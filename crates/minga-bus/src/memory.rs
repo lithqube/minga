@@ -223,7 +223,25 @@ impl EventBus for MemoryBus {
                 .lock()
                 .unwrap()
                 .iter()
-                .any(|event| event.tenant_id == tenant_id))
+                .any(|event| event.tenant_id == tenant_id)
+            || self
+                .tenant_log_history
+                .lock()
+                .unwrap()
+                .keys()
+                .any(|(tenant, _)| tenant == tenant_id)
+            || self
+                .leases
+                .lock()
+                .unwrap()
+                .keys()
+                .any(|(tenant, _)| tenant == tenant_id)
+            || self
+                .assignments
+                .lock()
+                .unwrap()
+                .keys()
+                .any(|key| key.starts_with(&format!("{tenant_id}."))))
     }
     async fn delete_tenant_resources(&self, tenant_id: &str) -> Result<()> {
         validate_tenant_id(tenant_id)?;
@@ -257,6 +275,12 @@ impl EventBus for MemoryBus {
             .lock()
             .unwrap()
             .retain(|(tenant, _), _| tenant != tenant_id);
+        // Assignment keys are tenant-first: `<tenant>.node.<n>.…`.
+        let prefix = format!("{tenant_id}.");
+        self.assignments
+            .lock()
+            .unwrap()
+            .retain(|key, _| !key.starts_with(&prefix));
         Ok(())
     }
     async fn publish_tenant_event(
@@ -974,6 +998,9 @@ mod tests {
             bus.refresh_tenant_lease(tenant, 1, b"registration")
                 .await
                 .unwrap();
+            bus.put_assignment(&format!("{tenant}.node.1.task.t"), b"assigned")
+                .await
+                .unwrap();
         }
         // Nothing was configured, yet data is retained, so the ID is not free.
         assert!(bus.tenant_resources_exist("gone").await.unwrap());
@@ -983,7 +1010,16 @@ mod tests {
         assert!(bus.list_audit("gone", 10).await.unwrap().is_empty());
         assert!(bus.list_tenant_status("gone").await.unwrap().is_empty());
         assert!(!bus.is_tenant_node_alive("gone", 1).await.unwrap());
+        assert_eq!(
+            bus.get_assignment("gone.node.1.task.t").await.unwrap(),
+            None
+        );
         // Another tenant keeps everything.
+        assert!(bus
+            .get_assignment("kept.node.1.task.t")
+            .await
+            .unwrap()
+            .is_some());
         assert!(bus.tenant_resources_exist("kept").await.unwrap());
         assert_eq!(bus.list_audit("kept", 10).await.unwrap().len(), 1);
         assert!(bus.is_tenant_node_alive("kept", 1).await.unwrap());

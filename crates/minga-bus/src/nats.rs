@@ -809,24 +809,34 @@ impl NatsBus {
             if !key.starts_with(subjects::NODE_JOIN_PREFIX) {
                 continue;
             }
-            let Some(entry) = self
-                .status_kv
-                .entry(&key)
-                .await
-                .map_err(|error| BusError::Kv(format!("get {key}: {error}")))?
-            else {
-                continue;
-            };
-            if entry.value.as_ref() == tenant_id.as_bytes() {
-                // Only while the key is still the revision read: a node ID the
-                // deleted tenant had may have joined another tenant since, and
-                // that newer record must stay. A refusal means it changed.
-                if let Err(error) = self
+            // Only while the key is still the revision read: a node ID the
+            // deleted tenant had may have joined another tenant since, and that
+            // newer record must stay. A revision conflict re-reads it; any other
+            // failure is returned, before the streams go, so the delete can be
+            // repeated.
+            for _ in 0..3 {
+                let Some(entry) = self
+                    .status_kv
+                    .entry(&key)
+                    .await
+                    .map_err(|error| BusError::Kv(format!("get {key}: {error}")))?
+                else {
+                    break;
+                };
+                if entry.value.as_ref() != tenant_id.as_bytes() {
+                    break;
+                }
+                match self
                     .status_kv
                     .purge_expect_revision(&key, Some(entry.revision))
                     .await
                 {
-                    tracing::debug!(%key, %error, "node-join record changed during tenant cleanup; kept");
+                    Ok(()) => break,
+                    Err(error)
+                        if error.kind() == jetstream::kv::PurgeErrorKind::WrongLastRevision => {}
+                    Err(error) => {
+                        return Err(BusError::Kv(format!("purge {key}: {error}")));
+                    }
                 }
             }
         }
