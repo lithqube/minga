@@ -36,6 +36,17 @@ use serde::Serialize;
 /// field-shape change and add the corresponding migration.
 pub const FORMAT_VERSION: u8 = 11;
 
+/// The newest apply-rule level this build implements (ADR 0009).
+///
+/// Level 1 is every refusal `apply_command` made through v1.3.0-rc.1. A change
+/// that makes an entry fail which an earlier build applied must be gated on
+/// the next level and bump this constant; see the ADR before adding one.
+pub const APPLY_RULES_VERSION: u32 = 1;
+
+/// Metadata key that holds the apply-rule level in force in each redb file.
+/// Absent means level 1.
+pub const APPLY_RULES_KEY: &str = "apply_rules";
+
 /// The persisted version immediately before Raft-backed change requests.
 pub const V10_FORMAT_VERSION: u8 = 10;
 
