@@ -5,6 +5,11 @@
 Changes on `main` after `v1.3.0-rc.1`. They go into 1.3.0.
 
 ### Changes
+- **Compose `ports` host IPs work again (#162).** A port with `host_ip` (`127.0.0.1:8080:80`, `host_ip:` in the long syntax) is accepted by `minga validate` and published on that node address only. A port without one stays published on every node address.
+  - A `host_ip` that is not an IP address is refused when the file loads.
+  - `0.0.0.0` and `::` mean every address. An IPv6 address is carried and stored, but the node publishes through IPv4 rules only, so it logs a warning and does not publish that port (it is never widened to every address).
+  - One published port and protocol still belongs to one service in the cluster, whatever its `host_ip`.
+  - A rolling upgrade can leave a node that ignores `host_ip` and publishes on every address: upgrade every node before deploying a file that uses it.
 - **Security, no upgrade action.** `minga-ctl change approve` shows what it will apply before it asks (#134):
   - It prints the redacted before and after value of every changed field to stderr, then asks for confirmation.
     Scripts must pass `--yes`.

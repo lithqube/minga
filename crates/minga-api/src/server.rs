@@ -2779,6 +2779,7 @@ mod tests {
         let mut rolled = service_record("svc-rollback", "default");
         let mut earlier = rolled.clone();
         earlier.ports = vec![minga_state::types::PortMapping {
+            host_ip: None,
             target: 80,
             published: Some(18080),
             protocol: "tcp".into(),

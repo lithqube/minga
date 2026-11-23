@@ -1,6 +1,5 @@
-//! `minga validate` fails loudly when a port sets `host_ip` (issue #135):
-//! the host IP cannot reach desired state yet, so loading must refuse it
-//! instead of silently publishing the port on every address.
+//! `minga validate` accepts a port that sets `host_ip` (issue #162) and refuses
+//! one whose `host_ip` is not an IP address.
 
 use std::io::Write;
 use std::process::{Command, Stdio};
@@ -22,27 +21,27 @@ fn run_validate(compose: &str) -> (bool, String) {
 }
 
 #[test]
-fn validate_rejects_port_host_ip_short_syntax() {
-    let (ok, out) = run_validate("services:\n  db: {image: db, ports: ['127.0.0.1:5432:5432']}\n");
-    assert!(!ok, "validate should fail:\n{out}");
-    assert!(
-        out.contains(
-            "services.db.ports[0]: `host_ip` is part of the Compose spec but not supported yet"
-        ),
-        "unexpected output:\n{out}"
+fn validate_accepts_port_host_ip_short_syntax() {
+    let (ok, out) = run_validate(
+        "services:\n  db: {image: db, ports: ['127.0.0.1:5432:5432', '[::1]:5433:5433']}\n",
     );
+    assert!(ok, "validate should succeed:\n{out}");
 }
 
 #[test]
-fn validate_rejects_port_host_ip_long_syntax() {
+fn validate_accepts_port_host_ip_long_syntax() {
     let (ok, out) = run_validate(
         "services:\n  db:\n    image: db\n    ports:\n      - {target: 5432, published: 5432, host_ip: 127.0.0.1}\n",
     );
+    assert!(ok, "validate should succeed:\n{out}");
+}
+
+#[test]
+fn validate_rejects_port_host_ip_that_is_not_an_ip_address() {
+    let (ok, out) = run_validate("services:\n  db: {image: db, ports: ['localhost:5432:5432']}\n");
     assert!(!ok, "validate should fail:\n{out}");
     assert!(
-        out.contains(
-            "services.db.ports[0]: `host_ip` is part of the Compose spec but not supported yet"
-        ),
+        out.contains("is not an IP address"),
         "unexpected output:\n{out}"
     );
 }

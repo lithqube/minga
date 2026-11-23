@@ -145,11 +145,25 @@ fn translate_service(
     // A range such as `80-81:8080-8081` becomes one mapping per port; the
     // loader has checked both ranges are the same size. A single target with
     // a published range takes any port from it, as Docker does: the first.
-    let ports = svc
-        .ports
-        .iter()
-        .flat_map(|p| {
-            (p.target.start..=p.target.end).map(move |target| minga_state::types::PortMapping {
+    let mut ports = Vec::new();
+    for (index, p) in svc.ports.iter().enumerate() {
+        // The loader checks this too; a project built by hand must not widen
+        // a port to every address because its `host_ip` does not parse.
+        let host_ip = p
+            .host_ip
+            .as_deref()
+            .map(|ip| {
+                ip.parse::<std::net::IpAddr>().map_err(|_| {
+                    TranslateError::Service(
+                        name.to_string(),
+                        format!("ports[{index}]: host_ip {ip:?} is not an IP address"),
+                    )
+                })
+            })
+            .transpose()?;
+        ports.extend((p.target.start..=p.target.end).map(|target| {
+            minga_state::types::PortMapping {
+                host_ip,
                 target,
                 published: p.published.map(|published| {
                     if p.target.count() > 1 {
@@ -164,9 +178,9 @@ fn translate_service(
                     Some("host") => minga_state::types::PortMode::Host,
                     _ => minga_state::types::PortMode::Ingress,
                 },
-            })
-        })
-        .collect();
+            }
+        }));
+    }
 
     // Networks: service networks or the default network.
     let networks: Vec<String> = if svc.networks.is_empty() {
@@ -1270,6 +1284,46 @@ volumes:
                 (Some(5353), 53, "udp", Host),
             ]
         );
+    }
+
+    #[test]
+    fn port_host_ip_reaches_every_mapping_and_no_host_ip_stays_none() {
+        let svc = translate_one(
+            "services:\n  web:\n    image: nginx\n    ports:\n      \
+             - \"127.0.0.1:80-81:8080-8081\"\n      - \"[::1]:9000:9000\"\n      \
+             - target: 7000\n        published: 7000\n        host_ip: 10.0.0.5\n      \
+             - \"6000:6000\"\n",
+        )
+        .unwrap();
+        let ports: Vec<_> = svc
+            .ports
+            .iter()
+            .map(|p| (p.published, p.host_ip.map(|ip| ip.to_string())))
+            .collect();
+        assert_eq!(
+            ports,
+            vec![
+                (Some(80), Some("127.0.0.1".to_string())),
+                (Some(81), Some("127.0.0.1".to_string())),
+                (Some(9000), Some("::1".to_string())),
+                (Some(7000), Some("10.0.0.5".to_string())),
+                // No host_ip: published on every node address, as before.
+                (Some(6000), None),
+            ]
+        );
+    }
+
+    #[test]
+    fn port_host_ip_that_does_not_parse_is_an_error_not_every_address() {
+        let mut project = minga_compose::load(
+            "services:\n  web:\n    image: nginx\n    ports: ['80:80']\n",
+            &minga_compose::LoadOptions::default(),
+        )
+        .expect("compose should load")
+        .project;
+        project.services.get_mut("web").unwrap().ports[0].host_ip = Some("not-an-ip".into());
+        let err = translate_project(&project, "shop", None).unwrap_err();
+        assert!(err.to_string().contains("is not an IP address"), "{err}");
     }
 
     #[test]

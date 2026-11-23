@@ -4168,6 +4168,7 @@ mod tests {
             constraints: Vec::new(),
             env: HashMap::new(),
             ports: vec![minga_state::types::PortMapping {
+                host_ip: None,
                 target: 443,
                 published: Some(published),
                 protocol: "tcp".to_string(),

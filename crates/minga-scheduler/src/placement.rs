@@ -442,6 +442,7 @@ mod tests {
             constraints: Vec::new(),
             env: HashMap::new(),
             ports: vec![PortMapping {
+                host_ip: None,
                 target: 80,
                 published: Some(8080),
                 protocol: "tcp".to_string(),

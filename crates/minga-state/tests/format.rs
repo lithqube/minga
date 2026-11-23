@@ -144,6 +144,32 @@ fn old_cluster_node_without_wireguard_or_reservation_fields_decodes() {
 }
 
 #[test]
+fn port_mapping_host_ip_is_additive_and_omitted_when_absent() {
+    // A record written before `host_ip` (a Raft log entry or snapshot) means every address.
+    let old: PortMapping = serde_json::from_value(serde_json::json!({
+        "target": 80, "published": 8080, "protocol": "tcp", "mode": "ingress"
+    }))
+    .unwrap();
+    assert_eq!(old.host_ip, None);
+    // No host_ip is not written, so existing records and the frozen fixtures keep their bytes.
+    assert!(serde_json::to_value(&old).unwrap().get("host_ip").is_none());
+
+    for ip in ["127.0.0.1", "::1"] {
+        let value = serde_json::json!({
+            "host_ip": ip, "target": 80, "published": 8080, "protocol": "tcp", "mode": "ingress"
+        });
+        let with: PortMapping = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(with.host_ip, Some(ip.parse().unwrap()));
+        assert_eq!(serde_json::to_value(&with).unwrap(), value);
+    }
+    // A value that is not an IP address does not decode into "every address".
+    assert!(serde_json::from_value::<PortMapping>(serde_json::json!({
+        "host_ip": "localhost", "target": 80, "published": 8080, "protocol": "tcp"
+    }))
+    .is_err());
+}
+
+#[test]
 fn old_port_mapping_defaults_to_ingress_and_modes_use_lowercase() {
     let old: PortMapping = serde_json::from_value(serde_json::json!({
         "target": 80,
@@ -298,6 +324,7 @@ fn mount() -> ServiceMount {
 
 fn port() -> PortMapping {
     PortMapping {
+        host_ip: None,
         target: 80,
         published: Some(8080),
         protocol: "tcp".into(),

@@ -371,6 +371,7 @@ pub fn service_spec_to_state(spec: &models::ServiceSpec) -> Result<Service, Stri
                         _ => return Err(format!("unsupported port protocol {:?}", p.Protocol)),
                     };
                     Ok(p.TargetPort.map(|target| PortMapping {
+                        host_ip: None,
                         target: target as u16,
                         published: p.PublishedPort.map(|pp| pp as u16),
                         protocol: protocol.to_string(),

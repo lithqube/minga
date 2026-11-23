@@ -221,30 +221,50 @@ fn dependency_on_disabled_profile_fails() {
 }
 
 #[test]
-fn port_host_ip_short_syntax_is_unsupported() {
-    let err = load(
-        "services:\n  db: {image: db, ports: ['127.0.0.1:5432:5432']}\n",
+fn port_host_ip_short_syntax_loads_for_ipv4_and_ipv6() {
+    let loaded = load(
+        "services:\n  db: {image: db, ports: ['127.0.0.1:5432:5432', '[::1]:5433:5433']}\n",
         &opts(&[], &[]),
     )
-    .unwrap_err();
-    assert!(
-        matches!(&err.0[0], ComposeError::Unsupported { path, key, .. } if path == "services.db.ports[0]" && key == "host_ip")
-    );
+    .unwrap_or_else(|e| panic!("unexpected errors: {e:?}"));
+    let ips: Vec<_> = loaded.project.services["db"]
+        .ports
+        .iter()
+        .map(|p| p.host_ip.as_deref())
+        .collect();
+    assert_eq!(ips, [Some("127.0.0.1"), Some("::1")]);
 }
 
 #[test]
-fn port_host_ip_long_syntax_is_unsupported() {
-    let errs = errors(
-        "services:\n  db:\n    image: db\n    ports:\n      - {target: 5432, published: 5432, host_ip: 127.0.0.1}\n",
-    );
-    assert_eq!(errs.len(), 1);
-    assert!(
-        errs[0].starts_with(
-            "services.db.ports[0]: `host_ip` is part of the Compose spec but not supported yet"
-        ),
-        "unexpected error: {}",
-        errs[0]
-    );
+fn port_host_ip_long_syntax_loads_for_ipv4_and_ipv6() {
+    let loaded = load(
+        "services:\n  db:\n    image: db\n    ports:\n      - {target: 5432, published: 5432, host_ip: 127.0.0.1}\n      - {target: 5433, published: 5433, host_ip: '::1'}\n",
+        &opts(&[], &[]),
+    )
+    .unwrap_or_else(|e| panic!("unexpected errors: {e:?}"));
+    let ips: Vec<_> = loaded.project.services["db"]
+        .ports
+        .iter()
+        .map(|p| p.host_ip.as_deref())
+        .collect();
+    assert_eq!(ips, [Some("127.0.0.1"), Some("::1")]);
+}
+
+#[test]
+fn port_host_ip_that_is_not_an_ip_address_is_refused() {
+    for ports in [
+        "['localhost:5432:5432']",
+        "['999.0.0.1:5432:5432']",
+        "[{target: 5432, published: 5432, host_ip: db.internal}]",
+        "[{target: 5432, published: 5432, host_ip: '[::1]'}]",
+        "[{target: 5432, published: 5432, host_ip: ''}]",
+    ] {
+        let errs = errors(&format!("services:\n  db: {{image: db, ports: {ports}}}\n"));
+        assert!(
+            errs.iter().any(|e| e.contains("is not an IP address")),
+            "{ports}: unexpected errors: {errs:?}"
+        );
+    }
 }
 
 #[test]
