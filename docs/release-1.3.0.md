@@ -31,10 +31,13 @@ numbers in the list; the changelog has the detail and the upgrade steps.
 
 ## Upgrade notes
 
-Upgrading a 1.2.0 cluster is **one coordinated window**. Run
-`minga-ctl upgrade preflight --to v1.3.0` first: it is read-only, and it
-reports the Raft membership and quorum, backups, NATS, tenants and a rollback
-plan. It fails closed when it cannot check something.
+Upgrading a 1.2.0 cluster is **one coordinated window**. Count the voters by
+hand before you start (see [Order](#order)), because the 1.3.0 tools that
+report them cannot read a 1.2.0 API. `minga-ctl upgrade preflight --to v1.3.0`
+is read-only and reports the Raft membership and quorum, backups, NATS,
+tenants and a rollback plan, and it fails closed when it cannot check
+something. Its diagnostics endpoints are new in 1.3.0, so run it against an
+upgraded manager, not a 1.2.0 one.
 
 **State migrates in place, one way.** 1.2.0 state is format 2; 1.3.0 is format
 11. Opening a store migrates state and Raft logs from v2 through v10, and a
@@ -86,10 +89,19 @@ removes the worker voters is a Raft write, so it needs a majority of the
 voters that can answer. Upgrading the workers first does not help: an
 upgraded worker no longer votes. This candidate has not shown that the
 conversion commits when the managers are a minority of the voters, so treat
-that shape as unsupported. `minga-ctl upgrade preflight` reports the Raft
-membership and quorum, and `minga migrate-v1` without `--apply` prints the
-voter set it would convert. If the managers are not a majority of it, or you
-cannot rehearse the upgrade on a copy first, use
+that shape as unsupported.
+
+Count the voters before upgrading anything, from your own inventory and the
+1.2.0 API, which can list nodes but cannot report Raft membership: in 1.2.0
+every `minga manager`, every `minga worker` and every `minga api` process is a
+voter. `docker node ls` against the 1.2.0 API lists the managers and workers;
+add the `minga api` processes you run. The managers (the `minga manager`
+processes, which you upgrade first) must be a majority of that total. `minga
+api` is retired in 1.3.0, so it never counts toward the managers.
+`minga migrate-v1` without `--apply` and `upgrade preflight` run only against
+an upgraded manager, as a second check before you apply the conversion. If the
+managers are not a majority of the voters, or you cannot rehearse the upgrade
+on a copy first, use
 [the export and import path](#when-the-managers-are-not-a-majority) instead.
 
 1. Upgrade the managers first, then, on the leader, change membership once to
@@ -107,6 +119,25 @@ converted the voters `{1, 2, 99}` to `{1}` with one manager upgraded; the
 record does not explain how that reached a majority, so do not rely on it for
 a different shape. See [supported topologies](topologies.md) for what it did
 and did not cover.
+
+#### If the conversion stalls or a step fails
+
+An older binary refuses a migrated store, and an upgraded node refuses 1.2.0
+messages, so a half-upgraded cluster does not recover by restarting it with
+the old binary. The way back is the copy you took first:
+
+1. Stop every node.
+2. On each node, restore the full data directory you copied before the upgrade
+   (`raft_log.redb`, `state.redb` and the rest, [backup.md](backup.md) says to
+   cold-copy it) over the migrated one.
+3. Start the 1.2.0 binaries with the certificates and flags they had. Keep the
+   old certificates until the upgrade has succeeded; issue the new ones beside
+   them, not over them.
+
+This follows from how the stores and the wire format behave and from the
+backup guide. **It has not been rehearsed**, not in a live run and not in CI,
+so rehearse it on a copy of the cluster before the window, and do not start
+the window without the copy.
 
 #### When the managers are not a majority
 

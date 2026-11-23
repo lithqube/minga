@@ -19,9 +19,11 @@ changes refuse to start on settings that used to log a warning.
   window; nodes of different formats refuse each other. Back up first, and note
   that an older binary refuses a newer store.
 - Managers first, then workers (workers stop voting and join as NATS clients).
-  The conversion is a Raft write, so check the voter set first; if the managers
-  are not a majority of it, export the state and import it into a fresh
-  cluster instead (see the release notes). Reissue
+  The conversion is a Raft write, so count the 1.2.0 voters by hand first
+  (1.2.0 cannot report them); if the managers are not a majority, export the
+  state and import it into a fresh cluster instead. The way back is a cold copy
+  of each data directory, which has not been rehearsed (see the release
+  notes). Reissue
   manager and NATS route certificates before upgrading; see below.
 - A manager refuses to start on a non-loopback API without a token or client
   TLS, on an empty token, and on plaintext Raft off loopback.
