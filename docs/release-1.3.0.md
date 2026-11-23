@@ -79,6 +79,19 @@ has migrated.
 
 ### Order
 
+**First check the voter set.** In 1.2.0 every node is a Raft voter, and nodes
+of different formats refuse each other's messages. The membership change that
+removes the worker voters is a Raft write, so it needs a majority of the
+1.2.0 voter set, and during step 1 the upgraded managers may be the only
+voters that can answer. Upgrading the workers first does not help: an
+upgraded worker no longer votes. This candidate has not shown that the
+conversion commits when the managers are a minority of the voters, so treat
+that shape as unsupported. `minga-ctl upgrade preflight` reports the Raft
+membership and quorum, and `minga migrate-v1` without `--apply` prints the
+voter set it would convert. If the managers are not a majority of it, or you
+cannot rehearse the upgrade on a copy first, use
+[the export and import path](#when-the-managers-are-not-a-majority) instead.
+
 1. Upgrade the managers first, then, on the leader, change membership once to
    the manager set, removing worker voters. `minga migrate-v1` previews that
    voter set before applying it.
@@ -89,8 +102,21 @@ has migrated.
    It is not kept as an alias.
 
 A 1.2.0 cluster went through this in a live proof with a service and a running
-container intact, and the upgraded worker adopted the same task. See
-[supported topologies](topologies.md) for what that did and did not cover.
+container intact, and the upgraded worker adopted the same task. The proof
+converted the voters `{1, 2, 99}` to `{1}` with one manager upgraded; the
+record does not explain how that reached a majority, so do not rely on it for
+a different shape. See [supported topologies](topologies.md) for what it did
+and did not cover.
+
+#### When the managers are not a majority
+
+Do not try to convert in place. Export the desired state from the running
+1.2.0 cluster with `minga state export`, build a fresh 1.3.0 cluster, and
+restore with `minga state import`, which accepts snapshots from format v2
+upward. The export carries services, networks, volumes and secret and config
+names, not secret values, volume data or TLS material: copy those as
+[backup.md](backup.md) describes. Tests cover importing v2-format snapshots;
+this path has not been run as a live upgrade.
 
 ### What changes after
 
