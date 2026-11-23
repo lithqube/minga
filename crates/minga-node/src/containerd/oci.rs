@@ -943,6 +943,7 @@ mod tests {
     fn spec_annotations_include_ports() {
         let mut ts = base_spec();
         ts.ports.push(PortMapping {
+            host_ip: None,
             target: 80,
             published: Some(8080),
             protocol: "tcp".to_string(),

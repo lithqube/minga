@@ -178,6 +178,7 @@ async fn scenario(setup: &NetworkSetup) -> Result<(), String> {
         }]
     };
     let ports = [PortMapping {
+        host_ip: None,
         target: TARGET,
         published: Some(PUBLISHED),
         protocol: "tcp".into(),
@@ -299,6 +300,7 @@ async fn scenario(setup: &NetworkSetup) -> Result<(), String> {
 
     // Port 53 belongs to the embedded DNS server on every gateway.
     let dns = [PortMapping {
+        host_ip: None,
         target: 5353,
         published: Some(53),
         protocol: "udp".into(),
@@ -383,6 +385,7 @@ async fn ingress_port_reaches_each_backend_on_another_node() {
         }]
     };
     let ingress_ports = [PortMapping {
+        host_ip: None,
         target: TARGET,
         published: Some(INGRESS_PUBLISHED),
         protocol: "tcp".into(),
@@ -428,6 +431,7 @@ async fn ingress_port_reaches_each_backend_on_another_node() {
             .await
             .map_err(|error| error.to_string())?;
         let assignment = minga_state::types::IngressAssignment {
+            host_ip: None,
             published: INGRESS_PUBLISHED,
             protocol: "tcp".into(),
             backends: vec![

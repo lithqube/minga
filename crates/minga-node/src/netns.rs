@@ -24,7 +24,7 @@
 //! Requires root (CAP_NET_ADMIN). iproute2 and iptables must be installed.
 
 use std::collections::HashSet;
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
 
 use minga_net::Cidr;
@@ -499,16 +499,58 @@ enum Chain {
     Output,
 }
 
-/// iptables arguments for one DNAT rule. `op` is `-A` or `-D`.
-fn dnat_rule(op: &str, chain: Chain, proto: &str, published: u16, to: &str) -> Vec<String> {
+/// Which node address a published port answers on.
+#[derive(Debug, PartialEq, Eq)]
+enum HostMatch {
+    /// Every node address.
+    Any,
+    /// Only this IPv4 address.
+    Only(Ipv4Addr),
+    /// An IPv6 address. The rules here are iptables (IPv4) only, so the port
+    /// is not published at all rather than widened to every address.
+    Unsupported,
+}
+
+impl HostMatch {
+    fn of(host_ip: Option<IpAddr>) -> Self {
+        match host_ip {
+            // `0.0.0.0` and `::` both mean every address, as in Docker.
+            None => Self::Any,
+            Some(ip) if ip.is_unspecified() => Self::Any,
+            Some(IpAddr::V4(ip)) => Self::Only(ip),
+            Some(IpAddr::V6(_)) => Self::Unsupported,
+        }
+    }
+
+    /// The destination match for an iptables rule or `iptables-restore` line.
+    fn dst(&self) -> Option<String> {
+        match self {
+            Self::Only(ip) => Some(format!("{ip}/32")),
+            _ => None,
+        }
+    }
+}
+
+/// iptables arguments for one DNAT rule. `op` is `-A` or `-D`. `host` limits
+/// the rule to one destination address.
+fn dnat_rule(
+    op: &str,
+    chain: Chain,
+    proto: &str,
+    host: &HostMatch,
+    published: u16,
+    to: &str,
+) -> Vec<String> {
     let (name, matches): (&str, &[&str]) = match chain {
         Chain::PreroutingLocal => ("PREROUTING", &["-m", "addrtype", "--dst-type", "LOCAL"]),
         Chain::PreroutingAny => ("PREROUTING", &[]),
         Chain::Output => ("OUTPUT", &["-o", "lo"]),
     };
+    let dst = host.dst();
     ["-w", "5", "-t", "nat", op, name]
         .into_iter()
         .chain(matches.iter().copied())
+        .chain(dst.iter().flat_map(|dst| ["-d", dst.as_str()]))
         .chain(["-p", proto, "--dport", &published.to_string()])
         .chain(["-j", "DNAT", "--to-destination", to])
         .map(String::from)
@@ -717,6 +759,39 @@ fn ingress_forward_batch(
     batch
 }
 
+/// The `MINGA_INGRESS` line that sends a published port to its backend chain,
+/// limited to the port's `host_ip` when it has one.
+fn ingress_dispatch_rule(
+    assignment: &minga_state::types::IngressAssignment,
+    chain: &str,
+) -> String {
+    format!(
+        "-A MINGA_INGRESS{} -p {} --dport {} -j {chain}\n",
+        dst_arg(&HostMatch::of(assignment.host_ip)),
+        assignment.protocol,
+        assignment.published
+    )
+}
+
+/// The `MINGA_INGRESS_MARK` line for a published port, matching the same
+/// destination as its dispatch rule.
+fn ingress_mark_rule(assignment: &minga_state::types::IngressAssignment) -> String {
+    format!(
+        "-A MINGA_INGRESS_MARK{} -p {} --dport {} -m conntrack --ctstate NEW \
+         -j CONNMARK --set-mark {INGRESS_CONNMARK}\n",
+        dst_arg(&HostMatch::of(assignment.host_ip)),
+        assignment.protocol,
+        assignment.published
+    )
+}
+
+/// ` -d <ip>/32` for a rule line, or nothing when every address matches.
+fn dst_arg(host: &HostMatch) -> String {
+    host.dst()
+        .map(|dst| format!(" -d {dst}"))
+        .unwrap_or_default()
+}
+
 fn ingress_port_chain(assignment: &minga_state::types::IngressAssignment) -> String {
     let protocol = match assignment.protocol.as_str() {
         "tcp" => "T",
@@ -898,6 +973,25 @@ impl NetworkSetup {
         assignments: &[minga_state::types::IngressAssignment],
         node_id: minga_state::types::NodeId,
     ) -> Result<(), NetError> {
+        // An IPv6 host address cannot be matched by these IPv4 rules; leave
+        // that port unpublished instead of publishing it on every address.
+        let publishable: Vec<_> = assignments
+            .iter()
+            .filter(|assignment| {
+                let ok = HostMatch::of(assignment.host_ip) != HostMatch::Unsupported;
+                if !ok {
+                    tracing::warn!(
+                        port = assignment.published,
+                        protocol = %assignment.protocol,
+                        host_ip = ?assignment.host_ip,
+                        "not publishing the port: its host_ip is IPv6 and the node publishes through IPv4 rules only"
+                    );
+                }
+                ok
+            })
+            .cloned()
+            .collect();
+        let assignments = publishable.as_slice();
         let mut desired_chains = HashSet::new();
         for assignment in assignments {
             if assignment.published == 0
@@ -1024,10 +1118,7 @@ impl NetworkSetup {
         for assignment in assignments {
             let chain = ingress_port_chain(assignment);
             batch.push_str(&format!("-F {chain}\n"));
-            batch.push_str(&format!(
-                "-A MINGA_INGRESS -p {} --dport {} -j {chain}\n",
-                assignment.protocol, assignment.published
-            ));
+            batch.push_str(&ingress_dispatch_rule(assignment, &chain));
             for (index, backend) in assignment.backends.iter().enumerate() {
                 let destination = format!("{}:{}", backend.ip, backend.target_port);
                 if index + 1 < assignment.backends.len() {
@@ -1059,11 +1150,7 @@ impl NetworkSetup {
         let mut mark_batch =
             String::from("*mangle\n:MINGA_INGRESS_MARK - [0:0]\n-F MINGA_INGRESS_MARK\n");
         for assignment in assignments {
-            mark_batch.push_str(&format!(
-                "-A MINGA_INGRESS_MARK -p {} --dport {} -m conntrack --ctstate NEW \
-                 -j CONNMARK --set-mark {INGRESS_CONNMARK}\n",
-                assignment.protocol, assignment.published
-            ));
+            mark_batch.push_str(&ingress_mark_rule(assignment));
         }
         mark_batch.push_str("COMMIT\n");
         iptables_restore(&mark_batch).await?;
@@ -1096,7 +1183,14 @@ impl NetworkSetup {
                 };
                 let destination = format!("{ip}:{}", port.target);
                 for chain in [Chain::PreroutingLocal, Chain::PreroutingAny, Chain::Output] {
-                    let rule = dnat_rule("-D", chain, &port.protocol, published, &destination);
+                    let rule = dnat_rule(
+                        "-D",
+                        chain,
+                        &port.protocol,
+                        &HostMatch::Any,
+                        published,
+                        &destination,
+                    );
                     run_tolerated("iptables", &as_strs(&rule)).await;
                 }
             }
@@ -1471,7 +1565,10 @@ impl NetworkSetup {
         }
 
         for port in ports {
-            if port.mode == minga_state::types::PortMode::Host {
+            // An IPv6 address installs no rule below, so it cannot collide.
+            if port.mode == minga_state::types::PortMode::Host
+                && HostMatch::of(port.host_ip) != HostMatch::Unsupported
+            {
                 if let Some(published) = port.published {
                     self.check_port_free(&port.protocol, published)?;
                 }
@@ -1634,11 +1731,28 @@ impl NetworkSetup {
             let Some(published) = port.published else {
                 continue;
             };
+            let host = HostMatch::of(port.host_ip);
+            if host == HostMatch::Unsupported {
+                tracing::warn!(
+                    task = %task_id,
+                    port = published,
+                    host_ip = ?port.host_ip,
+                    "not publishing the port: its host_ip is IPv6 and the node publishes through IPv4 rules only"
+                );
+                continue;
+            }
             let to = format!("{}:{}", primary_ip, port.target);
             for rule in [
-                dnat_rule("-A", Chain::PreroutingLocal, &port.protocol, published, &to),
+                dnat_rule(
+                    "-A",
+                    Chain::PreroutingLocal,
+                    &port.protocol,
+                    &host,
+                    published,
+                    &to,
+                ),
                 // Host-local clients (curl from the node itself).
-                dnat_rule("-A", Chain::Output, &port.protocol, published, &to),
+                dnat_rule("-A", Chain::Output, &port.protocol, &host, published, &to),
             ] {
                 run("iptables", &as_strs(&rule)).await?;
             }
@@ -1711,10 +1825,15 @@ impl NetworkSetup {
                         continue;
                     };
                     let to = format!("{}:{}", ip, port.target);
+                    let host = HostMatch::of(port.host_ip);
+                    // Setup installed nothing for an IPv6 address.
+                    if host == HostMatch::Unsupported {
+                        continue;
+                    }
                     // The current forms, plus the 1.0.2 PREROUTING form
                     // that rules written by an older binary may still use.
                     for chain in [Chain::PreroutingLocal, Chain::PreroutingAny, Chain::Output] {
-                        let rule = dnat_rule("-D", chain, &port.protocol, published, &to);
+                        let rule = dnat_rule("-D", chain, &port.protocol, &host, published, &to);
                         run_tolerated("iptables", &as_strs(&rule)).await;
                     }
                 }
@@ -2039,6 +2158,7 @@ mod tests {
             target_port: 8080,
         };
         let assignment = minga_state::types::IngressAssignment {
+            host_ip: None,
             published: 18080,
             protocol: "tcp".into(),
             backends: vec![backend(2, "10.242.0.20"), backend(3, "10.242.0.21")],
@@ -2108,23 +2228,102 @@ mod tests {
     #[test]
     fn prerouting_dnat_only_matches_node_addresses() {
         let to = "10.100.5.2:8080";
-        let new = dnat_rule("-A", Chain::PreroutingLocal, "tcp", 443, to).join(" ");
+        let new = dnat_rule(
+            "-A",
+            Chain::PreroutingLocal,
+            "tcp",
+            &HostMatch::Any,
+            443,
+            to,
+        )
+        .join(" ");
         assert_eq!(
             new,
             "-w 5 -t nat -A PREROUTING -m addrtype --dst-type LOCAL -p tcp --dport 443 \
              -j DNAT --to-destination 10.100.5.2:8080"
         );
         // The 1.0.2 form (no destination match) is what teardown must still delete.
-        let old = dnat_rule("-D", Chain::PreroutingAny, "tcp", 443, to).join(" ");
+        let old = dnat_rule("-D", Chain::PreroutingAny, "tcp", &HostMatch::Any, 443, to).join(" ");
         assert_eq!(
             old,
             "-w 5 -t nat -D PREROUTING -p tcp --dport 443 -j DNAT --to-destination 10.100.5.2:8080"
         );
     }
 
+    fn assignment(host_ip: Option<IpAddr>) -> minga_state::types::IngressAssignment {
+        minga_state::types::IngressAssignment {
+            host_ip,
+            published: 8443,
+            protocol: "tcp".into(),
+            backends: vec![minga_state::types::IngressBackend {
+                node_id: 1,
+                ip: "10.242.0.20".into(),
+                target_port: 8080,
+            }],
+            source_overlay_ip: None,
+        }
+    }
+
+    #[test]
+    fn ingress_without_host_ip_matches_every_node_address() {
+        let a = assignment(None);
+        assert_eq!(
+            ingress_dispatch_rule(&a, "MINGA_I_T_8443"),
+            "-A MINGA_INGRESS -p tcp --dport 8443 -j MINGA_I_T_8443\n"
+        );
+        assert!(ingress_mark_rule(&a).starts_with("-A MINGA_INGRESS_MARK -p tcp --dport 8443 "));
+    }
+
+    #[test]
+    fn ingress_with_ipv4_host_ip_matches_only_that_address() {
+        let a = assignment(Some("127.0.0.1".parse().unwrap()));
+        assert_eq!(
+            ingress_dispatch_rule(&a, "MINGA_I_T_8443"),
+            "-A MINGA_INGRESS -d 127.0.0.1/32 -p tcp --dport 8443 -j MINGA_I_T_8443\n"
+        );
+        assert!(ingress_mark_rule(&a)
+            .starts_with("-A MINGA_INGRESS_MARK -d 127.0.0.1/32 -p tcp --dport 8443 "));
+    }
+
+    #[test]
+    fn host_match_treats_unspecified_as_every_address_and_ipv6_as_unsupported() {
+        let of = |ip: &str| HostMatch::of(Some(ip.parse().unwrap()));
+        assert_eq!(HostMatch::of(None), HostMatch::Any);
+        assert_eq!(of("0.0.0.0"), HostMatch::Any);
+        assert_eq!(of("::"), HostMatch::Any);
+        assert_eq!(of("10.0.0.5"), HostMatch::Only(Ipv4Addr::new(10, 0, 0, 5)));
+        // iptables is IPv4 only: an IPv6 address is never widened to every address.
+        assert_eq!(of("::1"), HostMatch::Unsupported);
+        assert_eq!(of("fd00::5"), HostMatch::Unsupported);
+    }
+
+    #[test]
+    fn host_mode_dnat_with_host_ip_matches_that_destination_in_both_chains() {
+        let host = HostMatch::of(Some("127.0.0.1".parse().unwrap()));
+        let to = "10.100.5.2:8080";
+        assert_eq!(
+            dnat_rule("-A", Chain::PreroutingLocal, "tcp", &host, 443, to).join(" "),
+            "-w 5 -t nat -A PREROUTING -m addrtype --dst-type LOCAL -d 127.0.0.1/32 -p tcp \
+             --dport 443 -j DNAT --to-destination 10.100.5.2:8080"
+        );
+        assert_eq!(
+            dnat_rule("-D", Chain::Output, "tcp", &host, 443, to).join(" "),
+            "-w 5 -t nat -D OUTPUT -o lo -d 127.0.0.1/32 -p tcp --dport 443 \
+             -j DNAT --to-destination 10.100.5.2:8080"
+        );
+    }
+
     #[test]
     fn output_dnat_is_loopback_only() {
-        let rule = dnat_rule("-A", Chain::Output, "udp", 53, "10.100.5.2:5353").join(" ");
+        let rule = dnat_rule(
+            "-A",
+            Chain::Output,
+            "udp",
+            &HostMatch::Any,
+            53,
+            "10.100.5.2:5353",
+        )
+        .join(" ");
         assert_eq!(
             rule,
             "-w 5 -t nat -A OUTPUT -o lo -p udp --dport 53 -j DNAT --to-destination 10.100.5.2:5353"

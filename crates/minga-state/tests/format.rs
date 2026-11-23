@@ -14,9 +14,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
 
 use minga_state::codec::{
-    self, FORMAT_KEY, FORMAT_VERSION, V10_FORMAT_VERSION, V2_FORMAT_VERSION, V3_FORMAT_VERSION,
-    V4_FORMAT_VERSION, V5_FORMAT_VERSION, V6_FORMAT_VERSION, V7_FORMAT_VERSION, V8_FORMAT_VERSION,
-    V9_FORMAT_VERSION,
+    self, FORMAT_KEY, FORMAT_VERSION, V10_FORMAT_VERSION, V11_FORMAT_VERSION, V2_FORMAT_VERSION,
+    V3_FORMAT_VERSION, V4_FORMAT_VERSION, V5_FORMAT_VERSION, V6_FORMAT_VERSION, V7_FORMAT_VERSION,
+    V8_FORMAT_VERSION, V9_FORMAT_VERSION,
 };
 use minga_state::types::{
     AgentCapabilities, AgentDirGrant, AgentGrant, AgentSpec, ChangeKind, ChangeRequest,
@@ -86,7 +86,7 @@ fn a_fixture_accepts_added_fields_and_rejects_changed_ones() {
 
 /// Compares `value` with its fixture, and decodes the fixture back.
 fn check<T: Serialize + DeserializeOwned>(name: &str, value: &T) {
-    for version in V2_FORMAT_VERSION..=V10_FORMAT_VERSION {
+    for version in V2_FORMAT_VERSION..=V11_FORMAT_VERSION {
         let old_path = fixture_path_for_version(version, name);
         if old_path.exists() {
             let old = std::fs::read_to_string(&old_path).unwrap_or_else(|e| {
@@ -141,6 +141,32 @@ fn old_cluster_node_without_wireguard_or_reservation_fields_decodes() {
     assert!(node.reserved_ports.is_empty());
     assert_eq!(node.tenant_id, minga_state::types::DEFAULT_TENANT_ID);
     assert_eq!(node.nats_user_public_key, None);
+}
+
+#[test]
+fn port_mapping_host_ip_is_additive_and_omitted_when_absent() {
+    // A record written before `host_ip` (a Raft log entry or snapshot) means every address.
+    let old: PortMapping = serde_json::from_value(serde_json::json!({
+        "target": 80, "published": 8080, "protocol": "tcp", "mode": "ingress"
+    }))
+    .unwrap();
+    assert_eq!(old.host_ip, None);
+    // No host_ip is not written, so existing records and the frozen fixtures keep their bytes.
+    assert!(serde_json::to_value(&old).unwrap().get("host_ip").is_none());
+
+    for ip in ["127.0.0.1", "::1"] {
+        let value = serde_json::json!({
+            "host_ip": ip, "target": 80, "published": 8080, "protocol": "tcp", "mode": "ingress"
+        });
+        let with: PortMapping = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(with.host_ip, Some(ip.parse().unwrap()));
+        assert_eq!(serde_json::to_value(&with).unwrap(), value);
+    }
+    // A value that is not an IP address does not decode into "every address".
+    assert!(serde_json::from_value::<PortMapping>(serde_json::json!({
+        "host_ip": "localhost", "target": 80, "published": 8080, "protocol": "tcp"
+    }))
+    .is_err());
 }
 
 #[test]
@@ -298,6 +324,7 @@ fn mount() -> ServiceMount {
 
 fn port() -> PortMapping {
     PortMapping {
+        host_ip: None,
         target: 80,
         published: Some(8080),
         protocol: "tcp".into(),
@@ -405,6 +432,9 @@ fn v3_port_schema_fixtures() {
     let mut host = port();
     host.mode = PortMode::Host;
     check("port_mapping_host", &host);
+    let mut host_ip = port();
+    host_ip.host_ip = Some("127.0.0.1".parse().unwrap());
+    check("port_mapping_host_ip", &host_ip);
     check("port_mode_host", &PortMode::Host);
     check(
         "reserved_port",
@@ -1254,6 +1284,55 @@ async fn a_v10_store_migrates_and_initializes_change_requests() {
 
     assert_eq!(read_marker(&state_file, SM_META), Some(FORMAT_VERSION));
     assert_eq!(read_marker(&log_file, RAFT_META), Some(FORMAT_VERSION));
+}
+
+#[tokio::test]
+async fn a_v11_store_migrates_and_a_port_without_host_ip_still_means_every_address() {
+    let (_dir, path) = written_dir().await;
+    let state_file = path.join("state.redb");
+    let log_file = path.join("raft_log.redb");
+    // Everything in a v11 store was written before `host_ip` existed.
+    set_marker(state_file.clone(), SM_META, Some(V11_FORMAT_VERSION));
+    set_marker(log_file.clone(), RAFT_META, Some(V11_FORMAT_VERSION));
+
+    let store = StateStore::open(1, "127.0.0.1:0", &path, BTreeMap::new())
+        .await
+        .unwrap();
+    let web = store.get_service("shop.web").await.unwrap().unwrap();
+    assert_eq!(web.ports, vec![port()]);
+    assert_eq!(web.ports[0].host_ip, None);
+    // The apply-rule level (#157) lives in sm_meta beside the marker; a v11 store has none, which is level 1.
+    assert_eq!(store.apply_rules().await.unwrap(), 1);
+    // A port that sets one survives the next restart.
+    let mut narrow = service("shop.narrow");
+    narrow.ports[0].published = Some(8081);
+    narrow.ports[0].host_ip = Some("::1".parse().unwrap());
+    store.upsert_service(narrow).await.unwrap();
+    store.shutdown().await.unwrap();
+
+    assert_eq!(read_marker(&state_file, SM_META), Some(FORMAT_VERSION));
+    assert_eq!(read_marker(&log_file, RAFT_META), Some(FORMAT_VERSION));
+    let store = StateStore::open(1, "127.0.0.1:0", &path, BTreeMap::new())
+        .await
+        .unwrap();
+    let narrow = store.get_service("shop.narrow").await.unwrap().unwrap();
+    assert_eq!(narrow.ports[0].host_ip, Some("::1".parse().unwrap()));
+    store.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_v11_snapshot_imports_with_ports_that_mean_every_address() {
+    let (_dir, path) = written_dir().await;
+    let store = StateStore::open(1, "127.0.0.1:0", &path, BTreeMap::new())
+        .await
+        .unwrap();
+    let mut old_json = serde_json::to_value(store.export().await.unwrap()).unwrap();
+    store.shutdown().await.unwrap();
+    old_json["format_version"] = serde_json::json!(V11_FORMAT_VERSION);
+    assert!(old_json["services"][0]["ports"][0].get("host_ip").is_none());
+    let snapshot: StateSnapshot = serde_json::from_value(old_json).unwrap();
+    let (result, _) = import_with_byte_quota(snapshot, u64::MAX / 2).await;
+    assert!(result.is_ok(), "{result:?}");
 }
 
 #[tokio::test]

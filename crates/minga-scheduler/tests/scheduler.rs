@@ -638,6 +638,7 @@ async fn reconcile_projects_wireguard_peer_sets_from_live_placement() {
     let mut worker_service = make_service("app.worker", 1);
     worker_service.networks = vec!["shared".into(), "other".into()];
     worker_service.ports = vec![PortMapping {
+        host_ip: None,
         target: 80,
         published: Some(18080),
         protocol: "tcp".into(),
@@ -993,6 +994,7 @@ async fn ingress_backend_and_backendless_workers_peer_both_ways() {
     let mut service = make_service("app.web", 1);
     service.networks = vec!["web".into()];
     service.ports = vec![PortMapping {
+        host_ip: None,
         target: 80,
         published: Some(18080),
         protocol: "tcp".into(),
@@ -1050,6 +1052,72 @@ async fn ingress_backend_and_backendless_workers_peer_both_ways() {
 }
 
 #[tokio::test]
+async fn ingress_assignment_carries_the_ports_host_ip() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(
+        StateStore::open(1, "127.0.0.1:0", dir.path(), BTreeMap::new())
+            .await
+            .unwrap(),
+    );
+    store.upsert_node(make_node(1, 8.0, 1 << 34)).await.unwrap();
+    store
+        .upsert_network(Network {
+            id: "default".into(),
+            tenant_id: "default".to_string(),
+            name: "default".into(),
+            driver: "overlay".into(),
+            attachable: false,
+            subnet: Some("10.100.9.0/24".into()),
+            wg_port: None,
+        })
+        .await
+        .unwrap();
+    let port = |published: u16, host_ip: Option<&str>| PortMapping {
+        host_ip: host_ip.map(|ip| ip.parse().unwrap()),
+        target: 80,
+        published: Some(published),
+        protocol: "tcp".into(),
+        mode: PortMode::Ingress,
+    };
+    let mut loopback = make_service("app.loopback", 1);
+    loopback.ports = vec![port(18080, Some("127.0.0.1"))];
+    let mut v6 = make_service("app.v6", 1);
+    v6.ports = vec![port(18081, Some("::1"))];
+    let mut every = make_service("app.every", 1);
+    every.ports = vec![port(18082, None)];
+    for service in [loopback, v6, every] {
+        store.upsert_service(service).await.unwrap();
+    }
+
+    let bus = MemoryBus::with_lease_ttl(Duration::from_secs(60));
+    bus.refresh_lease(1, b"registration").await.unwrap();
+    let scheduler = Scheduler::with_bus(store.clone(), bus.clone());
+    scheduler.reconcile_once().await.unwrap();
+    let host_ip = |published: u16| {
+        let bus = bus.clone();
+        async move {
+            let key = subjects::kv_assignment_ingress("default", 1, published, "tcp");
+            let raw = bus.get_assignment(&key).await.unwrap().unwrap();
+            minga_state::codec::decode_wire::<minga_state::types::IngressAssignment>(&raw)
+                .unwrap()
+                .host_ip
+        }
+    };
+    assert_eq!(host_ip(18080).await, Some("127.0.0.1".parse().unwrap()));
+    assert_eq!(host_ip(18081).await, Some("::1".parse().unwrap()));
+    // No host_ip: published on every node address, as before.
+    assert_eq!(host_ip(18082).await, None);
+
+    drop(scheduler);
+    Arc::try_unwrap(store)
+        .ok()
+        .expect("scheduler dropped")
+        .shutdown()
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
 async fn ingress_backend_projection_tracks_task_movement() {
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(
@@ -1075,6 +1143,7 @@ async fn ingress_backend_projection_tracks_task_movement() {
         .unwrap();
     let mut service = make_service("app.web", 1);
     service.ports = vec![PortMapping {
+        host_ip: None,
         target: 80,
         published: Some(18080),
         protocol: "tcp".into(),
@@ -1106,6 +1175,7 @@ async fn ingress_backend_projection_tracks_task_movement() {
 
     let mut host_service = make_service("app.host", 1);
     host_service.ports = vec![PortMapping {
+        host_ip: None,
         target: 80,
         published: Some(18081),
         protocol: "tcp".into(),
@@ -1128,6 +1198,7 @@ async fn ingress_backend_projection_tracks_task_movement() {
     // A task address outside its network's subnet never becomes a backend.
     let mut forged = make_service("app.forged", 1);
     forged.ports = vec![PortMapping {
+        host_ip: None,
         target: 80,
         published: Some(18082),
         protocol: "tcp".into(),

@@ -270,6 +270,7 @@ mod tests {
             constraints: Vec::new(),
             env: HashMap::new(),
             ports: vec![PortMapping {
+                host_ip: None,
                 target: 80,
                 published: None,
                 protocol: "tcp".to_string(),
@@ -511,6 +512,7 @@ mod tests {
         let nodes = vec![node(1)];
         let actions_for = |mode| {
             let published = vec![PortMapping {
+                host_ip: None,
                 target: 80,
                 published: Some(80),
                 protocol: "tcp".to_string(),

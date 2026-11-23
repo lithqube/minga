@@ -1124,6 +1124,7 @@ impl StateStore {
         match snapshot.format_version {
             crate::codec::FORMAT_VERSION
             | crate::codec::V9_FORMAT_VERSION
+            | crate::codec::V11_FORMAT_VERSION
             | crate::codec::V10_FORMAT_VERSION
             | crate::codec::V8_FORMAT_VERSION
             | crate::codec::V7_FORMAT_VERSION
@@ -1134,7 +1135,8 @@ impl StateStore {
             | crate::codec::V2_FORMAT_VERSION => {
                 // Egress policy defaults to none; pre-v9 agents get the v8
                 // migration's grants; legacy resource fields default to
-                // `default`. Nodes are not in snapshots.
+                // `default`; ports without `host_ip` publish on every
+                // address. Nodes are not in snapshots.
             }
             found => {
                 return Err(StateError::BadSnapshot(format!(

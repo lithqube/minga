@@ -15,7 +15,7 @@ use super::report::{self, Finding, Severity, Status};
 
 const TARGET_RELEASE: ReleaseMetadata = ReleaseMetadata {
     version: "1.3.0",
-    state_format: 11,
+    state_format: 12,
     bundled_nats: "2.15.3",
     external_nats_tested: "2.14.10 and 2.15.3",
     min_jetstream_api_level: 4,
@@ -261,7 +261,7 @@ pub async fn run(
             "After the candidate is ready, verify doctor readiness, Raft quorum, tenant ownership, task health and restored workload behavior.",
         ],
         disruption: "Plan a coordinated Minga control-plane outage. The API and scheduler are unavailable during replacement; workload continuity depends on replica placement and is not guaranteed.",
-        rollback_boundary: "Once the candidate opens the data it is migrated to state format v11, which the previous binary cannot read; do not downgrade in place. Rollback requires restoring the complete pre-upgrade backup with the previous binary across the cluster; NATS downgrade is not a supported rollback path.",
+        rollback_boundary: "Once the candidate opens the data it is migrated to state format v12, which the previous binary cannot read; do not downgrade in place. Rollback requires restoring the complete pre-upgrade backup with the previous binary across the cluster; NATS downgrade is not a supported rollback path.",
         read_only: true,
     };
     let mut state_finding =
@@ -522,7 +522,7 @@ fn state_format_finding(current: Option<u8>, target: u8) -> Finding {
             status: Status::Failed,
             summary: "current state format has no migration to target".into(),
             evidence: format!(
-                "no migration from format v{version} to v{target}; this build migrates formats v2 through v10"
+                "no migration from format v{version} to v{target}; this build migrates formats v2 through v11"
             ),
             next_action: "Stop before upgrading; use a documented intermediate migration path or stay on the current release.",
         },
@@ -542,7 +542,7 @@ fn state_format_finding(current: Option<u8>, target: u8) -> Finding {
             status: Status::Failed,
             summary: "no supported direct state migration is known".into(),
             evidence: format!(
-                "no direct migration from format v{version} to v{target}; supported migration sources are v2 through v10"
+                "no direct migration from format v{version} to v{target}; supported migration sources are v2 through v11"
             ),
             next_action: "Stop before upgrading; use a documented intermediate migration path or stay on the current release.",
         },
@@ -603,33 +603,33 @@ mod tests {
 
     #[test]
     fn state_format_assessment_uses_only_supported_migrations() {
-        let from_v2 = state_format_finding(Some(2), 11);
+        let from_v2 = state_format_finding(Some(2), 12);
         assert_eq!(from_v2.id, "state-format");
         assert_eq!(from_v2.severity, Severity::Info);
         assert!(from_v2
             .evidence
-            .contains("format v2 migrates directly to v11"));
+            .contains("format v2 migrates directly to v12"));
 
-        let current = state_format_finding(Some(11), 11);
+        let current = state_format_finding(Some(12), 12);
         assert_eq!(current.status, Status::Ok);
 
-        let unsupported = state_format_finding(Some(1), 11);
+        let unsupported = state_format_finding(Some(1), 12);
         assert_eq!(unsupported.status, Status::Failed);
         assert_eq!(unsupported.severity, Severity::Error);
         assert!(unsupported
             .evidence
-            .contains("this build migrates formats v2 through v10"));
-        let newer = state_format_finding(Some(12), 11);
+            .contains("this build migrates formats v2 through v11"));
+        let newer = state_format_finding(Some(13), 12);
         assert!(newer.evidence.contains("target cannot read it"));
 
-        let unknown = state_format_finding(None, 11);
+        let unknown = state_format_finding(None, 12);
         assert_eq!(unknown.status, Status::Unknown);
         assert_eq!(unknown.severity, Severity::Error);
     }
 
     #[test]
     fn target_metadata_fails_closed_for_unknown_versions() {
-        assert_eq!(known_target("v1.3.0").unwrap().state_format, 11);
+        assert_eq!(known_target("v1.3.0").unwrap().state_format, 12);
         assert!(known_target("9.9.9").is_none());
         assert_eq!(known_current("v1.2.0").unwrap().state_format, 10);
         assert!(known_current("1.0.2").is_none());
@@ -675,7 +675,7 @@ mod tests {
 
     #[test]
     fn a_check_that_could_not_run_blocks_the_upgrade() {
-        let unknown_format = state_format_finding(None, 11);
+        let unknown_format = state_format_finding(None, 12);
         let unread_raft = raft_finding(Err("timed out after 10s"));
         let warning = Finding {
             id: "release-gate",

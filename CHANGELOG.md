@@ -5,6 +5,11 @@
 Changes on `main` after `v1.3.0-rc.1`. They go into 1.3.0.
 
 ### Changes
+- **Compose `ports` host IPs work again (#162).** A port with `host_ip` (`127.0.0.1:8080:80`, `host_ip:` in the long syntax) is accepted by `minga validate` and published on that node address only. A port without one stays published on every node address.
+  - A `host_ip` that is not an IP address is refused when the file loads.
+  - `0.0.0.0` and `::` mean every address. An IPv6 address is carried and stored, but the node publishes through IPv4 rules only, so it logs a warning and does not publish that port (it is never widened to every address).
+  - One published port and protocol still belongs to one service in the cluster, whatever its `host_ip`.
+  - **Upgrade action:** this adds a field to the persisted port record, so the state and wire format is now v12. A v11 store (including 1.3.0-rc.1) migrates in place on open, a port without `host_ip` keeps meaning every address, and a v11 snapshot still imports. Every node must change together; a v11 node refuses v12 Raft messages and assignments, so none can publish a port wider than its `host_ip`. A v12 store cannot be opened by the previous binary: take the backup first.
 - **Fix.** Containers resolve a sibling service by its bare Compose name again (#193):
   - v1.3.0-rc.1 broke this. After `minga deploy`, `minga-ctl stack deploy` or any other deploy through the API,
     `db`, `tasks.db` and `db.<stack>.minga.local` did not resolve; only `<stack>.db` did, so connections between

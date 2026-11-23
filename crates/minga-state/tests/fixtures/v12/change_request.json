@@ -1,0 +1,353 @@
+{
+  "after": {
+    "agent": {
+      "capabilities": {
+        "dirs": [
+          {
+            "guest": "/data",
+            "host": "/srv/data"
+          }
+        ],
+        "grants": [
+          "env",
+          "http"
+        ]
+      },
+      "egress_url": "http://127.0.0.1:8088",
+      "fuel_limit": 1000000,
+      "memory_limit": 134217728,
+      "module_ref": "/var/lib/minga/modules/summarize.wasm",
+      "prompt": "Summarize",
+      "sandbox_env": {
+        "MODEL": "small"
+      },
+      "timeout_secs": 30,
+      "token_budget": 50000
+    },
+    "command": [
+      "nginx",
+      "-g",
+      "daemon off;"
+    ],
+    "constraints": [
+      "node.role==worker"
+    ],
+    "egress": {
+      "models": [
+        "gpt-4o*",
+        "claude-sonnet"
+      ],
+      "required": true,
+      "routes": [
+        {
+          "auth": {
+            "scheme": "bearer",
+            "secret": "openai_key"
+          },
+          "fallback": [
+            "claude",
+            "bedrock"
+          ],
+          "input_price_micros_per_million": 2500000,
+          "name": "openai",
+          "output_price_micros_per_million": 10000000,
+          "upstream_url": "https://api.openai.com"
+        },
+        {
+          "auth": {
+            "scheme": "api_key",
+            "secret": "anthropic_key"
+          },
+          "fallback": [],
+          "input_price_micros_per_million": null,
+          "name": "claude",
+          "output_price_micros_per_million": null,
+          "upstream_url": "https://api.anthropic.com"
+        },
+        {
+          "auth": {
+            "access_key_secret": "aws_access",
+            "region": "eu-west-1",
+            "scheme": "aws_sigv4",
+            "secret_key_secret": "aws_secret",
+            "service": "bedrock",
+            "session_token_secret": "aws_session"
+          },
+          "fallback": [],
+          "input_price_micros_per_million": null,
+          "name": "bedrock",
+          "output_price_micros_per_million": null,
+          "upstream_url": "https://bedrock-runtime.eu-west-1.amazonaws.com"
+        }
+      ]
+    },
+    "entrypoint": [
+      "/docker-entrypoint.sh"
+    ],
+    "env": {
+      "MODE": "prod"
+    },
+    "extra_hosts": [
+      [
+        "db",
+        "10.0.0.5"
+      ]
+    ],
+    "healthcheck": {
+      "interval_secs": 10,
+      "retries": 3,
+      "start_period_secs": 5,
+      "test": [
+        "CMD",
+        "true"
+      ],
+      "timeout_secs": 3
+    },
+    "id": "shop.web",
+    "image": "docker.io/library/nginx:1.27",
+    "is_job": false,
+    "labels": {
+      "com.docker.stack.namespace": "shop"
+    },
+    "mode": "Replicated",
+    "mounts": [
+      {
+        "kind": "Bind",
+        "read_only": true,
+        "source": "/srv/data",
+        "target": "/data"
+      }
+    ],
+    "name": "web",
+    "networks": [
+      "shop_default"
+    ],
+    "ports": [
+      {
+        "mode": "ingress",
+        "protocol": "tcp",
+        "published": 8080,
+        "target": 80
+      }
+    ],
+    "previous": null,
+    "replicas": 3,
+    "resources": {
+      "cpus": 0.5,
+      "gpus": 0,
+      "memory_bytes": 268435456
+    },
+    "restart_policy": {
+      "condition": "OnFailure",
+      "delay_secs": 5,
+      "max_attempts": 3
+    },
+    "rollback": {
+      "delay_secs": 0,
+      "failure_action": "Pause",
+      "monitor_secs": 5,
+      "order": "StopFirst",
+      "parallelism": 1
+    },
+    "secrets": [
+      {
+        "secret_id": "shop_password",
+        "target": "/run/secrets/password",
+        "version": "sha256:00"
+      }
+    ],
+    "tenant_id": "default",
+    "update": {
+      "delay_secs": 5,
+      "failure_action": "Rollback",
+      "monitor_secs": 10,
+      "order": "StartFirst",
+      "parallelism": 2
+    },
+    "user": "nginx:nginx"
+  },
+  "audit": [
+    {
+      "action": "created",
+      "actor": "agent",
+      "occurred_at_unix": 100
+    }
+  ],
+  "before": {
+    "agent": {
+      "capabilities": {
+        "dirs": [
+          {
+            "guest": "/data",
+            "host": "/srv/data"
+          }
+        ],
+        "grants": [
+          "env",
+          "http"
+        ]
+      },
+      "egress_url": "http://127.0.0.1:8088",
+      "fuel_limit": 1000000,
+      "memory_limit": 134217728,
+      "module_ref": "/var/lib/minga/modules/summarize.wasm",
+      "prompt": "Summarize",
+      "sandbox_env": {
+        "MODEL": "small"
+      },
+      "timeout_secs": 30,
+      "token_budget": 50000
+    },
+    "command": [
+      "nginx",
+      "-g",
+      "daemon off;"
+    ],
+    "constraints": [
+      "node.role==worker"
+    ],
+    "egress": {
+      "models": [
+        "gpt-4o*",
+        "claude-sonnet"
+      ],
+      "required": true,
+      "routes": [
+        {
+          "auth": {
+            "scheme": "bearer",
+            "secret": "openai_key"
+          },
+          "fallback": [
+            "claude",
+            "bedrock"
+          ],
+          "input_price_micros_per_million": 2500000,
+          "name": "openai",
+          "output_price_micros_per_million": 10000000,
+          "upstream_url": "https://api.openai.com"
+        },
+        {
+          "auth": {
+            "scheme": "api_key",
+            "secret": "anthropic_key"
+          },
+          "fallback": [],
+          "input_price_micros_per_million": null,
+          "name": "claude",
+          "output_price_micros_per_million": null,
+          "upstream_url": "https://api.anthropic.com"
+        },
+        {
+          "auth": {
+            "access_key_secret": "aws_access",
+            "region": "eu-west-1",
+            "scheme": "aws_sigv4",
+            "secret_key_secret": "aws_secret",
+            "service": "bedrock",
+            "session_token_secret": "aws_session"
+          },
+          "fallback": [],
+          "input_price_micros_per_million": null,
+          "name": "bedrock",
+          "output_price_micros_per_million": null,
+          "upstream_url": "https://bedrock-runtime.eu-west-1.amazonaws.com"
+        }
+      ]
+    },
+    "entrypoint": [
+      "/docker-entrypoint.sh"
+    ],
+    "env": {
+      "MODE": "prod"
+    },
+    "extra_hosts": [
+      [
+        "db",
+        "10.0.0.5"
+      ]
+    ],
+    "healthcheck": {
+      "interval_secs": 10,
+      "retries": 3,
+      "start_period_secs": 5,
+      "test": [
+        "CMD",
+        "true"
+      ],
+      "timeout_secs": 3
+    },
+    "id": "shop.web",
+    "image": "docker.io/library/nginx:1.27",
+    "is_job": false,
+    "labels": {
+      "com.docker.stack.namespace": "shop"
+    },
+    "mode": "Replicated",
+    "mounts": [
+      {
+        "kind": "Bind",
+        "read_only": true,
+        "source": "/srv/data",
+        "target": "/data"
+      }
+    ],
+    "name": "web",
+    "networks": [
+      "shop_default"
+    ],
+    "ports": [
+      {
+        "mode": "ingress",
+        "protocol": "tcp",
+        "published": 8080,
+        "target": 80
+      }
+    ],
+    "previous": null,
+    "replicas": 2,
+    "resources": {
+      "cpus": 0.5,
+      "gpus": 0,
+      "memory_bytes": 268435456
+    },
+    "restart_policy": {
+      "condition": "OnFailure",
+      "delay_secs": 5,
+      "max_attempts": 3
+    },
+    "rollback": {
+      "delay_secs": 0,
+      "failure_action": "Pause",
+      "monitor_secs": 5,
+      "order": "StopFirst",
+      "parallelism": 1
+    },
+    "secrets": [
+      {
+        "secret_id": "shop_password",
+        "target": "/run/secrets/password",
+        "version": "sha256:00"
+      }
+    ],
+    "tenant_id": "default",
+    "update": {
+      "delay_secs": 5,
+      "failure_action": "Rollback",
+      "monitor_secs": 10,
+      "order": "StartFirst",
+      "parallelism": 2
+    },
+    "user": "nginx:nginx"
+  },
+  "created_at_unix": 100,
+  "decided_at_unix": null,
+  "expires_at_unix": 1000,
+  "id": "cr-1-2-3",
+  "kind": "scale",
+  "requester": "agent",
+  "reviewer": null,
+  "service_id": "shop.web",
+  "status": "pending",
+  "tenant_id": "default"
+}

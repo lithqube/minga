@@ -294,6 +294,13 @@ impl Port {
     }
 
     fn check(&self, s: &str) -> Result<(), String> {
+        // An address that does not parse must fail here: dropping it later
+        // would publish the port on every node address.
+        if let Some(ip) = &self.host_ip {
+            if ip.parse::<std::net::IpAddr>().is_err() {
+                return Err(format!("{s:?}: host_ip {ip:?} is not an IP address"));
+            }
+        }
         if let Some(p) = self.published {
             if self.target.count() > 1 && p.count() != self.target.count() {
                 return Err(format!("{s:?}: published and target ranges differ in size"));

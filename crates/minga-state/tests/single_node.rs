@@ -60,6 +60,7 @@ fn sample_service(id: &str) -> Service {
         constraints: vec!["node.labels.gpu == true".to_string()],
         env: HashMap::from([("LOG_LEVEL".to_string(), "info".to_string())]),
         ports: vec![PortMapping {
+            host_ip: None,
             target: 8080,
             published: Some(443),
             protocol: "tcp".to_string(),

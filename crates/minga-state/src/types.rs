@@ -5,6 +5,7 @@
 //! Compose services into these types before proposing them to Raft.
 
 use std::collections::{BTreeSet, HashMap};
+use std::net::IpAddr;
 
 use serde::{Deserialize, Serialize};
 
@@ -635,6 +636,11 @@ pub enum ServiceMode {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PortMapping {
+    /// Node address the port is published on; `None` publishes it on every
+    /// node address. A record written before this field existed decodes as
+    /// `None`, and `None` is not written, so old records keep their bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_ip: Option<IpAddr>,
     pub target: u16,
     pub published: Option<u16>,
     pub protocol: String,
@@ -1060,6 +1066,9 @@ pub struct IngressBackend {
 /// A published ingress port and its scheduled task backends.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct IngressAssignment {
+    /// Node address the port is published on; `None` is every node address.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_ip: Option<IpAddr>,
     pub published: u16,
     pub protocol: String,
     pub backends: Vec<IngressBackend>,
@@ -1201,6 +1210,7 @@ mod tests {
             constraints: Vec::new(),
             env: HashMap::new(),
             ports: vec![PortMapping {
+                host_ip: None,
                 target: 80,
                 published: Some(8080),
                 protocol: "tcp".to_owned(),
@@ -1242,6 +1252,20 @@ mod tests {
         assert_eq!(
             published_port_conflict(&request, [&owner]).as_deref(),
             Some("ingress port 8080/tcp is already used by service tenant-a.web")
+        );
+    }
+
+    #[test]
+    fn one_service_cannot_publish_a_port_twice_even_on_different_host_ips() {
+        let mut service = service_with_ingress_port("tenant-a.web", "tenant-a");
+        let mut narrow = service.ports[0].clone();
+        narrow.host_ip = Some("127.0.0.1".parse().unwrap());
+        narrow.target = 81;
+        service.ports.push(narrow);
+
+        assert_eq!(
+            published_port_conflict(&service, []).as_deref(),
+            Some("port 8080/tcp is published more than once")
         );
     }
 

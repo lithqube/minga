@@ -2111,6 +2111,23 @@ pub async fn update_service(
         svc.egress = existing.egress.clone();
         translate::sync_required_egress_label(&mut svc);
     }
+    // The Docker port model has no host address, so an update that resubmits a
+    // port cannot name one: keep the stored address of the same port instead
+    // of widening it to every node address.
+    for port in &mut svc.ports {
+        port.host_ip = existing
+            .ports
+            .iter()
+            .find(|stored| {
+                (
+                    stored.published,
+                    &stored.protocol,
+                    stored.target,
+                    stored.mode,
+                ) == (port.published, &port.protocol, port.target, port.mode)
+            })
+            .and_then(|stored| stored.host_ip);
+    }
     svc.check_agent_egress()
         .map_err(|e| bad_request(format!("service '{id}': {e}")))?;
     resolve_service_references(&app, tenant_id, &mut svc).await?;
@@ -3669,6 +3686,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_docker_update_keeps_the_stored_host_ip_of_an_unchanged_port() {
+        let (app, _dir) = app_with_node(1.0).await;
+        let port = |published: u16, host_ip: Option<&str>| minga_state::types::PortMapping {
+            host_ip: host_ip.map(|ip| ip.parse().unwrap()),
+            target: 80,
+            published: Some(published),
+            protocol: "tcp".into(),
+            mode: minga_state::types::PortMode::Ingress,
+        };
+        let mut svc = translate::service_spec_to_state(&spec("web", 0)).unwrap();
+        svc.ports = vec![port(18080, Some("127.0.0.1")), port(18081, None)];
+        app.store.upsert_service(svc.clone()).await.unwrap();
+
+        // Docker's port model has no host address, so the resubmitted spec has none.
+        let mut docker = translate::service_to_docker(&svc).Spec;
+        let update = |docker: models::ServiceSpec| {
+            update_service(
+                State(app.clone()),
+                default_caller(),
+                Path(("v1.41".to_string(), "web".to_string())),
+                Query(
+                    serde_json::from_value::<models::ServiceUpdateQuery>(serde_json::json!({}))
+                        .unwrap(),
+                ),
+                Json(docker),
+            )
+        };
+        let _ = update(docker.clone()).await.expect("unrelated update");
+        let stored = app.store.get_service("web").await.unwrap().unwrap();
+        let hosts: Vec<_> = stored.ports.iter().map(|p| p.host_ip).collect();
+        assert_eq!(hosts, [Some("127.0.0.1".parse().unwrap()), None]);
+
+        // A port the update moves to another published port is a new port: no address is inherited.
+        docker.EndpointSpec.as_mut().unwrap().Ports[0].PublishedPort = Some(18090);
+        let _ = update(docker).await.expect("update that moves a port");
+        let stored = app.store.get_service("web").await.unwrap().unwrap();
+        assert_eq!(stored.ports[0].published, Some(18090));
+        assert_eq!(stored.ports[0].host_ip, None);
+    }
+
+    #[tokio::test]
     async fn egress_route_secrets_of_another_tenant_are_not_declared() {
         let (app, _dir) = app_with_node(1.0).await;
         let mut node = app.store.get_node(1).await.unwrap().unwrap();
@@ -4212,6 +4270,7 @@ mod tests {
             constraints: Vec::new(),
             env: HashMap::new(),
             ports: vec![minga_state::types::PortMapping {
+                host_ip: None,
                 target: 443,
                 published: Some(published),
                 protocol: "tcp".to_string(),
