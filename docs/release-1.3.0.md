@@ -119,6 +119,9 @@ and restore the copy as described below. `minga migrate-v1` without `--apply`
 and `upgrade preflight` run only against an upgraded manager, as a second
 check; they cannot replace this one.
 
+**What the in-place conversion does.** The live proof ran it, and a single
+host above may run it; it is the only in-place path this candidate offers:
+
 1. Upgrade the managers first, then, on the leader, change membership once to
    the manager set, removing worker voters. `minga migrate-v1` previews that
    voter set before applying it.
