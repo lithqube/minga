@@ -311,6 +311,12 @@ token/transport configuration without exposing peer addresses or credential
 details. This is not proof of each manager's Raft TLS configuration; verify
 Raft and NATS TLS independently on every node.
 
+A later release that adds a Raft apply refusal needs one more step after every
+manager is upgraded: raising the replicated apply-rule level
+([ADR 0009](adr/0009-raft-apply-rule-versions.md)). No `minga-ctl` command
+raises or reports it yet ([#188](https://github.com/lithqube/minga/issues/188)),
+and preflight does not check it. Nothing in v1.3.0 needs it.
+
 On the nodes, over SSH (`--ssh TARGET`, repeatable; by default the context's
 `--node` targets, else its `--ssh`, else this machine):
 

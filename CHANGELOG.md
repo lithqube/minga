@@ -5,6 +5,14 @@
 Changes on `main` after `v1.3.0-rc.1`. They go into 1.3.0.
 
 ### Changes
+- **No upgrade action.** The Raft apply rules are versioned (#157, [ADR 0009](https://github.com/lithqube/minga/blob/main/docs/adr/0009-raft-apply-rule-versions.md)):
+  - A replicated apply-rule level (1 today, every refusal through 1.3.0-rc.1) decides which refusals the apply
+    makes, so a manager rebuilt from the log, or on a newer build, gets the result the cluster committed.
+  - Nothing is gated yet and the level stays 1, so there is no step now. The first release that adds an apply
+    refusal will say: upgrade every manager, check that none is old, then raise the level once. There is no
+    command to raise it yet (#188); a manager that implements a lower level stops at the raise instead of
+    diverging.
+  - Stores and snapshots written before this keep their meaning: an absent level is 1.
 - **Security, no upgrade action.** `minga-ctl change approve` shows what it will apply before it asks (#134):
   - It prints the redacted before and after value of every changed field to stderr, then asks for confirmation.
     Scripts must pass `--yes`.

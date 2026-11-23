@@ -19,9 +19,9 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::codec::{
-    check_format, FORMAT_KEY, FORMAT_VERSION, V10_FORMAT_VERSION, V2_FORMAT_VERSION,
-    V3_FORMAT_VERSION, V4_FORMAT_VERSION, V5_FORMAT_VERSION, V6_FORMAT_VERSION, V7_FORMAT_VERSION,
-    V8_FORMAT_VERSION, V9_FORMAT_VERSION,
+    check_format, APPLY_RULES_KEY, APPLY_RULES_VERSION, FORMAT_KEY, FORMAT_VERSION,
+    V10_FORMAT_VERSION, V2_FORMAT_VERSION, V3_FORMAT_VERSION, V4_FORMAT_VERSION, V5_FORMAT_VERSION,
+    V6_FORMAT_VERSION, V7_FORMAT_VERSION, V8_FORMAT_VERSION, V9_FORMAT_VERSION,
 };
 use crate::command::{ObjectKind, StateCommand, StateResponse};
 use crate::types::*;
@@ -565,8 +565,78 @@ struct StateSnapshot {
     tenants: Vec<Tenant>,
     #[serde(default)]
     change_requests: Vec<ChangeRequest>,
+    /// The apply-rule level in force at `last_applied` (ADR 0009). A snapshot
+    /// written before the field existed is level 1.
+    #[serde(default = "baseline_apply_rules")]
+    apply_rules: u32,
     last_applied: Option<LogId<u64>>,
     last_membership: StoredMembership<u64, BasicNode>,
+}
+
+fn baseline_apply_rules() -> u32 {
+    1
+}
+
+/// The apply-rule level in force inside this transaction (ADR 0009). It is
+/// replicated state, so every replica reads the same value at the same log
+/// index; absent means level 1.
+#[allow(clippy::result_large_err)]
+fn apply_rules_in(tx: &redb::WriteTransaction) -> Result<u32, StorageError<u64>> {
+    let meta = tx.open_table(SM_META_TABLE).map_err(sm_io_err)?;
+    let Some(raw) = meta.get(APPLY_RULES_KEY).map_err(sm_io_err)? else {
+        return Ok(baseline_apply_rules());
+    };
+    crate::codec::decode(raw.value())
+        .map_err(|e| sm_storage_err(ErrorSubject::Store, ErrorVerb::Read, e))
+}
+
+/// True when the rule introduced at `since` applies to the entry being
+/// applied. A new refusal calls this with its own level and returns the old
+/// result below it. Unused until the first release that adds a refusal.
+#[cfg_attr(not(test), allow(dead_code))]
+#[allow(clippy::result_large_err)]
+fn rule_in_force(tx: &redb::WriteTransaction, since: u32) -> Result<bool, StorageError<u64>> {
+    Ok(apply_rules_in(tx)? >= since)
+}
+
+/// A build that implements fewer levels than the state holds cannot apply
+/// under them, so it stops instead of diverging.
+fn unsupported_rules(level: u32, supported: u32) -> StorageError<u64> {
+    sm_storage_err(
+        ErrorSubject::Store,
+        ErrorVerb::Read,
+        std::io::Error::other(format!(
+            "cluster state uses apply rules level {level}, this build implements {supported}; \
+             upgrade this manager"
+        )),
+    )
+}
+
+/// Applies [`StateCommand::SetApplyRules`]. `supported` is this build's
+/// [`APPLY_RULES_VERSION`]; tests pass a newer one to act as an upgraded build.
+#[allow(clippy::result_large_err)]
+fn set_apply_rules(
+    tx: &redb::WriteTransaction,
+    level: u32,
+    supported: u32,
+) -> Result<StateResponse, StorageError<u64>> {
+    if level > supported {
+        return Err(unsupported_rules(level, supported));
+    }
+    let current = apply_rules_in(tx)?;
+    if level < current {
+        return Ok(StateResponse::Conflict(format!(
+            "apply rules are at level {current} and never go down"
+        )));
+    }
+    if level > current {
+        let bytes = crate::codec::encode(&level)
+            .map_err(|e| sm_storage_err(ErrorSubject::Store, ErrorVerb::Write, e))?;
+        let mut meta = tx.open_table(SM_META_TABLE).map_err(sm_io_err)?;
+        meta.insert(APPLY_RULES_KEY, bytes.as_slice())
+            .map_err(sm_io_err)?;
+    }
+    Ok(StateResponse::Ok)
 }
 
 // --- state machine ------------------------------------------------------------
@@ -632,7 +702,28 @@ impl RedbStateMachine {
             last_membership: StoredMembership::default(),
         };
         sm.load_meta()?;
+        // Like a newer format: a store whose rules this build does not
+        // implement is refused, not applied under older rules.
+        let level = sm.apply_rules_sync()?;
+        if level > APPLY_RULES_VERSION {
+            return Err(sm_io_err_any(
+                ErrorSubject::Store,
+                ErrorVerb::Read,
+                std::io::Error::other(unsupported_rules(level, APPLY_RULES_VERSION).to_string()),
+            ));
+        }
         Ok(sm)
+    }
+
+    fn apply_rules_sync(&self) -> Result<u32, StorageIOError<u64>> {
+        let db = self.db.lock().unwrap();
+        let tx = db.begin_read().map_err(sm_io_err)?;
+        let meta = tx.open_table(SM_META_TABLE).map_err(sm_io_err)?;
+        let Some(raw) = meta.get(APPLY_RULES_KEY).map_err(sm_io_err)? else {
+            return Ok(baseline_apply_rules());
+        };
+        crate::codec::decode(raw.value())
+            .map_err(|e| sm_io_err_any(ErrorSubject::Store, ErrorVerb::Read, e))
     }
 
     /// Loads last_applied and last_membership from disk.
@@ -685,6 +776,9 @@ impl RedbStateMachine {
         cmd: &StateCommand,
     ) -> Result<StateResponse, StorageError<u64>> {
         match cmd {
+            StateCommand::SetApplyRules { level } => {
+                set_apply_rules(tx, *level, APPLY_RULES_VERSION)
+            }
             StateCommand::UpsertNode(node) => {
                 if tenant_quota(tx, &node.tenant_id)?.is_none() {
                     return Ok(StateResponse::NotFound);
@@ -1748,6 +1842,11 @@ impl RedbStateMachine {
         }
     }
 
+    /// The apply-rule level in force on this replica (ADR 0009).
+    pub async fn apply_rules(&self) -> Result<u32, String> {
+        self.apply_rules_sync().map_err(|e| e.to_string())
+    }
+
     pub async fn list_tenants(&self) -> Result<Vec<Tenant>, String> {
         let db = self.db.lock().unwrap();
         let tx = db.begin_read().map_err(|e| e.to_string())?;
@@ -1832,6 +1931,9 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
         let bytes = snapshot.into_inner();
         let snap: StateSnapshot = crate::codec::decode(&bytes)
             .map_err(|e| sm_storage_err(ErrorSubject::Store, ErrorVerb::Read, e))?;
+        if snap.apply_rules > APPLY_RULES_VERSION {
+            return Err(unsupported_rules(snap.apply_rules, APPLY_RULES_VERSION));
+        }
 
         let db = self.db.lock().unwrap();
         let tx = db.begin_write().map_err(sm_io_err)?;
@@ -1935,6 +2037,13 @@ impl RaftStateMachine<TypeConfig> for RedbStateMachine {
         }
 
         // Save snapshot metadata.
+        {
+            let bytes = crate::codec::encode(&snap.apply_rules)
+                .map_err(|e| sm_storage_err(ErrorSubject::Store, ErrorVerb::Write, e))?;
+            let mut meta = tx.open_table(SM_META_TABLE).map_err(sm_io_err)?;
+            meta.insert(APPLY_RULES_KEY, bytes.as_slice())
+                .map_err(sm_io_err)?;
+        }
         Self::save_meta(&tx, snap.last_applied, &snap.last_membership)?;
 
         tx.commit().map_err(sm_io_err)?;
@@ -1976,6 +2085,7 @@ impl RaftSnapshotBuilder<TypeConfig> for RedbSnapshotBuilder {
             configs: Vec::new(),
             tenants: Vec::new(),
             change_requests: Vec::new(),
+            apply_rules: baseline_apply_rules(),
             last_applied: None,
             last_membership: StoredMembership::default(),
         };
@@ -2065,6 +2175,10 @@ impl RaftSnapshotBuilder<TypeConfig> for RedbSnapshotBuilder {
         // Read metadata.
         {
             let meta = tx.open_table(SM_META_TABLE).map_err(sm_io_err)?;
+            if let Some(v) = meta.get(APPLY_RULES_KEY).map_err(sm_io_err)? {
+                snap.apply_rules = crate::codec::decode(v.value())
+                    .map_err(|e| sm_storage_err(ErrorSubject::Store, ErrorVerb::Read, e))?;
+            }
             if let Some(v) = meta.get("last_applied").map_err(sm_io_err)? {
                 let log_id: LogId<u64> = crate::codec::decode(v.value())
                     .map_err(|e| sm_storage_err(ErrorSubject::Store, ErrorVerb::Read, e))?;
@@ -2266,6 +2380,122 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// What a build that implements apply-rule level 2 does: the one rule
+    /// level 2 adds (refusing `RemoveNode(99)`) runs only once the level in
+    /// state is 2, exactly as a gated arm of `apply_command` will.
+    fn apply_as_level_2_build(sm: &RedbStateMachine, command: StateCommand) -> StateResponse {
+        let db = sm.db.lock().unwrap();
+        let tx = db.begin_write().unwrap();
+        let response = match &command {
+            StateCommand::SetApplyRules { level } => set_apply_rules(&tx, *level, 2).unwrap(),
+            StateCommand::RemoveNode(99) if rule_in_force(&tx, 2).unwrap() => {
+                StateResponse::Error("level 2 refuses node 99".into())
+            }
+            other => RedbStateMachine::apply_command(&tx, other).unwrap(),
+        };
+        tx.commit().unwrap();
+        response
+    }
+
+    #[test]
+    fn a_log_replays_to_the_same_results_before_and_after_a_rule_level_is_raised() {
+        let dir = tempfile::tempdir().unwrap();
+        // The log as the cluster committed it: the entry applied as Ok under
+        // level 1, the raise, then the same entry again.
+        let log = [
+            StateCommand::RemoveNode(99),
+            StateCommand::SetApplyRules { level: 2 },
+            StateCommand::RemoveNode(99),
+        ];
+        let expected = [
+            StateResponse::Ok,
+            StateResponse::Ok,
+            StateResponse::Error("level 2 refuses node 99".into()),
+        ];
+        // A replica that applied the log live, and one rebuilt from it later
+        // by a build that already implements level 2, must agree entry by entry.
+        for name in ["live.redb", "rebuilt.redb"] {
+            let sm = RedbStateMachine::open(dir.path().join(name)).unwrap();
+            let got: Vec<_> = log
+                .iter()
+                .map(|entry| apply_as_level_2_build(&sm, entry.clone()))
+                .collect();
+            assert_eq!(got, expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn apply_rules_only_go_up_and_never_past_what_the_build_implements() {
+        let dir = tempfile::tempdir().unwrap();
+        let sm = RedbStateMachine::open(dir.path().join("sm.redb")).unwrap();
+        let level = |sm: &RedbStateMachine| {
+            let db = sm.db.lock().unwrap();
+            let tx = db.begin_write().unwrap();
+            apply_rules_in(&tx).unwrap()
+        };
+        assert_eq!(level(&sm), 1, "a store with no marker is level 1");
+        assert_eq!(
+            apply(&sm, StateCommand::SetApplyRules { level: 1 }),
+            StateResponse::Ok
+        );
+        assert_eq!(
+            apply(&sm, StateCommand::SetApplyRules { level: 0 }),
+            StateResponse::Conflict("apply rules are at level 1 and never go down".into())
+        );
+        // An older build stops at the entry instead of applying it as a no-op.
+        let db = sm.db.lock().unwrap();
+        let tx = db.begin_write().unwrap();
+        assert!(
+            RedbStateMachine::apply_command(&tx, &StateCommand::SetApplyRules { level: 2 })
+                .is_err()
+        );
+        drop(tx);
+        drop(db);
+        assert_eq!(level(&sm), 1);
+    }
+
+    #[test]
+    fn a_store_or_snapshot_on_newer_rules_is_refused_not_applied_under_older_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sm.redb");
+        let mut sm = RedbStateMachine::open(&path).unwrap();
+        // A snapshot written by a build that already implements level 2.
+        let mut value: serde_json::Value =
+            crate::codec::decode(snapshot_of(&mut sm).snapshot.get_ref()).unwrap();
+        assert_eq!(value["apply_rules"], 1);
+        value["apply_rules"] = 2.into();
+        let newer = Cursor::new(crate::codec::encode(&value).unwrap());
+        let meta = snapshot_of(&mut sm).meta;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        assert!(runtime
+            .block_on(sm.install_snapshot(&meta, Box::new(newer)))
+            .is_err());
+        // A snapshot from before the field existed is level 1.
+        value.as_object_mut().unwrap().remove("apply_rules");
+        let older = Cursor::new(crate::codec::encode(&value).unwrap());
+        runtime
+            .block_on(sm.install_snapshot(&meta, Box::new(older)))
+            .unwrap();
+        // A data directory a newer build raised is refused on open, and a
+        // snapshot built from it carries the level.
+        {
+            let db = sm.db.lock().unwrap();
+            let tx = db.begin_write().unwrap();
+            {
+                let mut t = tx.open_table(SM_META_TABLE).unwrap();
+                t.insert(APPLY_RULES_KEY, b"2".as_slice()).unwrap();
+            }
+            tx.commit().unwrap();
+        }
+        let carried: StateSnapshot =
+            crate::codec::decode(snapshot_of(&mut sm).snapshot.get_ref()).unwrap();
+        assert_eq!(carried.apply_rules, 2);
+        drop(sm);
+        assert!(RedbStateMachine::open(&path).is_err());
     }
 
     #[test]
