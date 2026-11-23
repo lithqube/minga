@@ -1,0 +1,8 @@
+PASS answer='n': diff before prompt, ASCII escapes, calls=[('GET', '/minga/change-requests?id=cr-review')]
+change request cr-review: image: "web:1" -> "web:\u202e2\udb40\udc01"; replicas: 1 -> 2
+Approve this change?
+Continue? [y/N] 
+PASS answer='y': diff before prompt, ASCII escapes, calls=[('GET', '/minga/change-requests?id=cr-review'), ('POST', '/minga/change-requests/cr-review/approve')]
+change request cr-review: image: "web:1" -> "web:\u202e2\udb40\udc01"; replicas: 1 -> 2
+Approve this change?
+Continue? [y/N] 

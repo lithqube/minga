@@ -2730,6 +2730,28 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::FORBIDDEN);
 
+        for image in ["web:\u{202e}2", "web:\u{200b}2", "web:é", "web:\u{e0001}2"] {
+            let (status, body) = send_request(
+                router.clone(),
+                request(
+                    "POST",
+                    "/minga/change-requests",
+                    ApiRole::Agent,
+                    "default",
+                    "agent",
+                    Some(serde_json::json!({
+                        "action":"deploy", "service_id":"svc-a", "image":image
+                    })),
+                ),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "accepted {image:?}: {body}"
+            );
+        }
+
         // A global service ignores `replicas`: scale and stop are refused.
         let mut global = service_record("svc-global", "default");
         global.mode = minga_state::types::ServiceMode::Global;
@@ -2804,6 +2826,25 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::CREATED);
         let id = proposal["id"].as_str().unwrap().to_owned();
+        for (tenant, expected) in [("default", 1), ("tenant-b", 0)] {
+            let (status, filtered) = send_request(
+                router.clone(),
+                request(
+                    "GET",
+                    &format!("/minga/change-requests?id={id}&limit=1"),
+                    ApiRole::Viewer,
+                    tenant,
+                    "viewer",
+                    None,
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(filtered.as_array().unwrap().len(), expected);
+            if expected == 1 {
+                assert_eq!(filtered[0]["id"], id);
+            }
+        }
 
         let (status, default_list) = send_request(
             router.clone(),

@@ -1,0 +1,6 @@
+Traceback (most recent call last):
+  File "/Users/admin/dev/minga/.claude/worktrees/issue-134-qa/docs/super-board/runs/issue-134-qa-v2/terminal_negative_control.py", line 92, in <module>
+    check(response)
+  File "/Users/admin/dev/minga/.claude/worktrees/issue-134-qa/docs/super-board/runs/issue-134-qa-v2/terminal_negative_control.py", line 61, in check
+    assert chunk, evidence
+AssertionError: b'change request cr-review: image: "web:1" -> "web:\\u202e2\\udb40\\udc01"; replicas: 1 -> 2\n'
