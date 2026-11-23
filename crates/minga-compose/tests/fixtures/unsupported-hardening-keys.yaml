@@ -1,0 +1,67 @@
+# Fixture used by the rejection tests to verify that every hardening key that
+# is parsed but not yet carried end-to-end is rejected with Unsupported.
+# One service per key so each test can target a minimal file.
+name: hardening-rejection
+
+services:
+
+  # 1. cap_add
+  svc-cap-add:
+    image: busybox
+    cap_add: [SYS_RAWIO]
+
+  # 2. cap_drop
+  svc-cap-drop:
+    image: busybox
+    cap_drop: [ALL]
+
+  # 3. read_only
+  svc-read-only:
+    image: busybox
+    read_only: true
+
+  # 4. ulimits
+  svc-ulimits:
+    image: busybox
+    ulimits:
+      nofile: 65536
+
+  # 5. privileged (true)
+  svc-privileged-true:
+    image: busybox
+    privileged: true
+
+  # 6. privileged (false) — presence alone must trigger rejection
+  svc-privileged-false:
+    image: busybox
+    privileged: false
+
+  # 7. devices
+  svc-devices:
+    image: busybox
+    devices:
+      - /dev/ttyUSB0:/dev/ttyUSB0:rw
+
+  # 8. sysctls
+  svc-sysctls:
+    image: busybox
+    sysctls:
+      net.core.somaxconn: 1024
+
+  # 9. tmpfs
+  svc-tmpfs:
+    image: busybox
+    tmpfs: /tmp
+
+  # 10. init
+  svc-init:
+    image: busybox
+    init: true
+
+  # 11. deploy.resources.limits.pids (nested)
+  svc-pids:
+    image: busybox
+    deploy:
+      resources:
+        limits:
+          pids: 100

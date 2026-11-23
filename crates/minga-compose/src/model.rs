@@ -49,26 +49,14 @@ pub struct Service {
     pub healthcheck: Option<Healthcheck>,
     pub deploy: Option<Deploy>,
     pub restart: Option<String>,
-    #[serde(deserialize_with = "opt_parse")]
-    pub privileged: Option<bool>,
-    pub devices: Vec<Device>,
-    pub cap_add: Vec<String>,
-    pub cap_drop: Vec<String>,
     pub user: Option<String>,
     pub working_dir: Option<String>,
     pub hostname: Option<String>,
-    #[serde(deserialize_with = "opt_parse")]
-    pub init: Option<bool>,
-    #[serde(deserialize_with = "opt_parse")]
-    pub read_only: Option<bool>,
     pub secrets: Vec<FileRef>,
     pub configs: Vec<FileRef>,
     pub profiles: Vec<String>,
     pub stop_grace_period: Option<String>,
     pub stop_signal: Option<String>,
-    pub sysctls: ListOrMap,
-    pub tmpfs: Option<StringOrList>,
-    pub ulimits: IndexMap<String, Ulimit>,
     pub logging: Option<Logging>,
     pub env_file: Vec<EnvFile>,
     pub extra_hosts: ListOrMap,
@@ -705,70 +693,6 @@ pub struct UpdateConfig {
     pub order: Option<String>,
 }
 
-/// A host device mapped into the container, or a CDI device name.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Device {
-    pub source: String,
-    pub target: Option<String>,
-    pub permissions: Option<String>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct DeviceLong {
-    source: String,
-    target: Option<String>,
-    permissions: Option<String>,
-}
-
-impl Device {
-    /// Parses `/dev/x`, `/dev/x:/dev/y`, `/dev/x:/dev/y:rwm` or a CDI name
-    /// such as `nvidia.com/gpu=all`.
-    pub fn parse_short(s: &str) -> Result<Self, String> {
-        if !s.starts_with('/') && s.contains('=') {
-            return Ok(Self {
-                source: s.to_string(),
-                target: None,
-                permissions: None,
-            });
-        }
-        let parts: Vec<&str> = s.split(':').collect();
-        let (source, target, permissions) = match parts.as_slice() {
-            [src] => (*src, None, None),
-            [src, dst] => (*src, Some(*dst), None),
-            [src, dst, perms] => (*src, Some(*dst), Some(*perms)),
-            _ => return Err(format!("invalid device {s:?}")),
-        };
-        if let Some(p) = permissions {
-            if p.is_empty() || !p.chars().all(|c| matches!(c, 'r' | 'w' | 'm')) {
-                return Err(format!("device {s:?}: permissions must use r, w and m"));
-            }
-        }
-        Ok(Self {
-            source: source.to_string(),
-            target: target.map(str::to_string),
-            permissions: permissions.map(str::to_string),
-        })
-    }
-}
-
-impl<'de> Deserialize<'de> for Device {
-    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        match Value::deserialize(d)? {
-            Value::String(s) => Self::parse_short(&s).map_err(D::Error::custom),
-            v @ Value::Mapping(_) => {
-                let l: DeviceLong = from_value(v).map_err(D::Error::custom)?;
-                Ok(Self {
-                    source: l.source,
-                    target: l.target,
-                    permissions: l.permissions,
-                })
-            }
-            _ => Err(D::Error::custom("expected a device string or mapping")),
-        }
-    }
-}
-
 /// A service's reference to a top-level secret or config.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FileRef {
@@ -816,36 +740,6 @@ impl<'de> Deserialize<'de> for FileRef {
             _ => Err(D::Error::custom(
                 "expected a name or a mapping with `source`",
             )),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Ulimit {
-    Single(i64),
-    Range { soft: i64, hard: i64 },
-}
-
-impl<'de> Deserialize<'de> for Ulimit {
-    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct Range {
-            soft: i64,
-            hard: i64,
-        }
-        match Value::deserialize(d)? {
-            v @ Value::Mapping(_) => {
-                let r: Range = from_value(v).map_err(D::Error::custom)?;
-                Ok(Self::Range {
-                    soft: r.soft,
-                    hard: r.hard,
-                })
-            }
-            v => scalar(&v)
-                .and_then(|s| s.parse().ok())
-                .map(Self::Single)
-                .ok_or_else(|| D::Error::custom("expected a number or {soft, hard}")),
         }
     }
 }
@@ -1004,14 +898,5 @@ mod tests {
         assert_eq!(v.source, None);
         assert!(ServiceVolume::parse_short("data:relative").is_err());
         assert!(ServiceVolume::parse_short("a:/b:bogus").is_err());
-    }
-
-    #[test]
-    fn short_devices() {
-        let d = Device::parse_short("/dev/ttyUSB0:/dev/ttyUSB0:rw").unwrap();
-        assert_eq!(d.permissions.as_deref(), Some("rw"));
-        let d = Device::parse_short("nvidia.com/gpu=all").unwrap();
-        assert_eq!((d.source.as_str(), d.target), ("nvidia.com/gpu=all", None));
-        assert!(Device::parse_short("/dev/x:/dev/x:rwx").is_err());
     }
 }
