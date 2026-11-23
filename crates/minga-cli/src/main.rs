@@ -1692,7 +1692,11 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
     if args.wg_endpoint.is_none()
         && manager_requires_wg_endpoint(is_manager, args.join || !args.peers.is_empty(), false)
     {
-        eprintln!("error: managers in a multi-node cluster require --wg-endpoint");
+        if args.join {
+            eprintln!("error: --join requires --wg-endpoint so peers can reach this manager");
+        } else {
+            eprintln!("error: --peer is set, which makes this a multi-node cluster; either add --wg-endpoint or remove --peer to run as a single host");
+        }
         return ExitCode::FAILURE;
     }
     let supernet = match overlay_supernet(&args.overlay_supernet) {
@@ -1767,7 +1771,7 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
             }
         };
         if manager_requires_wg_endpoint(is_manager, false, has_other_nodes) {
-            eprintln!("error: managers in a multi-node cluster require --wg-endpoint");
+            eprintln!("error: other nodes are registered in this cluster; either add --wg-endpoint or, for a single-host install, remove --peer and restart");
             return ExitCode::FAILURE;
         }
     }

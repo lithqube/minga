@@ -176,6 +176,82 @@ names, not secret values, volume data or TLS material: copy those as
 [backup.md](backup.md) describes. Tests cover importing v2-format snapshots;
 this path has not been run as a live upgrade.
 
+#### Upgrading a v1.2.0 single-host layout (manager + api + `--peer`)
+
+The v1.2.0 quick-start runs `minga manager` and `minga api` as separate
+processes, both started with `--peer`. That adds `minga api` as a Raft voter
+and leaves `--peer` flags in systemd units or start scripts. This section
+gives numbered steps for that layout. It is a subset of the export and import
+path, not the in-place path: treat the host as a cluster whose voter set is
+unknown until step 3 proves otherwise.
+
+Before you start: read [Before you start](#before-you-start) above. Certificate
+and NATS reissuance applies here too.
+
+**Steps:**
+
+1. **Export desired state from the running 1.2.0 cluster.**
+   ```bash
+   minga state export -o /root/minga-state.json --api-url http://127.0.0.1:2375
+   ```
+   The file holds service specs including environment values; store it
+   encrypted and keep its mode 0600. See [backup.md](backup.md) for what the
+   export does and does not cover.
+
+2. **Back up all state from the data directory while both processes are still running.**
+   Follow [backup.md](backup.md): cold-copy the full data directory
+   (`raft_log.redb`, `state.redb`, `nats/`, `volumes/`, `logs/`, TLS files)
+   and the secret store (default `/var/lib/minga/secrets`). Stop `minga api`
+   and `minga manager` only after the backup is complete.
+
+3. **Stop the old processes and remove the `--peer` flags and the `minga api` unit.**
+   Remove or disable the `minga api` systemd unit. Remove `--peer` from the
+   `minga manager` unit; in 1.3.0 the API is served by `minga manager --api-bind`.
+
+4. **Install the 1.3.0 binary.**
+
+5. **Start the manager without `--peer`, with `--api-bind`.**
+   ```bash
+   minga manager \
+     --node-id <YOUR_NODE_ID> \
+     --bind 127.0.0.1:50051 \
+     --api-bind 0.0.0.0:2375 \
+     --api-token <YOUR_TOKEN> \
+     --data-dir /var/lib/minga
+   ```
+   A single-host manager does not need `--wg-endpoint` and must not have
+   `--peer` (that flag told 1.2.0 about other voters; 1.3.0 reads membership
+   from the existing store, and passing `--peer` makes the manager expect a
+   multi-node overlay).
+
+6. **Confirm the manager becomes leader and accepts a Raft write.**
+   Wait for `/readyz` to return 200, then deploy a test service:
+   ```bash
+   curl -s http://127.0.0.1:2375/readyz
+   minga-ctl upgrade preflight --api-url http://127.0.0.1:2375
+   ```
+   `upgrade preflight` reports the Raft membership and quorum. If the
+   manager does not become leader within about 30 seconds, stop it and
+   restore the backup as described under
+   [If the conversion stalls or a step fails](#if-the-conversion-stalls-or-a-step-fails).
+
+7. **Import the desired state into the fresh 1.3.0 store.**
+   ```bash
+   minga state import /root/minga-state.json --api-url http://127.0.0.1:2375
+   ```
+   Services, networks, volumes and secret names are restored. Secret values
+   must be re-provisioned in `--secret-store` (default `/var/lib/minga/secrets`)
+   if the backup was not restored directly; see [backup.md](backup.md).
+
+8. **Verify the result.**
+   Check that your services are listed and tasks are placed:
+   ```bash
+   minga-ctl stack ls --api-url http://127.0.0.1:2375
+   ```
+   Task status and restart counts reset once after the upgrade; this is
+   expected (see [What changes after](#what-changes-after)).
+
+
 ### What changes after
 
 - **Task status and restart counts reset** once: tenant-first bus names replace
