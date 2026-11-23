@@ -4013,6 +4013,37 @@ mod tests {
             .expect("own secret");
     }
 
+    /// AC2: a tenant's own missing secret returns 404 on inspect and on delete,
+    /// not 400 or 200. This is distinct from the cross-tenant oracle fix above.
+    #[tokio::test]
+    async fn own_missing_secret_returns_404_on_inspect_and_delete() {
+        let (app, _dir) = app_with_node(1.0).await;
+        // Inspect: get_secret on a name that was never created.
+        let inspect_err = get_secret(
+            State(app.clone()),
+            default_caller(),
+            version_path("does-not-exist"),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(inspect_err, ApiError::NotFound(_)),
+            "inspect of own missing secret must be 404, got {inspect_err:?}"
+        );
+        // Delete: delete_secret on a name that was never created.
+        let delete_err = delete_secret(
+            State(app.clone()),
+            default_caller(),
+            version_path("does-not-exist"),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(delete_err, ApiError::NotFound(_)),
+            "delete of own missing secret must be 404, got {delete_err:?}"
+        );
+    }
+
     #[tokio::test]
     async fn update_excludes_the_services_own_tasks_from_capacity() {
         let (app, _dir) = app_with_node(1.0).await;
