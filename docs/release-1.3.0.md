@@ -31,13 +31,16 @@ numbers in the list; the changelog has the detail and the upgrade steps.
 
 ## Upgrade notes
 
-Upgrading a 1.2.0 cluster is **one coordinated window**. Count the voters by
-hand before you start (see [Order](#order)), because the 1.3.0 tools that
-report them cannot read a 1.2.0 API. `minga-ctl upgrade preflight --to v1.3.0`
-is read-only and reports the Raft membership and quorum, backups, NATS,
-tenants and a rollback plan, and it fails closed when it cannot check
-something. Its diagnostics endpoints are new in 1.3.0, so run it against an
-upgraded manager, not a 1.2.0 one.
+Upgrading a 1.2.0 cluster is **one coordinated window**, and **1.2.0 cannot
+report which of its nodes are Raft voters**. Nothing you can read from a
+running 1.2.0 cluster, the node list included, proves it. So the default is
+to export the state and import it into a fresh cluster, and a single host may
+convert in place only on the evidence described under [Order](#order). The
+1.3.0 tools that report the voter set cannot read a 1.2.0 API:
+`minga-ctl upgrade preflight --to v1.3.0` is read-only and reports the Raft
+membership and quorum, backups, NATS, tenants and a rollback plan, and it
+fails closed when it cannot check something. Its diagnostics endpoints are new
+in 1.3.0, so run it against an upgraded manager, not a 1.2.0 one.
 
 **State migrates in place, one way.** 1.2.0 state is format 2; 1.3.0 is format
 11. Opening a store migrates state and Raft logs from v2 through v10, and a
