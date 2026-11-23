@@ -5,6 +5,18 @@
 Changes on `main` after `v1.3.0-rc.1`. They go into 1.3.0.
 
 ### Changes
+- **Fix.** Containers resolve a sibling service by its bare Compose name again (#193):
+  - v1.3.0-rc.1 broke this. After `minga deploy`, `minga-ctl stack deploy` or any other deploy through the API,
+    `db`, `tasks.db` and `db.<stack>.minga.local` did not resolve; only `<stack>.db` did, so connections between
+    the services of a stack failed. 1.2.0 resolved the bare name.
+  - The manager now sends nodes the bare Compose service name, for every tenant, and nodes register `db`,
+    `tasks.db` and `db.<stack>.minga.local` from it.
+  - `<stack>.<service>` keeps resolving, so a stack edited to that form on rc.1 needs no second edit.
+  - A cluster that ran rc.1: bare names come back on every worker once the manager is upgraded. A worker still on
+    rc.1 then stops answering `<stack>.<service>` until it is upgraded too, so upgrade the workers in the same
+    window. A 1.2.0 cluster is not affected.
+  - As in 1.2.0, two stacks on one node that both have a service `db` share the bare name `db`; rc.1 hid this
+    because it answered only to the stack-qualified name (#200).
 - **No upgrade action.** The Raft apply rules are versioned (#157, [ADR 0009](https://github.com/lithqube/minga/blob/main/docs/adr/0009-raft-apply-rule-versions.md)):
   - A replicated apply-rule level (1 today, every refusal through 1.3.0-rc.1) decides which refusals the apply
     makes, so a manager rebuilt from the log, or on a newer build, gets the result the cluster committed.

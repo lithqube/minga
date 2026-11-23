@@ -221,3 +221,135 @@ async fn a_registered_node_lets_the_service_run_end_to_end() {
     registration.abort();
     membership.leave().await;
 }
+
+const SHOP: &str = r#"
+services:
+  web:
+    image: nginx:1.27
+  db:
+    image: postgres:16
+"#;
+
+/// Deploys `SHOP` as stack `shop` the way `minga deploy` does (the same
+/// translation, the same request bodies, the service `Name` being
+/// `<stack>.<service>`) as a caller of `tenant`, and returns the service
+/// names the scheduler sends the node for DNS on the stack's network.
+async fn deployed_dns_names(tenant: &str) -> Vec<(String, String)> {
+    use axum::body::Body;
+    use axum::http::Request;
+    use minga_bus::EventBus;
+    use tower::ServiceExt;
+
+    let (store, _dir) = store().await;
+    if tenant != "default" {
+        store
+            .create_tenant(minga_state::types::Tenant {
+                id: tenant.into(),
+                name: tenant.into(),
+                quotas: Default::default(),
+                nats_revoked_user_public_keys: Vec::new(),
+                created_at: 1,
+            })
+            .await
+            .unwrap();
+    }
+    store
+        .upsert_node(identity(1).cluster_node_for_tenant(tenant))
+        .await
+        .unwrap();
+    let bus = MemoryBus::new();
+    bus.refresh_tenant_lease(tenant, 1, b"registration")
+        .await
+        .unwrap();
+    // A node of another tenant gets tasks only once its join was accepted.
+    bus.put_tenant_status(
+        tenant,
+        &minga_bus::subjects::kv_node_join(tenant, 1),
+        tenant.as_bytes(),
+    )
+    .await
+    .unwrap();
+    let router = minga_api::server::build_router_with_bus_and_auth(
+        store.clone(),
+        bus.clone(),
+        Arc::new(minga_telemetry::ReadyState::new()),
+        None,
+    );
+
+    let loaded = minga_compose::load(SHOP, &minga_compose::LoadOptions::default()).unwrap();
+    let translated = minga_scheduler::translate_project(&loaded.project, "shop", None).unwrap();
+    let mut requests = Vec::new();
+    for net in &translated.networks {
+        requests.push((
+            "networks/create",
+            serde_json::json!({
+                "Name": net.name,
+                "Driver": net.driver,
+                "Attachable": net.attachable,
+                "Labels": {"com.docker.stack.namespace": "shop"},
+            }),
+        ));
+    }
+    for svc in &translated.services {
+        let spec = minga_api::translate::service_to_docker(svc).Spec;
+        requests.push(("services/create", serde_json::to_value(&spec).unwrap()));
+    }
+    for (path, body) in requests {
+        let mut req = Request::builder()
+            .method("POST")
+            .uri(format!("/v1.41/{path}"))
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        req.extensions_mut()
+            .insert(minga_api::auth::ClientIdentity {
+                name: "deployer".into(),
+                role: Some(minga_api::auth::ApiRole::Deployer),
+                tenant: Some(tenant.into()),
+            });
+        let resp = router.clone().oneshot(req).await.unwrap();
+        let status = resp.status();
+        let reply = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let reply = String::from_utf8_lossy(&reply);
+        assert_eq!(status, 201, "{path} as {tenant}: {reply}");
+    }
+
+    Scheduler::with_bus(store.clone(), bus.clone())
+        .reconcile_once()
+        .await
+        .unwrap();
+    let prefix = minga_bus::subjects::kv_assignment_node_network_prefix(tenant, 1);
+    let mut names: Vec<(String, String)> = bus
+        .list_assignments("")
+        .await
+        .unwrap()
+        .iter()
+        .filter(|(key, _)| key.starts_with(&prefix))
+        .flat_map(|(_, value)| {
+            minga_state::codec::decode_wire::<minga_state::types::NetworkAssignment>(value)
+                .unwrap()
+                .tasks
+        })
+        .map(|task| (task.service_name, task.stack))
+        .collect();
+    names.sort();
+    names
+}
+
+/// Regression for #193: v1.3.0-rc.1 sent the node `shop.db`, so `db`,
+/// `tasks.db` and `db.shop.minga.local` did not resolve.
+#[tokio::test]
+async fn a_deployed_service_is_assigned_its_bare_compose_name_for_dns() {
+    let bare = [("db", "shop"), ("web", "shop")].map(|(n, s)| (n.to_string(), s.to_string()));
+    assert_eq!(deployed_dns_names("default").await, bare);
+}
+
+/// A tenant other than `default` has the ID `<tenant>.<stack>.<service>`;
+/// the DNS name is still the bare Compose name.
+#[tokio::test]
+async fn a_tenants_deployed_service_is_assigned_its_bare_compose_name_for_dns() {
+    let bare = [("db", "shop"), ("web", "shop")].map(|(n, s)| (n.to_string(), s.to_string()));
+    assert_eq!(deployed_dns_names("acme").await, bare);
+}
