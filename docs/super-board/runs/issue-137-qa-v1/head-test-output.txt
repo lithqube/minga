@@ -1,0 +1,116 @@
+$ cargo fmt --all --check
+fmt: clean (exit 0)
+
+$ cargo test -p minga-net
+   Compiling minga-net v1.2.0 (/Users/admin/dev/minga/.claude/worktrees/issue-137-qa/crates/minga-net)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.10s
+     Running unittests src/lib.rs (target/debug/deps/minga_net-5692e80bc00f4602)
+
+running 85 tests
+test cidr::tests::overlaps_is_symmetric_and_exact ... ok
+test cidr::tests::contains_check ... ok
+test cidr::tests::default_supernet ... ok
+test cidr::tests::parse_valid_cidr ... ok
+test cidr::tests::nth_host_slash_30 ... ok
+test cidr::tests::nth_host ... ok
+test cidr::tests::slash_31_both_usable ... ok
+test cidr::tests::parse_invalid_cidr ... ok
+test cidr::tests::nth_subnet_invalid_prefix ... ok
+test cidr::tests::nth_subnet ... ok
+test cidr::tests::display ... ok
+test cidr::tests::slash_32_single_host ... ok
+test cidr::tests::usable_hosts_iter ... ok
+test dns::tests::is_minga_name_check ... ok
+test cidr::tests::supernet_refused_when_it_overlaps_a_host_route ... ok
+test dns::tests::node_fqdn_format ... ok
+test dns::tests::remove_ip_removes_empty_record ... ok
+test dns::tests::remove_ip_from_record ... ok
+test dns::tests::clear_all ... ok
+test dns::tests::list_records_sorted ... ok
+test dns::tests::add_ip_to_record ... ok
+test dns::tests::remove_record ... ok
+test dns::tests::resolve_case_insensitive ... ok
+test dns::tests::resolve_not_found ... ok
+test dns::tests::service_fqdn_format ... ok
+test dns::tests::multiple_services_same_stack ... ok
+test dns::tests::set_and_resolve ... ok
+test dns::tests::short_name_strips_suffix ... ok
+test dns::tests::task_fqdn_format ... ok
+test dns_server::tests::encode_decode_round_trip ... ok
+test dns_server::tests::non_a_minga_query_returns_noerror_empty ... ok
+test dns_server::tests::a_query_known_name_returns_ips ... ok
+test dns_server::tests::tcp_maximum_length_query_is_answered ... ok
+test dns_server::tests::non_minga_without_upstream_refused ... ok
+test dns_server::tests::tcp_oversized_prefix_is_rejected_without_a_body ... ok
+test ipam::tests::allocate_and_get ... ok
+test ipam::tests::allocate_idempotent ... ok
+test ipam::tests::allocate_is_deterministic ... ok
+test dns_server::tests::unknown_minga_name_returns_noerror_empty ... ok
+test ipam::tests::different_tasks_get_different_ips ... ok
+test dns_server::tests::a_source_leaving_the_set_is_proxied_again ... ok
+test ipam::tests::free_count ... ok
+test ipam::tests::get_task_reverse_lookup ... ok
+test ipam::tests::ip_in_subnet_range ... ok
+test ipam::tests::list_allocations ... ok
+test ipam::tests::release_and_reallocate ... ok
+test ipam::tests::release_nonexistent ... ok
+test ipam::tests::restore_allocations ... ok
+test ipam::tests::small_subnet_exhaustion ... ok
+test ipam::tests::restore_ignores_ips_outside_subnet ... ok
+test overlay::tests::allocate_and_release_ip ... ok
+test overlay::tests::allocate_ip_nonexistent_network ... ok
+test overlay::tests::create_and_get_network ... ok
+test overlay::tests::create_duplicate_network_fails ... ok
+test dns_server::tests::upstream_proxy_relays_response ... ok
+test overlay::tests::create_network_auto_never_reuses_a_subnet ... ok
+test overlay::tests::create_network_auto_subnet ... ok
+test overlay::tests::mesh_node_addresses_are_stable_and_unique ... ok
+test overlay::tests::driver_opts_accept_only_encrypted ... ok
+test overlay::tests::mesh_subnet_is_separate ... ok
+test overlay::tests::multiple_networks_independent_ipam ... ok
+test overlay::tests::network_subnet_must_stay_inside_the_supernet_and_off_the_mesh ... ok
+test overlay::tests::register_and_resolve_service ... ok
+test overlay::tests::register_and_unregister_task ... ok
+test overlay::tests::remove_nonexistent_network ... ok
+test overlay::tests::remove_network ... ok
+test overlay::tests::resolve_short_name ... ok
+test wireguard::tests::config_string_format ... ok
+test wireguard::tests::derive_public_invalid_key ... ok
+test wireguard::tests::debug_output_redacts_private_key ... ok
+test wireguard::tests::generate_keypair ... ok
+test wireguard::tests::node_interface_name_is_fixed ... ok
+test wireguard::tests::peer_to_wg_set_args ... ok
+test wireguard::tests::validate_endpoint_invalid ... ok
+test wireguard::tests::derive_public_from_private ... ok
+test wireguard::tests::validate_endpoint_valid ... ok
+test wireguard::tests::validate_public_key_invalid ... ok
+test wireguard::tests::keypairs_are_unique ... ok
+test wireguard::tests::validate_public_key_valid ... ok
+test dns_server::tests::tcp_connections_over_cap_are_closed ... ok
+test dns_server::tests::tcp_shutdown_closes_open_connections ... ok
+test ipam::tests::allocate_subnet_skips_taken_until_exhausted ... ok
+test dns_server::tests::a_confined_source_gets_local_names_but_no_upstream ... ok
+test dns_server::tests::tcp_idle_connection_is_closed ... ok
+test dns_server::tests::tcp_partial_prefix_and_body_time_out ... ok
+
+test result: ok. 85 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.00s
+
+     Running tests/dns_tcp_limits.rs (target/debug/deps/dns_tcp_limits-5be96d39494d20c9)
+
+running 6 tests
+test ac_maximum_length_query_is_still_answered ... ok
+test ac_length_prefix_above_the_maximum_is_rejected_before_the_body ... ok
+test ac_shutdown_ends_open_connection_tasks ... ok
+test regression_required_egress_refuses_non_local_names_over_tcp ... ok
+test ac_connections_beyond_the_cap_are_refused ... ok
+test ac_idle_tcp_connection_is_closed_within_the_timeout ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.00s
+
+   Doc-tests minga_net
+
+running 1 test
+test crates/minga-net/src/lib.rs - (line 25) ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.45s
+

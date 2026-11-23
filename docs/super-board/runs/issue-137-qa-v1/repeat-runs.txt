@@ -1,0 +1,11 @@
+$ cargo test -p minga-net --test dns_tcp_limits -- --nocapture   (x5, head d10f75b)
+observed: 72 of 200 connections refused, 128 stayed open
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.01s
+observed: 72 of 200 connections refused, 128 stayed open
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.00s
+observed: 72 of 200 connections refused, 128 stayed open
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.00s
+observed: 72 of 200 connections refused, 128 stayed open
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.00s
+observed: 72 of 200 connections refused, 128 stayed open
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.00s
