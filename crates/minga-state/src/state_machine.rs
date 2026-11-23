@@ -2551,4 +2551,106 @@ mod tests {
             StateResponse::Conflict(_)
         ));
     }
+
+    // AC4: state-machine commit agrees with API admission — cross-tenant
+    // services sharing an ingress port must both commit successfully, while
+    // a same-tenant collision at commit time is refused.
+    #[test]
+    fn commit_agrees_with_admission_on_cross_tenant_ingress_ports() {
+        let dir = tempfile::tempdir().unwrap();
+        let sm = RedbStateMachine::open(dir.path().join("sm.redb")).unwrap();
+
+        // Helper: minimal Service with one ingress port.
+        let ingress_svc = |id: &str, tenant: &str, port: u16| Service {
+            id: id.to_owned(),
+            tenant_id: tenant.to_owned(),
+            name: id.to_owned(),
+            image: "nginx".to_owned(),
+            replicas: 1,
+            mode: ServiceMode::Replicated,
+            is_job: false,
+            constraints: Vec::new(),
+            env: Default::default(),
+            ports: vec![PortMapping {
+                host_ip: None,
+                target: 80,
+                published: Some(port),
+                protocol: "tcp".to_owned(),
+                mode: PortMode::Ingress,
+            }],
+            networks: Vec::new(),
+            resources: ResourceSpec::default(),
+            agent: None,
+            egress: None,
+            restart_policy: Default::default(),
+            secrets: Vec::new(),
+            command: Vec::new(),
+            entrypoint: Vec::new(),
+            labels: Default::default(),
+            healthcheck: None,
+            mounts: Vec::new(),
+            user: None,
+            extra_hosts: Vec::new(),
+            update: Default::default(),
+            rollback: None,
+            previous: None,
+        };
+
+        let tenant_a = Tenant {
+            id: "tenant-a".into(),
+            name: "Tenant A".into(),
+            nats_revoked_user_public_keys: Vec::new(),
+            quotas: TenantQuotas::default(),
+            created_at: 1,
+        };
+        let tenant_b = Tenant {
+            id: "tenant-b".into(),
+            name: "Tenant B".into(),
+            nats_revoked_user_public_keys: Vec::new(),
+            quotas: TenantQuotas::default(),
+            created_at: 2,
+        };
+        assert_eq!(
+            apply(&sm, StateCommand::CreateTenant(tenant_a)),
+            StateResponse::Ok
+        );
+        assert_eq!(
+            apply(&sm, StateCommand::CreateTenant(tenant_b)),
+            StateResponse::Ok
+        );
+
+        // Tenant-A claims port 8080 — must succeed.
+        assert_eq!(
+            apply(
+                &sm,
+                StateCommand::UpsertService(ingress_svc("a-web", "tenant-a", 8080))
+            ),
+            StateResponse::Ok,
+            "tenant-a first upsert must succeed"
+        );
+
+        // AC4a: Tenant-B on the same port — commit must agree with admission
+        // that this is NOT a conflict.
+        assert_eq!(
+            apply(
+                &sm,
+                StateCommand::UpsertService(ingress_svc("b-web", "tenant-b", 8080))
+            ),
+            StateResponse::Ok,
+            "cross-tenant ingress port overlap must be admitted at commit"
+        );
+
+        // AC4b: a second service inside tenant-A on the same port — commit
+        // must agree with admission that this IS a conflict.
+        assert!(
+            matches!(
+                apply(
+                    &sm,
+                    StateCommand::UpsertService(ingress_svc("a-api", "tenant-a", 8080))
+                ),
+                StateResponse::Error(_)
+            ),
+            "same-tenant ingress port collision must be refused at commit"
+        );
+    }
 }
