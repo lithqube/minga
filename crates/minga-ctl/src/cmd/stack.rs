@@ -568,6 +568,34 @@ pub async fn run(
     }
 }
 
+/// How long `rm --with` waits for a network that only the stack's own tasks
+/// still hold: the leader reaps a removed service's tasks on its next pass.
+const TASK_REAP_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
+const TASK_REAP_POLL: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Deletes a named resource. A network is refused while a task still holds an
+/// address on it, which is true for a moment after the services that ran them
+/// are removed, so that refusal alone is retried for a bounded time. Every
+/// other refusal, and a task that outlives the wait, is returned as it is.
+async fn delete_resource(client: &ApiClient, c: &Candidate) -> Result<Found, CtlError> {
+    let path = format!("{}/{}", c.collection, c.id);
+    let deadline = tokio::time::Instant::now() + TASK_REAP_WAIT;
+    loop {
+        match client.delete(&path).await {
+            Err(CtlError::Api {
+                status: 409,
+                ref message,
+            }) if c.collection == "networks"
+                && message.contains("in use by a task")
+                && tokio::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep(TASK_REAP_POLL).await;
+            }
+            other => return other,
+        }
+    }
+}
+
 /// What `rm --with` can name, as (kind, API collection).
 const KINDS: [(&str, &str); 3] = [
     ("network", "networks"),
@@ -694,7 +722,7 @@ async fn rm(
             in_use.push((*c, reason.to_string()));
             continue;
         }
-        match client.delete(&format!("{}/{}", c.collection, c.id)).await {
+        match delete_resource(client, c).await {
             Ok(_) => removed.push(*c),
             Err(CtlError::Api {
                 status: 409,
