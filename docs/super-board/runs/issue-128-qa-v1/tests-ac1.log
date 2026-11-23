@@ -1,0 +1,8 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.17s
+     Running unittests src/lib.rs (target/debug/deps/minga_api-da942c4024aff82c)
+
+running 1 test
+test handlers::tests::foreign_secret_reference_gets_the_same_answer_as_an_absent_one ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 159 filtered out; finished in 0.42s
+

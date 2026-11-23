@@ -3957,6 +3957,93 @@ mod tests {
         );
     }
 
+    /// Regression for the cross-tenant existence oracle: a service that
+    /// references a secret owned by another tenant must get the same answer
+    /// as one referencing an undeclared secret (ADR 0008 §2).
+    #[tokio::test]
+    async fn foreign_secret_reference_gets_the_same_answer_as_an_absent_one() {
+        let (app, _dir) = app_with_node(1.0).await;
+        app.store
+            .create_tenant(Tenant {
+                nats_revoked_user_public_keys: Vec::new(),
+                id: "acme".into(),
+                name: "Acme".into(),
+                quotas: Default::default(),
+                created_at: 1,
+            })
+            .await
+            .unwrap();
+        app.store
+            .upsert_secret(minga_state::types::Secret {
+                id: "acme-key".into(),
+                tenant_id: "acme".into(),
+                name: "acme-key".into(),
+            })
+            .await
+            .unwrap();
+
+        let svc_with = |secret_id: &str| {
+            let mut svc = translate::service_spec_to_state(&spec("web", 0)).unwrap();
+            svc.secrets = vec![minga_state::types::SecretRef::new(
+                secret_id,
+                "/run/secrets/key",
+            )];
+            svc
+        };
+
+        let foreign = check_service_secrets(&app, "default", &svc_with("acme-key"))
+            .await
+            .unwrap_err();
+        let absent = check_service_secrets(&app, "default", &svc_with("missing-key"))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(foreign, ApiError::BadRequest(_)),
+            "foreign secret must be indistinguishable from an absent one: {foreign:?}"
+        );
+        assert_eq!(
+            foreign.to_string().replace("acme-key", "<id>"),
+            absent.to_string().replace("missing-key", "<id>"),
+            "status and message must match apart from the caller-supplied name"
+        );
+
+        // The owner's own secret still passes the check.
+        check_service_secrets(&app, "acme", &svc_with("acme-key"))
+            .await
+            .expect("own secret");
+    }
+
+    /// AC2: a tenant's own missing secret returns 404 on inspect and on delete,
+    /// not 400 or 200. This is distinct from the cross-tenant oracle fix above.
+    #[tokio::test]
+    async fn own_missing_secret_returns_404_on_inspect_and_delete() {
+        let (app, _dir) = app_with_node(1.0).await;
+        // Inspect: get_secret on a name that was never created.
+        let inspect_err = get_secret(
+            State(app.clone()),
+            default_caller(),
+            version_path("does-not-exist"),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(inspect_err, ApiError::NotFound(_)),
+            "inspect of own missing secret must be 404, got {inspect_err:?}"
+        );
+        // Delete: delete_secret on a name that was never created.
+        let delete_err = delete_secret(
+            State(app.clone()),
+            default_caller(),
+            version_path("does-not-exist"),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(delete_err, ApiError::NotFound(_)),
+            "delete of own missing secret must be 404, got {delete_err:?}"
+        );
+    }
+
     #[tokio::test]
     async fn update_excludes_the_services_own_tasks_from_capacity() {
         let (app, _dir) = app_with_node(1.0).await;
