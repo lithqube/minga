@@ -1,0 +1,39 @@
+BASE = 8c978dc (merge-base of issue-137-dns-tcp-cap-timeout with main)
+$ cargo test -p minga-net --test dns_tcp_limits
+   Compiling minga-net v1.2.0 (/Users/admin/dev/minga/.claude/worktrees/issue-137-qa/crates/minga-net)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.84s
+     Running tests/dns_tcp_limits.rs (target/debug/deps/dns_tcp_limits-5be96d39494d20c9)
+
+running 6 tests
+test ac_connections_beyond_the_cap_are_refused ... 
+thread 'ac_connections_beyond_the_cap_are_refused' (8067975) panicked at crates/minga-net/tests/dns_tcp_limits.rs:193:5:
+no connection was refused: the TCP listener accepts without a cap
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+test ac_idle_tcp_connection_is_closed_within_the_timeout ... 
+thread 'ac_idle_tcp_connection_is_closed_within_the_timeout' (8067999) panicked at crates/minga-net/tests/dns_tcp_limits.rs:138:19:
+idle DNS TCP connection: the connection was still open after 15s
+FAILED
+test ac_length_prefix_above_the_maximum_is_rejected_before_the_body ... 
+thread 'ac_length_prefix_above_the_maximum_is_rejected_before_the_body' (8073954) panicked at crates/minga-net/tests/dns_tcp_limits.rs:138:19:
+DNS TCP query above the maximum length: the connection was still open after 3s
+FAILED
+test ac_maximum_length_query_is_still_answered ... ok
+test ac_shutdown_ends_open_connection_tasks ... 
+thread 'ac_shutdown_ends_open_connection_tasks' (8074791) panicked at crates/minga-net/tests/dns_tcp_limits.rs:138:19:
+DNS TCP connection after shutdown: the connection was still open after 3s
+FAILED
+test regression_required_egress_refuses_non_local_names_over_tcp ... ok
+
+failures:
+
+failures:
+    ac_connections_beyond_the_cap_are_refused
+    ac_idle_tcp_connection_is_closed_within_the_timeout
+    ac_length_prefix_above_the_maximum_is_rejected_before_the_body
+    ac_shutdown_ends_open_connection_tasks
+
+test result: FAILED. 2 passed; 4 failed; 0 ignored; 0 measured; 0 filtered out; finished in 22.63s
+
+error: test failed, to rerun pass `-p minga-net --test dns_tcp_limits`
+exit=101
