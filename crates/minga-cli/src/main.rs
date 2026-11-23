@@ -824,7 +824,20 @@ async fn run_migrate_v1(args: MigrateV1Args) -> ExitCode {
     }
 
     let url = format!("{}/minga/managers", args.api_url.trim_end_matches('/'));
-    let client = reqwest::Client::new();
+    // The admin token must not reach an HTTP proxy. Build the client the same
+    // way deploy.rs and state.rs do: no proxy, no redirects.
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("error: cannot build HTTP client: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
     let mut request = client.get(&url);
     if let Some(token) = &args.api_token {
         request = request.bearer_auth(token);
@@ -3168,8 +3181,9 @@ fn port_of(addr: &str) -> Option<u16> {
 mod tests {
     use super::{
         cas_overlap, cert_has_dns_name, is_loopback_bind, is_wildcard_bind,
-        manager_requires_wg_endpoint, node_certificate_names, port_of, project_dir, run_node,
-        run_tls, worker_has_manager_only_flags, Cli, Command, NodeCertificateRole, TlsCommand,
+        manager_requires_wg_endpoint, node_certificate_names, port_of, project_dir, run_migrate_v1,
+        run_node, run_tls, worker_has_manager_only_flags, Cli, Command, MigrateV1Args,
+        NodeCertificateRole, TlsCommand,
     };
     use clap::Parser;
     use std::os::unix::fs::PermissionsExt;
@@ -3631,5 +3645,153 @@ mod tests {
         let want = dir.path().canonicalize().unwrap();
         assert_eq!(project_dir(file.to_str().unwrap()), Some(want));
         assert_eq!(project_dir("/nonexistent-minga-dir/compose.yaml"), None);
+    }
+
+    // ── migrate-v1 proxy-safety tests ─────────────────────────────────────────
+    //
+    // The two tests below prove both ACs from issue #139:
+    //
+    //   AC1: with HTTP_PROXY set, migrate-v1 sends no request to the proxy.
+    //   AC2: migrate-v1 still works against a loopback API.
+    //
+    // We start a minimal axum "mock API" that speaks the two migrate-v1
+    // endpoints (GET /minga/managers, POST /minga/managers/migrate-v1) and
+    // separately a plain TCP socket acting as the "proxy".  The tests are
+    // async (tokio) and do not manipulate global env state without cleanup.
+
+    /// Spawn a single-use axum server on a random loopback port that answers
+    /// the two migrate-v1 endpoints, then return its base URL and a shutdown
+    /// handle.
+    async fn start_mock_migrate_api(
+        voters: Vec<u64>,
+    ) -> (String, tokio::sync::oneshot::Sender<()>) {
+        use axum::{
+            extract::State,
+            routing::{get, post},
+            Json, Router,
+        };
+        use std::sync::Arc;
+
+        #[derive(Clone)]
+        struct S(Arc<Vec<u64>>);
+
+        async fn list_voters(State(s): State<S>) -> Json<Vec<u64>> {
+            Json((*s.0).clone())
+        }
+        async fn do_migrate() -> axum::http::StatusCode {
+            axum::http::StatusCode::OK
+        }
+
+        let state = S(Arc::new(voters));
+        let app = Router::new()
+            .route("/minga/managers", get(list_voters))
+            .route("/minga/managers/migrate-v1", post(do_migrate))
+            .with_state(state);
+
+        // Bind inside the async context so tokio owns the socket from the start.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock server");
+        let addr = listener.local_addr().unwrap();
+
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    rx.await.ok();
+                })
+                .await
+                .ok();
+        });
+        (format!("http://{addr}"), tx)
+    }
+
+    /// Bind a TCP port that acts as the "proxy"; return the URL and the listener
+    /// so the test can check whether anything connected to it.
+    fn proxy_listener() -> (String, std::net::TcpListener) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind proxy listener");
+        listener
+            .set_nonblocking(true)
+            .expect("set_nonblocking on proxy");
+        let addr = listener.local_addr().unwrap();
+        (format!("http://{addr}"), listener)
+    }
+
+    // AC1: with HTTP_PROXY set the migrate-v1 client must not contact the proxy.
+    #[tokio::test]
+    async fn migrate_v1_does_not_use_http_proxy() {
+        let (api_url, _shutdown) = start_mock_migrate_api(vec![1, 2, 3]).await;
+        let (proxy_url, proxy) = proxy_listener();
+
+        // Point both common proxy variables at our sentinel listener.
+        // We restore them after the test so we don't pollute parallel tests.
+        let old_http = std::env::var("HTTP_PROXY").ok();
+        let old_https = std::env::var("HTTPS_PROXY").ok();
+        let old_all = std::env::var("ALL_PROXY").ok();
+        std::env::set_var("HTTP_PROXY", &proxy_url);
+        std::env::set_var("HTTPS_PROXY", &proxy_url);
+        std::env::set_var("ALL_PROXY", &proxy_url);
+
+        let result = run_migrate_v1(MigrateV1Args {
+            api_url,
+            api_token: Some("s3cr3t".into()),
+            manager_ids: vec![1, 2, 3],
+            apply: false,
+        })
+        .await;
+
+        // Restore the env before any assert so a failure doesn't leave them set.
+        match old_http {
+            Some(v) => std::env::set_var("HTTP_PROXY", v),
+            None => std::env::remove_var("HTTP_PROXY"),
+        }
+        match old_https {
+            Some(v) => std::env::set_var("HTTPS_PROXY", v),
+            None => std::env::remove_var("HTTPS_PROXY"),
+        }
+        match old_all {
+            Some(v) => std::env::set_var("ALL_PROXY", v),
+            None => std::env::remove_var("ALL_PROXY"),
+        }
+
+        // The command must succeed (dry run with all voters retained).
+        assert_eq!(result, std::process::ExitCode::SUCCESS);
+
+        // The proxy listener must have received zero connections: `.accept()`
+        // on a non-blocking socket returns `WouldBlock` when nothing connected.
+        let no_connection = match proxy.accept() {
+            Err(e) => e.kind() == std::io::ErrorKind::WouldBlock,
+            Ok(_) => false,
+        };
+        assert!(
+            no_connection,
+            "migrate-v1 sent a request to the HTTP proxy — admin token leaked"
+        );
+    }
+
+    // AC2: migrate-v1 must complete successfully against a loopback API.
+    #[tokio::test]
+    async fn migrate_v1_works_against_loopback_api() {
+        let (api_url, _shutdown) = start_mock_migrate_api(vec![1, 2, 3]).await;
+
+        // Dry run: returns SUCCESS and prints the plan without applying.
+        let result = run_migrate_v1(MigrateV1Args {
+            api_url: api_url.clone(),
+            api_token: Some("s3cr3t".into()),
+            manager_ids: vec![1, 2, 3],
+            apply: false,
+        })
+        .await;
+        assert_eq!(result, std::process::ExitCode::SUCCESS);
+
+        // Apply: returns SUCCESS when the POST endpoint confirms the migration.
+        let result = run_migrate_v1(MigrateV1Args {
+            api_url,
+            api_token: Some("s3cr3t".into()),
+            manager_ids: vec![1, 2, 3],
+            apply: true,
+        })
+        .await;
+        assert_eq!(result, std::process::ExitCode::SUCCESS);
     }
 }
