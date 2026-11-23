@@ -582,8 +582,11 @@ pub async fn create_change_request(
             after.image = image;
         }
         ChangeProposal::Scale { replicas, .. } => {
-            if !(1..=1000).contains(&replicas) {
-                return Err(bad_request("replicas must be between 1 and 1000"));
+            if !(1..=translate::MAX_SERVICE_REPLICAS).contains(&replicas) {
+                return Err(bad_request(format!(
+                    "replicas must be between 1 and {}",
+                    translate::MAX_SERVICE_REPLICAS
+                )));
             }
             after.replicas = replicas;
         }
@@ -3833,6 +3836,47 @@ mod tests {
         assert!(matches!(err, ApiError::BadRequest(_)), "{err:?}");
         assert!(app.store.get_service("bot").await.unwrap().is_none());
     }
+    #[tokio::test]
+    async fn create_and_update_reject_excessive_replicas_before_placement() {
+        let (app, _dir) = app_with_node(1.0).await;
+        let _ = create_service(State(app.clone()), default_caller(), Json(spec("web", 0)))
+            .await
+            .unwrap();
+        let original = app.store.get_service("web").await.unwrap().unwrap();
+        for replicas in [1001, u64::from(u32::MAX) + 1, u64::MAX] {
+            for mode in [
+                models::ServiceMode::Replicated { Replicas: replicas },
+                models::ServiceMode::ReplicatedJob { Replicas: replicas },
+            ] {
+                // Placement would refuse this CPU request with 409; admission must return 400.
+                let mut create_spec = spec("rejected", 2_000_000_000);
+                create_spec.Mode = Some(mode.clone());
+                let error = create_service(State(app.clone()), default_caller(), Json(create_spec))
+                    .await
+                    .unwrap_err();
+                assert_eq!(error.into_response().status(), StatusCode::BAD_REQUEST);
+
+                let mut update_spec = spec("web", 2_000_000_000);
+                update_spec.Mode = Some(mode);
+                let error = update_service(
+                    State(app.clone()),
+                    default_caller(),
+                    Path(("v1.41".to_owned(), "web".to_owned())),
+                    Query(serde_json::from_value(serde_json::json!({})).unwrap()),
+                    Json(update_spec),
+                )
+                .await
+                .unwrap_err();
+                assert_eq!(error.into_response().status(), StatusCode::BAD_REQUEST);
+                assert!(app.store.get_service("rejected").await.unwrap().is_none());
+                assert_eq!(
+                    app.store.get_service("web").await.unwrap().unwrap(),
+                    original
+                );
+            }
+        }
+    }
+
     #[tokio::test]
     async fn create_and_update_refuse_unimplemented_hardening_json_with_bad_request() {
         let (app, _dir) = app_with_node(1.0).await;

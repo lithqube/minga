@@ -23,6 +23,9 @@ use minga_state::types::{
 
 use crate::models;
 
+/// Upper bound for direct service admission and change-request scaling.
+pub(crate) const MAX_SERVICE_REPLICAS: u32 = 1000;
+
 /// Service label that carries an agent workload's spec (JSON) through the
 /// Docker API, which has no field for it. Stripped from state labels.
 pub const AGENT_LABEL: &str = "minga.agent";
@@ -384,13 +387,18 @@ pub fn service_spec_to_state(spec: &models::ServiceSpec) -> Result<Service, Stri
         .unwrap_or_default();
     // Mode and replicas.
     let (replicas, mode, is_job) = match &spec.Mode {
-        Some(models::ServiceMode::Replicated { Replicas }) => {
-            (*Replicas as u32, ServiceMode::Replicated, false)
+        Some(
+            models::ServiceMode::Replicated { Replicas }
+            | models::ServiceMode::ReplicatedJob { Replicas },
+        ) => {
+            let replicas = match u32::try_from(*Replicas) {
+                Ok(replicas) if replicas <= MAX_SERVICE_REPLICAS => replicas,
+                _ => return Err(format!("replicas must not exceed {MAX_SERVICE_REPLICAS}")),
+            };
+            let is_job = matches!(&spec.Mode, Some(models::ServiceMode::ReplicatedJob { .. }));
+            (replicas, ServiceMode::Replicated, is_job)
         }
         Some(models::ServiceMode::Global {}) => (0, ServiceMode::Global, false),
-        Some(models::ServiceMode::ReplicatedJob { Replicas }) => {
-            (*Replicas as u32, ServiceMode::Replicated, true)
-        }
         Some(models::ServiceMode::GlobalJob { .. }) => (0, ServiceMode::Global, true),
         None => (1, ServiceMode::Replicated, false),
     };
@@ -1702,6 +1710,42 @@ mod tests {
         .unwrap();
         let err = service_spec_to_state(&spec).unwrap_err();
         assert!(err.contains("Ulimits"), "{err}");
+    }
+
+    #[test]
+    fn service_spec_rejects_excessive_replicas_without_truncation() {
+        for replicas in [1001, u64::from(u32::MAX) + 1, u64::MAX] {
+            for mode in [
+                models::ServiceMode::Replicated { Replicas: replicas },
+                models::ServiceMode::ReplicatedJob { Replicas: replicas },
+            ] {
+                let mut spec = sample_docker_spec();
+                spec.Mode = Some(mode);
+                assert!(
+                    service_spec_to_state(&spec).is_err(),
+                    "accepted replicas={replicas} in {:?}",
+                    spec.Mode
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn service_spec_preserves_supported_replica_counts_and_job_mode() {
+        for replicas in [0, 1, 1000] {
+            for is_job in [false, true] {
+                let mut spec = sample_docker_spec();
+                spec.Mode = Some(if is_job {
+                    models::ServiceMode::ReplicatedJob { Replicas: replicas }
+                } else {
+                    models::ServiceMode::Replicated { Replicas: replicas }
+                });
+                let service = service_spec_to_state(&spec).unwrap();
+                assert_eq!(u64::from(service.replicas), replicas);
+                assert_eq!(service.mode, ServiceMode::Replicated);
+                assert_eq!(service.is_job, is_job);
+            }
+        }
     }
 
     #[test]
