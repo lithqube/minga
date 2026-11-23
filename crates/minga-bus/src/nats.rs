@@ -814,6 +814,7 @@ impl NatsBus {
             // newer record must stay. A revision conflict re-reads it; any other
             // failure is returned, before the streams go, so the delete can be
             // repeated.
+            let mut settled = false;
             for _ in 0..3 {
                 let Some(entry) = self
                     .status_kv
@@ -821,9 +822,11 @@ impl NatsBus {
                     .await
                     .map_err(|error| BusError::Kv(format!("get {key}: {error}")))?
                 else {
+                    settled = true;
                     break;
                 };
                 if entry.value.as_ref() != tenant_id.as_bytes() {
+                    settled = true;
                     break;
                 }
                 match self
@@ -831,13 +834,23 @@ impl NatsBus {
                     .purge_expect_revision(&key, Some(entry.revision))
                     .await
                 {
-                    Ok(()) => break,
+                    Ok(()) => {
+                        settled = true;
+                        break;
+                    }
                     Err(error)
                         if error.kind() == jetstream::kv::PurgeErrorKind::WrongLastRevision => {}
                     Err(error) => {
                         return Err(BusError::Kv(format!("purge {key}: {error}")));
                     }
                 }
+            }
+            if !settled {
+                // Still changing under us after every retry: stop before the
+                // streams go, so a repeated delete tries this record again.
+                return Err(BusError::Kv(format!(
+                    "node-join record {key} kept changing during tenant cleanup; delete again"
+                )));
             }
         }
         // Last, so that a failure above leaves a stream behind and the tenant

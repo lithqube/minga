@@ -273,18 +273,16 @@ pub async fn create_tenant(
     Ok((StatusCode::CREATED, Json(tenant)))
 }
 
-/// Whether a failed tenant write certainly did not commit: the store refused
-/// it. Any other error, a timeout or a lost leader say, leaves the outcome open.
+/// Whether a failed tenant write certainly did not commit and left no tenant
+/// that owns the bus resources: the store refused the request itself. Any other
+/// error, a timeout or a lost leader say, leaves the outcome open. A conflict
+/// is not here: it means the tenant exists, created by another request, and
+/// the resources are then its own.
 fn definitely_not_created(error: &minga_state::StateError) -> bool {
     use minga_state::StateError as E;
     matches!(
         error,
-        E::InvalidTenant(_)
-            | E::NotFound(_)
-            | E::Conflict(_)
-            | E::NameInUse
-            | E::QuotaExceeded(_)
-            | E::BadSnapshot(_)
+        E::InvalidTenant(_) | E::NotFound(_) | E::QuotaExceeded(_) | E::BadSnapshot(_)
     )
 }
 
@@ -3145,9 +3143,11 @@ mod tests {
     #[test]
     fn only_a_store_refusal_proves_a_tenant_was_not_created() {
         use minga_state::StateError as E;
-        assert!(definitely_not_created(&E::NameInUse));
-        assert!(definitely_not_created(&E::Conflict("x".into())));
         assert!(definitely_not_created(&E::QuotaExceeded("tenants".into())));
+        assert!(definitely_not_created(&E::InvalidTenant("bad".into())));
+        // The tenant exists, made by another request: its resources are not ours to delete.
+        assert!(!definitely_not_created(&E::Conflict("exists".into())));
+        assert!(!definitely_not_created(&E::NameInUse));
         // A timeout or a lost leader may follow a write that committed.
         assert!(!definitely_not_created(&E::Storage(
             "write timed out".into()
