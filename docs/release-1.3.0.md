@@ -101,16 +101,23 @@ store is a voter, and `minga api` is retired in 1.3.0, so it never counts
 toward the managers. Counting `docker node ls` rows plus your `minga api`
 processes gives an estimate that can be wrong in either direction.
 
-**Fail closed.** Use the in-place conversion only when the voter set is
-certain: a single host with one `minga manager` that was started without
-`--peer`, no workers and no `minga api` process, so the manager is the only
-voter. For every other cluster, including one where your count shows a manager
-majority, use [the export and import path](#when-the-managers-are-not-a-majority)
-unless you can show from each node's data directory and original flags that
-its voter set is exactly the nodes you counted, and have rehearsed the upgrade
-on a copy. `minga migrate-v1` without `--apply` and `upgrade preflight` run
-only against an upgraded manager, as a second check before applying; they
-cannot replace this one.
+**Fail closed.** For every cluster with more than one node, including one
+where your count shows a manager majority, use
+[the export and import path](#when-the-managers-are-not-a-majority). Nothing
+in 1.2.0 shows which nodes are voters, and nothing here shows that converting
+in place works for any shape but the one proof above.
+
+**A single host** (one `minga manager`, no workers, no `minga api` process)
+is the one case you may convert in place, and only on this evidence, not on
+the flags it was started with: 1.2.0 uses `--peer` only when a store is first
+created, so a store started once with peers may still list them as voters.
+Take the cold copy, upgrade the manager, and require that it **becomes leader
+on its own and accepts a Raft write** (deploy a test service). A node cannot
+become leader without a majority of its persisted voters, so that outcome
+shows the voter set is only that manager. If it does not become leader, stop,
+and restore the copy as described below. `minga migrate-v1` without `--apply`
+and `upgrade preflight` run only against an upgraded manager, as a second
+check; they cannot replace this one.
 
 1. Upgrade the managers first, then, on the leader, change membership once to
    the manager set, removing worker voters. `minga migrate-v1` previews that
