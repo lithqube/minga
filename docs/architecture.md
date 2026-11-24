@@ -78,9 +78,6 @@ both workers are behind NAT, a manager relays by decrypting and re-encrypting
 packets, so it can inspect relayed container payloads. Tenant log streams
 (`MINGA_LOGS_<tenant>`) remain single-replica and are unavailable while their
 hosting NATS server is down.
-After test credential updates, one manager failed to restart with an NATS
-authorization violation; validate manager rejoin after credential changes
-before release.
 
 See [ADR 0007](adr/0007-wireguard-mesh.md) for mesh decisions and trust
 boundaries, and [supported topologies](topologies.md) for evidence and
@@ -124,8 +121,7 @@ See [ADR 0006](adr/0006-workers-leave-raft.md),
 ## Next work
 
 1. At release readiness, run the deferred Phase 15 T3 tenant-isolation proof.
-2. Before release, validate manager rejoin after NATS credential changes.
-3. For agent-plane feature work, complete the remaining distributed customer
+2. For agent-plane feature work, complete the remaining distributed customer
    budget and request-rate-limit work (B6/B7), then continue the listed
    identity, scheduled-job and sandbox-capability steps in
    [the agent-plane roadmap](agent-plane-roadmap.md).

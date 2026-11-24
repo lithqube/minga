@@ -2311,6 +2311,7 @@ dependencies = [
 name = "minga-cli"
 version = "1.3.0-rc.1"
 dependencies = [
+ "async-nats",
  "axum",
  "clap",
  "futures",
@@ -2326,6 +2327,8 @@ dependencies = [
  "minga-scheduler",
  "minga-state",
  "minga-telemetry",
+ "nats-jwt-rs",
+ "nkeys",
  "rand 0.8.8",
  "rcgen",
  "reqwest",
