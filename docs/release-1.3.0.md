@@ -135,8 +135,11 @@ host above may run it; it is the only in-place path this candidate offers:
 3. `minga api` exits with a message pointing to `minga manager --api-bind`.
    It is not kept as an alias. A systemd unit that still runs it fails on every
    start and restarts in a loop, so disable it:
-   `systemctl disable --now <unit>` (find it with
-   `grep -l "minga api" /etc/systemd/system/*.service`).
+   `systemctl disable --now <unit>`. Find it with `systemctl list-units 'minga*'`
+   (it shows `activating (auto-restart)` and its log says `minga api` was folded
+   into the manager), or with
+   `grep -l -e "minga api" -e "MINGA_ROLE=api" /etc/systemd/system/*.service /etc/minga/*.env`,
+   since the shipped unit takes its role from `MINGA_ROLE`.
 
 A 1.2.0 cluster went through this in a live proof with a service and a running
 container intact, and the upgraded worker adopted the same task. The proof
