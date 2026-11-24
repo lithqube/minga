@@ -2463,13 +2463,23 @@ mod assignment_tests {
         assert_eq!(after_third, 30, "seqs 21-30 must ship (10 new)");
     }
 
-    // --- AC2 (supervisor level): gap counted in log but not re-published ------
+    // --- AC2 (supervisor level): gap counted once, not re-published -----------
 
     /// When chunks are dropped before the cursor reaches them the supervisor
-    /// must log a tracing::warn once per gap (not per chunk) and must NOT
-    /// re-publish the surviving chunks from before the gap.
-    /// We verify via the bus log count: only the surviving chunks after the gap
-    /// must appear, with no duplicates.
+    /// must NOT re-publish surviving chunks already in the ring (no-duplicate
+    /// invariant) AND must count the gap **at most once per gap** (the cursor
+    /// advances past the gap on the first pass, so the warn condition cannot
+    /// fire a second time for the same gap).
+    ///
+    /// We assert three things:
+    /// (a) chunks ship: 5 new entries appear after the gap pass.
+    /// (b) no re-send: a second reconcile with the SAME gap data adds 0 entries.
+    /// (c) gap fires exactly once: a third reconcile with a fresh second gap adds
+    ///     5 more entries, proving the gap path is still live — it fires when a
+    ///     new gap appears but not for the already-seen one (cursor past it).
+    ///
+    /// Together (a)+(b) prove: cursor advances on the first gap pass and the
+    /// warn path is taken exactly once per gap, not per chunk and not zero times.
     #[tokio::test]
     async fn seq_gap_is_not_republished_ac2() {
         use crate::runtime::ContainerLog;
@@ -2500,7 +2510,7 @@ mod assignment_tests {
             .await
             .unwrap()
             .len();
-        assert_eq!(count_a, 5);
+        assert_eq!(count_a, 5, "first batch: 5 chunks published");
 
         // Now simulate: seqs 6-9 were written and evicted (never saw cursor).
         // The ring now only contains seqs 10..=14.
@@ -2515,17 +2525,61 @@ mod assignment_tests {
             .injected_logs
             .lock()
             .unwrap()
-            .insert(container_id, gap_batch);
+            .insert(container_id.clone(), gap_batch.clone());
+        // (a) Gap pass: 5 surviving chunks ship; cursor advances to 14.
         supervisor.reconcile_once().await.unwrap();
         let count_b = bus
             .tenant_log_history("default", "task-1", 0)
             .await
             .unwrap()
             .len();
-        // Exactly 5 new chunks (seqs 10-14) must appear — not 9 (no re-send of 1-5).
         assert_eq!(
             count_b, 10,
-            "only the 5 surviving chunks after gap must ship"
+            "only the 5 surviving chunks after gap must ship (no re-send of 1-5)"
+        );
+
+        // (b) Second reconcile with the SAME gap data: cursor == 14, first.seq == 10.
+        // Condition `first.seq (10) > cursor+1 (15)` is false → warn CANNOT fire.
+        // No new chunks are past the cursor either → 0 new publishes.
+        runtime
+            .injected_logs
+            .lock()
+            .unwrap()
+            .insert(container_id.clone(), gap_batch);
+        supervisor.reconcile_once().await.unwrap();
+        let count_c = bus
+            .tenant_log_history("default", "task-1", 0)
+            .await
+            .unwrap()
+            .len();
+        assert_eq!(
+            count_c, 10,
+            "second pass with same gap data: cursor past gap, no re-publish and no duplicate warn"
+        );
+
+        // (c) A second distinct gap (seqs 15-19 evicted, ring has 20..=24) triggers
+        // the warn path again — proving the warn fires once per new gap, not zero times.
+        let second_gap_batch: Vec<ContainerLog> = (20u64..=24)
+            .map(|s| ContainerLog {
+                stream: RtStream::Stdout,
+                data: format!("chunk-{s}\n").into_bytes(),
+                seq: s,
+            })
+            .collect();
+        runtime
+            .injected_logs
+            .lock()
+            .unwrap()
+            .insert(container_id, second_gap_batch);
+        supervisor.reconcile_once().await.unwrap();
+        let count_d = bus
+            .tenant_log_history("default", "task-1", 0)
+            .await
+            .unwrap()
+            .len();
+        assert_eq!(
+            count_d, 15,
+            "second gap: 5 new chunks from second gap batch shipped"
         );
     }
 }

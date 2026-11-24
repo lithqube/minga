@@ -462,17 +462,24 @@ async fn containerd_named_user_resolves_from_the_image() {
 
 /// AC3 — supervisor restart: output written after a restart reaches the stream.
 ///
-/// 1. Start a container whose command writes an initial line then sleeps.
-/// 2. Record the initial output via `runtime.logs()`.
-/// 3. Drop and re-create the supervisor (simulating a node restart) **without**
-///    stopping the container — the runtime is shared, so the container keeps
-///    running.
-/// 4. Call `open_log_fifos` on the new runtime instance for the adopted
-///    container (the same code path `recover_running_containers` calls).
-/// 5. The container's subsequent stdout lines must appear in `runtime.logs()`
-///    after the FIFO readers are re-opened.
+/// Real restart path: a NEW `ContainerdRuntime` instance adopts an already-running
+/// container by calling `open_log_fifos`. The original instance's `log_readers`
+/// guard does NOT fire because the new instance has empty state. This is exactly
+/// what `recover_running_containers` does on a node restart.
+///
+/// Steps:
+/// 1. Start a container on `runtime` (first instance); wait for initial output.
+/// 2. Create `runtime2` — a fresh `ContainerdRuntime::connect()` with the SAME
+///    `logs_dir`. Its `log_readers` map is empty, so the guard cannot fire.
+/// 3. Call `runtime2.open_log_fifos(&container_id)` — this is the restart path.
+/// 4. Assert that subsequent output arrives in `runtime2.logs()`.
+///
+/// **Red-first evidence:** without the production `open_log_fifos` implementation
+/// (or with the old same-instance call) `runtime2`'s ring stays empty and
+/// `saw_after` never fires — the assert at the bottom of this function fails.
 ///
 /// This test requires containerd and skips on macOS or CI without the daemon.
+/// `MINGA_REQUIRE_CONTAINERD=1` turns the skip into a hard failure.
 #[tokio::test]
 async fn supervisor_restart_adopted_container_logs_reach_stream_ac3() {
     let socket = socket_path();
@@ -480,6 +487,8 @@ async fn supervisor_restart_adopted_container_logs_reach_stream_ac3() {
         eprintln!("SKIP: containerd not available at {socket}");
         return;
     }
+
+    // --- First instance: start the container and confirm initial output ---
     let runtime = match ContainerdRuntime::connect(&socket).await {
         Ok(rt) => rt,
         Err(e) => {
@@ -494,8 +503,8 @@ async fn supervisor_restart_adopted_container_logs_reach_stream_ac3() {
     let logs_dir = tempfile::tempdir().unwrap();
     let runtime = runtime.with_logs_dir(logs_dir.path());
 
-    // Start a container that emits a line, then keeps writing lines every 100 ms.
-    let task_id = "minga-ac3-restart-logs-001".to_string();
+    // Start a container that writes a "before" marker then keeps writing "after" lines.
+    let task_id = "minga-ac3-restart-logs-002".to_string();
     let spec = minga_state::types::TaskSpec {
         image: "docker.io/library/busybox:latest".to_string(),
         command: vec![
@@ -512,8 +521,9 @@ async fn supervisor_restart_adopted_container_logs_reach_stream_ac3() {
         .await
         .expect("failed to start AC3 container");
 
-    // Wait for the initial "before-restart" line to arrive.
     let container_id = task_id.clone();
+
+    // Wait for the "before-restart" line from the first instance.
     let mut saw_before = false;
     for _ in 0..40 {
         let chunks = runtime.logs(&container_id, 0).await;
@@ -533,13 +543,23 @@ async fn supervisor_restart_adopted_container_logs_reach_stream_ac3() {
     );
 
     // --- Simulate supervisor restart ---
-    // The container keeps running. `open_log_fifos` re-attaches FIFO readers.
-    runtime.open_log_fifos(&container_id).await;
+    // Create a SECOND ContainerdRuntime instance with the same logs_dir.
+    // Its log_readers map is empty, so open_log_fifos will NOT be short-circuited
+    // by the contains_key guard. This is the actual restart path that
+    // recover_running_containers exercises.
+    let runtime2 = ContainerdRuntime::connect(&socket)
+        .await
+        .expect("second runtime connect failed");
+    let runtime2 = runtime2.with_logs_dir(logs_dir.path());
 
-    // Output written after re-open must now arrive in the ring.
+    // open_log_fifos on the new instance — mirrors recover_running_containers.
+    runtime2.open_log_fifos(&container_id).await;
+
+    // Output written after re-open must arrive in runtime2's log ring.
+    // (runtime2 has no log ring for this container until open_log_fifos runs.)
     let mut saw_after = false;
     for _ in 0..40 {
-        let chunks = runtime.logs(&container_id, 0).await;
+        let chunks = runtime2.logs(&container_id, 0).await;
         let all: String = chunks
             .iter()
             .flat_map(|c| std::str::from_utf8(&c.data).unwrap_or("").chars())
@@ -552,9 +572,10 @@ async fn supervisor_restart_adopted_container_logs_reach_stream_ac3() {
     }
     assert!(
         saw_after,
-        "output written after supervisor restart must reach the log stream"
+        "output written after supervisor restart must reach the log stream via the new runtime instance"
     );
 
+    // Cleanup: stop via the first instance (which owns the containerd task).
     runtime
         .stop(&container_id)
         .await
