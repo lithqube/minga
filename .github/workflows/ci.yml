@@ -104,15 +104,6 @@ jobs:
       - name: NATS integration suites (fail closed)
         run: cargo test -p minga-bus
 
-      # TEMPORARY: 20-run loop to prove the cluster flake is gone (#150).
-      # Remove before merge.
-      - name: Cluster flake regression (20 consecutive runs)
-        run: |
-          for i in $(seq 1 20); do
-            echo "=== run $i/20 ==="
-            cargo test -p minga-bus --test nats_cluster -- --nocapture
-          done
-
   nats-upgrade:
     name: NATS store upgrade 2.10.22 to ${{ matrix.nats-version }} (plan 14-04)
     strategy:
