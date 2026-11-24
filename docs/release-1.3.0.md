@@ -228,7 +228,7 @@ and NATS reissuance applies here too.
    Wait for `/readyz` to return 200, then deploy a test service:
    ```bash
    curl -s http://127.0.0.1:2375/readyz
-   minga-ctl upgrade preflight --api-url http://127.0.0.1:2375
+   MINGA_CTL_ENDPOINT=http://127.0.0.1:2375 minga-ctl upgrade preflight --to v1.3.0
    ```
    `upgrade preflight` reports the Raft membership and quorum. If the
    manager does not become leader within about 30 seconds, stop it and
@@ -246,7 +246,7 @@ and NATS reissuance applies here too.
 8. **Verify the result.**
    Check that your services are listed and tasks are placed:
    ```bash
-   minga-ctl stack ls --api-url http://127.0.0.1:2375
+   MINGA_CTL_ENDPOINT=http://127.0.0.1:2375 minga-ctl stack ls
    ```
    Task status and restart counts reset once after the upgrade; this is
    expected (see [What changes after](#what-changes-after)).
