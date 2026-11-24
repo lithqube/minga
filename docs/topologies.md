@@ -117,9 +117,7 @@ host, the installer is the simpler path.
 Managers-only Raft, JetStream workers and cross-node container networking
 support T2–T4 cluster shapes. T2 and T3 have live VM evidence; T4 has not
 been load-tested. Cross-node tasks retain their network names and addresses
-over a node-level WireGuard L3 mesh. After test credential updates, a later
-manager-1 restart failed with an NATS authorization violation; verify rejoin
-after credential changes before release.
+over a node-level WireGuard L3 mesh.
 
 ```mermaid
 flowchart TB
@@ -206,8 +204,7 @@ option. See [ADR 0006](adr/0006-workers-leave-raft.md#11-bus-partitions-preserve
 - Cross-node networking requires WireGuard support in the Linux kernel and
   the `wg` tool. Managers in a multi-manager cluster need reachable UDP
   endpoints; NAT-isolated workers use manager relays. Keep manager hosts
-  trusted because relay traffic is visible. Verify manager rejoin after test
-  credential changes before release.
+  trusted because relay traffic is visible.
 
 ## Not supported
 
