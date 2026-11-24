@@ -11,10 +11,13 @@ use openraft::{BasicNode, Raft};
 use serde::{Deserialize, Serialize};
 use tokio::time::timeout;
 
+use crate::apply_rules::{check_raise, ApplyRulesStatus, ManagerApplyRules};
 use crate::command::{ObjectKind, StateCommand, StateResponse};
 use crate::error::StateError;
 use crate::log_store::RedbLogStore;
-use crate::network::{forward_write, serve_raft_rpc, RaftTlsConfig, TcpNetworkFactory};
+use crate::network::{
+    fetch_apply_rules_version, forward_write, serve_raft_rpc, RaftTlsConfig, TcpNetworkFactory,
+};
 use crate::state_machine::RedbStateMachine;
 use crate::types::{
     AgentCapabilities, ChangeRequest, ClusterNode, Config as StateConfig, ConfigId, Network,
@@ -107,6 +110,9 @@ pub struct StateStore {
     membership_change: tokio::sync::Mutex<()>,
     /// This manager's `--overlay-supernet`, once set.
     overlay_supernet: std::sync::OnceLock<minga_net::Cidr>,
+    /// The highest apply-rule level this build implements, shared with the RPC
+    /// server that answers peers (ADR 0009).
+    implemented_apply_rules: Arc<std::sync::atomic::AtomicU32>,
 }
 
 /// Membership changes run only on the leader. A follower says which manager
@@ -259,9 +265,17 @@ impl StateStore {
             .map_err(|e| StateError::Fatal(e.to_string()))?;
 
         // Start the RPC server so peers can reach this node.
-        let rpc_server = serve_raft_rpc(raft.clone(), &bind_addr, server_tls)
-            .await
-            .map_err(|e| StateError::storage(format!("rpc server bind {bind_addr}: {e}")))?;
+        let implemented_apply_rules = Arc::new(std::sync::atomic::AtomicU32::new(
+            crate::codec::APPLY_RULES_VERSION,
+        ));
+        let rpc_server = serve_raft_rpc(
+            raft.clone(),
+            &bind_addr,
+            server_tls,
+            implemented_apply_rules.clone(),
+        )
+        .await
+        .map_err(|e| StateError::storage(format!("rpc server bind {bind_addr}: {e}")))?;
 
         // A joining node must never bootstrap a separate cluster.
         let mut initialized = raft
@@ -324,6 +338,7 @@ impl StateStore {
             tls_client: client_tls,
             membership_change: tokio::sync::Mutex::new(()),
             overlay_supernet: std::sync::OnceLock::new(),
+            implemented_apply_rules,
         };
         if initialized {
             let default_tenant = Tenant {
@@ -699,22 +714,85 @@ impl StateStore {
         self.reader.apply_rules().await.map_err(StateError::storage)
     }
 
-    /// Raises the apply-rule level for the whole cluster (ADR 0009). Call it
-    /// only after every manager runs a build that implements `level`: a
-    /// manager that does not stops applying at this entry.
+    /// The level in force and the highest level each manager's build implements
+    /// (ADR 0009). Every Raft member is asked over the Raft transport; a member
+    /// that does not answer, or is a build from before the level existed, is
+    /// reported as unknown.
+    pub async fn apply_rules_status(&self) -> Result<ApplyRulesStatus, StateError> {
+        let level = self.apply_rules().await?;
+        let implemented = self
+            .implemented_apply_rules
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let members = self
+            .raft
+            .metrics()
+            .borrow()
+            .membership_config
+            .nodes()
+            .map(|(id, node)| (*id, node.addr.clone()))
+            .collect::<Vec<_>>();
+        let mut asks = tokio::task::JoinSet::new();
+        for (id, addr) in members {
+            if id == self.node_id {
+                continue;
+            }
+            let tls = self.tls_client.clone();
+            asks.spawn(async move {
+                let answer = timeout(
+                    Duration::from_secs(2),
+                    fetch_apply_rules_version(id, &addr, tls),
+                )
+                .await;
+                (id, answer.ok().and_then(Result::ok))
+            });
+        }
+        let mut managers = vec![ManagerApplyRules {
+            id: self.node_id,
+            implemented: Some(implemented),
+        }];
+        while let Some(joined) = asks.join_next().await {
+            if let Ok((id, implemented)) = joined {
+                managers.push(ManagerApplyRules { id, implemented });
+            }
+        }
+        managers.sort_by_key(|manager| manager.id);
+        Ok(ApplyRulesStatus {
+            level,
+            implemented,
+            managers,
+        })
+    }
+
+    /// Raises the apply-rule level for the whole cluster (ADR 0009). A manager
+    /// that implements fewer levels stops applying at this entry, so the raise
+    /// is refused unless every manager reports a build that implements `level`;
+    /// a manager that cannot be asked counts as behind.
     pub async fn set_apply_rules(&self, level: u32) -> Result<(), StateError> {
-        if level > crate::codec::APPLY_RULES_VERSION {
+        let implemented = self
+            .implemented_apply_rules
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if level > implemented {
             return Err(StateError::ApplyRules(format!(
-                "this build implements apply rules up to level {}",
-                crate::codec::APPLY_RULES_VERSION
+                "this build implements apply rules up to level {implemented}"
             )));
         }
+        let status = self.apply_rules_status().await?;
+        check_raise(level, status.level, &status.managers)?;
         match self.propose(StateCommand::SetApplyRules { level }).await? {
             StateResponse::Conflict(message) | StateResponse::Error(message) => {
                 Err(StateError::ApplyRules(message))
             }
             _ => Ok(()),
         }
+    }
+
+    /// Makes this manager report, and require of itself, a different highest
+    /// apply-rule level, so a test can run managers on different builds. The
+    /// state machine still refuses a level above [`crate::codec::APPLY_RULES_VERSION`].
+    #[doc(hidden)]
+    pub fn pretend_implemented_apply_rules(&self, level: u32) {
+        self.implemented_apply_rules
+            .store(level, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Records a revoked node NKey in permanent cluster state.

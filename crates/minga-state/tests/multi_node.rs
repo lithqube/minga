@@ -602,3 +602,57 @@ async fn v1_migration_removes_workers_in_one_membership_change() {
     store2.shutdown().await.unwrap();
     store3.shutdown().await.unwrap();
 }
+
+/// ADR 0009 / #188: two managers on builds that implement different levels.
+/// The raise to the higher level is refused, and the level stays where it was.
+#[tokio::test]
+async fn raising_apply_rules_is_refused_while_a_manager_implements_a_lower_level() {
+    let [addr1, addr2] = free_addrs();
+    let peers1 = BTreeMap::from([(2, addr2.clone())]);
+    let peers2 = BTreeMap::from([(1, addr1.clone())]);
+    let dir1 = tempfile::tempdir().unwrap();
+    let dir2 = tempfile::tempdir().unwrap();
+    let (store1, store2) = tokio::time::timeout(WAIT, async {
+        tokio::try_join!(
+            StateStore::open(1, &addr1, dir1.path(), peers1),
+            StateStore::open(2, &addr2, dir2.path(), peers2),
+        )
+    })
+    .await
+    .expect("2-node cluster did not start in time")
+    .unwrap();
+    std::mem::forget(dir1);
+    std::mem::forget(dir2);
+    let stores = [&store1, &store2];
+    let _ = leader(&stores).await;
+
+    // Manager 1 runs a build that implements level 2; manager 2 still level 1.
+    store1.pretend_implemented_apply_rules(2);
+    let status = store1.apply_rules_status().await.unwrap();
+    assert_eq!(status.level, 1);
+    assert_eq!(status.implemented, 2);
+    assert_eq!(
+        status
+            .managers
+            .iter()
+            .map(|m| (m.id, m.implemented))
+            .collect::<Vec<_>>(),
+        vec![(1, Some(2)), (2, Some(1))]
+    );
+
+    let error = store1.set_apply_rules(2).await.unwrap_err().to_string();
+    assert!(error.contains("manager 2 (level 1)"), "{error}");
+    // The lagging manager cannot raise the level either: its own build stops at 1.
+    let error = store2.set_apply_rules(2).await.unwrap_err().to_string();
+    assert!(error.contains("up to level 1"), "{error}");
+    for store in stores {
+        assert_eq!(store.apply_rules().await.unwrap(), 1);
+    }
+
+    // The same cluster with nothing to wait for raises as before.
+    store1.pretend_implemented_apply_rules(1);
+    store1.set_apply_rules(1).await.unwrap();
+
+    store1.shutdown().await.unwrap();
+    store2.shutdown().await.unwrap();
+}

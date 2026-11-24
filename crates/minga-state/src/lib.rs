@@ -44,6 +44,7 @@
 //! # }
 //! ```
 
+mod apply_rules;
 pub mod codec;
 mod command;
 mod error;
@@ -56,6 +57,7 @@ pub mod types;
 
 use std::io::Cursor;
 
+pub use apply_rules::{ApplyRulesStatus, ManagerApplyRules};
 pub use command::{ObjectKind, StateCommand, StateResponse};
 pub use error::StateError;
 pub use network::{serve_raft_rpc, StubNetworkFactory, TcpNetworkFactory};

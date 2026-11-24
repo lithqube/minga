@@ -67,6 +67,7 @@ impl From<minga_state::StateError> for ApiError {
             | E::NameInUse
             | E::SubnetOverlap
             | E::Membership(_)
+            | E::ApplyRules(_)
             | E::NotLeader(_) => ApiError::Conflict(e.to_string()),
             E::NotFound(_) => ApiError::NotFound(e.to_string()),
             E::InvalidTenant(_) | E::BadSnapshot(_) => ApiError::BadRequest(e.to_string()),
