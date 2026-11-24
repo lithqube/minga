@@ -8,7 +8,7 @@ feature documented under current `main` exists in v1.2.0.
 | Tool | Runs on | What it does | Ships in |
 | --- | --- | --- | --- |
 | `minga` | Every node for the `manager` and `worker` roles; any machine for client commands | Runs the cluster, serves the manager's Docker API, and deploys, validates, backs up state, reads logs, pulls images and issues certificates | The release archive and the `ghcr.io/lithqube/minga` image |
-| `minga-ctl` | The operator's workstation | Named contexts, stacks, services, secrets, images, managers, nodes, networks, configs, tasks, registry logins and health checks, over SSH or HTTPS | Not in the archive: `cargo install --locked --path crates/minga-ctl` from a checkout of the release tag |
+| `minga-ctl` | The operator's workstation | Named contexts, stacks, services, secrets, images, managers, nodes, networks, configs, tasks, registry logins and health checks, over SSH or HTTPS | The release archive (installed by `install.sh`) and the `ghcr.io/lithqube/minga` image, from the first release after 1.3.0-rc.1. Earlier releases: `cargo install --locked --path crates/minga-ctl` from a checkout of the release tag |
 
 Supported layouts (single host, multi-node, Talos, air-gapped) are in
 [topologies.md](topologies.md).

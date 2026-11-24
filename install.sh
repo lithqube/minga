@@ -110,14 +110,14 @@ if [ "$UNINSTALL" = "1" ]; then
         $sudo_sys systemctl daemon-reload 2>/dev/null || true
         echo "removed systemd unit"
     fi
-    $sudo_bin rm -f "$PREFIX/minga" "$PREFIX/nats-server"
+    $sudo_bin rm -f "$PREFIX/minga" "$PREFIX/minga-ctl" "$PREFIX/nats-server"
     # Only remove a ctr this script installed (marker written at install).
     if [ -f "${PREFIX%/bin}/share/minga/.ctr-installed" ]; then
         $sudo_bin rm -f "$PREFIX/ctr"
         echo "removed $PREFIX/ctr"
     fi
     $sudo_bin rm -rf "${PREFIX%/bin}/share/minga"
-    echo "removed $PREFIX/minga, $PREFIX/nats-server and licenses"
+    echo "removed $PREFIX/minga, $PREFIX/minga-ctl, $PREFIX/nats-server and licenses"
     echo "kept /etc/minga and /var/lib/minga; remove them by hand if unneeded"
     exit 0
 fi
@@ -157,6 +157,12 @@ fi
 $sudo_bin mkdir -p "$PREFIX"
 $sudo_bin install -m 0755 "$tmp/minga" "$PREFIX/minga"
 $sudo_bin install -m 0755 "$tmp/nats-server" "$PREFIX/nats-server"
+# Archives before the minga-ctl packaging change (#206) do not have it.
+ctl_note="minga-ctl not in this archive (it predates minga-ctl packaging)"
+if [ -f "$tmp/minga-ctl" ]; then
+    $sudo_bin install -m 0755 "$tmp/minga-ctl" "$PREFIX/minga-ctl"
+    ctl_note="installed: $PREFIX/minga-ctl"
+fi
 
 share="${PREFIX%/bin}/share/minga"
 $sudo_bin mkdir -p "$share"
@@ -175,6 +181,7 @@ fi
 $sudo_bin install -m 0644 "$tmp/LICENSE" "$tmp/NATS-LICENSE" "$share/"
 
 echo "installed: $PREFIX/minga, $PREFIX/nats-server (licenses in $share)"
+echo "$ctl_note"
 echo "$ctr_note"
 
 if [ "$WITH_SYSTEMD" = "1" ]; then

@@ -21,9 +21,11 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 # nats-server sits next to minga: the manager's sidecar lookup checks
-# the minga binary's own directory first. ctr pulls and preloads workload
+# the minga binary's own directory first. minga-ctl is the operator CLI
+# (`docker run --entrypoint minga-ctl ... doctor`). ctr pulls and preloads workload
 # images into the `minga` containerd namespace.
 COPY linux-${TARGETARCH}/minga /usr/local/bin/minga
+COPY linux-${TARGETARCH}/minga-ctl /usr/local/bin/minga-ctl
 COPY linux-${TARGETARCH}/nats-server /usr/local/bin/nats-server
 COPY linux-${TARGETARCH}/ctr /usr/local/bin/ctr
 COPY linux-${TARGETARCH}/NATS-LICENSE /usr/local/share/minga/NATS-LICENSE

@@ -34,6 +34,17 @@ jobs:
 
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
 
+      # The release workflow runs this script on each archive; prove here that
+      # it still rejects an archive without minga-ctl (#206).
+      - name: Release archive check rejects a missing minga-ctl
+        run: |
+          d=$(mktemp -d)
+          (cd "$d" && touch minga minga-ctl nats-server ctr NATS-LICENSE install.sh LICENSE minga.service minga.env.example)
+          tar -C "$d" -czf "$d/good.tar.gz" minga minga-ctl nats-server ctr NATS-LICENSE install.sh LICENSE minga.service minga.env.example
+          tar -C "$d" -czf "$d/bad.tar.gz" minga nats-server ctr NATS-LICENSE install.sh LICENSE minga.service minga.env.example
+          sh scripts/check-release-archive.sh "$d/good.tar.gz"
+          if sh scripts/check-release-archive.sh "$d/bad.tar.gz"; then echo "::error::check accepted an archive without minga-ctl"; exit 1; fi
+
       - name: Install nats-server (bus tests require the binary)
         env:
           NATS_VERSION: ${{ matrix.nats-version }}
