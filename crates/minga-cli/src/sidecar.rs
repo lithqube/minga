@@ -223,25 +223,13 @@ impl NatsSidecar {
                         account_claim_path.display()
                     )));
                 }
-                Ok(_) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    std::fs::copy(&jwt_auth.account_jwt_file, &account_claim_path).map_err(
-                        |error| {
-                            SidecarError::JwtConfig(format!(
-                                "cannot preload account claim `{}`: {error}",
-                                account_claim_path.display()
-                            ))
-                        },
-                    )?;
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::fs::PermissionsExt;
-                        std::fs::set_permissions(
-                            &account_claim_path,
-                            std::fs::Permissions::from_mode(0o600),
-                        )
-                        .map_err(|error| SidecarError::JwtConfig(error.to_string()))?;
+                Ok(_) => {
+                    if resolver_claim_is_stale(jwt_auth, &account_claim_path)? {
+                        write_account_claim(jwt_auth, &account_claim_path)?;
                     }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    write_account_claim(jwt_auth, &account_claim_path)?;
                 }
                 Err(error) => return Err(SidecarError::JwtConfig(error.to_string())),
             }
@@ -325,6 +313,62 @@ impl Drop for NatsSidecar {
     fn drop(&mut self) {
         // kill_on_drop(true) handles this, but we also try explicitly.
         let _ = self.child.start_kill();
+    }
+}
+
+/// Copy the provisioned account JWT into the full resolver, owner-only.
+fn write_account_claim(jwt_auth: &NatsJwtAuth, claim_path: &Path) -> Result<(), SidecarError> {
+    let claim = crate::read_owner_only_file(&jwt_auth.account_jwt_file, 64 * 1024)
+        .map_err(SidecarError::JwtConfig)?;
+    crate::private::write_file(claim_path, &claim).map_err(|error| {
+        SidecarError::JwtConfig(format!(
+            "cannot preload account claim `{}`: {error}",
+            claim_path.display()
+        ))
+    })
+}
+
+/// Whether the resolver's account claim predates the provisioned JWT.
+///
+/// The resolver is also written at runtime: a revocation push replaces the
+/// claim with a newer one carrying the revoked users. That claim must survive
+/// a restart, so only a provisioned JWT issued at or after it (a rotation)
+/// replaces it. An unreadable resolver claim is replaced.
+fn resolver_claim_is_stale(
+    jwt_auth: &NatsJwtAuth,
+    claim_path: &Path,
+) -> Result<bool, SidecarError> {
+    use nats_jwt_rs::{account::Account, Claims};
+
+    let provisioned = crate::read_owner_only_file(&jwt_auth.account_jwt_file, 64 * 1024)
+        .map_err(SidecarError::JwtConfig)?;
+    let current = std::fs::read(claim_path).map_err(|error| {
+        SidecarError::JwtConfig(format!("cannot read `{}`: {error}", claim_path.display()))
+    })?;
+    if provisioned.trim_ascii() == current.trim_ascii() {
+        return Ok(false);
+    }
+    let decode = |bytes: &[u8]| {
+        std::str::from_utf8(bytes)
+            .map_err(|error| error.to_string())
+            .and_then(|jwt| {
+                Claims::<Account>::decode(jwt.trim()).map_err(|error| error.to_string())
+            })
+    };
+    let provisioned = decode(&provisioned).map_err(|error| {
+        SidecarError::JwtConfig(format!("invalid account JWT in account_jwt_file: {error}"))
+    })?;
+    if provisioned.sub != jwt_auth.account_public_key {
+        return Err(SidecarError::JwtConfig(
+            "account JWT subject does not match the configured account".to_string(),
+        ));
+    }
+    match decode(&current) {
+        Ok(current) => Ok(provisioned.iat >= current.iat),
+        Err(error) => {
+            tracing::warn!(%error, path = %claim_path.display(), "resolver account claim unreadable; replacing it");
+            Ok(true)
+        }
     }
 }
 
@@ -523,6 +567,10 @@ fn find_nats_server() -> Result<PathBuf, SidecarError> {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+#[path = "sidecar_jwt_tests.rs"]
+mod jwt_tests;
 
 #[cfg(test)]
 mod tests {

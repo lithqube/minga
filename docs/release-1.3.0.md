@@ -344,6 +344,19 @@ isolation and anti-spoofing, ingress, and a 1.2.0 to 1.3.0 migration.
 Throughput samples are in the [benchmark notes](benchmark.md); they are short
 virtualized runs, not capacity figures.
 
+### Manager rejoin after NATS credential changes (#198)
+
+The Phase 13 run log was not kept, so that exact failure was not replayed. A
+test against a real `nats-server` in operator/JWT mode reproduced one cause,
+and it is fixed. The sidecar copied the account JWT into the resolver
+directory only when the file was missing, so a rotated account JWT (for
+example a new tenant signer) was ignored on restart and users from the new
+signer got an authorization violation. The sidecar now replaces the resolver
+claim when the provisioned JWT is at least as new, and keeps a newer claim
+that a revocation push wrote. A changed manager credentials file under the
+same account was already accepted on restart. A multi-VM rerun on the
+candidate build would still confirm that this was the Phase 13 cause.
+
 ### Not yet verified
 
 These are what the candidate is for. 1.3.0 waits for them.
@@ -352,9 +365,6 @@ These are what the candidate is for. 1.3.0 waits for them.
   tenant A's node), recorded against the exact candidate build.
 - **A staging upgrade from 1.2.0** on the candidate, with the backup and
   rollback steps rehearsed.
-- **Manager rejoin after NATS credential changes.** A manager failed to
-  restart after test credentials were updated, with a NATS authorization
-  violation.
 - **The per-tenant assignment bucket upgrade** against real old-server data.
   Its upgrade job in CI passes, but only on the bundled test data.
 - **Several managers and several tenants together**, including the tenant
