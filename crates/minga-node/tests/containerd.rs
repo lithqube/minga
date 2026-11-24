@@ -597,3 +597,116 @@ async fn supervisor_restart_adopted_container_logs_reach_stream_ac3() {
         .await
         .expect("failed to stop AC3 container");
 }
+
+/// AC1 — a fast-crashing task's last output reaches the retained log stream.
+///
+/// A container writes a marker line to stderr and exits immediately. The
+/// supervisor's `reconcile_once` tick detects the termination, drains the
+/// ring before tearing down the log path, and publishes the entry to the bus.
+/// The marker must be in `tenant_log_history` after that tick.
+///
+/// Requires a running containerd daemon. Skips gracefully when absent.
+/// Set `MINGA_REQUIRE_CONTAINERD=1` to turn the skip into a hard failure (CI).
+#[tokio::test]
+async fn supervisor_fast_crash_drains_last_output_before_teardown_ac1() {
+    use minga_bus::{subjects, EventBus, MemoryBus};
+    use minga_node::Supervisor;
+    use minga_state::types::{NodeId, TaskAssignment, TaskSpec, DEFAULT_TENANT_ID};
+    use std::sync::Arc;
+
+    let socket = socket_path();
+    if !containerd_available_at(&socket) {
+        eprintln!("SKIP: containerd not available at {socket}");
+        return;
+    }
+
+    let runtime = match ContainerdRuntime::connect(&socket).await {
+        Ok(rt) => rt,
+        Err(e) => {
+            assert!(
+                std::env::var_os("MINGA_REQUIRE_CONTAINERD").is_none(),
+                "required containerd connection failed: {e}"
+            );
+            eprintln!("SKIP: cannot connect to containerd: {e}");
+            return;
+        }
+    };
+    let logs_dir = tempfile::tempdir().unwrap();
+    let runtime = runtime.with_logs_dir(logs_dir.path());
+    let runtime: Arc<dyn minga_node::Runtime> = Arc::new(runtime);
+
+    let bus = MemoryBus::new();
+    let node_id: NodeId = 196_u64;
+    let supervisor = Supervisor::with_bus(runtime.clone(), bus.clone(), node_id);
+
+    // Write an assignment so reconcile_once starts the container.
+    let task_id = "minga-ac1-fast-crash-drain-001".to_string();
+    let spec = TaskSpec {
+        image: "docker.io/library/busybox:latest".to_string(),
+        command: vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            // Write to stderr and exit immediately.
+            "echo crash-marker-ac1 >&2".to_string(),
+        ],
+        // restart_policy defaults to RestartCondition::None — task stops, never restarts.
+        ..Default::default()
+    };
+    let assignment = TaskAssignment {
+        task_id: task_id.clone(),
+        service_id: "test.ac1".to_string(),
+        service_name: "ac1".to_string(),
+        stack: "test".to_string(),
+        node_id,
+        spec: spec.clone(),
+        networks: Vec::new(),
+    };
+    let encoded = minga_state::codec::encode_wire(&assignment).unwrap();
+    bus.put_assignment(
+        &subjects::kv_assignment_task(DEFAULT_TENANT_ID, node_id, &task_id),
+        &encoded,
+    )
+    .await
+    .unwrap();
+
+    // First reconcile: starts the container.
+    supervisor.reconcile_once().await.unwrap();
+
+    // Wait for the container to terminate (it exits in <1 s).
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let state = runtime.state(&task_id).await;
+        if state
+            .as_ref()
+            .map(|s| s.status.is_terminated())
+            .unwrap_or(false)
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "container did not terminate within 15 s"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    // Second reconcile: detects the terminated container, drains the ring,
+    // publishes the log entry, then stops and tears down the log path.
+    supervisor.reconcile_once().await.unwrap();
+
+    // The marker written to stderr must be in the retained log history.
+    let history = bus
+        .tenant_log_history(DEFAULT_TENANT_ID, &task_id, 0)
+        .await
+        .expect("tenant_log_history failed");
+
+    let combined: String = history
+        .iter()
+        .flat_map(|e| std::str::from_utf8(&e.data).unwrap_or("").chars())
+        .collect();
+
+    assert!(
+        combined.contains("crash-marker-ac1"),
+        "last output of fast-crashing task must reach the retained log stream; got: {combined:?}"
+    );
+}

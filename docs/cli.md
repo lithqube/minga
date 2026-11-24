@@ -269,7 +269,7 @@ Through the API:
 | `stack rm STACK [--with ID]... [--yes]` | Removes the services only. A network, config or secret goes only when named with `--with`; it must start with `<stack>_`, and no service outside the stack may use it. |
 | `service ls [--stack STACK]`, `service ps SERVICE` | Running and desired replicas; tasks with an `ERROR` column. |
 | `service inspect SERVICE [--tail N]` | Image, replicas, ports, networks, update policy, healthcheck, and each task's state, restarts, exit code and last error, plus the last lines of output of tasks that are not running. |
-| `service logs SERVICE [-f] [--tail N]` | The output of the service's running tasks, through `minga logs` and the context's `--nats-url`. |
+| `service logs SERVICE [-f] [--tail N]` | The output of the service's **currently running** tasks, through `minga logs` and the context's `--nats-url`. For output of tasks that have already exited, use `service inspect SERVICE --tail N` or `minga logs TASK_ID`. `GET /{version}/services/{id}/logs` returns 404 — that Docker API endpoint is not implemented; use `GET /{version}/tasks/{id}/logs`. |
 | `service scale --replicas N SERVICE` | Returns when the API accepts the spec, not when the rollout ends. |
 | `service update SERVICE --image REF \| --env-add KEY=VALUE \| --env-rm KEY \| --replicas N` | Same. `--env-add` values show in process listings; use secrets for credentials. |
 | `service rm SERVICE [--yes]` | Saves the spec first, so `service rollback` can bring it back. |
@@ -289,6 +289,26 @@ Through the API:
 | `metrics` | The Prometheus metrics the cluster reports. |
 | `agent usage [--customer ID] [--since 30d]` | Uses the context API token as a cluster operator and reports aggregate usage by tenant. The usage API does not expose tenant-scoped request rows; `--customer` is rejected for this caller. Read-only. |
 | `change list [--limit N] [--pending]`, `change approve ID [--yes]`, `change reject ID` | Tenant-scoped maker-checker over a direct HTTPS context with a tenant client certificate/key. Listing requires a tenant viewer certificate; approval/rejection additionally require a deployer/admin certificate (a token is refused). Each request shows redacted before/after values for every changed field. Table and JSON output escape non-ASCII characters. Approval prints the diff to stderr and asks for confirmation; scripts must pass `--yes`. Proposal images must be printable ASCII. Approval runs service-update admission, then applies the reviewed desired state atomically. |
+
+### Reading the output of a task that is no longer running
+
+`service logs` streams the output of **currently running** tasks only. For a
+task that crashed or was stopped, its last output is retained in JetStream and
+readable with:
+
+```bash
+minga logs TASK_ID               # read retained output via NATS (needs --nats-url or MINGA_NATS_URL)
+minga-ctl service inspect SERVICE --tail 50   # shows the last N lines of each stopped task
+```
+
+Task IDs follow the pattern `<stack>.<service>.<replica>`, for example
+`web.api.1`. Use `minga-ctl task ls` or `service ps SERVICE` to find the ID.
+
+> **Note — Docker API:** `GET /{version}/services/{id}/logs` is not implemented
+> and returns `404 endpoint not implemented by Minga`. Use
+> `GET /{version}/tasks/{id}/logs` instead, which returns the retained output
+> of that specific task replica.
+
 
 
 `doctor` reports observed status separately from unknowns; it never restarts or
