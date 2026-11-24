@@ -142,6 +142,8 @@ iptables --version
 # should include "nf_tables" or "legacy"
 ```
 
+After a switch between `iptables-nft` and `iptables-legacy`, rules installed through the old backend stay active beside the new ones. See [host requirements](networking.md#host-requirements) for how to check and clear them.
+
 Confirm that `iptables-restore` is available:
 
 ```bash
