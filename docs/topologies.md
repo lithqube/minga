@@ -56,7 +56,7 @@ already listens on: it fails with `port N is in use on this node`.
 
 **Before going live**
 
-- `--runtime containerd` on the manager (the default `mock` runs nothing).
+- `--runtime containerd` on the manager (`--runtime` is required; `mock` runs nothing).
 - An API token, in an `EnvironmentFile` with mode 0600, whenever the API is bound off loopback.
 - Images present: pulled by containerd on first use, or preloaded with `minga image pull` or `ctr -n minga images import`.
 - Secrets provisioned with `minga secret put` (or `minga-ctl secret put`) before the deploy that needs them.
