@@ -132,6 +132,9 @@ pub async fn deploy_stack(
     for svc in &translated.services {
         // The outbound Docker spec of the translated service round-trips
         // through the API's inbound translation — one shared write path.
+        // Fail before posting if the Docker spec cannot carry a field of
+        // the translated service; the API would store it without that field.
+        minga_api::translate::docker_round_trip_check(svc)?;
         let spec = minga_api::translate::service_to_docker(svc).Spec;
         let body = serde_json::to_value(&spec)
             .map_err(|e| format!("service {}: cannot serialize spec: {e}", svc.id))?;

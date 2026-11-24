@@ -578,31 +578,35 @@ fn translate_resources(
     let Some(resources) = &deploy.resources else {
         return Ok(ResourceSpec::default());
     };
-    let Some(limits) = &resources.limits else {
-        return Ok(ResourceSpec::default());
-    };
 
-    let memory_bytes = match &limits.memory {
-        Some(m) => {
-            parse_memory(m).map_err(|e| TranslateError::Memory(m.clone(), name.to_string(), e))?
+    let (cpus, memory_bytes) = match &resources.limits {
+        Some(limits) => {
+            let memory_bytes = match &limits.memory {
+                Some(m) => parse_memory(m)
+                    .map_err(|e| TranslateError::Memory(m.clone(), name.to_string(), e))?,
+                None => 0,
+            };
+            (limits.cpus.unwrap_or(0.0), memory_bytes)
         }
-        None => 0,
+        None => (0.0, 0),
     };
 
-    // Count GPU device requests.
-    let gpus: u32 = limits
-        .devices
-        .iter()
+    // Compose puts device requests under `reservations`; `limits` is
+    // accepted too. Both count.
+    let gpus = [&resources.reservations, &resources.limits]
+        .into_iter()
+        .flatten()
+        .flat_map(|r| &r.devices)
         .filter(|d| d.capabilities.iter().any(|c| c == "gpu"))
         .map(|d| match d.count {
             Some(DeviceCount::All) => u32::MAX,
             Some(DeviceCount::Count(n)) => n,
             None => 1,
         })
-        .sum();
+        .fold(0, u32::saturating_add);
 
     Ok(ResourceSpec {
-        cpus: limits.cpus.unwrap_or(0.0),
+        cpus,
         memory_bytes,
         gpus,
     })
@@ -1005,6 +1009,25 @@ mod tests {
         assert!(container.agent.is_none());
         assert!(agent.image.is_empty());
         assert!(agent.agent.is_some());
+    }
+
+    #[test]
+    fn gpu_reservation_counts_devices_under_reservations() {
+        let gpus = |devices: &str| {
+            let svc = make_compose_service(&format!(
+                "image: i\ndeploy:\n  resources:\n    limits:\n      memory: 1G\n    reservations:\n      devices:\n{devices}"
+            ));
+            translate_service("web", &svc, "s", &empty_project(), None)
+                .unwrap()
+                .resources
+                .gpus
+        };
+        let one = "        - driver: nvidia\n          count: 1\n          capabilities: [gpu]\n";
+        let all = "        - capabilities: [gpu]\n          count: all\n";
+        assert_eq!(gpus(one), 1);
+        assert_eq!(gpus(&format!("{one}{one}")), 2);
+        assert_eq!(gpus(all), u32::MAX);
+        assert_eq!(gpus(&format!("{all}{all}")), u32::MAX, "saturates");
     }
 
     #[test]
