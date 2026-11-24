@@ -116,3 +116,19 @@ Tasks on different networks cannot reach each other except through published por
 Tasks cannot reach `127.0.0.0/8` on the host (a loopback guard prevents this via CVE-2020-8558 mitigations). Source IP is validated per-veth: a task sending traffic from an IP it was not assigned is dropped.
 
 Tasks under a required egress policy (`x-minga-egress`) have their DNS responses confined to local names; external DNS queries are refused at the resolver level, so the egress proxy is the only outbound route.
+
+## Host requirements
+
+A node started with `--runtime containerd` needs `iproute2`, `iptables`, `iptables-restore` and `nft`, and a kernel that supports every iptables match its rules use. At start it adds a rule for each match to a scratch chain (`MINGA_PREFLIGHT`, never hooked into a built-in chain) and removes it again:
+
+| Match | Kernel module | First used |
+| --- | --- | --- |
+| `physdev` (task source-address guard) | `xt_physdev` (the node also loads `br_netfilter`) | 1.3.0 |
+| `addrtype` (published ports) | `xt_addrtype` | 1.2.0 or earlier |
+| `conntrack` (isolation, masquerade) | `xt_conntrack` | 1.2.0 or earlier |
+
+With the `iptables-nft` backend (`iptables -V` prints `(nf_tables)`) each match also needs the `nft_compat` module. A kernel built without one of them fails the check. The node then exits at start with `this host cannot run task networking`, naming the match, its module, the iptables backend, the kernel release and the iptables command with its stderr. Fix it by installing the module, or by selecting the other backend (`update-alternatives --config iptables`), then restart the node.
+
+1.2.0 did not use `physdev`, so a kernel that ran 1.2.0 can fail this check on 1.3.0. Attach the message to a bug report: it holds what is needed to diagnose it.
+
+Task namespaces (`minga-<task-id>`) are removed at start when they have no state file and no process runs in them, for example after the state directory was wiped. One a process still runs in is kept, and the node refuses to start tasks until you stop that process and `ip netns delete` it.

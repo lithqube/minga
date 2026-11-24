@@ -30,9 +30,11 @@ use std::path::PathBuf;
 use minga_net::Cidr;
 use minga_state::types::{NetworkId, PortMapping};
 
+pub use crate::netns_rules::NetfilterUnsupported;
 use crate::netns_rules::{
     egress_delete_args, egress_delete_script, egress_listener_script, egress_policy_script,
-    egress_table_name, write_atomic, EGRESS_LISTENER_TABLE,
+    egress_table_name, untracked_namespace_refusal, write_atomic, EGRESS_LISTENER_TABLE,
+    NETFILTER_PROBES,
 };
 
 /// Errors from network setup. Always name the failing command.
@@ -58,6 +60,8 @@ pub enum NetError {
     },
     #[error("invalid ingress assignment: {0}")]
     IngressAssignment(String),
+    #[error(transparent)]
+    Netfilter(#[from] Box<NetfilterUnsupported>),
 }
 /// Runs a command; on non-zero exit, fails with its stderr.
 async fn run(program: &str, args: &[&str]) -> Result<(), NetError> {
@@ -94,6 +98,53 @@ async fn output(program: &str, args: &[&str]) -> Result<String, NetError> {
     }
     Ok(String::from_utf8_lossy(&result.stdout).into_owned())
 }
+const PREFLIGHT_CHAIN: &str = "MINGA_PREFLIGHT";
+
+/// Tries each iptables match the node installs against an unhooked scratch
+/// chain, so a kernel missing one fails at start naming the match, module,
+/// backend and kernel instead of at the first task with a bare iptables error.
+pub async fn preflight_netfilter() -> Result<(), NetError> {
+    let backend = output("iptables", &["-V"]).await?.trim().to_owned();
+    let kernel = tokio::fs::read_to_string("/proc/sys/kernel/osrelease")
+        .await
+        .map(|release| release.trim().to_owned())
+        .unwrap_or_else(|_| "unknown".into());
+    for probe in NETFILTER_PROBES {
+        let scoped = |extra: &[&'static str]| -> Vec<&'static str> {
+            ["-w", "5", "-t", probe.table]
+                .into_iter()
+                .chain(extra.iter().copied())
+                .collect()
+        };
+        run_tolerated("iptables", &scoped(&["-N", PREFLIGHT_CHAIN])).await;
+        let setup = run("iptables", &scoped(&["-F", PREFLIGHT_CHAIN])).await;
+        let added = if setup.is_ok() {
+            let args = scoped(&[&["-A", PREFLIGHT_CHAIN], probe.rule].concat());
+            run("iptables", &args)
+                .await
+                .err()
+                .map(|error| (args, error))
+        } else {
+            None
+        };
+        run_tolerated("iptables", &scoped(&["-F", PREFLIGHT_CHAIN])).await;
+        run_tolerated("iptables", &scoped(&["-X", PREFLIGHT_CHAIN])).await;
+        setup?;
+        if let Some((args, NetError::Command { stderr, .. })) = added {
+            return Err(Box::new(NetfilterUnsupported {
+                backend,
+                kernel,
+                matcher: probe.matcher.into(),
+                module: probe.module.into(),
+                command: format!("iptables {}", args.join(" ")),
+                stderr,
+            })
+            .into());
+        }
+    }
+    Ok(())
+}
+
 /// Installs (or replaces) the egress listener restriction for `port`.
 pub async fn restrict_egress_listener(port: u16) -> Result<(), NetError> {
     run_tolerated("nft", &egress_delete_args(EGRESS_LISTENER_TABLE)).await;
@@ -1923,16 +1974,13 @@ impl NetworkSetup {
             Ok(entries) => entries,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 let namespaces = output("ip", &["netns", "list"]).await?;
-                if namespaces.lines().any(|line| {
-                    line.split_whitespace()
-                        .next()
-                        .is_some_and(|namespace| namespace.starts_with("minga-"))
-                }) {
-                    return Err(NetError::Command {
-                        cmd: format!("read task network state {}", self.state_dir.display()),
-                        stderr: "active task namespaces exist without state files".into(),
-                    });
-                }
+                self.reclaim_untracked_namespaces(
+                    namespaces
+                        .lines()
+                        .filter_map(|line| line.split_whitespace().next())
+                        .filter(|namespace| namespace.starts_with("minga-")),
+                )
+                .await?;
                 self.unblock_task_networking().await?;
                 return Ok(());
             }
@@ -2034,14 +2082,42 @@ impl NetworkSetup {
                 .await?;
             }
         }
-        if let Some(namespace) = untracked_namespaces.into_iter().next() {
-            return Err(NetError::Command {
-                cmd: format!("read task network state {}", self.state_dir.display()),
-                stderr: format!("active task namespace {namespace} has no state file"),
-            });
-        }
+        self.reclaim_untracked_namespaces(untracked_namespaces.iter().map(String::as_str))
+            .await?;
         self.unblock_task_networking().await?;
         Ok(())
+    }
+
+    /// Removes a `minga-*` namespace that has no state file (state wiped, or
+    /// a crash before the state write). No source guard can be rebuilt for
+    /// it, so it must not outlive start: left in place it would block every
+    /// task. A namespace some process still runs in is kept and refused, as
+    /// deleting its name would leave that process unguarded.
+    async fn reclaim_untracked_namespaces<'a>(
+        &self,
+        namespaces: impl Iterator<Item = &'a str>,
+    ) -> Result<(), NetError> {
+        // Every reclaimable one goes before the first refusal is reported.
+        let mut first_error = None;
+        for namespace in namespaces {
+            if let Err(error) = self.reclaim_untracked_namespace(namespace).await {
+                first_error.get_or_insert(error);
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
+    async fn reclaim_untracked_namespace(&self, namespace: &str) -> Result<(), NetError> {
+        let pids = output("ip", &["netns", "pids", namespace]).await?;
+        if let Some(message) = untracked_namespace_refusal(namespace, &pids) {
+            return Err(NetError::Command {
+                cmd: format!("read task network state {}", self.state_dir.display()),
+                stderr: message,
+            });
+        }
+        tracing::warn!(%namespace, "removing a task namespace that has no state file");
+        self.teardown_task(namespace.strip_prefix("minga-").unwrap_or(namespace))
+            .await
     }
 
     /// Blocks all task bridge ingress and egress while source guards are

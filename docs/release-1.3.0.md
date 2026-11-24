@@ -74,6 +74,7 @@ has migrated.
 - **Ports.** Short-syntax Compose ports now publish on every node. Use
   `mode: host` to keep a port on the node that runs the task. Conflicting
   ingress ports return 409.
+- **Host kernel.** The task source-address guard uses the iptables `physdev` match (`xt_physdev`, and `nft_compat` on `iptables-nft`), which 1.2.0 did not. A node on `--runtime containerd` checks every match it needs at start and exits naming the missing module. See [host requirements](networking.md#host-requirements).
 - **Data volume.** The NATS sidecar's JetStream file store cap rose from 1 GB
   to 8 GB, not preallocated. It shares the data volume with Raft and
   containerd, so size it for that.
