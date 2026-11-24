@@ -174,7 +174,7 @@ flowchart TB
 
 ## Quick start: one Linux host
 
-You need Linux, root (the supervisor creates netns, bridges and iptables rules), `iproute2` + `iptables` + `procps` (present in any standard server install; the container image bundles them), and containerd. A task pulls a missing image into the `minga` namespace through containerd's Transfer API on `--containerd-socket` (containerd 1.7 or newer for private registries). Registry credentials come from `$DOCKER_CONFIG/config.json`, else `~/.docker/config.json`: `credHelpers`, then `credsStore`, then inline `auths`.
+You need Linux, root (the supervisor creates netns, bridges and iptables rules), `iproute2` + `iptables` + `procps` (present in any standard server install; the container image bundles them), a kernel with the `xt_physdev`, `xt_addrtype` and `xt_conntrack` modules (plus `nft_compat` on the `iptables-nft` backend; the node checks this at start, see [host requirements](docs/networking.md#host-requirements)), and containerd. A task pulls a missing image into the `minga` namespace through containerd's Transfer API on `--containerd-socket` (containerd 1.7 or newer for private registries). Registry credentials come from `$DOCKER_CONFIG/config.json`, else `~/.docker/config.json`: `credHelpers`, then `credsStore`, then inline `auths`.
 
 ```bash
 # Installs minga, minga-ctl and the checksum-pinned nats-server, and verifies SHA256SUMS.

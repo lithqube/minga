@@ -2276,6 +2276,13 @@ async fn run_node(args: NodeArgs, is_manager: bool) -> ExitCode {
     // for tasks and DNS service discovery. Mock workloads never join
     // overlay networks, so they need neither.
     #[cfg(target_os = "linux")]
+    if args.runtime == "containerd" {
+        if let Err(e) = minga_node::netns::preflight_netfilter().await {
+            eprintln!("error: this host cannot run task networking: {e}");
+            return ExitCode::FAILURE;
+        }
+    }
+    #[cfg(target_os = "linux")]
     let networking: Option<Arc<minga_node::NetworkSetup>> = if args.runtime == "containerd" {
         Some(Arc::new(
             minga_node::NetworkSetup::new(format!("{}/net", args.data_dir))

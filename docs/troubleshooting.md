@@ -125,6 +125,14 @@ sysctl net.ipv4.ip_forward
 # should be: net.ipv4.ip_forward = 1
 ```
 
+**`this host cannot run task networking` at start:**
+
+The kernel rejected an iptables match the node needs (`Incompatible with this kernel` is the usual iptables wording). The message names the match, the kernel module, `iptables -V`, the kernel release and the failing command. See [host requirements](networking.md#host-requirements).
+
+**A task will not start: `active task namespace minga-... has no state file`:**
+
+A process still runs in a task namespace whose state file is gone. Stop that process, then `ip netns delete minga-...`. Namespaces nothing runs in are removed by the node at start.
+
 **iptables backend mismatch:**
 
 Minga uses `iptables` and `iptables-restore`. If the system uses only `nftables` and the `iptables-nft` shim is absent, rules cannot be installed. Check:

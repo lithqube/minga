@@ -5,6 +5,79 @@
 use std::net::Ipv4Addr;
 use std::path::Path;
 
+/// One netfilter match the node's iptables rules rely on, tried against a
+/// scratch chain at start so an unsupported kernel fails with a name.
+pub(crate) struct NetfilterProbe {
+    pub(crate) table: &'static str,
+    /// The `-m` extension, as iptables spells it.
+    pub(crate) matcher: &'static str,
+    /// Kernel module that provides it.
+    pub(crate) module: &'static str,
+    pub(crate) rule: &'static [&'static str],
+}
+
+/// Every `-m` extension `netns.rs` installs. `physdev` is new in 1.3.0
+/// (task source guard); the others date from 1.2.0.
+pub(crate) const NETFILTER_PROBES: &[NetfilterProbe] = &[
+    NetfilterProbe {
+        table: "filter",
+        matcher: "physdev",
+        module: "xt_physdev",
+        rule: &[
+            "-m",
+            "physdev",
+            "--physdev-in",
+            "mingaprobe0",
+            "-j",
+            "RETURN",
+        ],
+    },
+    NetfilterProbe {
+        table: "nat",
+        matcher: "addrtype",
+        module: "xt_addrtype",
+        rule: &["-m", "addrtype", "--dst-type", "LOCAL", "-j", "RETURN"],
+    },
+    NetfilterProbe {
+        table: "filter",
+        matcher: "conntrack",
+        module: "xt_conntrack",
+        rule: &["-m", "conntrack", "--ctstate", "NEW", "-j", "RETURN"],
+    },
+];
+
+/// The kernel rejected an iptables match the node needs. Carries what an
+/// operator must attach to a report: backend, kernel, command and stderr.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "the kernel does not support the iptables `{matcher}` match Minga needs \
+     (kernel module {module}{compat}). backend: {backend}; kernel: {kernel}; \
+     `{command}` failed: {stderr}. Load the module or select the host's other \
+     iptables backend, then restart the node; see docs/networking.md#host-requirements",
+    compat = if backend.contains("nf_tables") { " plus nft_compat" } else { "" },
+)]
+pub struct NetfilterUnsupported {
+    pub(crate) backend: String,
+    pub(crate) kernel: String,
+    pub(crate) matcher: String,
+    pub(crate) module: String,
+    pub(crate) command: String,
+    pub(crate) stderr: String,
+}
+
+/// Why a state-less task namespace may not be removed, from `ip netns pids`
+/// output; `None` when no process runs in it.
+pub(crate) fn untracked_namespace_refusal(namespace: &str, pids: &str) -> Option<String> {
+    let pids: Vec<&str> = pids.split_whitespace().collect();
+    (!pids.is_empty()).then(|| {
+        format!(
+            "active task namespace {namespace} has no state file and process(es) {} run in it; \
+             stop them, then remove it with `ip netns delete {namespace}`",
+            pids.join(",")
+        )
+    })
+}
+
 pub(crate) fn egress_table_name(task_id: &str) -> String {
     use sha2::{Digest, Sha256};
     let digest = Sha256::digest(task_id.as_bytes());
@@ -184,6 +257,72 @@ mod tests {
                 "add table {family} {table}\ndelete table {family} {table}\n"
             )));
         }
+    }
+
+    #[test]
+    fn netfilter_probes_cover_every_extension_the_node_rules_use() {
+        // 1.3.0 added `physdev`; `addrtype` and `conntrack` came with DNAT
+        // and masquerade. A new `-m <ext>` in netns.rs needs a probe here.
+        let probed: Vec<&str> = NETFILTER_PROBES.iter().map(|p| p.matcher).collect();
+        assert_eq!(probed, ["physdev", "addrtype", "conntrack"]);
+        for probe in NETFILTER_PROBES {
+            assert!(
+                probe.rule.contains(&"-m"),
+                "{} probes no match",
+                probe.matcher
+            );
+            assert!(probe.rule.contains(&probe.matcher));
+            assert!(probe.module.starts_with("xt_"));
+        }
+    }
+
+    #[test]
+    fn unsupported_netfilter_names_backend_kernel_module_and_stderr() {
+        let failure = NetfilterUnsupported {
+            backend: "iptables v1.8.9 (nf_tables)".into(),
+            kernel: "6.8.0-1015-aws".into(),
+            matcher: "physdev".into(),
+            module: "xt_physdev".into(),
+            command: "iptables -w 5 -t filter -A MINGA_PREFLIGHT -m physdev".into(),
+            stderr: "Warning: Extension physdev revision 0 not supported, missing kernel module?\n\
+                     iptables: Incompatible with this kernel."
+                .into(),
+        };
+        let text = failure.to_string();
+        for needle in [
+            "iptables v1.8.9 (nf_tables)",
+            "6.8.0-1015-aws",
+            "physdev",
+            "xt_physdev",
+            "nft_compat",
+            "Incompatible with this kernel",
+            "iptables -w 5 -t filter -A MINGA_PREFLIGHT -m physdev",
+        ] {
+            assert!(text.contains(needle), "missing {needle:?} in: {text}");
+        }
+    }
+
+    #[test]
+    fn legacy_backend_does_not_ask_for_nft_compat() {
+        let failure = NetfilterUnsupported {
+            backend: "iptables v1.8.7 (legacy)".into(),
+            kernel: "5.15.0".into(),
+            matcher: "conntrack".into(),
+            module: "xt_conntrack".into(),
+            command: "iptables -A".into(),
+            stderr: "x".into(),
+        };
+        assert!(!failure.to_string().contains("nft_compat"));
+    }
+
+    #[test]
+    fn stateless_namespace_is_reclaimed_only_when_no_process_runs_in_it() {
+        assert_eq!(untracked_namespace_refusal("minga-t1", ""), None);
+        assert_eq!(untracked_namespace_refusal("minga-t1", "\n"), None);
+        let message = untracked_namespace_refusal("minga-t1", "412\n977\n").unwrap();
+        assert!(message.contains("minga-t1"));
+        assert!(message.contains("412,977"));
+        assert!(message.contains("ip netns delete minga-t1"));
     }
 
     #[tokio::test]
