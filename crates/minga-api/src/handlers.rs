@@ -21,7 +21,7 @@ use minga_state::types::{
     NodeStatus as MingaNodeStatus, ResourceSpec, Service as StateService, Task, Tenant,
     TenantQuotas,
 };
-use minga_state::{join_token::JoinTokenKey, StateStore};
+use minga_state::{join_token::JoinTokenKey, ApplyRulesStatus, StateStore};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -176,6 +176,50 @@ pub async fn migrate_manager_voters(
         .migrate_manager_voters(request.manager_ids)
         .await?;
     Ok(Json(serde_json::json!({"removed_voters": removed})))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RaiseApplyRulesRequest {
+    level: u32,
+}
+
+/// Reads the Raft apply-rule level in force and what each manager implements
+/// (ADR 0009). The route is cluster-operator-only: the level is not tenant state.
+pub async fn get_apply_rules(
+    State(app): State<Arc<AppState>>,
+) -> ApiResult<Json<ApplyRulesStatus>> {
+    Ok(Json(app.store.apply_rules_status().await?))
+}
+
+/// Raises the apply-rule level once every manager implements it. The raise is
+/// one-way, so the caller is logged on every attempt, refused or not.
+pub async fn raise_apply_rules(
+    State(app): State<Arc<AppState>>,
+    Extension(caller): Extension<Caller>,
+    Json(request): Json<RaiseApplyRulesRequest>,
+) -> ApiResult<Json<ApplyRulesStatus>> {
+    tracing::warn!(
+        caller = %caller.name,
+        level = request.level,
+        "apply-rule level raise requested"
+    );
+    match app.store.set_apply_rules(request.level).await {
+        Ok(()) => tracing::warn!(
+            caller = %caller.name,
+            level = request.level,
+            "apply-rule level raised"
+        ),
+        Err(error) => {
+            tracing::warn!(
+                caller = %caller.name,
+                level = request.level,
+                %error,
+                "apply-rule level raise refused"
+            );
+            return Err(error.into());
+        }
+    }
+    Ok(Json(app.store.apply_rules_status().await?))
 }
 
 /// Lists tenants. This route is available only to cluster operators.

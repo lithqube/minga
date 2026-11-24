@@ -1,6 +1,6 @@
 # ADR 0009: Version the Raft apply rules
 
-**Status:** Accepted — the state mechanism is implemented; the operator command is not (see [Implementation status](#implementation-status-2026-11-23))  
+**Status:** Accepted — the state mechanism and the operator command are implemented (see [Implementation status](#implementation-status-2026-11-23))  
 **Date:** 2026-11-23  
 **Deciders:** Ferru
 
@@ -55,9 +55,19 @@ A build from before this ADR does not know the key. It cannot decode the new com
 
 `StateSnapshot` (the internal Raft snapshot) carries `apply_rules`, with a serde default of 1, so a snapshot written before the field decodes as level 1 and `last_applied` keeps its meaning. A snapshot install sets the level to the snapshot's, together with `last_applied`. The portable `minga state export` does not carry it: an import is written through Raft under the importing cluster's level.
 
-### 6. No `FORMAT_VERSION` bump
+### 6. The operator reads and raises the level through the API
 
-The `codec.rs` rule asks for a bump and a migration whenever a persisted shape changes. This change adds one metadata key, one snapshot field with a default, and one command that no build writes until an operator raises the level. A bump makes every node change in one window, the cost this ADR exists to avoid for later releases, and no stored record changes. The key is read with a default, so an older store opens unchanged.
+A cluster operator (`O=*` with the admin role, or the admin token) reads the level with `GET /minga/apply-rules` and raises it with `POST /minga/apply-rules {"level": N}`. A tenant identity, and an `O=*` identity below the admin role, gets 403 on both. `minga-ctl info` and `minga-ctl upgrade apply-rules [--to N] [--yes]` call it, and `minga-ctl upgrade preflight` reports it.
+
+The raise is only safe when every manager implements `N`, so `StateStore::set_apply_rules` checks that before it proposes anything, in the store, not the client. Each manager answers one extra Raft RPC, `ApplyRulesVersion`, with its build's `APPLY_RULES_VERSION`; the manager that serves the request asks every member of the Raft membership, voter or learner, and answers for itself. A raise to a level above the level in force is refused when any manager implements less, and also when a manager does not answer in two seconds or cannot decode the question, which is what a build from before this RPC does. An unknown level is treated as a lower one, because the raise cannot be undone. A repeat of the level in force, or a lower level, skips the check and gets the state machine's answer (`Ok` or `Conflict`). The refusal is HTTP 409.
+
+Each attempt, allowed or refused, is logged with the caller's name. There is no cluster-level audit stream to write it to; the tenant audit trail is per tenant.
+
+The check reads the membership once, so a manager added between the check and the entry, with an older build, is not covered: it stops at the raise entry when it replays the log. Add managers only with a build that implements the level in force.
+
+### 7. No `FORMAT_VERSION` bump
+
+The `codec.rs` rule asks for a bump and a migration whenever a persisted shape changes. This change adds one metadata key, one snapshot field with a default, and one command that no build writes until an operator raises the level. A bump makes every node change in one window, the cost this ADR exists to avoid for later releases, and no stored record changes. The key is read with a default, so an older store opens unchanged. The `ApplyRulesVersion` RPC of section 6 is a new last variant of the Raft request enum, so every earlier variant keeps its encoding. An older build cannot decode it and drops the connection, which the asker reads as an unknown level; it is not a frame change, and builds of different formats still refuse each other.
 
 ## Rejected options
 
@@ -74,19 +84,19 @@ The `codec.rs` rule asks for a bump and a migration whenever a persisted shape c
 - Replaying a log, or applying it on managers of different builds that share a format, gives the same state for every replica while the level is the same on each. This is shown by a test of the mechanism, not by a live rolling upgrade.
 - A new refusal costs one level, one gate and one replay test. The level goes into the release notes with the operator's step.
 - A rule that is gated keeps its old code path for as long as any log entry written before its raise can still be replayed, which means as long as the log is retained. A later ADR may retire a path after a snapshot proves no older entry remains.
-- Until the follow-up lands, the raise is a library call (`StateStore::set_apply_rules`) with no API route, command, or preflight check. No release gates a rule yet, so none needs it.
+- The raise is `minga-ctl upgrade apply-rules`, or `POST /minga/apply-rules`, and refuses while any manager implements a lower level or does not report one. No release gates a rule yet, so none needs it.
 - The level is cluster-wide control-plane state. It is not a tenant object, and no tenant identity can read or write it.
 - Not covered: entries committed under 1.2.0 are replayed under the level-1 rules of 1.3.0. The 1.2.0 upgrade is a coordinated window, and the release notes keep export and import as the default for a cluster with more than one node. This ADR does not version 1.2.0's rules.
 
 ## Tenancy checklist (ADR 0008)
 
 1. **Owner.** No tenant. The level is a property of the replicated state machine, stored under `sm_meta`, not in a tenant table, so it carries no tenant and needs no tenant in a key.
-2. **Access.** Only the library call, which no API route reaches yet. The follow-up exposes it to a cluster operator only (`O=*` or the admin token). A tenant identity never reads or writes it.
+2. **Access.** `GET` and `POST /minga/apply-rules`, behind the cluster-operator-with-admin-role check that guards `/minga/managers`: `O=*` with OU `admin`, or the admin token. A tenant identity, a tenant administrator, and an `O=*` identity below admin get 403 on both. No path under `/{version}/` reaches it.
 3. **Bus.** Not applicable: it uses no subject or key, and it is never published to JetStream.
 4. **Node.** Managers only. Workers do not open a state store.
 5. **Shared plane.** One monotonic integer and at most one log entry per raise, so a tenant has nothing to grow. No quota applies because no tenant writes it.
-6. **Audit.** Not applicable until the follow-up adds the route, which must log the caller on each raise.
-7. **Test.** Not applicable as a two-tenant test, because no tenant-reachable path exists. The replay, monotonicity, snapshot and open tests in `state_machine.rs` cover the mechanism.
+6. **Audit.** Each raise attempt is logged at `warn` with the caller's name, and the outcome. `minga-ctl` also writes its local audit line for `upgrade apply-rules`.
+7. **Test.** `apply_rules_route_is_for_cluster_operators_only` in `crates/minga-api/src/server.rs` sends `GET` and `POST` as a tenant administrator and as `O=*` identities below admin, and expects 403 for each, and 401 with no credential. The replay, monotonicity, snapshot and open tests in `state_machine.rs` cover the mechanism.
 
 ## Implementation status (2026-11-23)
 
@@ -96,8 +106,14 @@ Implemented in `minga-state`:
 - The level in the Raft snapshot with a default of 1; refusal on snapshot install and on open when the level is above the build's.
 - Tests: an entry applied under level 1, then the raise, then the same entry, on a live replica and on a rebuilt one, give the same results, and the replay test fails if `rule_in_force` ignores the level; the level never goes down or above the build's; a snapshot or data directory from a newer build is refused; a snapshot from before the field is level 1.
 
+Implemented for [#188](https://github.com/lithqube/minga/issues/188):
+
+- `GET` and `POST /minga/apply-rules` (cluster operator with the admin role only), `minga-ctl upgrade apply-rules [--to N] [--yes]`, the level in `minga-ctl info`, and an `apply-rules` finding in `minga-ctl upgrade preflight` that fails closed for a manager that implements less than the target, does not report, or cannot be read.
+- `StateStore::apply_rules_status` and the manager check inside `StateStore::set_apply_rules`; the `ApplyRulesVersion` Raft RPC.
+- Tests with two managers on different maximum levels at three layers: the store (`multi_node.rs`), the API (`server.rs`) and the binary (`minga-ctl/tests/apply_rules.rs`). The store and API tests fail if the check in `set_apply_rules` is removed; the binary test also passes on the client's own check, so it shows the user-facing refusal, not the server's.
+
 Not implemented:
 
-- No apply rule is gated yet, because level 1 is everything through v1.3.0-rc.1. The replay test uses a stand-in level-2 rule, not a real one.
-- The operator surface: an API route, `minga-ctl upgrade apply-rules`, the level in `minga-ctl info`, and a preflight check that every manager implements the target level. It is tracked in [#188](https://github.com/lithqube/minga/issues/188).
+- No apply rule is gated yet, because level 1 is everything through v1.3.0-rc.1. The replay test uses a stand-in level-2 rule, not a real one, and no real manager can yet implement a level above 1, so the raise itself is only exercised with a test knob (`StateStore::pretend_implemented_apply_rules`) that makes a manager report a higher level.
+- `add_manager` does not check the level, so a manager added with an older build after a raise stops when it replays the log.
 - No live rolling-upgrade run has exercised the mechanism.

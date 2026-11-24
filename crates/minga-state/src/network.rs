@@ -256,6 +256,11 @@ enum RaftRequest {
     /// writes; the API and node registration must work from any node.
     /// Boxed: `StateCommand` is much larger than the raft RPC variants.
     ClientWrite(Box<StateCommand>),
+    /// Asks a manager for the highest apply-rule level its build implements
+    /// (ADR 0009). Appended last so every earlier variant keeps its encoding; a
+    /// build from before it cannot decode this one and closes the connection,
+    /// which the asker reads as "level unknown".
+    ApplyRulesVersion,
 }
 
 /// The reply to a [`RaftRequest`]. Errors are carried as strings; the
@@ -266,6 +271,7 @@ enum RaftReply {
     Vote(Result<VoteResponse<u64>, String>),
     InstallSnapshot(Result<InstallSnapshotResponse<u64>, String>),
     ClientWrite(Result<StateResponse, String>),
+    ApplyRulesVersion(u32),
 }
 
 /// Transport-level error (IO, encode/decode). Wraps into `RPCError`.
@@ -472,6 +478,30 @@ pub(crate) async fn forward_write(
     }
 }
 
+/// Asks manager `id` at `addr` for the highest apply-rule level its build
+/// implements. An error means the level is unknown: the manager is down, or is
+/// a build that cannot answer.
+pub(crate) async fn fetch_apply_rules_version(
+    id: u64,
+    addr: &str,
+    tls: Option<std::sync::Arc<rustls::ClientConfig>>,
+) -> Result<u32, StateError> {
+    let network = TcpNetwork {
+        target: id,
+        addr: addr.to_string(),
+        tls,
+    };
+    match network.send(RaftRequest::ApplyRulesVersion).await {
+        Ok(RaftReply::ApplyRulesVersion(level)) => Ok(level),
+        Ok(_) => Err(StateError::Raft(format!(
+            "manager {id} sent the wrong reply type for an apply-rules query"
+        ))),
+        Err(e) => Err(StateError::Raft(format!(
+            "ask manager {id} at {addr} for its apply-rule level: {e}"
+        ))),
+    }
+}
+
 // --- server side --------------------------------------------------------------
 
 /// Starts a TCP server that handles incoming Raft RPCs.
@@ -479,12 +509,16 @@ pub(crate) async fn forward_write(
 /// Returns a [`tokio::task::JoinHandle`] for the server task. Abort the
 /// handle to stop the server.
 ///
+/// `apply_rules_version` is the highest apply-rule level this build implements;
+/// peers ask for it before an operator raises the level (ADR 0009).
+///
 /// The server accepts connections, reads a length-prefixed [`RaftRequest`],
 /// dispatches it to the [`Raft`] instance, and writes back a [`RaftReply`].
 pub async fn serve_raft_rpc(
     raft: Raft<TypeConfig>,
     bind_addr: &str,
     tls: Option<std::sync::Arc<rustls::ServerConfig>>,
+    apply_rules_version: std::sync::Arc<std::sync::atomic::AtomicU32>,
 ) -> Result<tokio::task::JoinHandle<()>, std::io::Error> {
     let listener = TcpListener::bind(bind_addr).await?;
     tracing::info!(
@@ -505,6 +539,7 @@ pub async fn serve_raft_rpc(
                 Ok((stream, peer)) => {
                     let raft = raft.clone();
                     let tls = tls.clone();
+                    let apply_rules_version = apply_rules_version.clone();
                     tokio::spawn(async move {
                         let _permit = permit;
                         // When TLS is configured, an uncredentialed peer
@@ -531,7 +566,8 @@ pub async fn serve_raft_rpc(
                             }
                             None => Box::new(stream),
                         };
-                        if let Err(e) = handle_connection(stream, raft).await {
+                        if let Err(e) = handle_connection(stream, raft, &apply_rules_version).await
+                        {
                             tracing::debug!(%peer, error = %e, "raft rpc connection closed");
                         }
                     });
@@ -551,6 +587,7 @@ pub async fn serve_raft_rpc(
 async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
     mut stream: S,
     raft: Raft<TypeConfig>,
+    apply_rules_version: &std::sync::atomic::AtomicU32,
 ) -> Result<(), TransportError> {
     // Read length-prefixed request, within a deadline.
     let buf = tokio::time::timeout(REQUEST_READ_TIMEOUT, async {
@@ -593,6 +630,9 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
             Ok(resp) => RaftReply::ClientWrite(Ok(resp.data)),
             Err(e) => RaftReply::ClientWrite(Err(e.to_string())),
         },
+        RaftRequest::ApplyRulesVersion => RaftReply::ApplyRulesVersion(
+            apply_rules_version.load(std::sync::atomic::Ordering::Relaxed),
+        ),
     };
 
     // Write length-prefixed response.

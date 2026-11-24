@@ -287,18 +287,34 @@ That release's notes will name the step. The order is:
    state format agree. Builds of a different state format still refuse each
    other, as above.
 2. Check that every manager runs the new build.
-3. Raise the level, once. 1.3.0 has no `minga-ctl` command or API route for
-   this; [#188](https://github.com/lithqube/minga/issues/188) adds one, and no
-   release may gate a rule before it lands.
+3. Raise the level, once, from any machine with a cluster-operator admin
+   identity (`O=*`, OU `admin`, or the admin token):
+
+   ```bash
+   minga-ctl info                                  # level in force, level each manager implements
+   minga-ctl upgrade apply-rules --to N --yes      # omit --to for the highest level the manager you reach implements
+   ```
+
+   `info` and `upgrade preflight` show the level in force and the level each
+   manager's build implements. `upgrade apply-rules` refuses unless every
+   manager reports a build that implements `N`, and a manager that does not
+   answer counts as behind. The manager checks again before it proposes the
+   raise, so the refusal does not rest on the client. It goes through Raft as
+   one `SetApplyRules` entry, and each raise is logged with the caller's name.
+   The API route behind it is `GET` and `POST /minga/apply-rules`; a tenant
+   identity gets `403` on both.
 
 Do not raise it while a manager is still old: a manager that implements a lower
 level stops applying at that entry instead of applying it by older rules. The
 level never goes down, so a raise is not undone by a downgrade; do not roll a
-manager back to a build from before 1.3.0 after one.
+manager back to a build from before 1.3.0 after one. A manager added after the
+raise that runs an older build also stops at that entry when it replays the
+log, so add managers only with a build that implements the level in force.
 
 A unit test replays a log on a live and on a rebuilt replica and shows the
-same results before and after a raise. No live rolling upgrade has exercised it,
-and no rule is gated yet.
+same results before and after a raise. Tests with two managers on different
+maximum levels show the refusal, through the store, the API and `minga-ctl`.
+No live rolling upgrade has exercised it, and no rule is gated yet.
 
 ## Known issues and limits in this candidate
 

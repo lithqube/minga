@@ -163,8 +163,13 @@ fn run(cli: &Cli) -> Result<(), CtlError> {
         }),
         Command::Upgrade(args) => api::block_on(async {
             let resolved = resolve(cli)?;
-            let conn = transport::connect(&resolved, cli.debug).await?;
-            cmd::upgrade::run(args, &conn, &resolved, format, quiet).await
+            let result = async {
+                let conn = transport::connect(&resolved, cli.debug).await?;
+                cmd::upgrade::run(args, &conn, &resolved, format, quiet).await
+            }
+            .await;
+            audit(&resolved, args.audit(), &result);
+            result
         }),
         Command::Doctor(args) => api::block_on(async {
             let resolved = resolve(cli)?;

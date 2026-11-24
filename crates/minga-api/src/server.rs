@@ -565,6 +565,12 @@ fn build_router_with_app_state(
                 .layer(axum::middleware::from_fn(require_operator_admin)),
         )
         .route(
+            "/minga/apply-rules",
+            get(handlers::get_apply_rules)
+                .post(handlers::raise_apply_rules)
+                .layer(axum::middleware::from_fn(require_operator_admin)),
+        )
+        .route(
             "/minga/managers/:id",
             delete(handlers::remove_manager)
                 .layer(axum::middleware::from_fn(require_operator_admin)),
@@ -1371,6 +1377,207 @@ mod tests {
                 assert_eq!(status, StatusCode::FORBIDDEN, "{role:?} on {uri}");
             }
         }
+    }
+
+    fn identity_request(
+        method: &str,
+        uri: &str,
+        body: &str,
+        name: &str,
+        role: ApiRole,
+        tenant: &str,
+    ) -> Request<Body> {
+        let mut req = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("Content-Type", "application/json")
+            .body(Body::from(body.to_owned()))
+            .unwrap();
+        req.extensions_mut().insert(ClientIdentity {
+            name: name.into(),
+            role: Some(role),
+            tenant: Some(tenant.into()),
+        });
+        req
+    }
+
+    #[tokio::test]
+    async fn apply_rules_route_is_for_cluster_operators_only() {
+        let (router, store, _dir) = admin_router().await;
+        store
+            .upsert_tenant(minga_state::types::Tenant {
+                nats_revoked_user_public_keys: Vec::new(),
+                id: "tenant-a".into(),
+                name: "A".into(),
+                quotas: Default::default(),
+                created_at: 0,
+            })
+            .await
+            .unwrap();
+        for (method, body) in [("GET", ""), ("POST", r#"{"level":1}"#)] {
+            // A tenant administrator, and an `O=*` identity below the admin role.
+            for (role, tenant) in [
+                (ApiRole::Admin, "tenant-a"),
+                (ApiRole::Deployer, "*"),
+                (ApiRole::Viewer, "*"),
+            ] {
+                let req =
+                    identity_request(method, "/minga/apply-rules", body, "caller", role, tenant);
+                let (status, _) = send_request(router.clone(), req).await;
+                assert_eq!(
+                    status,
+                    StatusCode::FORBIDDEN,
+                    "{method} as {role:?} in {tenant}"
+                );
+            }
+            // No credential at all.
+            let req = Request::builder()
+                .method(method)
+                .uri("/minga/apply-rules")
+                .header("Content-Type", "application/json")
+                .body(Body::from(body))
+                .unwrap();
+            let (status, _) = send_request(router.clone(), req).await;
+            assert_eq!(
+                status,
+                StatusCode::UNAUTHORIZED,
+                "{method} without credentials"
+            );
+        }
+        assert_eq!(store.apply_rules().await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn apply_rules_route_reads_and_raises_for_an_operator_and_the_admin_token() {
+        let (router, store, _dir) = admin_router().await;
+        let expected = serde_json::json!({
+            "level": 1,
+            "implemented": 1,
+            "managers": [{"id": 1, "implemented": 1}],
+        });
+
+        let req = identity_request("GET", "/minga/apply-rules", "", "ops", ApiRole::Admin, "*");
+        let (status, body) = send_request(router.clone(), req).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body, expected);
+
+        let req = Request::builder()
+            .uri("/minga/apply-rules")
+            .header("Authorization", "Bearer admin-token")
+            .body(Body::empty())
+            .unwrap();
+        let (status, body) = send_request(router.clone(), req).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body, expected);
+
+        // This build implements level 1 only, so a raise past it is a conflict.
+        let req = identity_request(
+            "POST",
+            "/minga/apply-rules",
+            r#"{"level":2}"#,
+            "ops",
+            ApiRole::Admin,
+            "*",
+        );
+        let (status, body) = send_request(router.clone(), req).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert!(body["message"].as_str().unwrap().contains("up to level 1"));
+
+        // Raising to the level in force answers with the status.
+        let req = identity_request(
+            "POST",
+            "/minga/apply-rules",
+            r#"{"level":1}"#,
+            "ops",
+            ApiRole::Admin,
+            "*",
+        );
+        let (status, body) = send_request(router.clone(), req).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body, expected);
+        assert_eq!(store.apply_rules().await.unwrap(), 1);
+
+        let req = identity_request(
+            "POST",
+            "/minga/apply-rules",
+            r#"{"level":"two"}"#,
+            "ops",
+            ApiRole::Admin,
+            "*",
+        );
+        let (status, _) = send_request(router, req).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn apply_rules_raise_is_refused_while_a_manager_implements_a_lower_level() {
+        let dir1 = tempfile::tempdir().unwrap();
+        let dir2 = tempfile::tempdir().unwrap();
+        let store1 = Arc::new(
+            StateStore::open(1, "127.0.0.1:0", dir1.path(), BTreeMap::new())
+                .await
+                .unwrap(),
+        );
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr2 = listener.local_addr().unwrap().to_string();
+        drop(listener);
+        let store2 = Arc::new(StateStore::open_join(2, &addr2, dir2.path()).await.unwrap());
+        store1.add_manager(2, addr2).await.unwrap();
+        // Manager 1 is upgraded to a build that implements level 2; manager 2 is not.
+        store1.pretend_implemented_apply_rules(2);
+        let router = build_router_with_bus_and_auth(
+            store1.clone(),
+            MemoryBus::new(),
+            Arc::new(ReadyState::new()),
+            Some("admin-token".into()),
+        );
+
+        let req = Request::builder()
+            .uri("/minga/apply-rules")
+            .header("Authorization", "Bearer admin-token")
+            .body(Body::empty())
+            .unwrap();
+        let (status, body) = send_request(router.clone(), req).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["implemented"], 2);
+        assert_eq!(
+            body["managers"],
+            serde_json::json!([
+                {"id": 1, "implemented": 2},
+                {"id": 2, "implemented": 1},
+            ])
+        );
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/minga/apply-rules")
+            .header("Authorization", "Bearer admin-token")
+            .header("Content-Type", "application/json")
+            .body(Body::from(r#"{"level":2}"#))
+            .unwrap();
+        let (status, body) = send_request(router, req).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap()
+                .contains("manager 2 (level 1)"),
+            "{body}"
+        );
+        assert_eq!(store1.apply_rules().await.unwrap(), 1);
+
+        Arc::try_unwrap(store1)
+            .ok()
+            .unwrap()
+            .shutdown()
+            .await
+            .unwrap();
+        Arc::try_unwrap(store2)
+            .ok()
+            .unwrap()
+            .shutdown()
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

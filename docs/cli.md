@@ -283,9 +283,10 @@ Through the API:
 | `task ls`, `task inspect ID` | Desired and actual task state, placement and errors. |
 | `version` | API version metadata. |
 | `health [--stack STACK] [--timeout SECS]` | The API, and with `--stack` the stack's services and their health URLs. |
-| `info` | Client build, server version/build, Docker API version, persisted state format and Raft membership/quorum observations. |
+| `info` | Client build, server version/build, Docker API version, persisted state format, Raft membership/quorum observations, the Raft apply-rule level in force and the level each manager implements. |
 | `doctor [--bundle PATH] [--timeout SECS]` | Read-only API/readiness, Raft, bus, inventory, task and local auth/TLS diagnostics. Default probe timeout is 5 seconds. |
-| `upgrade preflight --to v1.3.0` | Read-only compatibility, Raft membership/quorum, selected-context auth/transport, backup, NATS, tenant impact, maintenance-order and rollback plan. Unknown release metadata fails closed; no upgrade is started. |
+| `upgrade preflight --to v1.3.0` | Read-only compatibility, Raft membership/quorum, apply-rule level of each manager, selected-context auth/transport, backup, NATS, tenant impact, maintenance-order and rollback plan. Unknown release metadata fails closed; no upgrade is started. |
+| `upgrade apply-rules [--to N] [--yes]` | Raises the replicated Raft apply-rule level ([ADR 0009](adr/0009-raft-apply-rule-versions.md)). One-way. Refuses unless every manager reports a build that implements `N`. Needs an `O=*` admin certificate or the admin token. |
 | `metrics` | The Prometheus metrics the cluster reports. |
 | `agent usage [--customer ID] [--since 30d]` | Uses the context API token as a cluster operator and reports aggregate usage by tenant. The usage API does not expose tenant-scoped request rows; `--customer` is rejected for this caller. Read-only. |
 | `change list [--limit N] [--pending]`, `change approve ID [--yes]`, `change reject ID` | Tenant-scoped maker-checker over a direct HTTPS context with a tenant client certificate/key. Listing requires a tenant viewer certificate; approval/rejection additionally require a deployer/admin certificate (a token is refused). Each request shows redacted before/after values for every changed field. Table and JSON output escape non-ASCII characters. Approval prints the diff to stderr and asks for confirmation; scripts must pass `--yes`. Proposal images must be printable ASCII. Approval runs service-update admission, then applies the reviewed desired state atomically. |
@@ -333,9 +334,16 @@ Raft and NATS TLS independently on every node.
 
 A later release that adds a Raft apply refusal needs one more step after every
 manager is upgraded: raising the replicated apply-rule level
-([ADR 0009](adr/0009-raft-apply-rule-versions.md)). No `minga-ctl` command
-raises or reports it yet ([#188](https://github.com/lithqube/minga/issues/188)),
-and preflight does not check it. Nothing in v1.3.0 needs it.
+([ADR 0009](adr/0009-raft-apply-rule-versions.md)) with
+`minga-ctl upgrade apply-rules`. `info` shows the level in force and the level
+each manager implements. Preflight fails when a manager implements less than the
+target needs, or does not report a level, and when the levels cannot be read at
+all, which includes a server from before the route existed. Nothing in v1.3.0
+needs the raise: it starts at level 1, which v1.3.0 implements.
+
+The raise is one-way and cannot be undone. A manager on a build that implements
+fewer levels stops applying at that log entry, so run it only after every
+manager has been upgraded.
 
 On the nodes, over SSH (`--ssh TARGET`, repeatable; by default the context's
 `--node` targets, else its `--ssh`, else this machine):

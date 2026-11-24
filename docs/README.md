@@ -16,7 +16,7 @@
 - [ADR 0006: Workers leave Raft](adr/0006-workers-leave-raft.md): implemented in v1.3.0
 - [ADR 0007: WireGuard and routing mesh](adr/0007-wireguard-mesh.md): implemented in Phase 13; scale limits remain
 - [ADR 0008: Multi-tenancy and isolation](adr/0008-multi-tenancy.md): T1–T5 implementation complete; T3 live proof remains open
-- [ADR 0009: Version the Raft apply rules](adr/0009-raft-apply-rule-versions.md): state mechanism implemented; the operator command is tracked in #188
+- [ADR 0009: Version the Raft apply rules](adr/0009-raft-apply-rule-versions.md): state mechanism and the operator command (`minga-ctl upgrade apply-rules`) implemented
 
 Implementation-status notes distinguish what is merged from what remains proposed or unverified.
 

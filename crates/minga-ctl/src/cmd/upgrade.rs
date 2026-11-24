@@ -11,7 +11,12 @@ use crate::error::CtlError;
 use crate::output::{self, Format};
 use crate::transport::Connection;
 
+use super::apply_rules::{self, ApplyRulesArgs};
 use super::report::{self, Finding, Severity, Status};
+
+/// The highest Raft apply-rule level the target release implements (ADR 0009).
+/// Every manager must report at least this before the upgrade is safe to finish.
+const TARGET_APPLY_RULES: u32 = 1;
 
 const TARGET_RELEASE: ReleaseMetadata = ReleaseMetadata {
     version: "1.3.0",
@@ -69,6 +74,19 @@ pub struct UpgradeArgs {
 enum UpgradeCommand {
     /// Compare the running cluster with a known target; makes no changes.
     Preflight(PreflightArgs),
+    /// Raise the Raft apply-rule level once every manager runs a build that
+    /// implements it. The raise cannot be undone.
+    ApplyRules(ApplyRulesArgs),
+}
+
+impl UpgradeArgs {
+    /// Audit metadata for a command that changes state; `None` for a read.
+    pub fn audit(&self) -> Option<(&'static str, Value)> {
+        match &self.command {
+            UpgradeCommand::Preflight(_) => None,
+            UpgradeCommand::ApplyRules(args) => Some(args.audit()),
+        }
+    }
 }
 
 #[derive(Debug, Args)]
@@ -169,7 +187,12 @@ pub async fn run(
     format: Format,
     quiet: bool,
 ) -> Result<(), CtlError> {
-    let UpgradeCommand::Preflight(args) = &args.command;
+    let args = match &args.command {
+        UpgradeCommand::Preflight(args) => args,
+        UpgradeCommand::ApplyRules(args) => {
+            return apply_rules::run(args, &conn.api, format, quiet).await;
+        }
+    };
     let target = known_target(&args.to).ok_or_else(|| {
         CtlError::Usage(format!(
             "no upgrade metadata for target `{}`; known target: v{}",
@@ -197,6 +220,7 @@ pub async fn run(
         .and_then(|diagnostics| diagnostics.state_format_version);
     let state_format =
         reported_format.or_else(|| current_metadata.map(|release| release.state_format));
+    let levels = request(timeout, apply_rules::Status::fetch(&conn.api)).await;
     let node_count = collection_count(request(timeout, conn.api.get("nodes", None)).await.ok());
     let tenants_url = format!("{}/minga/tenants", conn.api.root());
     let tenant_count = request(timeout, conn.api.text(&tenants_url))
@@ -259,6 +283,7 @@ pub async fn run(
             "With every role stopped, take a cold backup of node data directories, volume data, secret values, TLS files and NATS data, and verify it restores; state export omits these and an online copy is not a restorable backup.",
             "Install the same candidate on every node, start the manager cohort together, then start workers; do not mix wire-format versions.",
             "After the candidate is ready, verify doctor readiness, Raft quorum, tenant ownership, task health and restored workload behavior.",
+            "Only when the release notes name an apply-rule level above the one in force, and every manager runs the candidate, raise it once with `minga-ctl upgrade apply-rules`; the raise cannot be undone.",
         ],
         disruption: "Plan a coordinated Minga control-plane outage. The API and scheduler are unavailable during replacement; workload continuity depends on replica placement and is not guaranteed.",
         rollback_boundary: "Once the candidate opens the data it is migrated to state format v12, which the previous binary cannot read; do not downgrade in place. Rollback requires restoring the complete pre-upgrade backup with the previous binary across the cluster; NATS downgrade is not a supported rollback path.",
@@ -298,6 +323,10 @@ pub async fn run(
             .raft
             .as_ref()
             .ok_or_else(|| cluster.as_ref().err().map_or("", String::as_str)),
+    ));
+    report.findings.push(apply_rules_finding(
+        levels.as_ref().map_err(String::as_str),
+        TARGET_APPLY_RULES,
     ));
     report.findings.push(if report.current.api_auth_configured
         && report.current.api_transport_secure
@@ -429,6 +458,61 @@ fn known_current(version: &str) -> Option<&'static ReleaseMetadata> {
     CURRENT_RELEASES
         .iter()
         .find(|release| release.version == version)
+}
+
+/// Whether every manager implements the apply-rule level the target needs
+/// (ADR 0009). A manager that implements less, or did not report, fails the
+/// check: it would stop applying at the raise. `Err` carries why the levels
+/// could not be read, which also fails: a check that cannot run must not pass.
+fn apply_rules_finding(levels: Result<&apply_rules::Status, &str>, required: u32) -> Finding {
+    const ACTION: &str =
+        "Upgrade every manager to the target build, then raise the level with `minga-ctl upgrade apply-rules` only if the release notes ask for it.";
+    let levels = match levels {
+        Ok(levels) => levels,
+        Err(why) => {
+            return Finding::new(
+                "apply-rules",
+                Severity::Error,
+                Status::Unknown,
+                "Raft apply-rule levels could not be read",
+                why,
+                "Use an operator-admin identity against a manager that serves `minga/apply-rules`; do not raise the level while it is unknown.",
+            );
+        }
+    };
+    let evidence = format!(
+        "level in force {}; implemented: {}; target needs level {required}",
+        levels.level,
+        levels.managers_summary()
+    );
+    if levels.managers.iter().any(|m| m.implemented.is_none()) {
+        return Finding::new(
+            "apply-rules",
+            Severity::Error,
+            Status::Unknown,
+            "a manager did not report the apply-rule level it implements",
+            evidence,
+            ACTION,
+        );
+    }
+    if levels.blockers(required).is_some() {
+        return Finding::new(
+            "apply-rules",
+            Severity::Error,
+            Status::Failed,
+            "a manager implements a lower apply-rule level than the target needs",
+            evidence,
+            ACTION,
+        );
+    }
+    Finding::new(
+        "apply-rules",
+        Severity::Info,
+        Status::Ok,
+        "every manager implements the apply-rule level the target needs",
+        evidence,
+        ACTION,
+    )
 }
 
 /// `Err` carries why the diagnostics could not be read.
@@ -671,6 +755,47 @@ mod tests {
         assert_eq!(unread.status, Status::Unknown);
         assert_eq!(unread.severity, Severity::Error);
         assert!(unread.evidence.contains("API 403"));
+    }
+
+    fn levels(managers: &[(u64, Option<u32>)]) -> apply_rules::Status {
+        apply_rules::Status {
+            level: 1,
+            implemented: 1,
+            managers: managers
+                .iter()
+                .map(|(id, implemented)| apply_rules::ManagerLevel {
+                    id: *id,
+                    implemented: *implemented,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn apply_rules_finding_fails_closed_for_an_older_or_silent_manager() {
+        let ok = apply_rules_finding(Ok(&levels(&[(1, Some(2)), (2, Some(2))])), 2);
+        assert_eq!((ok.severity, ok.status), (Severity::Info, Status::Ok));
+        assert!(ok.evidence.contains("manager 2: 2"), "{}", ok.evidence);
+
+        let older = apply_rules_finding(Ok(&levels(&[(1, Some(2)), (2, Some(1))])), 2);
+        assert_eq!(
+            (older.severity, older.status),
+            (Severity::Error, Status::Failed)
+        );
+
+        let silent = apply_rules_finding(Ok(&levels(&[(1, Some(2)), (2, None)])), 2);
+        assert_eq!(
+            (silent.severity, silent.status),
+            (Severity::Error, Status::Unknown)
+        );
+        assert!(silent.evidence.contains("manager 2: unknown"));
+
+        let unread = apply_rules_finding(Err("API error 404"), 2);
+        assert_eq!(
+            (unread.severity, unread.status),
+            (Severity::Error, Status::Unknown)
+        );
+        assert!(report::exit_status(&[older, silent, unread]).is_err());
     }
 
     #[test]

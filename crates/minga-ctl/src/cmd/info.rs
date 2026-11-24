@@ -8,6 +8,8 @@ use crate::api::ApiClient;
 use crate::error::CtlError;
 use crate::output::{self, Format, Rows};
 
+use super::apply_rules;
+
 #[derive(Debug, Deserialize)]
 struct ClusterResponse {
     server_version: String,
@@ -45,13 +47,25 @@ struct Info {
     api_version: String,
     state_format_version: u8,
     raft: RaftInfo,
+    /// The Raft apply-rule level in force and what each manager implements.
+    apply_rules: Option<apply_rules::Status>,
+    /// Why `apply_rules` is absent: an older server has no such route.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    apply_rules_error: Option<String>,
 }
 
 /// Reads server build metadata and Raft observations without changing state.
 pub async fn run(api: &ApiClient, format: Format, quiet: bool) -> Result<(), CtlError> {
     let response = api.get("minga/cluster", None).await?;
     let response: ClusterResponse = serde_json::from_value(response)?;
+    // A server from before the route answers 404; the rest of `info` still holds.
+    let (apply_rules, apply_rules_error) = match apply_rules::Status::fetch(api).await {
+        Ok(status) => (Some(status), None),
+        Err(error) => (None, Some(error.to_string())),
+    };
     let info = Info {
+        apply_rules,
+        apply_rules_error,
         client_version: env!("CARGO_PKG_VERSION"),
         server_version: response.server_version,
         build_revision: response.build_revision,
@@ -92,6 +106,28 @@ pub async fn run(api: &ApiClient, format: Format, quiet: bool) -> Result<(), Ctl
             "recent quorum acknowledgment",
             json!(info.raft.quorum_ack_recent),
         );
+        match (&info.apply_rules, &info.apply_rules_error) {
+            (Some(levels), _) => {
+                push(&mut rows, "apply-rule level in force", json!(levels.level));
+                for manager in &levels.managers {
+                    push(
+                        &mut rows,
+                        &format!("manager {} implements apply-rule level", manager.id),
+                        json!(manager
+                            .implemented
+                            .map_or("unknown".to_owned(), |l| l.to_string())),
+                    );
+                }
+            }
+            (None, error) => push(
+                &mut rows,
+                "apply-rule level in force",
+                json!(format!(
+                    "unavailable: {}",
+                    error.as_deref().unwrap_or("unknown")
+                )),
+            ),
+        }
         for member in &info.raft.members {
             push(
                 &mut rows,

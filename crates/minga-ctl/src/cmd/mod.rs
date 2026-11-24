@@ -1,5 +1,6 @@
 //! Command groups.
 
+pub mod apply_rules;
 pub mod change;
 pub mod cluster;
 pub mod context;
