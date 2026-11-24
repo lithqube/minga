@@ -1,5 +1,5 @@
 //! DNS server for the overlay: answers `minga.local` service-discovery
-//! queries from a [`DnsStore`] and proxies everything else upstream.
+//! queries from a [`Records`] source and proxies everything else upstream.
 //!
 //! Each overlay network's bridge gateway IP runs a `DnsServer` on UDP/TCP
 //! port 53. Containers point their resolver at the gateway IP (Docker
@@ -33,7 +33,7 @@ use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
-use crate::dns::{is_minga_name, DnsStore, LocalOnlySources};
+use crate::dns::{is_minga_name, LocalOnlySources, Records};
 
 /// TTL (seconds) for synthesized A records.
 const ANSWER_TTL_SECS: u32 = 60;
@@ -72,9 +72,9 @@ impl DnsServer {
     /// (e.g. `127.0.0.53:53` from `/etc/resolv.conf`) receives
     /// non-`minga.local` queries via UDP proxying, except from sources in
     /// `local_only`, which get REFUSED for them.
-    pub async fn start(
+    pub async fn start<R: Records>(
         binds: Vec<SocketAddr>,
-        store: Arc<RwLock<DnsStore>>,
+        store: Arc<RwLock<R>>,
         upstream: Option<SocketAddr>,
         local_only: LocalOnlySources,
     ) -> io::Result<Self> {
@@ -122,9 +122,9 @@ impl DnsServer {
 // Listener loops
 // ---------------------------------------------------------------------------
 
-async fn udp_loop(
+async fn udp_loop<R: Records>(
     socket: UdpSocket,
-    store: Arc<RwLock<DnsStore>>,
+    store: Arc<RwLock<R>>,
     upstream: Option<SocketAddr>,
     local_only: LocalOnlySources,
 ) {
@@ -148,9 +148,9 @@ async fn udp_loop(
     }
 }
 
-async fn tcp_loop(
+async fn tcp_loop<R: Records>(
     listener: TcpListener,
-    store: Arc<RwLock<DnsStore>>,
+    store: Arc<RwLock<R>>,
     upstream: Option<SocketAddr>,
     local_only: LocalOnlySources,
 ) {
@@ -205,9 +205,9 @@ async fn tcp_loop(
 /// §4.2.2), one response, then close. Every read and write is bounded by
 /// [`TCP_IO_TIMEOUT`], and a length prefix above [`MAX_DATAGRAM`] is
 /// rejected before its buffer is allocated.
-async fn handle_tcp_conn(
+async fn handle_tcp_conn<R: Records>(
     mut stream: TcpStream,
-    store: Arc<RwLock<DnsStore>>,
+    store: Arc<RwLock<R>>,
     upstream: Option<SocketAddr>,
     source: IpAddr,
     local_only: LocalOnlySources,
@@ -253,9 +253,9 @@ async fn write_with_timeout(stream: &mut TcpStream, buf: &[u8]) -> io::Result<()
 
 /// Produces a response datagram for `datagram`, or `None` if the query is
 /// malformed (dropped silently) or an upstream proxy attempt failed.
-async fn handle_query(
+async fn handle_query<R: Records>(
     datagram: &[u8],
-    store: &Arc<RwLock<DnsStore>>,
+    store: &Arc<RwLock<R>>,
     upstream: Option<SocketAddr>,
     source: IpAddr,
     local_only: &LocalOnlySources,
@@ -273,12 +273,11 @@ async fn handle_query(
     // like Docker's embedded DNS on an overlay network. Non-A queries get
     // NOERROR with an empty answer: a companion AAAA lookup returning
     // NXDOMAIN would make musl discard the good A answer.
-    let known = is_minga_name(&q.name) || store.read().map(|s| s.exists(&q.name)).unwrap_or(false);
-    if known {
-        let ips = if q.qtype == QTYPE_A && q.qclass == QCLASS_IN {
-            store.read().map(|s| s.resolve(&q.name)).unwrap_or_default()
-        } else {
-            Vec::new()
+    let found = store.read().ok().and_then(|s| s.lookup(source, &q.name));
+    if is_minga_name(&q.name) || found.is_some() {
+        let ips = match found {
+            Some(ips) if q.qtype == QTYPE_A && q.qclass == QCLASS_IN => ips,
+            _ => Vec::new(),
         };
         debug!(name = %q.name, found = ips.len(), "dns: overlay query");
         // NOERROR even when empty: never NXDOMAIN for overlay names, so
@@ -429,6 +428,7 @@ fn build_response(query: &[u8], q: &Question, ips: &[Ipv4Addr], rcode: u16) -> V
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dns::{DnsStore, ScopedDnsStore};
 
     /// Builds a standard query datagram for `name` (one question, RD set).
     fn encode_query(id: u16, name: &str, qtype: u16) -> Vec<u8> {
@@ -547,6 +547,51 @@ mod tests {
         assert_eq!(parsed.id, 0x42);
         assert_eq!(parsed.rcode, RCODE_NOERROR);
         assert_eq!(parsed.ips, ips);
+
+        server.shutdown().await;
+    }
+
+    /// The server answers from the querying source's networks: the same name
+    /// gives `127.0.0.1` the `front` address and an unattached source nothing.
+    #[tokio::test]
+    async fn answers_are_scoped_to_the_querying_clients_networks() {
+        let client = Ipv4Addr::LOCALHOST;
+        let mut store = ScopedDnsStore::new();
+        store
+            .network_mut("front")
+            .add("app", Ipv4Addr::new(10, 1, 0, 3));
+        store
+            .network_mut("back")
+            .add("app", Ipv4Addr::new(10, 2, 0, 3));
+        store.attach(client, "front");
+        let store = Arc::new(RwLock::new(store));
+        let server = DnsServer::start(
+            vec!["127.0.0.1:0".parse().unwrap()],
+            Arc::clone(&store),
+            None,
+            LocalOnlySources::default(),
+        )
+        .await
+        .unwrap();
+        let addr = server.local_addrs()[0];
+        let ask = |name: &'static str| async move {
+            parse_response(&query_udp(addr, &encode_query(1, name, QTYPE_A)).await)
+        };
+
+        assert_eq!(ask("app").await.ips, vec![Ipv4Addr::new(10, 1, 0, 3)]);
+
+        // Attached to both networks, the client sees both.
+        store.write().unwrap().attach(client, "back");
+        assert_eq!(
+            ask("app").await.ips,
+            vec![Ipv4Addr::new(10, 1, 0, 3), Ipv4Addr::new(10, 2, 0, 3)]
+        );
+
+        // A source with no network gets an empty minga.local answer.
+        *store.write().unwrap() = ScopedDnsStore::new();
+        let none = ask("app.shop.minga.local").await;
+        assert_eq!(none.rcode, RCODE_NOERROR);
+        assert!(none.ips.is_empty());
 
         server.shutdown().await;
     }

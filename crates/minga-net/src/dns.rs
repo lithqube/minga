@@ -16,7 +16,7 @@
 //! provides the data model and resolution logic.
 
 use std::collections::HashMap;
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr};
 
 /// The internal DNS domain suffix.
 pub const MINGA_DOMAIN: &str = "minga.local";
@@ -79,6 +79,10 @@ impl DnsStore {
         self.records.contains_key(&name.to_lowercase())
     }
 
+    fn get(&self, name: &str) -> Option<&Vec<Ipv4Addr>> {
+        self.records.get(&name.to_lowercase())
+    }
+
     /// List all records (name, IPs), sorted by name.
     pub fn list(&self) -> Vec<(String, Vec<Ipv4Addr>)> {
         let mut entries: Vec<_> = self
@@ -103,6 +107,83 @@ impl DnsStore {
     /// Clear all records.
     pub fn clear(&mut self) {
         self.records.clear();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Source-aware lookup
+// ---------------------------------------------------------------------------
+
+/// What the DNS server answers from. The querying client's address is part of
+/// the lookup, so an implementation can scope answers to that client.
+pub trait Records: Send + Sync + 'static {
+    /// Addresses of `name` as `client` sees them; `None` when the name does
+    /// not exist for that client.
+    fn lookup(&self, client: IpAddr, name: &str) -> Option<Vec<Ipv4Addr>>;
+}
+
+/// A flat store answers every client alike; it does not scope by network.
+impl Records for DnsStore {
+    fn lookup(&self, _client: IpAddr, name: &str) -> Option<Vec<Ipv4Addr>> {
+        self.get(name).cloned()
+    }
+}
+
+/// One [`DnsStore`] per network, plus the networks each client address is
+/// attached to. A client resolves only names on its own networks, so a
+/// service on networks A and B shows a client on A just its A address, and
+/// the same bare name on two networks never mixes.
+#[derive(Debug, Default)]
+pub struct ScopedDnsStore {
+    networks: HashMap<String, DnsStore>,
+    clients: HashMap<Ipv4Addr, Vec<String>>,
+}
+
+impl ScopedDnsStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The records of `network`, created on first use.
+    pub fn network_mut(&mut self, network: &str) -> &mut DnsStore {
+        self.networks.entry(network.to_string()).or_default()
+    }
+
+    /// Lets the client at `client` resolve names on `network`. A task on
+    /// several networks has one address on each, and each is attached to all
+    /// of them, because its resolver names the gateway of only one.
+    pub fn attach(&mut self, client: Ipv4Addr, network: &str) {
+        let networks = self.clients.entry(client).or_default();
+        if !networks.iter().any(|n| n == network) {
+            networks.push(network.to_string());
+        }
+    }
+
+    /// Resolves `name` for `client`; empty when it has no such name.
+    pub fn resolve_for(&self, client: Ipv4Addr, name: &str) -> Vec<Ipv4Addr> {
+        self.lookup(IpAddr::V4(client), name).unwrap_or_default()
+    }
+}
+
+impl Records for ScopedDnsStore {
+    fn lookup(&self, client: IpAddr, name: &str) -> Option<Vec<Ipv4Addr>> {
+        // An unknown or IPv6 source is no attached task: nothing resolves.
+        let IpAddr::V4(client) = client else {
+            return None;
+        };
+        let mut found: Option<Vec<Ipv4Addr>> = None;
+        for network in self.clients.get(&client)? {
+            let Some(ips) = self.networks.get(network).and_then(|s| s.get(name)) else {
+                continue;
+            };
+            let merged = found.get_or_insert_with(Vec::new);
+            for ip in ips {
+                if !merged.contains(ip) {
+                    merged.push(*ip);
+                }
+            }
+        }
+        found
     }
 }
 
