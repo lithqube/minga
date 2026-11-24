@@ -13,6 +13,7 @@
 //! | `MINGA_LOGS_<tenant>` | `minga.<tenant>.log.>` | Tenant quota | Worker log chunks |
 //! | `MINGA_AUDIT_<tenant>` | `minga.<tenant>.audit` | Tenant quota | Tenant audit records |
 //! | `MINGA_LOGS` | `legacy.minga.log.>` | Legacy retention | Old unscoped log records; no new writes |
+//! | `MINGA_COMMANDS` | `legacy.minga.ctl.node.>` | Left from 1.2.0 | Only in an upgraded store; moved, never read |
 //!
 //! # KV buckets
 //!
@@ -1477,6 +1478,63 @@ impl NatsBus {
     }
 
     async fn setup_streams(js: &JetStream) -> Result<()> {
+        // 1.2.0 streams on `minga.log.>` and `minga.ctl.node.>` overlap
+        // `minga.*.node.>`, so both leave the namespace before MINGA_EVENTS
+        // moves; otherwise that update fails with error 10065 (#204).
+        //
+        // Tenant logs use `minga.<tenant>.log.>`; the legacy stream below
+        // stays outside the tenant namespace so these filters cannot overlap.
+        let logs = StreamConfig {
+            name: "MINGA_LOGS".to_string(),
+            subjects: vec!["legacy.minga.log.>".to_string()],
+            retention: RetentionPolicy::Limits,
+            max_bytes: 512 * 1024 * 1024,
+            max_age: Duration::from_secs(24 * 3600),
+            ..Default::default()
+        };
+        let mut stream = js
+            .get_or_create_stream(logs)
+            .await
+            .map_err(|error| BusError::Other(format!("MINGA_LOGS: {error}")))?;
+        let mut config = stream
+            .info()
+            .await
+            .map_err(|error| BusError::Other(format!("MINGA_LOGS info: {error}")))?
+            .config
+            .clone();
+        if config.subjects != ["legacy.minga.log.>"] {
+            config.subjects = vec!["legacy.minga.log.>".to_string()];
+            js.update_stream(config)
+                .await
+                .map_err(|error| BusError::Other(format!("MINGA_LOGS subjects: {error}")))?;
+        }
+
+        // 1.2.0's node command stream; nothing reads it since 1.3.0. It is
+        // moved, not created or deleted, so an upgraded store keeps its data.
+        match js.get_stream("MINGA_COMMANDS").await {
+            Ok(mut stream) => {
+                let mut config = stream
+                    .info()
+                    .await
+                    .map_err(|error| BusError::Other(format!("MINGA_COMMANDS info: {error}")))?
+                    .config
+                    .clone();
+                if config.subjects != ["legacy.minga.ctl.node.>"] {
+                    config.subjects = vec!["legacy.minga.ctl.node.>".to_string()];
+                    js.update_stream(config).await.map_err(|error| {
+                        BusError::Other(format!("MINGA_COMMANDS subjects: {error}"))
+                    })?;
+                }
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    jetstream::context::GetStreamErrorKind::JetStream(ref inner)
+                        if inner.error_code() == jetstream::ErrorCode::STREAM_NOT_FOUND
+                ) => {}
+            Err(error) => return Err(BusError::Other(format!("MINGA_COMMANDS: {error}"))),
+        }
+
         // MINGA_EVENTS — status reports and lifecycle events.
         let event_subjects = EVENT_SUBJECTS.map(str::to_string).to_vec();
         let events = StreamConfig {
@@ -1503,33 +1561,6 @@ impl NatsBus {
             js.update_stream(config)
                 .await
                 .map_err(|e| BusError::Other(format!("MINGA_EVENTS subjects: {e}")))?;
-        }
-
-        // Tenant logs use `minga.<tenant>.log.>`; the legacy stream below
-        // stays outside the tenant namespace so these filters cannot overlap.
-        let logs = StreamConfig {
-            name: "MINGA_LOGS".to_string(),
-            subjects: vec!["legacy.minga.log.>".to_string()],
-            retention: RetentionPolicy::Limits,
-            max_bytes: 512 * 1024 * 1024,
-            max_age: Duration::from_secs(24 * 3600),
-            ..Default::default()
-        };
-        let mut stream = js
-            .get_or_create_stream(logs)
-            .await
-            .map_err(|error| BusError::Other(format!("MINGA_LOGS: {error}")))?;
-        let mut config = stream
-            .info()
-            .await
-            .map_err(|error| BusError::Other(format!("MINGA_LOGS info: {error}")))?
-            .config
-            .clone();
-        if config.subjects != ["legacy.minga.log.>"] {
-            config.subjects = vec!["legacy.minga.log.>".to_string()];
-            js.update_stream(config)
-                .await
-                .map_err(|error| BusError::Other(format!("MINGA_LOGS subjects: {error}")))?;
         }
 
         Ok(())

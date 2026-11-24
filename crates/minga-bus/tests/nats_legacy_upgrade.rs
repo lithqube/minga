@@ -46,6 +46,56 @@ async fn connecting_moves_a_pre_tenant_events_stream_to_tenant_subjects() {
 }
 
 #[tokio::test]
+async fn connecting_to_a_v1_2_store_moves_streams_whose_subjects_overlap_the_events() {
+    // A 1.2.0 store (#204): `minga.ctl.node.>` and `minga.log.>` both
+    // overlap `minga.*.node.>`, so moving MINGA_EVENTS first fails with
+    // "subjects overlap with an existing stream" (10065).
+    let _serial = SERIAL.lock().await;
+    let Some(url) = common::nats_url().await else {
+        return;
+    };
+    let url: &str = &url;
+    let client = async_nats::connect(url).await.expect("connect");
+    let js = async_nats::jetstream::new(client);
+    for name in ["MINGA_EVENTS", "MINGA_COMMANDS", "MINGA_LOGS"] {
+        let _ = js.delete_stream(name).await;
+    }
+    for (name, subjects) in [
+        (
+            "MINGA_EVENTS",
+            &["minga.node.>", "minga.task.>", "minga.egress.>"][..],
+        ),
+        ("MINGA_COMMANDS", &["minga.ctl.node.>"][..]),
+        ("MINGA_LOGS", &["minga.log.>"][..]),
+    ] {
+        js.create_stream(async_nats::jetstream::stream::Config {
+            name: name.to_string(),
+            subjects: subjects.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        })
+        .await
+        .unwrap_or_else(|e| panic!("create 1.2.0 {name}: {e}"));
+    }
+
+    NatsBus::connect(url)
+        .await
+        .expect("connect bus to a 1.2.0 store");
+
+    for (name, subjects) in [
+        (
+            "MINGA_EVENTS",
+            &["minga.*.node.>", "minga.*.task.>", "minga.*.egress.>"][..],
+        ),
+        ("MINGA_COMMANDS", &["legacy.minga.ctl.node.>"][..]),
+        ("MINGA_LOGS", &["legacy.minga.log.>"][..]),
+    ] {
+        let mut stream = js.get_stream(name).await.expect(name);
+        let info = stream.info().await.expect("info");
+        assert_eq!(info.config.subjects, subjects, "{name}");
+    }
+}
+
+#[tokio::test]
 async fn connecting_a_manager_purges_pre_tenant_keys_only() {
     let _serial = SERIAL.lock().await;
     let Some(url) = common::nats_url().await else {
