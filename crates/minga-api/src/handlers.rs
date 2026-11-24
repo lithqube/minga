@@ -2003,12 +2003,7 @@ pub async fn create_service(
     app.store
         .upsert_service(svc.clone())
         .await
-        .map_err(|error| match error {
-            minga_state::StateError::PortConflict(_) => {
-                conflict("published port conflicts with another cluster service")
-            }
-            other => ApiError::from(other),
-        })?;
+        .map_err(ApiError::from)?;
 
     tracing::info!(tenant = %tenant_id, service = %svc.id, image = %svc.image, "service created via API");
 
@@ -2162,12 +2157,7 @@ pub async fn update_service(
     app.store
         .upsert_service(svc.clone())
         .await
-        .map_err(|error| match error {
-            minga_state::StateError::PortConflict(_) => {
-                conflict("published port conflicts with another cluster service")
-            }
-            other => ApiError::from(other),
-        })?;
+        .map_err(ApiError::from)?;
 
     tracing::info!(tenant = %tenant_id, service = %svc.id, "service updated via API");
 
@@ -4440,6 +4430,56 @@ mod tests {
         assert!(
             matches!(&err, ApiError::Conflict(m) if m == "ingress port is reserved on a cluster node"),
             "expected the reserved-port conflict, got {err:?}"
+        );
+    }
+
+    /// import_state uses `?` to propagate store errors, so `From<StateError>` owns the
+    /// message. Confirm it returns the fixed generic string — not the inner service-ID
+    /// message produced by `published_port_conflict` — when a port collision occurs.
+    #[tokio::test]
+    async fn import_port_conflict_returns_generic_message() {
+        let (app, _dir) = app_with_node(1.0).await;
+
+        // Plant a service on port 9090 via the store directly (bypasses placement checks
+        // that need a node with capacity; we only need a stored port reservation).
+        let existing = ingress_service("default", 9090);
+        app.store.upsert_service(existing.clone()).await.unwrap();
+
+        // Build a snapshot with a *different* service claiming the same port.
+        let mut conflicting = ingress_service("default", 9090);
+        conflicting.id = "svc-conflicting".to_owned();
+        conflicting.name = "svc-conflicting".to_owned();
+        let snapshot = serde_json::to_value(minga_state::StateSnapshot {
+            format_version: minga_state::codec::FORMAT_VERSION,
+            exported_at_unix: 0,
+            tenants: vec![],
+            services: vec![conflicting],
+            networks: vec![],
+            volumes: vec![],
+            secrets: vec![],
+            configs: vec![],
+        })
+        .unwrap();
+
+        let err = import_state(
+            State(app.clone()),
+            default_caller(),
+            Query(ImportQuery { overwrite: true }),
+            Json(snapshot),
+        )
+        .await
+        .unwrap_err();
+
+        // Must be a 409 Conflict with the exact generic string.
+        assert!(
+            matches!(&err, ApiError::Conflict(m) if m == "published port conflicts with another cluster service"),
+            "import port-conflict must return the generic message, got {err:?}"
+        );
+        // The message must not contain any service ID.
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("svc-"),
+            "message must not name a service ID, got {msg:?}"
         );
     }
 }
