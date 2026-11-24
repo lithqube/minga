@@ -224,9 +224,25 @@ jobs:
       - name: Checksums
         run: cd dist && sha256sum minga-*.tar.gz > SHA256SUMS && cat SHA256SUMS
 
+      - name: Resolve release notes
+        id: notes
+        run: |
+          # Derive major.minor from the tag, e.g. v1.3.0-rc.1 → 1.3
+          tag="${GITHUB_REF_NAME#v}"
+          major_minor=$(echo "$tag" | cut -d. -f1,2)
+          notes_file="docs/release-${major_minor}.0.md"
+          if [ -f "$notes_file" ]; then
+            cp "$notes_file" release-notes-body.md
+          else
+            : > release-notes-body.md
+          fi
+
       - name: Upload release assets
         uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3
         with:
+          # body_path prepends the upgrade notes above the auto-generated PR
+          # list; generate_release_notes appends the changelog section after.
+          body_path: release-notes-body.md
           generate_release_notes: true
           # Stable tags publish the versioned image, major.minor, and latest.
           prerelease: ${{ contains(github.ref_name, '-') }}
