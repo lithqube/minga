@@ -895,8 +895,16 @@ impl Supervisor {
             // Detect dropped chunks: if the first surviving chunk has seq >
             // cursor + 1, some chunks were evicted before we published them.
             // Log the gap exactly once (not once per chunk) and advance past it.
+            //
+            // The original guard `*cursor > 0` suppressed the warning when
+            // cursor == 0, missing gaps on the very first reconcile of an
+            // already-overflowed ring.  The correct condition is: a gap exists
+            // when the first surviving chunk is above the next expected seq —
+            // i.e. `first.seq > cursor + 1`.  For cursor == 0 that means
+            // first.seq > 1, which correctly stays silent for a fresh ring
+            // whose first-ever chunk carries seq 1 (nothing evicted).
             if let Some(first) = chunks.first() {
-                if first.seq > *cursor + 1 && *cursor > 0 {
+                if first.seq > *cursor + 1 {
                     let dropped = first.seq - *cursor - 1;
                     tracing::warn!(
                         task = %task_id,
@@ -2687,6 +2695,129 @@ mod assignment_tests {
             gap_warn_count.load(Ordering::SeqCst),
             2,
             "second distinct gap: gap-warn must fire exactly once more (total 2)"
+        );
+    }
+
+    // --- AC4: first reconcile on an already-overflowed ring counts the gap ---
+
+    /// Before the fix: cursor == 0 and `*cursor > 0` is false, so the gap is
+    /// never counted.  This test MUST FAIL before the fix and PASS after.
+    ///
+    /// Setup: ring was written and overflowed before the first reconcile.
+    /// Only seqs 5..=9 survive.  Cursor is 0 (nothing published yet).
+    /// Expected: gap-warn fires exactly once (4 chunks dropped), all 5
+    /// surviving chunks ship.  A second reconcile with the same ring data must
+    /// NOT fire the warn again.
+    #[tokio::test]
+    async fn first_reconcile_on_overflowed_ring_counts_gap() {
+        use crate::runtime::ContainerLog;
+        use crate::runtime::LogStream as RtStream;
+
+        let gap_warn_count = Arc::new(AtomicUsize::new(0));
+        let subscriber = tracing_subscriber::registry().with(WarnCounter {
+            count: gap_warn_count.clone(),
+            target: "gap counted",
+        });
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let (supervisor, runtime, bus) = setup(7).await;
+        write_assignment(&bus, &assignment("task-1")).await;
+
+        // The MockRuntime assigns IDs as "mock-{:04}" starting at counter=1.
+        // Inject the overflowed ring BEFORE the first reconcile so that when
+        // stream_logs runs for the first time the cursor is 0 and the ring has
+        // already overflowed.  Container ID is predictable: "mock-0001".
+        let container_id = "mock-0001".to_string();
+        // Ring already overflowed: seqs 1..=4 were evicted, only 5..=9 survive.
+        let overflowed: Vec<ContainerLog> = (5u64..=9)
+            .map(|s| ContainerLog {
+                stream: RtStream::Stdout,
+                data: format!("chunk-{s}\n").into_bytes(),
+                seq: s,
+            })
+            .collect();
+        runtime
+            .injected_logs
+            .lock()
+            .unwrap()
+            .insert(container_id.clone(), overflowed.clone());
+
+        // First reconcile: creates the container and calls stream_logs.
+        // cursor == 0, first.seq == 5 → 4 dropped chunks.
+        // AC4: gap-warn MUST fire exactly once.
+        supervisor.reconcile_once().await.unwrap();
+        let after_first = bus
+            .tenant_log_history("default", "task-1", 0)
+            .await
+            .unwrap()
+            .len();
+        assert_eq!(after_first, 5, "all 5 surviving chunks must ship");
+        assert_eq!(
+            gap_warn_count.load(Ordering::SeqCst),
+            1,
+            "first reconcile on overflowed ring: gap-warn must fire exactly once"
+        );
+
+        // AC2 compatibility: second reconcile with the same ring must NOT
+        // re-fire the warn (cursor is now at 9, past the gap).
+        runtime
+            .injected_logs
+            .lock()
+            .unwrap()
+            .insert(container_id, overflowed);
+        supervisor.reconcile_once().await.unwrap();
+        assert_eq!(
+            gap_warn_count.load(Ordering::SeqCst),
+            1,
+            "same gap re-presented with cursor past it: gap-warn must NOT fire again"
+        );
+    }
+
+    // --- AC3: fresh ring whose first chunk is seq 1 produces no gap warning ---
+
+    /// A ring whose first (and only surviving) chunk carries seq 1 with a
+    /// cursor of 0 means nothing was evicted — the warn must stay silent.
+    #[tokio::test]
+    async fn fresh_ring_no_gap_warning_ac3() {
+        use crate::runtime::ContainerLog;
+        use crate::runtime::LogStream as RtStream;
+
+        let gap_warn_count = Arc::new(AtomicUsize::new(0));
+        let subscriber = tracing_subscriber::registry().with(WarnCounter {
+            count: gap_warn_count.clone(),
+            target: "gap counted",
+        });
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let (supervisor, runtime, bus) = setup(7).await;
+        write_assignment(&bus, &assignment("task-1")).await;
+
+        // Inject seq=1 before the first reconcile so cursor is 0 when
+        // stream_logs first runs — this is the "fresh ring, nothing evicted" case.
+        // Container ID is predictable: mock-0001.
+        let fresh: Vec<ContainerLog> = vec![ContainerLog {
+            stream: RtStream::Stdout,
+            data: b"hello\n".to_vec(),
+            seq: 1,
+        }];
+        runtime
+            .injected_logs
+            .lock()
+            .unwrap()
+            .insert("mock-0001".to_string(), fresh);
+
+        // First reconcile: cursor==0, first.seq==1 → 1 > 0+1 is false → no gap.
+        supervisor.reconcile_once().await.unwrap();
+        let count = bus
+            .tenant_log_history("default", "task-1", 0)
+            .await
+            .unwrap()
+            .len();
+        assert_eq!(count, 1, "single fresh chunk must ship");
+        assert_eq!(
+            gap_warn_count.load(Ordering::SeqCst),
+            0,
+            "fresh ring with seq==1 and cursor==0: gap-warn must NOT fire"
         );
     }
 }
