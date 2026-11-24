@@ -34,6 +34,7 @@
 //! ```
 
 pub mod constraints;
+mod isolation;
 pub mod netassign;
 pub mod placement;
 pub mod reconcile;
@@ -55,7 +56,10 @@ use minga_state::types::{
 use minga_state::{StateError, StateStore};
 use thiserror::Error;
 
+use isolation::Isolation;
+
 pub use constraints::{evaluate, matches_str, parse_constraint, Constraint, ConstraintOp};
+pub use isolation::{Stage, TenantError};
 pub use placement::{check_placeable, place_service, PlacementError};
 pub use reconcile::{plan, ReconcileAction};
 pub use translate::{
@@ -76,6 +80,12 @@ pub enum SchedulerError {
     Serialization(String),
     #[error("node ID {0} has no address in the WireGuard mesh subnet")]
     MeshAddressUnavailable(u64),
+}
+
+impl From<minga_bus::BusError> for SchedulerError {
+    fn from(error: minga_bus::BusError) -> Self {
+        Self::Bus(error.to_string())
+    }
 }
 
 /// Merges current task status from MINGA_STATUS with Raft's desired task record.
@@ -175,7 +185,7 @@ impl Scheduler {
             .scheduler_reconcile_duration_seconds
             .start_timer();
 
-        let services = self.state.list_services().await?;
+        let mut services = self.state.list_services().await?;
         let mut tasks = self.state.list_tasks().await?;
         let mut nodes = self.state.list_nodes().await?;
         if let Some(bus) = &self.bus {
@@ -219,31 +229,43 @@ impl Scheduler {
             }
             nodes.retain(|node| live_nodes.contains(&node.id));
         }
-        validate_manager_endpoints(&nodes)?;
+        // Everything below is per tenant: an error is recorded against the
+        // tenant it belongs to, which is then left out of the rest of the
+        // pass (see `isolation`). Only the cluster-level steps above, which
+        // read Raft state and the node leases, end the pass for everyone.
+        let mut isolation = Isolation::default();
+        let mut nodes = audit_nodes(nodes, &mut isolation);
         let tenants = self.state.list_tenants().await?;
         let tenant_ids: Vec<_> = tenants.iter().map(|tenant| tenant.id.clone()).collect();
+        let mut statuses = HashMap::new();
         if let Some(bus) = &self.bus {
-            let (statuses, joined) = match read_task_statuses(bus.as_ref(), &tenant_ids).await {
-                Ok(statuses) => statuses,
-                Err(error) => {
-                    tracing::warn!(error = %error, "cannot read task status; skipping reconciliation");
-                    return Ok(Vec::new());
-                }
-            };
+            let (read, joined) =
+                read_task_statuses(bus.as_ref(), &tenant_ids, &mut isolation).await;
+            statuses = read;
             tasks = overlay_task_statuses(tasks, &statuses);
             // A live lease alone does not admit a non-default node: until a
             // manager accepted its join token it gets no tasks and no peers.
+            // A tenant whose status could not be read has no join records to
+            // check, so its nodes stay out as well rather than being admitted
+            // unchecked.
             nodes.retain(|node| {
                 node.tenant_id == minga_state::types::DEFAULT_TENANT_ID
                     || joined.get(&node.id) == Some(&node.tenant_id)
             });
         }
         let mut networks = self.state.list_networks().await?;
-        self.fill_subnets(&mut networks, &tasks).await?;
+        self.fill_subnets(&mut networks, &tasks, &mut isolation)
+            .await;
 
+        // A tenant that failed so far is not planned: its status or subnets
+        // are unknown, and planning on them would place its tasks again.
+        services.retain(|service| !isolation.has_failed(&service.tenant_id));
+        tasks.retain(|task| !isolation.has_failed(&task.tenant_id));
+        networks.retain(|network| !isolation.has_failed(&network.tenant_id));
         let placement_nodes: Vec<_> = nodes
             .iter()
             .filter(|node| tenants.len() < 2 || node.role != NodeRole::Manager)
+            .filter(|node| !isolation.has_failed(&node.tenant_id))
             .cloned()
             .collect();
         let actions = plan(
@@ -258,122 +280,147 @@ impl Scheduler {
         // supernet is full) cannot give a task an IP, and a task created
         // without one keeps none while it stays on its node. Wait for the
         // subnet and plan the task again on a later pass.
-        let unsubnetted: std::collections::HashSet<&str> = networks
+        let unsubnetted: HashSet<&str> = networks
             .iter()
             .filter(|network| network.subnet.is_none())
             .map(|network| network.id.as_str())
             .collect();
         for action in &actions {
-            match action {
-                ReconcileAction::CreateTask(task)
-                    if services.iter().any(|service| {
-                        service.id == task.service_id
-                            && service.agent.is_none()
-                            && service
-                                .networks
-                                .iter()
-                                .any(|network| unsubnetted.contains(network.as_str()))
-                    }) =>
-                {
-                    tracing::warn!(
-                        task = %task.id,
-                        service = %task.service_id,
-                        "a network of the service has no subnet yet; not creating the task"
-                    );
-                }
-                ReconcileAction::CreateTask(task) => {
-                    tracing::info!(
-                        task = %task.id,
-                        service = %task.service_id,
-                        node = task.node_id,
-                        "creating task"
-                    );
-                    if let Err(error) = self.state.upsert_task(task.as_ref().clone()).await {
-                        skip_quota_error(error, &task.service_id)?;
-                        continue;
-                    }
-                    minga_telemetry::METRICS
-                        .scheduler_placement_decisions_total
-                        .with_label_values(&["placed"])
-                        .inc();
-                }
-                ReconcileAction::RollbackService(service_id) => {
-                    let Some(current) = services.iter().find(|s| &s.id == service_id) else {
-                        continue;
-                    };
-                    let Some(previous) = current.previous.clone() else {
-                        continue;
-                    };
-                    // An agent with an egress policy would run without its
-                    // route policy: drop the rollback target and keep the
-                    // current spec instead.
-                    if let Err(reason) = previous.check_agent_egress() {
-                        tracing::warn!(service = %service_id, reason, "rollout failed; refusing to roll back");
-                        let kept = Service {
-                            previous: None,
-                            ..current.clone()
-                        };
-                        if let Err(error) = self.state.upsert_service(kept).await {
-                            skip_quota_error(error, service_id)?;
-                        }
-                        continue;
-                    }
-                    tracing::warn!(service = %service_id, "rollout failed, rolling back");
-                    let mut rolled_back = *previous;
-                    rolled_back.rollback = current.rollback;
-                    if let Some(rollback_policy) = &current.rollback {
-                        rolled_back.update = *rollback_policy;
-                    }
-                    if let Err(error) = self.state.upsert_service(rolled_back).await {
-                        skip_quota_error(error, service_id)?;
-                    }
-                }
-                ReconcileAction::SettleService(service_id) => {
-                    let Some(service) = services.iter().find(|s| &s.id == service_id) else {
-                        continue;
-                    };
-                    tracing::info!(service = %service_id, "rollout settled");
-                    let settled = Service {
-                        previous: None,
-                        ..service.clone()
-                    };
-                    if let Err(error) = self.state.upsert_service(settled).await {
-                        skip_quota_error(error, service_id)?;
-                    }
-                }
-                ReconcileAction::RemoveTask { task_id, .. } => {
-                    let Some(task) = tasks.iter().find(|task| &task.id == task_id) else {
-                        continue;
-                    };
-                    tracing::info!(task = %task_id, "removing task");
-                    self.state
-                        .remove_task(task_id.clone(), &task.tenant_id)
-                        .await?;
-                }
+            let Some(tenant_id) = action_tenant(action, &services, &tasks) else {
+                continue;
+            };
+            if isolation.has_failed(tenant_id) {
+                continue;
+            }
+            if let Err(error) = self
+                .apply_action(action, &services, &tasks, &unsubnetted)
+                .await
+            {
+                isolation.fail(tenant_id, Stage::Placement, error);
             }
         }
 
-        self.publish_projection(&nodes).await?;
+        self.publish_projection(&nodes, &statuses, &mut isolation)
+            .await?;
         Ok(actions)
     }
 
-    async fn publish_projection(&self, nodes: &[ClusterNode]) -> Result<(), SchedulerError> {
+    /// Applies one planned action to the state store.
+    async fn apply_action(
+        &self,
+        action: &ReconcileAction,
+        services: &[Service],
+        tasks: &[Task],
+        unsubnetted: &HashSet<&str>,
+    ) -> Result<(), StateError> {
+        match action {
+            ReconcileAction::CreateTask(task)
+                if services.iter().any(|service| {
+                    service.id == task.service_id
+                        && service.agent.is_none()
+                        && service
+                            .networks
+                            .iter()
+                            .any(|network| unsubnetted.contains(network.as_str()))
+                }) =>
+            {
+                tracing::warn!(
+                    task = %task.id,
+                    service = %task.service_id,
+                    "a network of the service has no subnet yet; not creating the task"
+                );
+            }
+            ReconcileAction::CreateTask(task) => {
+                tracing::info!(
+                    task = %task.id,
+                    service = %task.service_id,
+                    node = task.node_id,
+                    "creating task"
+                );
+                if let Err(error) = self.state.upsert_task(task.as_ref().clone()).await {
+                    return skip_quota_error(error, &task.service_id);
+                }
+                minga_telemetry::METRICS
+                    .scheduler_placement_decisions_total
+                    .with_label_values(&["placed"])
+                    .inc();
+            }
+            ReconcileAction::RollbackService(service_id) => {
+                let Some(current) = services.iter().find(|s| &s.id == service_id) else {
+                    return Ok(());
+                };
+                let Some(previous) = current.previous.clone() else {
+                    return Ok(());
+                };
+                // An agent with an egress policy would run without its
+                // route policy: drop the rollback target and keep the
+                // current spec instead.
+                if let Err(reason) = previous.check_agent_egress() {
+                    tracing::warn!(service = %service_id, reason, "rollout failed; refusing to roll back");
+                    let kept = Service {
+                        previous: None,
+                        ..current.clone()
+                    };
+                    return match self.state.upsert_service(kept).await {
+                        Err(error) => skip_quota_error(error, service_id),
+                        Ok(()) => Ok(()),
+                    };
+                }
+                tracing::warn!(service = %service_id, "rollout failed, rolling back");
+                let mut rolled_back = *previous;
+                rolled_back.rollback = current.rollback;
+                if let Some(rollback_policy) = &current.rollback {
+                    rolled_back.update = *rollback_policy;
+                }
+                if let Err(error) = self.state.upsert_service(rolled_back).await {
+                    return skip_quota_error(error, service_id);
+                }
+            }
+            ReconcileAction::SettleService(service_id) => {
+                let Some(service) = services.iter().find(|s| &s.id == service_id) else {
+                    return Ok(());
+                };
+                tracing::info!(service = %service_id, "rollout settled");
+                let settled = Service {
+                    previous: None,
+                    ..service.clone()
+                };
+                if let Err(error) = self.state.upsert_service(settled).await {
+                    return skip_quota_error(error, service_id);
+                }
+            }
+            ReconcileAction::RemoveTask { task_id, .. } => {
+                let Some(task) = tasks.iter().find(|task| &task.id == task_id) else {
+                    return Ok(());
+                };
+                tracing::info!(task = %task_id, "removing task");
+                self.state
+                    .remove_task(task_id.clone(), &task.tenant_id)
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Publishes every tenant's assignments, then sweeps stale keys.
+    ///
+    /// The pass first stages what each tenant should have (pure, no bus
+    /// calls), then writes tenant by tenant. A tenant that failed anywhere in
+    /// the pass is not written and its keys are not swept: what is on the bus
+    /// for it stays as the last good pass left it.
+    async fn publish_projection(
+        &self,
+        nodes: &[ClusterNode],
+        statuses: &HashMap<(String, String), TaskStatusReport>,
+        isolation: &mut Isolation,
+    ) -> Result<(), SchedulerError> {
         let Some(bus) = &self.bus else {
             return Ok(());
         };
         let services = self.state.list_services().await?;
         // Stored task state lags the nodes' reports; without the overlay a
         // replica reported Failed would stay an ingress backend.
-        let tenants = self.state.list_tenants().await?;
-        let tenant_ids: Vec<_> = tenants.iter().map(|tenant| tenant.id.clone()).collect();
-        let (statuses, _) = match read_task_statuses(bus.as_ref(), &tenant_ids).await {
-            Ok(statuses) => statuses,
-            Err(error) => {
-                tracing::warn!(error = %error, "cannot read task status; skipping projection");
-                return Ok(());
-            }
-        };
-        let tasks = overlay_task_statuses(self.state.list_tasks().await?, &statuses);
+        let tasks = overlay_task_statuses(self.state.list_tasks().await?, statuses);
         let networks = self.state.list_networks().await?;
         let live_node_ids: HashSet<_> = nodes.iter().map(|node| node.id).collect();
         let service_by_id: HashMap<_, _> = services
@@ -392,7 +439,7 @@ impl Scheduler {
         // may differ in `host_ip`. [`narrower`] merges them without depending
         // on task order.
         let mut ingress_backends: HashMap<(String, u16, String), HostBackends> = HashMap::new();
-        let mut desired = HashSet::new();
+        let mut staged = Staged::default();
         for task in &tasks {
             let Some(service) = service_by_id.get(task.service_id.as_str()) else {
                 continue;
@@ -424,13 +471,12 @@ impl Scheduler {
                 spec: task.spec.clone(),
                 networks: task_networks,
             };
-            let key = subjects::kv_assignment_task(&task.tenant_id, task.node_id, &task.id);
-            let value = minga_state::codec::encode_wire(&assignment)
-                .map_err(|error| SchedulerError::Serialization(error.to_string()))?;
-            bus.put_assignment(&key, &value)
-                .await
-                .map_err(|error| SchedulerError::Bus(error.to_string()))?;
-            desired.insert(key);
+            staged.put(
+                isolation,
+                &task.tenant_id,
+                subjects::kv_assignment_task(&task.tenant_id, task.node_id, &task.id),
+                &assignment,
+            );
             for (network_id, ip) in &task.spec.ips {
                 if network_by_id
                     .get(network_id.as_str())
@@ -491,6 +537,10 @@ impl Scheduler {
             });
         }
         for node in nodes {
+            // Node records without a mesh address were left out up front.
+            let Ok(source_overlay_ip) = minga_net::overlay::mesh_node_ip(node.id) else {
+                continue;
+            };
             for ((tenant_id, published, protocol), (host_ip, backends)) in &ingress_backends {
                 if node.tenant_id != *tenant_id {
                     continue;
@@ -500,20 +550,14 @@ impl Scheduler {
                     published: *published,
                     protocol: protocol.clone(),
                     backends: backends.clone(),
-                    source_overlay_ip: Some(
-                        minga_net::overlay::mesh_node_ip(node.id)
-                            .map_err(|_| SchedulerError::MeshAddressUnavailable(node.id))?
-                            .to_string(),
-                    ),
+                    source_overlay_ip: Some(source_overlay_ip.to_string()),
                 };
-                let key =
-                    subjects::kv_assignment_ingress(&node.tenant_id, node.id, *published, protocol);
-                let value = minga_state::codec::encode_wire(&assignment)
-                    .map_err(|error| SchedulerError::Serialization(error.to_string()))?;
-                bus.put_assignment(&key, &value)
-                    .await
-                    .map_err(|error| SchedulerError::Bus(error.to_string()))?;
-                desired.insert(key);
+                staged.put(
+                    isolation,
+                    &node.tenant_id,
+                    subjects::kv_assignment_ingress(&node.tenant_id, node.id, *published, protocol),
+                    &assignment,
+                );
             }
         }
         // Each network goes only to the nodes that run one of its tasks, so a
@@ -524,43 +568,81 @@ impl Scheduler {
                 .unwrap_or_default();
             let task_nodes: std::collections::BTreeSet<_> =
                 dns_tasks.iter().map(|task| task.node_id).collect();
-            let value = minga_state::codec::encode_wire(&NetworkAssignment {
-                tasks: dns_tasks,
-                network: network.clone(),
-            })
-            .map_err(|error| SchedulerError::Serialization(error.to_string()))?;
+            let Some(value) = staged.encode(
+                isolation,
+                &network.tenant_id,
+                &NetworkAssignment {
+                    tasks: dns_tasks,
+                    network: network.clone(),
+                },
+            ) else {
+                continue;
+            };
             for node_id in task_nodes {
-                let key = subjects::kv_assignment_network(&network.tenant_id, node_id, &network.id);
-                desired.insert(key.clone());
-                bus.put_assignment(&key, &value)
-                    .await
-                    .map_err(|error| SchedulerError::Bus(error.to_string()))?;
+                staged.push(
+                    &network.tenant_id,
+                    subjects::kv_assignment_network(&network.tenant_id, node_id, &network.id),
+                    value.clone(),
+                );
             }
         }
-        let peer_sets = build_wireguard_peer_sets(nodes, &tasks, &networks, &self.supernet)?;
+        let PeerSets {
+            by_node: peer_sets,
+            unrelayable,
+        } = build_wireguard_peer_sets(nodes, &tasks, &networks, &self.supernet);
+        for tenant_id in unrelayable {
+            isolation.fail(
+                &tenant_id,
+                Stage::Projection,
+                SchedulerError::RelayManagerUnavailable,
+            );
+        }
         for node in nodes {
-            let key = format!("{}.node.{}.wg", node.tenant_id, node.id);
-            let value = minga_state::codec::encode_wire(
-                peer_sets
-                    .get(&node.id)
-                    .expect("peer set built for each live node"),
-            )
-            .map_err(|error| SchedulerError::Serialization(error.to_string()))?;
-            bus.put_assignment(&key, &value)
-                .await
-                .map_err(|error| SchedulerError::Bus(error.to_string()))?;
-            desired.insert(key);
+            let Some(peer_set) = peer_sets.get(&node.id) else {
+                continue;
+            };
+            staged.put(
+                isolation,
+                &node.tenant_id,
+                format!("{}.node.{}.wg", node.tenant_id, node.id),
+                peer_set,
+            );
         }
 
-        for (key, _) in bus
-            .list_assignments("")
-            .await
-            .map_err(|error| SchedulerError::Bus(error.to_string()))?
-        {
-            if !desired.contains(&key) {
-                bus.delete_assignment(&key)
-                    .await
-                    .map_err(|error| SchedulerError::Bus(error.to_string()))?;
+        for (tenant_id, writes) in &staged.by_tenant {
+            for (key, value) in writes {
+                if isolation.has_failed(tenant_id) {
+                    break;
+                }
+                if let Err(error) = bus.put_assignment(key, value).await {
+                    isolation.fail(tenant_id, Stage::Projection, error);
+                }
+            }
+        }
+
+        // Keys name their tenant first, and a tenant ID has no dot. A tenant
+        // that failed keeps every key it has. A listing that fails as a whole
+        // belongs to no tenant: the sweep waits for the next pass.
+        let desired: HashSet<&str> = staged
+            .by_tenant
+            .values()
+            .flatten()
+            .map(|(key, _)| key.as_str())
+            .collect();
+        match bus.list_assignments("").await {
+            Ok(existing) => {
+                for (key, _) in existing {
+                    let tenant_id = key.split('.').next().unwrap_or_default();
+                    if desired.contains(key.as_str()) || isolation.has_failed(tenant_id) {
+                        continue;
+                    }
+                    if let Err(error) = bus.delete_assignment(&key).await {
+                        isolation.fail(tenant_id, Stage::Sweep, error);
+                    }
+                }
+            }
+            Err(error) => {
+                tracing::warn!(%error, "cannot list assignments; skipping the sweep of stale keys");
             }
         }
         Ok(())
@@ -573,7 +655,8 @@ impl Scheduler {
         &self,
         networks: &mut [minga_state::types::Network],
         tasks: &[minga_state::types::Task],
-    ) -> Result<(), SchedulerError> {
+        isolation: &mut Isolation,
+    ) {
         let (changed, errors) = netassign::fill_subnets(networks, tasks, &self.supernet);
         for e in errors {
             tracing::error!(error = %e, "cannot assign a network subnet");
@@ -592,7 +675,12 @@ impl Scheduler {
                     tracing::warn!(network = %net.id, "assigned subnet was taken meanwhile; retrying next pass");
                     networks[i].subnet = None;
                 }
-                Err(error) => return Err(error.into()),
+                // Any other refusal is the network's tenant's alone. Its
+                // tasks wait, with no subnet planned from the unstored one.
+                Err(error) => {
+                    networks[i].subnet = None;
+                    isolation.fail(&net.tenant_id, Stage::Subnet, error);
+                }
             }
         }
         let mut reported = self.reported.lock().unwrap_or_else(|e| e.into_inner());
@@ -630,7 +718,6 @@ impl Scheduler {
                 }
             }
         }
-        Ok(())
     }
 
     /// Runs the reconcile loop forever, sleeping `interval` between passes.
@@ -680,58 +767,159 @@ fn skip_quota_error(error: StateError, service_id: &str) -> Result<(), StateErro
     }
 }
 
-fn validate_manager_endpoints(nodes: &[ClusterNode]) -> Result<(), SchedulerError> {
-    if nodes.len() > 1
-        && nodes.iter().any(|node| {
-            node.role == NodeRole::Manager
+/// Leaves out the node records the projection cannot represent, and freezes
+/// their tenants: a manager of a multi-node cluster without a usable
+/// WireGuard endpoint (workers could not reach it), and an ID with no address
+/// in the mesh subnet. Peers list every node, so a bad record is dropped for
+/// everyone, but only its own tenant fails.
+fn audit_nodes(nodes: Vec<ClusterNode>, isolation: &mut Isolation) -> Vec<ClusterNode> {
+    let multi_node = nodes.len() > 1;
+    nodes
+        .into_iter()
+        .filter(|node| {
+            let fault = if multi_node
+                && node.role == NodeRole::Manager
                 && node
                     .wg_endpoint
                     .as_deref()
                     .is_none_or(|endpoint| !minga_net::wireguard::validate_endpoint(endpoint))
+            {
+                Some(SchedulerError::ManagerEndpointUnavailable)
+            } else if minga_net::overlay::mesh_node_ip(node.id).is_err() {
+                Some(SchedulerError::MeshAddressUnavailable(node.id))
+            } else {
+                None
+            };
+            let Some(fault) = fault else {
+                return true;
+            };
+            isolation.fail(&node.tenant_id, Stage::Nodes, fault);
+            false
         })
-    {
-        return Err(SchedulerError::ManagerEndpointUnavailable);
-    }
-    Ok(())
+        .collect()
 }
 
-/// Reads the nodes' task reports from MINGA_STATUS, keyed by task ID. A report
-/// whose key does not match its own node and task is ignored.
-/// Task status reports, plus each node's joined tenant from the same listing.
+/// The tenant an action works for, or `None` when its service or task is gone.
+fn action_tenant<'a>(
+    action: &ReconcileAction,
+    services: &'a [Service],
+    tasks: &'a [Task],
+) -> Option<&'a str> {
+    match action {
+        ReconcileAction::CreateTask(task) => services
+            .iter()
+            .find(|service| service.id == task.service_id)
+            .map(|service| service.tenant_id.as_str()),
+        ReconcileAction::RollbackService(service_id)
+        | ReconcileAction::SettleService(service_id) => services
+            .iter()
+            .find(|service| &service.id == service_id)
+            .map(|service| service.tenant_id.as_str()),
+        ReconcileAction::RemoveTask { task_id, .. } => tasks
+            .iter()
+            .find(|task| &task.id == task_id)
+            .map(|task| task.tenant_id.as_str()),
+    }
+}
+
+/// What a pass will write to the assignment bucket, by owning tenant.
+#[derive(Default)]
+struct Staged {
+    by_tenant: std::collections::BTreeMap<String, Vec<(String, Vec<u8>)>>,
+}
+
+impl Staged {
+    /// Encodes `value`; a value that cannot be encoded fails its tenant.
+    fn encode<T: serde::Serialize + ?Sized>(
+        &self,
+        isolation: &mut Isolation,
+        tenant_id: &str,
+        value: &T,
+    ) -> Option<Vec<u8>> {
+        match minga_state::codec::encode_wire(value) {
+            Ok(bytes) => Some(bytes),
+            Err(error) => {
+                isolation.fail(
+                    tenant_id,
+                    Stage::Projection,
+                    SchedulerError::Serialization(error.to_string()),
+                );
+                None
+            }
+        }
+    }
+
+    fn push(&mut self, tenant_id: &str, key: String, value: Vec<u8>) {
+        self.by_tenant
+            .entry(tenant_id.to_owned())
+            .or_default()
+            .push((key, value));
+    }
+
+    fn put<T: serde::Serialize + ?Sized>(
+        &mut self,
+        isolation: &mut Isolation,
+        tenant_id: &str,
+        key: String,
+        value: &T,
+    ) {
+        if let Some(bytes) = self.encode(isolation, tenant_id, value) {
+            self.push(tenant_id, key, bytes);
+        }
+    }
+}
+
+/// Reads the nodes' task reports from MINGA_STATUS, keyed by tenant and task
+/// ID, plus each node's joined tenant from the same listing. A report whose
+/// key does not match its own node and task is ignored. Each tenant's bucket
+/// is read on its own: one that cannot be read fails that tenant and adds
+/// nothing, so its tasks must not be taken for tasks without a report.
 async fn read_task_statuses(
     bus: &dyn EventBus,
     tenant_ids: &[String],
-) -> minga_bus::Result<(
+    isolation: &mut Isolation,
+) -> (
     HashMap<(String, String), TaskStatusReport>,
     HashMap<u64, String>,
-)> {
+) {
     let mut statuses = HashMap::new();
     let mut joined = HashMap::new();
-    for (tenant_id, key, bytes) in bus.list_all_tenant_status(tenant_ids).await? {
-        if let Some(node_id) = key
-            .strip_prefix(subjects::NODE_JOIN_PREFIX)
-            .and_then(|id| id.parse::<u64>().ok())
-        {
-            if std::str::from_utf8(&bytes).ok() == Some(tenant_id.as_str()) {
-                joined.insert(node_id, tenant_id.clone());
+    for tenant_id in tenant_ids {
+        let entries = match bus.list_tenant_status(tenant_id).await {
+            Ok(entries) => entries,
+            Err(error) => {
+                isolation.fail(tenant_id, Stage::Status, error);
+                continue;
             }
-            continue;
-        }
-        // Manager bookkeeping such as node registration shares the bucket;
-        // any other key is decoded so a malformed report is still logged.
-        if key.starts_with("internal.") {
-            continue;
-        }
+        };
+        for (key, bytes) in entries {
+            if let Some(node_id) = key
+                .strip_prefix(subjects::NODE_JOIN_PREFIX)
+                .and_then(|id| id.parse::<u64>().ok())
+            {
+                if std::str::from_utf8(&bytes).ok() == Some(tenant_id.as_str()) {
+                    joined.insert(node_id, tenant_id.clone());
+                }
+                continue;
+            }
+            // Manager bookkeeping such as node registration shares the bucket;
+            // any other key is decoded so a malformed report is still logged.
+            if key.starts_with("internal.") {
+                continue;
+            }
 
-        match TaskStatusReport::from_bytes(&bytes) {
-            Ok(report) if key == subjects::kv_node_task_status(report.node_id, &report.task_id) => {
-                statuses.insert((tenant_id, report.task_id.clone()), report);
+            match TaskStatusReport::from_bytes(&bytes) {
+                Ok(report)
+                    if key == subjects::kv_node_task_status(report.node_id, &report.task_id) =>
+                {
+                    statuses.insert((tenant_id.clone(), report.task_id.clone()), report);
+                }
+                Ok(_) => {}
+                Err(error) => tracing::warn!(key, error = %error, "cannot decode task status"),
             }
-            Ok(_) => {}
-            Err(error) => tracing::warn!(key, error = %error, "cannot decode task status"),
         }
     }
-    Ok((statuses, joined))
+    (statuses, joined)
 }
 
 fn overlay_task_statuses(
@@ -763,12 +951,28 @@ fn primary_task_ip(ips: &HashMap<String, String>) -> Option<(&str, &str)> {
         .map(|(network_id, ip)| (network_id.as_str(), ip.as_str()))
 }
 
+/// The WireGuard peer set of each node, and the tenants it cannot serve.
+struct PeerSets {
+    by_node: HashMap<u64, WireGuardPeerSet>,
+    /// Tenants with a network that needs the relay when no manager can relay.
+    unrelayable: std::collections::BTreeSet<String>,
+}
+
 fn build_wireguard_peer_sets(
     nodes: &[ClusterNode],
     tasks: &[Task],
     networks: &[Network],
     supernet: &minga_net::Cidr,
-) -> Result<HashMap<u64, WireGuardPeerSet>, SchedulerError> {
+) -> PeerSets {
+    // Peers are addressed by their mesh IP; a node without one cannot be a
+    // peer. The pass drops such records up front, so this only guards the
+    // indexing below.
+    let addressable: Vec<ClusterNode> = nodes
+        .iter()
+        .filter(|node| minga_net::overlay::mesh_node_ip(node.id).is_ok())
+        .cloned()
+        .collect();
+    let nodes = addressable.as_slice();
     let node_by_id: HashMap<_, _> = nodes.iter().map(|node| (node.id, node)).collect();
     let network_tenants: HashMap<_, _> = networks
         .iter()
@@ -813,12 +1017,12 @@ fn build_wireguard_peer_sets(
     };
     let mesh_node_ips: HashMap<_, _> = nodes
         .iter()
-        .map(|node| {
+        .filter_map(|node| {
             minga_net::overlay::mesh_node_ip(node.id)
+                .ok()
                 .map(|address| (node.id, address.to_string()))
-                .map_err(|_| SchedulerError::MeshAddressUnavailable(node.id))
         })
-        .collect::<Result<_, _>>()?;
+        .collect();
     let mut ingress_network_ids = HashSet::new();
     let mut ingress_task_ips: HashMap<u64, HashMap<String, Vec<String>>> = HashMap::new();
     if nodes.len() > 1 {
@@ -901,30 +1105,38 @@ fn build_wireguard_peer_sets(
                 .insert(node.id);
         }
     }
-    let relay_network_ids: HashSet<String> = nat_workers_by_network
+    let mut relay_network_ids: HashSet<String> = nat_workers_by_network
         .into_iter()
         .filter_map(|(network_id, workers)| (workers.len() > 1).then(|| network_id.to_owned()))
         .collect();
 
+    let mut unrelayable = std::collections::BTreeSet::new();
     let home_manager = if relay_network_ids.is_empty() {
         None
     } else {
-        Some(
-            nodes
-                .iter()
-                .filter(|node| {
-                    node.role == NodeRole::Manager
-                        && node.status == NodeStatus::Active
-                        && node.wg_public_key.is_some()
-                        && node
-                            .wg_endpoint
-                            .as_deref()
-                            .is_some_and(minga_net::wireguard::validate_endpoint)
-                })
-                .map(|node| node.id)
-                .min()
-                .ok_or(SchedulerError::RelayManagerUnavailable)?,
-        )
+        let manager = nodes
+            .iter()
+            .filter(|node| {
+                node.role == NodeRole::Manager
+                    && node.status == NodeStatus::Active
+                    && node.wg_public_key.is_some()
+                    && node
+                        .wg_endpoint
+                        .as_deref()
+                        .is_some_and(minga_net::wireguard::validate_endpoint)
+            })
+            .map(|node| node.id)
+            .min();
+        if manager.is_none() {
+            // No manager can relay, so the tenants that need it fail; the
+            // others have no relay network and are served as usual.
+            unrelayable.extend(
+                relay_network_ids
+                    .drain()
+                    .filter_map(|id| network_tenants.get(id.as_str()).map(|t| (*t).to_owned())),
+            );
+        }
+        manager
     };
 
     let mut peer_sets = HashMap::with_capacity(nodes.len());
@@ -1105,7 +1317,10 @@ fn build_wireguard_peer_sets(
             },
         );
     }
-    Ok(peer_sets)
+    PeerSets {
+        by_node: peer_sets,
+        unrelayable,
+    }
 }
 
 #[cfg(test)]
@@ -1164,14 +1379,18 @@ mod subnet_race_tests {
         let scheduler = Scheduler::new(store.clone());
 
         let mut stale = vec![network("late", None)];
-        scheduler.fill_subnets(&mut stale, &[]).await.unwrap();
+        scheduler
+            .fill_subnets(&mut stale, &[], &mut Isolation::default())
+            .await;
         assert_eq!(stale[0].subnet, None, "the refused subnet is still planned");
         let stored = store.get_network("late").await.unwrap().unwrap();
         assert_eq!(stored.subnet, None, "the refused subnet was stored");
 
         // The retry reads current state and picks a free /24.
         let mut fresh = store.list_networks().await.unwrap();
-        scheduler.fill_subnets(&mut fresh, &[]).await.unwrap();
+        scheduler
+            .fill_subnets(&mut fresh, &[], &mut Isolation::default())
+            .await;
         let stored = store.get_network("late").await.unwrap().unwrap();
         assert_eq!(stored.subnet.as_deref(), Some("10.100.1.0/24"));
         drop(scheduler);

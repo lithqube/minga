@@ -76,6 +76,11 @@ pub struct MemoryBus {
     usage_ids: Mutex<HashSet<(String, String)>>,
     /// Tenants whose bus resources were configured and not yet deleted.
     tenant_resources: Mutex<HashSet<String>>,
+    /// Tenants whose status listing fails, set by [`MemoryBus::fail_tenant`].
+    failing_status: Mutex<HashSet<String>>,
+    /// Tenants whose assignment writes fail, set by [`MemoryBus::fail_tenant`]
+    /// or [`MemoryBus::fail_tenant_assignments`].
+    failing_assignments: Mutex<HashSet<String>>,
 }
 struct Lease {
     refreshed_at: Instant,
@@ -120,7 +125,56 @@ impl MemoryBus {
             tenant_api_requests: Mutex::new(HashMap::new()),
             usage: Mutex::new(Vec::new()),
             usage_ids: Mutex::new(HashSet::new()),
+            failing_status: Mutex::new(HashSet::new()),
+            failing_assignments: Mutex::new(HashSet::new()),
         })
+    }
+
+    /// Makes every status listing and assignment write or delete of one tenant
+    /// fail with a KV error, as a JetStream fault on that tenant's buckets
+    /// would, until [`MemoryBus::heal_tenant`]. Other tenants are unaffected.
+    pub fn fail_tenant(&self, tenant_id: &str) {
+        self.failing_status
+            .lock()
+            .unwrap()
+            .insert(tenant_id.to_owned());
+        self.fail_tenant_assignments(tenant_id);
+    }
+
+    /// Like [`MemoryBus::fail_tenant`], but only the tenant's assignment writes
+    /// and deletes fail; its status still reads.
+    pub fn fail_tenant_assignments(&self, tenant_id: &str) {
+        self.failing_assignments
+            .lock()
+            .unwrap()
+            .insert(tenant_id.to_owned());
+    }
+
+    /// Ends the faults set for a tenant.
+    pub fn heal_tenant(&self, tenant_id: &str) {
+        self.failing_status.lock().unwrap().remove(tenant_id);
+        self.failing_assignments.lock().unwrap().remove(tenant_id);
+    }
+
+    fn check_status_fault(&self, tenant_id: &str) -> Result<()> {
+        Self::check_fault(&self.failing_status, tenant_id)
+    }
+
+    fn check_assignment_fault(&self, key: &str) -> Result<()> {
+        // Assignment keys start with the tenant, and a tenant ID has no dot.
+        Self::check_fault(
+            &self.failing_assignments,
+            key.split('.').next().unwrap_or_default(),
+        )
+    }
+
+    fn check_fault(failing: &Mutex<HashSet<String>>, tenant_id: &str) -> Result<()> {
+        if failing.lock().unwrap().contains(tenant_id) {
+            return Err(BusError::Kv(format!(
+                "injected fault for tenant {tenant_id}"
+            )));
+        }
+        Ok(())
     }
     /// Account JWTs accepted by the in-memory resolver simulation.
     pub fn account_claim_updates(&self) -> Vec<String> {
@@ -325,6 +379,7 @@ impl EventBus for MemoryBus {
         Ok(())
     }
     async fn put_assignment(&self, key: &str, value: &[u8]) -> Result<()> {
+        self.check_assignment_fault(key)?;
         self.assignments
             .lock()
             .unwrap()
@@ -353,6 +408,7 @@ impl EventBus for MemoryBus {
     }
 
     async fn delete_assignment(&self, key: &str) -> Result<()> {
+        self.check_assignment_fault(key)?;
         let removed = self.assignments.lock().unwrap().remove(key);
         if removed.is_some() {
             let _ = self.assignment_tx.send(KvEvent {
@@ -440,6 +496,7 @@ impl EventBus for MemoryBus {
 
     async fn list_tenant_status(&self, tenant_id: &str) -> Result<Vec<(String, Vec<u8>)>> {
         validate_tenant_id(tenant_id)?;
+        self.check_status_fault(tenant_id)?;
         Ok(self
             .tenant_status
             .lock()
@@ -456,6 +513,7 @@ impl EventBus for MemoryBus {
     ) -> Result<Vec<(String, String, Vec<u8>)>> {
         for tenant in tenant_ids {
             validate_tenant_id(tenant)?;
+            self.check_status_fault(tenant)?;
         }
         let allowed: HashSet<&str> = tenant_ids.iter().map(String::as_str).collect();
         Ok(self
