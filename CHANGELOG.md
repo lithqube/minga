@@ -5,6 +5,7 @@
 Changes on `main` after `v1.3.0-rc.1`. They go into 1.3.0.
 
 ### Changes
+- **Fix.** Adopting a container whose log FIFOs are only partly present no longer logs a false `log fifo open failed` error for the stream that never existed (#220). A reader is started for each FIFO that is actually on disk and its output published; the absent stream is reported at debug level. If the FIFOs vanish between the check and the open, no empty log ring is registered and no misleading "log readers started" line is logged.
 - **Compose `ports` host IPs work again (#162).** A port with `host_ip` (`127.0.0.1:8080:80`, `host_ip:` in the long syntax) is accepted by `minga validate` and published on that node address only. A port without one stays published on every node address.
   - A `host_ip` that is not an IP address is refused when the file loads.
   - `0.0.0.0` and `::` mean every address. An IPv6 address is carried and stored, but the node publishes through IPv4 rules only, so it logs a warning and does not publish that port (it is never widened to every address).

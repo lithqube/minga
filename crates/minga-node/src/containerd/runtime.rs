@@ -264,64 +264,134 @@ fn make_fifo(path: &std::path::Path) -> Result<(), std::io::Error> {
     }
 }
 
-/// Drains a FIFO into `ring` until aborted. Opened O_RDWR nonblocking so
-/// the open never blocks and reads never report EOF while containerd
-/// lazily opens the writer end.
-async fn fifo_reader(fifo: PathBuf, stream: LogStream, ring: Arc<LogRing>) {
-    use std::os::unix::io::AsRawFd;
+/// Returns the stdout and stderr FIFO paths that exist on disk for `container_id`
+/// under `logs_dir`. Each slot is `Some(path)` when the FIFO file is present and
+/// `None` when it is absent. The caller must only open paths that are `Some`.
+fn select_log_fifos(
+    logs_dir: &std::path::Path,
+    container_id: &str,
+) -> (Option<PathBuf>, Option<PathBuf>) {
+    let stdout = logs_dir.join(format!("{container_id}.stdout.fifo"));
+    let stderr = logs_dir.join(format!("{container_id}.stderr.fifo"));
+    (
+        stdout.exists().then_some(stdout),
+        stderr.exists().then_some(stderr),
+    )
+}
 
-    let file = match std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(&fifo)
-    {
-        Ok(f) => f,
+/// Opens each FIFO selected by `select_log_fifos`. A failed open is
+/// reported once and yields `None` for that slot. When selection saw at
+/// least one FIFO but every open fails — the FIFOs vanished between the
+/// existence check and the open — both slots come back `None`; the caller
+/// must then leave no log ring behind rather than register an empty one.
+fn establish_log_readers(
+    stdout_path: Option<PathBuf>,
+    stderr_path: Option<PathBuf>,
+    ring: &Arc<LogRing>,
+) -> (Option<EstablishedFifo>, Option<EstablishedFifo>) {
+    let stdout = stdout_path.and_then(|path| {
+        EstablishedFifo::open(path.clone(), LogStream::Stdout, ring.clone())
+            .map_err(|e| {
+                tracing::error!(fifo = %path.display(), error = %e, "log fifo open failed");
+            })
+            .ok()
+    });
+    let stderr = stderr_path.and_then(|path| {
+        EstablishedFifo::open(path.clone(), LogStream::Stderr, ring.clone())
+            .map_err(|e| {
+                tracing::error!(fifo = %path.display(), error = %e, "log fifo open failed");
+            })
+            .ok()
+    });
+    (stdout, stderr)
+}
+
+/// A log FIFO opened O_RDWR nonblocking and registered with the async
+/// reactor, ready to be drained into `ring`. Opened read+write so the open
+/// never blocks and reads never report EOF while containerd lazily opens
+/// the writer end. The open is split from the drain so the caller can
+/// establish each reader before committing to the long-running task: a
+/// FIFO that vanishes between the existence check and the open is
+/// reported by `open` instead of leaving an empty log ring behind.
+struct EstablishedFifo {
+    fd: tokio::io::unix::AsyncFd<std::fs::File>,
+    fifo: PathBuf,
+    stream: LogStream,
+    ring: Arc<LogRing>,
+}
+
+impl EstablishedFifo {
+    fn open(fifo: PathBuf, stream: LogStream, ring: Arc<LogRing>) -> Result<Self, std::io::Error> {
+        use std::os::unix::io::AsRawFd;
+
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&fifo)?;
+        // SAFETY: fcntl on a valid fd.
+        unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) };
+        let fd = tokio::io::unix::AsyncFd::new(file)?;
+        Ok(Self {
+            fd,
+            fifo,
+            stream,
+            ring,
+        })
+    }
+
+    /// Drains the FIFO into the ring until a read error.
+    async fn run(self) {
+        use std::os::unix::io::AsRawFd;
+
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            let mut guard = match self.fd.readable().await {
+                Ok(g) => g,
+                Err(e) => {
+                    tracing::error!(fifo = %self.fifo.display(), error = %e, "log fifo readable failed");
+                    return;
+                }
+            };
+            let result = guard.try_io(|inner| {
+                // SAFETY: buf is a valid writable region; fd is valid.
+                let n =
+                    unsafe { libc::read(inner.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
+                if n < 0 {
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    Ok(n as usize)
+                }
+            });
+            match result {
+                Ok(Ok(0)) => {}
+                Ok(Ok(n)) => self.ring.push(ContainerLog {
+                    stream: self.stream,
+                    data: buf[..n].to_vec(),
+                    seq: 0, // ring.push() overwrites this with the next sequence number
+                }),
+                Ok(Err(e)) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Ok(Err(e)) => {
+                    tracing::error!(fifo = %self.fifo.display(), error = %e, "log fifo read failed");
+                    return;
+                }
+                Err(_not_ready) => {}
+            }
+        }
+    }
+}
+
+/// Opens `fifo` and drains it into `ring` until a read error. Returns
+/// `true` when the reader was established (the open succeeded); `false`
+/// means the FIFO could not be opened and no reader is running.
+async fn fifo_reader(fifo: PathBuf, stream: LogStream, ring: Arc<LogRing>) -> bool {
+    match EstablishedFifo::open(fifo.clone(), stream, ring) {
+        Ok(established) => {
+            established.run().await;
+            true
+        }
         Err(e) => {
             tracing::error!(fifo = %fifo.display(), error = %e, "log fifo open failed");
-            return;
-        }
-    };
-    // SAFETY: fcntl on a valid fd.
-    unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) };
-    let fd = match tokio::io::unix::AsyncFd::new(file) {
-        Ok(fd) => fd,
-        Err(e) => {
-            tracing::error!(fifo = %fifo.display(), error = %e, "log fifo async setup failed");
-            return;
-        }
-    };
-
-    let mut buf = vec![0u8; 64 * 1024];
-    loop {
-        let mut guard = match fd.readable().await {
-            Ok(g) => g,
-            Err(e) => {
-                tracing::error!(fifo = %fifo.display(), error = %e, "log fifo readable failed");
-                return;
-            }
-        };
-        let result = guard.try_io(|inner| {
-            // SAFETY: buf is a valid writable region; fd is valid.
-            let n = unsafe { libc::read(inner.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
-            if n < 0 {
-                Err(std::io::Error::last_os_error())
-            } else {
-                Ok(n as usize)
-            }
-        });
-        match result {
-            Ok(Ok(0)) => {}
-            Ok(Ok(n)) => ring.push(ContainerLog {
-                stream,
-                data: buf[..n].to_vec(),
-                seq: 0, // ring.push() overwrites this with the next sequence number
-            }),
-            Ok(Err(e)) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-            Ok(Err(e)) => {
-                tracing::error!(fifo = %fifo.display(), error = %e, "log fifo read failed");
-                return;
-            }
-            Err(_not_ready) => {}
+            false
         }
     }
 }
@@ -1057,26 +1127,68 @@ impl ContainerdRuntime {
         if self.log_readers.lock().await.contains_key(container_id) {
             return;
         }
-        let stdout_path = logs_dir.join(format!("{container_id}.stdout.fifo"));
-        let stderr_path = logs_dir.join(format!("{container_id}.stderr.fifo"));
-        if !stdout_path.exists() && !stderr_path.exists() {
+        let (stdout_path, stderr_path) = select_log_fifos(logs_dir, container_id);
+        if stdout_path.is_none() && stderr_path.is_none() {
             tracing::debug!(
                 container = %container_id,
                 "no log FIFOs found for adopted container; log capture will be absent"
             );
             return;
         }
+        // Report each absent FIFO at debug level — it was never created for this
+        // container, so no "open failed" error is appropriate.
+        if stdout_path.is_none() {
+            tracing::debug!(
+                container = %container_id,
+                "stdout log FIFO absent for adopted container; no stdout reader started"
+            );
+        }
+        if stderr_path.is_none() {
+            tracing::debug!(
+                container = %container_id,
+                "stderr log FIFO absent for adopted container; no stderr reader started"
+            );
+        }
         let ring = Arc::new(LogRing::default());
+        // Open each selected FIFO before the ring is registered or the
+        // reader task is spawned. If every open fails — the FIFOs vanished
+        // between the existence check and the open — no ring is registered
+        // and no reader task runs; the pre-fix shape registered an empty
+        // ring here and logged "readers started" while no reader could run.
+        let (stdout_established, stderr_established) =
+            establish_log_readers(stdout_path, stderr_path, &ring);
+        if stdout_established.is_none() && stderr_established.is_none() {
+            tracing::debug!(
+                container = %container_id,
+                "log FIFOs vanished before readers opened; log capture will be absent"
+            );
+            return;
+        }
         self.log_rings
             .lock()
             .await
-            .insert(container_id.to_string(), ring.clone());
-        let out_ring = ring.clone();
+            .insert(container_id.to_string(), ring);
+        // Spawn only the readers whose FIFOs were established. tokio::join!
+        // on two futures is kept as the join shape where both are present;
+        // for one FIFO we await a single future so there is no dangling
+        // join arm.
         let handle = tokio::spawn(async move {
-            tokio::join!(
-                fifo_reader(stdout_path, LogStream::Stdout, out_ring),
-                fifo_reader(stderr_path, LogStream::Stderr, ring),
-            );
+            match (stdout_established, stderr_established) {
+                (Some(out), Some(err)) => {
+                    tokio::join!(out.run(), err.run());
+                }
+                (Some(out), None) => {
+                    out.run().await;
+                }
+                (None, Some(err)) => {
+                    err.run().await;
+                }
+                (None, None) => {
+                    // Both opens failed: the guard above returns before we
+                    // reach here. This arm is unreachable but kept for
+                    // exhaustiveness.
+                }
+            }
         });
         self.log_readers
             .lock()
@@ -1290,7 +1402,7 @@ impl Runtime for ContainerdRuntime {
                 let err_path = PathBuf::from(&stderr);
                 let out_ring = ring.clone();
                 let handle = tokio::spawn(async move {
-                    tokio::join!(
+                    let _ = tokio::join!(
                         fifo_reader(out_path, LogStream::Stdout, out_ring),
                         fifo_reader(err_path, LogStream::Stderr, ring),
                     );
@@ -2064,6 +2176,119 @@ mod tests {
         assert!(
             !gap_again,
             "no second gap must be reported after cursor advances past all surviving chunks"
+        );
+    }
+
+    // --- AC4: partly-present FIFO set — reader decision -------------------
+
+    /// A container whose log directory has only the stdout FIFO must have its
+    /// stdout selected and stderr left as absent (not attempted).
+    ///
+    /// **Red-first evidence:** `select_log_fifos` does not exist before this
+    /// fix; this test fails to compile until the helper is extracted.
+    #[test]
+    fn select_log_fifos_partly_present_stdout_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let container_id = "test-container-ac4";
+
+        // Only stdout FIFO exists (as a regular file — exists() only checks path).
+        let stdout_path = dir.path().join(format!("{container_id}.stdout.fifo"));
+        std::fs::write(&stdout_path, b"").unwrap();
+
+        let (got_stdout, got_stderr) = select_log_fifos(dir.path(), container_id);
+        assert_eq!(
+            got_stdout,
+            Some(stdout_path),
+            "stdout path must be returned when it exists"
+        );
+        assert_eq!(
+            got_stderr, None,
+            "stderr must be absent when its FIFO does not exist"
+        );
+    }
+
+    /// Both FIFOs present: both returned.
+    #[test]
+    fn select_log_fifos_both_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let container_id = "test-container-both";
+        let stdout_path = dir.path().join(format!("{container_id}.stdout.fifo"));
+        let stderr_path = dir.path().join(format!("{container_id}.stderr.fifo"));
+        std::fs::write(&stdout_path, b"").unwrap();
+        std::fs::write(&stderr_path, b"").unwrap();
+
+        let (got_stdout, got_stderr) = select_log_fifos(dir.path(), container_id);
+        assert_eq!(got_stdout, Some(stdout_path), "stdout must be returned");
+        assert_eq!(got_stderr, Some(stderr_path), "stderr must be returned");
+    }
+
+    /// Neither FIFO present: both absent.
+    #[test]
+    fn select_log_fifos_neither_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let (got_stdout, got_stderr) = select_log_fifos(dir.path(), "absent-container");
+        assert_eq!(got_stdout, None, "stdout must be absent");
+        assert_eq!(got_stderr, None, "stderr must be absent");
+    }
+
+    /// Only stderr FIFO exists: stderr returned, stdout absent.
+    #[test]
+    fn select_log_fifos_partly_present_stderr_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let container_id = "test-container-stderr-only";
+        let stderr_path = dir.path().join(format!("{container_id}.stderr.fifo"));
+        std::fs::write(&stderr_path, b"").unwrap();
+
+        let (got_stdout, got_stderr) = select_log_fifos(dir.path(), container_id);
+        assert_eq!(got_stdout, None, "stdout must be absent");
+        assert_eq!(got_stderr, Some(stderr_path), "stderr must be returned");
+    }
+
+    // --- Reviewer R1: FIFOs that vanish between selection and open --------
+
+    /// Selection confirmed a FIFO present but every open fails (the FIFOs
+    /// vanished in between, simulated here by a directory at the FIFO path:
+    /// `exists()` is true, the O_RDWR open fails). No reader may be
+    /// established — the caller leaves no log ring behind in this case.
+    #[tokio::test]
+    async fn establish_log_readers_all_vanished_establishes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let container_id = "test-container-vanished";
+        // A directory passes `exists()` but fails the read+write open.
+        let stdout_path = dir.path().join(format!("{container_id}.stdout.fifo"));
+        let stderr_path = dir.path().join(format!("{container_id}.stderr.fifo"));
+        std::fs::create_dir(&stdout_path).unwrap();
+        std::fs::create_dir(&stderr_path).unwrap();
+
+        let ring = Arc::new(LogRing::default());
+        let (stdout, stderr) = establish_log_readers(Some(stdout_path), Some(stderr_path), &ring);
+        assert!(
+            stdout.is_none(),
+            "no stdout reader may be established for a vanished FIFO"
+        );
+        assert!(
+            stderr.is_none(),
+            "no stderr reader may be established for a vanished FIFO"
+        );
+    }
+
+    /// A real FIFO is established; the vanished one (a directory) is not.
+    #[tokio::test]
+    async fn establish_log_readers_establishes_only_openable_fifos() {
+        let dir = tempfile::tempdir().unwrap();
+        let container_id = "test-container-partly";
+        let stdout_path = dir.path().join(format!("{container_id}.stdout.fifo"));
+        make_fifo(&stdout_path).unwrap();
+        // stderr: a directory, so selection sees it but the open fails.
+        let stderr_path = dir.path().join(format!("{container_id}.stderr.fifo"));
+        std::fs::create_dir(&stderr_path).unwrap();
+
+        let ring = Arc::new(LogRing::default());
+        let (stdout, stderr) = establish_log_readers(Some(stdout_path), Some(stderr_path), &ring);
+        assert!(stdout.is_some(), "the real FIFO must be established");
+        assert!(
+            stderr.is_none(),
+            "the vanished FIFO must not be established"
         );
     }
 }
