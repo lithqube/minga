@@ -23,7 +23,9 @@ them 1.0.2.
 
 ## Quick start
 
-Install `minga-ctl` on the workstation: it is not in the release archive.
+`minga-ctl` is in the release archive and `install.sh` installs it next to
+`minga`. Releases up to 1.3.0-rc.1 do not have it; build it from a checkout of
+the release tag instead:
 
 ```
 cargo install --locked --path crates/minga-ctl

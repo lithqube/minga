@@ -177,7 +177,7 @@ flowchart TB
 You need Linux, root (the supervisor creates netns, bridges and iptables rules), `iproute2` + `iptables` + `procps` (present in any standard server install; the container image bundles them), and containerd. A task pulls a missing image into the `minga` namespace through containerd's Transfer API on `--containerd-socket` (containerd 1.7 or newer for private registries). Registry credentials come from `$DOCKER_CONFIG/config.json`, else `~/.docker/config.json`: `credHelpers`, then `credsStore`, then inline `auths`.
 
 ```bash
-# Installs minga + the checksum-pinned nats-server and verifies SHA256SUMS.
+# Installs minga, minga-ctl and the checksum-pinned nats-server, and verifies SHA256SUMS.
 curl -fsSL https://github.com/lithqube/minga/releases/latest/download/install.sh | sh
 # Same, plus the systemd unit and an /etc/minga/minga.env template:
 #   curl -fsSL .../install.sh | sh -s -- --with-systemd
@@ -186,6 +186,9 @@ curl -fsSL https://github.com/lithqube/minga/releases/latest/download/install.sh
 # From source instead:
 cargo build --release -p minga-cli
 sudo install -m 0755 target/release/minga /usr/local/bin/minga
+
+# Check the install: status, doctor and log commands live in minga-ctl
+minga-ctl doctor
 
 # Optional: preload images (air-gapped sites, private registries); otherwise a task pulls what it needs
 sudo ctr -n minga images pull docker.io/library/nginx:1.27
@@ -260,11 +263,11 @@ flowchart TB
    trust, ingress/host publishing and verification status are in
    [supported topologies](docs/topologies.md).
 3. **Talos Linux.** **Validated single-node install** on Talos v1.14: Minga runs as two `ContainerConfig` containers pulled from GHCR — no system extension, no custom boot asset — and workload images preload via a Kubernetes Job using the bundled `ctr`. Guide: [docs/talos-deployment.md](docs/talos-deployment.md). Bare-metal and multi-node are not hardware-validated.
-4. **Air-gapped.** Copy the release archive (with `minga`, `nats-server` and the licenses) and image tarballs to the site. Then run `ctr -n minga images import <image>.tar` on each node and start the roles as above. No step needs a network connection.
+4. **Air-gapped.** Copy the release archive (with `minga`, `minga-ctl`, `nats-server` and the licenses) and image tarballs to the site. Then run `ctr -n minga images import <image>.tar` on each node and start the roles as above. No step needs a network connection.
 
 ### Container image
 
-The release workflow also pushes a multi-arch image (`linux/amd64`, `linux/arm64`) built from the same binaries as the archives: `ghcr.io/lithqube/minga` with tags `vX.Y.Z`, `X.Y` and `latest`. The image bundles `nats-server` next to `minga`, like the archive.
+The release workflow also pushes a multi-arch image (`linux/amd64`, `linux/arm64`) built from the same binaries as the archives: `ghcr.io/lithqube/minga` with tags `vX.Y.Z`, `X.Y` and `latest`. The image bundles `nats-server` and `minga-ctl` next to `minga`, like the archive; run the CLI with `--entrypoint minga-ctl`.
 
 ```bash
 docker run --rm ghcr.io/lithqube/minga:latest --help

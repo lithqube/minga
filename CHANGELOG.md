@@ -5,6 +5,7 @@
 Changes on `main` after `v1.3.0-rc.1`. They go into 1.3.0.
 
 ### Changes
+- **`minga-ctl` is in the release archive, `install.sh` and the container image (#206).** `minga-ctl doctor`, `stack ps`, `service ls`, `service logs` and `service inspect` no longer need a Rust toolchain; `install.sh --uninstall` removes it, and the release workflow fails if an archive lacks it. Archives of earlier releases do not contain it, and `install.sh --version` of one of those still installs `minga` alone.
 - **Breaking, upgrade action: a node names its runtime, and a worker refuses manager settings (#202).**
   - `minga manager` and `minga worker` now require `--runtime`. It no longer defaults to `mock`, which reported
     tasks running and healthy while no container existed. Add `--runtime containerd` to any hand-written command

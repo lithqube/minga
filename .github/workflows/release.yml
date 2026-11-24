@@ -104,7 +104,7 @@ jobs:
       # `shared-key` or `prefix-key` no ci.yml job uses, so a branch-built
       # cache can never feed the tagged release.
       - name: Build the release binary
-        run: cargo build --release -p minga-cli --target ${{ matrix.target }}
+        run: cargo build --release -p minga-cli -p minga-ctl --target ${{ matrix.target }}
 
       - name: Fetch and verify nats-server
         run: |
@@ -134,13 +134,18 @@ jobs:
       - name: Package
         run: |
           mkdir -p dist
-          cp "target/${{ matrix.target }}/release/minga" nats-server ctr NATS-LICENSE dist/
+          cp "target/${{ matrix.target }}/release/minga" "target/${{ matrix.target }}/release/minga-ctl" nats-server ctr NATS-LICENSE dist/
           cp install.sh README.md LICENSE CHANGELOG.md dist/
           # install.sh --with-systemd copies these out of the archive.
           cp scripts/minga.service scripts/minga.env.example dist/
           tar -C dist -czf "minga-${{ matrix.target }}.tar.gz" \
-            minga nats-server ctr NATS-LICENSE install.sh README.md LICENSE CHANGELOG.md \
+            minga minga-ctl nats-server ctr NATS-LICENSE install.sh README.md LICENSE CHANGELOG.md \
             minga.service minga.env.example
+
+      # Fails the build, before anything is uploaded or published, when the
+      # archive lacks a binary operators expect (#206: minga-ctl was missing).
+      - name: Check the archive contents
+        run: sh scripts/check-release-archive.sh "minga-${{ matrix.target }}.tar.gz"
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
