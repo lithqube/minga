@@ -96,6 +96,7 @@ async fn node_join_credentials_require_mutual_tls() {
             name: "Acme".into(),
             quotas: Default::default(),
             created_at: 1,
+            generation: 0,
         })
         .await
         .unwrap();

@@ -10,6 +10,7 @@ license.workspace = true
 axum.workspace = true
 minga-bus = { path = "../minga-bus" }
 base64.workspace = true
+rand.workspace = true
 chrono.workspace = true
 futures.workspace = true
 minga-net = { path = "../minga-net" }

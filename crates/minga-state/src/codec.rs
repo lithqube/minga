@@ -17,16 +17,16 @@
 //! # Format marker
 //!
 //! Each redb file stores [`FORMAT_VERSION`] under [`FORMAT_KEY`] in its
-//! metadata table. Formats v2 through v11 migrate to v12 on open; portable
+//! metadata table. Formats v2 through v12 migrate to v13 on open; portable
 //! snapshots are migrated on import.
 //!
 //! # Wire frame
 //!
 //! A Raft message is `[u32 BE length][u8 FORMAT_VERSION][JSON]`, the length
 //! covering the version byte and the JSON. Since peers reject a different
-//! frame version, v12 requires a coordinated upgrade of every cluster node;
-//! mixed v11/v12 nodes cannot exchange Raft messages. Worker assignments use
-//! the same frame, so a v11 worker refuses a v12 task instead of dropping its
+//! frame version, v13 requires a coordinated upgrade of every cluster node;
+//! mixed v12/v13 nodes cannot exchange Raft messages. Worker assignments use
+//! the same frame, so a v12 worker refuses a v13 task instead of dropping its
 //! state.
 
 use serde::de::DeserializeOwned;
@@ -34,7 +34,10 @@ use serde::Serialize;
 
 /// Version of the persisted and wire format. Bump it for every persisted
 /// field-shape change and add the corresponding migration.
-pub const FORMAT_VERSION: u8 = 12;
+pub const FORMAT_VERSION: u8 = 13;
+
+/// The persisted version immediately before tenants gained a generation.
+pub const V12_FORMAT_VERSION: u8 = 12;
 
 /// The persisted version immediately before ports gained a host address.
 pub const V11_FORMAT_VERSION: u8 = 11;

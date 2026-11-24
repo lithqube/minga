@@ -49,6 +49,12 @@ pub struct Tenant {
     pub nats_revoked_user_public_keys: Vec<String>,
     /// Unix timestamp in seconds when the tenant was created.
     pub created_at: u64,
+    /// Identity of this incarnation of the ID. A create draws a new one, and a
+    /// delete or bus provisioning step names the one it acts for, so a step
+    /// left over from a deleted incarnation is refused (issue #203). Zero is a
+    /// tenant from before the field, which has one incarnation.
+    #[serde(default)]
+    pub generation: u64,
 }
 
 impl Tenant {
@@ -1195,6 +1201,7 @@ mod tests {
             quotas: TenantQuotas::default(),
             nats_revoked_user_public_keys: Vec::new(),
             created_at: 1,
+            generation: 0,
         }
         .validate()
         .is_err());

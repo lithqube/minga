@@ -1,0 +1,158 @@
+{
+  "id": "shop.web.1",
+  "last_error": null,
+  "last_exit_code": null,
+  "node_id": 3,
+  "restarts": 2,
+  "running_since_unix": 1794000100,
+  "service_id": "shop.web",
+  "spec": {
+    "command": [
+      "nginx"
+    ],
+    "egress": {
+      "policy": {
+        "models": [
+          "gpt-4o*",
+          "claude-sonnet"
+        ],
+        "required": true,
+        "routes": [
+          {
+            "auth": {
+              "scheme": "bearer",
+              "secret": "openai_key"
+            },
+            "fallback": [
+              "claude",
+              "bedrock"
+            ],
+            "input_price_micros_per_million": 2500000,
+            "name": "openai",
+            "output_price_micros_per_million": 10000000,
+            "upstream_url": "https://api.openai.com"
+          },
+          {
+            "auth": {
+              "scheme": "api_key",
+              "secret": "anthropic_key"
+            },
+            "fallback": [],
+            "input_price_micros_per_million": null,
+            "name": "claude",
+            "output_price_micros_per_million": null,
+            "upstream_url": "https://api.anthropic.com"
+          },
+          {
+            "auth": {
+              "access_key_secret": "aws_access",
+              "region": "eu-west-1",
+              "scheme": "aws_sigv4",
+              "secret_key_secret": "aws_secret",
+              "service": "bedrock",
+              "session_token_secret": "aws_session"
+            },
+            "fallback": [],
+            "input_price_micros_per_million": null,
+            "name": "bedrock",
+            "output_price_micros_per_million": null,
+            "upstream_url": "https://bedrock-runtime.eu-west-1.amazonaws.com"
+          }
+        ]
+      },
+      "service_id": "shop.web",
+      "tenant_id": "default"
+    },
+    "entrypoint": [
+      "/docker-entrypoint.sh"
+    ],
+    "env": {
+      "MODE": "prod"
+    },
+    "extra_hosts": [
+      [
+        "db",
+        "host-gateway"
+      ]
+    ],
+    "healthcheck": {
+      "interval_secs": 10,
+      "retries": 3,
+      "start_period_secs": 5,
+      "test": [
+        "CMD",
+        "true"
+      ],
+      "timeout_secs": 3
+    },
+    "image": "docker.io/library/nginx:1.27",
+    "ips": {
+      "shop_default": "10.100.1.4"
+    },
+    "kind": {
+      "Agent": {
+        "capabilities": {
+          "dirs": [
+            {
+              "guest": "/data",
+              "host": "/srv/data"
+            }
+          ],
+          "grants": [
+            "env",
+            "http"
+          ]
+        },
+        "egress_url": "http://127.0.0.1:8088",
+        "fuel_limit": 1000000,
+        "memory_limit": 134217728,
+        "module_ref": "/var/lib/minga/modules/summarize.wasm",
+        "prompt": "Summarize",
+        "sandbox_env": {
+          "MODEL": "small"
+        },
+        "timeout_secs": 30,
+        "token_budget": 50000
+      }
+    },
+    "labels": {
+      "tier": "web"
+    },
+    "mounts": [
+      {
+        "kind": "Bind",
+        "read_only": true,
+        "source": "/srv/data",
+        "target": "/data"
+      }
+    ],
+    "ports": [
+      {
+        "mode": "ingress",
+        "protocol": "tcp",
+        "published": 8080,
+        "target": 80
+      }
+    ],
+    "resources": {
+      "cpus": 0.5,
+      "gpus": 0,
+      "memory_bytes": 268435456
+    },
+    "restart_policy": {
+      "condition": "Any",
+      "delay_secs": 2,
+      "max_attempts": null
+    },
+    "secrets": [
+      {
+        "secret_id": "shop_password",
+        "target": "/run/secrets/password",
+        "version": null
+      }
+    ],
+    "user": "101"
+  },
+  "state": "Running",
+  "tenant_id": "default"
+}

@@ -1,0 +1,20 @@
+{
+  "created_at": 1794000000,
+  "generation": 7,
+  "id": "tenant-a",
+  "name": "Tenant A",
+  "nats_revoked_user_public_keys": [],
+  "quotas": {
+    "api_requests_per_second": 100,
+    "configs": 7,
+    "desired_state_bytes": 10485760,
+    "jetstream_age_secs": 86400,
+    "jetstream_bytes": 1073741824,
+    "jobs": 8,
+    "networks": 5,
+    "secrets": 20,
+    "services": 10,
+    "tasks": 50,
+    "volumes": 6
+  }
+}

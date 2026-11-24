@@ -78,11 +78,88 @@ pub enum BusError {
     #[error("serialization error: {0}")]
     Serialization(String),
 
+    /// A tenant lifecycle step names an incarnation that no longer owns the
+    /// tenant's bus resources (issue #203). Refused, not retried: the caller
+    /// acts for a tenant that was deleted or replaced.
+    #[error("tenant lifecycle fenced: {0}")]
+    Fenced(String),
+
     #[error("bus error: {0}")]
     Other(String),
 }
 
 pub type Result<T> = std::result::Result<T, BusError>;
+
+/// Who owns a tenant's bus resources: one marker per tenant ID, written with
+/// compare-and-set so managers on one bus agree (issue #203).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TenantMarker {
+    /// The `Tenant::generation` the resources were provisioned for.
+    pub generation: u64,
+    /// A delete owns the resources and no create or provisioning may start.
+    pub deleting: bool,
+    /// When the marker was last written, unix milliseconds.
+    pub since_unix_ms: u64,
+}
+
+/// How long a claim with no tenant record may stand before a delete treats it
+/// as abandoned: a create is a few bus calls and one Raft write.
+pub const ORPHAN_CLAIM_AFTER: Duration = Duration::from_secs(120);
+
+/// A marker and the revision it was read at.
+pub(crate) type Marked = Option<(TenantMarker, u64)>;
+
+/// What a claim must write: nothing when the same incarnation already holds
+/// the ID, or a new Active marker.
+pub(crate) fn plan_claim(tenant_id: &str, marker: &Marked, generation: u64) -> Result<bool> {
+    match marker {
+        None => Ok(true),
+        Some((m, _)) if m.generation == generation && !m.deleting => Ok(false),
+        Some((m, _)) => Err(BusError::Fenced(format!(
+            "tenant {tenant_id} is held by generation {}{}, not {generation}",
+            m.generation,
+            if m.deleting { " (being deleted)" } else { "" },
+        ))),
+    }
+}
+
+/// What a delete start must write: `Ok(None)` when there is nothing to
+/// delete, else the generation and the revision to replace (`None` creates).
+pub(crate) fn plan_delete(
+    tenant_id: &str,
+    marker: &Marked,
+    expected: Option<u64>,
+    resources_exist: bool,
+    now_unix_ms: u64,
+) -> Result<Option<(u64, Option<u64>)>> {
+    let Some((m, revision)) = marker else {
+        // No marker: a tenant from before markers, or a leftover.
+        return Ok((expected.is_some() || resources_exist).then_some((expected.unwrap_or(0), None)));
+    };
+    if let Some(expected) = expected {
+        if expected != m.generation && m.generation != 0 && expected != 0 {
+            return Err(BusError::Fenced(format!(
+                "tenant {tenant_id} generation {expected} is not the one on the bus ({})",
+                m.generation
+            )));
+        }
+    } else if !m.deleting {
+        let age = now_unix_ms.saturating_sub(m.since_unix_ms);
+        if age < ORPHAN_CLAIM_AFTER.as_millis() as u64 {
+            // Another manager may be creating it right now.
+            return Ok(None);
+        }
+    }
+    Ok(Some((m.generation, Some(*revision))))
+}
+
+/// Proof that this caller holds a tenant's delete: the marker revision it
+/// wrote. Taking the delete over writes a new revision and fences the old holder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeleteFence {
+    pub generation: u64,
+    pub revision: u64,
+}
 
 // ---------------------------------------------------------------------------
 // Types
@@ -418,8 +495,33 @@ pub trait EventBus: Send + Sync {
     async fn tenant_resources_exist(&self, _tenant_id: &str) -> Result<bool> {
         Ok(false)
     }
-    /// Deletes everything the tenant has on the bus. Safe to repeat.
+    /// Deletes everything the tenant has on the bus, whoever owns it. Safe to
+    /// repeat. Tenant lifecycle code uses [`EventBus::delete_tenant_incarnation`].
     async fn delete_tenant_resources(&self, _tenant_id: &str) -> Result<()> {
+        Ok(())
+    }
+    /// Claims the tenant ID for one incarnation before its resources exist.
+    /// Refused with [`BusError::Fenced`] while any other incarnation, or a
+    /// delete, holds the ID. Repeating the same claim is a no-op.
+    async fn claim_tenant(&self, _tenant_id: &str, _generation: u64) -> Result<()> {
+        Ok(())
+    }
+    /// Takes the delete of a tenant. `generation` is the one in the tenant
+    /// record, or `None` when the record is gone and this is a retry. Returns
+    /// `None` when there is nothing this caller may delete. A repeat takes the
+    /// delete over and fences whoever held it.
+    async fn begin_tenant_delete(
+        &self,
+        _tenant_id: &str,
+        _generation: Option<u64>,
+    ) -> Result<Option<DeleteFence>> {
+        Ok(None)
+    }
+    /// Deletes what the tenant has on the bus for the holder of `fence`, and
+    /// releases the ID. Every step checks the fence first, so a holder that
+    /// was taken over stops with [`BusError::Fenced`] instead of deleting the
+    /// resources of whoever came after.
+    async fn delete_tenant_incarnation(&self, _tenant_id: &str, _fence: DeleteFence) -> Result<()> {
         Ok(())
     }
 

@@ -249,6 +249,7 @@ async fn deployed_dns_names(tenant: &str) -> Vec<(String, String)> {
                 quotas: Default::default(),
                 nats_revoked_user_public_keys: Vec::new(),
                 created_at: 1,
+                generation: 0,
             })
             .await
             .unwrap();
