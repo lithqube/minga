@@ -6,6 +6,25 @@ Changes on `main` after `v1.3.0-rc.1`. They go into 1.3.0.
 
 ### Changes
 - **`minga-ctl` is in the release archive, `install.sh` and the container image (#206).** `minga-ctl doctor`, `stack ps`, `service ls`, `service logs` and `service inspect` no longer need a Rust toolchain; `install.sh --uninstall` removes it, and the release workflow fails if an archive lacks it. Archives of earlier releases do not contain it, and `install.sh --version` of one of those still installs `minga` alone.
+- **Breaking, upgrade action: a node names its runtime, and a worker refuses manager settings (#202).**
+  - `minga manager` and `minga worker` now require `--runtime`. It no longer defaults to `mock`, which reported
+    tasks running and healthy while no container existed. Add `--runtime containerd` to any hand-written command
+    line, service file or script that omitted it; `--runtime mock` still works for tests. The shipped unit, the
+    README and the Talos manifests already passed `containerd`.
+  - The two roles are parsed from separate argument groups. A manager-only flag on a worker (`--bind`, `--peer`,
+    `--api-*`, `--raft-tls-*`, `--nats-resolver-dir`, `--nats-account-jwt-file`, `--nats-account-seed-file`,
+    `--nats-tenant-signer-dir`, `--nats-sys-credentials-file`, …) is now a usage error that names the flag.
+    Five of those (the NATS resolver, account and signer flags) were silently ignored before.
+  - **Upgrade action for a worker host:** a manager-only variable in a worker's environment (`MINGA_BIND`,
+    `MINGA_API_TOKEN`, `MINGA_JOIN_TOKEN_KEY_FILE`, `MINGA_NATS_REPLICAS`, `MINGA_NATS_OPERATOR_JWT`,
+    `MINGA_NATS_RESOLVER_DIR`, `MINGA_NATS_ACCOUNT_JWT_FILE`, `MINGA_NATS_ACCOUNT_SEED_FILE`,
+    `MINGA_NATS_TENANT_SIGNER_DIR`, `MINGA_NATS_SYS_CREDENTIALS_FILE`) makes the worker exit at start and name the
+    variable. Remove those lines from a worker's `/etc/minga/minga.env`; a worker env file copied from a manager
+    is the usual cause. Empty assignments are ignored. A manager with `MINGA_NODE_JOIN_TOKEN_FILE` set was
+    already refused.
+  - `scripts/minga.service` no longer passes `--bind`; a manager reads `MINGA_BIND` from its env file, as before.
+    `MINGA_ROLE=worker` now starts a worker with the shipped unit. An older copy of the unit that passes
+    `--bind ${MINGA_BIND}` still works for a manager.
 - **Fix.** A manager restarted after its NATS account JWT was rotated now accepts users from the new signers (#198). In operator/JWT mode the built-in sidecar copied the account JWT into the resolver directory only when the file was missing, so a rotated JWT was ignored and the new users got a NATS authorization violation. The sidecar now replaces the resolver claim when the provisioned JWT is at least as new, and keeps a newer claim written by a revocation push. To rotate, replace the account JWT file and restart the manager.
 - **Fix.** Adopting a container whose log FIFOs are only partly present no longer logs a false `log fifo open failed` error for the stream that never existed (#220). A reader is started for each FIFO that is actually on disk and its output published; the absent stream is reported at debug level. If the FIFOs vanish between the check and the open, no empty log ring is registered and no misleading "log readers started" line is logged.
 - **Compose `ports` host IPs work again (#162).** A port with `host_ip` (`127.0.0.1:8080:80`, `host_ip:` in the long syntax) is accepted by `minga validate` and published on that node address only. A port without one stays published on every node address.

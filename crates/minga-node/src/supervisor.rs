@@ -201,7 +201,7 @@ type RestartStates = Arc<Mutex<HashMap<TaskId, RestartState>>>;
 #[cfg(target_os = "linux")]
 pub struct SupervisorNetworking {
     setup: Arc<crate::netns::NetworkSetup>,
-    dns_store: Arc<std::sync::RwLock<minga_net::DnsStore>>,
+    dns_store: Arc<std::sync::RwLock<minga_net::ScopedDnsStore>>,
     upstream: Option<std::net::SocketAddr>,
     server: std::sync::Mutex<Option<minga_net::DnsServer>>,
     current_binds: std::sync::Mutex<Vec<std::net::SocketAddr>>,
@@ -215,7 +215,7 @@ impl SupervisorNetworking {
     ) -> Self {
         Self {
             setup,
-            dns_store: Arc::new(std::sync::RwLock::new(minga_net::DnsStore::new())),
+            dns_store: Arc::new(std::sync::RwLock::new(minga_net::ScopedDnsStore::new())),
             upstream,
             server: std::sync::Mutex::new(None),
             current_binds: std::sync::Mutex::new(Vec::new()),
@@ -223,35 +223,65 @@ impl SupervisorNetworking {
     }
 }
 
-/// Builds DNS records from MINGA_ASSIGN network/DNS entries. Only networks
-/// with a task on this node are published: the resolver listens on those
-/// gateways, and names from networks this node does not serve must not leak.
+/// Builds DNS records from MINGA_ASSIGN network/DNS entries, one store per
+/// network. Only networks with a task on this node are published: the
+/// resolver listens on those gateways, and names from networks this node does
+/// not serve must not leak. A local task is attached to every network it is
+/// on (by task ID), so it resolves each of them through the one gateway its
+/// `resolv.conf` names, and to nothing outside them.
 #[cfg(any(target_os = "linux", test))]
-fn build_dns_store(assignments: &[NetworkAssignment], node_id: NodeId) -> minga_net::DnsStore {
-    let mut store = minga_net::DnsStore::new();
-    for assignment in assignments
-        .iter()
-        .filter(|assignment| assignment.tasks.iter().any(|task| task.node_id == node_id))
-    {
+fn build_dns_store(
+    assignments: &[NetworkAssignment],
+    node_id: NodeId,
+) -> minga_net::ScopedDnsStore {
+    let served = || {
+        assignments
+            .iter()
+            .filter(|assignment| assignment.tasks.iter().any(|task| task.node_id == node_id))
+    };
+    let mut networks_of: std::collections::HashMap<&str, Vec<&str>> =
+        std::collections::HashMap::new();
+    for assignment in served() {
+        for task in assignment
+            .tasks
+            .iter()
+            .filter(|task| task.node_id == node_id)
+        {
+            networks_of
+                .entry(&task.task_id)
+                .or_default()
+                .push(&assignment.network.id);
+        }
+    }
+
+    let mut store = minga_net::ScopedDnsStore::new();
+    for assignment in served() {
+        let network = assignment.network.id.as_str();
         for task in &assignment.tasks {
             let Ok(ip) = task.ip.parse::<std::net::Ipv4Addr>() else {
                 continue;
             };
+            if task.node_id == node_id {
+                for joined in &networks_of[task.task_id.as_str()] {
+                    store.attach(ip, joined);
+                }
+            }
+            let records = store.network_mut(network);
             // `service_name` is the bare Compose name; the scheduler owns
             // that. Docker semantics: it resolves as a record of its own,
             // because musl images do not apply `search` domains.
-            store.add(&task.service_name, ip);
-            store.add(format!("tasks.{}", task.service_name), ip);
+            records.add(&task.service_name, ip);
+            records.add(format!("tasks.{}", task.service_name), ip);
             // v1.3.0-rc.1 resolved only `<stack>.<service>`; stacks edited
             // to that form keep working.
             if !task.stack.is_empty() {
-                store.add(format!("{}.{}", task.stack, task.service_name), ip);
+                records.add(format!("{}.{}", task.stack, task.service_name), ip);
             }
-            store.add(
+            records.add(
                 minga_net::dns::service_fqdn(&task.service_name, &task.stack),
                 ip,
             );
-            store.add(
+            records.add(
                 minga_net::dns::task_fqdn(&task.task_id, &task.service_name, &task.stack),
                 ip,
             );
@@ -2414,60 +2444,172 @@ mod assignment_tests {
             .unwrap()
             .is_empty());
     }
+    fn dns_net(id: &str) -> minga_state::types::Network {
+        minga_state::types::Network {
+            id: id.to_string(),
+            tenant_id: "default".to_string(),
+            name: id.to_string(),
+            driver: "bridge".to_string(),
+            attachable: true,
+            subnet: None,
+            wg_port: None,
+        }
+    }
+
+    fn dns_task(
+        node_id: NodeId,
+        task_id: &str,
+        service: &str,
+        stack: &str,
+        ip: &str,
+    ) -> minga_state::types::NetworkDnsTask {
+        minga_state::types::NetworkDnsTask {
+            node_id,
+            task_id: task_id.to_string(),
+            service_name: service.to_string(),
+            stack: stack.to_string(),
+            ip: ip.to_string(),
+        }
+    }
+
+    fn v4(a: u8, b: u8, c: u8, d: u8) -> std::net::Ipv4Addr {
+        std::net::Ipv4Addr::new(a, b, c, d)
+    }
+
     #[test]
     fn dns_records_come_from_network_assignment_entries() {
         let record = NetworkAssignment {
-            network: minga_state::types::Network {
-                id: "network-1".to_string(),
-                tenant_id: "default".to_string(),
-                name: "network".to_string(),
-                driver: "bridge".to_string(),
-                attachable: true,
-                subnet: Some("10.0.0.0/24".to_string()),
-                wg_port: None,
-            },
+            network: dns_net("network-1"),
             tasks: vec![
-                minga_state::types::NetworkDnsTask {
-                    node_id: 7,
-                    task_id: "task-1".to_string(),
-                    service_name: "web".to_string(),
-                    stack: "plant".to_string(),
-                    ip: "10.0.0.10".to_string(),
-                },
-                minga_state::types::NetworkDnsTask {
-                    node_id: 8,
-                    task_id: "task-2".to_string(),
-                    service_name: "web".to_string(),
-                    stack: "plant".to_string(),
-                    ip: "10.0.0.11".to_string(),
-                },
+                dns_task(7, "task-1", "web", "plant", "10.0.0.10"),
+                dns_task(8, "task-2", "web", "plant", "10.0.0.11"),
             ],
         };
-
-        let mut remote_only = record.clone();
-        remote_only.network.id = "network-2".to_string();
-        remote_only.tasks = vec![minga_state::types::NetworkDnsTask {
-            node_id: 8,
-            task_id: "task-3".to_string(),
-            service_name: "web".to_string(),
-            stack: "plant".to_string(),
-            ip: "10.0.1.12".to_string(),
-        }];
+        let remote_only = NetworkAssignment {
+            network: dns_net("network-2"),
+            tasks: vec![dns_task(8, "task-3", "web", "plant", "10.0.1.12")],
+        };
 
         let dns = build_dns_store(&[record, remote_only], 7);
+        let client = v4(10, 0, 0, 10);
         // Remote tasks on a shared network resolve; a network with no local
         // task contributes nothing.
         assert_eq!(
-            dns.resolve(&minga_net::dns::service_fqdn("web", "plant")),
-            vec![
-                std::net::Ipv4Addr::new(10, 0, 0, 10),
-                std::net::Ipv4Addr::new(10, 0, 0, 11)
-            ]
+            dns.resolve_for(client, &minga_net::dns::service_fqdn("web", "plant")),
+            vec![v4(10, 0, 0, 10), v4(10, 0, 0, 11)]
         );
         // The bare name, `tasks.<service>` and the `<stack>.<service>` form
         // v1.3.0-rc.1 answered to resolve to the same tasks.
         for name in ["web", "tasks.web", "plant.web"] {
-            assert_eq!(dns.resolve(name).len(), 2, "{name}");
+            assert_eq!(dns.resolve_for(client, name).len(), 2, "{name}");
+        }
+        assert!(dns
+            .resolve_for(client, "task-3.web.plant.minga.local")
+            .is_empty());
+    }
+
+    /// Issue #200 symptom 1: `proxy` on `front`, `app` on `front` and `back`,
+    /// `db` on `back`. The proxy sees only app's `front` address; the app is
+    /// on both and sees both networks.
+    #[test]
+    fn dns_answers_only_with_addresses_on_the_clients_networks() {
+        let front = NetworkAssignment {
+            network: dns_net("front"),
+            tasks: vec![
+                dns_task(7, "proxy-1", "proxy", "shop", "10.1.0.2"),
+                dns_task(7, "app-1", "app", "shop", "10.1.0.3"),
+            ],
+        };
+        let back = NetworkAssignment {
+            network: dns_net("back"),
+            tasks: vec![
+                dns_task(7, "app-1", "app", "shop", "10.2.0.3"),
+                dns_task(7, "db-1", "db", "shop", "10.2.0.4"),
+            ],
+        };
+        let dns = build_dns_store(&[front, back], 7);
+        let proxy = v4(10, 1, 0, 2);
+        let app_on_front = v4(10, 1, 0, 3);
+        let app_on_back = v4(10, 2, 0, 3);
+        let db = v4(10, 2, 0, 4);
+
+        // The proxy is only on `front`.
+        for name in [
+            "app",
+            "tasks.app",
+            "shop.app",
+            "app.shop.minga.local",
+            "app-1.app.shop.minga.local",
+        ] {
+            assert_eq!(
+                dns.resolve_for(proxy, name),
+                vec![v4(10, 1, 0, 3)],
+                "{name}"
+            );
+        }
+        assert!(dns.resolve_for(proxy, "db").is_empty());
+        // The db is only on `back`.
+        assert_eq!(dns.resolve_for(db, "app"), vec![app_on_back]);
+        assert!(dns.resolve_for(db, "proxy").is_empty());
+        // A task on both networks resolves both, whichever gateway its
+        // query arrived on (its resolv.conf names the first network's).
+        for from in [app_on_front, app_on_back] {
+            assert_eq!(dns.resolve_for(from, "proxy"), vec![proxy]);
+            assert_eq!(dns.resolve_for(from, "db"), vec![db]);
+            assert_eq!(
+                dns.resolve_for(from, "tasks.app"),
+                vec![app_on_front, app_on_back]
+            );
+        }
+    }
+
+    /// Issue #200 symptom 2: two stacks on one node, each with a `db`.
+    #[test]
+    fn dns_bare_names_do_not_cross_stacks() {
+        let one = NetworkAssignment {
+            network: dns_net("one_default"),
+            tasks: vec![
+                dns_task(7, "web-1", "web", "one", "10.1.0.2"),
+                dns_task(7, "db-1", "db", "one", "10.1.0.3"),
+            ],
+        };
+        let two = NetworkAssignment {
+            network: dns_net("two_default"),
+            tasks: vec![
+                dns_task(7, "web-2", "web", "two", "10.2.0.2"),
+                dns_task(7, "db-2", "db", "two", "10.2.0.3"),
+            ],
+        };
+        let dns = build_dns_store(&[one, two], 7);
+        assert_eq!(
+            dns.resolve_for(v4(10, 1, 0, 2), "db"),
+            vec![v4(10, 1, 0, 3)]
+        );
+        assert_eq!(
+            dns.resolve_for(v4(10, 2, 0, 2), "db"),
+            vec![v4(10, 2, 0, 3)]
+        );
+        // Another stack's FQDN is no more reachable than its bare name.
+        assert!(dns
+            .resolve_for(v4(10, 1, 0, 2), "db.two.minga.local")
+            .is_empty());
+    }
+
+    /// Tenancy: a source that is no attached local task (another tenant's
+    /// address, the host, a spoofed one) resolves nothing, so it gets the
+    /// same not-found answer as a name that does not exist.
+    #[test]
+    fn dns_unknown_source_resolves_nothing() {
+        let record = NetworkAssignment {
+            network: dns_net("n"),
+            tasks: vec![dns_task(7, "web-1", "web", "plant", "10.0.0.10")],
+        };
+        let dns = build_dns_store(&[record], 7);
+        for stranger in [v4(10, 9, 9, 9), v4(127, 0, 0, 1)] {
+            assert!(dns.resolve_for(stranger, "web").is_empty());
+            assert!(dns
+                .resolve_for(stranger, "web.plant.minga.local")
+                .is_empty());
         }
     }
 
