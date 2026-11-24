@@ -60,8 +60,10 @@ impl From<minga_state::StateError> for ApiError {
     fn from(e: minga_state::StateError) -> Self {
         use minga_state::StateError as E;
         match e {
+            E::PortConflict(_) => ApiError::Conflict(
+                "published port conflicts with another cluster service".to_owned(),
+            ),
             E::Conflict(_)
-            | E::PortConflict(_)
             | E::NameInUse
             | E::SubnetOverlap
             | E::Membership(_)
