@@ -2,7 +2,12 @@
 
 ## [Unreleased]
 
-Changes on `main` after `v1.3.0-rc.1`. They go into 1.3.0.
+## [1.3.0-rc.2] — 2026-11-24
+
+Second release candidate for 1.3.0, cut to rerun the staging checks against
+every fix since `v1.3.0-rc.1`. It is a pre-release: `releases/latest` still
+points at 1.2.0. Read the [upgrade notes](https://github.com/lithqube/minga/blob/v1.3.0-rc.2/docs/release-1.3.0.md#upgrade-notes)
+before upgrading.
 
 ### Changes
 - **Task networking starts on `iptables-nft` hosts that answer a missing chain with `Incompatible with this kernel` (#204).** On Ubuntu 24.04 (iptables 1.8.10, kernel 6.8) `iptables -S <chain>` for a chain not yet created fails with that message instead of `No chain/target/match by that name`, so the node treated the not-yet-created `MINGA_TASK_SOURCE` as an error and stopped setting up WireGuard and task networking. The node now checks a chain by listing the filter table. Hosts that were switched to `iptables-legacy` to work around it can switch back; see [host requirements](docs/networking.md#host-requirements) for clearing the rules left in the other backend.
