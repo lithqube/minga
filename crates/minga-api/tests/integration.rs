@@ -210,6 +210,31 @@ async fn info_endpoint_shows_swarm() {
 }
 
 #[tokio::test]
+async fn internal_network_is_refused_and_not_created() {
+    let (_server, base, _dir) = start_test_server().await;
+    let http = client();
+    let create = |name: &str, internal: bool| {
+        http.post(format!("{base}/v1.41/networks/create"))
+            .json(&json!({"Name": name, "Internal": internal}))
+            .send()
+    };
+
+    let resp = create("isolated", true).await.unwrap();
+    assert_eq!(resp.status(), 400);
+    assert!(resp.text().await.unwrap().contains("Internal"));
+    let resp = http
+        .get(format!("{base}/v1.41/networks/isolated"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+
+    // An existing network is not handed back as if it were isolated.
+    assert_eq!(create("open", false).await.unwrap().status(), 201);
+    assert_eq!(create("open", true).await.unwrap().status(), 400);
+}
+
+#[tokio::test]
 async fn full_stack_deploy_workflow() {
     let (_server, base, _dir) = start_test_server().await;
     let http = client();

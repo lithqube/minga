@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Security
+- **Breaking: `internal: true` on a network is refused (#270).** It used to be accepted and ignored, so the network had the same external egress as any other. `minga validate`, `minga deploy` and `minga-ctl stack deploy` now fail and name the network, and `POST /networks/create` with `Internal: true` answers 400. Remove the key or set it to `false`. A network created earlier with it is still not isolated.
+
 ## [1.3.0-rc.2] — 2026-11-24
 
 Second release candidate for 1.3.0, cut to rerun the staging checks against

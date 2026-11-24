@@ -117,6 +117,8 @@ Tasks cannot reach `127.0.0.0/8` on the host (a loopback guard prevents this via
 
 Tasks under a required egress policy (`x-minga-egress`) have their DNS responses confined to local names; external DNS queries are refused at the resolver level, so the egress proxy is the only outbound route.
 
+A network cannot yet be cut off from external addresses: `internal: true` in Compose and `Internal: true` in the Docker API are refused.
+
 ## Host requirements
 
 A node started with `--runtime containerd` needs `iproute2`, `iptables`, `iptables-restore` and `nft`, and a kernel that supports every iptables match its rules use. At start it adds a rule for each match to a scratch chain (`MINGA_PREFLIGHT`, never hooked into a built-in chain) and removes it again:
