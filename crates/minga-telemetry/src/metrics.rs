@@ -24,6 +24,8 @@ pub struct Metrics {
     // Scheduler metrics
     pub scheduler_reconcile_duration_seconds: Histogram,
     pub scheduler_placement_decisions_total: CounterVec,
+    /// Tenants left out of a reconcile pass by an error, by tenant and stage.
+    pub scheduler_tenant_failures_total: CounterVec,
 
     // Raft metrics
     pub raft_leader: Gauge,
@@ -104,6 +106,18 @@ impl Metrics {
         registry
             .register(Box::new(scheduler_placement_decisions_total.clone()))
             .expect("register scheduler_placement_decisions_total");
+
+        let scheduler_tenant_failures_total = CounterVec::new(
+            prometheus::Opts::new(
+                "minga_scheduler_tenant_failures_total",
+                "Reconcile passes in which one tenant was skipped after an error",
+            ),
+            &["tenant", "stage"],
+        )
+        .expect("minga_scheduler_tenant_failures_total");
+        registry
+            .register(Box::new(scheduler_tenant_failures_total.clone()))
+            .expect("register scheduler_tenant_failures_total");
 
         let raft_leader = Gauge::new(
             "minga_raft_leader",
@@ -232,6 +246,7 @@ impl Metrics {
             task_restarts_total,
             scheduler_reconcile_duration_seconds,
             scheduler_placement_decisions_total,
+            scheduler_tenant_failures_total,
             raft_leader,
             raft_replication_lag,
             bus_publish_latency_seconds,

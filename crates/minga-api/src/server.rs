@@ -3256,6 +3256,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_node_refuses_an_id_with_no_mesh_address() {
+        let (router, _dir) = test_router().await;
+        for id in [0u64, 1 << 40] {
+            let req = Request::builder()
+                .method("POST")
+                .uri("/v1.41/nodes")
+                .header("Content-Type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({"id": id, "address": "10.0.0.9:50051"}))
+                        .unwrap(),
+                ))
+                .unwrap();
+            let (status, json) = send_operator_request(router.clone(), req).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "id {id}: {json}");
+        }
+    }
+
+    #[tokio::test]
     async fn create_node_rejects_duplicates_and_empty_address() {
         let (router, _dir) = test_router().await;
 

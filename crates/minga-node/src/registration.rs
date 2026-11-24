@@ -669,6 +669,12 @@ async fn register_pending_nodes_with_join(
             pending.remove(&node_id);
             continue;
         }
+        // The scheduler addresses a node in the WireGuard mesh by its ID.
+        if let Err(error) = minga_net::overlay::mesh_node_ip(node_id) {
+            tracing::warn!(node_id, error = %error, "refusing registration: node ID has no mesh address");
+            pending.remove(&node_id);
+            continue;
+        }
         // Raft refuses a key another node holds; checking first keeps a node
         // that renews a copied key to a local read per lease, not a Raft write
         // per retry tick.

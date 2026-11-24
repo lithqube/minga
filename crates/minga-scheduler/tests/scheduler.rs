@@ -120,7 +120,7 @@ async fn bus_lease_controls_node_eligibility() {
 }
 
 #[tokio::test]
-async fn manager_without_endpoint_blocks_multi_node_placement() {
+async fn manager_without_endpoint_leaves_its_tenant_out_of_multi_node_placement() {
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(
         StateStore::open(1, "127.0.0.1:0", dir.path(), BTreeMap::new())
@@ -140,8 +140,17 @@ async fn manager_without_endpoint_blocks_multi_node_placement() {
     bus.refresh_lease(2, b"registration").await.unwrap();
     let scheduler = Scheduler::with_bus(store.clone(), bus);
 
-    assert!(scheduler.reconcile_once().await.is_err());
+    let failures = || {
+        minga_telemetry::METRICS
+            .scheduler_tenant_failures_total
+            .with_label_values(&[minga_state::types::DEFAULT_TENANT_ID, "nodes"])
+            .get()
+    };
+    let before = failures();
+    // The manager's tenant is skipped and counted; the pass itself succeeds.
+    scheduler.reconcile_once().await.unwrap();
     assert!(store.list_tasks().await.unwrap().is_empty());
+    assert!(failures() > before);
 
     drop(scheduler);
     Arc::try_unwrap(store)
@@ -1815,6 +1824,223 @@ async fn one_tenant_at_its_task_quota_does_not_block_other_tenants() {
     let count = |tenant: &str| tasks.iter().filter(|t| t.tenant_id == tenant).count();
     assert_eq!(count(minga_state::types::DEFAULT_TENANT_ID), 1);
     assert_eq!(count("tenant-b"), 1);
+
+    drop(scheduler);
+    Arc::try_unwrap(store)
+        .ok()
+        .expect("scheduler dropped")
+        .shutdown()
+        .await
+        .unwrap();
+}
+
+/// A cluster of one manager and one worker per named tenant, every node live
+/// and joined. Node 1 is the manager; the tenants' workers are nodes 2, 3, ….
+async fn tenant_cluster(tenants: &[&str]) -> (Arc<StateStore>, Arc<MemoryBus>, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(
+        StateStore::open(1, "127.0.0.1:0", dir.path(), BTreeMap::new())
+            .await
+            .unwrap(),
+    );
+    let bus = MemoryBus::new();
+    let mut manager = make_node(1, 8.0, 1 << 34);
+    manager.role = NodeRole::Manager;
+    manager.wg_public_key = Some("manager-key".into());
+    manager.wg_endpoint = Some("192.0.2.1:51820".into());
+    store.upsert_node(manager).await.unwrap();
+    bus.refresh_lease(1, b"registration").await.unwrap();
+    for (index, tenant) in tenants.iter().enumerate() {
+        let node_id = index as u64 + 2;
+        store
+            .upsert_tenant(minga_state::types::Tenant {
+                nats_revoked_user_public_keys: Vec::new(),
+                id: (*tenant).into(),
+                name: (*tenant).into(),
+                quotas: Default::default(),
+                created_at: 1,
+            })
+            .await
+            .unwrap();
+        let mut worker = make_node(node_id, 8.0, 1 << 34);
+        worker.tenant_id = (*tenant).into();
+        worker.wg_public_key = Some(format!("{tenant}-key"));
+        worker.wg_endpoint = Some(format!("192.0.2.{}:51820", node_id + 1));
+        store.upsert_node(worker).await.unwrap();
+        bus.refresh_tenant_lease(tenant, node_id, b"registration")
+            .await
+            .unwrap();
+        bus.put_tenant_status(
+            tenant,
+            &subjects::kv_node_join(tenant, node_id),
+            tenant.as_bytes(),
+        )
+        .await
+        .unwrap();
+    }
+    (store, bus, dir)
+}
+
+async fn deploy(store: &StateStore, tenant: &str, name: &str) {
+    let mut service = make_service(&format!("{tenant}.{name}"), 1);
+    service.tenant_id = tenant.into();
+    store.upsert_service(service).await.unwrap();
+}
+
+fn keys_of(entries: Vec<(String, Vec<u8>)>, tenant: &str) -> Vec<String> {
+    let prefix = format!("{tenant}.");
+    let mut keys: Vec<_> = entries
+        .into_iter()
+        .map(|(key, _)| key)
+        .filter(|key| key.starts_with(&prefix))
+        .collect();
+    keys.sort();
+    keys
+}
+
+fn tenant_failures(tenant: &str, stage: &str) -> f64 {
+    minga_telemetry::METRICS
+        .scheduler_tenant_failures_total
+        .with_label_values(&[tenant, stage])
+        .get()
+}
+
+#[tokio::test]
+async fn a_tenant_whose_bus_calls_fail_does_not_stop_the_pass_for_another_tenant() {
+    let (store, bus, _dir) = tenant_cluster(&["iso-a", "iso-b"]).await;
+    deploy(&store, "iso-a", "web").await;
+    let scheduler = Scheduler::with_bus(store.clone(), bus.clone());
+    scheduler.reconcile_once().await.unwrap();
+    let tasks_of = |tenant: &'static str| {
+        let store = store.clone();
+        async move {
+            let mut tasks: Vec<_> = store
+                .list_tasks()
+                .await
+                .unwrap()
+                .into_iter()
+                .filter(|task| task.tenant_id == tenant)
+                .collect();
+            tasks.sort_by(|a, b| a.id.cmp(&b.id));
+            tasks
+        }
+    };
+    let a_tasks = tasks_of("iso-a").await;
+    assert_eq!(a_tasks.len(), 1, "tenant A is placed while healthy");
+    let a_keys = keys_of(bus.list_assignments("").await.unwrap(), "iso-a");
+    assert!(!a_keys.is_empty());
+
+    // Tenant A's buckets fail (status listing, assignment write and delete).
+    // Tenant A has a new service; tenant B arrives in the same pass.
+    bus.fail_tenant("iso-a");
+    deploy(&store, "iso-a", "api").await;
+    deploy(&store, "iso-b", "web").await;
+    scheduler
+        .reconcile_once()
+        .await
+        .expect("one tenant's bus error is not a pass error");
+
+    let b_tasks = tasks_of("iso-b").await;
+    assert_eq!(b_tasks.len(), 1, "tenant B is placed in the same pass");
+    let b_key = subjects::kv_assignment_task("iso-b", b_tasks[0].node_id, &b_tasks[0].id);
+    assert!(
+        bus.get_assignment(&b_key).await.unwrap().is_some(),
+        "tenant B's assignment is written"
+    );
+    assert_eq!(
+        tasks_of("iso-a").await,
+        a_tasks,
+        "a tenant whose status is unreadable is left alone, not re-placed or marked down"
+    );
+    assert_eq!(
+        keys_of(bus.list_assignments("").await.unwrap(), "iso-a"),
+        a_keys,
+        "tenant A's existing assignment keys are not swept"
+    );
+    assert_eq!(tenant_failures("iso-a", "status"), 1.0, "counted once");
+    assert_eq!(tenant_failures("iso-b", "status"), 0.0);
+
+    // Counted once per pass while the fault lasts, then it retries and heals.
+    scheduler.reconcile_once().await.unwrap();
+    assert_eq!(tenant_failures("iso-a", "status"), 2.0);
+    bus.heal_tenant("iso-a");
+    scheduler.reconcile_once().await.unwrap();
+    assert_eq!(tenant_failures("iso-a", "status"), 2.0);
+    assert_eq!(tasks_of("iso-a").await.len(), 2, "A catches up next pass");
+
+    drop(scheduler);
+    Arc::try_unwrap(store)
+        .ok()
+        .expect("scheduler dropped")
+        .shutdown()
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn a_failing_assignment_write_skips_only_its_tenant() {
+    let (store, bus, _dir) = tenant_cluster(&["iso-c", "iso-d"]).await;
+    deploy(&store, "iso-c", "web").await;
+    deploy(&store, "iso-d", "web").await;
+    // Status reads succeed for everyone; only tenant C's writes fail.
+    bus.fail_tenant_assignments("iso-c");
+    let scheduler = Scheduler::with_bus(store.clone(), bus.clone());
+    scheduler.reconcile_once().await.unwrap();
+
+    let d_keys = keys_of(bus.list_assignments("").await.unwrap(), "iso-d");
+    assert!(
+        d_keys.iter().any(|key| key.contains(".task.")),
+        "tenant D's task assignment is written: {d_keys:?}"
+    );
+    assert!(d_keys.contains(&"iso-d.node.3.wg".to_string()));
+    assert_eq!(tenant_failures("iso-c", "projection"), 1.0);
+    assert_eq!(tenant_failures("iso-d", "projection"), 0.0);
+
+    drop(scheduler);
+    Arc::try_unwrap(store)
+        .ok()
+        .expect("scheduler dropped")
+        .shutdown()
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn a_node_record_without_a_mesh_address_skips_only_its_tenant() {
+    let (store, bus, _dir) = tenant_cluster(&["iso-e", "iso-f"]).await;
+    // A node ID the WireGuard mesh subnet has no host for, in tenant E.
+    let mut stray = make_node(70_000, 8.0, 1 << 34);
+    stray.tenant_id = "iso-e".into();
+    store.upsert_node(stray).await.unwrap();
+    bus.refresh_tenant_lease("iso-e", 70_000, b"registration")
+        .await
+        .unwrap();
+    bus.put_tenant_status("iso-e", &subjects::kv_node_join("iso-e", 70_000), b"iso-e")
+        .await
+        .unwrap();
+    deploy(&store, "iso-e", "web").await;
+    deploy(&store, "iso-f", "web").await;
+
+    let scheduler = Scheduler::with_bus(store.clone(), bus.clone());
+    scheduler.reconcile_once().await.unwrap();
+
+    let tasks = store.list_tasks().await.unwrap();
+    assert_eq!(
+        tasks
+            .iter()
+            .filter(|task| task.tenant_id == "iso-f")
+            .count(),
+        1,
+        "tenant F is placed"
+    );
+    assert!(
+        !tasks.iter().any(|task| task.tenant_id == "iso-e"),
+        "tenant E is left out of the pass"
+    );
+    assert!(keys_of(bus.list_assignments("").await.unwrap(), "iso-f")
+        .iter()
+        .any(|key| key.ends_with(".wg")));
+    assert_eq!(tenant_failures("iso-e", "nodes"), 1.0);
 
     drop(scheduler);
     Arc::try_unwrap(store)

@@ -1616,6 +1616,13 @@ pub async fn create_node(
         }
         None => nodes.iter().map(|n| n.id).max().unwrap_or(0) + 1,
     };
+    // The scheduler gives every node an address in the WireGuard mesh subnet
+    // by its ID; a node without one could not be projected.
+    if let Err(error) = minga_net::overlay::mesh_node_ip(id) {
+        return Err(bad_request(format!(
+            "node ID {id} has no address in the WireGuard mesh subnet: {error}"
+        )));
+    }
     if nodes.iter().any(|n| n.address == req.address) {
         return Err(conflict(format!(
             "node address {} is already registered",

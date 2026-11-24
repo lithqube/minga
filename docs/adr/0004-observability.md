@@ -24,6 +24,7 @@ Operators need Prometheus-scrapable metrics, Kubernetes-compatible health probes
    - `minga_task_starts_total`, `minga_task_stops_total`, `minga_task_restarts_total` — counters
    - `minga_scheduler_reconcile_duration_seconds` — histogram
    - `minga_scheduler_placement_decisions_total{result="placed|no_node|constraint_fail"}` — counter
+   - `minga_scheduler_tenant_failures_total{tenant,stage}` — counter, one per pass in which an error left that tenant out of the pass (stage: `nodes|status|subnet|placement|projection|sweep`)
    - `minga_raft_leader{term}` — gauge (1 if leader)
    - `minga_raft_replication_lag` — gauge (log index diff)
    - `minga_bus_publish_latency_seconds{topic="events|logs|commands"}` — histogram
