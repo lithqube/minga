@@ -264,6 +264,21 @@ fn make_fifo(path: &std::path::Path) -> Result<(), std::io::Error> {
     }
 }
 
+/// Returns the stdout and stderr FIFO paths that exist on disk for `container_id`
+/// under `logs_dir`. Each slot is `Some(path)` when the FIFO file is present and
+/// `None` when it is absent. The caller must only open paths that are `Some`.
+fn select_log_fifos(
+    logs_dir: &std::path::Path,
+    container_id: &str,
+) -> (Option<PathBuf>, Option<PathBuf>) {
+    let stdout = logs_dir.join(format!("{container_id}.stdout.fifo"));
+    let stderr = logs_dir.join(format!("{container_id}.stderr.fifo"));
+    (
+        stdout.exists().then_some(stdout),
+        stderr.exists().then_some(stderr),
+    )
+}
+
 /// Drains a FIFO into `ring` until aborted. Opened O_RDWR nonblocking so
 /// the open never blocks and reads never report EOF while containerd
 /// lazily opens the writer end.
@@ -1057,14 +1072,27 @@ impl ContainerdRuntime {
         if self.log_readers.lock().await.contains_key(container_id) {
             return;
         }
-        let stdout_path = logs_dir.join(format!("{container_id}.stdout.fifo"));
-        let stderr_path = logs_dir.join(format!("{container_id}.stderr.fifo"));
-        if !stdout_path.exists() && !stderr_path.exists() {
+        let (stdout_path, stderr_path) = select_log_fifos(logs_dir, container_id);
+        if stdout_path.is_none() && stderr_path.is_none() {
             tracing::debug!(
                 container = %container_id,
                 "no log FIFOs found for adopted container; log capture will be absent"
             );
             return;
+        }
+        // Report each absent FIFO at debug level — it was never created for this
+        // container, so no "open failed" error is appropriate.
+        if stdout_path.is_none() {
+            tracing::debug!(
+                container = %container_id,
+                "stdout log FIFO absent for adopted container; no stdout reader started"
+            );
+        }
+        if stderr_path.is_none() {
+            tracing::debug!(
+                container = %container_id,
+                "stderr log FIFO absent for adopted container; no stderr reader started"
+            );
         }
         let ring = Arc::new(LogRing::default());
         self.log_rings
@@ -1072,11 +1100,28 @@ impl ContainerdRuntime {
             .await
             .insert(container_id.to_string(), ring.clone());
         let out_ring = ring.clone();
+        // Spawn only the readers whose FIFOs exist. tokio::join! on two
+        // futures is kept as the join shape where both are present; for one
+        // FIFO we await a single future so there is no dangling join arm.
         let handle = tokio::spawn(async move {
-            tokio::join!(
-                fifo_reader(stdout_path, LogStream::Stdout, out_ring),
-                fifo_reader(stderr_path, LogStream::Stderr, ring),
-            );
+            match (stdout_path, stderr_path) {
+                (Some(out), Some(err)) => {
+                    tokio::join!(
+                        fifo_reader(out, LogStream::Stdout, out_ring),
+                        fifo_reader(err, LogStream::Stderr, ring),
+                    );
+                }
+                (Some(out), None) => {
+                    fifo_reader(out, LogStream::Stdout, out_ring).await;
+                }
+                (None, Some(err)) => {
+                    fifo_reader(err, LogStream::Stderr, ring).await;
+                }
+                (None, None) => {
+                    // Both absent: guard above returns before we reach here.
+                    // This arm is unreachable but kept for exhaustiveness.
+                }
+            }
         });
         self.log_readers
             .lock()
@@ -2065,5 +2110,70 @@ mod tests {
             !gap_again,
             "no second gap must be reported after cursor advances past all surviving chunks"
         );
+    }
+
+    // --- AC4: partly-present FIFO set — reader decision -------------------
+
+    /// A container whose log directory has only the stdout FIFO must have its
+    /// stdout selected and stderr left as absent (not attempted).
+    ///
+    /// **Red-first evidence:** `select_log_fifos` does not exist before this
+    /// fix; this test fails to compile until the helper is extracted.
+    #[test]
+    fn select_log_fifos_partly_present_stdout_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let container_id = "test-container-ac4";
+
+        // Only stdout FIFO exists (as a regular file — exists() only checks path).
+        let stdout_path = dir.path().join(format!("{container_id}.stdout.fifo"));
+        std::fs::write(&stdout_path, b"").unwrap();
+
+        let (got_stdout, got_stderr) = select_log_fifos(dir.path(), container_id);
+        assert_eq!(
+            got_stdout,
+            Some(stdout_path),
+            "stdout path must be returned when it exists"
+        );
+        assert_eq!(
+            got_stderr, None,
+            "stderr must be absent when its FIFO does not exist"
+        );
+    }
+
+    /// Both FIFOs present: both returned.
+    #[test]
+    fn select_log_fifos_both_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let container_id = "test-container-both";
+        let stdout_path = dir.path().join(format!("{container_id}.stdout.fifo"));
+        let stderr_path = dir.path().join(format!("{container_id}.stderr.fifo"));
+        std::fs::write(&stdout_path, b"").unwrap();
+        std::fs::write(&stderr_path, b"").unwrap();
+
+        let (got_stdout, got_stderr) = select_log_fifos(dir.path(), container_id);
+        assert_eq!(got_stdout, Some(stdout_path), "stdout must be returned");
+        assert_eq!(got_stderr, Some(stderr_path), "stderr must be returned");
+    }
+
+    /// Neither FIFO present: both absent.
+    #[test]
+    fn select_log_fifos_neither_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let (got_stdout, got_stderr) = select_log_fifos(dir.path(), "absent-container");
+        assert_eq!(got_stdout, None, "stdout must be absent");
+        assert_eq!(got_stderr, None, "stderr must be absent");
+    }
+
+    /// Only stderr FIFO exists: stderr returned, stdout absent.
+    #[test]
+    fn select_log_fifos_partly_present_stderr_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let container_id = "test-container-stderr-only";
+        let stderr_path = dir.path().join(format!("{container_id}.stderr.fifo"));
+        std::fs::write(&stderr_path, b"").unwrap();
+
+        let (got_stdout, got_stderr) = select_log_fifos(dir.path(), container_id);
+        assert_eq!(got_stdout, None, "stdout must be absent");
+        assert_eq!(got_stderr, Some(stderr_path), "stderr must be returned");
     }
 }
