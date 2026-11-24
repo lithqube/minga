@@ -129,6 +129,8 @@ A node started with `--runtime containerd` needs `iproute2`, `iptables`, `iptabl
 
 With the `iptables-nft` backend (`iptables -V` prints `(nf_tables)`) each match also needs the `nft_compat` module. A kernel built without one of them fails the check. The node then exits at start with `this host cannot run task networking`, naming the match, its module, the iptables backend, the kernel release and the iptables command with its stderr. Fix it by installing the module, or by selecting the other backend (`update-alternatives --config iptables`), then restart the node.
 
+Switching the backend does not remove the rules already installed through the other one, and the kernel applies both sets: packets still pass the old chains, including another firewall's (ufw) `DROP` policies. Check both with `iptables-nft-save | grep -c MINGA` and `iptables-legacy-save | grep -c MINGA`. The simplest clean state is a reboot after `update-alternatives`, so every firewall reinstalls its rules through the selected backend only.
+
 1.2.0 did not use `physdev`, so a kernel that ran 1.2.0 can fail this check on 1.3.0. Attach the message to a bug report: it holds what is needed to diagnose it.
 
 Task namespaces (`minga-<task-id>`) are removed at start when they have no state file and no process runs in them, for example after the state directory was wiped. One a process still runs in is kept, and the node refuses to start tasks until you stop that process and `ip netns delete` it.

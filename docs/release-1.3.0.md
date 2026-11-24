@@ -133,7 +133,10 @@ host above may run it; it is the only in-place path this candidate offers:
    `--data-dir`, log once that it can be deleted, and never open it. They join
    as NATS clients.
 3. `minga api` exits with a message pointing to `minga manager --api-bind`.
-   It is not kept as an alias.
+   It is not kept as an alias. A systemd unit that still runs it fails on every
+   start and restarts in a loop, so disable it:
+   `systemctl disable --now <unit>` (find it with
+   `grep -l "minga api" /etc/systemd/system/*.service`).
 
 A 1.2.0 cluster went through this in a live proof with a service and a running
 container intact, and the upgraded worker adopted the same task. The proof
@@ -206,7 +209,9 @@ and NATS reissuance applies here too.
    and `minga manager` only after the backup is complete.
 
 3. **Stop the old processes and remove the `--peer` flags and the `minga api` unit.**
-   Remove or disable the `minga api` systemd unit. Remove `--peer` from the
+   Remove or disable the `minga api` systemd unit
+   (`systemctl disable --now <unit>`); left enabled, it restarts in a loop
+   under 1.3.0. Remove `--peer` from the
    `minga manager` unit; in 1.3.0 the API is served by `minga manager --api-bind`.
 
 4. **Install the 1.3.0 binary.**
