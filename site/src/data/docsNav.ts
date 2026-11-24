@@ -14,6 +14,8 @@ export const docsNav = [
       { label: 'Supported topologies', href: '/docs/topologies/' },
       { label: 'Backup and restore', href: '/docs/backup/' },
       { label: 'Talos Linux', href: '/docs/talos-deployment/', badge: 'partially validated' },
+      { label: 'Networking', href: '/docs/networking/' },
+      { label: 'Troubleshooting', href: '/docs/troubleshooting/' },
     ],
   },
   {

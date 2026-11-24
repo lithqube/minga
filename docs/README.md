@@ -45,6 +45,8 @@ Implementation-status notes distinguish what is merged from what remains propose
 - [systemd unit](../scripts/minga.service) and [environment example](../scripts/minga.env.example)
 - [Talos Linux](talos-deployment.md): one docker-provisioned Talos v1.14 node through workload start; bare metal and multi-node remain unvalidated
 - [Hetzner ARM staging stack](hetzner-arm-staging.md): example deployment; verify host-specific claims against current status
+- [Networking](networking.md): service names, DNS, subnets, published ports and cross-node traffic
+- [Troubleshooting](troubleshooting.md): task will not start, name resolution, iptables/kernel errors, node logs
 
 ## History and research
 
