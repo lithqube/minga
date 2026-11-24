@@ -64,20 +64,45 @@ const DEFAULT_RUNTIME_NAME: &str = "io.containerd.runc.v2";
 const LOG_RING_BYTES: usize = 1024 * 1024;
 
 /// A bounded, append-only log capture for one container.
-#[derive(Default)]
+///
+/// Each chunk receives a 1-based monotonic sequence number. The sequence
+/// never resets while the ring is alive, so the supervisor can use the last
+/// sequence it saw as a cursor: even after older chunks are evicted it can
+/// tell whether it has published every surviving chunk.
 struct LogRing {
-    inner: std::sync::Mutex<(usize, std::collections::VecDeque<ContainerLog>)>,
+    inner: std::sync::Mutex<LogRingInner>,
+}
+
+struct LogRingInner {
+    /// Total captured bytes currently in the deque.
+    bytes: usize,
+    deque: std::collections::VecDeque<ContainerLog>,
+    /// Next sequence number to assign (1-based; 0 = "nothing pushed yet").
+    next_seq: u64,
+}
+
+impl Default for LogRing {
+    fn default() -> Self {
+        Self {
+            inner: std::sync::Mutex::new(LogRingInner {
+                bytes: 0,
+                deque: std::collections::VecDeque::new(),
+                next_seq: 1,
+            }),
+        }
+    }
 }
 
 impl LogRing {
-    fn push(&self, log: ContainerLog) {
+    fn push(&self, mut log: ContainerLog) {
         let mut guard = self.inner.lock().unwrap();
-        let (bytes, deque) = &mut *guard;
-        *bytes += log.data.len();
-        deque.push_back(log);
-        while *bytes > LOG_RING_BYTES {
-            if let Some(old) = deque.pop_front() {
-                *bytes -= old.data.len();
+        log.seq = guard.next_seq;
+        guard.next_seq += 1;
+        guard.bytes += log.data.len();
+        guard.deque.push_back(log);
+        while guard.bytes > LOG_RING_BYTES {
+            if let Some(old) = guard.deque.pop_front() {
+                guard.bytes -= old.data.len();
             } else {
                 break;
             }
@@ -85,7 +110,7 @@ impl LogRing {
     }
 
     fn snapshot(&self) -> Vec<ContainerLog> {
-        self.inner.lock().unwrap().1.iter().cloned().collect()
+        self.inner.lock().unwrap().deque.iter().cloned().collect()
     }
 }
 
@@ -289,6 +314,7 @@ async fn fifo_reader(fifo: PathBuf, stream: LogStream, ring: Arc<LogRing>) {
             Ok(Ok(n)) => ring.push(ContainerLog {
                 stream,
                 data: buf[..n].to_vec(),
+                seq: 0, // ring.push() overwrites this with the next sequence number
             }),
             Ok(Err(e)) if e.kind() == std::io::ErrorKind::WouldBlock => {}
             Ok(Err(e)) => {
@@ -737,6 +763,21 @@ impl ContainerdRuntime {
         }
     }
 
+    /// Aborts log reader tasks for `container_id` without removing the FIFO
+    /// files from disk.
+    ///
+    /// This models a supervisor restart: the old process dies (reader tasks
+    /// are gone) but the named pipes survive on disk so the new instance can
+    /// re-open them via [`Self::open_log_fifos`].  Used by tests that need
+    /// to stop the original readers before the second runtime instance
+    /// adopts the same container.
+    pub async fn close_log_readers(&self, container_id: &str) {
+        if let Some(handle) = self.log_readers.lock().await.remove(container_id) {
+            handle.abort();
+        }
+        self.log_rings.lock().await.remove(container_id);
+    }
+
     /// Undoes the network and log setup of a start that failed before its
     /// container existed, and hands back the error.
     async fn abort_start(&self, container_id: &str, error: RuntimeError) -> RuntimeError {
@@ -1003,6 +1044,45 @@ impl ContainerdRuntime {
         } else {
             format!("; rollback incomplete: {}", errors.join(", "))
         }
+    }
+    /// Opens FIFO readers for a container that was adopted on startup
+    /// (already running when the supervisor started). The FIFOs must already
+    /// exist on disk — they were created when the container was first started.
+    /// If readers are already running for this container this is a no-op.
+    async fn start_adopted_log_readers(&self, container_id: &str) {
+        let Some(logs_dir) = &self.logs_dir else {
+            return;
+        };
+        // Guard: skip if readers already running.
+        if self.log_readers.lock().await.contains_key(container_id) {
+            return;
+        }
+        let stdout_path = logs_dir.join(format!("{container_id}.stdout.fifo"));
+        let stderr_path = logs_dir.join(format!("{container_id}.stderr.fifo"));
+        if !stdout_path.exists() && !stderr_path.exists() {
+            tracing::debug!(
+                container = %container_id,
+                "no log FIFOs found for adopted container; log capture will be absent"
+            );
+            return;
+        }
+        let ring = Arc::new(LogRing::default());
+        self.log_rings
+            .lock()
+            .await
+            .insert(container_id.to_string(), ring.clone());
+        let out_ring = ring.clone();
+        let handle = tokio::spawn(async move {
+            tokio::join!(
+                fifo_reader(stdout_path, LogStream::Stdout, out_ring),
+                fifo_reader(stderr_path, LogStream::Stderr, ring),
+            );
+        });
+        self.log_readers
+            .lock()
+            .await
+            .insert(container_id.to_string(), handle);
+        tracing::info!(container = %container_id, "log readers started for adopted container");
     }
 }
 
@@ -1719,6 +1799,10 @@ impl Runtime for ContainerdRuntime {
             snap[snap.len() - tail..].to_vec()
         }
     }
+
+    async fn open_log_fifos(&self, container_id: &str) {
+        self.start_adopted_log_readers(container_id).await;
+    }
 }
 
 #[cfg(test)]
@@ -1849,5 +1933,137 @@ mod tests {
     fn grace_period_is_reasonable() {
         assert!(GRACE_PERIOD >= Duration::from_secs(5));
         assert!(GRACE_PERIOD <= Duration::from_secs(30));
+    }
+
+    // --- AC1: ring sequence numbers let the cursor skip evicted chunks --------
+
+    /// Push more than 1 MiB through the ring in equal-size 64 KiB chunks.
+    /// Every chunk that remains in the ring must have a unique, contiguous
+    /// sequence starting at some `first_seq`. The snapshot must be exactly the
+    /// expected tail (drop-oldest eviction) and every remaining chunk must be
+    /// published exactly once when iterated by sequence cursor.
+    #[test]
+    fn log_ring_sequence_survives_eviction_ac1() {
+        const CHUNK: usize = 64 * 1024; // 64 KiB
+        const TOTAL: usize = 2 * 1024 * 1024; // 2 MiB — well over the 1 MiB cap
+        let chunks_total = TOTAL / CHUNK; // 32 chunks
+
+        let ring = LogRing::default();
+        for i in 0..chunks_total {
+            ring.push(ContainerLog {
+                stream: LogStream::Stdout,
+                data: vec![i as u8; CHUNK],
+                seq: 0, // ring overwrites this
+            });
+        }
+
+        let snap = ring.snapshot();
+        // The ring holds at most LOG_RING_BYTES / CHUNK chunks (16 of the 32).
+        let expected_surviving = LOG_RING_BYTES / CHUNK;
+        assert_eq!(
+            snap.len(),
+            expected_surviving,
+            "ring must hold exactly the last {expected_surviving} chunks"
+        );
+
+        // Every surviving chunk must have a unique, contiguous sequence.
+        let seqs: Vec<u64> = snap.iter().map(|c| c.seq).collect();
+        for w in seqs.windows(2) {
+            assert_eq!(w[1], w[0] + 1, "sequences must be contiguous: {:?}", seqs);
+        }
+        // First surviving seq must equal chunks_total - expected_surviving + 1.
+        assert_eq!(
+            seqs[0],
+            (chunks_total - expected_surviving + 1) as u64,
+            "first surviving seq must follow the evicted range"
+        );
+
+        // Simulate the supervisor cursor: iterate by seq > cursor.
+        // Use a local snapshot of cursor for the closure to avoid borrow conflict.
+        let mut cursor: u64 = 0;
+        let mut published = 0usize;
+        for chunk in snap.iter() {
+            if chunk.seq > cursor {
+                cursor = chunk.seq;
+                published += 1;
+            }
+        }
+        assert_eq!(
+            published, expected_surviving,
+            "every surviving chunk must be published exactly once"
+        );
+
+        // A second pass with the same cursor must publish nothing (idempotent).
+        let second_pass = snap.iter().filter(|c| c.seq > cursor).count();
+        assert_eq!(second_pass, 0, "no chunk must be published twice");
+    }
+
+    // --- AC2: dropped-before-published gap is detected once -------------------
+
+    /// Simulate a ring that evicted chunks before the cursor advanced past
+    /// them. The gap must be detectable by comparing cursor + 1 to the first
+    /// surviving seq, and once the cursor jumps past the gap no second warning
+    /// fires.
+    #[test]
+    fn log_ring_gap_detection_ac2() {
+        let ring = LogRing::default();
+        // Push 3 chunks so they get seq 1, 2, 3.
+        for i in 0u8..3 {
+            ring.push(ContainerLog {
+                stream: LogStream::Stdout,
+                data: vec![i; 10],
+                seq: 0,
+            });
+        }
+        // Push a chunk that is just over the ring capacity so that all three
+        // earlier chunks (seq 1-3) are evicted. This chunk gets seq 4.
+        // After eviction seq 4 is the only surviving chunk.
+        ring.push(ContainerLog {
+            stream: LogStream::Stdout,
+            data: vec![0xFFu8; LOG_RING_BYTES + 1],
+            seq: 0,
+        });
+        // The oversized chunk itself exceeds the cap: the ring's eviction loop
+        // runs until bytes <= LOG_RING_BYTES, but the loop pops the front first.
+        // Let's push a small chunk (seq 5) after the big one so we have a known
+        // surviving element regardless of whether seq 4 itself was dropped.
+        ring.push(ContainerLog {
+            stream: LogStream::Stdout,
+            data: vec![42u8; 100],
+            seq: 0,
+        });
+
+        let snap = ring.snapshot();
+        assert!(!snap.is_empty(), "ring must not be empty after pushes");
+
+        // The small final chunk (seq 5) must be in the snapshot.
+        let last = snap.last().unwrap();
+        assert_eq!(last.seq, 5, "last chunk must have seq 5");
+
+        // Cursor is set to 1 (we "published" seq 1 previously).
+        // The first surviving chunk has seq > 1, so a gap is present.
+        let cursor: u64 = 1;
+        let first = snap.first().unwrap();
+        let gap_present = first.seq > cursor + 1;
+        assert!(
+            gap_present,
+            "gap must be detected: first.seq={} cursor={}",
+            first.seq, cursor
+        );
+        // dropped = first_surviving_seq - last_published_seq - 1
+        let dropped = first.seq - cursor - 1;
+        // All seqs between cursor+1 and first.seq-1 were dropped.
+        assert!(dropped > 0, "at least one chunk must have been dropped");
+
+        // After the cursor advances past the gap, no second gap fires.
+        let new_cursor = last.seq; // cursor now at seq 5
+        let gap_again = snap
+            .first()
+            .map(|c| c.seq > new_cursor + 1 && new_cursor > 0)
+            .unwrap_or(false);
+        assert!(
+            !gap_again,
+            "no second gap must be reported after cursor advances past all surviving chunks"
+        );
     }
 }

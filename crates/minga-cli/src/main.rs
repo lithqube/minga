@@ -2554,8 +2554,10 @@ fn print_translated(t: &minga_scheduler::TranslatedStack) {
             println!("    agent {}", details.join("  "));
         }
         if !svc.env.is_empty() {
-            let env: Vec<String> = svc.env.iter().map(|(k, v)| format!("{k}={v}")).collect();
-            println!("    env {}", env.join(" "));
+            // Print keys only: values may contain credentials and must not appear in
+            // terminal scrollback, CI logs, or shell history captures (issue #195).
+            let keys: Vec<&str> = svc.env.keys().map(String::as_str).collect();
+            println!("    env {}", keys.join(" "));
         }
         if !svc.ports.is_empty() {
             let ports: Vec<String> = svc

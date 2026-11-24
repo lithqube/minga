@@ -4343,6 +4343,55 @@ mod tests {
         );
     }
 
+    // AC1: a service in tenant `beta` publishing port 443 must not block
+    // an independent service in tenant `acme` publishing the same port.
+    #[test]
+    fn cross_tenant_service_on_same_ingress_port_is_admitted() {
+        let existing = ingress_service("beta", 443);
+        let incoming = ingress_service("acme", 443);
+        assert!(
+            validate_ingress_ports(&incoming, &[existing], &[]).is_ok(),
+            "cross-tenant ingress port overlap must not block admission"
+        );
+    }
+
+    // AC2: same-tenant collision is still rejected with a descriptive error.
+    #[test]
+    fn same_tenant_service_on_same_ingress_port_is_rejected() {
+        let mut existing = ingress_service("acme", 443);
+        existing.id = "svc-acme-other".to_string();
+        let incoming = ingress_service("acme", 443);
+        let err = validate_ingress_ports(&incoming, &[existing], &[]);
+        assert!(
+            err.is_err(),
+            "same-tenant ingress port overlap must be rejected"
+        );
+    }
+
+    // AC3: the rejection for a same-tenant collision must not carry
+    // another tenant's identifiers.  Here the services slice contains
+    // both a cross-tenant service and a same-tenant blocker; the error
+    // returned must only mention the same-tenant service, never the
+    // cross-tenant one.
+    #[test]
+    fn same_tenant_409_does_not_leak_other_tenant_identifiers() {
+        let cross_tenant = ingress_service("beta", 443);
+        let mut same_tenant_blocker = ingress_service("acme", 443);
+        same_tenant_blocker.id = "svc-acme-other".to_string();
+        same_tenant_blocker.name = "svc-acme-other".to_string();
+        let incoming = ingress_service("acme", 443);
+        let err = validate_ingress_ports(&incoming, &[cross_tenant, same_tenant_blocker], &[])
+            .unwrap_err();
+        assert!(
+            !err.contains("beta"),
+            "409 body must not name the other tenant; got: {err}"
+        );
+        assert!(
+            !err.contains("svc-beta"),
+            "409 body must not name the other tenant's service; got: {err}"
+        );
+    }
+
     #[tokio::test]
     async fn service_admission_scopes_reserved_ports_to_the_service_tenant() {
         let dir = tempfile::tempdir().unwrap();

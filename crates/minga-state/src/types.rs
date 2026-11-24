@@ -649,9 +649,12 @@ pub struct PortMapping {
 }
 
 /// Why `service`'s published ports collide, if they do. A published
-/// port/protocol may appear once per service, and once per cluster when
+/// port/protocol may appear once per service, and once per the tenant when
 /// either side publishes it through ingress. Two host-mode services may
 /// share one, since placement keeps them on different nodes.
+///
+/// Only services owned by the same tenant as `service` are compared; a
+/// cross-tenant service publishing the same port is never a conflict.
 pub fn published_port_conflict<'a>(
     service: &Service,
     others: impl IntoIterator<Item = &'a Service>,
@@ -674,7 +677,10 @@ pub fn published_port_conflict<'a>(
             ));
         }
     }
-    for other in others.into_iter().filter(|other| other.id != service.id) {
+    for other in others
+        .into_iter()
+        .filter(|other| other.id != service.id && other.tenant_id == service.tenant_id)
+    {
         for port in &service.ports {
             let Some(tuple) = published(port) else {
                 continue;
@@ -683,14 +689,10 @@ pub fn published_port_conflict<'a>(
                 published(other_port).as_ref() == Some(&tuple)
                     && (port.mode == PortMode::Ingress || other_port.mode == PortMode::Ingress)
             }) {
-                return Some(if other.tenant_id == service.tenant_id {
-                    format!(
-                        "ingress port {}/{} is already used by service {}",
-                        tuple.0, tuple.1, other.id
-                    )
-                } else {
-                    format!("ingress port {}/{} is already in use", tuple.0, tuple.1)
-                });
+                return Some(format!(
+                    "ingress port {}/{} is already used by service {}",
+                    tuple.0, tuple.1, other.id
+                ));
             }
         }
     }
@@ -1234,16 +1236,19 @@ mod tests {
         }
     }
 
+    // AC1: different tenants publishing the same ingress port are admitted independently.
     #[test]
-    fn cross_tenant_ingress_conflict_does_not_disclose_service_id() {
+    fn cross_tenant_ingress_same_port_is_not_a_conflict() {
         let owner = service_with_ingress_port("tenant-a.web", "tenant-a");
         let request = service_with_ingress_port("tenant-b.web", "tenant-b");
-        let conflict = published_port_conflict(&request, [&owner]).unwrap();
-
-        assert_eq!(conflict, "ingress port 8080/tcp is already in use");
-        assert!(!conflict.contains("tenant-a.web"));
+        assert_eq!(
+            published_port_conflict(&request, [&owner]),
+            None,
+            "cross-tenant ingress port overlap must not be a conflict"
+        );
     }
 
+    // AC2: same-tenant collision still 409s with the existing message.
     #[test]
     fn same_tenant_ingress_conflict_names_service() {
         let owner = service_with_ingress_port("tenant-a.web", "tenant-a");
@@ -1253,6 +1258,32 @@ mod tests {
             published_port_conflict(&request, [&owner]).as_deref(),
             Some("ingress port 8080/tcp is already used by service tenant-a.web")
         );
+    }
+
+    // AC3: 409 body must not carry another tenant's identifiers.
+    #[test]
+    fn same_tenant_409_does_not_leak_other_tenant_id() {
+        let owner = service_with_ingress_port("tenant-a.web", "tenant-a");
+        let request = service_with_ingress_port("tenant-a.api", "tenant-a");
+        let conflict = published_port_conflict(&request, [&owner]).unwrap();
+        // The message names the same-tenant service ID — that is fine.
+        // It must never reference a different tenant's service.
+        assert!(conflict.contains("tenant-a.web"));
+    }
+
+    // AC1 extended: mix of same-tenant and cross-tenant services; only
+    // same-tenant peers may cause a conflict.
+    #[test]
+    fn cross_tenant_service_in_mixed_others_does_not_cause_conflict() {
+        let cross = service_with_ingress_port("tenant-b.web", "tenant-b");
+        let same = service_with_ingress_port("tenant-a.other", "tenant-a");
+        let request = service_with_ingress_port("tenant-a.api", "tenant-a");
+        // cross-tenant peer alone → no conflict
+        assert_eq!(published_port_conflict(&request, [&cross]), None);
+        // same-tenant peer → conflict
+        assert!(published_port_conflict(&request, [&same]).is_some());
+        // both together → still a conflict (but only because of same-tenant)
+        assert!(published_port_conflict(&request, [&cross, &same]).is_some());
     }
 
     #[test]

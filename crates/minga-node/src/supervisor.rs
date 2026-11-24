@@ -171,9 +171,13 @@ type RunningTasks = Arc<Mutex<HashMap<TaskId, String>>>;
 /// Tracks agent task IDs currently running on this node.
 type RunningAgents = Arc<Mutex<HashSet<TaskId>>>;
 
-/// Tracks how many log entries have been published per task (container or agent).
-/// Used to avoid re-publishing the same log lines on each reconcile pass.
-type LogOffsets = Arc<Mutex<HashMap<TaskId, usize>>>;
+/// Tracks the last published log sequence number per task.
+///
+/// The cursor is the `seq` field of the last [`ContainerLog`] published to
+/// the bus. Because the ring assigns monotonically increasing sequence numbers,
+/// the publisher can skip chunks with `seq <= cursor` even after older chunks
+/// are evicted from the ring. A cursor of 0 means nothing has been published.
+type LogOffsets = Arc<Mutex<HashMap<TaskId, u64>>>;
 
 /// Tracks restart state for a failed task.
 #[derive(Debug, Clone)]
@@ -841,26 +845,34 @@ impl Supervisor {
     }
 
     /// Stream log output from running containers and agents to the bus.
-    /// Tracks per-task offsets to avoid re-publishing the same lines.
+    /// Uses per-task sequence cursors so evicted ring chunks do not stall
+    /// shipping (AC1) and gaps are counted and logged exactly once (AC2).
     async fn stream_logs(&self, bus: &Arc<dyn EventBus>) {
         // --- Container logs ---
         let running = self.running.lock().await;
         for (task_id, container_id) in running.iter() {
             let chunks = self.runtime.logs(container_id, 0).await;
             let mut offsets = self.log_offsets.lock().await;
-            let offset = offsets.entry(task_id.clone()).or_insert(0);
-            // The runtime's capture is bounded; if it dropped entries we
-            // already counted, re-baseline instead of skipping forever.
-            if *offset > chunks.len() {
-                tracing::warn!(
-                    task = %task_id,
-                    offset = *offset,
-                    available = chunks.len(),
-                    "log capture truncated before publishing; re-baselining"
-                );
-                *offset = chunks.len();
+            let cursor = offsets.entry(task_id.clone()).or_insert(0);
+
+            // Detect dropped chunks: if the first surviving chunk has seq >
+            // cursor + 1, some chunks were evicted before we published them.
+            // Log the gap exactly once (not once per chunk) and advance past it.
+            if let Some(first) = chunks.first() {
+                if first.seq > *cursor + 1 && *cursor > 0 {
+                    let dropped = first.seq - *cursor - 1;
+                    tracing::warn!(
+                        task = %task_id,
+                        dropped,
+                        last_published_seq = *cursor,
+                        first_available_seq = first.seq,
+                        "log ring evicted chunks before they were published; gap counted"
+                    );
+                }
             }
-            for chunk in chunks.iter().skip(*offset) {
+
+            let start_cursor = *cursor;
+            for chunk in chunks.iter().filter(|c| c.seq > start_cursor) {
                 let entry = LogEntry {
                     task_id: task_id.clone(),
                     stream: match chunk.stream {
@@ -876,8 +888,8 @@ impl Supervisor {
                 {
                     tracing::warn!(task = %task_id, error = %e, "failed to publish log entry");
                 }
+                *cursor = chunk.seq;
             }
-            *offset = chunks.len();
         }
         drop(running);
 
@@ -1486,6 +1498,9 @@ impl Supervisor {
                     && !assignment.spec.uses_egress_proxy()
                 {
                     tracing::info!(task = %container.task_id, container = %container.id, "adopted running container");
+                    // Re-open log FIFOs so output written after the restart
+                    // reaches the retained log stream (AC3).
+                    self.runtime.open_log_fifos(&container.id).await;
                     self.running
                         .lock()
                         .await
@@ -1563,6 +1578,43 @@ mod assignment_tests {
     use super::*;
     use crate::runtime::MockRuntime;
     use minga_bus::MemoryBus;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tracing_subscriber::layer::{Context, SubscriberExt as _};
+
+    /// A minimal tracing `Layer` that counts WARN events whose message
+    /// contains `target`.  Used in `seq_gap_is_not_republished_ac2` to prove
+    /// the gap-warn fires exactly once per gap rather than once per chunk or
+    /// zero times.
+    struct WarnCounter {
+        count: Arc<AtomicUsize>,
+        target: &'static str,
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for WarnCounter {
+        fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+            if *event.metadata().level() != tracing::Level::WARN {
+                return;
+            }
+            struct Msg(String);
+            impl tracing::field::Visit for Msg {
+                fn record_str(&mut self, f: &tracing::field::Field, v: &str) {
+                    if f.name() == "message" {
+                        self.0 = v.to_owned();
+                    }
+                }
+                fn record_debug(&mut self, f: &tracing::field::Field, v: &dyn std::fmt::Debug) {
+                    if f.name() == "message" {
+                        self.0 = format!("{v:?}");
+                    }
+                }
+            }
+            let mut msg = Msg(String::new());
+            event.record(&mut msg);
+            if msg.0.contains(self.target) {
+                self.count.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    }
 
     fn assignment(task_id: &str) -> TaskAssignment {
         assignment_on(task_id, 7)
@@ -2372,5 +2424,232 @@ mod assignment_tests {
         for name in ["web", "tasks.web", "plant.web"] {
             assert_eq!(dns.resolve(name).len(), 2, "{name}");
         }
+    }
+
+    // --- AC1 (supervisor level): sequence cursor keeps shipping past ring cap --
+
+    /// The supervisor must keep publishing log chunks whose seq is higher than
+    /// the cursor even when earlier chunks have been evicted. We simulate this
+    /// by injecting high-seq chunks into MockRuntime and asserting all of them
+    /// are delivered to the bus exactly once.
+    #[tokio::test]
+    async fn seq_cursor_keeps_shipping_past_ring_eviction_ac1() {
+        use crate::runtime::ContainerLog;
+        use crate::runtime::LogStream as RtStream;
+
+        let (supervisor, runtime, bus) = setup(7).await;
+        write_assignment(&bus, &assignment("task-1")).await;
+        supervisor.reconcile_once().await.unwrap();
+
+        let container_id = runtime.list().await[0].id.clone();
+
+        // Inject 20 chunks with seqs 1..=20 (simulating a full ring after
+        // eviction — we only provide the surviving 20 of some larger set).
+        let injected: Vec<ContainerLog> = (1u64..=20)
+            .map(|s| ContainerLog {
+                stream: RtStream::Stdout,
+                data: format!("chunk-{s}\n").into_bytes(),
+                seq: s,
+            })
+            .collect();
+        runtime
+            .injected_logs
+            .lock()
+            .unwrap()
+            .insert(container_id.clone(), injected.clone());
+
+        // First reconcile: all 20 must ship.
+        supervisor.reconcile_once().await.unwrap();
+        let after_first = bus
+            .tenant_log_history("default", "task-1", 0)
+            .await
+            .unwrap()
+            .len();
+        assert_eq!(after_first, 20, "all 20 surviving chunks must ship");
+
+        // Second reconcile with same ring: nothing new must ship.
+        supervisor.reconcile_once().await.unwrap();
+        let after_second = bus
+            .tenant_log_history("default", "task-1", 0)
+            .await
+            .unwrap()
+            .len();
+        assert_eq!(after_second, 20, "no chunk must be re-published");
+
+        // Now simulate the ring evicting the first 10 and adding 10 new ones
+        // (seqs 11..=30) — cursor is at 20, so only seqs 21..=30 ship.
+        let evicted_ring: Vec<ContainerLog> = (11u64..=30)
+            .map(|s| ContainerLog {
+                stream: RtStream::Stdout,
+                data: format!("chunk-{s}\n").into_bytes(),
+                seq: s,
+            })
+            .collect();
+        runtime
+            .injected_logs
+            .lock()
+            .unwrap()
+            .insert(container_id, evicted_ring);
+
+        supervisor.reconcile_once().await.unwrap();
+        let after_third = bus
+            .tenant_log_history("default", "task-1", 0)
+            .await
+            .unwrap()
+            .len();
+        assert_eq!(after_third, 30, "seqs 21-30 must ship (10 new)");
+    }
+
+    // --- AC2 (supervisor level): gap counted once, not re-published -----------
+
+    /// When chunks are dropped before the cursor reaches them the supervisor
+    /// must NOT re-publish surviving chunks already in the ring (no-duplicate
+    /// invariant) AND must count the gap **at most once per gap** (the cursor
+    /// advances past the gap on the first pass, so the warn condition cannot
+    /// fire a second time for the same gap).
+    ///
+    /// We assert three things:
+    /// (a) chunks ship: 5 new entries appear after the gap pass.
+    /// (b) no re-send: a second reconcile with the SAME gap data adds 0 entries.
+    /// (c) gap fires exactly once: a third reconcile with a fresh second gap adds
+    ///     5 more entries, proving the gap path is still live — it fires when a
+    ///     new gap appears but not for the already-seen one (cursor past it).
+    ///
+    /// Together (a)+(b) prove: cursor advances on the first gap pass and the
+    /// warn path is taken exactly once per gap, not per chunk and not zero times.
+    #[tokio::test]
+    async fn seq_gap_is_not_republished_ac2() {
+        use crate::runtime::ContainerLog;
+        use crate::runtime::LogStream as RtStream;
+
+        // Install a scoped subscriber that counts the gap-warn events.
+        // `set_default` uses a thread-local guard; because this is a
+        // single-threaded tokio test and all reconcile_once() calls are
+        // awaited inline (no cross-thread spawns touch the warn path),
+        // the counter sees every WARN event emitted in this test.
+        let gap_warn_count = Arc::new(AtomicUsize::new(0));
+        let subscriber = tracing_subscriber::registry().with(WarnCounter {
+            count: gap_warn_count.clone(),
+            target: "gap counted",
+        });
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let (supervisor, runtime, bus) = setup(7).await;
+        write_assignment(&bus, &assignment("task-1")).await;
+        supervisor.reconcile_once().await.unwrap();
+
+        let container_id = runtime.list().await[0].id.clone();
+
+        // First pass: no gap — cursor advances to seq 5; warn must NOT fire.
+        let first_batch: Vec<ContainerLog> = (1u64..=5)
+            .map(|s| ContainerLog {
+                stream: RtStream::Stdout,
+                data: format!("chunk-{s}\n").into_bytes(),
+                seq: s,
+            })
+            .collect();
+        runtime
+            .injected_logs
+            .lock()
+            .unwrap()
+            .insert(container_id.clone(), first_batch);
+        supervisor.reconcile_once().await.unwrap();
+        let count_a = bus
+            .tenant_log_history("default", "task-1", 0)
+            .await
+            .unwrap()
+            .len();
+        assert_eq!(count_a, 5, "first batch: 5 chunks published");
+        assert_eq!(
+            gap_warn_count.load(Ordering::SeqCst),
+            0,
+            "no gap in first pass: gap-warn must not fire"
+        );
+
+        // Now simulate: seqs 6-9 were written and evicted (never saw cursor).
+        // The ring now only contains seqs 10..=14.
+        let gap_batch: Vec<ContainerLog> = (10u64..=14)
+            .map(|s| ContainerLog {
+                stream: RtStream::Stdout,
+                data: format!("chunk-{s}\n").into_bytes(),
+                seq: s,
+            })
+            .collect();
+        runtime
+            .injected_logs
+            .lock()
+            .unwrap()
+            .insert(container_id.clone(), gap_batch.clone());
+        // (a) Gap pass: 5 surviving chunks ship; cursor advances to 14.
+        //     The gap-warn must fire EXACTLY ONCE (once per gap, not per chunk).
+        supervisor.reconcile_once().await.unwrap();
+        let count_b = bus
+            .tenant_log_history("default", "task-1", 0)
+            .await
+            .unwrap()
+            .len();
+        assert_eq!(
+            count_b, 10,
+            "only the 5 surviving chunks after gap must ship (no re-send of 1-5)"
+        );
+        assert_eq!(
+            gap_warn_count.load(Ordering::SeqCst),
+            1,
+            "first gap pass: gap-warn must fire exactly once (not once per chunk)"
+        );
+
+        // (b) Second reconcile with the SAME gap data: cursor == 14, first.seq == 10.
+        // Condition `first.seq (10) > cursor+1 (15)` is false → warn CANNOT fire.
+        // No new chunks are past the cursor either → 0 new publishes.
+        runtime
+            .injected_logs
+            .lock()
+            .unwrap()
+            .insert(container_id.clone(), gap_batch);
+        supervisor.reconcile_once().await.unwrap();
+        let count_c = bus
+            .tenant_log_history("default", "task-1", 0)
+            .await
+            .unwrap()
+            .len();
+        assert_eq!(
+            count_c, 10,
+            "second pass with same gap data: cursor past gap, no re-publish and no duplicate warn"
+        );
+        assert_eq!(
+            gap_warn_count.load(Ordering::SeqCst),
+            1,
+            "same gap re-presented: gap-warn must NOT fire again (cursor already past it)"
+        );
+
+        // (c) A second distinct gap (seqs 15-19 evicted, ring has 20..=24) triggers
+        // the warn path again — proving the warn fires once per new gap, not zero times.
+        let second_gap_batch: Vec<ContainerLog> = (20u64..=24)
+            .map(|s| ContainerLog {
+                stream: RtStream::Stdout,
+                data: format!("chunk-{s}\n").into_bytes(),
+                seq: s,
+            })
+            .collect();
+        runtime
+            .injected_logs
+            .lock()
+            .unwrap()
+            .insert(container_id, second_gap_batch);
+        supervisor.reconcile_once().await.unwrap();
+        let count_d = bus
+            .tenant_log_history("default", "task-1", 0)
+            .await
+            .unwrap()
+            .len();
+        assert_eq!(
+            count_d, 15,
+            "second gap: 5 new chunks from second gap batch shipped"
+        );
+        assert_eq!(
+            gap_warn_count.load(Ordering::SeqCst),
+            2,
+            "second distinct gap: gap-warn must fire exactly once more (total 2)"
+        );
     }
 }

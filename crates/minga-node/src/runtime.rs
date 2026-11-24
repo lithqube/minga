@@ -66,6 +66,10 @@ pub struct ContainerInfo {
 pub struct ContainerLog {
     pub stream: LogStream,
     pub data: Vec<u8>,
+    /// Monotonic sequence number assigned by the ring (1-based, 0 = unset /
+    /// mock). The supervisor uses this as the publish cursor so that dropped
+    /// chunks do not freeze shipping.
+    pub seq: u64,
 }
 
 /// Which output stream a log chunk came from.
@@ -136,6 +140,13 @@ pub trait Runtime: Send + Sync {
     /// Force-kills a container's process. The container stays around, so
     /// the restart policy sees an ordinary exit.
     async fn kill(&self, container_id: &str) -> Result<(), RuntimeError>;
+
+    /// Open log FIFOs and start readers for a container that the node adopted
+    /// (i.e. was already running when the supervisor restarted). No-op when the
+    /// runtime has no log capture directory or when readers are already running.
+    async fn open_log_fifos(&self, _container_id: &str) {
+        // Default: no-op. Runtimes without FIFO-based log capture ignore this.
+    }
 }
 
 // --- MockRuntime ---------------------------------------------------------------
@@ -161,6 +172,9 @@ pub struct MockRuntime {
     pub exit_codes: Mutex<HashMap<String, i32>>,
     /// What `exec()` returns per container. Defaults to 0 (healthy).
     pub exec_codes: Mutex<HashMap<String, i32>>,
+    /// Per-container log overrides. When set, `logs()` returns these instead
+    /// of the synthetic lines. Used to inject explicit `seq` values in tests.
+    pub injected_logs: Mutex<HashMap<String, Vec<ContainerLog>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -327,23 +341,40 @@ impl Runtime for MockRuntime {
     }
 
     async fn logs(&self, container_id: &str, tail: usize) -> Vec<ContainerLog> {
+        // Allow tests to inject exact sequences.
+        if let Some(injected) = self
+            .injected_logs
+            .lock()
+            .unwrap()
+            .get(container_id)
+            .cloned()
+        {
+            if tail > 0 && tail < injected.len() {
+                return injected[injected.len() - tail..].to_vec();
+            }
+            return injected;
+        }
         let containers = self.containers.lock().unwrap();
         let Some(c) = containers.get(container_id) else {
             return Vec::new();
         };
         // Generate synthetic log lines for the mock container.
+        // seq is 1-based to match the real ring; mock sequences are fixed.
         let lines = vec![
             ContainerLog {
                 stream: LogStream::Stdout,
                 data: format!("[{}] starting {} (mock)\n", c.task_id, c.image).into_bytes(),
+                seq: 1,
             },
             ContainerLog {
                 stream: LogStream::Stdout,
                 data: format!("[{}] listening on 0.0.0.0:8080\n", c.task_id).into_bytes(),
+                seq: 2,
             },
             ContainerLog {
                 stream: LogStream::Stdout,
                 data: format!("[{}] ready (mock)\n", c.task_id).into_bytes(),
+                seq: 3,
             },
         ];
         if tail > 0 && tail < lines.len() {
