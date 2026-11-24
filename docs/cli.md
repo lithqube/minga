@@ -43,9 +43,15 @@ Compose file keeps running with either command.
 ### Node roles
 
 ```bash
-minga manager --node-id <ID> --bind <ADDR> [--api-bind <ADDR>] [flags] # scheduler + API + supervisor (+ NATS sidecar)
-minga worker  --node-id <ID> --nats-url <URL> [flags]                # supervisor only
+minga manager --node-id <ID> --bind <ADDR> --runtime <RT> [--api-bind <ADDR>] [flags] # scheduler + API + supervisor (+ NATS sidecar)
+minga worker  --node-id <ID> --nats-url <URL> --runtime <RT> [flags]                # supervisor only
 ```
+
+A worker is parsed without the manager-only flags, so `minga worker --peer …` (or any
+other Raft, API, sidecar or NATS-credential flag listed under "managers only") is a usage
+error naming the flag, and `minga worker --help` lists only worker flags. A manager-only
+`MINGA_*` variable in a worker's environment, and `MINGA_NODE_JOIN_TOKEN_FILE` in a
+manager's, is refused at start and named in the error: give each role its own env file.
 
 `minga api` is retired and exits with guidance to use `minga manager --api-bind`.
 Only managers vote in Raft and serve the Docker Engine API. Workers are
@@ -63,7 +69,7 @@ The API waits for catch-up before promotion. Remove it with
 | Flag | Default | Notes |
 | --- | --- | --- |
 | `--node-id <ID>` | required | Unique, stable ID for this Raft node. |
-| `--bind <ADDR>` | required | Address the Raft RPC server listens on and peers dial, for example `127.0.0.1:7001`. |
+| `--bind <ADDR>`, `MINGA_BIND` | required | Address the Raft RPC server listens on and peers dial, for example `127.0.0.1:7001`. |
 | `--peer <ID=ADDR>` | none | Initial cluster membership only. Repeat for the other voters when bootstrapping; `--join` cannot be combined with `--peer`. |
 | `--join` | off | Never initializes a pristine store; waits for a manager to add this node. |
 | `--data-dir <DIR>` | `/var/lib/minga` | Manager Raft data (`raft_log.redb`, `state.redb`), plus node-local `secrets/`, `volumes/` and `modules/`. Workers never open Raft files. Tightened to 0700 at start. |
@@ -73,7 +79,7 @@ The API waits for catch-up before promotion. Remove it with
 
 | Flag | Default | Notes |
 | --- | --- | --- |
-| `--runtime <mock\|containerd>` | `mock` | **Set `containerd` for real containers.** `mock` is in-memory and meant for tests. `scripts/minga.service` passes `containerd`. |
+| `--runtime <mock\|containerd>` | required | `containerd` runs real containers. `mock` is in-memory: it reports tasks running and healthy without starting anything, so name it only in tests. There is no default. `scripts/minga.service` passes `containerd`. |
 | `--containerd-socket <PATH>` | `/run/containerd/containerd.sock` | A filesystem path, not a `unix://` URL. |
 | `--nats-url <URL>`, `MINGA_NATS_URL` | none | Unset on a manager: it starts the NATS sidecar. Workers must set it; use a comma-separated TLS seed list for clustered managers. |
 | `--nats-token`, `MINGA_NATS_TOKEN` | none | Development-only plaintext-loopback token authentication. Mutually exclusive with NATS JWT credentials. |
@@ -412,7 +418,8 @@ race.
 
 `scripts/minga.service` runs the `manager` or `worker` role from
 `/etc/minga/minga.env` ([template](../scripts/minga.env.example)): `MINGA_ROLE`,
-`MINGA_NODE_ID`, `MINGA_BIND` and `MINGA_EXTRA_ARGS` for everything else. The
+`MINGA_NODE_ID` and `MINGA_EXTRA_ARGS` for everything else, plus the variables the
+binary reads itself (`MINGA_BIND` for a manager, `MINGA_NATS_URL`, …). The
 unit already passes `--data-dir /var/lib/minga`, `--runtime containerd` and
 `--containerd-socket`, so do not repeat them. The manager serves the API with
 `--api-bind`; it does not need a second `minga api` unit. Set `MINGA_API_TOKEN`

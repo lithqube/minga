@@ -10,6 +10,8 @@ fn run_manager_with_peer() -> (bool, String) {
             "manager",
             "--node-id",
             "1",
+            "--runtime",
+            "mock",
             "--bind",
             "127.0.0.1:59900",
             // Bind API to loopback to bypass the "no-token / no-TLS" check that

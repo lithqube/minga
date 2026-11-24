@@ -17,12 +17,13 @@ Requires=containerd.service
 # "starting manager loops" / "starting worker loop".
 Type=simple
 EnvironmentFile=/etc/minga/minga.env
-# MINGA_NATS_URL, MINGA_NATS_TOKEN, MINGA_NATS_TLS_* and MINGA_METRICS_BIND
-# are read from the environment directly. $MINGA_EXTRA_ARGS is split on
-# whitespace (peers, labels, Raft TLS flags).
+# MINGA_BIND (manager only: the Raft address), MINGA_NATS_URL, MINGA_NATS_TOKEN,
+# MINGA_NATS_TLS_* and MINGA_METRICS_BIND are read from the environment
+# directly, so the same command line starts either role; a manager-only
+# variable in a worker's env file is refused at start. $MINGA_EXTRA_ARGS is
+# split on whitespace (peers, labels, Raft TLS flags).
 ExecStart=/usr/local/bin/minga ${MINGA_ROLE} \
   --node-id ${MINGA_NODE_ID} \
-  --bind ${MINGA_BIND} \
   --data-dir /var/lib/minga \
   --runtime containerd \
   --containerd-socket /run/containerd/containerd.sock \
