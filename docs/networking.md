@@ -7,8 +7,8 @@ This page explains how Minga connects tasks to each other and to the outside wor
 Every Compose network gets its own `/24` subnet, allocated from the overlay supernet (default `10.100.0.0/16`, override with `--overlay-supernet`). The Raft leader picks the first non-overlapping `/24` and stores it in state; workers read it from there and never compute one on their own.
 
 ```
-// crates/minga-net/src/ipam.rs
-pub const DEFAULT_SUPERNET: &str = "10.100.0.0/16";   // crates/minga-net/src/cidr.rs
+// crates/minga-net/src/cidr.rs
+pub const DEFAULT_SUPERNET: &str = "10.100.0.0/16";
 ```
 
 A `/24` holds 254 usable task addresses. If the supernet runs out (`--overlay-supernet` not widened and all 256 `/24`s are taken) the leader rejects new networks with `supernet exhausted`.
@@ -69,10 +69,11 @@ Each task's `/etc/resolv.conf` is written at start time (`crates/minga-node/src/
 ```
 nameserver <bridge-gateway-ip>
 options ndots:0
-search <stack>.minga.local minga.local   # only when MINGA_STACK is set
+search minga.local                          # always present
+search <stack>.minga.local minga.local      # when MINGA_STACK is set
 ```
 
-`ndots:0` means every name is tried as an absolute name first. The search domains are set only when the task has a `MINGA_STACK` environment variable (injected by the scheduler for Compose stacks). With search domains present, a lookup for `web` tries `web.<stack>.minga.local` and `web.minga.local` before falling back to the upstream resolver (`crates/minga-node/src/containerd/runtime.rs:682-690`).
+`ndots:0` means every name is tried as an absolute name first. The `search minga.local` line is always written; `<stack>.minga.local` is prepended when the task has a `MINGA_STACK` environment variable (injected by the scheduler for Compose stacks). With the stack search domain present, a lookup for `web` tries `web.<stack>.minga.local` and `web.minga.local` before falling back to the upstream resolver (`crates/minga-node/src/containerd/runtime.rs:682-690`).
 
 ## Published ports
 
@@ -83,7 +84,7 @@ Minga supports two port-publication modes (`crates/minga-state/src/types.rs:192-
 | `ingress` (default) | `ports: ["8080:80"]` | Port answers on **every node**; the ingress layer forwards to the task wherever it runs. |
 | `host` | `ports: ["8080:80"]` with `mode: host` | Port answers only on the node running the task. Minga refuses the same port for two host-mode services. |
 
-For both modes, Minga installs iptables DNAT rules in `PREROUTING` (for traffic addressed to the node) and `OUTPUT` (for clients on the node itself). The `--dst-type LOCAL` match limits capture to traffic addressed to the node, not to passing packets (`crates/minga-node/src/netns.rs:421`).
+For both modes, Minga installs iptables DNAT rules in `PREROUTING` (for traffic addressed to the node) and `OUTPUT` (for clients on the node itself). The `--dst-type LOCAL` match limits capture to traffic addressed to the node, not to passing packets (`crates/minga-node/src/netns.rs:545`).
 
 A published port that the node itself uses (NATS on 4222, Raft on 7001, the embedded DNS on 53, the API) is refused at setup time with an error naming the conflict.
 
