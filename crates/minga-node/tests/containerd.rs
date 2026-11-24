@@ -459,3 +459,141 @@ async fn containerd_named_user_resolves_from_the_image() {
         "{error}"
     );
 }
+
+/// AC3 — supervisor restart: output written after a restart reaches the stream.
+///
+/// Real restart path: a NEW `ContainerdRuntime` instance adopts an already-running
+/// container by calling `open_log_fifos`. The original instance's `log_readers`
+/// guard does NOT fire because the new instance has empty state. This is exactly
+/// what `recover_running_containers` does on a node restart.
+///
+/// Steps:
+/// 1. Start a container on `runtime` (first instance); wait for initial output.
+/// 2. Create `runtime2` — a fresh `ContainerdRuntime::connect()` with the SAME
+///    `logs_dir`. Its `log_readers` map is empty, so the guard cannot fire.
+/// 3. Call `runtime2.open_log_fifos(&container_id)` — this is the restart path.
+/// 4. Assert that subsequent output arrives in `runtime2.logs()`.
+///
+/// **Red-first evidence:** without the production `open_log_fifos` implementation
+/// (or with the old same-instance call) `runtime2`'s ring stays empty and
+/// `saw_after` never fires — the assert at the bottom of this function fails.
+///
+/// This test requires containerd and skips on macOS or CI without the daemon.
+/// `MINGA_REQUIRE_CONTAINERD=1` turns the skip into a hard failure.
+#[tokio::test]
+async fn supervisor_restart_adopted_container_logs_reach_stream_ac3() {
+    let socket = socket_path();
+    if !containerd_available_at(&socket) {
+        eprintln!("SKIP: containerd not available at {socket}");
+        return;
+    }
+
+    // --- First instance: start the container and confirm initial output ---
+    let runtime = match ContainerdRuntime::connect(&socket).await {
+        Ok(rt) => rt,
+        Err(e) => {
+            assert!(
+                std::env::var_os("MINGA_REQUIRE_CONTAINERD").is_none(),
+                "required containerd connection failed: {e}"
+            );
+            eprintln!("SKIP: cannot connect to containerd: {e}");
+            return;
+        }
+    };
+    let logs_dir = tempfile::tempdir().unwrap();
+    let runtime = runtime.with_logs_dir(logs_dir.path());
+
+    // Start a container that writes a "before" marker then keeps writing "after" lines.
+    let task_id = "minga-ac3-restart-logs-002".to_string();
+    let spec = minga_state::types::TaskSpec {
+        image: "docker.io/library/busybox:latest".to_string(),
+        command: vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            // Write a "before" marker, then keep emitting "after" lines.
+            "echo before-restart; while true; do echo after-restart; sleep 0.1; done".to_string(),
+        ],
+        ..Default::default()
+    };
+
+    runtime
+        .start(&task_id, &spec)
+        .await
+        .expect("failed to start AC3 container");
+
+    let container_id = task_id.clone();
+
+    // Wait for the "before-restart" line from the first instance.
+    let mut saw_before = false;
+    for _ in 0..40 {
+        let chunks = runtime.logs(&container_id, 0).await;
+        let all: String = chunks
+            .iter()
+            .flat_map(|c| std::str::from_utf8(&c.data).unwrap_or("").chars())
+            .collect();
+        if all.contains("before-restart") {
+            saw_before = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        saw_before,
+        "initial output must arrive before simulating restart"
+    );
+    // --- Simulate supervisor restart ---
+    //
+    // A real restart means the old process is gone: its reader tasks are dead,
+    // the FIFOs survive on disk, and the new process re-opens them.  We model
+    // that here by calling `close_log_readers` on `runtime` BEFORE creating
+    // `runtime2`.  After this call, no task is reading the FIFOs, so every
+    // byte emitted by the container goes exclusively to `runtime2`'s reader.
+    //
+    // Red-first evidence: if `runtime2.open_log_fifos()` is commented out,
+    // `runtime2.log_rings` has no entry and `logs()` returns empty — the
+    // `saw_after` assert below fails.  If `close_log_readers` is omitted and
+    // `runtime`'s reader is still alive it may consume the bytes first, making
+    // the assertion non-deterministic; with the call the assertion is structural.
+    runtime.close_log_readers(&container_id).await;
+
+    // Allow any in-flight FIFO reads from the old reader to drain before the
+    // new reader opens.  One yield is enough; the abort is cooperative.
+    tokio::task::yield_now().await;
+
+    // Create a second ContainerdRuntime with the same logs_dir; its log_readers
+    // map is empty (fresh Arc).
+    let runtime2 = ContainerdRuntime::connect(&socket)
+        .await
+        .expect("second runtime connect failed");
+    let runtime2 = runtime2.with_logs_dir(logs_dir.path());
+
+    // open_log_fifos on the new instance — mirrors recover_running_containers.
+    runtime2.open_log_fifos(&container_id).await;
+
+    // Output written after re-open must arrive in runtime2's log ring.
+    // (runtime2 has no log ring for this container until open_log_fifos runs.)
+    let mut saw_after = false;
+    for _ in 0..40 {
+        let chunks = runtime2.logs(&container_id, 0).await;
+        let all: String = chunks
+            .iter()
+            .flat_map(|c| std::str::from_utf8(&c.data).unwrap_or("").chars())
+            .collect();
+        if all.contains("after-restart") {
+            saw_after = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        saw_after,
+        "output written after supervisor restart must reach the log stream via the new runtime instance"
+    );
+
+    // Cleanup: either instance can stop the container (both talk to the same
+    // containerd daemon); use runtime2 since runtime no longer owns readers.
+    runtime2
+        .stop(&container_id)
+        .await
+        .expect("failed to stop AC3 container");
+}
