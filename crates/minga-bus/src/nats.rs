@@ -656,6 +656,33 @@ impl NatsBus {
         if self.ensured_tenants.lock().unwrap().contains(tenant_id) {
             return Ok(());
         }
+        // Provisioning needs a tenant that is not being deleted, and no
+        // other incarnation's claim to change. A tenant with no marker (from
+        // before markers, or a stale write after a delete) gets generation 0.
+        match self.read_marker(tenant_id).await? {
+            Some((marker, _)) if marker.deleting => {
+                return Err(BusError::Fenced(format!(
+                    "tenant {tenant_id} is being deleted; refusing to provision it"
+                )))
+            }
+            Some(_) => {}
+            None => match self.write_marker(tenant_id, 0, false, None).await {
+                Ok(_) => {}
+                Err(BusError::Fenced(_)) => {
+                    // A concurrent claim or delete won: re-read and judge it.
+                    if self
+                        .read_marker(tenant_id)
+                        .await?
+                        .is_some_and(|(marker, _)| marker.deleting)
+                    {
+                        return Err(BusError::Fenced(format!(
+                            "tenant {tenant_id} is being deleted; refusing to provision it"
+                        )));
+                    }
+                }
+                Err(error) => return Err(error),
+            },
+        }
         let assign_bucket = subjects::assignment_bucket(tenant_id);
         Self::setup_kv_with_cap(
             &self.js,
@@ -769,8 +796,88 @@ impl NatsBus {
     /// created later under the same ID would inherit the old owner's audit,
     /// logs, usage and status. Safe to repeat.
     pub async fn delete_tenant_resources(&self, tenant_id: &str) -> Result<()> {
+        self.delete_resources(tenant_id, None).await
+    }
+
+    fn marker_key(tenant_id: &str) -> String {
+        format!("incarnation.{tenant_id}")
+    }
+
+    async fn read_marker(&self, tenant_id: &str) -> Result<crate::Marked> {
+        let key = Self::marker_key(tenant_id);
+        let entry = self
+            .status_kv
+            .entry(&key)
+            .await
+            .map_err(|error| BusError::Kv(format!("get {key}: {error}")))?;
+        match entry {
+            Some(entry) if matches!(entry.operation, KvOperation::Put) => {
+                let marker = serde_json::from_slice(&entry.value)
+                    .map_err(|error| BusError::Serialization(format!("{key}: {error}")))?;
+                Ok(Some((marker, entry.revision)))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Writes the marker if the ID is still at `revision` (`None`: still
+    /// free). A lost race is [`BusError::Fenced`].
+    async fn write_marker(
+        &self,
+        tenant_id: &str,
+        generation: u64,
+        deleting: bool,
+        revision: Option<u64>,
+    ) -> Result<u64> {
+        let key = Self::marker_key(tenant_id);
+        let value = Bytes::from(
+            serde_json::to_vec(&crate::TenantMarker {
+                generation,
+                deleting,
+                since_unix_ms: now_millis(),
+            })
+            .map_err(|error| BusError::Serialization(error.to_string()))?,
+        );
+        let written = match revision {
+            None => self
+                .status_kv
+                .create(&key, value)
+                .await
+                .map_err(|e| e.to_string()),
+            Some(revision) => self
+                .status_kv
+                .update(&key, value, revision)
+                .await
+                .map_err(|e| e.to_string()),
+        };
+        written.map_err(|error| {
+            BusError::Fenced(format!(
+                "tenant {tenant_id} changed on another manager while this step ran: {error}"
+            ))
+        })
+    }
+
+    /// Stops a delete whose fence was taken over or released since it began.
+    async fn check_fence(&self, tenant_id: &str, fence: Option<crate::DeleteFence>) -> Result<()> {
+        let Some(fence) = fence else {
+            return Ok(());
+        };
+        match self.read_marker(tenant_id).await? {
+            Some((marker, revision)) if marker.deleting && revision == fence.revision => Ok(()),
+            _ => Err(BusError::Fenced(format!(
+                "the delete of tenant {tenant_id} was taken over or finished by another manager"
+            ))),
+        }
+    }
+
+    async fn delete_resources(
+        &self,
+        tenant_id: &str,
+        fence: Option<crate::DeleteFence>,
+    ) -> Result<()> {
         validate_tenant_id(tenant_id)?;
         self.require_manager("delete tenant bus resources")?;
+        self.check_fence(tenant_id, fence).await?;
         self.ensured_tenants.lock().unwrap().remove(tenant_id);
         self.manager_assignments_kv
             .lock()
@@ -784,6 +891,7 @@ impl NatsBus {
             .filter(format!("minga.{tenant_id}.>"))
             .await
             .map_err(|error| BusError::Other(format!("purge {tenant_id} events: {error}")))?;
+        self.check_fence(tenant_id, fence).await?;
         let lease_prefix = format!("{tenant_id}.lease.");
         let leases = self.leases_kv.store("delete tenant leases")?;
         let mut keys = leases
@@ -809,6 +917,7 @@ impl NatsBus {
             if !key.starts_with(subjects::NODE_JOIN_PREFIX) {
                 continue;
             }
+            self.check_fence(tenant_id, fence).await?;
             // Only while the key is still the revision read: a node ID the
             // deleted tenant had may have joined another tenant since, and that
             // newer record must stay. A revision conflict re-reads it; any other
@@ -857,6 +966,7 @@ impl NatsBus {
         // still shows as having resources: a repeated delete then finishes the
         // cleanup, and a create over the leftovers is refused.
         for name in Self::tenant_streams(tenant_id) {
+            self.check_fence(tenant_id, fence).await?;
             if let Err(error) = self.js.delete_stream(&name).await {
                 // Gone already, or a concurrent delete won.
                 if self.stream_exists(&name).await? {
@@ -1014,10 +1124,27 @@ impl NatsBus {
         if self.worker_node_id.is_none() {
             self.ensure_tenant_resources(tenant_id).await?;
         }
-        self.js
-            .get_key_value(&bucket)
-            .await
-            .map_err(|error| BusError::Kv(format!("open {bucket}: {error}")))
+        match self.js.get_key_value(&bucket).await {
+            Ok(store) => Ok(store),
+            // The cache says the bucket was set up, but another manager
+            // deleted it (issue #203): forget the cache entry and set it up
+            // again, which the marker allows unless the tenant is being deleted.
+            Err(error)
+                if self.worker_node_id.is_none()
+                    && matches!(
+                        error.kind(),
+                        jetstream::context::KeyValueErrorKind::GetBucket
+                    ) =>
+            {
+                self.ensured_tenants.lock().unwrap().remove(tenant_id);
+                self.ensure_tenant_resources(tenant_id).await?;
+                self.js
+                    .get_key_value(&bucket)
+                    .await
+                    .map_err(|error| BusError::Kv(format!("open {bucket}: {error}")))
+            }
+            Err(error) => Err(BusError::Kv(format!("open {bucket}: {error}"))),
+        }
     }
 
     /// Connect to a NATS server and set up streams/KV buckets.
@@ -1901,6 +2028,54 @@ impl EventBus for NatsBus {
 
     async fn delete_tenant_resources(&self, tenant_id: &str) -> Result<()> {
         NatsBus::delete_tenant_resources(self, tenant_id).await
+    }
+
+    async fn claim_tenant(&self, tenant_id: &str, generation: u64) -> Result<()> {
+        validate_tenant_id(tenant_id)?;
+        self.require_manager("claim a tenant")?;
+        let marker = self.read_marker(tenant_id).await?;
+        if crate::plan_claim(tenant_id, &marker, generation)? {
+            self.write_marker(tenant_id, generation, false, None)
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn begin_tenant_delete(
+        &self,
+        tenant_id: &str,
+        generation: Option<u64>,
+    ) -> Result<Option<crate::DeleteFence>> {
+        validate_tenant_id(tenant_id)?;
+        self.require_manager("delete a tenant")?;
+        let marker = self.read_marker(tenant_id).await?;
+        let exists = marker.is_none() && self.tenant_resources_exist(tenant_id).await?;
+        let Some((generation, revision)) =
+            crate::plan_delete(tenant_id, &marker, generation, exists, now_millis())?
+        else {
+            return Ok(None);
+        };
+        let revision = self
+            .write_marker(tenant_id, generation, true, revision)
+            .await?;
+        Ok(Some(crate::DeleteFence {
+            generation,
+            revision,
+        }))
+    }
+
+    async fn delete_tenant_incarnation(
+        &self,
+        tenant_id: &str,
+        fence: crate::DeleteFence,
+    ) -> Result<()> {
+        self.delete_resources(tenant_id, Some(fence)).await?;
+        self.check_fence(tenant_id, Some(fence)).await?;
+        let key = Self::marker_key(tenant_id);
+        self.status_kv
+            .purge_expect_revision(&key, Some(fence.revision))
+            .await
+            .map_err(|error| BusError::Fenced(format!("release {key}: {error}")))
     }
 
     async fn put_assignment(&self, key: &str, value: &[u8]) -> Result<()> {

@@ -264,7 +264,7 @@ and NATS reissuance applies here too.
 - **Network removal** returns 409 while a service, a rollback revision or a
   running task still uses the network. `minga-ctl stack rm --with` waits up to
   15 seconds for the stack's tasks to be reaped.
-- **Compose** rejects `deploy.labels` it used to drop. `ports` host IPs are published on that IPv4 address only; an IPv6 host IP is accepted and stored but not published (#162). State is format 12, so every node changes together.
+- **Compose** rejects `deploy.labels` it used to drop. `ports` host IPs are published on that IPv4 address only; an IPv6 host IP is accepted and stored but not published (#162). State is format 13 (tenant generation, #203), so every node changes together.
 - **Unreleased builds.** Entries in the changelog marked "upgrade action
   needed" also describe changes between unreleased builds of `main`: the
   per-tenant assignment buckets, the NATS operator/JWT mode and the worker ACL
@@ -334,12 +334,17 @@ before 1.3.0: fix, or document and defer.
 
 Limits that are documented rather than open issues:
 
-- **Several API managers and tenant lifecycle.** Tenant create and delete are
-  serialized within one process only. With more than one API manager, a
-  delete that pauses can remove the streams of a tenant another manager has
-  since recreated under the same ID, and cached tenant setup on another
-  manager is not invalidated. Delete and recreate a tenant ID through one
-  manager at a time.
+- **Several API managers and tenant lifecycle.** Each tenant has a generation
+  in the replicated record, and a marker on the bus names the generation that
+  owns its resources (#203). A create claims the ID first, a delete takes it
+  before the record goes, and every delete step checks that it still holds it,
+  so a delete that pauses on one manager cannot remove what another manager
+  made after it. What remains: a step is checked before each bus call, not
+  during it, so one call already in flight can still land; the record removal
+  itself is not checked against the generation; and a create that failed with
+  an unknown outcome leaves its claim, which a delete may take over after two
+  minutes. A manager's cached tenant setup is dropped when a status write finds
+  the bucket missing, not when any other resource is.
 - **A delete can leave names taken.** Object names are unique per tenant, but a
   legacy bare ID, or a `default` name containing a dot, can equal another
   tenant's qualified ID. The later creation is refused with 409.

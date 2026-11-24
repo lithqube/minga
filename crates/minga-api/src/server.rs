@@ -1411,6 +1411,7 @@ mod tests {
                 name: "A".into(),
                 quotas: Default::default(),
                 created_at: 0,
+                generation: 0,
             })
             .await
             .unwrap();
@@ -1613,6 +1614,7 @@ mod tests {
                 name: "A".into(),
                 quotas: Default::default(),
                 created_at: 0,
+                generation: 0,
             })
             .await
             .unwrap();
@@ -1841,6 +1843,7 @@ mod tests {
                     name: id.into(),
                     quotas: Default::default(),
                     created_at: 1,
+                    generation: 0,
                 })
                 .await
                 .unwrap();
@@ -2040,6 +2043,7 @@ mod tests {
                     name: id.into(),
                     quotas: Default::default(),
                     created_at: 1,
+                    generation: 0,
                 })
                 .await
                 .unwrap();
@@ -2177,6 +2181,7 @@ mod tests {
                     name: id.into(),
                     quotas: Default::default(),
                     created_at: 1,
+                    generation: 0,
                 })
                 .await
                 .unwrap();
@@ -2257,6 +2262,7 @@ mod tests {
                 name: "tenant-a".into(),
                 quotas: Default::default(),
                 created_at: 1,
+                generation: 0,
             })
             .await
             .unwrap();
@@ -2720,6 +2726,7 @@ mod tests {
                 name: "tenant-b".into(),
                 quotas: Default::default(),
                 created_at: 1,
+                generation: 0,
             })
             .await
             .unwrap();
@@ -2877,6 +2884,7 @@ mod tests {
                 name: "tenant-b".into(),
                 quotas: Default::default(),
                 created_at: 1,
+                generation: 0,
             })
             .await
             .unwrap();
@@ -4102,5 +4110,63 @@ mod tests {
             .unwrap();
         let (status, json) = send_request(router, req).await;
         assert!(status.is_success(), "{status}: {json}");
+    }
+    fn tenant_call(method: &str, id: &str) -> Request<Body> {
+        let (uri, body) = if method == "POST" {
+            (
+                "/minga/tenants".to_string(),
+                serde_json::json!({"id": id, "name": id}),
+            )
+        } else {
+            (format!("/minga/tenants/{id}"), serde_json::Value::Null)
+        };
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("Authorization", "Bearer admin-token")
+            .header("Content-Type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap()
+    }
+
+    /// Two managers share the Raft store and the bus. Manager A's delete stalls
+    /// after the tenant left the store, manager B finishes the delete on retry and
+    /// creates the ID again, then A goes on. A must not remove B's tenant's streams.
+    #[tokio::test]
+    async fn a_stalled_delete_on_one_manager_cannot_remove_a_recreated_tenants_bus_resources() {
+        let (_router, store, _dir) = admin_router().await;
+        let bus = MemoryBus::new();
+        let router_a = build_router_with_bus_and_auth(
+            store.clone(),
+            bus.clone(),
+            Arc::new(ReadyState::new()),
+            Some("admin-token".to_string()),
+        );
+        let router_b = build_router_with_bus_and_auth(
+            store.clone(),
+            bus.clone(),
+            Arc::new(ReadyState::new()),
+            Some("admin-token".to_string()),
+        );
+        let (status, _) = send_request(router_a.clone(), tenant_call("POST", "acme")).await;
+        assert_eq!(status, StatusCode::CREATED);
+
+        let (reached, release) = bus.pause_next_tenant_delete();
+        let stalled = tokio::spawn(send_request(router_a, tenant_call("DELETE", "acme")));
+        reached.notified().await;
+
+        let (status, body) = send_request(router_b.clone(), tenant_call("DELETE", "acme")).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+        let (status, body) = send_request(router_b, tenant_call("POST", "acme")).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+
+        release.notify_one();
+        let (stalled_status, _) = stalled.await.unwrap();
+
+        assert!(
+            bus.tenant_resources_exist("acme").await.unwrap(),
+            "the stalled delete removed the bus resources of the recreated tenant"
+        );
+        assert_ne!(stalled_status, StatusCode::NO_CONTENT);
     }
 }

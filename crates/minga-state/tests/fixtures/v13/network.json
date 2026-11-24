@@ -1,0 +1,9 @@
+{
+  "attachable": true,
+  "driver": "bridge",
+  "id": "shop_default",
+  "name": "default",
+  "subnet": "10.100.0.0/24",
+  "tenant_id": "default",
+  "wg_port": 51820
+}

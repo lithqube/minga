@@ -31,6 +31,27 @@ const LOG_HISTORY_CAPACITY: usize = 1000;
 /// Maximum retained tenant events for deterministic in-memory diagnostics.
 const TENANT_EVENT_HISTORY_CAPACITY: usize = 4096;
 
+fn unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+fn marker(generation: u64, deleting: bool) -> crate::TenantMarker {
+    crate::TenantMarker {
+        generation,
+        deleting,
+        since_unix_ms: unix_ms(),
+    }
+}
+
+fn fenced(tenant_id: &str) -> BusError {
+    BusError::Fenced(format!(
+        "the delete of tenant {tenant_id} was taken over or finished by another manager"
+    ))
+}
+
 // ---------------------------------------------------------------------------
 // MemoryBus
 // ---------------------------------------------------------------------------
@@ -40,6 +61,10 @@ pub struct MemoryBus {
     /// Broadcast channel for events.
     events_tx: broadcast::Sender<BusEvent>,
     tenant_events: Mutex<VecDeque<(String, BusEvent)>>,
+    /// Test hook: the next `delete_tenant_incarnation` signals `.0`, then waits for `.1`.
+    tenant_markers: Mutex<HashMap<String, (crate::TenantMarker, u64)>>,
+    marker_revision: AtomicU64,
+    delete_gate: Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
     /// Assignment KV store: key → latest manager-authored value.
     assignments: Mutex<HashMap<String, Vec<u8>>>,
     /// Broadcast channel for assignment KV notifications.
@@ -105,6 +130,9 @@ impl MemoryBus {
             events_tx,
             tenant_resources: Mutex::new(HashSet::new()),
             tenant_events: Mutex::new(VecDeque::new()),
+            tenant_markers: Mutex::new(HashMap::new()),
+            marker_revision: AtomicU64::new(0),
+            delete_gate: Mutex::new(None),
             assignments: Mutex::new(HashMap::new()),
             assignment_tx,
             kv: Mutex::new(HashMap::new()),
@@ -128,6 +156,25 @@ impl MemoryBus {
             failing_status: Mutex::new(HashSet::new()),
             failing_assignments: Mutex::new(HashSet::new()),
         })
+    }
+
+    fn check_fence(&self, tenant_id: &str, fence: crate::DeleteFence) -> Result<()> {
+        match self.tenant_markers.lock().unwrap().get(tenant_id) {
+            Some((m, revision)) if m.deleting && *revision == fence.revision => Ok(()),
+            _ => Err(fenced(tenant_id)),
+        }
+    }
+
+    /// Pauses the next `delete_tenant_incarnation` call before it deletes
+    /// anything, as a manager stalled or cut off mid-delete would be. Returns
+    /// (signalled when the call is paused, call it to let the call go on).
+    pub fn pause_next_tenant_delete(&self) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
+        let gate = (
+            Arc::new(tokio::sync::Notify::new()),
+            Arc::new(tokio::sync::Notify::new()),
+        );
+        *self.delete_gate.lock().unwrap() = Some(gate.clone());
+        gate
     }
 
     /// Makes every status listing and assignment write or delete of one tenant
@@ -308,6 +355,61 @@ impl EventBus for MemoryBus {
                 .unwrap()
                 .keys()
                 .any(|key| key.starts_with(&format!("{tenant_id}."))))
+    }
+    async fn claim_tenant(&self, tenant_id: &str, generation: u64) -> Result<()> {
+        validate_tenant_id(tenant_id)?;
+        let mut markers = self.tenant_markers.lock().unwrap();
+        if crate::plan_claim(tenant_id, &markers.get(tenant_id).cloned(), generation)? {
+            let revision = self.marker_revision.fetch_add(1, Ordering::SeqCst) + 1;
+            markers.insert(tenant_id.to_owned(), (marker(generation, false), revision));
+        }
+        Ok(())
+    }
+    async fn begin_tenant_delete(
+        &self,
+        tenant_id: &str,
+        generation: Option<u64>,
+    ) -> Result<Option<crate::DeleteFence>> {
+        validate_tenant_id(tenant_id)?;
+        let exists = self.tenant_resources_exist(tenant_id).await?;
+        let mut markers = self.tenant_markers.lock().unwrap();
+        let plan = crate::plan_delete(
+            tenant_id,
+            &markers.get(tenant_id).cloned(),
+            generation,
+            exists,
+            unix_ms(),
+        )?;
+        Ok(plan.map(|(generation, _)| {
+            let revision = self.marker_revision.fetch_add(1, Ordering::SeqCst) + 1;
+            markers.insert(tenant_id.to_owned(), (marker(generation, true), revision));
+            crate::DeleteFence {
+                generation,
+                revision,
+            }
+        }))
+    }
+    async fn delete_tenant_incarnation(
+        &self,
+        tenant_id: &str,
+        fence: crate::DeleteFence,
+    ) -> Result<()> {
+        validate_tenant_id(tenant_id)?;
+        let gate = self.delete_gate.lock().unwrap().take();
+        if let Some((reached, release)) = gate {
+            reached.notify_one();
+            release.notified().await;
+        }
+        self.check_fence(tenant_id, fence)?;
+        self.delete_tenant_resources(tenant_id).await?;
+        let mut markers = self.tenant_markers.lock().unwrap();
+        match markers.get(tenant_id) {
+            Some((_, revision)) if *revision == fence.revision => {
+                markers.remove(tenant_id);
+                Ok(())
+            }
+            _ => Err(fenced(tenant_id)),
+        }
     }
     async fn delete_tenant_resources(&self, tenant_id: &str) -> Result<()> {
         validate_tenant_id(tenant_id)?;

@@ -650,3 +650,81 @@ async fn deleting_a_tenant_removes_everything_it_had_on_the_bus() {
         bus.delete_tenant_resources(tenant).await.unwrap();
     }
 }
+
+/// A second manager's connection to the server `bus` is on.
+async fn second_manager(bus: &NatsTestBus) -> std::sync::Arc<NatsBus> {
+    NatsBus::connect(&bus._server)
+        .await
+        .expect("second manager connects")
+}
+
+#[tokio::test]
+async fn a_stale_delete_from_one_manager_cannot_remove_a_recreated_tenants_streams() {
+    let Some(a) = connect().await else {
+        return;
+    };
+    let b = second_manager(&a).await;
+    let tenant = format!("fenced{}", std::process::id());
+
+    a.claim_tenant(&tenant, 1).await.unwrap();
+    seed_tenant(&a, &tenant, u64::from(std::process::id()) * 10 + 3).await;
+    // A takes the delete and stalls; B retries it, takes it over and finishes.
+    let fence_a = a
+        .begin_tenant_delete(&tenant, Some(1))
+        .await
+        .unwrap()
+        .unwrap();
+    let fence_b = b.begin_tenant_delete(&tenant, None).await.unwrap().unwrap();
+    assert_ne!(fence_a.revision, fence_b.revision);
+    b.delete_tenant_incarnation(&tenant, fence_b).await.unwrap();
+    assert!(!b.tenant_resources_exist(&tenant).await.unwrap());
+
+    // B creates the ID again under a new generation.
+    b.claim_tenant(&tenant, 2).await.unwrap();
+    b.ensure_tenant_resources(&tenant).await.unwrap();
+    assert!(b.tenant_resources_exist(&tenant).await.unwrap());
+
+    // A resumes: refused, and B's streams stay.
+    let error = a
+        .delete_tenant_incarnation(&tenant, fence_a)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, minga_bus::BusError::Fenced(_)), "{error}");
+    assert!(b.tenant_resources_exist(&tenant).await.unwrap());
+    // And the old generation cannot provision over the new one.
+    let error = a.claim_tenant(&tenant, 1).await.unwrap_err();
+    assert!(matches!(error, minga_bus::BusError::Fenced(_)), "{error}");
+
+    let fence = b
+        .begin_tenant_delete(&tenant, Some(2))
+        .await
+        .unwrap()
+        .unwrap();
+    b.delete_tenant_incarnation(&tenant, fence).await.unwrap();
+}
+
+#[tokio::test]
+async fn a_manager_sets_a_tenant_bucket_up_again_after_another_manager_deleted_it() {
+    let Some(a) = connect().await else {
+        return;
+    };
+    let b = second_manager(&a).await;
+    let tenant = format!("stale{}", std::process::id());
+
+    a.ensure_tenant_resources(&tenant).await.unwrap();
+    a.put_tenant_status(&tenant, "node.7.task.t", b"running")
+        .await
+        .unwrap();
+    // Another manager deletes the tenant's buckets; A's cache still says they exist.
+    b.delete_tenant_resources(&tenant).await.unwrap();
+    assert!(!b.tenant_resources_exist(&tenant).await.unwrap());
+
+    a.put_tenant_status(&tenant, "node.7.task.t", b"running again")
+        .await
+        .unwrap();
+    assert_eq!(
+        a.get_tenant_status(&tenant, "node.7.task.t").await.unwrap(),
+        Some(b"running again".to_vec())
+    );
+    a.delete_tenant_resources(&tenant).await.unwrap();
+}

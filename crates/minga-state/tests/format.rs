@@ -14,9 +14,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
 
 use minga_state::codec::{
-    self, FORMAT_KEY, FORMAT_VERSION, V10_FORMAT_VERSION, V11_FORMAT_VERSION, V2_FORMAT_VERSION,
-    V3_FORMAT_VERSION, V4_FORMAT_VERSION, V5_FORMAT_VERSION, V6_FORMAT_VERSION, V7_FORMAT_VERSION,
-    V8_FORMAT_VERSION, V9_FORMAT_VERSION,
+    self, FORMAT_KEY, FORMAT_VERSION, V10_FORMAT_VERSION, V11_FORMAT_VERSION, V12_FORMAT_VERSION,
+    V2_FORMAT_VERSION, V3_FORMAT_VERSION, V4_FORMAT_VERSION, V5_FORMAT_VERSION, V6_FORMAT_VERSION,
+    V7_FORMAT_VERSION, V8_FORMAT_VERSION, V9_FORMAT_VERSION,
 };
 use minga_state::types::{
     AgentCapabilities, AgentDirGrant, AgentGrant, AgentSpec, ChangeKind, ChangeRequest,
@@ -86,7 +86,7 @@ fn a_fixture_accepts_added_fields_and_rejects_changed_ones() {
 
 /// Compares `value` with its fixture, and decodes the fixture back.
 fn check<T: Serialize + DeserializeOwned>(name: &str, value: &T) {
-    for version in V2_FORMAT_VERSION..=V11_FORMAT_VERSION {
+    for version in V2_FORMAT_VERSION..=V12_FORMAT_VERSION {
         let old_path = fixture_path_for_version(version, name);
         if old_path.exists() {
             let old = std::fs::read_to_string(&old_path).unwrap_or_else(|e| {
@@ -237,6 +237,7 @@ fn tenant() -> Tenant {
             jetstream_age_secs: Some(86_400),
         },
         created_at: 1_794_000_000,
+        generation: 7,
     }
 }
 
@@ -1318,6 +1319,56 @@ async fn a_v11_store_migrates_and_a_port_without_host_ip_still_means_every_addre
     let narrow = store.get_service("shop.narrow").await.unwrap().unwrap();
     assert_eq!(narrow.ports[0].host_ip, Some("::1".parse().unwrap()));
     store.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_v12_store_migrates_and_a_tenant_without_a_generation_keeps_generation_zero() {
+    let (_dir, path) = written_dir().await;
+    let state_file = path.join("state.redb");
+    let log_file = path.join("raft_log.redb");
+    // Everything in a v12 store was written before tenants had a generation.
+    set_marker(state_file.clone(), SM_META, Some(V12_FORMAT_VERSION));
+    set_marker(log_file.clone(), RAFT_META, Some(V12_FORMAT_VERSION));
+
+    let store = StateStore::open(1, "127.0.0.1:0", &path, BTreeMap::new())
+        .await
+        .unwrap();
+    let default = store.get_tenant("default").await.unwrap().unwrap();
+    assert_eq!(default.generation, 0);
+    store.create_tenant(tenant()).await.unwrap();
+    store.shutdown().await.unwrap();
+
+    assert_eq!(read_marker(&state_file, SM_META), Some(FORMAT_VERSION));
+    let store = StateStore::open(1, "127.0.0.1:0", &path, BTreeMap::new())
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .get_tenant("tenant-a")
+            .await
+            .unwrap()
+            .unwrap()
+            .generation,
+        7
+    );
+    store.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_v12_snapshot_imports_with_tenants_at_generation_zero() {
+    let (_dir, path) = written_dir().await;
+    let store = StateStore::open(1, "127.0.0.1:0", &path, BTreeMap::new())
+        .await
+        .unwrap();
+    let mut old_json = serde_json::to_value(store.export().await.unwrap()).unwrap();
+    store.shutdown().await.unwrap();
+    old_json["format_version"] = serde_json::json!(V12_FORMAT_VERSION);
+    for tenant in old_json["tenants"].as_array_mut().unwrap() {
+        tenant.as_object_mut().unwrap().remove("generation");
+    }
+    let snapshot: StateSnapshot = serde_json::from_value(old_json).unwrap();
+    let (result, _) = import_with_byte_quota(snapshot, u64::MAX / 2).await;
+    assert!(result.is_ok(), "{result:?}");
 }
 
 #[tokio::test]

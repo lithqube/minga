@@ -347,6 +347,7 @@ impl StateStore {
                 name: DEFAULT_TENANT_ID.to_owned(),
                 quotas: TenantQuotas::default(),
                 created_at: crate::types::unix_now(),
+                generation: 0,
             };
             match store.create_tenant(default_tenant).await {
                 Ok(()) | Err(StateError::Conflict(_)) => {}
@@ -691,6 +692,7 @@ impl StateStore {
             name,
             quotas,
             created_at: 0,
+            generation: 0,
         };
         tenant
             .validate()
@@ -1202,6 +1204,7 @@ impl StateStore {
         match snapshot.format_version {
             crate::codec::FORMAT_VERSION
             | crate::codec::V9_FORMAT_VERSION
+            | crate::codec::V12_FORMAT_VERSION
             | crate::codec::V11_FORMAT_VERSION
             | crate::codec::V10_FORMAT_VERSION
             | crate::codec::V8_FORMAT_VERSION
@@ -1260,6 +1263,7 @@ impl StateStore {
                 name: DEFAULT_TENANT_ID.to_string(),
                 quotas: TenantQuotas::default(),
                 created_at: crate::types::unix_now(),
+                generation: 0,
             });
         }
         // Existing tenants keep their quotas and name: a snapshot (or a

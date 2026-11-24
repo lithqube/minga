@@ -487,6 +487,7 @@ async fn tenant_crud_is_persisted_and_protects_owned_resources() {
             ..TenantQuotas::default()
         },
         created_at: 123,
+        generation: 0,
     };
     store.create_tenant(tenant.clone()).await.unwrap();
     assert!(matches!(
@@ -564,6 +565,7 @@ async fn tenant_crud_is_persisted_and_protects_owned_resources() {
             name: "Persisted".into(),
             quotas: TenantQuotas::default(),
             created_at: 456,
+            generation: 0,
         })
         .await
         .unwrap();
@@ -593,6 +595,7 @@ async fn cluster_revocations_survive_tenant_updates_and_deletion() {
             quotas: TenantQuotas::default(),
             nats_revoked_user_public_keys: Vec::new(),
             created_at: 1,
+            generation: 0,
         })
         .await
         .unwrap();
@@ -634,6 +637,7 @@ async fn tenant_count_and_desired_state_quotas_are_enforced_transactionally() {
                 ..TenantQuotas::default()
             },
             created_at: 1,
+            generation: 0,
         })
         .await
         .unwrap();
@@ -670,6 +674,7 @@ async fn tenant_count_and_desired_state_quotas_are_enforced_transactionally() {
                 ..TenantQuotas::default()
             },
             created_at: 2,
+            generation: 0,
         })
         .await
         .unwrap();
@@ -697,6 +702,7 @@ async fn tenant_count_and_desired_state_quotas_are_enforced_transactionally() {
                 ..TenantQuotas::default()
             },
             created_at: 3,
+            generation: 0,
         })
         .await
         .unwrap();
@@ -732,6 +738,7 @@ async fn tenant_count_and_desired_state_quotas_are_enforced_transactionally() {
                 ..TenantQuotas::default()
             },
             created_at: 4,
+            generation: 0,
         })
         .await
         .unwrap();
@@ -790,6 +797,7 @@ fn named_tenant(id: &str, quotas: TenantQuotas) -> Tenant {
         name: id.into(),
         quotas,
         created_at: 1,
+        generation: 0,
     }
 }
 

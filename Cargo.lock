@@ -2268,6 +2268,7 @@ dependencies = [
  "minga-telemetry",
  "nats-jwt-rs",
  "nkeys",
+ "rand 0.8.8",
  "rcgen",
  "reqwest",
  "rustls",

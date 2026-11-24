@@ -176,6 +176,7 @@ async fn multi_tenant_placement_and_wireguard_routes_stay_tenant_scoped() {
             name: "Tenant B".into(),
             quotas: Default::default(),
             created_at: 1,
+            generation: 0,
         })
         .await
         .unwrap();
@@ -1695,6 +1696,7 @@ async fn relay_manager_carries_only_unique_addresses_inside_each_network() {
             name: "Tenant B".into(),
             quotas: Default::default(),
             created_at: 1,
+            generation: 0,
         })
         .await
         .unwrap();
@@ -1799,6 +1801,7 @@ async fn one_tenant_at_its_task_quota_does_not_block_other_tenants() {
             name: "Tenant B".into(),
             quotas: Default::default(),
             created_at: 1,
+            generation: 0,
         })
         .await
         .unwrap();
@@ -1859,6 +1862,7 @@ async fn tenant_cluster(tenants: &[&str]) -> (Arc<StateStore>, Arc<MemoryBus>, t
                 name: (*tenant).into(),
                 quotas: Default::default(),
                 created_at: 1,
+                generation: 0,
             })
             .await
             .unwrap();

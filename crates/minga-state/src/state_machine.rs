@@ -20,9 +20,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::codec::{
     check_format, APPLY_RULES_KEY, APPLY_RULES_VERSION, FORMAT_KEY, FORMAT_VERSION,
-    V10_FORMAT_VERSION, V11_FORMAT_VERSION, V2_FORMAT_VERSION, V3_FORMAT_VERSION,
-    V4_FORMAT_VERSION, V5_FORMAT_VERSION, V6_FORMAT_VERSION, V7_FORMAT_VERSION, V8_FORMAT_VERSION,
-    V9_FORMAT_VERSION,
+    V10_FORMAT_VERSION, V11_FORMAT_VERSION, V12_FORMAT_VERSION, V2_FORMAT_VERSION,
+    V3_FORMAT_VERSION, V4_FORMAT_VERSION, V5_FORMAT_VERSION, V6_FORMAT_VERSION, V7_FORMAT_VERSION,
+    V8_FORMAT_VERSION, V9_FORMAT_VERSION,
 };
 use crate::command::{ObjectKind, StateCommand, StateResponse};
 use crate::types::*;
@@ -688,6 +688,7 @@ impl RedbStateMachine {
             || stored.as_deref() == Some(&[V9_FORMAT_VERSION])
             || stored.as_deref() == Some(&[V10_FORMAT_VERSION])
             || stored.as_deref() == Some(&[V11_FORMAT_VERSION])
+            || stored.as_deref() == Some(&[V12_FORMAT_VERSION])
         {
             migrate_state(&tx)?;
         } else {
@@ -2602,6 +2603,7 @@ mod tests {
             nats_revoked_user_public_keys: Vec::new(),
             quotas: TenantQuotas::default(),
             created_at: 1,
+            generation: 0,
         };
         let tenant_b = Tenant {
             id: "tenant-b".into(),
@@ -2609,6 +2611,7 @@ mod tests {
             nats_revoked_user_public_keys: Vec::new(),
             quotas: TenantQuotas::default(),
             created_at: 2,
+            generation: 0,
         };
         assert_eq!(
             apply(&sm, StateCommand::CreateTenant(tenant_a)),

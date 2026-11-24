@@ -37,6 +37,8 @@ pub struct AppState {
     pub bus: Option<Arc<dyn EventBus>>,
     pub join_token_key: Option<Arc<JoinTokenKey>>,
     pub nats_credential_issuer: Option<Arc<crate::nats_credentials::NatsCredentialIssuer>>,
+    /// Serializes tenant create and delete inside this manager, see `create_tenant`.
+    tenant_lifecycle: tokio::sync::Mutex<()>,
 }
 
 impl AppState {
@@ -46,6 +48,7 @@ impl AppState {
             bus: None,
             join_token_key: None,
             nats_credential_issuer: None,
+            tenant_lifecycle: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -55,6 +58,7 @@ impl AppState {
             bus: Some(bus),
             join_token_key: None,
             nats_credential_issuer: None,
+            tenant_lifecycle: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -252,13 +256,15 @@ pub async fn create_tenant(
         name: request.name,
         quotas: request.quotas,
         created_at: unix_now(),
+        // Nonzero: zero is a tenant from before generations.
+        generation: rand::random::<u64>() | 1,
     };
     Tenant::validate_id(&tenant.id).map_err(bad_request)?;
-    // One tenant create or delete at a time in this process: two creates of an
-    // ID could otherwise both pass the checks below, and the one that loses the
-    // store write would then delete the bus resources the winner just made.
-    // Other managers are not covered; the store write still decides a race.
-    let _lifecycle = TENANT_LIFECYCLE.lock().await;
+    // One tenant create or delete at a time in this manager: two creates of an
+    // ID could otherwise both pass the checks below. Other managers are fenced
+    // on the bus: the claim below admits one incarnation, and every delete or
+    // provisioning step names the incarnation it acts for (issue #203).
+    let _lifecycle = app.tenant_lifecycle.lock().await;
     if app.store.get_tenant(&tenant.id).await?.is_some() {
         return Err(conflict(format!("tenant {} already exists", tenant.id)));
     }
@@ -279,6 +285,9 @@ pub async fn create_tenant(
         )));
     }
     let provisioned: ApiResult<()> = async {
+        bus.claim_tenant(&tenant.id, tenant.generation)
+            .await
+            .map_err(|error| lifecycle_error("cannot claim the tenant on the bus", error))?;
         configure_tenant_bus(&app, &tenant).await?;
         append_tenant_audit(
             &app,
@@ -303,7 +312,17 @@ pub async fn create_tenant(
         if undo {
             // Undo whatever the steps above made on the bus, or the retry
             // would be refused as a leftover.
-            if let Err(cleanup) = bus.delete_tenant_resources(&tenant.id).await {
+            // Fenced to this incarnation: a claim that was never ours, or a
+            // tenant another manager has made since, is left alone.
+            let cleanup = match bus
+                .begin_tenant_delete(&tenant.id, Some(tenant.generation))
+                .await
+            {
+                Ok(Some(fence)) => bus.delete_tenant_incarnation(&tenant.id, fence).await,
+                Ok(None) => Ok(()),
+                Err(error) => Err(error),
+            };
+            if let Err(cleanup) = cleanup {
                 tracing::warn!(tenant = %tenant.id, error = %cleanup, "cannot remove bus resources of a tenant that was not created");
             }
         } else {
@@ -349,7 +368,18 @@ async fn append_tenant_audit(
         occurred_at_unix: unix_now(),
     })
     .await
-    .map_err(|error| ApiError::Unavailable(format!("tenant audit append failed: {error}")))
+    .map_err(|error| match error {
+        minga_bus::BusError::Fenced(message) => conflict(message),
+        error => ApiError::Unavailable(format!("tenant audit append failed: {error}")),
+    })
+}
+
+/// Maps a refused lifecycle step to 409, any other bus failure to 503.
+fn lifecycle_error(what: &str, error: minga_bus::BusError) -> ApiError {
+    match error {
+        minga_bus::BusError::Fenced(message) => conflict(message),
+        error => ApiError::Unavailable(format!("{what}: {error}")),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -856,38 +886,50 @@ pub async fn delete_tenant(
     Path(id): Path<String>,
 ) -> ApiResult<StatusCode> {
     Tenant::validate_id(&id).map_err(bad_request)?;
-    let _lifecycle = TENANT_LIFECYCLE.lock().await;
-    if app.store.get_tenant(&id).await?.is_some() {
-        append_tenant_audit(
+    let _lifecycle = app.tenant_lifecycle.lock().await;
+    let tenant = app.store.get_tenant(&id).await?;
+    if tenant.is_some() {
+        match append_tenant_audit(
             &app,
             &id,
             &caller.name,
             "tenant.delete.requested",
             &format!("/tenants/{id}"),
         )
-        .await?;
-        app.store.remove_tenant(&id).await?;
-    } else if !tenant_bus_resources_exist(&app, &id).await? {
-        return Err(not_found("tenant", &id));
+        .await
+        {
+            // A delete already holds the tenant, so provisioning the audit
+            // stream is refused; this is the retry of that delete.
+            Ok(()) | Err(ApiError::Conflict(_)) => {}
+            Err(error) => return Err(error),
+        }
     }
     let bus = app.bus.as_ref().ok_or_else(|| {
         ApiError::Unavailable("tenant bus resource manager is not configured".into())
     })?;
-    bus.delete_tenant_resources(&id).await.map_err(|error| {
-        ApiError::Unavailable(format!(
-            "tenant {id} was removed but its bus resources were not: {error}; delete it again to retry"
-        ))
-    })?;
-    Ok(StatusCode::NO_CONTENT)
-}
-
-async fn tenant_bus_resources_exist(app: &AppState, tenant_id: &str) -> ApiResult<bool> {
-    let Some(bus) = app.bus.as_ref() else {
-        return Ok(false);
-    };
-    bus.tenant_resources_exist(tenant_id)
+    // Take the tenant's bus resources before the record goes: from here no
+    // create or provisioning can start, and a retry on another manager takes
+    // the delete over and fences this one.
+    let fence = bus
+        .begin_tenant_delete(&id, tenant.as_ref().map(|tenant| tenant.generation))
         .await
-        .map_err(|error| ApiError::Unavailable(format!("cannot check bus resources: {error}")))
+        .map_err(|error| lifecycle_error("cannot start the tenant delete on the bus", error))?;
+    match (&tenant, &fence) {
+        (None, None) => return Err(not_found("tenant", &id)),
+        (Some(_), _) => app.store.remove_tenant(&id).await?,
+        (None, Some(_)) => {}
+    }
+    if let Some(fence) = fence {
+        bus.delete_tenant_incarnation(&id, fence)
+            .await
+            .map_err(|error| match error {
+                minga_bus::BusError::Fenced(message) => conflict(message),
+                error => ApiError::Unavailable(format!(
+                    "tenant {id} was removed but its bus resources were not: {error}; delete it again to retry"
+                )),
+            })?;
+    }
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// `GET /v{version}/audit` — list only the authenticated tenant's audit trail.
@@ -1720,9 +1762,6 @@ pub async fn create_node(
 /// shortcut: process-local; revocation runs only on the Raft leader, so move
 /// this into Raft if credential issuance ever runs on followers.
 pub(crate) static NODE_CREDENTIALS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-/// Serializes tenant create and delete in this process, see `create_tenant`.
-static TENANT_LIFECYCLE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// `POST /minga/nodes/{id}/join-token` — mint a tenant-bound token and NATS credentials.
 pub async fn issue_node_join_token(
@@ -2781,6 +2820,7 @@ mod tests {
                 name: id.into(),
                 quotas: Default::default(),
                 created_at: 1,
+                generation: 0,
             })
             .await
             .unwrap();
@@ -3248,6 +3288,7 @@ mod tests {
                 name: "Acme".into(),
                 quotas: Default::default(),
                 created_at: 1,
+                generation: 0,
             })
             .await
             .unwrap();
@@ -3399,6 +3440,7 @@ mod tests {
                 name: "Acme".into(),
                 quotas: Default::default(),
                 created_at: 1,
+                generation: 0,
             })
             .await
             .unwrap();
@@ -3595,6 +3637,7 @@ mod tests {
                 name: "Acme".into(),
                 quotas: Default::default(),
                 created_at: 1,
+                generation: 0,
             })
             .await
             .unwrap();
@@ -3783,6 +3826,7 @@ mod tests {
                 name: "Acme".into(),
                 quotas: Default::default(),
                 created_at: 1,
+                generation: 0,
             })
             .await
             .unwrap();
@@ -4113,6 +4157,7 @@ mod tests {
                 name: "Acme".into(),
                 quotas: Default::default(),
                 created_at: 1,
+                generation: 0,
             })
             .await
             .unwrap();
@@ -4448,6 +4493,7 @@ mod tests {
                 name: "acme".into(),
                 quotas: TenantQuotas::default(),
                 created_at: 1,
+                generation: 0,
             })
             .await
             .unwrap();

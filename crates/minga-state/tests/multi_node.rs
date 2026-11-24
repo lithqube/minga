@@ -296,6 +296,7 @@ async fn tenant_writes_replicate_to_all_nodes() {
             name: "Tenant A".into(),
             quotas: TenantQuotas::default(),
             created_at: 1_794_000_000,
+            generation: 0,
         })
         .await
         .unwrap();

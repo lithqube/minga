@@ -890,6 +890,7 @@ mod tests {
                 name: "Acme".into(),
                 quotas: Default::default(),
                 created_at: 1,
+                generation: 0,
             })
             .await
             .unwrap();
@@ -1220,6 +1221,7 @@ mod tests {
                 name: id.into(),
                 quotas: Default::default(),
                 created_at: 1,
+                generation: 0,
             })
             .await
             .unwrap();
