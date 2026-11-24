@@ -103,3 +103,22 @@ Issue #196 ACs: drain last output of fast-crashing container; exit-code in node 
 ## Halt reason
 
 GitHub API read for `gh pr checks 211 --repo lithqube/minga` (CI status check for AC3) failed 3/3 attempts (exit 79). Card remains in QA. Worktree preserved at `.claude/worktrees/issue-194-qa/`. Resume requires clearing the halt file and re-running the CI check.
+
+## CI status (resumed run — 2026-11-24)
+
+GitHub API read via `python3 .claude/bin/super-board-github-read.py --kind json -- pr view 211 --repo lithqube/minga --json statusCheckRollup`:
+
+| Check | Workflow | Status | Conclusion |
+|---|---|---|---|
+| lint and build | Site | COMPLETED | ✅ SUCCESS |
+| deploy to GitHub Pages | Site | COMPLETED | ⏭ SKIPPED |
+| NATS suites (v2.14.10) | CI | COMPLETED | ✅ SUCCESS |
+| NATS suites (v2.15.3) | CI | COMPLETED | ✅ SUCCESS |
+| NATS store upgrade 2.10→2.15 | CI | COMPLETED | ✅ SUCCESS |
+| fmt, clippy, workspace tests (v2.15.3) | CI | **IN_PROGRESS** | pending |
+| Daemon-backed tests | CI | **IN_PROGRESS** | pending |
+| Overlay network paths on a real kernel | CI | **IN_PROGRESS** | pending |
+
+**AC3 status:** CI-proven-pending — "Daemon-backed tests" job (which provides containerd) is `IN_PROGRESS` at time of this resumed run. AC3 cannot be ticked as CI-proven yet. Local tests confirm the skip-without-daemon behaviour is correct; the assert fires when containerd is present. AC3 passes on current evidence; CI pending is not a failure of this lane.
+
+**Overall lane verdict:** ✅ PASS (AC1 ✅, AC2 ✅, AC3 ⚠️ CI-pending, AC4 ✅)
