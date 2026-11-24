@@ -302,25 +302,24 @@ async fn keep_wireguard_forward_first() -> Result<(), NetError> {
     move_filter_jump_first("INPUT", TASK_FAIL_CLOSED_IN_CHAIN).await
 }
 
+/// Whether the filter table declares `chain`. Lists the whole table because
+/// `-S <missing chain>` has no portable error: iptables-nft 1.8.10 on Ubuntu
+/// 24.04 (kernel 6.8) prints "Incompatible with this kernel", not "No
+/// chain/target/match by that name" (#204).
+async fn filter_chain_exists(chain: &str) -> Result<bool, NetError> {
+    let rules = output("iptables", &["-w", "5", "-t", "filter", "-S"]).await?;
+    Ok(declares_chain(&rules, chain))
+}
+
+fn declares_chain(rules: &str, chain: &str) -> bool {
+    rules
+        .lines()
+        .any(|line| line.strip_prefix("-N ").map(str::trim) == Some(chain))
+}
+
 async fn move_filter_jump_first(hook: &str, chain: &str) -> Result<(), NetError> {
-    let args = ["-w", "5", "-t", "filter", "-S", chain];
-    let result = tokio::process::Command::new("iptables")
-        .args(args)
-        .output()
-        .await
-        .map_err(|error| NetError::Command {
-            cmd: format!("iptables {}", args.join(" ")),
-            stderr: error.to_string(),
-        })?;
-    if !result.status.success() {
-        let stderr = String::from_utf8_lossy(&result.stderr).trim().to_string();
-        if stderr.contains("No chain/target/match by that name") {
-            return Ok(());
-        }
-        return Err(NetError::Command {
-            cmd: format!("iptables {}", args.join(" ")),
-            stderr,
-        });
+    if !filter_chain_exists(chain).await? {
+        return Ok(());
     }
     // With the nf_tables backend a concurrent mover can commit first and
     // delete the rule this batch was built against (RULE_DELETE: No such
@@ -2182,25 +2181,8 @@ impl NetworkSetup {
         // Keep the empty chains and their hooks installed. A later fail-closed
         // transition can populate them without a window before the jump exists.
         for chain in [TASK_FAIL_CLOSED_IN_CHAIN, TASK_FAIL_CLOSED_OUT_CHAIN] {
-            let args = ["-w", "5", "-t", "filter", "-S", chain];
-            let result = tokio::process::Command::new("iptables")
-                .args(args)
-                .output()
-                .await
-                .map_err(|error| NetError::Command {
-                    cmd: format!("iptables {}", args.join(" ")),
-                    stderr: error.to_string(),
-                })?;
-            if result.status.success() {
+            if filter_chain_exists(chain).await? {
                 run("iptables", &["-w", "5", "-t", "filter", "-F", chain]).await?;
-            } else {
-                let stderr = String::from_utf8_lossy(&result.stderr);
-                if !stderr.contains("No chain/target/match by that name") {
-                    return Err(NetError::Command {
-                        cmd: format!("iptables {}", args.join(" ")),
-                        stderr: stderr.trim().to_string(),
-                    });
-                }
             }
         }
         Ok(())
@@ -2226,6 +2208,22 @@ pub fn system_upstream_resolver() -> Option<std::net::SocketAddr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn declares_chain_reads_only_chain_declarations() {
+        // `iptables -S` on the #204 staging host (iptables-nft beside legacy tables).
+        let rules = "# Warning: iptables-legacy tables present, use iptables-legacy to see them\n\
+                     -P FORWARD DROP\n\
+                     -N MINGA_TASK_SOURCE_OLD\n\
+                     -N MINGA_WG_FORWARD\n\
+                     -A FORWARD -j MINGA_TASK_SOURCE\n\
+                     -A FORWARD -j MINGA_WG_FORWARD\n";
+        assert!(declares_chain(rules, "MINGA_WG_FORWARD"));
+        // Referenced by a jump or sharing a prefix is not declared.
+        assert!(!declares_chain(rules, "MINGA_TASK_SOURCE"));
+        assert!(!declares_chain(rules, "FORWARD"));
+        assert!(!declares_chain("", "MINGA_WG_FORWARD"));
+    }
+
     #[test]
     fn ingress_forward_admits_only_local_backend_ports() {
         let backend = |node_id, ip: &str| minga_state::types::IngressBackend {

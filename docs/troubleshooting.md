@@ -127,7 +127,7 @@ sysctl net.ipv4.ip_forward
 
 **`this host cannot run task networking` at start:**
 
-The kernel rejected an iptables match the node needs (`Incompatible with this kernel` is the usual iptables wording). The message names the match, the kernel module, `iptables -V`, the kernel release and the failing command. See [host requirements](networking.md#host-requirements).
+The kernel rejected an iptables match the node needs. The message names the match, the kernel module, `iptables -V`, the kernel release and the failing command. See [host requirements](networking.md#host-requirements).
 
 **A task will not start: `active task namespace minga-... has no state file`:**
 

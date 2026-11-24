@@ -5,6 +5,7 @@
 Changes on `main` after `v1.3.0-rc.1`. They go into 1.3.0.
 
 ### Changes
+- **Task networking starts on `iptables-nft` hosts that answer a missing chain with `Incompatible with this kernel` (#204).** On Ubuntu 24.04 (iptables 1.8.10, kernel 6.8) `iptables -S <chain>` for a chain not yet created fails with that message instead of `No chain/target/match by that name`, so the node treated the not-yet-created `MINGA_TASK_SOURCE` as an error and stopped setting up WireGuard and task networking. The node now checks a chain by listing the filter table. Hosts that were switched to `iptables-legacy` to work around it can switch back; see [host requirements](docs/networking.md#host-requirements) for clearing the rules left in the other backend.
 - **`minga-ctl` is in the release archive, `install.sh` and the container image (#206).** `minga-ctl doctor`, `stack ps`, `service ls`, `service logs` and `service inspect` no longer need a Rust toolchain; `install.sh --uninstall` removes it, and the release workflow fails if an archive lacks it. Archives of earlier releases do not contain it, and `install.sh --version` of one of those still installs `minga` alone.
 - **Breaking, upgrade action: a node names its runtime, and a worker refuses manager settings (#202).**
   - `minga manager` and `minga worker` now require `--runtime`. It no longer defaults to `mock`, which reported
