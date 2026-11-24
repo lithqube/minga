@@ -3,6 +3,8 @@
 //!
 //! To run: `cargo test -p minga-bus --test nats_cluster -- --nocapture`
 
+use std::fs::File;
+use std::future::Future;
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -13,6 +15,8 @@ use minga_bus::{EventBus, NatsBus};
 struct ClusterServer {
     child: Child,
     _store: tempfile::TempDir,
+    /// Stderr log file for this server instance; printed on meta-group timeout.
+    stderr_file: tempfile::NamedTempFile,
 }
 
 impl Drop for ClusterServer {
@@ -40,32 +44,56 @@ fn nats_server_bin() -> PathBuf {
         .expect("nats-server is required; install it or set MINGA_NATS_SERVER_BIN")
 }
 
-fn free_port() -> u16 {
-    TcpListener::bind(("127.0.0.1", 0))
-        .expect("bind ephemeral port")
-        .local_addr()
-        .expect("read ephemeral port")
-        .port()
-}
-
 /// Starts three JetStream server processes routed to each other.
 async fn start_cluster() -> (Vec<ClusterServer>, String, Vec<String>) {
     let binary = nats_server_bin();
     let tag = std::process::id();
     let names: Vec<String> = (1..=3).map(|i| format!("minga-nats-{tag}-{i}")).collect();
-    let client_ports: Vec<u16> = (0..3).map(|_| free_port()).collect();
-    let monitor_ports: Vec<u16> = (0..3).map(|_| free_port()).collect();
-    let route_ports: Vec<u16> = (0..3).map(|_| free_port()).collect();
+
+    // Held until each server spawns so a parallel test cannot take a port
+    // between the bind and the nats-server exec.  Nine ports: 3 client,
+    // 3 monitor, 3 route — same layout as the sidecar tests in
+    // crates/minga-cli/src/sidecar.rs.
+    let mut listeners: Vec<Option<TcpListener>> = (0..9)
+        .map(|_| Some(TcpListener::bind(("127.0.0.1", 0)).expect("bind ephemeral port")))
+        .collect();
+    let ports: Vec<u16> = listeners
+        .iter()
+        .flatten()
+        .map(|l| l.local_addr().expect("read ephemeral port").port())
+        .collect();
+
+    // ports layout: [client×3 | monitor×3 | route×3]
+    let client_ports = &ports[0..3];
+    let monitor_ports = &ports[3..6];
+    let route_ports = &ports[6..9];
+
     let routes = route_ports
         .iter()
         .map(|port| format!("nats://127.0.0.1:{port}"))
         .collect::<Vec<_>>()
         .join(",");
+
     let mut servers = Vec::new();
     let mut urls = Vec::new();
 
     for index in 0..3 {
         let store = tempfile::tempdir().expect("create JetStream store");
+        let stderr_file = tempfile::NamedTempFile::new().expect("create stderr tempfile");
+        let stderr_handle = File::open(stderr_file.path()).expect("open stderr tempfile for read");
+
+        // Release the three listeners for this server just before exec so
+        // nats-server can bind the same addresses.
+        listeners[index] = None; // client port
+        listeners[3 + index] = None; // monitor port
+        listeners[6 + index] = None; // route port
+        drop(stderr_handle); // keep only the write end open
+
+        let stderr_write = File::options()
+            .write(true)
+            .open(stderr_file.path())
+            .expect("open stderr tempfile for write");
+
         let child = Command::new(&binary)
             .arg("-js")
             .arg("-p")
@@ -83,12 +111,13 @@ async fn start_cluster() -> (Vec<ClusterServer>, String, Vec<String>) {
             .arg("--store_dir")
             .arg(store.path())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::from(stderr_write))
             .spawn()
             .expect("start nats-server");
         servers.push(ClusterServer {
             child,
             _store: store,
+            stderr_file,
         });
         urls.push(format!("nats://127.0.0.1:{}", client_ports[index]));
     }
@@ -96,14 +125,17 @@ async fn start_cluster() -> (Vec<ClusterServer>, String, Vec<String>) {
         .iter()
         .map(|port| format!("http://127.0.0.1:{port}/jsz"))
         .collect();
-    wait_for_meta_group(&monitors).await;
+    wait_for_meta_group(&monitors, &servers).await;
     (servers, urls.join(","), names)
 }
 
 /// Waits until every server reports a meta leader and a three-peer meta
 /// group. "Server is ready" comes before either, and a meta group short of
 /// three peers is what fails R3 placement with a bare "no suitable peers".
-async fn wait_for_meta_group(monitors: &[String]) {
+///
+/// On timeout the stderr captured from each nats-server is printed so a
+/// bind error or route failure is visible in the failing test's output.
+async fn wait_for_meta_group(monitors: &[String], servers: &[ClusterServer]) {
     let http = reqwest::Client::builder()
         .no_proxy()
         // Covers send and body: a stalled monitor counts as not formed.
@@ -128,10 +160,16 @@ async fn wait_for_meta_group(monitors: &[String]) {
         if formed {
             return;
         }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "JetStream meta group did not reach three peers: {views:?}"
-        );
+        if tokio::time::Instant::now() >= deadline {
+            // Print each server's captured stderr so a bind error or route
+            // failure is visible directly in the test output.
+            for (i, server) in servers.iter().enumerate() {
+                let log = std::fs::read_to_string(server.stderr_file.path())
+                    .unwrap_or_else(|e| format!("<could not read stderr: {e}>"));
+                eprintln!("--- nats-server[{i}] stderr ---\n{log}\n---");
+            }
+            panic!("JetStream meta group did not reach three peers: {views:?}");
+        }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
 }
@@ -153,7 +191,7 @@ async fn replicas(bus: &NatsBus, stream: &str) -> usize {
 async fn eventually<T, F, Fut>(what: &str, mut f: F) -> T
 where
     F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = minga_bus::Result<T>>,
+    Fut: Future<Output = minga_bus::Result<T>>,
 {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
