@@ -23,6 +23,55 @@ use minga_state::types::{
 
 use crate::models;
 
+/// Generic-resource kind that carries a service's GPU count.
+const GPU_KIND: &str = "gpu";
+
+/// `gpu` is ours; `NVIDIA-GPU` is what `docker service create
+/// --generic-resource` users write.
+fn is_gpu_kind(kind: &str) -> bool {
+    kind.eq_ignore_ascii_case(GPU_KIND) || kind.eq_ignore_ascii_case("NVIDIA-GPU")
+}
+
+/// Fields `minga deploy` may change on the way through the Docker spec.
+/// `name`: the spec has one `Name`, which becomes both id and name, so the
+/// Compose service name (`web`) is stored as the id (`shop.web`). Anything
+/// else the spec cannot carry must fail the deploy, not vanish.
+pub const DOCKER_ROUND_TRIP_ALLOWED_DIFFERENCES: &[&str] = &["name"];
+
+/// Checks that `svc` comes back unchanged from `service_to_docker` then
+/// `service_spec_to_state`, the path `minga deploy` takes. `Err` names the
+/// fields that did not survive.
+pub fn docker_round_trip_check(svc: &Service) -> Result<(), String> {
+    let back = service_spec_to_state(&service_to_docker(svc).Spec)?;
+    let json = |s: &Service| serde_json::to_value(s).map_err(|e| e.to_string());
+    let (before, after) = (json(svc)?, json(&back)?);
+    let keys = |v: &serde_json::Value| -> Vec<String> {
+        v.as_object()
+            .into_iter()
+            .flat_map(|o| o.keys().cloned())
+            .collect()
+    };
+    let mut lost: Vec<String> = [keys(&before), keys(&after)]
+        .concat()
+        .into_iter()
+        .filter(|key| {
+            before.get(key) != after.get(key)
+                && !DOCKER_ROUND_TRIP_ALLOWED_DIFFERENCES.contains(&key.as_str())
+        })
+        .collect();
+    lost.sort();
+    lost.dedup();
+    if lost.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "service '{}': the Docker service spec cannot carry {}",
+            svc.id,
+            lost.join(", ")
+        ))
+    }
+}
+
 /// Upper bound for direct service admission and change-request scaling.
 pub(crate) const MAX_SERVICE_REPLICAS: u32 = 1000;
 
@@ -370,6 +419,41 @@ pub fn service_spec_to_state(spec: &models::ServiceSpec) -> Result<Service, Stri
                 ));
             }
         }
+        // Only whole-GPU counts fit `resources.gpus`; anything else would
+        // run without the device, so it is refused.
+        if res
+            .Limits
+            .as_ref()
+            .is_some_and(|l| l.GenericResources.is_some())
+        {
+            return Err(format!(
+                "service '{name}': Resources.Limits.GenericResources is not supported; \
+                 reserve a GPU under Resources.Reservations"
+            ));
+        }
+        for generic in res
+            .Reservations
+            .iter()
+            .flat_map(|r| r.GenericResources.iter().flatten())
+        {
+            match &generic.DiscreteResourceSpec {
+                Some(d) if is_gpu_kind(&d.Kind) && generic.NamedResourceSpec.is_none() => {
+                    let count = u32::try_from(d.Value).map_err(|_| {
+                        format!(
+                            "service '{name}': GPU reservation {} is out of range",
+                            d.Value
+                        )
+                    })?;
+                    resources.gpus = resources.gpus.saturating_add(count);
+                }
+                _ => {
+                    return Err(format!(
+                        "service '{name}': generic resource {generic:?} is not supported \
+                         (only discrete `gpu` reservations)"
+                    ))
+                }
+            }
+        }
         if let Some(limits) = &res.Limits {
             if let Some(nano_cpus) = limits.NanoCPUs {
                 resources.cpus = nano_cpus as f64 / 1_000_000_000.0;
@@ -447,9 +531,11 @@ pub fn service_spec_to_state(spec: &models::ServiceSpec) -> Result<Service, Stri
         .map(|p| p.Constraints.clone())
         .unwrap_or_default();
 
-    // Command/args override the image defaults at runtime.
-    let command = container.Command.clone();
-    let entrypoint = container.Args.clone();
+    // Swarm runs `Command` as the container's Entrypoint and `Args` as its
+    // Cmd (`docker service create --entrypoint X img a b` sends
+    // Command=[X], Args=[a, b]).
+    let entrypoint = container.Command.clone();
+    let command = container.Args.clone();
 
     // Healthcheck. Docker API durations are nanoseconds; state is seconds.
     let nanos = |v: Option<u64>| v.map(|n| n / 1_000_000_000);
@@ -728,8 +814,8 @@ pub fn service_to_docker(svc: &Service) -> models::Service {
                 }
             })
             .collect(),
-        Command: svc.command.clone(),
-        Args: svc.entrypoint.clone(),
+        Command: svc.entrypoint.clone(),
+        Args: svc.command.clone(),
         Mounts: mounts,
         User: svc.user.clone(),
         Hosts: svc
@@ -749,9 +835,19 @@ pub fn service_to_docker(svc: &Service) -> models::Service {
     if svc.resources.memory_bytes > 0 {
         limits.MemoryBytes = Some(svc.resources.memory_bytes as i64);
     }
+    let reservations = (svc.resources.gpus > 0).then(|| models::ResourceSpec {
+        GenericResources: Some(vec![models::GenericResource {
+            NamedResourceSpec: None,
+            DiscreteResourceSpec: Some(models::DiscreteGenericResource {
+                Kind: GPU_KIND.to_string(),
+                Value: i64::from(svc.resources.gpus),
+            }),
+        }]),
+        ..Default::default()
+    });
     let resources = models::Resources {
         Limits: Some(limits),
-        Reservations: None,
+        Reservations: reservations,
     };
 
     let networks: Vec<models::ServiceNetwork> = svc
@@ -2003,6 +2099,177 @@ mod tests {
         spec.EndpointSpec = None;
         let svc = service_spec_to_state(&spec).unwrap();
         assert!(svc.ports.is_empty());
+    }
+
+    /// A service with every field `minga deploy` can set, so a field the
+    /// Docker spec cannot carry shows up as a difference below.
+    fn fully_populated_service() -> Service {
+        use minga_state::types::{Healthcheck, MountKind, PortMode, ServiceMount};
+        Service {
+            id: "stack_gpu".into(),
+            tenant_id: DEFAULT_TENANT_ID.to_owned(),
+            name: "stack_gpu".into(),
+            image: "registry.local/vllm:0.6.3".into(),
+            replicas: 2,
+            mode: ServiceMode::Replicated,
+            is_job: false,
+            constraints: vec!["node.labels.gpu == true".into()],
+            env: HashMap::from([
+                ("FOO".to_string(), "bar".to_string()),
+                ("MINGA_STACK".to_string(), "stack".to_string()),
+            ]),
+            ports: vec![PortMapping {
+                host_ip: None,
+                target: 8000,
+                published: Some(8000),
+                protocol: "tcp".into(),
+                mode: PortMode::Host,
+            }],
+            networks: vec!["stack_backplane".into()],
+            resources: ResourceSpec {
+                cpus: 4.0,
+                memory_bytes: 24 << 30,
+                gpus: 2,
+            },
+            agent: None,
+            egress: None,
+            restart_policy: RestartPolicy {
+                condition: RestartCondition::OnFailure,
+                delay_secs: 5,
+                max_attempts: Some(3),
+            },
+            secrets: vec![SecretRef::new("stack_key", "/run/secrets/key")],
+            command: vec!["--port".into(), "8000".into()],
+            entrypoint: vec!["/bin/serve".into()],
+            labels: HashMap::from([
+                (
+                    "com.docker.stack.namespace".to_string(),
+                    "stack".to_string(),
+                ),
+                ("tier".to_string(), "gpu".to_string()),
+            ]),
+            healthcheck: Some(Healthcheck {
+                test: vec!["CMD".into(), "true".into()],
+                interval_secs: Some(10),
+                timeout_secs: Some(3),
+                start_period_secs: Some(120),
+                retries: Some(5),
+            }),
+            mounts: vec![ServiceMount {
+                kind: MountKind::Bind,
+                source: "/models".into(),
+                target: "/models".into(),
+                read_only: true,
+            }],
+            user: Some("1000:1000".into()),
+            extra_hosts: vec![("db".into(), "10.0.0.5".into())],
+            update: UpdatePolicy {
+                parallelism: 2,
+                order: UpdateOrder::StartFirst,
+                delay_secs: 4,
+                monitor_secs: 6,
+                failure_action: FailureAction::Rollback,
+            },
+            rollback: Some(UpdatePolicy::default()),
+            previous: None,
+        }
+    }
+
+    #[test]
+    fn deploy_round_trip_keeps_every_field() {
+        let svc = fully_populated_service();
+        let back = service_spec_to_state(&service_to_docker(&svc).Spec).unwrap();
+        assert_eq!(back, svc);
+    }
+
+    #[test]
+    fn docker_service_create_entrypoint_runs_as_the_entrypoint() {
+        // `docker service create --entrypoint /custom img a b` sends
+        // Command=["/custom"], Args=["a","b"]: swarm runs Command as the
+        // Entrypoint and Args as Cmd.
+        let mut spec = sample_docker_spec();
+        let container = spec.TaskTemplate.ContainerSpec.as_mut().unwrap();
+        container.Command = vec!["/custom".into()];
+        container.Args = vec!["a".into(), "b".into()];
+        let svc = service_spec_to_state(&spec).unwrap();
+        assert_eq!(svc.entrypoint, ["/custom"]);
+        assert_eq!(svc.command, ["a", "b"]);
+
+        let out = service_to_docker(&svc)
+            .Spec
+            .TaskTemplate
+            .ContainerSpec
+            .unwrap();
+        assert_eq!(out.Command, ["/custom"]);
+        assert_eq!(out.Args, ["a", "b"]);
+    }
+
+    #[test]
+    fn gpus_ride_the_docker_spec_as_a_discrete_generic_resource() {
+        let mut svc = fully_populated_service();
+        svc.resources.gpus = 2;
+        let reservations = service_to_docker(&svc)
+            .Spec
+            .TaskTemplate
+            .Resources
+            .unwrap()
+            .Reservations
+            .unwrap();
+        let generic = reservations.GenericResources.unwrap();
+        assert_eq!(generic.len(), 1);
+        let discrete = generic[0].DiscreteResourceSpec.as_ref().unwrap();
+        assert_eq!((discrete.Kind.as_str(), discrete.Value), ("gpu", 2));
+    }
+
+    #[test]
+    fn generic_resources_the_state_cannot_hold_are_refused() {
+        let generic = |kind: &str| {
+            vec![models::GenericResource {
+                NamedResourceSpec: None,
+                DiscreteResourceSpec: Some(models::DiscreteGenericResource {
+                    Kind: kind.into(),
+                    Value: 1,
+                }),
+            }]
+        };
+        let refuse = |resources: models::Resources| {
+            let mut spec = sample_docker_spec();
+            spec.TaskTemplate.Resources = Some(resources);
+            service_spec_to_state(&spec).unwrap_err()
+        };
+        let reserve = |generic| models::Resources {
+            Limits: None,
+            Reservations: Some(models::ResourceSpec {
+                GenericResources: Some(generic),
+                ..Default::default()
+            }),
+        };
+        assert!(refuse(reserve(generic("fpga"))).contains("fpga"));
+        let named = vec![models::GenericResource {
+            NamedResourceSpec: Some(models::NamedGenericResource {
+                Kind: "gpu".into(),
+                Value: "GPU-0".into(),
+            }),
+            DiscreteResourceSpec: None,
+        }];
+        assert!(refuse(reserve(named)).contains("gpu"));
+        let limit = models::Resources {
+            Limits: Some(models::ResourceSpec {
+                GenericResources: Some(generic("gpu")),
+                ..Default::default()
+            }),
+            Reservations: None,
+        };
+        assert!(refuse(limit).contains("GenericResources"));
+    }
+
+    #[test]
+    fn a_service_the_docker_spec_cannot_carry_is_refused_by_name() {
+        assert_eq!(docker_round_trip_check(&fully_populated_service()), Ok(()));
+        let mut svc = fully_populated_service();
+        svc.ports[0].host_ip = Some("127.0.0.1".parse().unwrap());
+        let err = docker_round_trip_check(&svc).unwrap_err();
+        assert!(err.contains("ports"), "{err}");
     }
 
     #[test]
