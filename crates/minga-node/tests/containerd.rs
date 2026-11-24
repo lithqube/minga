@@ -541,12 +541,27 @@ async fn supervisor_restart_adopted_container_logs_reach_stream_ac3() {
         saw_before,
         "initial output must arrive before simulating restart"
     );
-
     // --- Simulate supervisor restart ---
-    // Create a SECOND ContainerdRuntime instance with the same logs_dir.
-    // Its log_readers map is empty, so open_log_fifos will NOT be short-circuited
-    // by the contains_key guard. This is the actual restart path that
-    // recover_running_containers exercises.
+    //
+    // A real restart means the old process is gone: its reader tasks are dead,
+    // the FIFOs survive on disk, and the new process re-opens them.  We model
+    // that here by calling `close_log_readers` on `runtime` BEFORE creating
+    // `runtime2`.  After this call, no task is reading the FIFOs, so every
+    // byte emitted by the container goes exclusively to `runtime2`'s reader.
+    //
+    // Red-first evidence: if `runtime2.open_log_fifos()` is commented out,
+    // `runtime2.log_rings` has no entry and `logs()` returns empty — the
+    // `saw_after` assert below fails.  If `close_log_readers` is omitted and
+    // `runtime`'s reader is still alive it may consume the bytes first, making
+    // the assertion non-deterministic; with the call the assertion is structural.
+    runtime.close_log_readers(&container_id).await;
+
+    // Allow any in-flight FIFO reads from the old reader to drain before the
+    // new reader opens.  One yield is enough; the abort is cooperative.
+    tokio::task::yield_now().await;
+
+    // Create a second ContainerdRuntime with the same logs_dir; its log_readers
+    // map is empty (fresh Arc).
     let runtime2 = ContainerdRuntime::connect(&socket)
         .await
         .expect("second runtime connect failed");
@@ -575,8 +590,9 @@ async fn supervisor_restart_adopted_container_logs_reach_stream_ac3() {
         "output written after supervisor restart must reach the log stream via the new runtime instance"
     );
 
-    // Cleanup: stop via the first instance (which owns the containerd task).
-    runtime
+    // Cleanup: either instance can stop the container (both talk to the same
+    // containerd daemon); use runtime2 since runtime no longer owns readers.
+    runtime2
         .stop(&container_id)
         .await
         .expect("failed to stop AC3 container");

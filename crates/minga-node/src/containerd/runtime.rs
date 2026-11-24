@@ -763,6 +763,21 @@ impl ContainerdRuntime {
         }
     }
 
+    /// Aborts log reader tasks for `container_id` without removing the FIFO
+    /// files from disk.
+    ///
+    /// This models a supervisor restart: the old process dies (reader tasks
+    /// are gone) but the named pipes survive on disk so the new instance can
+    /// re-open them via [`Self::open_log_fifos`].  Used by tests that need
+    /// to stop the original readers before the second runtime instance
+    /// adopts the same container.
+    pub async fn close_log_readers(&self, container_id: &str) {
+        if let Some(handle) = self.log_readers.lock().await.remove(container_id) {
+            handle.abort();
+        }
+        self.log_rings.lock().await.remove(container_id);
+    }
+
     /// Undoes the network and log setup of a start that failed before its
     /// container existed, and hands back the error.
     async fn abort_start(&self, container_id: &str, error: RuntimeError) -> RuntimeError {

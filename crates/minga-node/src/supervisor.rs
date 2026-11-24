@@ -1578,6 +1578,43 @@ mod assignment_tests {
     use super::*;
     use crate::runtime::MockRuntime;
     use minga_bus::MemoryBus;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tracing_subscriber::layer::{Context, SubscriberExt as _};
+
+    /// A minimal tracing `Layer` that counts WARN events whose message
+    /// contains `target`.  Used in `seq_gap_is_not_republished_ac2` to prove
+    /// the gap-warn fires exactly once per gap rather than once per chunk or
+    /// zero times.
+    struct WarnCounter {
+        count: Arc<AtomicUsize>,
+        target: &'static str,
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for WarnCounter {
+        fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+            if *event.metadata().level() != tracing::Level::WARN {
+                return;
+            }
+            struct Msg(String);
+            impl tracing::field::Visit for Msg {
+                fn record_str(&mut self, f: &tracing::field::Field, v: &str) {
+                    if f.name() == "message" {
+                        self.0 = v.to_owned();
+                    }
+                }
+                fn record_debug(&mut self, f: &tracing::field::Field, v: &dyn std::fmt::Debug) {
+                    if f.name() == "message" {
+                        self.0 = format!("{v:?}");
+                    }
+                }
+            }
+            let mut msg = Msg(String::new());
+            event.record(&mut msg);
+            if msg.0.contains(self.target) {
+                self.count.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    }
 
     fn assignment(task_id: &str) -> TaskAssignment {
         assignment_on(task_id, 7)
@@ -2485,13 +2522,25 @@ mod assignment_tests {
         use crate::runtime::ContainerLog;
         use crate::runtime::LogStream as RtStream;
 
+        // Install a scoped subscriber that counts the gap-warn events.
+        // `set_default` uses a thread-local guard; because this is a
+        // single-threaded tokio test and all reconcile_once() calls are
+        // awaited inline (no cross-thread spawns touch the warn path),
+        // the counter sees every WARN event emitted in this test.
+        let gap_warn_count = Arc::new(AtomicUsize::new(0));
+        let subscriber = tracing_subscriber::registry().with(WarnCounter {
+            count: gap_warn_count.clone(),
+            target: "gap counted",
+        });
+        let _guard = tracing::subscriber::set_default(subscriber);
+
         let (supervisor, runtime, bus) = setup(7).await;
         write_assignment(&bus, &assignment("task-1")).await;
         supervisor.reconcile_once().await.unwrap();
 
         let container_id = runtime.list().await[0].id.clone();
 
-        // First pass: cursor advances to seq 5.
+        // First pass: no gap — cursor advances to seq 5; warn must NOT fire.
         let first_batch: Vec<ContainerLog> = (1u64..=5)
             .map(|s| ContainerLog {
                 stream: RtStream::Stdout,
@@ -2511,6 +2560,11 @@ mod assignment_tests {
             .unwrap()
             .len();
         assert_eq!(count_a, 5, "first batch: 5 chunks published");
+        assert_eq!(
+            gap_warn_count.load(Ordering::SeqCst),
+            0,
+            "no gap in first pass: gap-warn must not fire"
+        );
 
         // Now simulate: seqs 6-9 were written and evicted (never saw cursor).
         // The ring now only contains seqs 10..=14.
@@ -2527,6 +2581,7 @@ mod assignment_tests {
             .unwrap()
             .insert(container_id.clone(), gap_batch.clone());
         // (a) Gap pass: 5 surviving chunks ship; cursor advances to 14.
+        //     The gap-warn must fire EXACTLY ONCE (once per gap, not per chunk).
         supervisor.reconcile_once().await.unwrap();
         let count_b = bus
             .tenant_log_history("default", "task-1", 0)
@@ -2536,6 +2591,11 @@ mod assignment_tests {
         assert_eq!(
             count_b, 10,
             "only the 5 surviving chunks after gap must ship (no re-send of 1-5)"
+        );
+        assert_eq!(
+            gap_warn_count.load(Ordering::SeqCst),
+            1,
+            "first gap pass: gap-warn must fire exactly once (not once per chunk)"
         );
 
         // (b) Second reconcile with the SAME gap data: cursor == 14, first.seq == 10.
@@ -2555,6 +2615,11 @@ mod assignment_tests {
         assert_eq!(
             count_c, 10,
             "second pass with same gap data: cursor past gap, no re-publish and no duplicate warn"
+        );
+        assert_eq!(
+            gap_warn_count.load(Ordering::SeqCst),
+            1,
+            "same gap re-presented: gap-warn must NOT fire again (cursor already past it)"
         );
 
         // (c) A second distinct gap (seqs 15-19 evicted, ring has 20..=24) triggers
@@ -2580,6 +2645,11 @@ mod assignment_tests {
         assert_eq!(
             count_d, 15,
             "second gap: 5 new chunks from second gap batch shipped"
+        );
+        assert_eq!(
+            gap_warn_count.load(Ordering::SeqCst),
+            2,
+            "second distinct gap: gap-warn must fire exactly once more (total 2)"
         );
     }
 }
