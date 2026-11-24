@@ -1,10 +1,10 @@
-# Release notes: v1.3.0 (candidate v1.3.0-rc.1)
+# Release notes: v1.3.0 (candidate v1.3.0-rc.2)
 
 The authoritative change list is the [changelog](../CHANGELOG.md); this page
 records what 1.3.0 contains, what was checked, what was not, and how to
 upgrade from 1.2.0. The release workflow checks that the tag matches
 `[workspace.package] version` in `Cargo.toml`, so the candidate is tagged
-`v1.3.0-rc.1` and the final release `v1.3.0` after the version is bumped.
+`v1.3.0-rc.2` and the final release `v1.3.0` after the version is bumped.
 
 **This is a release candidate.** It exists so the checks that need real
 machines can run against one exact build. Those checks are listed under
@@ -403,8 +403,8 @@ These are what the candidate is for. 1.3.0 waits for them.
 ## Publishing the candidate
 
 1. Merge the pull request that carries this page and the version bump.
-2. Tag the merge commit: `git tag v1.3.0-rc.1 <commit> && git push origin
-   v1.3.0-rc.1`. The workflow refuses a tag that does not match the workspace
+2. Tag the merge commit: `git tag v1.3.0-rc.2 <commit> && git push origin
+   v1.3.0-rc.2`. The workflow refuses a tag that does not match the workspace
    version, builds the archives and the image, and marks any tag containing a
    `-` as a pre-release, so `releases/latest` stays on 1.2.0.
 3. Run the checks above against that build. Fix what they find on the release

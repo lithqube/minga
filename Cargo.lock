@@ -2253,7 +2253,7 @@ checksum = "6877bb514081ee2a7ff5ef9de3281f14a4dd4bceac4c09388074a6b5df8a139a"
 
 [[package]]
 name = "minga-api"
-version = "1.3.0-rc.1"
+version = "1.3.0-rc.2"
 dependencies = [
  "async-nats",
  "axum",
@@ -2287,7 +2287,7 @@ dependencies = [
 
 [[package]]
 name = "minga-bus"
-version = "1.3.0-rc.1"
+version = "1.3.0-rc.2"
 dependencies = [
  "async-nats",
  "async-trait",
@@ -2310,7 +2310,7 @@ dependencies = [
 
 [[package]]
 name = "minga-cli"
-version = "1.3.0-rc.1"
+version = "1.3.0-rc.2"
 dependencies = [
  "async-nats",
  "axum",
@@ -2348,7 +2348,7 @@ dependencies = [
 
 [[package]]
 name = "minga-compose"
-version = "1.3.0-rc.1"
+version = "1.3.0-rc.2"
 dependencies = [
  "indexmap 2.14.2",
  "serde",
@@ -2360,7 +2360,7 @@ dependencies = [
 
 [[package]]
 name = "minga-ctl"
-version = "1.3.0-rc.1"
+version = "1.3.0-rc.2"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -2384,7 +2384,7 @@ dependencies = [
 
 [[package]]
 name = "minga-egress"
-version = "1.3.0-rc.1"
+version = "1.3.0-rc.2"
 dependencies = [
  "aws-credential-types",
  "aws-sigv4",
@@ -2412,7 +2412,7 @@ dependencies = [
 
 [[package]]
 name = "minga-net"
-version = "1.3.0-rc.1"
+version = "1.3.0-rc.2"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -2428,7 +2428,7 @@ dependencies = [
 
 [[package]]
 name = "minga-node"
-version = "1.3.0-rc.1"
+version = "1.3.0-rc.2"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -2458,7 +2458,7 @@ dependencies = [
 
 [[package]]
 name = "minga-sandbox"
-version = "1.3.0-rc.1"
+version = "1.3.0-rc.2"
 dependencies = [
  "async-trait",
  "lru",
@@ -2475,7 +2475,7 @@ dependencies = [
 
 [[package]]
 name = "minga-scheduler"
-version = "1.3.0-rc.1"
+version = "1.3.0-rc.2"
 dependencies = [
  "minga-bus",
  "minga-compose",
@@ -2495,7 +2495,7 @@ dependencies = [
 
 [[package]]
 name = "minga-state"
-version = "1.3.0-rc.1"
+version = "1.3.0-rc.2"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -2519,7 +2519,7 @@ dependencies = [
 
 [[package]]
 name = "minga-telemetry"
-version = "1.3.0-rc.1"
+version = "1.3.0-rc.2"
 dependencies = [
  "axum",
  "http",

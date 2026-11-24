@@ -11,7 +11,7 @@ export interface Step {
 
 export const prerequisites = [
   'Linux with root (the supervisor creates netns, bridges and iptables rules)',
-  'Install from a release archive; it includes minga, nats-server and ctr. These steps use the v1.3.0-rc.1 layout (one minga manager process serves the API); v1.2.0 needs minga api as a second process.',
+  'Install from a release archive; it includes minga, nats-server and ctr. These steps use the v1.3.0-rc.2 layout (one minga manager process serves the API); v1.2.0 needs minga api as a second process.',
   'containerd running (1.7 or newer for private registries)',
   'iproute2, iptables and procps (any standard server install)',
   'Free loopback ports 7001, 2375 and 9100',
@@ -20,7 +20,7 @@ export const prerequisites = [
 export const steps: Step[] = [
   {
     title: 'Install minga + nats-server (install.sh verifies SHA256SUMS)',
-    note: 'The installer verifies SHA256SUMS. This installs v1.2.0, the latest release; for the steps below add --version v1.3.0-rc.1 (see the README). Supported distro guidance: Debian 11+, Ubuntu 20.04+, Fedora 32+; add --with-systemd for the unit.',
+    note: 'The installer verifies SHA256SUMS. This installs v1.2.0, the latest release; for the steps below add --version v1.3.0-rc.2 (see the README). Supported distro guidance: Debian 11+, Ubuntu 20.04+, Fedora 32+; add --with-systemd for the unit.',
     code: `curl -fsSL https://github.com/lithqube/minga/releases/latest/download/install.sh | sh`,
   },
   {
