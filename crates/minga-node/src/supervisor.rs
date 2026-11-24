@@ -656,7 +656,7 @@ impl Supervisor {
         for (task_id, container_id) in terminated {
             // Remove the terminated container from tracking and clean it up.
             self.running.lock().await.remove(&task_id);
-            self.log_offsets.lock().await.remove(&task_id);
+            let last_cursor = self.log_offsets.lock().await.remove(&task_id).unwrap_or(0);
             self.health.lock().await.remove(&task_id);
 
             // Capture the exit code BEFORE stopping: `stop()` deletes the
@@ -667,6 +667,41 @@ impl Supervisor {
                 .state(&container_id)
                 .await
                 .and_then(|s| s.exit_code);
+
+            // Drain any output written since the last stream_logs pass before
+            // calling stop(). stop() calls teardown_logs() which aborts the
+            // FIFO reader and drops the ring — without this drain the last
+            // lines of a fast-crashing task are silently discarded.
+            if let Some(bus) = &self.bus {
+                let chunks = self.runtime.logs(&container_id, 0).await;
+                let start_cursor = last_cursor;
+                let mut cursor = last_cursor;
+                for chunk in chunks.iter().filter(|c| c.seq > start_cursor) {
+                    let entry = LogEntry {
+                        task_id: task_id.clone(),
+                        stream: match chunk.stream {
+                            crate::runtime::LogStream::Stdout => LogStream::Stdout,
+                            crate::runtime::LogStream::Stderr => LogStream::Stderr,
+                        },
+                        data: chunk.data.clone(),
+                        timestamp: now_millis(),
+                    };
+                    if let Err(e) = bus
+                        .publish_tenant_node_log(&self.tenant_id, self.node_id, &task_id, &entry)
+                        .await
+                    {
+                        tracing::warn!(task = %task_id, error = %e, "failed to publish final log entry");
+                    }
+                    cursor = chunk.seq;
+                }
+                if cursor > start_cursor {
+                    tracing::debug!(
+                        task = %task_id,
+                        chunks = cursor - start_cursor,
+                        "drained final log chunks before teardown"
+                    );
+                }
+            }
 
             // Best-effort stop to clean up the container. If it already
             // exited, this only removes the task and container records.
@@ -694,7 +729,7 @@ impl Supervisor {
 
             let policy = &spec.restart_policy;
             if policy.condition == RestartCondition::None {
-                tracing::info!(task = %task_id, "task terminated, restart policy is `none`");
+                tracing::info!(task = %task_id, exit_code = ?exit_code, "task stopped; restart policy is `none`");
                 let end = if exit_code == Some(0) {
                     TaskState::Stopped
                 } else {
@@ -743,6 +778,7 @@ impl Supervisor {
                     if state.attempts >= max {
                         tracing::warn!(
                             task = %task_id,
+                            exit_code = ?exit_code,
                             attempts = state.attempts,
                             max,
                             "task failed, max restart attempts reached"
@@ -785,6 +821,7 @@ impl Supervisor {
                         tracing::info!(
                             task = %task_id,
                             container = %new_container_id,
+                            exit_code = ?exit_code,
                             attempt,
                             "restarted failed container"
                         );
