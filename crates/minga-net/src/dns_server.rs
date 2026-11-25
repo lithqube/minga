@@ -57,6 +57,12 @@ const TCP_IO_TIMEOUT: Duration = Duration::from_secs(5);
 /// TCP connections served at once; further ones are dropped on accept.
 const MAX_TCP_CONNECTIONS: usize = 128;
 
+/// UDP queries answered at once; further ones are dropped on receipt.
+///
+/// Every query gets its own task, so the cap is what keeps a burst of
+/// queries from spawning unbounded work.
+const MAX_UDP_QUERIES: usize = 256;
+
 /// A DNS server answering overlay queries on one or more bind addresses.
 ///
 /// Dropping the server does not stop the listener tasks; call
@@ -88,7 +94,7 @@ impl DnsServer {
             let store_udp = Arc::clone(&store);
             let local_only_udp = Arc::clone(&local_only);
             tasks.push(tokio::spawn(async move {
-                udp_loop(udp, store_udp, upstream, local_only_udp).await;
+                udp_loop(Arc::new(udp), store_udp, upstream, local_only_udp).await;
             }));
 
             let store_tcp = Arc::clone(&store);
@@ -123,28 +129,56 @@ impl DnsServer {
 // ---------------------------------------------------------------------------
 
 async fn udp_loop<R: Records>(
-    socket: UdpSocket,
+    socket: Arc<UdpSocket>,
     store: Arc<RwLock<R>>,
     upstream: Option<SocketAddr>,
     local_only: LocalOnlySources,
 ) {
+    // Each query is answered in its own task: one query waiting on the
+    // upstream resolver must not delay the next one.
+    let slots = Arc::new(tokio::sync::Semaphore::new(MAX_UDP_QUERIES));
+    // The set owns the query tasks: dropping it, when the listener task is
+    // aborted, aborts every in-flight query with it.
+    let mut queries = tokio::task::JoinSet::new();
     let mut buf = vec![0u8; MAX_DATAGRAM];
     loop {
-        match socket.recv_from(&mut buf).await {
-            Ok((n, peer)) => {
-                if let Some(resp) =
-                    handle_query(&buf[..n], &store, upstream, peer.ip(), &local_only).await
-                {
-                    if let Err(e) = socket.send_to(&resp, peer).await {
-                        debug!(error = %e, %peer, "failed to send DNS response");
-                    }
-                }
+        // Reap the queries that finished; never wait for one here, or a
+        // slow query would hold up the next one again.
+        while let Some(completed) = queries.try_join_next() {
+            if let Err(e) = completed {
+                warn!(error = %e, "DNS UDP query task failed");
             }
+        }
+        let (n, peer) = match socket.recv_from(&mut buf).await {
+            Ok(received) => received,
             Err(e) => {
                 warn!(error = %e, "DNS UDP recv error; stopping listener");
                 return;
             }
-        }
+        };
+        // Over the cap: drop the query instead of spawning unbounded work.
+        let permit = match slots.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                debug!("DNS UDP query over cap; dropping");
+                continue;
+            }
+        };
+        // The datagram is copied out: the buffer is reused by the next read.
+        let datagram = buf[..n].to_vec();
+        let socket = Arc::clone(&socket);
+        let store = Arc::clone(&store);
+        let local_only = local_only.clone();
+        queries.spawn(async move {
+            let _permit = permit;
+            if let Some(resp) =
+                handle_query(&datagram, &store, upstream, peer.ip(), &local_only).await
+            {
+                if let Err(e) = socket.send_to(&resp, peer).await {
+                    debug!(error = %e, %peer, "failed to send DNS response");
+                }
+            }
+        });
     }
 }
 
@@ -942,5 +976,70 @@ mod tests {
             assert_tcp_closed(&mut body, Duration::from_secs(6)),
         );
         server.shutdown().await;
+    }
+
+    /// A query waiting on a silent upstream must not hold up the next one.
+    ///
+    /// The upstream socket below never answers, so the proxied query waits
+    /// out `UPSTREAM_TIMEOUT` (3 s). The overlay query that follows it must
+    /// be answered from the store straight away: a server that answered one
+    /// query at a time would hold the overlay query behind the slow one.
+    #[tokio::test]
+    async fn a_slow_query_does_not_hold_up_the_next_one() {
+        // An upstream that receives but never answers.
+        let silent_upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = silent_upstream.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; MAX_DATAGRAM];
+            while silent_upstream.recv_from(&mut buf).await.is_ok() {}
+        });
+
+        let mut store = DnsStore::new();
+        store.set(
+            "web.plant-7.minga.local",
+            vec![Ipv4Addr::new(10, 100, 1, 10)],
+        );
+        let server = DnsServer::start(
+            vec!["127.0.0.1:0".parse().unwrap()],
+            Arc::new(RwLock::new(store)),
+            Some(upstream_addr),
+            LocalOnlySources::default(),
+        )
+        .await
+        .unwrap();
+        let addr = server.local_addrs()[0];
+
+        // The slow query: a name outside the overlay goes to the upstream
+        // that never answers.
+        let slow = tokio::spawn(async move {
+            query_udp(addr, &encode_query(0x11, "slow.example.com", QTYPE_A)).await
+        });
+        // Give the server time to pick the slow query up and start waiting.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // The overlay query that follows must not wait for the slow one.
+        let started = std::time::Instant::now();
+        let fast = tokio::time::timeout(
+            Duration::from_secs(1),
+            query_udp(
+                addr,
+                &encode_query(0x12, "web.plant-7.minga.local", QTYPE_A),
+            ),
+        )
+        .await
+        .expect("the overlay query waited behind the slow one");
+        let parsed = parse_response(&fast);
+        assert_eq!(parsed.id, 0x12);
+        assert_eq!(parsed.rcode, RCODE_NOERROR);
+        assert_eq!(parsed.ips, vec![Ipv4Addr::new(10, 100, 1, 10)]);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the overlay query took {:?}",
+            started.elapsed()
+        );
+
+        server.shutdown().await;
+        // The slow query gives up on its own; the server is gone either way.
+        let _ = slow.await;
     }
 }
