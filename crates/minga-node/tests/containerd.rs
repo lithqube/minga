@@ -366,6 +366,66 @@ async fn containerd_kernel_paths_are_masked_and_read_only() {
     );
 }
 
+/// The default process limit reaches the running task's cgroup.
+#[tokio::test]
+async fn containerd_task_has_a_pids_limit() {
+    let socket = socket_path();
+    if !containerd_available_at(&socket) {
+        eprintln!("SKIP: containerd not available at {socket}");
+        return;
+    }
+    let runtime = match ContainerdRuntime::connect(&socket).await {
+        Ok(rt) => rt,
+        Err(e) => {
+            assert!(
+                std::env::var_os("MINGA_REQUIRE_CONTAINERD").is_none(),
+                "required containerd connection failed: {e}"
+            );
+            eprintln!("SKIP: cannot connect to containerd: {e}");
+            return;
+        }
+    };
+    let logs_dir = tempfile::tempdir().unwrap();
+    let runtime = runtime.with_logs_dir(logs_dir.path());
+
+    let task_id = "minga-test-pids-001".to_string();
+    let spec = minga_state::types::TaskSpec {
+        image: "docker.io/library/busybox:latest".to_string(),
+        command: vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            // cgroup v2, else the v1 pids controller.
+            "echo pids-max=$(cat /sys/fs/cgroup/pids.max 2>/dev/null || cat /sys/fs/cgroup/pids/pids.max); sleep 30"
+                .to_string(),
+        ],
+        ..Default::default()
+    };
+    runtime
+        .start(&task_id, &spec)
+        .await
+        .expect("failed to start container");
+
+    let mut out = String::new();
+    for _ in 0..20 {
+        out = runtime
+            .logs(&task_id, 0)
+            .await
+            .iter()
+            .filter(|c| c.stream == minga_node::runtime::LogStream::Stdout)
+            .map(|c| String::from_utf8_lossy(&c.data).into_owned())
+            .collect();
+        if out.contains('\n') {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    runtime
+        .stop(&task_id)
+        .await
+        .expect("failed to stop container");
+    assert_eq!(out.trim(), "pids-max=4096");
+}
+
 /// A named `user:` resolves against the image's own /etc/passwd and
 /// /etc/group (BusyBox: user `nobody` is 65534, group `root` is 0).
 #[tokio::test]

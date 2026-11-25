@@ -45,6 +45,8 @@ Task IDs follow the pattern `<stack>.<service>.<replica-number>`. Task output is
 | `exited with code 127` | The entrypoint or command was not found in the image |
 | Start error (agent task) | WASM module failed to load; `service inspect` shows the reason |
 
+**Resource limits.** Every container is limited to 4096 processes and threads (`pids.max`); past that, starting another one fails with `Resource temporarily unavailable`. The value cannot be set per service yet, so `deploy.resources.limits.pids` is refused. The limit applies to each container, not to the node as a whole, and a container created before this limit existed keeps running without it until it is replaced. A memory limit does not limit swap.
+
 **Step 4 — Image not found:**
 
 If the error mentions a missing image, the task could not be pulled. Verify the image is available in the `minga` containerd namespace:
