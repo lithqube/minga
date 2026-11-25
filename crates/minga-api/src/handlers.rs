@@ -2471,6 +2471,13 @@ pub async fn create_network(
     Json(req): Json<models::NetworkCreateRequest>,
 ) -> ApiResult<(StatusCode, Json<models::NetworkCreateResponse>)> {
     let tenant_id = tenant_scope(&caller)?;
+    // Before the existing-network shortcut: that one must not answer as if it
+    // were isolated.
+    if req.Internal == Some(true) {
+        return Err(bad_request(
+            "`Internal` networks are not supported yet: Minga does not block external egress",
+        ));
+    }
     if let Some(network) = find_network(&app, tenant_id, &req.Name).await? {
         return Ok((
             StatusCode::CREATED,

@@ -427,3 +427,26 @@ fn supported_compose_file_loads_without_hardening_errors() {
     .expect("edge-ai.yaml should load without errors after removing hardening keys");
     assert_eq!(loaded.project.name.as_deref(), Some("plant-7"));
 }
+
+#[test]
+fn internal_network_is_rejected() {
+    // Declared but unused, and the quoted form, are refused too.
+    for value in ["true", "\"true\""] {
+        let yaml =
+            format!("services:\n  s:\n    image: i\nnetworks:\n  back:\n    internal: {value}\n");
+        let err = load(&yaml, &opts(&[], &[])).expect_err("internal: true must not load");
+        assert!(
+            matches!(&err.0[..], [ComposeError::Unsupported { path, key, .. }]
+                if path == "networks.back" && key == "internal"),
+            "{value}: {err}"
+        );
+    }
+}
+
+#[test]
+fn network_that_is_not_internal_still_loads() {
+    for network in ["{ internal: false }", "{}", ""] {
+        let yaml = format!("services:\n  s:\n    image: i\nnetworks:\n  back: {network}\n");
+        load(&yaml, &opts(&[], &[])).unwrap_or_else(|e| panic!("{network:?}: {e}"));
+    }
+}

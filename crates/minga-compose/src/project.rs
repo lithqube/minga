@@ -67,6 +67,7 @@ impl Project {
         project.load_env_files(errors);
         project.check_dependencies(errors, warnings);
         project.check_services(errors);
+        project.check_networks(errors);
         project.check_file_objects(errors);
         project.check_port_conflicts(errors);
         project.order = project.compute_order(errors);
@@ -102,6 +103,23 @@ impl Project {
             }
             for dep in skipped {
                 svc.depends_on.shift_remove(&dep);
+            }
+        }
+    }
+
+    /// `internal: true` asks for no external egress, which nodes do not
+    /// enforce, so accepting it would claim an isolation that is not there.
+    fn check_networks(&self, errors: &mut Vec<ComposeError>) {
+        for (name, net) in &self.networks {
+            if net.internal == Some(true) {
+                errors.push(ComposeError::Unsupported {
+                    path: format!("networks.{name}"),
+                    key: "internal".to_string(),
+                    note: Some(
+                        "Minga does not block external egress yet; remove it or set it to false"
+                            .to_string(),
+                    ),
+                });
             }
         }
     }
