@@ -4,6 +4,7 @@
 
 ### Security
 - **Breaking: `internal: true` on a network is refused (#270).** It used to be accepted and ignored, so the network had the same external egress as any other. `minga validate`, `minga deploy` and `minga-ctl stack deploy` now fail and name the network, and `POST /networks/create` with `Internal: true` answers 400. Remove the key or set it to `false`. A network created earlier with it is still not isolated.
+- **Containers have a process limit (#271).** Every new container may have at most 4096 processes and threads; before, minga set no limit. A workload that needs more now fails to start them, and the value cannot yet be set per service. Running containers get the limit when they are replaced. See [resource limits](docs/troubleshooting.md#task-will-not-start).
 
 ## [1.3.0-rc.2] — 2026-11-24
 

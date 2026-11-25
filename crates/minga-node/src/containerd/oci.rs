@@ -130,6 +130,12 @@ pub struct OciResources {
     pub memory: Option<OciMemory>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cpu: Option<OciCpu>,
+    pub pids: OciPids,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct OciPids {
+    pub limit: i64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -184,6 +190,12 @@ pub struct OciRlimit {
     pub hard: u64,
     pub soft: u64,
 }
+
+/// Processes and threads one container may have, so that a runaway one cannot
+/// take every PID on its node.
+// shortcut: fixed for every service; carry `deploy.resources.limits.pids`
+// (a state format bump) when a workload needs another value.
+const DEFAULT_PIDS_LIMIT: i64 = 4096;
 
 /// Default Linux capabilities for a container (same as Docker's default set).
 fn default_capabilities() -> OciCapabilities {
@@ -360,6 +372,9 @@ pub fn spec_from_task(container_id: &str, spec: &TaskSpec) -> OciSpec {
         }]),
         memory,
         cpu,
+        pids: OciPids {
+            limit: DEFAULT_PIDS_LIMIT,
+        },
     });
 
     // Standard container namespaces.
@@ -881,6 +896,17 @@ mod tests {
         let devices = resources.devices.expect("device rules");
         assert!(!devices[0].allow, "first device rule must deny all");
         assert_eq!(devices[0].access.as_deref(), Some("rwm"));
+    }
+
+    #[test]
+    fn spec_always_limits_pids() {
+        let mut limited = base_spec();
+        limited.resources.cpus = 2.0;
+        limited.resources.memory_bytes = 512 * 1024 * 1024;
+        for task in [base_spec(), limited] {
+            let json = serde_json::to_value(spec_from_task("c1", &task)).unwrap();
+            assert_eq!(json["linux"]["resources"]["pids"]["limit"], 4096);
+        }
     }
 
     #[test]
