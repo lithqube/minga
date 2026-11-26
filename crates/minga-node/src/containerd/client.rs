@@ -8,6 +8,7 @@
 //! types are defined in [`super::proto`].
 
 use std::path::Path;
+use std::time::Duration;
 
 use hyper_util::rt::TokioIo;
 use thiserror::Error;
@@ -41,6 +42,8 @@ pub enum ClientError {
     ContainerNotFound(String),
     #[error("task not found for container: {0}")]
     TaskNotFound(String),
+    #[error("containerd call {method} timed out after {after:?}")]
+    Timeout { method: String, after: Duration },
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -56,10 +59,24 @@ impl From<tonic::Status> for ClientError {
 pub struct ContainerdClient {
     channel: Channel,
     socket: Option<std::path::PathBuf>,
+    /// Deadline for a single call. A call that does not answer in time
+    /// returns [`ClientError::Timeout`] instead of hanging the caller.
+    call_timeout: Duration,
 }
 
 /// Default containerd socket path.
 pub const DEFAULT_SOCKET: &str = "/run/containerd/containerd.sock";
+
+/// How long a single containerd call may take before it is abandoned.
+///
+/// The node runs every containerd call from its one supervisor loop, so a
+/// call that never answers would stop restarts for every task on the node.
+/// A pull is the one call that is legitimately slow; it keeps
+/// [`TRANSFER_TIMEOUT`] instead.
+pub const DEFAULT_CALL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Deadline for the transfer call that pulls and unpacks an image.
+pub const TRANSFER_TIMEOUT: Duration = Duration::from_secs(300);
 
 impl ContainerdClient {
     /// Connect to containerd via a Unix domain socket.
@@ -85,6 +102,7 @@ impl ContainerdClient {
         Ok(Self {
             channel,
             socket: Some(socket),
+            call_timeout: DEFAULT_CALL_TIMEOUT,
         })
     }
 
@@ -93,7 +111,14 @@ impl ContainerdClient {
         Self {
             channel,
             socket: None,
+            call_timeout: DEFAULT_CALL_TIMEOUT,
         }
+    }
+
+    /// Set the deadline for a single call. A shorter one is useful in tests.
+    pub fn with_call_timeout(mut self, call_timeout: Duration) -> Self {
+        self.call_timeout = call_timeout;
+        self
     }
 
     /// The Unix socket this client connected to, if it connected by path.
@@ -108,11 +133,12 @@ impl ContainerdClient {
         &mut self,
         container: Container,
     ) -> Result<Container, ClientError> {
+        let task = container.id.clone();
         let request = CreateContainerRequest {
             container: Some(container),
         };
         let response: CreateContainerResponse =
-            self.unary(request, paths::CONTAINER_CREATE).await?;
+            self.unary(request, paths::CONTAINER_CREATE, &task).await?;
         response.container.ok_or_else(|| ClientError::Rpc {
             method: "ContainerService/Create".to_string(),
             message: "response missing container".to_string(),
@@ -122,7 +148,8 @@ impl ContainerdClient {
     /// Get a container by ID.
     pub async fn get_container(&mut self, id: &str) -> Result<Container, ClientError> {
         let request = GetContainerRequest { id: id.to_string() };
-        let response: GetContainerResponse = self.unary(request, paths::CONTAINER_GET).await?;
+        let response: GetContainerResponse =
+            self.unary(request, paths::CONTAINER_GET, id).await?;
         response
             .container
             .ok_or_else(|| ClientError::ContainerNotFound(id.to_string()))
@@ -134,14 +161,16 @@ impl ContainerdClient {
         filters: Vec<String>,
     ) -> Result<Vec<Container>, ClientError> {
         let request = ListContainersRequest { filters };
-        let response: ListContainersResponse = self.unary(request, paths::CONTAINER_LIST).await?;
+        let response: ListContainersResponse =
+            self.unary(request, paths::CONTAINER_LIST, "").await?;
         Ok(response.containers)
     }
 
     /// Delete a container by ID.
     pub async fn delete_container(&mut self, id: &str) -> Result<(), ClientError> {
         let request = DeleteContainerRequest { id: id.to_string() };
-        let _: DeleteContainerResponse = self.unary(request, paths::CONTAINER_DELETE).await?;
+        let _: DeleteContainerResponse =
+            self.unary(request, paths::CONTAINER_DELETE, id).await?;
         Ok(())
     }
 
@@ -169,7 +198,8 @@ impl ContainerdClient {
             options: None,
             runtime_path: String::new(),
         };
-        let response: CreateTaskResponse = self.unary(request, paths::TASK_CREATE).await?;
+        let response: CreateTaskResponse =
+            self.unary(request, paths::TASK_CREATE, container_id).await?;
         Ok(response.pid)
     }
 
@@ -179,7 +209,8 @@ impl ContainerdClient {
             container_id: container_id.to_string(),
             exec_id: String::new(),
         };
-        let response: StartResponse = self.unary(request, paths::TASK_START).await?;
+        let response: StartResponse =
+            self.unary(request, paths::TASK_START, container_id).await?;
         Ok(response.pid)
     }
 
@@ -191,7 +222,7 @@ impl ContainerdClient {
             signal,
             all: false,
         };
-        let _: KillResponse = self.unary(request, paths::TASK_KILL).await?;
+        let _: KillResponse = self.unary(request, paths::TASK_KILL, container_id).await?;
         Ok(())
     }
 
@@ -203,7 +234,8 @@ impl ContainerdClient {
         let request = DeleteTaskRequest {
             container_id: container_id.to_string(),
         };
-        let response: DeleteTaskResponse = self.unary(request, paths::TASK_DELETE).await?;
+        let response: DeleteTaskResponse =
+            self.unary(request, paths::TASK_DELETE, container_id).await?;
         Ok(response)
     }
 
@@ -213,7 +245,8 @@ impl ContainerdClient {
             container_id: container_id.to_string(),
             exec_id: String::new(),
         };
-        let response: GetTaskResponse = self.unary(request, paths::TASK_GET).await?;
+        let response: GetTaskResponse =
+            self.unary(request, paths::TASK_GET, container_id).await?;
         response
             .process
             .ok_or_else(|| ClientError::TaskNotFound(container_id.to_string()))
@@ -224,7 +257,7 @@ impl ContainerdClient {
         let request = ListTasksRequest {
             filter: String::new(),
         };
-        let response: ListTasksResponse = self.unary(request, paths::TASK_LIST).await?;
+        let response: ListTasksResponse = self.unary(request, paths::TASK_LIST, "").await?;
         Ok(response.tasks)
     }
 
@@ -237,7 +270,8 @@ impl ContainerdClient {
             container_id: container_id.to_string(),
             exec_id: String::new(),
         };
-        let response: WaitResponse = self.unary(request, paths::TASK_WAIT).await?;
+        let response: WaitResponse =
+            self.unary(request, paths::TASK_WAIT, container_id).await?;
         Ok(response.exit_status)
     }
 
@@ -257,7 +291,8 @@ impl ContainerdClient {
             spec: Some(spec),
             exec_id: exec_id.to_string(),
         };
-        let _: ExecProcessResponse = self.unary(request, paths::TASK_EXEC).await?;
+        let _: ExecProcessResponse =
+            self.unary(request, paths::TASK_EXEC, container_id).await?;
         Ok(())
     }
 
@@ -271,7 +306,7 @@ impl ContainerdClient {
             container_id: container_id.to_string(),
             exec_id: exec_id.to_string(),
         };
-        let _: StartResponse = self.unary(request, paths::TASK_START).await?;
+        let _: StartResponse = self.unary(request, paths::TASK_START, container_id).await?;
         Ok(())
     }
 
@@ -285,7 +320,8 @@ impl ContainerdClient {
             container_id: container_id.to_string(),
             exec_id: exec_id.to_string(),
         };
-        let response: GetTaskResponse = self.unary(request, paths::TASK_GET).await?;
+        let response: GetTaskResponse =
+            self.unary(request, paths::TASK_GET, container_id).await?;
         response
             .process
             .ok_or_else(|| ClientError::TaskNotFound(container_id.to_string()))
@@ -304,7 +340,7 @@ impl ContainerdClient {
             signal,
             all: false,
         };
-        let _: KillResponse = self.unary(request, paths::TASK_KILL).await?;
+        let _: KillResponse = self.unary(request, paths::TASK_KILL, container_id).await?;
         Ok(())
     }
 
@@ -318,7 +354,9 @@ impl ContainerdClient {
             container_id: container_id.to_string(),
             exec_id: exec_id.to_string(),
         };
-        let _: DeleteTaskResponse = self.unary(request, paths::TASK_DELETE_PROCESS).await?;
+        let _: DeleteTaskResponse = self
+            .unary(request, paths::TASK_DELETE_PROCESS, container_id)
+            .await?;
         Ok(())
     }
 
@@ -331,7 +369,7 @@ impl ContainerdClient {
             name: name.to_string(),
         };
         match self
-            .unary::<GetImageRequest, GetImageResponse>(request, paths::IMAGE_GET)
+            .unary::<GetImageRequest, GetImageResponse>(request, paths::IMAGE_GET, "")
             .await
         {
             Ok(response) => Ok(response.image),
@@ -398,7 +436,11 @@ impl ContainerdClient {
                 },
             )),
         };
-        let result: Result<(), ClientError> = self.clone().unary(request, paths::TRANSFER).await;
+        // A pull is legitimately slow, so it gets the longer transfer
+        // deadline instead of the per-call one.
+        let result: Result<(), ClientError> = self
+            .unary_within(request, paths::TRANSFER, "", TRANSFER_TIMEOUT)
+            .await;
         if let Some(task) = auth_task {
             task.abort();
         }
@@ -494,31 +536,48 @@ impl ContainerdClient {
             "containerd-namespace",
             "minga".parse().expect("static namespace"),
         );
-        let mut grpc = Grpc::new(self.channel.clone());
-        grpc.ready().await.map_err(|e| ClientError::Rpc {
-            method: paths::CONTENT_READ.into(),
-            message: e.to_string(),
-        })?;
-        let response = grpc
-            .server_streaming(
-                request,
-                PathAndQuery::from_static(paths::CONTENT_READ),
-                ProstCodec::<ReadContentRequest, ReadContentResponse>::default(),
-            )
-            .await?;
-        let mut stream = response.into_inner();
-        let mut data = Vec::with_capacity(descriptor.size as usize);
-        while let Some(chunk) = stream.message().await? {
-            if chunk.offset != data.len() as i64
-                || chunk.data.len() > descriptor.size as usize - data.len()
-            {
-                return Err(ClientError::Rpc {
-                    method: paths::CONTENT_READ.into(),
-                    message: "image metadata stream has invalid offset or size".into(),
+        let read = async {
+            let mut grpc = Grpc::new(self.channel.clone());
+            grpc.ready().await.map_err(|e| ClientError::Rpc {
+                method: paths::CONTENT_READ.into(),
+                message: e.to_string(),
+            })?;
+            let response = grpc
+                .server_streaming(
+                    request,
+                    PathAndQuery::from_static(paths::CONTENT_READ),
+                    ProstCodec::<ReadContentRequest, ReadContentResponse>::default(),
+                )
+                .await?;
+            let mut stream = response.into_inner();
+            let mut data = Vec::with_capacity(descriptor.size as usize);
+            while let Some(chunk) = stream.message().await? {
+                if chunk.offset != data.len() as i64
+                    || chunk.data.len() > descriptor.size as usize - data.len()
+                {
+                    return Err(ClientError::Rpc {
+                        method: paths::CONTENT_READ.into(),
+                        message: "image metadata stream has invalid offset or size".into(),
+                    });
+                }
+                data.extend_from_slice(&chunk.data);
+            }
+            Ok::<_, ClientError>(data)
+        };
+        let data = match tokio::time::timeout(self.call_timeout, read).await {
+            Ok(result) => result?,
+            Err(_) => {
+                tracing::warn!(
+                    call = %paths::CONTENT_READ,
+                    timeout_secs = self.call_timeout.as_secs(),
+                    "containerd call timed out"
+                );
+                return Err(ClientError::Timeout {
+                    method: paths::CONTENT_READ.to_string(),
+                    after: self.call_timeout,
                 });
             }
-            data.extend_from_slice(&chunk.data);
-        }
+        };
         descriptor
             .verify(&data)
             .map_err(|message| ClientError::Rpc {
@@ -538,7 +597,11 @@ impl ContainerdClient {
             key: key.into(),
         };
         match self
-            .unary::<StatSnapshotRequest, StatSnapshotResponse>(request, paths::SNAPSHOT_STAT)
+            .unary::<StatSnapshotRequest, StatSnapshotResponse>(
+                request,
+                paths::SNAPSHOT_STAT,
+                "",
+            )
             .await
         {
             Ok(response) => Ok(response.info),
@@ -560,7 +623,7 @@ impl ContainerdClient {
             labels: Default::default(),
         };
         let response: PrepareSnapshotResponse =
-            self.unary(request, paths::SNAPSHOT_PREPARE).await?;
+            self.unary(request, paths::SNAPSHOT_PREPARE, "").await?;
         Ok(response.mounts)
     }
 
@@ -573,17 +636,37 @@ impl ContainerdClient {
             snapshotter: snapshotter.into(),
             key: key.into(),
         };
-        let _: RemoveSnapshotResponse = self.unary(request, paths::SNAPSHOT_REMOVE).await?;
+        let _: RemoveSnapshotResponse = self.unary(request, paths::SNAPSHOT_REMOVE, "").await?;
         Ok(())
     }
 
     // --- Internal -----------------------------------------------------------
 
     /// Make a unary gRPC call.
+    ///
+    /// `task` names the task the call is for; it is only used to log a
+    /// timeout. Pass an empty string for a call that is not about one task.
     async fn unary<Req, Resp>(
-        &mut self,
+        &self,
         request: Req,
         path: &'static str,
+        task: &str,
+    ) -> Result<Resp, ClientError>
+    where
+        Req: prost::Message + Default + Send + 'static,
+        Resp: prost::Message + Default + Send + 'static,
+    {
+        self.unary_within(request, path, task, self.call_timeout)
+            .await
+    }
+
+    /// Make a unary gRPC call with an explicit deadline.
+    async fn unary_within<Req, Resp>(
+        &self,
+        request: Req,
+        path: &'static str,
+        task: &str,
+        timeout: Duration,
     ) -> Result<Resp, ClientError>
     where
         Req: prost::Message + Default + Send + 'static,
@@ -595,18 +678,32 @@ impl ContainerdClient {
             "minga".parse().expect("static namespace"),
         );
         let codec = ProstCodec::<Req, Resp>::default();
+        let method = path.to_string();
         let path = PathAndQuery::from_static(path);
 
-        let mut grpc = Grpc::new(self.channel.clone());
-        grpc.ready().await.map_err(|e| ClientError::Rpc {
-            method: path.to_string(),
-            message: e.to_string(),
-        })?;
-        let response = grpc
-            .unary(request, path, codec)
-            .await
-            .map_err(ClientError::from)?;
-        Ok(response.into_inner())
+        let call = async {
+            let mut grpc = Grpc::new(self.channel.clone());
+            grpc.ready().await.map_err(|e| ClientError::Rpc {
+                method: method.clone(),
+                message: e.to_string(),
+            })?;
+            grpc.unary(request, path, codec).await.map_err(ClientError::from)
+        };
+        match tokio::time::timeout(timeout, call).await {
+            Ok(result) => Ok(result?.into_inner()),
+            Err(_) => {
+                tracing::warn!(
+                    call = %method,
+                    task = %task,
+                    timeout_secs = timeout.as_secs(),
+                    "containerd call timed out"
+                );
+                Err(ClientError::Timeout {
+                    method,
+                    after: timeout,
+                })
+            }
+        }
     }
 }
 
