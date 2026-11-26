@@ -410,6 +410,9 @@ fn is_missing(error: &ClientError) -> bool {
 
 /// A container runtime backed by containerd.
 pub struct ContainerdRuntime {
+    /// The client is cloned out of the lock before every call, so a call
+    /// that hangs (a frozen shim) never holds the lock and never blocks
+    /// another task's calls. The lock only serializes the clone itself.
     client: Arc<Mutex<ContainerdClient>>,
     /// Track which container IDs we've started (for status lookups).
     containers: Arc<Mutex<HashSet<String>>>,
@@ -936,13 +939,13 @@ impl ContainerdRuntime {
     /// Ensure the image is available in the Minga containerd namespace,
     /// pulling from the registry if needed.
     async fn ensure_image(&self, image_ref: &str) -> Result<Image, RuntimeError> {
-        let mut client = self.client.lock().await;
+        let mut client = self.client.lock().await.clone();
         match client.get_image(image_ref).await {
             Ok(Some(image)) => Ok(image),
             Ok(None) => {
                 drop(client);
                 self.pull_image(image_ref).await?;
-                let mut client = self.client.lock().await;
+                let mut client = self.client.lock().await.clone();
                 client
                     .get_image(image_ref)
                     .await
@@ -964,7 +967,7 @@ impl ContainerdRuntime {
     #[cfg(target_os = "linux")]
     async fn stop_all_task_containers(&self) -> Result<(), RuntimeError> {
         let containers = {
-            let mut client = self.client.lock().await;
+            let mut client = self.client.lock().await.clone();
             client
                 .list_containers(vec!["labels.minga.task_id!=empty".to_string()])
                 .await
@@ -977,7 +980,7 @@ impl ContainerdRuntime {
         let mut errors = Vec::new();
         for container in containers {
             {
-                let mut client = self.client.lock().await;
+                let mut client = self.client.lock().await.clone();
                 if let Err(error) = client.kill_task(&container.id, 9).await {
                     tracing::warn!(
                         container = %container.id,
@@ -1057,7 +1060,9 @@ impl ContainerdRuntime {
     ) -> bool {
         loop {
             let status = {
-                let mut guard = client.lock().await;
+                // Clone the client out of the lock so a status read never
+                // holds the shared lock across the call.
+                let mut guard = client.lock().await.clone();
                 match guard.get_task(container_id).await {
                     Ok(process) => Some(
                         ProcessStatus::try_from(process.status).unwrap_or(ProcessStatus::Unknown),
@@ -1319,7 +1324,7 @@ impl Runtime for ContainerdRuntime {
             None
         };
 
-        let mut client = self.client.lock().await;
+        let mut client = self.client.lock().await.clone();
         let snapshot_key = format!("minga-{container_id}");
         let prepared = async {
             let config = image::load_image(&mut client, &image, &self.snapshotter)
@@ -1524,7 +1529,7 @@ impl Runtime for ContainerdRuntime {
     }
 
     async fn stop(&self, container_id: &str) -> Result<(), RuntimeError> {
-        let mut client = self.client.lock().await;
+        let mut client = self.client.lock().await.clone();
 
         // 1. Try graceful shutdown: SIGTERM.
         match client.kill_task(container_id, 15).await {
@@ -1542,8 +1547,8 @@ impl Runtime for ContainerdRuntime {
 
         // 2. Wait for the graceful exit.
         //
-        // The client guard must be released first: `wait_for_stop` locks the
-        // same mutex to read the task status.
+        // `client` is a clone, not the lock guard, so dropping it here only
+        // drops the clone; `wait_for_stop` clones its own client per read.
         drop(client);
         let deadline = std::time::Instant::now() + GRACE_PERIOD;
         if !Self::wait_for_stop(&self.client, container_id, deadline).await {
@@ -1551,7 +1556,7 @@ impl Runtime for ContainerdRuntime {
             // refuses to delete a task whose process is still alive, so the
             // delete below must not run until the process is really gone.
             tracing::warn!(container = %container_id, "grace period expired, sending SIGKILL");
-            let mut client = self.client.lock().await;
+            let mut client = self.client.lock().await.clone();
             let _ = client.kill_task(container_id, 9).await;
             drop(client);
             let deadline = std::time::Instant::now() + KILL_GRACE_PERIOD;
@@ -1561,7 +1566,7 @@ impl Runtime for ContainerdRuntime {
                 )));
             }
         }
-        let mut client = self.client.lock().await;
+        let mut client = self.client.lock().await.clone();
 
         // 3. Delete the task, then the container.
         //
@@ -1600,7 +1605,7 @@ impl Runtime for ContainerdRuntime {
         self.containers.lock().await.remove(container_id);
 
         // 6. Remove the writable snapshot prepared for this container.
-        let mut client = self.client.lock().await;
+        let mut client = self.client.lock().await.clone();
         if let Err(error) = client
             .remove_snapshot(&self.snapshotter, &format!("minga-{container_id}"))
             .await
@@ -1686,7 +1691,7 @@ impl Runtime for ContainerdRuntime {
         };
         #[cfg(not(target_os = "linux"))]
         let source_filter_error: Option<String> = None;
-        let mut client = self.client.lock().await;
+        let mut client = self.client.lock().await.clone();
         let containers = match client
             .list_containers(vec!["labels.minga.task_id!=empty".to_string()])
             .await
@@ -1703,7 +1708,7 @@ impl Runtime for ContainerdRuntime {
         for c in containers {
             // Get task status for each container.
             let status = {
-                let mut client = self.client.lock().await;
+                let mut client = self.client.lock().await.clone();
                 match client.get_task(&c.id).await {
                     Ok(process) => {
                         let ps = ProcessStatus::try_from(process.status)
@@ -1756,7 +1761,7 @@ impl Runtime for ContainerdRuntime {
     /// AlreadyExists.
     async fn purge_stopped_tasks(&self) {
         let tasks = {
-            let mut client = self.client.lock().await;
+            let mut client = self.client.lock().await.clone();
             match client.list_tasks().await {
                 Ok(ts) => ts,
                 Err(e) => {
@@ -1769,7 +1774,7 @@ impl Runtime for ContainerdRuntime {
             let ps = ProcessStatus::try_from(task.status).unwrap_or(ProcessStatus::Unknown);
             if matches!(ps, ProcessStatus::Stopped | ProcessStatus::Unknown) {
                 tracing::info!(task = %task.id, "startup: removing stale stopped/unknown task");
-                let mut client = self.client.lock().await;
+                let mut client = self.client.lock().await.clone();
                 let _ = client.kill_task(&task.id, 9).await;
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 let _ = client.delete_task(&task.id).await;
@@ -1782,7 +1787,7 @@ impl Runtime for ContainerdRuntime {
     }
 
     async fn state(&self, container_id: &str) -> Option<ContainerState> {
-        let mut client = self.client.lock().await;
+        let mut client = self.client.lock().await.clone();
         match client.get_task(container_id).await {
             Ok(process) => {
                 let ps = ProcessStatus::try_from(process.status).unwrap_or(ProcessStatus::Unknown);
@@ -1833,7 +1838,7 @@ impl Runtime for ContainerdRuntime {
             NEXT_EXEC_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         );
         {
-            let mut client = self.client.lock().await;
+            let mut client = self.client.lock().await.clone();
             let container = client.get_container(container_id).await.map_err(err)?;
             let spec = container
                 .spec
@@ -1854,7 +1859,7 @@ impl Runtime for ContainerdRuntime {
         let deadline = std::time::Instant::now() + timeout;
         let outcome = loop {
             let process = {
-                let mut client = self.client.lock().await;
+                let mut client = self.client.lock().await.clone();
                 client.get_process(container_id, &exec_id).await
             };
             match process {
